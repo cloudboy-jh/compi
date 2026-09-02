@@ -2,6 +2,16 @@
 
 Compi currently implements the persistent WSL2 session daemon, authoritative terminal state, protocol-v2 transport, and usable GPUI client described by Milestones 0–3. The remaining work below closes the unfinished P0 release requirements before Milestone 4 begins.
 
+## Completed product baseline
+
+- [x] Run multiple WSL2 Bash sessions through a persistent per-user Windows daemon.
+- [x] Detach and reattach the GPUI client without interrupting live shell work.
+- [x] Preserve authoritative terminal state, local scrollback, protocol-v2 recovery, and Kitty graphics.
+- [x] Support tabs, selection, mouse input, native titlebar controls, and tab-body window dragging.
+- [x] Support terminal-safe copy and paste, including `Ctrl+V`, `Ctrl+Shift+V`, and uninterrupted `Ctrl+C`.
+- [x] Start new sessions in the Linux user's home directory without injecting shell startup commands.
+- [x] Pass the full Rust regression suite, release build, and end-to-end persistence acceptance checks.
+
 ## 1. Finish Milestone 3 and P0
 
 ### Installer and daemon supervision
@@ -36,7 +46,7 @@ Compi currently implements the persistent WSL2 session daemon, authoritative ter
 - [ ] Measure detached-session reattach time and identify any synchronous work on the GPUI render/input path.
 - [ ] Keep terminal input, local scrollback, selection, tab switching, and window controls responsive while another session emits sustained output.
 - [ ] Validate normal, narrow, wide, maximized, minimized, mixed-DPI, and multi-monitor window behavior.
-- [ ] Verify that a normal launch creates a fresh session while detached sessions remain available through the switcher.
+- [x] Verify that a normal launch creates a fresh session while detached sessions remain available through the switcher.
 - [ ] Run an extended memory, handle, and process-leak soak with multiple active and detached sessions.
 
 ## 3. Establish repeatable Windows releases

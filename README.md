@@ -1,65 +1,27 @@
 ![Compi](assets/compi-readme.png)
 
-# Compi Milestone 3
+# Compi
 
-Compi pairs a native GPUI terminal window with a Windows daemon that owns persistent WSL2 Bash sessions. Closing the window detaches the client; reopening it reconnects to the same live shell and authoritative terminal state.
+Compi is a native Windows terminal for persistent WSL2 sessions. The window is a client, while a per-user daemon owns each shell and its terminal state. Closing Compi detaches the window without stopping the work inside it.
 
-## Requirements
+## Product
 
-- Windows 10 version 1809 or newer
-- WSL2 with a default distribution
-- Rust 1.89 or newer with the MSVC Windows target
-- Windows SDK build tools with `fxc.exe` on `PATH`, or `GPUI_FXC_PATH` set to its full path
+- **Persistent by default.** Reopen Compi and reconnect to live shells, scrollback, and screen state.
+- **Built for WSL2.** New sessions start in the Linux user's home directory in the default WSL2 distribution.
+- **Native Windows client.** GPUI renders the terminal, tabs, titlebar, selection, images, and window controls.
+- **Multiple independent sessions.** Create, detach, switch, and reconnect without adding an in-terminal multiplexer.
+- **Modern terminal behavior.** Unicode, ANSI styling, alternate screens, local scrollback, mouse input, bracketed paste, and Kitty graphics are part of the core terminal model.
 
-WSL1 is rejected. Sessions launch `/bin/bash -i` in the default WSL2 distribution without rewriting the environment or injecting shell startup code.
+## How it works
 
-## Run
-
-```powershell
-cargo build --release --bins
-target\release\compi.exe
+```text
+GPUI client  <->  per-user Compi daemon  <->  ConPTY  <->  WSL2 Bash
 ```
 
-The desktop client creates or reconnects to a session automatically. `Ctrl+T` opens a tab, `Ctrl+W` detaches the active tab, `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs, `Ctrl+Shift+C`/`Ctrl+Shift+V` copy and paste, and `Ctrl+Shift+P` opens the detached-session switcher.
+The daemon is the authority for session lifecycle and terminal state. The client can disappear and reconnect without becoming the owner of the shell process.
 
-The diagnostic probe remains available:
+## Status
 
-Session controls:
+Compi is a pre-release Windows application with the core persistent-terminal experience implemented and available for dogfooding. The remaining release path is installer and daemon supervision, lifecycle hardening, broader terminal compatibility, performance validation, and repeatable signed Windows releases.
 
-```powershell
-target\release\compi-probe.exe create
-target\release\compi-probe.exe list
-target\release\compi-probe.exe attach <session-id>
-target\release\compi-probe.exe inspect <session-id>
-target\release\compi-probe.exe kill <session-id>
-target\release\compi-probe.exe shutdown
-```
-
-The daemon uses a stable per-user named pipe secured to the current Windows SID. A second daemon instance for the same user is rejected. `--instance <name>` creates an isolated development daemon.
-
-## Current capabilities
-
-- Multiple live WSL2 Bash sessions with one controlling client per session
-- `vte` parsing owned exclusively by the daemon
-- Unicode, wide and combining cells, ANSI colors, text attributes, cursor state, and terminal title
-- Main and alternate screens, bracketed-paste state, editing operations, and scroll regions
-- Deterministic row-preserving resize behavior
-- Server-side scrollback capped at approximately 1 MiB
-- Kitty image transmit, chunking, zlib decompression, placement, deletion, and compositing state
-- Protocol-v2 snapshots and monotonically sequenced row deltas
-- Snapshot recovery when a client detects a missing delta
-- Terminal-generated status and cursor replies written back through ConPTY
-- Diagnostic JSON snapshots through `compi-probe inspect`
-- Daemon logs under `%LOCALAPPDATA%\Compi`
-
-The Milestone 3 GPUI client renders terminal cells, cursor state, ANSI styling, Kitty images, tabs, selection, clipboard, keyboard input, mouse reporting, local scrollback, reconnect states, and detached-session switching. Tabs share the custom Windows titlebar, and the executable embeds the Compi desktop icon.
-
-## Verification
-
-```powershell
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo build --release
-```
-
-The suite covers parser behavior, Unicode and ANSI state, editing operations, alternate screens, bounded scrollback, Kitty graphics, mirror equivalence, sequence-gap detection, snapshot recovery, representative shell and `top` behavior, multiple sessions, reconnects, resize, process exit, daemon shutdown, and slow-client backpressure.
+See [NEXT_STEPS.md](NEXT_STEPS.md) for the active roadmap.

@@ -23,6 +23,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
+const WSL_COMMAND_LINE: &str = "wsl.exe --cd ~ --exec /bin/bash -i";
+
 pub struct ConptySession {
     hpc: Option<HPCON>,
     process: OwnedHandle,
@@ -205,7 +207,7 @@ unsafe fn create_wsl_process(hpc: HPCON) -> Result<(OwnedHandle, OwnedHandle)> {
     startup.StartupInfo.hStdError = HANDLE::default();
     startup.lpAttributeList = attributes;
 
-    let mut command: Vec<u16> = OsStr::new("wsl.exe --exec /bin/bash -i")
+    let mut command: Vec<u16> = OsStr::new(WSL_COMMAND_LINE)
         .encode_wide()
         .chain(once(0))
         .collect();
@@ -260,4 +262,17 @@ unsafe fn terminate_and_wait(process: &OwnedHandle) {
     let process = HANDLE(process.as_raw_handle());
     let _ = unsafe { TerminateProcess(process, 1) };
     let _ = unsafe { WaitForSingleObject(process, 5_000) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starts_interactive_bash_in_wsl_home() {
+        assert_eq!(
+            WSL_COMMAND_LINE.split_whitespace().collect::<Vec<_>>(),
+            ["wsl.exe", "--cd", "~", "--exec", "/bin/bash", "-i"]
+        );
+    }
 }

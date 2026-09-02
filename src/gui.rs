@@ -10,7 +10,7 @@ use gpui::{
     App, Application, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
     EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, Hsla, KeyBinding,
     KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
+    Point, Render, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
     Subscription, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds,
     WindowControlArea, WindowOptions, actions, canvas, div, fill, font, point, prelude::*, px, rgb,
     size,
@@ -28,8 +28,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindowAsync};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows::Win32::UI::WindowsAndMessaging::{
+    HTCAPTION, PostMessageW, SW_RESTORE, ShowWindowAsync, WM_NCLBUTTONDOWN,
+};
 
 const DEFAULT_COLS: i16 = 100;
 const DEFAULT_ROWS: i16 = 30;
@@ -46,6 +49,7 @@ const SESSION_SWITCHER_WIDTH: f32 = 80.0;
 const TITLEBAR_DRAG_WIDTH: f32 = 48.0;
 const TITLEBAR_ACTIONS_WIDTH: f32 =
     TAB_NAV_WIDTH + NEW_TAB_WIDTH + SESSION_SWITCHER_WIDTH + TITLEBAR_DRAG_WIDTH;
+const TAB_DRAG_THRESHOLD: f32 = 4.0;
 const TERMINAL_PADDING: f32 = 8.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RECONNECT_DELAY: Duration = Duration::from_millis(350);
@@ -69,6 +73,7 @@ pub fn run() {
             KeyBinding::new("ctrl-tab", NextTab, Some("Terminal")),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("Terminal")),
             KeyBinding::new("ctrl-shift-c", CopySelection, Some("Terminal")),
+            KeyBinding::new("ctrl-v", PasteClipboard, Some("Terminal")),
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("Terminal")),
             KeyBinding::new("ctrl-shift-p", ToggleSessionSwitcher, Some("Terminal")),
         ]);
@@ -264,6 +269,7 @@ struct CompiApp {
     tabs: Vec<TerminalTab>,
     active_tab: Option<u64>,
     tab_scroll_handle: ScrollHandle,
+    tab_drag_origin: Option<Point<Pixels>>,
     next_tab_id: u64,
     sessions: Vec<SessionInfo>,
     switcher_open: bool,
@@ -290,6 +296,7 @@ impl CompiApp {
             tabs: Vec::new(),
             active_tab: None,
             tab_scroll_handle: ScrollHandle::new(),
+            tab_drag_origin: None,
             next_tab_id: 1,
             sessions: Vec::new(),
             switcher_open: false,
@@ -889,6 +896,45 @@ impl CompiApp {
         Some(GridPoint { row, col })
     }
 
+    fn begin_tab_drag(
+        &mut self,
+        tab_id: u64,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_tab = Some(tab_id);
+        self.reveal_tab(tab_id);
+        self.switcher_open = false;
+        self.tab_drag_origin = Some(event.position);
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn on_titlebar_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            self.tab_drag_origin = None;
+            return;
+        }
+        let Some(origin) = self.tab_drag_origin else {
+            return;
+        };
+        if drag_threshold_crossed(origin, event.position) {
+            self.tab_drag_origin = None;
+            start_native_window_move(window);
+            cx.stop_propagation();
+        }
+    }
+
+    fn end_tab_drag(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.tab_drag_origin = None;
+    }
+
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tabs = self.tabs.iter().map(|tab| {
             let id = tab.id;
@@ -917,13 +963,12 @@ impl CompiApp {
                     color(SURFACE)
                 })
                 .hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.active_tab = Some(id);
-                    this.reveal_tab(id);
-                    this.switcher_open = false;
-                    window.focus(&this.focus_handle);
-                    cx.notify();
-                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.begin_tab_drag(id, event, window, cx);
+                    }),
+                )
                 .child(div().size(px(6.0)).rounded_full().bg(status_color))
                 .child(
                     div()
@@ -948,6 +993,9 @@ impl CompiApp {
                                 .text_color(color(FOREGROUND))
                                 .cursor_pointer()
                         })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_tab_id(id);
                             cx.stop_propagation();
@@ -964,6 +1012,9 @@ impl CompiApp {
             .bg(color(BACKGROUND))
             .border_b_1()
             .border_color(color(BORDER))
+            .on_mouse_move(cx.listener(Self::on_titlebar_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::end_tab_drag))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_tab_drag))
             .child(
                 div()
                     .absolute()
@@ -1360,10 +1411,35 @@ fn window_control(
         .on_click(move |_, window, _| match area {
             WindowControlArea::Min => window.minimize_window(),
             WindowControlArea::Max => toggle_window_maximized(window),
+
             WindowControlArea::Close => window.remove_window(),
             WindowControlArea::Drag => {}
         })
         .child(label)
+}
+fn drag_threshold_crossed(origin: Point<Pixels>, current: Point<Pixels>) -> bool {
+    let dx = f32::from(current.x - origin.x);
+    let dy = f32::from(current.y - origin.y);
+    dx * dx + dy * dy >= TAB_DRAG_THRESHOLD * TAB_DRAG_THRESHOLD
+}
+
+fn start_native_window_move(window: &Window) {
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_NCLBUTTONDOWN,
+            WPARAM(HTCAPTION as usize),
+            LPARAM(0),
+        );
+    }
 }
 
 fn toggle_window_maximized(window: &Window) {
@@ -2038,7 +2114,7 @@ fn is_application_shortcut(keystroke: &Keystroke) -> bool {
     }
     matches!(
         (keystroke.modifiers.shift, keystroke.key.as_str()),
-        (false, "t" | "w" | "tab") | (true, "tab" | "c" | "v" | "p")
+        (false, "t" | "v" | "w" | "tab") | (true, "tab" | "c" | "v" | "p")
     )
 }
 
@@ -2346,6 +2422,32 @@ mod tests {
         };
         assert_eq!(encode_keystroke(&up, false), Some(b"\x1b[A".to_vec()));
         assert_eq!(encode_keystroke(&up, true), Some(b"\x1bOA".to_vec()));
+    }
+
+    #[test]
+    fn reserves_paste_shortcuts_without_stealing_ctrl_c() {
+        let shortcut = |key: &str, shift: bool| Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                shift,
+                ..Default::default()
+            },
+            key: key.into(),
+            key_char: None,
+        };
+
+        assert!(is_application_shortcut(&shortcut("v", false)));
+        assert!(is_application_shortcut(&shortcut("v", true)));
+        assert!(!is_application_shortcut(&shortcut("c", false)));
+        assert!(is_application_shortcut(&shortcut("c", true)));
+    }
+
+    #[test]
+    fn starts_tab_drag_only_after_crossing_threshold() {
+        let origin = point(px(10.0), px(10.0));
+
+        assert!(!drag_threshold_crossed(origin, point(px(12.0), px(12.0))));
+        assert!(drag_threshold_crossed(origin, point(px(14.0), px(10.0))));
     }
 
     #[test]
