@@ -61,9 +61,37 @@ Current measured baseline on 2026-09-02:
 - The release GUI used roughly 98–100 MB private bytes and 63–64 MB working set under the sampled workload. The initial 35 MB private-byte target is not met; GPUI/platform baseline measurement is still required.
 - The flood regression now proves that a controlling client stays attached, sends `Ctrl+C`, recovers a dropped-delta gap from a snapshot, and receives a clean prompt marker after three seconds of unbounded output.
 
-Detailed evidence and remaining manual checks: [`ACCEPTANCE_RESULTS_2026-09-02.md`](ACCEPTANCE_RESULTS_2026-09-02.md).
+|Detailed evidence and remaining manual checks: [`ACCEPTANCE_RESULTS_2026-09-02.md`](ACCEPTANCE_RESULTS_2026-09-02.md).
 
-## 3. Establish repeatable Windows releases
+## 3. Server architecture: cross-platform and memory
+
+The daemon is currently a Windows-only sidecar to the GPUI client — ConPTY spawns `wsl.exe`, named pipes for IPC, WSL assumed as the only process target. To match Superlogical's server design (run anywhere, serve terminals at agent scale), the daemon needs to become a standalone multiplexer that happens to have a GPUI client, not a GPUI app that happens to have a daemon.
+
+### PTY abstraction
+
+- [ ] Define a `PtySession` trait with `spawn`, `read`, `write`, `resize`, `wait` operations. Move the existing `ConPTY` code behind a Windows impl.
+- [ ] Add a `PosixPty` daemon impl using `openpty` + `fork`/`exec` on Linux and macOS. The daemon ships zero window-system dependencies.
+- [ ] Agent sessions spawn a native host process (fork/exec or posix_spawn with PTY), not `wsl.exe`. The `wsl.exe --cd ~ --exec /bin/bash -i` sequence becomes a human-session default, not the daemon's only mode.
+
+### Unix IPC alongside Windows named pipes
+
+- [ ] Abstract IPC behind a `Listener`/`Stream` pair. Windows uses the existing `CreateNamedPipeW` path; Unix uses Unix-domain sockets with `SO_PEERCRED` auth.
+- [ ] Same framing protocol, no version change. The daemon announces its transport (e.g. `\\\\.\\pipe\\` vs `unix://`), client connects transparently.
+
+### Three-level parking (core memory architecture)
+
+These reclaim the biggest Compi memory gap (~95 MB private bytes for one active session) and enable agent-scale terminal counts.
+
+- [ ] **Terminal parking:** 60 seconds of idle PTY read → bincode-serialize + flate2-compress `ScreenState` to disk, free the in-memory copy. Monitor FD; on next output, stream from disk and rehydrate. Target cost: ~400 KB per parked terminal.
+- [ ] **Scrollback compression in memory:** Compress scrollback rows with flate2 (already a dependency for Kitty). This alone reclaims the bulk of the 95 MB private-byte gap.
+- [ ] **PTY thread parking:** When terminal is parked or has no attached client, move its FD from the dedicated `std::thread` to a shared poll thread (IOCP on Windows, epoll on Linux). Tear down the per-PTY OS thread (each ~1-2 MB stack).
+- [ ] **Client buffer parking:** Detach or client-idle frees the `SyncSender<Outgoing>` writer thread and output queue. Reallocate on next attach.
+
+### Blank GPUI baseline
+
+- [ ] Measure `compi.exe` private bytes with zero terminal sessions (just an empty window) so GPUI/D3D framework cost is separated from terminal state cost. Do this before tuning memory targets.
+
+## 4. Establish repeatable Windows releases
 
 - [ ] Add Windows CI for formatting, tests, strict Clippy, and release builds.
 - [ ] Provision the Windows SDK shader compiler in CI or document a reproducible `GPUI_FXC_PATH` configuration.
@@ -73,7 +101,7 @@ Detailed evidence and remaining manual checks: [`ACCEPTANCE_RESULTS_2026-09-02.m
 - [ ] Publish checksums and concise install, upgrade, uninstall, and troubleshooting instructions.
 - [ ] Verify release artifacts on supported clean Windows 10 and Windows 11 environments with WSL2.
 
-## 4. Milestone 4: agent sessions
+## 5. Milestone 4: agent sessions
 
 Start this only after the P0 installer, supervision, compatibility, and release gates above pass.
 
