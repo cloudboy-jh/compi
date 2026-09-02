@@ -16,7 +16,7 @@ fn main() {
         }
     };
 
-    if let Err(error) = compi_probe::daemon::run(instance.as_deref()) {
+    if let Err(error) = compi::daemon::run(instance.as_deref()) {
         eprintln!("compi-daemon: {error}");
         std::process::exit(1);
     }

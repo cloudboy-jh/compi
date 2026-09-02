@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -148,7 +148,7 @@ mod tests {
         };
         let json = String::from_utf8(encode_server(&message).unwrap()).unwrap();
 
-        assert!(json.contains("\"protocol_version\":3"));
+        assert!(json.contains("\"protocol_version\":4"));
         assert_eq!(decode_server(json.as_bytes()).unwrap(), message);
     }
 }

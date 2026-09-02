@@ -30,11 +30,9 @@ fn parse_default_wsl_version(output: &[u8]) -> Option<u32> {
 }
 
 fn decode_wsl_output(output: &[u8]) -> String {
-    if output.len() >= 2 && output.chunks_exact(2).any(|pair| pair[1] == 0) {
-        let words: Vec<u16> = output
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+    let (pairs, _) = output.as_chunks::<2>();
+    if output.len() >= 2 && pairs.iter().any(|pair| pair[1] == 0) {
+        let words: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         String::from_utf16_lossy(&words)
     } else {
         String::from_utf8_lossy(output).into_owned()

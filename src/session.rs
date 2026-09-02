@@ -12,7 +12,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -23,6 +23,7 @@ use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_T
 
 const TRANSPORT_CHUNK: usize = 32 * 1024;
 const CLIENT_QUEUE_FRAMES: usize = 256;
+const CLIENT_SCREEN_QUEUE_FRAMES: usize = 32;
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -63,6 +64,7 @@ pub struct ConnectionSink {
     connection: Arc<File>,
     sender: SyncSender<Outgoing>,
     alive: Arc<AtomicBool>,
+    queued_frames: Arc<AtomicUsize>,
     writer_thread: Arc<OwnedHandle>,
 }
 
@@ -378,7 +380,7 @@ impl Session {
             state.client = None;
             return Err(SessionError::Internal(error.to_string()));
         }
-        if let Err(error) = sink.send_screen(&ScreenMessage::Snapshot { snapshot }) {
+        if let Err(error) = sink.send_screen_recovery(&ScreenMessage::Snapshot { snapshot }) {
             state.client = None;
             return Err(SessionError::Internal(error.to_string()));
         }
@@ -438,7 +440,7 @@ impl Session {
                 sequence: snapshot.sequence,
             },
         })
-        .and_then(|_| sink.send_screen(&ScreenMessage::Snapshot { snapshot }))
+        .and_then(|_| sink.send_screen_recovery(&ScreenMessage::Snapshot { snapshot }))
         .map_err(|error| SessionError::Internal(error.to_string()))
     }
 
@@ -548,6 +550,8 @@ impl ConnectionSink {
         let alive = Arc::new(AtomicBool::new(true));
         let writer_connection = connection.clone();
         let writer_alive = alive.clone();
+        let queued_frames = Arc::new(AtomicUsize::new(0));
+        let writer_queued_frames = queued_frames.clone();
         thread::spawn(move || {
             let thread_handle = unsafe {
                 OpenThread(THREAD_TERMINATE, false, GetCurrentThreadId())
@@ -560,6 +564,7 @@ impl ConnectionSink {
 
             let result = (|| -> Result<()> {
                 while let Ok(message) = receiver.recv() {
+                    writer_queued_frames.fetch_sub(1, Ordering::AcqRel);
                     let mut writer = &*writer_connection;
                     let write_result = frame::write(&mut writer, message.kind, &message.payload);
                     if let Some(acknowledgement) = message.acknowledgement {
@@ -588,6 +593,7 @@ impl ConnectionSink {
             connection,
             sender,
             alive,
+            queued_frames,
             writer_thread: Arc::new(writer_thread),
         })
     }
@@ -615,7 +621,15 @@ impl ConnectionSink {
             .map_err(Into::into)
     }
 
-    pub fn send_screen(&self, message: &ScreenMessage) -> Result<()> {
+    pub fn send_screen(&self, message: &ScreenMessage) -> Result<bool> {
+        if self.queued_frames.load(Ordering::Acquire) >= CLIENT_SCREEN_QUEUE_FRAMES {
+            return Ok(false);
+        }
+        let payload = encode_screen(message)?;
+        self.send(SCREEN_FRAME, &payload).map(|_| true)
+    }
+
+    fn send_screen_recovery(&self, message: &ScreenMessage) -> Result<()> {
         let payload = encode_screen(message)?;
         self.send(SCREEN_FRAME, &payload)
     }
@@ -642,13 +656,16 @@ impl ConnectionSink {
         if !self.is_alive() {
             return Err("client connection is closed".into());
         }
+        self.queued_frames.fetch_add(1, Ordering::AcqRel);
         match self.sender.try_send(outgoing) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
+                self.queued_frames.fetch_sub(1, Ordering::AcqRel);
                 self.disconnect();
                 Err("client output queue is full".into())
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.queued_frames.fetch_sub(1, Ordering::AcqRel);
                 self.alive.store(false, Ordering::Release);
                 Err("client writer stopped".into())
             }

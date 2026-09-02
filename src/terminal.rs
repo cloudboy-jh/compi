@@ -1,6 +1,7 @@
 use base64::Engine;
 use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::Read;
@@ -34,7 +35,7 @@ pub struct TextAttributes {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Cell {
-    pub text: String,
+    pub text: SmolStr,
     pub width: u8,
     pub foreground: Color,
     pub background: Color,
@@ -155,19 +156,15 @@ pub struct ScreenDelta {
     pub cols: u16,
     pub rows: u16,
     pub row_updates: Vec<RowUpdate>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub scrollback: Option<Vec<Row>>,
     pub cursor: CursorState,
     pub modes: TerminalModes,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<KittyImage>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub placements: Option<Vec<KittyPlacement>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScreenMessage {
     Snapshot { snapshot: ScreenSnapshot },
     Delta { delta: ScreenDelta },
@@ -583,7 +580,7 @@ impl TerminalState {
         let row = usize::from(self.cursor.row).min(self.rows() - 1);
         let col = usize::from(self.cursor.col).min(cols - 1);
         let cell = Cell {
-            text: character.to_string(),
+            text: SmolStr::new(character.to_string()),
             width: width as u8,
             foreground: self.rendition.foreground,
             background: self.rendition.background,
@@ -592,7 +589,7 @@ impl TerminalState {
         self.buffer_mut().rows[row].cells[col] = cell;
         if width == 2 {
             let mut continuation = self.blank_cell();
-            continuation.text.clear();
+            continuation.text = SmolStr::new_static("");
             continuation.width = 0;
             self.buffer_mut().rows[row].cells[col + 1] = continuation;
         }
@@ -612,7 +609,10 @@ impl TerminalState {
         while col > 0 && self.buffer().rows[row].cells[col].width == 0 {
             col -= 1;
         }
-        self.buffer_mut().rows[row].cells[col].text.push(character);
+        let cell = &mut self.buffer_mut().rows[row].cells[col];
+        let mut text = cell.text.to_string();
+        text.push(character);
+        cell.text = text.into();
     }
 
     fn linefeed(&mut self, wrapped: bool) {
@@ -1368,12 +1368,13 @@ fn repair_wide_cells(row: &mut Row) {
     }
 }
 
-pub fn encode_screen(message: &ScreenMessage) -> serde_json::Result<Vec<u8>> {
-    serde_json::to_vec(message)
+pub fn encode_screen(message: &ScreenMessage) -> Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(message, bincode::config::standard())
 }
 
-pub fn decode_screen(payload: &[u8]) -> serde_json::Result<ScreenMessage> {
-    serde_json::from_slice(payload)
+pub fn decode_screen(payload: &[u8]) -> Result<ScreenMessage, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map(|(message, _)| message)
 }
 
 #[cfg(test)]
@@ -1551,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_messages_round_trip_as_json() {
+    fn screen_messages_round_trip_as_binary() {
         let message = ScreenMessage::Snapshot {
             snapshot: TerminalState::new(4, 2).snapshot(),
         };

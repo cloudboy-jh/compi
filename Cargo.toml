@@ -1,10 +1,12 @@
 [package]
-name = "compi-probe"
+name = "compi"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [dependencies]
+async-channel = "2.5"
+bincode = { version = "2.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
@@ -14,6 +16,7 @@ vte = "0.15"
 gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 smallvec = "1.15"
+smol_str = { version = "0.3", features = ["serde"] }
 raw-window-handle = "0.6"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
@@ -27,6 +30,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

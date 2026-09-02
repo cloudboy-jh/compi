@@ -1,14 +1,14 @@
 #![cfg(windows)]
 
-use compi_probe::client::{DaemonClient, ServerEvent};
-use compi_probe::frame;
-use compi_probe::identity;
-use compi_probe::pipe;
-use compi_probe::protocol::{
+use compi::client::{DaemonClient, ServerEvent};
+use compi::frame;
+use compi::identity;
+use compi::pipe;
+use compi::protocol::{
     CONTROL_FRAME, ClientControl, ClientMessage, ErrorCode, ServerMessage, SessionStatus,
     decode_server, encode_client,
 };
-use compi_probe::terminal::{Color, MirrorApply, ScreenMessage, ScreenMirror, ScreenSnapshot};
+use compi::terminal::{Color, MirrorApply, ScreenMessage, ScreenMirror, ScreenSnapshot};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -225,12 +225,40 @@ fn persistent_multi_session_lifecycle() {
 
     after_crash
         .request(ClientMessage::Input {
-            data: b"yes X | head -c 12000000\r".to_vec(),
+            data: b"yes COMPI_FLOOD\r".to_vec(),
         })
         .unwrap();
     thread::sleep(Duration::from_secs(3));
-    control.kill_session(second.id.clone()).unwrap();
-    wait_for_status(&mut control, &second.id, SessionStatus::Exited);
+    assert!(
+        control
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .find(|session| session.id == second.id)
+            .is_some_and(|session| session.attached),
+        "output backpressure disconnected the attached client"
+    );
+    after_crash
+        .request(ClientMessage::Input { data: vec![3] })
+        .unwrap();
+    after_crash
+        .request(ClientMessage::Input {
+            data: b"echo FLOOD_INTERRUPTED\r".to_vec(),
+        })
+        .unwrap();
+    let flood_output = collect_until_marker(&mut after_crash, b"FLOOD_INTERRUPTED");
+    assert!(
+        flood_output
+            .windows(17)
+            .any(|bytes| bytes == b"FLOOD_INTERRUPTED")
+    );
+    after_crash
+        .request(ClientMessage::Input {
+            data: b"exit\r".to_vec(),
+        })
+        .unwrap();
+    let (_, flood_exit) = collect_until_exit(&mut after_crash, &second.id);
+    assert_eq!(flood_exit, 0);
     drop(after_crash);
 
     let sessions = control.list_sessions().unwrap();
@@ -365,24 +393,4 @@ fn snapshot_text(snapshot: &ScreenSnapshot) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn wait_for_status(client: &mut DaemonClient, session_id: &str, expected: SessionStatus) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let session = client
-            .list_sessions()
-            .unwrap()
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .unwrap();
-        if session.status == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "session did not reach {expected:?}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
 }

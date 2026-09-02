@@ -1,6 +1,6 @@
 # Compi next steps
 
-Compi currently implements the persistent WSL2 session daemon, authoritative terminal state, protocol-v2 transport, and usable GPUI client described by Milestones 0–3. The remaining work below closes the unfinished P0 release requirements before Milestone 4 begins.
+Compi currently implements the persistent WSL2 session daemon, authoritative terminal state, protocol-v4 transport, and usable GPUI client described by Milestones 0–3. The remaining work below closes the unfinished P0 release requirements before Milestone 4 begins.
 
 ## Completed product baseline
 
@@ -11,6 +11,10 @@ Compi currently implements the persistent WSL2 session daemon, authoritative ter
 - [x] Support terminal-safe copy and paste, including `Ctrl+V`, `Ctrl+Shift+V`, and uninterrupted `Ctrl+C`.
 - [x] Start new sessions in the Linux user's home directory without injecting shell startup commands.
 - [x] Pass the full Rust regression suite, release build, and end-to-end persistence acceptance checks.
+- [x] Ship only `compi.exe` and `compi-daemon.exe` in normal product builds; retain the diagnostic probe as an explicitly built example.
+- [x] Use compact binary screen frames, inline cell text, bounded screen backpressure, visible-row paint models, cached row shaping, and background Kitty image decoding.
+- [x] Wake the GPUI client from terminal events and cap event application to a display-paced UI budget instead of repainting from a fixed polling loop.
+- [x] Provide a tiered terminal acceptance matrix in `docs/testcmds.md`.
 
 ## 1. Finish Milestone 3 and P0
 
@@ -42,19 +46,29 @@ Compi currently implements the persistent WSL2 session daemon, authoritative ter
 
 ## 2. Meet the release feel bar
 
-- [ ] Measure cold and warm GUI launch-to-first-shell times using the existing startup instrumentation.
-- [ ] Measure detached-session reattach time and identify any synchronous work on the GPUI render/input path.
-- [ ] Keep terminal input, local scrollback, selection, tab switching, and window controls responsive while another session emits sustained output.
+- [x] Measure cold and warm GUI launch-to-first-shell times using the startup instrumentation.
+- [x] Measure detached-session reattach time and identify synchronous work on the GPUI render/input path.
+- [ ] Keep terminal input, local scrollback, selection, tab switching, and window controls responsive while another session emits sustained output. Protocol-level flood interruption and recovery pass; the full interactive GUI soak remains open.
 - [ ] Validate normal, narrow, wide, maximized, minimized, mixed-DPI, and multi-monitor window behavior.
 - [x] Verify that a normal launch creates a fresh session while detached sessions remain available through the switcher.
 - [ ] Run an extended memory, handle, and process-leak soak with multiple active and detached sessions.
+
+Current measured baseline on 2026-09-02:
+
+- Six release-mode warm launches reached the first window frame in 344–409 ms (median 358 ms) and the first terminal frame in 381–467 ms (median 400 ms). The sub-200 ms interaction target is not met.
+- Under sustained output on the Meta Virtual Monitor, terminal paint p50 was 229–234 µs and p95 was 453–458 µs. Observed frame-interval p50 was about 28.1 ms and p95 about 35.5 ms; repeat on the physical 120 Hz display before judging the 8,333 µs target.
+- The release GUI executable is 12.0 MB and the daemon is 991 KB.
+- The release GUI used roughly 98–100 MB private bytes and 63–64 MB working set under the sampled workload. The initial 35 MB private-byte target is not met; GPUI/platform baseline measurement is still required.
+- The flood regression now proves that a controlling client stays attached, sends `Ctrl+C`, recovers a dropped-delta gap from a snapshot, and receives a clean prompt marker after three seconds of unbounded output.
+
+Detailed evidence and remaining manual checks: [`ACCEPTANCE_RESULTS_2026-09-02.md`](ACCEPTANCE_RESULTS_2026-09-02.md).
 
 ## 3. Establish repeatable Windows releases
 
 - [ ] Add Windows CI for formatting, tests, strict Clippy, and release builds.
 - [ ] Provision the Windows SDK shader compiler in CI or document a reproducible `GPUI_FXC_PATH` configuration.
 - [ ] Produce versioned installer and portable artifacts from a tagged build.
-- [ ] Embed version metadata consistently in the GUI, daemon, probe, and installer.
+- [ ] Embed version metadata consistently in the GUI, daemon, and installer.
 - [ ] Sign release binaries and the installer before distribution.
 - [ ] Publish checksums and concise install, upgrade, uninstall, and troubleshooting instructions.
 - [ ] Verify release artifacts on supported clean Windows 10 and Windows 11 environments with WSL2.
@@ -86,4 +100,4 @@ Start this only after the P0 installer, supervision, compatibility, and release 
 
 ## Deferred beyond Milestone 4
 
-These remain intentionally outside the immediate plan: daemon/reboot survival of running processes, remote or Linux daemon mode, macOS client support, multi-viewer broadcast, split layouts, binary cell-stream optimization, ligatures and animation polish, persisted scrollback across daemon restart, preferences UI, forced themes, Windows-path translation, Sixel, default-terminal registration, and embedded multi-agent orchestration.
+These remain intentionally outside the immediate plan: daemon/reboot survival of running processes, remote or Linux daemon mode, macOS client support, multi-viewer broadcast, split layouts, ligatures and animation polish, persisted scrollback across daemon restart, preferences UI, forced themes, Windows-path translation, Sixel, default-terminal registration, and embedded multi-agent orchestration.

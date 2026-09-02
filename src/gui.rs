@@ -2,33 +2,38 @@ use crate::app;
 use crate::client::{DaemonClient, ServerEvent};
 use crate::protocol::{ClientMessage, ServerMessage, SessionInfo, SessionStatus};
 use crate::terminal::{
-    Cell, Color, CursorShape, KittyImage, KittyPlacement, MirrorApply, MouseMode, Row,
+    Cell, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MirrorApply, MouseMode, Row,
     ScreenMessage, ScreenMirror, ScreenSnapshot,
 };
 use base64::Engine as _;
 use gpui::{
     App, Application, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
     EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, Hsla, KeyBinding,
-    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
-    Subscription, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, canvas, div, fill, font, point, prelude::*, px, rgb,
-    size,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, Render, RenderImage, ScrollHandle, ScrollWheelEvent, ShapedLine,
+    SharedString, StrikethroughStyle, Subscription, TextRun, TitlebarOptions, UTF16Selection,
+    UnderlineStyle, Window, WindowBounds, WindowControlArea, WindowOptions, actions, canvas, div,
+    fill, font, point, prelude::*, px, rgb, size,
 };
 use image::{Frame as ImageFrame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use smallvec::smallvec;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Sender, TryRecvError};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::ProcessStatus::{
+    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, PostMessageW, SW_RESTORE, ShowWindowAsync, WM_NCLBUTTONDOWN,
@@ -38,33 +43,31 @@ const DEFAULT_COLS: i16 = 100;
 const DEFAULT_ROWS: i16 = 30;
 const CELL_WIDTH: f32 = 8.45;
 const CELL_HEIGHT: f32 = 18.0;
-const CHROME_HEIGHT: f32 = 42.0;
-const TAB_WIDTH: f32 = 210.0;
-const TAB_SCROLL_STEP: f32 = TAB_WIDTH;
+const CHROME_HEIGHT: f32 = 40.0;
+const TAB_WIDTH: f32 = 176.0;
 const WINDOW_CONTROLS_WIDTH: f32 = 138.0;
-const TITLEBAR_BRAND_WIDTH: f32 = 48.0;
-const TAB_NAV_WIDTH: f32 = 56.0;
-const NEW_TAB_WIDTH: f32 = 42.0;
-const SESSION_SWITCHER_WIDTH: f32 = 80.0;
-const TITLEBAR_DRAG_WIDTH: f32 = 48.0;
-const TITLEBAR_ACTIONS_WIDTH: f32 =
-    TAB_NAV_WIDTH + NEW_TAB_WIDTH + SESSION_SWITCHER_WIDTH + TITLEBAR_DRAG_WIDTH;
+const TITLEBAR_BRAND_WIDTH: f32 = 40.0;
+const NEW_TAB_WIDTH: f32 = 40.0;
+const SESSION_SWITCHER_WIDTH: f32 = 40.0;
+const TITLEBAR_DRAG_WIDTH: f32 = 16.0;
+const TITLEBAR_ACTIONS_WIDTH: f32 = NEW_TAB_WIDTH + SESSION_SWITCHER_WIDTH + TITLEBAR_DRAG_WIDTH;
 const TAB_DRAG_THRESHOLD: f32 = 4.0;
 const TERMINAL_PADDING: f32 = 8.0;
-const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const RECONNECT_DELAY: Duration = Duration::from_millis(350);
+const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
+const UI_EVENT_YIELD: Duration = Duration::from_micros(8_333);
 
-const BACKGROUND: u32 = 0x171614;
-const SURFACE: u32 = 0x211f1c;
-const SURFACE_HOVER: u32 = 0x2b2824;
-const BORDER: u32 = 0x3a3630;
-const FOREGROUND: u32 = 0xd8d2c7;
-const MUTED: u32 = 0x928b80;
-const ACCENT: u32 = 0xd19a66;
+const BACKGROUND: u32 = 0x171613;
+const SURFACE: u32 = 0x211f1a;
+const SURFACE_HOVER: u32 = 0x2b2922;
+const BORDER: u32 = 0x403c31;
+const FOREGROUND: u32 = 0xf4f1e8;
+const MUTED: u32 = 0xaaa394;
+const ACCENT: u32 = 0xdffb35;
 const ERROR: u32 = 0xe06c75;
-const SELECTION: u32 = 0x5b4634;
+const SELECTION: u32 = 0x4b5420;
 
-pub fn run() {
+pub fn run(instance: Option<String>) {
     let started_at = Instant::now();
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -91,7 +94,7 @@ pub fn run() {
                     focus: true,
                     ..Default::default()
                 },
-                move |window, cx| cx.new(|cx| CompiApp::new(started_at, window, cx)),
+                move |window, cx| cx.new(|cx| CompiApp::new(started_at, instance, window, cx)),
             )
             .expect("failed to open Compi window");
 
@@ -180,6 +183,8 @@ struct TerminalTab {
     selection: Option<Selection>,
     selecting: bool,
     image_cache: HashMap<u32, (String, Arc<RenderImage>)>,
+    image_pending: HashMap<u32, String>,
+    row_render_cache: Arc<Mutex<RowRenderCache>>,
     cols: i16,
     rows: i16,
 }
@@ -204,29 +209,44 @@ impl TerminalTab {
         }
     }
 
-    fn refresh_images(&mut self) {
+    fn refresh_images(&mut self, tab_id: u64, sender: UiEventSender) {
         let Some(snapshot) = self.mirror.snapshot() else {
             self.image_cache.clear();
+            self.image_pending.clear();
             return;
         };
-        let active_ids: Vec<u32> = snapshot.images.iter().map(|image| image.id).collect();
+        let images = snapshot.images.clone();
+        let active_ids: Vec<u32> = images.iter().map(|image| image.id).collect();
         self.image_cache
             .retain(|image_id, _| active_ids.contains(image_id));
-        for image in &snapshot.images {
-            let unchanged = self
+        self.image_pending
+            .retain(|image_id, _| active_ids.contains(image_id));
+        for image in images {
+            let cached = self
                 .image_cache
                 .get(&image.id)
                 .is_some_and(|(data, _)| data == &image.data);
-            if unchanged {
+            let pending = self
+                .image_pending
+                .get(&image.id)
+                .is_some_and(|data| data == &image.data);
+            if cached || pending {
                 continue;
             }
-            match decode_kitty_image(image) {
-                Ok(render_image) => {
-                    self.image_cache
-                        .insert(image.id, (image.data.clone(), render_image));
+            self.image_pending.insert(image.id, image.data.clone());
+            let data = image.data.clone();
+            thread::spawn({
+                let sender = sender.clone();
+                move || {
+                    let result = decode_kitty_image(&image);
+                    let _ = sender.send(UiEvent::KittyImageDecoded {
+                        tab_id,
+                        image_id: image.id,
+                        data,
+                        result,
+                    });
                 }
-                Err(error) => self.error = Some(format!("Kitty image {}: {error}", image.id)),
-            }
+            });
         }
     }
 
@@ -249,6 +269,12 @@ enum UiEvent {
         tab_id: u64,
         message: ScreenMessage,
     },
+    KittyImageDecoded {
+        tab_id: u64,
+        image_id: u32,
+        data: String,
+        result: Result<Arc<RenderImage>, String>,
+    },
     TabControl {
         tab_id: u64,
         message: ServerMessage,
@@ -258,10 +284,20 @@ enum UiEvent {
         error: String,
     },
 }
+#[derive(Clone)]
+struct UiEventSender(async_channel::Sender<UiEvent>);
+
+impl UiEventSender {
+    fn send(&self, event: UiEvent) -> bool {
+        self.0.send_blocking(event).is_ok()
+    }
+}
 
 struct CompiApp {
     started_at: Instant,
+    instance: Option<String>,
     first_snapshot_logged: bool,
+    window_title: String,
     focus_handle: FocusHandle,
     ime_text: String,
     ime_marked_range: Option<Range<usize>>,
@@ -276,19 +312,26 @@ struct CompiApp {
     loading_sessions: bool,
     attach_after_session_list: bool,
     global_error: Option<String>,
-    event_tx: Sender<UiEvent>,
-    event_rx: Receiver<UiEvent>,
+    event_tx: UiEventSender,
     subscriptions: Vec<Subscription>,
     terminal_cols: i16,
     terminal_rows: i16,
 }
 
 impl CompiApp {
-    fn new(started_at: Instant, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (event_tx, event_rx) = mpsc::channel();
+    fn new(
+        started_at: Instant,
+        instance: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let event_tx = UiEventSender(event_tx);
         let mut this = Self {
             started_at,
+            instance,
             first_snapshot_logged: false,
+            window_title: String::from("Compi"),
             focus_handle: cx.focus_handle(),
             ime_text: String::new(),
             ime_marked_range: None,
@@ -304,7 +347,6 @@ impl CompiApp {
             attach_after_session_list: false,
             global_error: None,
             event_tx,
-            event_rx,
             subscriptions: Vec::new(),
             terminal_cols: DEFAULT_COLS,
             terminal_rows: DEFAULT_ROWS,
@@ -322,21 +364,30 @@ impl CompiApp {
                 this.report_focus(window.is_window_active());
                 cx.notify();
             }));
+        let first_frame_started_at = started_at;
+        window.on_next_frame(move |_, _| {
+            log_startup_metric("first_window_frame_ms", first_frame_started_at.elapsed());
+        });
 
-        let timer = cx.background_executor().clone();
         cx.spawn(async move |weak, cx| {
-            loop {
-                timer.timer(POLL_INTERVAL).await;
+            while let Ok(first) = event_rx.recv().await {
+                let batch_started_at = Instant::now();
                 if weak
                     .update(cx, |this, cx| {
-                        if this.drain_events() {
-                            cx.notify();
+                        this.handle_event(first);
+                        while batch_started_at.elapsed() < UI_EVENT_BUDGET {
+                            let Ok(event) = event_rx.try_recv() else {
+                                break;
+                            };
+                            this.handle_event(event);
                         }
+                        cx.notify();
                     })
                     .is_err()
                 {
                     break;
                 }
+                cx.background_executor().timer(UI_EVENT_YIELD).await;
             }
         })
         .detach();
@@ -348,8 +399,9 @@ impl CompiApp {
         self.loading_sessions = true;
         self.attach_after_session_list |= attach_initial;
         let sender = self.event_tx.clone();
+        let instance = self.instance.clone();
         thread::spawn(move || {
-            let result = app::connect_or_start(None)
+            let result = app::connect_or_start(instance.as_deref())
                 .and_then(|mut client| client.list_sessions())
                 .map_err(|error| error.to_string());
             let _ = sender.send(UiEvent::SessionsLoaded(result));
@@ -360,8 +412,9 @@ impl CompiApp {
         let sender = self.event_tx.clone();
         let cols = self.terminal_cols;
         let rows = self.terminal_rows;
+        let instance = self.instance.clone();
         thread::spawn(move || {
-            let result = app::connect_or_start(None)
+            let result = app::connect_or_start(instance.as_deref())
                 .and_then(|mut client| client.create_session(cols, rows))
                 .map_err(|error| error.to_string());
             let _ = sender.send(UiEvent::SessionCreated(result));
@@ -396,7 +449,9 @@ impl CompiApp {
             selection: None,
             selecting: false,
             image_cache: HashMap::new(),
+            image_pending: HashMap::new(),
             cols: self.terminal_cols,
+            row_render_cache: Arc::new(Mutex::new(RowRenderCache::default())),
             rows: self.terminal_rows,
         });
         self.active_tab = Some(tab_id);
@@ -408,28 +463,8 @@ impl CompiApp {
             self.terminal_cols,
             self.terminal_rows,
             self.event_tx.clone(),
+            self.instance.clone(),
         );
-    }
-
-    fn drain_events(&mut self) -> bool {
-        let mut changed = false;
-        loop {
-            match self.event_rx.try_recv() {
-                Ok(event) => {
-                    changed = true;
-                    self.handle_event(event);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if self.global_error.is_none() {
-                        self.global_error = Some("internal UI event channel disconnected".into());
-                        changed = true;
-                    }
-                    break;
-                }
-            }
-        }
-        changed
     }
 
     fn handle_event(&mut self, event: UiEvent) {
@@ -474,11 +509,12 @@ impl CompiApp {
             }
             UiEvent::TabScreen { tab_id, message } => {
                 let mut request_snapshot = false;
+                let sender = self.event_tx.clone();
                 if let Some(tab) = self.tab_mut(tab_id) {
                     request_snapshot = matches!(tab.mirror.apply(message), MirrorApply::Gap { .. });
                     if !request_snapshot {
                         tab.state = ConnectionState::Attached;
-                        tab.refresh_images();
+                        tab.refresh_images(tab_id, sender);
                     }
                 }
                 if request_snapshot {
@@ -487,7 +523,25 @@ impl CompiApp {
                     }
                 } else if !self.first_snapshot_logged {
                     self.first_snapshot_logged = true;
-                    log_startup_metric(self.started_at.elapsed());
+                    log_startup_metric("first_terminal_frame_ms", self.started_at.elapsed());
+                }
+            }
+            UiEvent::KittyImageDecoded {
+                tab_id,
+                image_id,
+                data,
+                result,
+            } => {
+                if let Some(tab) = self.tab_mut(tab_id)
+                    && tab.image_pending.get(&image_id) == Some(&data)
+                {
+                    tab.image_pending.remove(&image_id);
+                    match result {
+                        Ok(image) => {
+                            tab.image_cache.insert(image_id, (data, image));
+                        }
+                        Err(error) => tab.error = Some(format!("Kitty image {image_id}: {error}")),
+                    }
                 }
             }
             UiEvent::TabControl { tab_id, message } => match message {
@@ -628,14 +682,6 @@ impl CompiApp {
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
             self.tab_scroll_handle.scroll_to_item(index);
         }
-    }
-
-    fn scroll_tabs(&mut self, direction: f32, cx: &mut Context<Self>) {
-        let offset = self.tab_scroll_handle.offset();
-        let max_offset = f32::from(self.tab_scroll_handle.max_offset().width);
-        let x = (f32::from(offset.x) - direction * TAB_SCROLL_STEP).clamp(-max_offset, 0.0);
-        self.tab_scroll_handle.set_offset(point(px(x), offset.y));
-        cx.notify();
     }
 
     fn on_tab_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -896,6 +942,16 @@ impl CompiApp {
         Some(GridPoint { row, col })
     }
 
+    fn begin_titlebar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.tab_drag_origin = Some(event.position);
+        window.focus(&self.focus_handle);
+    }
+
     fn begin_tab_drag(
         &mut self,
         tab_id: u64,
@@ -906,8 +962,8 @@ impl CompiApp {
         self.active_tab = Some(tab_id);
         self.reveal_tab(tab_id);
         self.switcher_open = false;
-        self.tab_drag_origin = Some(event.position);
-        window.focus(&self.focus_handle);
+        self.begin_titlebar_drag(event, window, cx);
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -936,14 +992,15 @@ impl CompiApp {
     }
 
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let multiple_tabs = self.tabs.len() > 1;
         let tabs = self.tabs.iter().map(|tab| {
             let id = tab.id;
             let active = self.active_tab == Some(id);
-            let status_color = match tab.state {
-                ConnectionState::Attached => color(ACCENT),
-                ConnectionState::Connecting | ConnectionState::Reconnecting => color(MUTED),
-                ConnectionState::Exited(_) => color(MUTED),
-                ConnectionState::Failed => color(ERROR),
+            let exceptional_state = match tab.state {
+                ConnectionState::Connecting | ConnectionState::Reconnecting => Some(color(MUTED)),
+                ConnectionState::Exited(_) => Some(color(MUTED)),
+                ConnectionState::Failed => Some(color(ERROR)),
+                ConnectionState::Attached => None,
             };
             div()
                 .id(("tab", id as usize))
@@ -954,13 +1011,21 @@ impl CompiApp {
                 .flex()
                 .items_center()
                 .gap_2()
-                .border_r_1()
                 .border_b_2()
-                .border_color(if active { color(ACCENT) } else { color(BORDER) })
-                .bg(if active {
-                    color(SURFACE_HOVER)
+                .border_color(if multiple_tabs && active {
+                    color(ACCENT)
                 } else {
+                    gpui::transparent_black()
+                })
+                .bg(if multiple_tabs && active {
                     color(SURFACE)
+                } else {
+                    color(BACKGROUND)
+                })
+                .text_color(if active {
+                    color(FOREGROUND)
+                } else {
+                    color(MUTED)
                 })
                 .hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
                 .on_mouse_down(
@@ -969,7 +1034,11 @@ impl CompiApp {
                         this.begin_tab_drag(id, event, window, cx);
                     }),
                 )
-                .child(div().size(px(6.0)).rounded_full().bg(status_color))
+                .on_mouse_move(cx.listener(Self::on_titlebar_mouse_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::end_tab_drag))
+                .when_some(exceptional_state, |tab, state_color| {
+                    tab.child(div().size(px(5.0)).rounded_full().bg(state_color))
+                })
                 .child(
                     div()
                         .flex_1()
@@ -978,32 +1047,35 @@ impl CompiApp {
                         .text_ellipsis()
                         .child(tab.title()),
                 )
-                .child(
-                    div()
-                        .id(("close-tab", id as usize))
-                        .size(px(22.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .text_color(color(MUTED))
-                        .hover(|style| {
-                            style
-                                .bg(color(BORDER))
-                                .text_color(color(FOREGROUND))
-                                .cursor_pointer()
-                        })
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_tab_id(id);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }))
-                        .child("×"),
-                )
+                .when(multiple_tabs && active, |tab| {
+                    tab.child(
+                        div()
+                            .id(("close-tab", id as usize))
+                            .size(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_color(color(MUTED))
+                            .hover(|style| {
+                                style
+                                    .bg(color(BORDER))
+                                    .text_color(color(FOREGROUND))
+                                    .cursor_pointer()
+                            })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_tab_id(id);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                            .child(chrome_icon(ChromeIcon::Close, color(MUTED))),
+                    )
+                })
         });
+
         div()
             .h(px(CHROME_HEIGHT))
             .w_full()
@@ -1011,7 +1083,8 @@ impl CompiApp {
             .overflow_hidden()
             .bg(color(BACKGROUND))
             .border_b_1()
-            .border_color(color(BORDER))
+            .border_color(color(BORDER).opacity(0.55))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_titlebar_drag))
             .on_mouse_move(cx.listener(Self::on_titlebar_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_tab_drag))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_tab_drag))
@@ -1022,14 +1095,13 @@ impl CompiApp {
                     .bottom_0()
                     .left_0()
                     .w(px(TITLEBAR_BRAND_WIDTH))
-                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(color(ACCENT))
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(">_"),
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_titlebar_drag))
+                    .on_mouse_move(cx.listener(Self::on_titlebar_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::end_tab_drag))
+                    .child(chrome_icon(ChromeIcon::Mark, color(ACCENT))),
             )
             .child(
                 div()
@@ -1045,68 +1117,7 @@ impl CompiApp {
                     .track_scroll(&self.tab_scroll_handle)
                     .on_scroll_wheel(cx.listener(Self::on_tab_scroll))
                     .children(tabs)
-                    .child(
-                        div()
-                            .h_full()
-                            .min_w(px(16.0))
-                            .flex_1()
-                            .window_control_area(WindowControlArea::Drag),
-                    ),
-            )
-            .child(
-                div()
-                    .id("scroll-tabs-left")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(WINDOW_CONTROLS_WIDTH
-                        + TITLEBAR_DRAG_WIDTH
-                        + SESSION_SWITCHER_WIDTH
-                        + NEW_TAB_WIDTH
-                        + TAB_NAV_WIDTH / 2.0))
-                    .w(px(28.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(color(MUTED))
-                    .hover(|style| {
-                        style
-                            .bg(color(SURFACE_HOVER))
-                            .text_color(color(FOREGROUND))
-                            .cursor_pointer()
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.scroll_tabs(-1.0, cx);
-                    }))
-                    .child("‹"),
-            )
-            .child(
-                div()
-                    .id("scroll-tabs-right")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(WINDOW_CONTROLS_WIDTH
-                        + TITLEBAR_DRAG_WIDTH
-                        + SESSION_SWITCHER_WIDTH
-                        + NEW_TAB_WIDTH))
-                    .w(px(28.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(color(MUTED))
-                    .hover(|style| {
-                        style
-                            .bg(color(SURFACE_HOVER))
-                            .text_color(color(FOREGROUND))
-                            .cursor_pointer()
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.scroll_tabs(1.0, cx);
-                    }))
-                    .child("›"),
+                    .child(div().h_full().min_w(px(16.0)).flex_1()),
             )
             .child(
                 div()
@@ -1118,7 +1129,6 @@ impl CompiApp {
                         + TITLEBAR_DRAG_WIDTH
                         + SESSION_SWITCHER_WIDTH))
                     .w(px(NEW_TAB_WIDTH))
-                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1129,11 +1139,13 @@ impl CompiApp {
                             .text_color(color(FOREGROUND))
                             .cursor_pointer()
                     })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.create_session();
+                        cx.stop_propagation();
                         cx.notify();
                     }))
-                    .child("+"),
+                    .child(chrome_icon(ChromeIcon::Plus, color(MUTED))),
             )
             .child(
                 div()
@@ -1142,13 +1154,10 @@ impl CompiApp {
                     .top_0()
                     .bottom_0()
                     .right(px(WINDOW_CONTROLS_WIDTH + TITLEBAR_DRAG_WIDTH))
-                    .flex_none()
                     .w(px(SESSION_SWITCHER_WIDTH))
-                    .justify_center()
-                    .px_3()
                     .flex()
                     .items_center()
-                    .text_sm()
+                    .justify_center()
                     .text_color(color(MUTED))
                     .hover(|style| {
                         style
@@ -1156,14 +1165,16 @@ impl CompiApp {
                             .text_color(color(FOREGROUND))
                             .cursor_pointer()
                     })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.switcher_open = !this.switcher_open;
                         if this.switcher_open {
                             this.refresh_sessions(false);
                         }
+                        cx.stop_propagation();
                         cx.notify();
                     }))
-                    .child("Sessions"),
+                    .child(chrome_icon(ChromeIcon::Search, color(MUTED))),
             )
             .child(
                 div()
@@ -1171,9 +1182,7 @@ impl CompiApp {
                     .top_0()
                     .bottom_0()
                     .right(px(WINDOW_CONTROLS_WIDTH))
-                    .w(px(TITLEBAR_DRAG_WIDTH))
-                    .bg(color(BACKGROUND))
-                    .window_control_area(WindowControlArea::Drag),
+                    .w(px(TITLEBAR_DRAG_WIDTH)),
             )
             .child(
                 div()
@@ -1186,19 +1195,19 @@ impl CompiApp {
                     .bg(color(BACKGROUND))
                     .child(window_control(
                         "minimize-window",
-                        "—",
+                        ChromeIcon::Minimize,
                         WindowControlArea::Min,
                         false,
                     ))
                     .child(window_control(
                         "maximize-window",
-                        "□",
+                        ChromeIcon::Maximize,
                         WindowControlArea::Max,
                         false,
                     ))
                     .child(window_control(
                         "close-window",
-                        "×",
+                        ChromeIcon::Close,
                         WindowControlArea::Close,
                         true,
                     )),
@@ -1208,7 +1217,7 @@ impl CompiApp {
     fn render_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.sessions.iter().map(|session| {
             let session = session.clone();
-            let can_attach = session.status == SessionStatus::Running && !session.attached;
+            let can_select = session.status == SessionStatus::Running;
             let status = match session.status {
                 SessionStatus::Starting => "Starting",
                 SessionStatus::Running if session.attached => "Open",
@@ -1219,15 +1228,14 @@ impl CompiApp {
             let session_for_attach = session.clone();
             div()
                 .id(("session", session.created_at_ms))
-                .w_full()
+                .mx_2()
                 .px_3()
                 .py_2()
                 .flex()
                 .items_center()
                 .justify_between()
-                .border_b_1()
-                .border_color(color(BORDER))
-                .when(can_attach, |row| {
+                .rounded_sm()
+                .when(can_select, |row| {
                     row.hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.attach_session(session_for_attach.clone());
@@ -1235,7 +1243,21 @@ impl CompiApp {
                             cx.notify();
                         }))
                 })
-                .child(short_session_id(&session.id))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(session.status == SessionStatus::Running, |title| {
+                            title.child(
+                                div()
+                                    .size(px(5.0))
+                                    .rounded_full()
+                                    .bg(color(if session.attached { ACCENT } else { MUTED })),
+                            )
+                        })
+                        .child(short_session_id(&session.id)),
+                )
                 .child(
                     div()
                         .text_sm()
@@ -1247,16 +1269,18 @@ impl CompiApp {
                         .child(status),
                 )
         });
+
         div()
-            .size_full()
-            .bg(color(BACKGROUND))
-            .p_6()
+            .absolute()
+            .top(px(CHROME_HEIGHT + 12.0))
+            .left_0()
+            .right_0()
             .flex()
             .justify_center()
             .child(
                 div()
-                    .w(px(560.0))
-                    .max_h(px(480.0))
+                    .w(px(520.0))
+                    .max_h(px(420.0))
                     .bg(color(SURFACE))
                     .border_1()
                     .border_color(color(BORDER))
@@ -1265,27 +1289,34 @@ impl CompiApp {
                     .child(
                         div()
                             .px_3()
-                            .py_3()
+                            .py_2()
                             .flex()
                             .items_center()
                             .justify_between()
                             .border_b_1()
-                            .border_color(color(BORDER))
-                            .child("Sessions")
+                            .border_color(color(BORDER).opacity(0.7))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_color(color(FOREGROUND))
+                                    .child(chrome_icon(ChromeIcon::Search, color(MUTED)))
+                                    .child("Switch session"),
+                            )
                             .child(
                                 div()
                                     .id("switcher-new-session")
-                                    .px_3()
+                                    .px_2()
                                     .py_1()
                                     .rounded_sm()
-                                    .bg(color(ACCENT))
-                                    .text_color(color(BACKGROUND))
-                                    .hover(|style| style.opacity(0.85).cursor_pointer())
+                                    .text_color(color(ACCENT))
+                                    .hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.create_session();
                                         cx.notify();
                                     }))
-                                    .child("New session"),
+                                    .child("New"),
                             ),
                     )
                     .when(self.loading_sessions, |panel| {
@@ -1383,9 +1414,81 @@ impl CompiApp {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ChromeIcon {
+    Mark,
+    Plus,
+    Search,
+    Minimize,
+    Maximize,
+    Close,
+}
+
+fn chrome_icon(icon: ChromeIcon, tint: Hsla) -> impl IntoElement {
+    canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            let x = |value: f32| bounds.left() + px(value);
+            let y = |value: f32| bounds.top() + px(value);
+            let mut path = PathBuilder::stroke(px(1.25));
+            match icon {
+                ChromeIcon::Mark => {
+                    path.move_to(point(x(2.0), y(8.0)));
+                    path.line_to(point(x(8.0), y(3.0)));
+                    path.line_to(point(x(14.0), y(8.0)));
+                    path.line_to(point(x(8.0), y(13.0)));
+                    path.line_to(point(x(2.0), y(8.0)));
+                    path.move_to(point(x(6.0), y(11.0)));
+                    path.line_to(point(x(10.0), y(5.0)));
+                }
+                ChromeIcon::Plus => {
+                    path.move_to(point(x(3.0), y(8.0)));
+                    path.line_to(point(x(13.0), y(8.0)));
+                    path.move_to(point(x(8.0), y(3.0)));
+                    path.line_to(point(x(8.0), y(13.0)));
+                }
+                ChromeIcon::Search => {
+                    path.move_to(point(x(9.5), y(3.5)));
+                    path.line_to(point(x(6.0), y(2.5)));
+                    path.line_to(point(x(3.0), y(4.5)));
+                    path.line_to(point(x(2.5), y(8.0)));
+                    path.line_to(point(x(4.5), y(11.0)));
+                    path.line_to(point(x(8.0), y(11.5)));
+                    path.line_to(point(x(10.5), y(9.5)));
+                    path.line_to(point(x(11.0), y(6.0)));
+                    path.line_to(point(x(9.5), y(3.5)));
+                    path.move_to(point(x(10.0), y(10.0)));
+                    path.line_to(point(x(14.0), y(14.0)));
+                }
+                ChromeIcon::Minimize => {
+                    path.move_to(point(x(3.0), y(11.0)));
+                    path.line_to(point(x(13.0), y(11.0)));
+                }
+                ChromeIcon::Maximize => {
+                    path.move_to(point(x(3.5), y(3.5)));
+                    path.line_to(point(x(12.5), y(3.5)));
+                    path.line_to(point(x(12.5), y(12.5)));
+                    path.line_to(point(x(3.5), y(12.5)));
+                    path.line_to(point(x(3.5), y(3.5)));
+                }
+                ChromeIcon::Close => {
+                    path.move_to(point(x(3.5), y(3.5)));
+                    path.line_to(point(x(12.5), y(12.5)));
+                    path.move_to(point(x(12.5), y(3.5)));
+                    path.line_to(point(x(3.5), y(12.5)));
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, tint);
+            }
+        },
+    )
+    .size(px(16.0))
+}
+
 fn window_control(
     id: &'static str,
-    label: &'static str,
+    icon: ChromeIcon,
     area: WindowControlArea,
     destructive: bool,
 ) -> impl IntoElement {
@@ -1408,14 +1511,14 @@ fn window_control(
                 .text_color(color(FOREGROUND))
         })
         .window_control_area(area)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, window, _| match area {
             WindowControlArea::Min => window.minimize_window(),
             WindowControlArea::Max => toggle_window_maximized(window),
-
             WindowControlArea::Close => window.remove_window(),
             WindowControlArea::Drag => {}
         })
-        .child(label)
+        .child(chrome_icon(icon, color(MUTED)))
 }
 fn drag_threshold_crossed(origin: Point<Pixels>, current: Point<Pixels>) -> bool {
     let dx = f32::from(current.x - origin.x);
@@ -1584,10 +1687,13 @@ impl EntityInputHandler for CompiApp {
 
 impl Render for CompiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(tab) = self.active_tab() {
-            window.set_window_title(&format!("{} · Compi", tab.title()));
-        } else {
-            window.set_window_title("Compi");
+        let title = self
+            .active_tab()
+            .map(|tab| format!("{} · Compi", tab.title()))
+            .unwrap_or_else(|| String::from("Compi"));
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
         }
         div()
             .key_context("Terminal")
@@ -1597,6 +1703,7 @@ impl Render for CompiApp {
                 cx.stop_propagation();
             }))
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .font_family("Segoe UI")
@@ -1611,26 +1718,38 @@ impl Render for CompiApp {
             .on_action(cx.listener(Self::paste_clipboard))
             .on_action(cx.listener(Self::toggle_switcher))
             .child(self.render_titlebar(cx))
-            .child(if self.switcher_open {
-                self.render_switcher(cx).into_any_element()
-            } else {
-                self.render_terminal(cx).into_any_element()
+            .child(self.render_terminal(cx))
+            .when(self.switcher_open, |client| {
+                client.child(self.render_switcher(cx))
             })
     }
 }
 
 #[derive(Clone)]
 struct PaintModel {
-    snapshot: ScreenSnapshot,
+    visible_rows: Vec<Row>,
+    base_row: usize,
+    scrollback_len: usize,
+    cursor: CursorState,
+    alternate_screen: bool,
+    placements: Vec<KittyPlacement>,
     scroll_offset: usize,
     selection: Option<Selection>,
     images: HashMap<u32, Arc<RenderImage>>,
+    row_render_cache: Arc<Mutex<RowRenderCache>>,
 }
 
 impl PaintModel {
     fn from_tab(tab: &TerminalTab) -> Option<Self> {
+        let snapshot = tab.mirror.snapshot()?;
+        let (visible_rows, base_row) = visible_rows(snapshot, tab.scroll_offset);
         Some(Self {
-            snapshot: tab.mirror.snapshot()?.clone(),
+            visible_rows: visible_rows.into_iter().cloned().collect(),
+            base_row,
+            scrollback_len: snapshot.scrollback.len(),
+            cursor: snapshot.cursor,
+            alternate_screen: snapshot.modes.alternate_screen,
+            placements: snapshot.placements.clone(),
             scroll_offset: tab.scroll_offset,
             selection: tab.selection,
             images: tab
@@ -1638,12 +1757,15 @@ impl PaintModel {
                 .iter()
                 .map(|(id, (_, image))| (*id, image.clone()))
                 .collect(),
+            row_render_cache: tab.row_render_cache.clone(),
         })
     }
 }
 
 fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Window, cx: &mut App) {
-    let (visible, base) = visible_rows(&model.snapshot, model.scroll_offset);
+    let paint_started_at = performance_metrics().map(|_| Instant::now());
+    let visible = &model.visible_rows;
+    let base = model.base_row;
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         paint_images(bounds, model, base, false, window);
         for (row_index, row) in visible.iter().enumerate() {
@@ -1654,10 +1776,13 @@ fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Windo
         }
         paint_cursor(bounds, model, base, window);
         for (row_index, row) in visible.iter().enumerate() {
-            paint_row_text(bounds, row_index, row, window, cx);
+            paint_row_text(bounds, row_index, row, &model.row_render_cache, window, cx);
         }
         paint_images(bounds, model, base, true, window);
     });
+    if let Some(started_at) = paint_started_at {
+        record_paint_metrics(started_at);
+    }
 }
 
 fn paint_row_backgrounds(bounds: Bounds<Pixels>, row_index: usize, row: &Row, window: &mut Window) {
@@ -1684,13 +1809,85 @@ fn paint_row_backgrounds(bounds: Bounds<Pixels>, row_index: usize, row: &Row, wi
     }
 }
 
+#[derive(Clone)]
+struct ShapedRun {
+    start: usize,
+    line: ShapedLine,
+}
+
+struct CachedRow {
+    source: Row,
+    runs: Arc<Vec<ShapedRun>>,
+}
+
+#[derive(Default)]
+struct RowRenderCache {
+    entries: HashMap<u64, CachedRow>,
+    insertion_order: VecDeque<u64>,
+}
+
+impl RowRenderCache {
+    const MAX_ROWS: usize = 512;
+
+    fn get(&self, fingerprint: u64, row: &Row) -> Option<Arc<Vec<ShapedRun>>> {
+        self.entries
+            .get(&fingerprint)
+            .filter(|cached| cached.source == *row)
+            .map(|cached| cached.runs.clone())
+    }
+
+    fn insert(&mut self, fingerprint: u64, row: Row, runs: Arc<Vec<ShapedRun>>) {
+        if !self.entries.contains_key(&fingerprint) {
+            while self.entries.len() >= Self::MAX_ROWS {
+                let Some(oldest) = self.insertion_order.pop_front() else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+            self.insertion_order.push_back(fingerprint);
+        }
+        self.entries
+            .insert(fingerprint, CachedRow { source: row, runs });
+    }
+}
+
+fn row_fingerprint(row: &Row) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    row.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn paint_row_text(
     bounds: Bounds<Pixels>,
     row_index: usize,
     row: &Row,
+    cache: &Arc<Mutex<RowRenderCache>>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let fingerprint = row_fingerprint(row);
+    let cached = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(fingerprint, row));
+    let runs = cached.unwrap_or_else(|| {
+        let shaped = Arc::new(shape_row(row, window));
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(fingerprint, row.clone(), shaped.clone());
+        }
+        shaped
+    });
+    for run in runs.iter() {
+        let origin = point(
+            bounds.left() + px(run.start as f32 * CELL_WIDTH),
+            bounds.top() + px(row_index as f32 * CELL_HEIGHT),
+        );
+        let _ = run.line.paint(origin, px(CELL_HEIGHT), window, cx);
+    }
+}
+
+fn shape_row(row: &Row, window: &mut Window) -> Vec<ShapedRun> {
+    let mut shaped = Vec::new();
     let mut start = 0;
     while start < row.cells.len() {
         if row.cells[start].width == 0 {
@@ -1702,7 +1899,7 @@ fn paint_row_text(
         let mut text = if style.attributes.hidden {
             " ".repeat(usize::from(style.width.max(1)))
         } else {
-            style.text.clone()
+            style.text.to_string()
         };
         while end < row.cells.len() {
             let cell = &row.cells[end];
@@ -1753,17 +1950,15 @@ fn paint_row_text(
             underline,
             strikethrough,
         };
-        let line =
-            window
+        shaped.push(ShapedRun {
+            start,
+            line: window
                 .text_system()
-                .shape_line(SharedString::from(text), px(14.0), &[run], None);
-        let origin = point(
-            bounds.left() + px(start as f32 * CELL_WIDTH),
-            bounds.top() + px(row_index as f32 * CELL_HEIGHT),
-        );
-        let _ = line.paint(origin, px(CELL_HEIGHT), window, cx);
+                .shape_line(SharedString::from(text), px(14.0), &[run], None),
+        });
         start = end;
     }
+    shaped
 }
 
 fn paint_selection(
@@ -1811,20 +2006,20 @@ fn paint_selection(
 }
 
 fn paint_cursor(bounds: Bounds<Pixels>, model: &PaintModel, base: usize, window: &mut Window) {
-    if !model.snapshot.cursor.visible || model.scroll_offset != 0 {
+    if !model.cursor.visible || model.scroll_offset != 0 {
         return;
     }
-    let absolute_row = model.snapshot.scrollback.len() + usize::from(model.snapshot.cursor.row);
+    let absolute_row = model.scrollback_len + usize::from(model.cursor.row);
     if absolute_row < base {
         return;
     }
     let row = absolute_row - base;
-    let col = usize::from(model.snapshot.cursor.col);
+    let col = usize::from(model.cursor.col);
     let (x, y) = (
         bounds.left() + px(col as f32 * CELL_WIDTH),
         bounds.top() + px(row as f32 * CELL_HEIGHT),
     );
-    let cursor_bounds = match model.snapshot.cursor.shape {
+    let cursor_bounds = match model.cursor.shape {
         CursorShape::Block => Bounds::new(point(x, y), size(px(CELL_WIDTH), px(CELL_HEIGHT))),
         CursorShape::Underline => Bounds::new(
             point(x, y + px(CELL_HEIGHT - 2.0)),
@@ -1843,7 +2038,6 @@ fn paint_images(
     window: &mut Window,
 ) {
     let mut placements: Vec<KittyPlacement> = model
-        .snapshot
         .placements
         .iter()
         .copied()
@@ -1851,7 +2045,7 @@ fn paint_images(
         .collect();
     placements.sort_by_key(|placement| placement.z_index);
     for placement in placements {
-        if placement.alternate_screen != model.snapshot.modes.alternate_screen {
+        if placement.alternate_screen != model.alternate_screen {
             continue;
         }
         let Some(image) = model.images.get(&placement.image_id).cloned() else {
@@ -1863,7 +2057,7 @@ fn paint_images(
             }
             placement.row as usize
         } else {
-            let row = model.snapshot.scrollback.len() as i64 + i64::from(placement.row);
+            let row = model.scrollback_len as i64 + i64::from(placement.row);
             if row < 0 {
                 continue;
             }
@@ -2190,7 +2384,7 @@ fn decode_kitty_image(image: &KittyImage) -> Result<Arc<RenderImage>, String> {
                 return Err("RGB payload length does not match dimensions".into());
             }
             let mut rgba = Vec::with_capacity(image.width as usize * image.height as usize * 4);
-            for pixel in bytes.chunks_exact(3) {
+            for pixel in bytes.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
             }
             RgbaImage::from_raw(image.width, image.height, rgba)
@@ -2202,7 +2396,7 @@ fn decode_kitty_image(image: &KittyImage) -> Result<Arc<RenderImage>, String> {
         format => return Err(format!("unsupported Kitty image format {format}")),
     };
     let raw: &mut [u8] = buffer.as_mut();
-    for pixel in raw.chunks_exact_mut(4) {
+    for pixel in raw.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Ok(Arc::new(RenderImage::new(smallvec![ImageFrame::new(
@@ -2215,7 +2409,8 @@ fn spawn_tab_worker(
     session_id: String,
     cols: i16,
     rows: i16,
-    sender: Sender<UiEvent>,
+    sender: UiEventSender,
+    instance: Option<String>,
 ) {
     thread::spawn(move || {
         let stop = Arc::new(AtomicBool::new(false));
@@ -2223,7 +2418,15 @@ fn spawn_tab_worker(
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            let result = run_tab_connection(tab_id, &session_id, cols, rows, stop.clone(), &sender);
+            let result = run_tab_connection(
+                tab_id,
+                &session_id,
+                cols,
+                rows,
+                stop.clone(),
+                &sender,
+                instance.as_deref(),
+            );
             if stop.load(Ordering::Acquire) {
                 return;
             }
@@ -2243,9 +2446,10 @@ fn run_tab_connection(
     cols: i16,
     rows: i16,
     stop: Arc<AtomicBool>,
-    sender: &Sender<UiEvent>,
+    sender: &UiEventSender,
+    instance: Option<&str>,
 ) -> crate::Result<()> {
-    let mut client = app::connect_or_start(None)?;
+    let mut client = app::connect_or_start(instance)?;
     let Some(session) = client
         .list_sessions()?
         .into_iter()
@@ -2297,9 +2501,9 @@ fn run_tab_connection(
         commands: command_tx,
         stop: stop.clone(),
     };
-    sender
-        .send(UiEvent::TabConnected { tab_id, transport })
-        .map_err(|_| "UI closed while attaching terminal")?;
+    if !sender.send(UiEvent::TabConnected { tab_id, transport }) {
+        return Err("UI closed while attaching terminal".into());
+    }
     let mut reader = DaemonClient::from_parts(connection, next_request_id);
     loop {
         loop {
@@ -2313,7 +2517,7 @@ fn run_tab_connection(
         }
         match reader.poll_event()? {
             Some(ServerEvent::Screen(message)) => {
-                if sender.send(UiEvent::TabScreen { tab_id, message }).is_err() {
+                if !sender.send(UiEvent::TabScreen { tab_id, message }) {
                     return Ok(());
                 }
             }
@@ -2323,10 +2527,7 @@ fn run_tab_connection(
                 if exited {
                     stop.store(true, Ordering::Release);
                 }
-                if sender
-                    .send(UiEvent::TabControl { tab_id, message })
-                    .is_err()
-                {
+                if !sender.send(UiEvent::TabControl { tab_id, message }) {
                     return Ok(());
                 }
                 if detached && stop.load(Ordering::Acquire) || exited {
@@ -2347,7 +2548,7 @@ fn short_session_id(id: &str) -> String {
         .collect()
 }
 
-fn log_startup_metric(elapsed: Duration) {
+fn log_startup_metric(name: &str, elapsed: Duration) {
     let Some(local_app_data) = env::var_os("LOCALAPPDATA") else {
         return;
     };
@@ -2360,7 +2561,123 @@ fn log_startup_metric(elapsed: Duration) {
         .append(true)
         .open(directory.join("client.log"))
     {
-        let _ = writeln!(file, "first_snapshot_ms={}", elapsed.as_millis());
+        let _ = writeln!(file, "{name}={}", elapsed.as_millis());
+    }
+}
+
+#[derive(Default)]
+struct PaintMetrics {
+    last_frame: Option<Instant>,
+    frame_intervals_us: Vec<u64>,
+    paint_times_us: Vec<u64>,
+}
+
+static PERFORMANCE_METRICS: LazyLock<Option<Mutex<PaintMetrics>>> = LazyLock::new(|| {
+    env::var_os("COMPI_PERF_LOG")
+        .is_some()
+        .then(|| Mutex::new(PaintMetrics::default()))
+});
+
+fn performance_metrics() -> Option<&'static Mutex<PaintMetrics>> {
+    PERFORMANCE_METRICS.as_ref()
+}
+fn record_paint_metrics(started_at: Instant) {
+    let finished_at = Instant::now();
+    let Some(metrics) = performance_metrics() else {
+        return;
+    };
+    let Ok(mut metrics) = metrics.lock() else {
+        return;
+    };
+    if let Some(last_frame) = metrics.last_frame {
+        let interval = finished_at.saturating_duration_since(last_frame);
+        if interval <= Duration::from_millis(100) {
+            metrics.frame_intervals_us.push(interval.as_micros() as u64);
+        }
+    }
+    metrics.last_frame = Some(finished_at);
+    metrics.paint_times_us.push(
+        finished_at
+            .saturating_duration_since(started_at)
+            .as_micros() as u64,
+    );
+    if metrics.paint_times_us.len() < 240 || metrics.frame_intervals_us.len() < 120 {
+        return;
+    }
+
+    metrics.frame_intervals_us.sort_unstable();
+    metrics.paint_times_us.sort_unstable();
+    let frame_p50 = percentile(&metrics.frame_intervals_us, 50);
+    let frame_p95 = percentile(&metrics.frame_intervals_us, 95);
+    let paint_p50 = percentile(&metrics.paint_times_us, 50);
+    let paint_p95 = percentile(&metrics.paint_times_us, 95);
+    let (private_bytes, handles) = current_process_metrics();
+    log_performance_sample(
+        frame_p50,
+        frame_p95,
+        paint_p50,
+        paint_p95,
+        private_bytes,
+        handles,
+    );
+    metrics.frame_intervals_us.clear();
+    metrics.paint_times_us.clear();
+}
+
+fn percentile(sorted: &[u64], percentile: usize) -> u64 {
+    sorted[(sorted.len().saturating_sub(1) * percentile) / 100]
+}
+
+fn current_process_metrics() -> (usize, u32) {
+    let process = unsafe { GetCurrentProcess() };
+    let mut memory = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    let memory_result = unsafe {
+        GetProcessMemoryInfo(
+            process,
+            &mut memory as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        )
+    };
+    let mut handles = 0;
+    let handle_result = unsafe { GetProcessHandleCount(process, &mut handles) };
+    let private_bytes = if memory_result.is_ok() {
+        memory.PrivateUsage
+    } else {
+        0
+    };
+    let handles = if handle_result.is_ok() { handles } else { 0 };
+    (private_bytes, handles)
+}
+
+fn log_performance_sample(
+    frame_p50_us: u64,
+    frame_p95_us: u64,
+    paint_p50_us: u64,
+    paint_p95_us: u64,
+    private_bytes: usize,
+    handles: u32,
+) {
+    let Some(local_app_data) = env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(local_app_data).join("Compi");
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("client-perf.log"))
+    {
+        let _ = writeln!(
+            file,
+            "frame_p50_us={frame_p50_us} frame_p95_us={frame_p95_us} \
+             paint_p50_us={paint_p50_us} paint_p95_us={paint_p95_us} \
+             private_bytes={private_bytes} handles={handles}"
+        );
     }
 }
 
@@ -2374,7 +2691,7 @@ mod tests {
             cells: text
                 .chars()
                 .map(|character| Cell {
-                    text: character.to_string(),
+                    text: character.to_string().into(),
                     width: 1,
                     foreground: Color::Default,
                     background: Color::Default,
@@ -2484,6 +2801,8 @@ mod tests {
             }),
             selecting: false,
             image_cache: HashMap::new(),
+            image_pending: HashMap::new(),
+            row_render_cache: Arc::new(Mutex::new(RowRenderCache::default())),
             cols: 4,
             rows: 1,
         };
