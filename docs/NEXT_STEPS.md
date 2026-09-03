@@ -97,6 +97,19 @@ The task runs `compi-daemon.exe --supervise` under the current user's interactiv
 - [ ] Exercise Kitty image chunking, zlib payloads, placement, deletion, clipping, scrollback, resize, detach, and reattach.
 - [ ] Confirm every client delta gap recovers from a fresh snapshot without duplicated or lost terminal state.
 
+### Project working directories
+
+Compi remains WSL-native while allowing a session to start directly in a project stored on either filesystem. It resolves the requested directory once at spawn and then lets WSL and the shell access the project in place. Compi does not copy, mirror, synchronize, or virtualize project files.
+
+- [ ] Add an optional working directory to session creation and persist it as session metadata.
+- [ ] Accept absolute WSL paths and absolute Windows paths. Resolve Windows paths through the selected WSL distribution before spawning Bash; keep `~` as the default when no directory is supplied.
+- [ ] Track the shell's current directory through OSC 7 so a new tab can inherit the active session's directory without injecting `cd` commands or rewriting shell startup files.
+- [ ] Warn, but do not block, when a Windows-hosted project is under OneDrive or another synchronized directory.
+- [ ] Use the same resolved working directory contract for human and agent sessions so both operate on the same project in place.
+- [ ] Cover WSL and Windows paths with spaces, Unicode, mixed case, missing directories, and unavailable distributions.
+- [ ] Verify Git and two representative agent harnesses against projects under both `/home/...` and `/mnt/c/...`, with edits immediately visible to the Windows editor and Explorer where applicable.
+- [ ] Measure Linux-filesystem and mounted-Windows-filesystem workloads separately. Filesystem results must not be reported as terminal renderer or protocol results.
+
 ## 4. Close the release-feel gates
 
 - [ ] Reduce warm first-window p95 below 100 ms and warm ready-for-input p95 below 200 ms, or record an explicit approved release exception.
@@ -156,4 +169,4 @@ Start only after the P0 installer, supervision, compatibility, performance, and 
 - Unix-domain IPC and any transport discovery mechanism.
 - Linux daemon, remote access, and macOS client work.
 - IOCP/epoll shared PTY polling, screen-state parking, scrollback compression, and client-buffer parking, after marginal measurements justify them.
-- Daemon/reboot survival of running processes, multi-viewer broadcast, split layouts, ligatures, animation polish, persisted scrollback, preferences UI, forced themes, Windows-path translation, Sixel, default-terminal registration, and embedded multi-agent orchestration.
+- Daemon/reboot survival of running processes, multi-viewer broadcast, split layouts, ligatures, animation polish, persisted scrollback, preferences UI, forced themes, Sixel, default-terminal registration, and embedded multi-agent orchestration.
