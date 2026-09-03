@@ -6,6 +6,7 @@ use crate::protocol::{
     CONTROL_FRAME, ErrorCode, SCREEN_FRAME, ServerControl, ServerMessage, SessionInfo,
     SessionStatus, encode_server,
 };
+use crate::session_store::SessionStore;
 use crate::terminal::{ScreenMessage, TerminalState, encode_screen};
 use std::collections::HashMap;
 use std::fmt;
@@ -27,6 +28,7 @@ const CLIENT_SCREEN_QUEUE_FRAMES: usize = 32;
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    store: SessionStore,
     next_id: AtomicU64,
 }
 
@@ -34,9 +36,10 @@ pub struct Session {
     id: String,
     created_at_ms: u64,
     state: Mutex<SessionRuntime>,
-    input: Mutex<File>,
+    input: Mutex<Option<File>>,
     commands: SyncSender<SessionCommand>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    store: SessionStore,
 }
 
 struct SessionRuntime {
@@ -108,9 +111,19 @@ impl std::error::Error for SessionError {}
 
 impl SessionManager {
     pub fn new() -> Self {
+        Self::with_store(SessionStore::memory())
+    }
+
+    pub fn persistent(instance: Option<&str>) -> Result<Self> {
+        Ok(Self::with_store(SessionStore::open(instance)?))
+    }
+
+    fn with_store(store: SessionStore) -> Self {
+        let next_id = store.next_ordinal();
         Self {
             sessions: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
+            store,
+            next_id: AtomicU64::new(next_id),
         }
     }
 
@@ -119,11 +132,42 @@ impl SessionManager {
         let created_at_ms = now_ms();
         let ordinal = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("s-{created_at_ms:x}-{ordinal:x}");
-        let session = Session::spawn(id.clone(), created_at_ms, cols, rows)?;
-        self.sessions
-            .lock()
-            .map_err(|_| "session registry lock was poisoned")?
-            .insert(id, session.clone());
+        self.store.record(&SessionInfo {
+            id: id.clone(),
+            status: SessionStatus::Starting,
+            attached: false,
+            cols,
+            rows,
+            created_at_ms,
+            exit_code: None,
+            error: None,
+        })?;
+        let session =
+            match Session::spawn(id.clone(), created_at_ms, cols, rows, self.store.clone()) {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = self.store.record(&SessionInfo {
+                        id,
+                        status: SessionStatus::Failed,
+                        attached: false,
+                        cols,
+                        rows,
+                        created_at_ms,
+                        exit_code: None,
+                        error: Some(error.to_string()),
+                    });
+                    return Err(error);
+                }
+            };
+        let mut sessions = match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                let _ = session.kill();
+                session.join();
+                return Err("session registry lock was poisoned".into());
+            }
+        };
+        sessions.insert(id, session.clone());
         Ok(session)
     }
 
@@ -132,26 +176,59 @@ impl SessionManager {
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {
-        let mut sessions: Vec<_> = self
-            .sessions
-            .lock()
-            .map(|sessions| sessions.values().map(|session| session.info()).collect())
-            .unwrap_or_default();
+        let mut sessions: HashMap<_, _> = self
+            .store
+            .list()
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect();
+        if let Ok(live) = self.sessions.lock() {
+            for session in live.values().map(|session| session.info()) {
+                sessions.insert(session.id.clone(), session);
+            }
+        }
+        let mut sessions: Vec<_> = sessions.into_values().collect();
         sessions.sort_by_key(|session| (session.created_at_ms, session.id.clone()));
         sessions
     }
 
-    pub fn shutdown_all(&self) {
+    pub fn get_info(&self, id: &str) -> Option<SessionInfo> {
+        self.get(id)
+            .map(|session| session.info())
+            .or_else(|| self.store.get(id))
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.len())
+            .unwrap_or_default()
+    }
+
+    pub fn shutdown_all(&self, reason: &str) {
         let sessions: Vec<_> = self
             .sessions
             .lock()
             .map(|sessions| sessions.values().cloned().collect())
             .unwrap_or_default();
+        let active_ids: Vec<_> = sessions
+            .iter()
+            .filter(|session| {
+                matches!(
+                    session.info().status,
+                    SessionStatus::Starting | SessionStatus::Running
+                )
+            })
+            .map(|session| session.id.clone())
+            .collect();
         for session in &sessions {
             let _ = session.kill();
         }
         for session in sessions {
             session.join();
+        }
+        if let Err(error) = self.store.mark_dead(&active_ids, reason) {
+            eprintln!("compi-daemon: could not persist daemon shutdown state: {error}");
         }
     }
 }
@@ -163,7 +240,13 @@ impl Default for SessionManager {
 }
 
 impl Session {
-    fn spawn(id: String, created_at_ms: u64, cols: i16, rows: i16) -> Result<Arc<Self>> {
+    fn spawn(
+        id: String,
+        created_at_ms: u64,
+        cols: i16,
+        rows: i16,
+        store: SessionStore,
+    ) -> Result<Arc<Self>> {
         let mut conpty = ConptySession::spawn(cols, rows)?;
         let (input, mut output) = conpty.take_io()?;
         let (command_sender, command_receiver) = sync_channel(64);
@@ -179,9 +262,10 @@ impl Session {
                 terminal: TerminalState::new(cols as u16, rows as u16),
                 client: None,
             }),
-            input: Mutex::new(input),
+            input: Mutex::new(Some(input)),
             commands: command_sender,
             worker: Mutex::new(None),
+            store,
         });
 
         let output_session = session.clone();
@@ -204,6 +288,9 @@ impl Session {
                     let Ok(mut input) = output_session.input.lock() else {
                         break;
                     };
+                    let Some(input) = input.as_mut() else {
+                        break;
+                    };
                     for reply in replies {
                         if input.write_all(&reply).is_err() {
                             break;
@@ -219,19 +306,31 @@ impl Session {
             }
         });
 
+        let (worker_start, worker_ready) = sync_channel(0);
         let worker_session = session.clone();
         let worker = thread::spawn(move || {
-            worker_session.run_worker(conpty, command_receiver, output_thread)
+            if worker_ready.recv().is_ok() {
+                worker_session.run_worker(conpty, command_receiver, output_thread);
+            }
+            worker_session.release_worker_handle();
         });
         *session
             .worker
             .lock()
             .map_err(|_| "session worker lock was poisoned")? = Some(worker);
+        worker_start
+            .send(())
+            .map_err(|_| "session worker stopped before startup")?;
         session
             .state
             .lock()
             .map_err(|_| "session state lock was poisoned")?
             .status = SessionStatus::Running;
+        if let Err(error) = session.persist() {
+            let _ = session.kill();
+            session.join();
+            return Err(error);
+        }
         Ok(session)
     }
 
@@ -297,6 +396,9 @@ impl Session {
 
         conpty.close_pseudoconsole();
         let _ = output_thread.join();
+        if let Ok(mut input) = self.input.lock() {
+            input.take();
+        }
 
         let sink = if let Ok(mut state) = self.state.lock() {
             state.exit_code = Some(exit_code);
@@ -310,6 +412,12 @@ impl Session {
         } else {
             None
         };
+        if let Err(error) = self.persist() {
+            eprintln!(
+                "compi-daemon: could not persist terminal state for {}: {error}",
+                self.id
+            );
+        }
         if let Some(sink) = sink {
             let _ = sink.send_control(&ServerControl {
                 request_id: None,
@@ -465,6 +573,7 @@ impl Session {
             .input
             .lock()
             .map_err(|_| SessionError::Internal("ConPTY input lock was poisoned".into()))?;
+        let input = input.as_mut().ok_or(SessionError::Exited)?;
         input
             .write_all(bytes)
             .and_then(|_| input.flush())
@@ -491,7 +600,9 @@ impl Session {
         result
             .recv_timeout(Duration::from_secs(2))
             .map_err(|_| SessionError::Internal("timed out resizing ConPTY".into()))?
-            .map_err(SessionError::Internal)
+            .map_err(SessionError::Internal)?;
+        self.persist()
+            .map_err(|error| SessionError::Internal(error.to_string()))
     }
 
     pub fn kill(&self) -> std::result::Result<(), SessionError> {
@@ -507,6 +618,12 @@ impl Session {
         let worker = self.worker.lock().ok().and_then(|mut worker| worker.take());
         if let Some(worker) = worker {
             let _ = worker.join();
+        }
+    }
+
+    fn release_worker_handle(&self) {
+        if let Ok(mut worker) = self.worker.lock() {
+            worker.take();
         }
     }
 
@@ -527,6 +644,10 @@ impl Session {
         } else {
             Err(SessionError::NotAttached)
         }
+    }
+
+    fn persist(&self) -> Result<()> {
+        self.store.record(&self.info())
     }
 
     fn info_from_state(&self, state: &SessionRuntime) -> SessionInfo {

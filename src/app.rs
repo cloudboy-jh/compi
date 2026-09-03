@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::client::{DaemonClient, ServerEvent};
 use crate::console;
-use crate::protocol::{ClientMessage, ServerMessage, SessionStatus};
+use crate::protocol::{ClientMessage, ServerMessage, SessionInfo, SessionStatus};
 use crate::terminal::ScreenMessage;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -90,23 +90,28 @@ fn list(instance: Option<&str>) -> Result<()> {
         return Ok(());
     }
     for session in sessions {
-        let status = match session.status {
-            SessionStatus::Starting => "starting",
-            SessionStatus::Running if session.attached => "attached",
-            SessionStatus::Running => "detached",
-            SessionStatus::Exited => "exited",
-            SessionStatus::Failed => "failed",
-        };
-        let detail = session
-            .error
-            .or_else(|| session.exit_code.map(|code| format!("exit {code}")))
-            .unwrap_or_default();
-        println!(
-            "{}\t{}\t{}x{}\t{}",
-            session.id, status, session.cols, session.rows, detail
-        );
+        println!("{}", format_session_line(session));
     }
     Ok(())
+}
+
+fn format_session_line(session: SessionInfo) -> String {
+    let status = match session.status {
+        SessionStatus::Starting => "starting",
+        SessionStatus::Running if session.attached => "attached",
+        SessionStatus::Running => "detached",
+        SessionStatus::Exited => "exited",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Dead => "dead",
+    };
+    let detail = session
+        .error
+        .or_else(|| session.exit_code.map(|code| format!("exit {code}")))
+        .unwrap_or_default();
+    format!(
+        "{}\t{}\t{}x{}\t{}",
+        session.id, status, session.cols, session.rows, detail
+    )
 }
 
 fn attach(instance: Option<&str>, session_id: String) -> Result<()> {
@@ -166,11 +171,19 @@ fn shutdown(instance: Option<&str>) -> Result<()> {
 }
 
 pub fn connect_or_start(instance: Option<&str>) -> Result<DaemonClient> {
+    let started_at = Instant::now();
     match DaemonClient::connect(instance, Duration::from_millis(250)) {
-        Ok(client) => Ok(client),
+        Ok(client) => {
+            crate::perf::set_startup_kind("warm");
+            crate::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
+            Ok(client)
+        }
         Err(_) => {
+            crate::perf::set_startup_kind("cold");
             start_daemon(instance)?;
-            DaemonClient::connect(instance, Duration::from_secs(5))
+            let client = DaemonClient::connect(instance, Duration::from_secs(5))?;
+            crate::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
+            Ok(client)
         }
     }
 }
@@ -178,6 +191,23 @@ pub fn connect_or_start(instance: Option<&str>) -> Result<DaemonClient> {
 fn start_daemon(instance: Option<&str>) -> Result<()> {
     if DaemonClient::connect(instance, Duration::from_millis(100)).is_ok() {
         return Ok(());
+    }
+
+    if instance.is_none() {
+        crate::supervisor::activate()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if DaemonClient::connect(None, Duration::from_millis(100)).is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "the registered Compi daemon task did not become available; inspect Task Scheduler or repair Compi"
+                        .into(),
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     let executable = env::current_exe()?.with_file_name("compi-daemon.exe");
@@ -231,5 +261,26 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
             return Err(format!("daemon did not start; inspect {}", log_path.display()).into());
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_session_output_includes_reason() {
+        let line = format_session_line(SessionInfo {
+            id: "s-dead".to_owned(),
+            status: SessionStatus::Dead,
+            attached: false,
+            cols: 80,
+            rows: 24,
+            created_at_ms: 1,
+            exit_code: None,
+            error: Some("previous daemon stopped".to_owned()),
+        });
+
+        assert_eq!(line, "s-dead\tdead\t80x24\tprevious daemon stopped");
     }
 }

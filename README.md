@@ -22,6 +22,26 @@ The daemon is the authority for session lifecycle and terminal state. The client
 
 ## Status
 
-Compi is a pre-release Windows application with the core persistent-terminal experience implemented and available for dogfooding. The remaining release path is installer and daemon supervision, lifecycle hardening, broader terminal compatibility, performance validation, and repeatable signed Windows releases.
+Compi is a pre-release Windows application with the core persistent-terminal experience, per-user daemon supervision, and a native installer implemented for dogfooding. The remaining release path is clean-profile installer qualification, broader terminal compatibility, performance validation, and repeatable signed Windows releases.
 
-See [NEXT_STEPS.md](NEXT_STEPS.md) for the active roadmap.
+For an isolated source-tree run without Task Scheduler registration:
+
+```powershell
+cargo build --bins
+.\target\debug\compi.exe --instance development
+```
+
+Build the per-user setup executable, portable ZIP, and SHA-256 manifest:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build-installer.ps1
+```
+
+The artifacts are written to `target\distribution`. Setup installs without elevation, registers the supervised daemon task, and exposes repair and removal through Windows Installed Apps. To inspect the installer without changing product state:
+
+```powershell
+cargo run --example compi-installer-preview -- ready
+# ready | upgrade | installing | complete | error | remove
+```
+
+See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) for the active roadmap.

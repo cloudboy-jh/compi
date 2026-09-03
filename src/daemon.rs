@@ -23,12 +23,29 @@ use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 use windows::core::PCWSTR;
 
 pub fn run(instance: Option<&str>) -> Result<()> {
-    wsl::ensure_default_wsl2()?;
     let names = identity::instance_names(instance)?;
     let _singleton = DaemonSingleton::acquire(&names.mutex)?;
+    let manager = Arc::new(SessionManager::persistent(instance)?);
+    wsl::ensure_default_wsl2()?;
     let security = PipeSecurity::for_current_user()?;
-    let manager = Arc::new(SessionManager::new());
     let stopping = Arc::new(AtomicBool::new(false));
+    if crate::perf::enabled() {
+        let sampler_manager = manager.clone();
+        let sampler_stopping = stopping.clone();
+        thread::spawn(move || {
+            while !sampler_stopping.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_secs(6));
+                if sampler_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                crate::perf::log_resource_sample(
+                    "daemon",
+                    "server",
+                    sampler_manager.session_count(),
+                );
+            }
+        });
+    }
     let connections = Arc::new(Mutex::new(HashMap::<u64, ConnectionSink>::new()));
     let handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
     let connection_ids = AtomicU64::new(1);
@@ -49,12 +66,16 @@ pub fn run(instance: Option<&str>) -> Result<()> {
             connection.disconnect();
         }
     }
-    manager.shutdown_all();
     if let Ok(mut handlers) = handlers.lock() {
         for handler in handlers.drain(..) {
             let _ = handler.join();
         }
     }
+    let shutdown_reason = match &result {
+        Ok(()) => "session ended because the daemon stopped intentionally".to_owned(),
+        Err(error) => format!("session ended because the daemon failed: {error}"),
+    };
+    manager.shutdown_all(&shutdown_reason);
     result
 }
 
@@ -247,12 +268,7 @@ fn handle_connection(
                     continue;
                 }
                 let Some(session) = manager.get(&session_id) else {
-                    send_error(
-                        &sink,
-                        Some(request.request_id),
-                        ErrorCode::SessionNotFound,
-                        "session was not found",
-                    );
+                    send_unavailable_session(&sink, request.request_id, &manager, &session_id);
                     continue;
                 };
                 match session.attach(sink.clone(), request.request_id, cols, rows) {
@@ -327,12 +343,7 @@ fn handle_connection(
             }
             ClientMessage::Kill { session_id } => {
                 let Some(session) = manager.get(&session_id) else {
-                    send_error(
-                        &sink,
-                        Some(request.request_id),
-                        ErrorCode::SessionNotFound,
-                        "session was not found",
-                    );
+                    send_unavailable_session(&sink, request.request_id, &manager, &session_id);
                     continue;
                 };
                 match session.kill() {
@@ -375,6 +386,27 @@ fn read_next(
         }
     }
     Ok(None)
+}
+
+fn send_unavailable_session(
+    sink: &ConnectionSink,
+    request_id: u64,
+    manager: &SessionManager,
+    session_id: &str,
+) {
+    if let Some(session) = manager.get_info(session_id) {
+        let message = session
+            .error
+            .unwrap_or_else(|| format!("session is {:?}", session.status).to_lowercase());
+        send_error(sink, Some(request_id), ErrorCode::SessionExited, &message);
+    } else {
+        send_error(
+            sink,
+            Some(request_id),
+            ErrorCode::SessionNotFound,
+            "session was not found",
+        );
+    }
 }
 
 fn send_session_error(sink: &ConnectionSink, request_id: u64, error: &SessionError) {

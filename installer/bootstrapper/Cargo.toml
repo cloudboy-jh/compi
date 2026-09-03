@@ -1,0 +1,15 @@
+[package]
+name = "compi-setup"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+compi = { path = "../.." }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

@@ -1,0 +1,9 @@
+pub const BACKGROUND: u32 = 0x171613;
+pub const SURFACE: u32 = 0x211f1a;
+pub const SURFACE_HOVER: u32 = 0x2b2922;
+pub const BORDER: u32 = 0x403c31;
+pub const FOREGROUND: u32 = 0xf4f1e8;
+pub const MUTED: u32 = 0xaaa394;
+pub const ACCENT: u32 = 0xdffb35;
+pub const ERROR: u32 = 0xe06c75;
+pub const SELECTION: u32 = 0x4b5420;

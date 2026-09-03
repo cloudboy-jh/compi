@@ -5,6 +5,9 @@ use crate::terminal::{
     Cell, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MirrorApply, MouseMode, Row,
     ScreenMessage, ScreenMirror, ScreenSnapshot,
 };
+use crate::theme::{
+    ACCENT, BACKGROUND, BORDER, ERROR, FOREGROUND, MUTED, SELECTION, SURFACE, SURFACE_HOVER,
+};
 use base64::Engine as _;
 use gpui::{
     App, Application, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
@@ -56,16 +59,6 @@ const TERMINAL_PADDING: f32 = 8.0;
 const RECONNECT_DELAY: Duration = Duration::from_millis(350);
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
 const UI_EVENT_YIELD: Duration = Duration::from_micros(8_333);
-
-const BACKGROUND: u32 = 0x171613;
-const SURFACE: u32 = 0x211f1a;
-const SURFACE_HOVER: u32 = 0x2b2922;
-const BORDER: u32 = 0x403c31;
-const FOREGROUND: u32 = 0xf4f1e8;
-const MUTED: u32 = 0xaaa394;
-const ACCENT: u32 = 0xdffb35;
-const ERROR: u32 = 0xe06c75;
-const SELECTION: u32 = 0x4b5420;
 
 pub fn run(instance: Option<String>) {
     let started_at = Instant::now();
@@ -296,7 +289,13 @@ impl UiEventSender {
 struct CompiApp {
     started_at: Instant,
     instance: Option<String>,
+    empty_window: bool,
+    perf_target_sessions: usize,
     first_snapshot_logged: bool,
+    ready_probe_marker: Option<String>,
+    ready_probe_sent_at: Option<Instant>,
+    ready_probe_render_pending: bool,
+    ready_probe_logged: bool,
     window_title: String,
     focus_handle: FocusHandle,
     ime_text: String,
@@ -326,11 +325,21 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let (event_tx, event_rx) = async_channel::unbounded();
+        let empty_window = crate::perf::empty_window_enabled();
+        let ready_probe_marker = crate::perf::ready_probe_enabled()
+            .then(|| format!("COMPI_READY_{}", std::process::id()));
+        let perf_target_sessions = crate::perf::target_session_count();
         let event_tx = UiEventSender(event_tx);
         let mut this = Self {
             started_at,
             instance,
+            empty_window,
+            perf_target_sessions,
             first_snapshot_logged: false,
+            ready_probe_marker,
+            ready_probe_sent_at: None,
+            ready_probe_render_pending: false,
+            ready_probe_logged: false,
             window_title: String::from("Compi"),
             focus_handle: cx.focus_handle(),
             ime_text: String::new(),
@@ -343,7 +352,7 @@ impl CompiApp {
             next_tab_id: 1,
             sessions: Vec::new(),
             switcher_open: false,
-            loading_sessions: true,
+            loading_sessions: !empty_window,
             attach_after_session_list: false,
             global_error: None,
             event_tx,
@@ -353,7 +362,9 @@ impl CompiApp {
         };
 
         this.update_dimensions(window);
-        this.refresh_sessions(true);
+        if !empty_window {
+            this.refresh_sessions(true);
+        }
         this.subscriptions
             .push(cx.observe_window_bounds(window, |this, window, cx| {
                 this.update_dimensions(window);
@@ -368,6 +379,27 @@ impl CompiApp {
         window.on_next_frame(move |_, _| {
             log_startup_metric("first_window_frame_ms", first_frame_started_at.elapsed());
         });
+        if crate::perf::enabled() {
+            cx.spawn(async move |weak, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(6)).await;
+                    if weak
+                        .update(cx, |this, _| {
+                            let workload = if this.empty_window {
+                                "empty_window"
+                            } else {
+                                "terminal"
+                            };
+                            crate::perf::log_resource_sample("client", workload, this.tabs.len());
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
 
         cx.spawn(async move |weak, cx| {
             while let Ok(first) = event_rx.recv().await {
@@ -419,6 +451,12 @@ impl CompiApp {
                 .map_err(|error| error.to_string());
             let _ = sender.send(UiEvent::SessionCreated(result));
         });
+    }
+
+    fn create_next_perf_session(&mut self) {
+        if self.tabs.len() < self.perf_target_sessions {
+            self.create_session();
+        }
     }
 
     fn attach_session(&mut self, session: SessionInfo) {
@@ -484,6 +522,7 @@ impl CompiApp {
                         .cloned()
                     {
                         self.attach_session(session);
+                        self.create_next_perf_session();
                     } else {
                         self.create_session();
                     }
@@ -496,25 +535,44 @@ impl CompiApp {
             UiEvent::SessionCreated(Ok(session)) => {
                 self.sessions.push(session.clone());
                 self.attach_session(session);
+                self.create_next_perf_session();
             }
             UiEvent::SessionCreated(Err(error)) => self.global_error = Some(error),
             UiEvent::TabConnected { tab_id, transport } => {
                 let (cols, rows) = (self.terminal_cols, self.terminal_rows);
+                let ready_probe = self
+                    .ready_probe_marker
+                    .clone()
+                    .filter(|_| self.ready_probe_sent_at.is_none());
+                if ready_probe.is_some() {
+                    self.ready_probe_sent_at = Some(Instant::now());
+                }
                 if let Some(tab) = self.tab_mut(tab_id) {
                     tab.transport = Some(transport);
                     tab.state = ConnectionState::Attached;
                     tab.error = None;
                     tab.send(ClientMessage::Resize { cols, rows });
+                    if let Some(marker) = ready_probe {
+                        tab.send(ClientMessage::Input {
+                            data: format!("printf '%s\\n' '{marker}'\n").into_bytes(),
+                        });
+                    }
                 }
             }
             UiEvent::TabScreen { tab_id, message } => {
                 let mut request_snapshot = false;
+                let mut ready_probe_observed = false;
                 let sender = self.event_tx.clone();
+                let ready_probe_marker = self.ready_probe_marker.clone();
                 if let Some(tab) = self.tab_mut(tab_id) {
                     request_snapshot = matches!(tab.mirror.apply(message), MirrorApply::Gap { .. });
                     if !request_snapshot {
                         tab.state = ConnectionState::Attached;
                         tab.refresh_images(tab_id, sender);
+                        ready_probe_observed =
+                            ready_probe_marker.as_deref().is_some_and(|marker| {
+                                snapshot_contains_marker(tab.mirror.snapshot(), marker)
+                            });
                     }
                 }
                 if request_snapshot {
@@ -523,8 +581,12 @@ impl CompiApp {
                     }
                 } else if !self.first_snapshot_logged {
                     self.first_snapshot_logged = true;
-                    log_startup_metric("first_terminal_frame_ms", self.started_at.elapsed());
+                    crate::perf::log_startup_metric(
+                        "first_terminal_frame_ms",
+                        self.started_at.elapsed(),
+                    );
                 }
+                self.ready_probe_render_pending |= ready_probe_observed;
             }
             UiEvent::KittyImageDecoded {
                 tab_id,
@@ -1224,7 +1286,11 @@ impl CompiApp {
                 SessionStatus::Running => "Detached",
                 SessionStatus::Exited => "Exited",
                 SessionStatus::Failed => "Failed",
+                SessionStatus::Dead => "Dead",
             };
+            let detail = (session.status == SessionStatus::Dead)
+                .then(|| session.error.clone())
+                .flatten();
             let session_for_attach = session.clone();
             div()
                 .id(("session", session.created_at_ms))
@@ -1246,27 +1312,59 @@ impl CompiApp {
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .gap_2()
-                        .when(session.status == SessionStatus::Running, |title| {
-                            title.child(
+                        .flex_col()
+                        .gap_1()
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when(session.status == SessionStatus::Running, |title| {
+                                            title.child(div().size(px(5.0)).rounded_full().bg(
+                                                color(if session.attached {
+                                                    ACCENT
+                                                } else {
+                                                    MUTED
+                                                }),
+                                            ))
+                                        })
+                                        .child(short_session_id(&session.id)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_sm()
+                                        .text_color(
+                                            if matches!(
+                                                session.status,
+                                                SessionStatus::Failed | SessionStatus::Dead
+                                            ) {
+                                                color(ERROR)
+                                            } else {
+                                                color(MUTED)
+                                            },
+                                        )
+                                        .child(status),
+                                ),
+                        )
+                        .when_some(detail, |details, detail| {
+                            details.child(
                                 div()
-                                    .size(px(5.0))
-                                    .rounded_full()
-                                    .bg(color(if session.attached { ACCENT } else { MUTED })),
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(11.0))
+                                    .text_color(color(MUTED))
+                                    .child(detail),
                             )
-                        })
-                        .child(short_session_id(&session.id)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(if session.status == SessionStatus::Failed {
-                            color(ERROR)
-                        } else {
-                            color(MUTED)
-                        })
-                        .child(status),
+                        }),
                 )
         });
 
@@ -1694,6 +1792,18 @@ impl Render for CompiApp {
         if title != self.window_title {
             window.set_window_title(&title);
             self.window_title = title;
+        }
+        if self.ready_probe_render_pending && !self.ready_probe_logged {
+            self.ready_probe_render_pending = false;
+            self.ready_probe_logged = true;
+            let started_at = self.started_at;
+            let sent_at = self.ready_probe_sent_at;
+            window.on_next_frame(move |_, _| {
+                crate::perf::log_startup_metric("ready_for_input_ms", started_at.elapsed());
+                if let Some(sent_at) = sent_at {
+                    crate::perf::log_startup_metric("input_to_render_ms", sent_at.elapsed());
+                }
+            });
         }
         div()
             .key_context("Terminal")
@@ -2548,21 +2658,25 @@ fn short_session_id(id: &str) -> String {
         .collect()
 }
 
-fn log_startup_metric(name: &str, elapsed: Duration) {
-    let Some(local_app_data) = env::var_os("LOCALAPPDATA") else {
-        return;
+fn snapshot_contains_marker(snapshot: Option<&ScreenSnapshot>, marker: &str) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
     };
-    let directory = std::path::PathBuf::from(local_app_data).join("Compi");
-    if fs::create_dir_all(&directory).is_err() {
-        return;
-    }
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("client.log"))
-    {
-        let _ = writeln!(file, "{name}={}", elapsed.as_millis());
-    }
+    snapshot
+        .scrollback
+        .iter()
+        .chain(&snapshot.cells)
+        .any(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains(marker)
+        })
+}
+
+fn log_startup_metric(name: &str, elapsed: Duration) {
+    crate::perf::log_startup_metric(name, elapsed);
 }
 
 #[derive(Default)]

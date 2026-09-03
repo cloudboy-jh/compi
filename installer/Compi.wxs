@@ -1,0 +1,127 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Compi"
+    Manufacturer="Compi"
+    Version="$(var.Version)"
+    UpgradeCode="{26B5FE7A-FDC6-4083-BEBD-947B3872311E}"
+    Scope="perUser"
+    Compressed="yes">
+
+    <SummaryInformation Description="Compi persistent WSL terminal" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Compi is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="CompiIcon" SourceFile="$(var.ProjectDir)\assets\Compi-desktopappicon-v4.ico" />
+    <Property Id="ARPPRODUCTICON" Value="CompiIcon" />
+    <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Compi">
+          <Component Id="ProductFiles" Guid="{6CCA75E9-042A-408A-9F8F-4CF30DE24843}">
+            <File Id="CompiExe" Source="$(var.BinDir)\compi.exe" />
+            <File Id="DaemonExe" Source="$(var.BinDir)\compi-daemon.exe" />
+            <File Id="MaintenanceExe" Name="Compi-Setup.exe" Source="$(var.MaintenanceExe)" />
+            <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+            <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\Compi"
+              Name="Installed"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="DisplayName" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="DisplayVersion" Type="string" Value="$(var.Version)" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="Publisher" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="InstallLocation" Type="string" Value="[INSTALLFOLDER]" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="DisplayIcon" Type="string" Value="[INSTALLFOLDER]compi.exe" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="UninstallString" Type="string" Value="&quot;[INSTALLFOLDER]Compi-Setup.exe&quot; --remove &quot;[ProductCode]&quot;" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="ModifyPath" Type="string" Value="&quot;[INSTALLFOLDER]Compi-Setup.exe&quot; --repair &quot;[ProductCode]&quot;" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="NoModify" Type="integer" Value="0" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="NoRepair" Type="integer" Value="0" />
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="WindowsInstaller" Type="integer" Value="0" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Compi">
+        <Component Id="StartMenuShortcut" Guid="{CFE1A452-4223-43E1-B1D4-5AF4396C164C}">
+          <Shortcut
+            Id="CompiStartMenuShortcut"
+            Name="Compi"
+            Description="Persistent WSL terminal"
+            Target="[INSTALLFOLDER]compi.exe"
+            WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue
+            Root="HKCU"
+            Key="Software\Compi"
+            Name="StartMenuShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Compi" Level="1">
+      <ComponentRef Id="ProductFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <CustomAction
+      Id="StopCompiDaemon"
+      FileRef="DaemonExe"
+      ExeCommand="--shutdown"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check" />
+    <CustomAction
+      Id="WriteCompiTaskXml"
+      FileRef="DaemonExe"
+      ExeCommand="--write-task-xml &quot;[INSTALLFOLDER]daemon-task.xml&quot; &quot;[UserSID]&quot;"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check" />
+    <CustomAction
+      Id="RemoveCompiTask"
+      Directory="SystemFolder"
+      ExeCommand="schtasks.exe /Delete /TN &quot;Compi Daemon&quot; /F"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="ignore" />
+    <CustomAction
+      Id="RegisterCompiTask"
+      Directory="SystemFolder"
+      ExeCommand="schtasks.exe /Create /TN &quot;Compi Daemon&quot; /XML &quot;[INSTALLFOLDER]daemon-task.xml&quot; /F"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check" />
+    <CustomAction
+      Id="RollbackCompiTask"
+      Directory="SystemFolder"
+      ExeCommand="schtasks.exe /Delete /TN &quot;Compi Daemon&quot; /F"
+      Execute="rollback"
+      Impersonate="yes"
+      Return="ignore" />
+    <CustomAction
+      Id="CleanupCompiTaskXml"
+      FileRef="DaemonExe"
+      ExeCommand="--remove-task-xml &quot;[INSTALLFOLDER]daemon-task.xml&quot;"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="StopCompiDaemon" Before="RemoveCompiTask" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveCompiTask" Before="CleanupCompiTaskXml" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="CleanupCompiTaskXml" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="WriteCompiTaskXml" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RollbackCompiTask" After="WriteCompiTaskXml" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RegisterCompiTask" After="RollbackCompiTask" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

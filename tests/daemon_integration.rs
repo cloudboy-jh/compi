@@ -9,9 +9,18 @@ use compi::protocol::{
     decode_server, encode_client,
 };
 use compi::terminal::{Color, MirrorApply, ScreenMessage, ScreenMirror, ScreenSnapshot};
+use std::fs;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Threading::{
+    GetProcessHandleCount, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
+static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct DaemonGuard {
     child: Child,
@@ -20,7 +29,10 @@ struct DaemonGuard {
 
 impl DaemonGuard {
     fn start() -> Self {
-        let instance = format!("integration_{}", std::process::id());
+        Self::start_instance(unique_instance())
+    }
+
+    fn start_instance(instance: String) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_compi-daemon"))
             .args(["--instance", &instance])
             .stdin(Stdio::null())
@@ -52,6 +64,12 @@ impl DaemonGuard {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    fn crash(mut self) -> String {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.instance.clone()
+    }
 }
 
 impl Drop for DaemonGuard {
@@ -66,6 +84,7 @@ impl Drop for DaemonGuard {
 #[test]
 fn persistent_multi_session_lifecycle() {
     let daemon = DaemonGuard::start();
+    let instance = daemon.instance.clone();
     reject_incompatible_protocol(&daemon.instance);
 
     let mut control = daemon.client();
@@ -272,6 +291,159 @@ fn persistent_multi_session_lifecycle() {
 
     drop(control);
     daemon.shutdown();
+    cleanup_metadata(&instance);
+}
+
+#[test]
+fn repeated_kills_release_daemon_process_handles() {
+    let daemon = DaemonGuard::start();
+    let instance = daemon.instance.clone();
+    let mut control = daemon.client();
+    let baseline = process_handle_count(daemon.child.id());
+
+    for _ in 0..12 {
+        let session = control.create_session(80, 24).unwrap();
+        control.kill_session(session.id.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = control
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap()
+                .status;
+            if matches!(status, SessionStatus::Exited | SessionStatus::Failed) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "killed session did not exit");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    thread::sleep(Duration::from_millis(250));
+    let final_count = process_handle_count(daemon.child.id());
+    assert!(
+        final_count <= baseline + 4,
+        "daemon process handles grew from {baseline} to {final_count}"
+    );
+
+    drop(control);
+    daemon.shutdown();
+    cleanup_metadata(&instance);
+}
+
+#[test]
+fn daemon_restart_reports_lost_sessions_as_dead() {
+    let daemon = DaemonGuard::start();
+    let mut client = daemon.client();
+    let lost = client.create_session(80, 24).unwrap();
+    drop(client);
+
+    let instance = daemon.crash();
+    let restarted = DaemonGuard::start_instance(instance.clone());
+    let mut client = restarted.client();
+    let dead = client
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == lost.id)
+        .expect("lost session metadata was not retained");
+    assert_eq!(dead.status, SessionStatus::Dead);
+    assert!(!dead.attached);
+    assert!(dead.error.as_deref().unwrap().contains("previous daemon"));
+
+    let attach_error = client
+        .request(ClientMessage::Attach {
+            session_id: lost.id,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(attach_error.contains("SessionExited"));
+
+    let replacement = client.create_session(80, 24).unwrap();
+    drop(client);
+    restarted.shutdown();
+
+    let restarted = DaemonGuard::start_instance(instance.clone());
+    let mut client = restarted.client();
+    let replacement = client
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == replacement.id)
+        .expect("intentional shutdown metadata was not retained");
+    assert_eq!(replacement.status, SessionStatus::Dead);
+    assert!(
+        replacement
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("stopped intentionally")
+    );
+    drop(client);
+    restarted.shutdown();
+    cleanup_metadata(&instance);
+}
+
+#[test]
+fn daemon_quarantines_malformed_session_metadata() {
+    let instance = unique_instance();
+    let path = metadata_path(&instance);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"{not-json").unwrap();
+
+    let daemon = DaemonGuard::start_instance(instance.clone());
+    assert!(daemon.client().list_sessions().unwrap().is_empty());
+    assert!(!path.exists());
+    let prefix = path.file_stem().unwrap().to_string_lossy().into_owned();
+    assert!(fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
+        entry.ok().is_some_and(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{prefix}.corrupt-"))
+        })
+    }));
+    daemon.shutdown();
+    cleanup_metadata(&instance);
+}
+
+fn unique_instance() -> String {
+    format!(
+        "i{:x}{:x}",
+        std::process::id(),
+        INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn metadata_path(instance: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+        .join("Compi")
+        .join(format!("sessions-{instance}-v1.json"))
+}
+
+fn cleanup_metadata(instance: &str) {
+    let path = metadata_path(instance);
+    let prefix = path.file_stem().unwrap().to_string_lossy().into_owned();
+    if let Ok(entries) = fs::read_dir(path.parent().unwrap()) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn process_handle_count(process_id: u32) -> u32 {
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.unwrap();
+    let mut count = 0;
+    unsafe { GetProcessHandleCount(process, &mut count) }.unwrap();
+    unsafe { CloseHandle(process) }.unwrap();
+    count
 }
 
 fn reject_incompatible_protocol(instance: &str) {

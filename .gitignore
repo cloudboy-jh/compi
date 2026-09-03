@@ -1,2 +1,3 @@
-/target/
+target/
 *.pdb
+/installer/bootstrapper/payload/

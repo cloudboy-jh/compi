@@ -1,0 +1,69 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Locate Windows SDK shader compiler
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $fxc = Get-ChildItem -Path $sdkRoot -Filter fxc.exe -File -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+            Select-Object -First 1
+          if (-not $fxc) {
+            throw "fxc.exe was not found below $sdkRoot"
+          }
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Using $($fxc.FullName)"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run strict Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run all target tests
+        run: cargo test --all-targets
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Verify product binaries
+        shell: pwsh
+        run: |
+          $expected = @('compi.exe', 'compi-daemon.exe')
+          $actual = Get-ChildItem target\release -File -Filter *.exe | Select-Object -ExpandProperty Name | Sort-Object
+          $difference = Compare-Object ($expected | Sort-Object) $actual
+          if ($difference) {
+            $difference | Format-Table | Out-String | Write-Host
+            throw "target/release does not contain exactly the product executables"
+          }
+
+      - name: Build installer distribution
+        shell: pwsh
+        run: .\tools\build-installer.ps1

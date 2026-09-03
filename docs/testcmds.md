@@ -15,6 +15,20 @@ cargo test --all-targets
 cargo build --release --bins
 ```
 
+Release builds of GPUI require the Windows SDK shader compiler. Resolve the newest installed x64 compiler and pass its executable path through `GPUI_FXC_PATH`:
+
+```powershell
+$sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+$fxc = Get-ChildItem -Path $sdkRoot -Filter fxc.exe -File -Recurse |
+  Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+  Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+  Select-Object -First 1
+if (-not $fxc) { throw "fxc.exe was not found below $sdkRoot" }
+$env:GPUI_FXC_PATH = $fxc.FullName
+```
+
+`GPUI_FXC_PATH` must name `fxc.exe`, not its containing directory. The Windows CI workflow uses the same discovery rule.
+
 Required result: every command exits zero. The release directory contains `compi.exe` and `compi-daemon.exe`; it does not contain `compi-probe.exe`.
 
 ## Tier 2: scripted terminal and performance checks
@@ -63,21 +77,41 @@ Run these commands inside an attached 100x30 Compi terminal. Capture pass/fail, 
 | 10 KiB paste | Paste a deterministic 10 KiB ASCII block into `wc -c` input, then `Ctrl+D` | Reported byte count matches the source exactly. |
 | Reattach under output | Start a build or count loop, close Compi, wait, reopen and attach | Process never stops; current screen and subsequent output are coherent. |
 
-For performance sampling, launch the release client with opt-in instrumentation:
+For ad hoc performance sampling, launch the release client with opt-in instrumentation:
 
 ```powershell
 $env:COMPI_PERF_LOG = '1'
+$env:COMPI_PERF_SAMPLE = 'manual-01'
 .\target\release\compi.exe --instance acceptance
 ```
 
-`%LOCALAPPDATA%\Compi\client.log` records first-window-frame and first-terminal-frame latency. `%LOCALAPPDATA%\Compi\client-perf.log` records frame-interval p50/p95, terminal-paint p50/p95, private bytes, and handle count during active output. The performance gate is:
+Instrumentation writes:
+
+- `%LOCALAPPDATA%\Compi\client-startup.log`: daemon connection, first window, first terminal frame, and optional ready-probe timing;
+- `%LOCALAPPDATA%\Compi\client-resource-<pid>.log`: six-second client private bytes, working set, handles, workload, and attached-tab count;
+- `%LOCALAPPDATA%\Compi\daemon-resource-<pid>.log`: six-second daemon private bytes, working set, handles, and session count;
+- `%LOCALAPPDATA%\Compi\client-perf.log`: frame-interval and terminal-paint distributions under active output.
+
+Set `COMPI_PERF_EMPTY_WINDOW=1` with `COMPI_PERF_LOG=1` to measure a blank GPUI window without connecting to a daemon. Set `COMPI_PERF_READY_PROBE=1` only against an isolated measurement session; it sends a deterministic `printf` command and measures both launch-to-rendered-marker and input-to-rendered-marker time.
+
+The release harness runs empty-window, warm-daemon, and cold-daemon launch samples; measures fresh one-, two-, and four-session client/daemon pairs; queries Windows GPU process-memory counters; and writes CSV plus environment JSON under `%LOCALAPPDATA%\Compi\measurements`:
+
+```powershell
+cargo build --release --bins --example compi-probe
+.\tools\measure-release.ps1 -Samples 10 -ConfirmPhysicalDisplay
+```
+
+`-ConfirmPhysicalDisplay` is an operator assertion. Do not pass it through a virtual display or remote-only session. Without it, the harness intentionally labels the run diagnostic rather than qualified. For longer marginal-session analysis, keep instrumentation active, add one blank session at a time, wait at least six seconds per state, and compare consecutive client and daemon resource records by their `sessions` values.
+
+The performance gate is:
 
 - first visible frame p95 under 100 ms;
-- warm existing-session interactive p95 under 200 ms;
-- active frame-interval p95 under 8,333 µs on a 120 Hz display;
+- warm existing-session ready-for-input p95 under 200 ms;
+- cold first-terminal-frame p95 under 500 ms;
+- active frame-interval p95 under 8,333 µs on a physical 120 Hz display;
 - terminal-paint p95 below the frame interval;
-- initially no more than 35 MiB private bytes, with a stretch target of 25 MiB;
-- no sustained private-byte or handle growth after tabs and Kitty images are closed.
+- initially no more than 35 MiB client private bytes, with a stretch target of 25 MiB;
+- no sustained private-byte, GPU-memory, or handle growth after tabs and Kitty images are closed.
 
 ## Tier 3: interactive client acceptance
 
