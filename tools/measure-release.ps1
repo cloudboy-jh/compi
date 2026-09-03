@@ -1,12 +1,15 @@
 [CmdletBinding()]
 param(
-    [string]$BinaryDirectory = (Join-Path $PSScriptRoot '..\target\release'),
+    [string]$BinaryDirectory,
     [ValidateSet('warm', 'cold', 'empty')]
     [string[]]$Mode = @('warm', 'cold', 'empty'),
     [ValidateRange(1, 100)]
     [int]$Samples = 10,
     [switch]$ConfirmPhysicalDisplay
 )
+if (-not $BinaryDirectory) {
+    $BinaryDirectory = Join-Path $PSScriptRoot '..\target\release'
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -114,8 +117,16 @@ function Wait-Daemon {
 
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     while ([DateTime]::UtcNow -lt $deadline) {
-        & $probePath --instance $Instance list *> $null
-        if ($LASTEXITCODE -eq 0) {
+        $priorErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & $probePath --instance $Instance list *> $null
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+        }
+        if ($exitCode -eq 0) {
             return
         }
         Start-Sleep -Milliseconds 100

@@ -60,9 +60,11 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(350);
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
 const UI_EVENT_YIELD: Duration = Duration::from_micros(8_333);
 
-pub fn run(instance: Option<String>) {
+pub fn run(instance: Option<String>, initial_working_directory: Option<String>) {
     let started_at = Instant::now();
-    Application::new().run(move |cx: &mut App| {
+    let application = Application::new();
+    log_startup_metric("application_created_ms", started_at.elapsed());
+    application.run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("ctrl-t", NewTab, Some("Terminal")),
             KeyBinding::new("ctrl-w", CloseTab, Some("Terminal")),
@@ -87,9 +89,14 @@ pub fn run(instance: Option<String>) {
                     focus: true,
                     ..Default::default()
                 },
-                move |window, cx| cx.new(|cx| CompiApp::new(started_at, instance, window, cx)),
+                move |window, cx| {
+                    cx.new(|cx| {
+                        CompiApp::new(started_at, instance, initial_working_directory, window, cx)
+                    })
+                },
             )
             .expect("failed to open Compi window");
+        log_startup_metric("window_opened_ms", started_at.elapsed());
 
         window
             .update(cx, |view, window, cx| {
@@ -289,6 +296,7 @@ impl UiEventSender {
 struct CompiApp {
     started_at: Instant,
     instance: Option<String>,
+    initial_working_directory: Option<String>,
     empty_window: bool,
     perf_target_sessions: usize,
     first_snapshot_logged: bool,
@@ -321,6 +329,7 @@ impl CompiApp {
     fn new(
         started_at: Instant,
         instance: Option<String>,
+        initial_working_directory: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -333,6 +342,7 @@ impl CompiApp {
         let mut this = Self {
             started_at,
             instance,
+            initial_working_directory,
             empty_window,
             perf_target_sessions,
             first_snapshot_logged: false,
@@ -440,22 +450,28 @@ impl CompiApp {
         });
     }
 
-    fn create_session(&mut self) {
+    fn create_session(&mut self, working_directory: Option<String>) {
         let sender = self.event_tx.clone();
         let cols = self.terminal_cols;
         let rows = self.terminal_rows;
         let instance = self.instance.clone();
         thread::spawn(move || {
             let result = app::connect_or_start(instance.as_deref())
-                .and_then(|mut client| client.create_session(cols, rows))
+                .and_then(|mut client| client.create_session(cols, rows, working_directory))
                 .map_err(|error| error.to_string());
             let _ = sender.send(UiEvent::SessionCreated(result));
         });
     }
 
+    fn create_inherited_session(&mut self) {
+        let working_directory =
+            inherited_working_directory(self.active_tab().and_then(|tab| tab.mirror.snapshot()));
+        self.create_session(working_directory);
+    }
+
     fn create_next_perf_session(&mut self) {
         if self.tabs.len() < self.perf_target_sessions {
-            self.create_session();
+            self.create_session(None);
         }
     }
 
@@ -508,12 +524,15 @@ impl CompiApp {
     fn handle_event(&mut self, event: UiEvent) {
         match event {
             UiEvent::SessionsLoaded(Ok(sessions)) => {
+                self.global_error = None;
                 self.loading_sessions = false;
                 let needs_initial_tab = self.attach_after_session_list && self.tabs.is_empty();
                 self.attach_after_session_list = false;
                 self.sessions = sessions;
                 if needs_initial_tab {
-                    if let Some(session) = self
+                    if let Some(working_directory) = self.initial_working_directory.take() {
+                        self.create_session(Some(working_directory));
+                    } else if let Some(session) = self
                         .sessions
                         .iter()
                         .find(|session| {
@@ -524,7 +543,7 @@ impl CompiApp {
                         self.attach_session(session);
                         self.create_next_perf_session();
                     } else {
-                        self.create_session();
+                        self.create_session(None);
                     }
                 }
             }
@@ -533,6 +552,7 @@ impl CompiApp {
                 self.global_error = Some(error);
             }
             UiEvent::SessionCreated(Ok(session)) => {
+                self.global_error = None;
                 self.sessions.push(session.clone());
                 self.attach_session(session);
                 self.create_next_perf_session();
@@ -684,7 +704,7 @@ impl CompiApp {
     }
 
     fn new_tab(&mut self, _: &NewTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.create_session();
+        self.create_inherited_session();
         cx.notify();
     }
 
@@ -1203,7 +1223,7 @@ impl CompiApp {
                     })
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.create_session();
+                        this.create_inherited_session();
                         cx.stop_propagation();
                         cx.notify();
                     }))
@@ -1411,7 +1431,7 @@ impl CompiApp {
                                     .text_color(color(ACCENT))
                                     .hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.create_session();
+                                        this.create_inherited_session();
                                         cx.notify();
                                     }))
                                     .child("New"),
@@ -1436,6 +1456,19 @@ impl CompiApp {
             .active_tab()
             .and_then(|tab| tab.error.clone())
             .or_else(|| self.global_error.clone());
+        let warning = error
+            .is_none()
+            .then(|| {
+                let session_id = self.active_tab().map(|tab| tab.session_id.as_str())?;
+                self.sessions
+                    .iter()
+                    .find(|session| session.id == session_id)?
+                    .working_directory
+                    .as_ref()?
+                    .warning
+                    .clone()
+            })
+            .flatten();
         let input = cx.entity();
         let input_focus = self.focus_handle.clone();
         div()
@@ -1482,6 +1515,24 @@ impl CompiApp {
                         .text_sm()
                         .text_color(color(ERROR))
                         .child(error.unwrap_or_default()),
+                )
+            })
+            .when(warning.is_some(), |terminal| {
+                terminal.child(
+                    div()
+                        .absolute()
+                        .bottom_2()
+                        .left_2()
+                        .right_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(color(SURFACE))
+                        .border_1()
+                        .border_color(color(ACCENT))
+                        .text_sm()
+                        .text_color(color(FOREGROUND))
+                        .child(warning.unwrap_or_default()),
                 )
             })
             .when(
@@ -2248,6 +2299,9 @@ fn ansi_color(index: u8) -> u32 {
     let gray = 8 + 10 * u32::from(index - 232);
     (gray << 16) | (gray << 8) | gray
 }
+fn inherited_working_directory(snapshot: Option<&ScreenSnapshot>) -> Option<String> {
+    snapshot.and_then(|snapshot| snapshot.current_directory.clone())
+}
 
 fn color(value: u32) -> Hsla {
     rgb(value).into()
@@ -2826,9 +2880,21 @@ mod tests {
             cursor: CursorState::default(),
             modes: TerminalModes::default(),
             title: String::new(),
+            current_directory: None,
             images: Vec::new(),
             placements: Vec::new(),
         }
+    }
+
+    #[test]
+    fn inherits_current_directory_from_active_screen_state() {
+        let mut screen = snapshot(Vec::new(), vec![row("", false)]);
+        screen.current_directory = Some("/home/dev/project".to_owned());
+        assert_eq!(
+            inherited_working_directory(Some(&screen)),
+            Some("/home/dev/project".to_owned())
+        );
+        assert_eq!(inherited_working_directory(None), None);
     }
 
     #[test]

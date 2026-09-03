@@ -60,8 +60,17 @@ impl DaemonClient {
         }
     }
 
-    pub fn create_session(&mut self, cols: i16, rows: i16) -> Result<SessionInfo> {
-        match self.request(ClientMessage::CreateSession { cols, rows })? {
+    pub fn create_session(
+        &mut self,
+        cols: i16,
+        rows: i16,
+        working_directory: Option<String>,
+    ) -> Result<SessionInfo> {
+        match self.request(ClientMessage::CreateSession {
+            cols,
+            rows,
+            working_directory,
+        })? {
             ServerMessage::SessionCreated { session } => Ok(session),
             message => Err(unexpected_response(message)),
         }

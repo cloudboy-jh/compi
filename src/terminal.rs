@@ -140,6 +140,7 @@ pub struct ScreenSnapshot {
     pub cursor: CursorState,
     pub modes: TerminalModes,
     pub title: String,
+    pub current_directory: Option<String>,
     pub images: Vec<KittyImage>,
     pub placements: Vec<KittyPlacement>,
 }
@@ -160,6 +161,7 @@ pub struct ScreenDelta {
     pub cursor: CursorState,
     pub modes: TerminalModes,
     pub title: String,
+    pub current_directory: Option<String>,
     pub images: Option<Vec<KittyImage>>,
     pub placements: Option<Vec<KittyPlacement>>,
 }
@@ -224,6 +226,7 @@ impl ScreenMirror {
                 snapshot.cursor = delta.cursor;
                 snapshot.modes = delta.modes;
                 snapshot.title = delta.title;
+                snapshot.current_directory = delta.current_directory;
                 if let Some(images) = delta.images {
                     snapshot.images = images;
                 }
@@ -298,6 +301,7 @@ struct ChangeBaseline {
     cursor: CursorState,
     modes: TerminalModes,
     title: String,
+    current_directory: Option<String>,
 }
 
 pub struct TerminalState {
@@ -310,6 +314,7 @@ pub struct TerminalState {
     saved_cursor: CursorState,
     rendition: Rendition,
     title: String,
+    current_directory: Option<String>,
     modes: TerminalModes,
     scroll_top: usize,
     scroll_bottom: usize,
@@ -342,6 +347,7 @@ impl TerminalState {
             saved_cursor: CursorState::default(),
             rendition: Rendition::default(),
             title: String::new(),
+            current_directory: None,
             modes: TerminalModes {
                 auto_wrap: true,
                 ..TerminalModes::default()
@@ -381,6 +387,7 @@ impl TerminalState {
             cursor: self.cursor,
             modes: self.modes.clone(),
             title: self.title.clone(),
+            current_directory: self.current_directory.clone(),
             images,
             placements,
         }
@@ -423,6 +430,7 @@ impl TerminalState {
             cursor: self.cursor,
             modes: self.modes.clone(),
             title: self.title.clone(),
+            current_directory: self.current_directory.clone(),
         }
     }
 
@@ -440,7 +448,8 @@ impl TerminalState {
             || graphics_changed
             || before.cursor != self.cursor
             || before.modes != self.modes
-            || before.title != self.title;
+            || before.title != self.title
+            || before.current_directory != self.current_directory;
         if !changed {
             return (None, replies);
         }
@@ -473,6 +482,7 @@ impl TerminalState {
             cursor: self.cursor,
             modes: self.modes.clone(),
             title: self.title.clone(),
+            current_directory: self.current_directory.clone(),
             images,
             placements,
         };
@@ -1198,6 +1208,10 @@ impl Perform for TerminalState {
                 .get(1)
                 .map(|value| String::from_utf8_lossy(value).into_owned())
                 .unwrap_or_default();
+        } else if command == "7"
+            && let Some(path) = params.get(1).and_then(|value| parse_osc7_path(value))
+        {
+            self.current_directory = Some(path);
         }
     }
 
@@ -1298,6 +1312,41 @@ impl Perform for TerminalState {
             b'H' | b'=' | b'>' => {}
             _ => eprintln!("compi-daemon: unsupported ESC sequence {byte:?}"),
         }
+    }
+}
+
+fn parse_osc7_path(value: &[u8]) -> Option<String> {
+    let uri = std::str::from_utf8(value).ok()?;
+    let location = uri.strip_prefix("file://")?;
+    let path = &location[location.find('/')?..];
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_digit(*bytes.get(index + 1)?)?;
+            let low = hex_digit(*bytes.get(index + 2)?)?;
+            decoded.push(high << 4 | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    if decoded.contains(&0) {
+        return None;
+    }
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|path| path.starts_with('/'))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1402,6 +1451,27 @@ mod tests {
         assert_eq!(snapshot.cells[0].cells[2].width, 2);
         assert_eq!(snapshot.cells[0].cells[3].width, 0);
         assert_eq!(snapshot.title, "Compi");
+    }
+
+    #[test]
+    fn tracks_percent_decoded_osc7_working_directory() {
+        let mut terminal = TerminalState::new(12, 3);
+        let (delta, _) =
+            terminal.advance(b"\x1b]7;file://wsl-host/home/dev/Agent%20Projects/%CF%80\x07");
+        assert_eq!(
+            terminal.snapshot().current_directory.as_deref(),
+            Some("/home/dev/Agent Projects/π")
+        );
+        assert_eq!(
+            delta.and_then(|delta| delta.current_directory),
+            Some("/home/dev/Agent Projects/π".to_owned())
+        );
+
+        terminal.advance(b"\x1b]7;https://example.invalid/path\x07");
+        assert_eq!(
+            terminal.snapshot().current_directory.as_deref(),
+            Some("/home/dev/Agent Projects/π")
+        );
     }
 
     #[test]

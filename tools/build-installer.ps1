@@ -1,6 +1,10 @@
 [CmdletBinding()]
 param(
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [string]$SigningCertificateThumbprint,
+    [string]$TimestampUrl = 'http://timestamp.digicert.com',
+    [string]$ExpectedTag,
+    [switch]$RequireSigning
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +17,49 @@ if ($manifest -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
     throw 'Could not read the Compi version from Cargo.toml'
 }
 $version = $Matches[1]
+$bootstrapperManifest = Get-Content -Raw (Join-Path $projectRoot 'installer\bootstrapper\Cargo.toml')
+if ($bootstrapperManifest -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"' -or $Matches[1] -ne $version) {
+    throw "installer/bootstrapper/Cargo.toml must use Compi version $version"
+}
+if ($ExpectedTag -and $ExpectedTag -ne "v$version") {
+    throw "Release tag $ExpectedTag does not match Cargo package version $version"
+}
+if ($RequireSigning -and -not $SigningCertificateThumbprint) {
+    throw 'A signing certificate thumbprint is required for this release build'
+}
+$sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+$signTool = $null
+if ($SigningCertificateThumbprint) {
+    $signTool = Get-ChildItem -Path $sdkRoot -Filter signtool.exe -File -Recurse |
+        Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+        Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+        Select-Object -First 1
+    if (-not $signTool) {
+        throw "signtool.exe was not found below $sdkRoot"
+    }
+}
+
+function Invoke-SignArtifact {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    if (-not $script:signTool) {
+        return
+    }
+    & $script:signTool.FullName sign /sha1 $SigningCertificateThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $Path
+    if ($LASTEXITCODE -ne 0) { throw "Failed to sign $Path" }
+    & $script:signTool.FullName verify /pa $Path
+    if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $Path" }
+}
+
+function Assert-FileVersion {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $actual = (Get-Item $Path).VersionInfo.ProductVersion
+    if (-not $actual -or -not $actual.StartsWith($script:version, [System.StringComparison]::Ordinal)) {
+        throw "$Path has product version '$actual'; expected $script:version"
+    }
+}
+
 $installerRoot = Join-Path $projectRoot 'target\installer'
 $productTarget = Join-Path $installerRoot 'product'
 $productBin = Join-Path $productTarget 'release'
@@ -29,7 +76,6 @@ $portableName = "Compi-$version-Windows-x64.zip"
 $portableDestination = Join-Path $OutputDirectory $portableName
 
 if (-not $env:GPUI_FXC_PATH) {
-    $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
     $fxc = Get-ChildItem -Path $sdkRoot -Filter fxc.exe -File -Recurse |
         Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
         Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
@@ -48,8 +94,14 @@ try {
 
     & cargo build --release --bin compi --bin compi-daemon --target-dir $productTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi product binaries' }
+    Assert-FileVersion (Join-Path $productBin 'compi.exe')
+    Assert-FileVersion (Join-Path $productBin 'compi-daemon.exe')
+    Invoke-SignArtifact (Join-Path $productBin 'compi.exe')
+    Invoke-SignArtifact (Join-Path $productBin 'compi-daemon.exe')
     & cargo build --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $maintenanceTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build the installed Compi maintenance surface' }
+    Assert-FileVersion $maintenanceSource
+    Invoke-SignArtifact $maintenanceSource
 
 
     & dotnet tool run wix build installer\Compi.wxs -arch x64 `
@@ -62,10 +114,13 @@ try {
 
     & dotnet tool run wix msi validate $msiPath
     if ($LASTEXITCODE -ne 0) { throw 'Compi.msi failed Windows Installer validation' }
+    Invoke-SignArtifact $msiPath
 
     Copy-Item -Force $msiPath $payloadPath
     & cargo build --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-setup --target-dir $bootstrapperTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build the Compi Setup bootstrapper' }
+    Assert-FileVersion $setupSource
+    Invoke-SignArtifact $setupSource
 
     Copy-Item -Force $setupSource $setupDestination
 
@@ -91,7 +146,11 @@ try {
         }
         "$hash *$([System.IO.Path]::GetFileName($artifact))"
     }
-    Set-Content -Path $checksumPath -Value $checksums -Encoding ascii
+    [System.IO.File]::WriteAllText(
+        $checksumPath,
+        ($checksums -join "`n") + "`n",
+        [System.Text.ASCIIEncoding]::new()
+    )
 
     Write-Host "Setup: $setupDestination"
     Write-Host "Portable: $portableDestination"

@@ -36,14 +36,14 @@ The active roadmap follows the P0 contract in `Spec.md`: Windows client and daem
 
 ### Persisted session-record contract
 
-- Persist metadata at `%LOCALAPPDATA%\Compi\sessions-v1.json`; the daemon is the only writer.
-- Store `format_version` and, per session, `id`, `created_at_ms`, `updated_at_ms`, `status`, `cols`, `rows`, optional `exit_code`, and optional `error`.
+- Persist protocol-v6 metadata at `%LOCALAPPDATA%\Compi\sessions-v2.json`; the daemon is the only writer.
+- Store `format_version` and, per session, `id`, `created_at_ms`, `updated_at_ms`, `status`, `cols`, `rows`, optional `exit_code`, optional `error`, and optional working-directory metadata containing the requested path, resolved absolute WSL path, selected distribution, and non-blocking warning.
 - Valid persisted states are exactly `starting`, `running`, `exited`, `failed`, and `dead`.
 - Write through a sibling temporary file and atomically replace the prior manifest after each lifecycle transition. Ignore and quarantine a malformed manifest rather than inventing live state.
 - On daemon startup, map persisted `starting` and `running` records to `dead` with a daemon-loss reason before accepting clients.
 - Never persist process handles, client attachment state, terminal input, screen state, scrollback, or Kitty payloads as recoverable process state.
 - Retain at most 100 terminal records and prune terminal records older than 30 days on daemon startup.
-- Adding `dead` to the public session status requires a protocol-version bump and explicit unsupported-peer errors.
+- Protocol v6 carries `dead`, working-directory metadata, and OSC 7 current-directory state; incompatible peers fail during the hello exchange.
 
 ### P0 release order
 
@@ -73,7 +73,7 @@ Memory work is evidence-driven. The current approximately 95 MiB failure is a `c
 - [ ] Exercise daemon crash, forced WSL shutdown, Windows sign-out, and malformed or stale metadata recovery.
 - [x] Verify that one controlling client remains enforced during reconnect races and concurrent client launches.
 - [x] Verify clean cleanup of ConPTY, WSL, job, pipe, and client resources after shell exit, explicit kill, and daemon shutdown.
-- [ ] Add soak coverage for repeated create, attach, detach, resize, and kill cycles.
+- [x] Add soak coverage for repeated create, attach, detach, resize, and kill cycles.
 
 ### Installer and daemon supervision
 
@@ -85,7 +85,7 @@ The task runs `compi-daemon.exe --supervise` under the current user's interactiv
 
 - [x] Build a per-user Windows installer for `compi.exe`, `compi-daemon.exe`, and required assets.
 - [x] Provide a branded GPUI setup surface plus an independent preview executable for ready, upgrade, installing, complete, error, and remove states.
-- [ ] Detect unsupported Windows versions, missing WSL, WSL1-only defaults, and missing default distributions with actionable messages. Missing WSL, WSL1 defaults, and missing default distributions are covered; the explicit supported-Windows-version gate remains.
+- [x] Detect unsupported Windows versions, missing WSL, WSL1-only defaults, and missing default distributions with actionable messages. Windows 10 version 2004 (build 19041) is the minimum.
 - [x] Define and implement upgrade, repair, and uninstall handling for locked binaries, startup registration, logs, and session metadata.
 - [ ] Verify install, upgrade, repair, and uninstall on a clean non-administrator Windows user profile. Install, repair, and complete uninstall passed under a non-elevated token after clearing local pre-release product state; a fresh profile and a real version-to-version upgrade remain.
 
@@ -95,18 +95,20 @@ The task runs `compi-daemon.exe --supervise` under the current user's interactiv
 - [ ] Cover Ctrl, Alt, Shift, function, navigation, and application-key sequences with a physical keyboard.
 - [ ] Verify Unicode, combining marks, wide characters, emoji, bracketed paste, mouse reporting, and selection across wrapped rows.
 - [ ] Exercise Kitty image chunking, zlib payloads, placement, deletion, clipping, scrollback, resize, detach, and reattach.
-- [ ] Confirm every client delta gap recovers from a fresh snapshot without duplicated or lost terminal state.
+- [x] Confirm every client delta gap recovers from a fresh snapshot without duplicated or lost terminal state.
 
 ### Project working directories
 
 Compi remains WSL-native while allowing a session to start directly in a project stored on either filesystem. It resolves the requested directory once at spawn and then lets WSL and the shell access the project in place. Compi does not copy, mirror, synchronize, or virtualize project files.
 
-- [ ] Add an optional working directory to session creation and persist it as session metadata.
-- [ ] Accept absolute WSL paths and absolute Windows paths. Resolve Windows paths through the selected WSL distribution before spawning Bash; keep `~` as the default when no directory is supplied.
-- [ ] Track the shell's current directory through OSC 7 so a new tab can inherit the active session's directory without injecting `cd` commands or rewriting shell startup files.
-- [ ] Warn, but do not block, when a Windows-hosted project is under OneDrive or another synchronized directory.
-- [ ] Use the same resolved working directory contract for human and agent sessions so both operate on the same project in place.
-- [ ] Cover WSL and Windows paths with spaces, Unicode, mixed case, missing directories, and unavailable distributions.
+P0 uses the default WSL2 distribution. An omitted directory starts Bash with `--cd ~` and does not run a discovery subprocess. An explicit absolute WSL or Windows path is resolved and validated against the default distribution before ConPTY launches; the resolved distribution is then pinned in the `wsl.exe` command. Session metadata keeps requested and resolved paths distinct. OSC 7 supplies live current-directory state but never rewrites the persisted spawn directory.
+
+- [x] Add an optional working directory to session creation and persist it as session metadata.
+- [x] Accept absolute WSL paths and absolute Windows paths. Resolve Windows paths through the selected WSL distribution before spawning Bash; keep `~` as the default when no directory is supplied.
+- [x] Track the shell's current directory through OSC 7 so a new tab can inherit the active session's directory without injecting `cd` commands or rewriting shell startup files.
+- [x] Warn, but do not block, when a Windows-hosted project is under OneDrive or another synchronized directory.
+- [x] Use the same resolved working directory contract for human and agent sessions so both operate on the same project in place.
+- [x] Cover WSL and Windows paths with spaces, Unicode, mixed case, missing directories, and unavailable distributions.
 - [ ] Verify Git and two representative agent harnesses against projects under both `/home/...` and `/mnt/c/...`, with edits immediately visible to the Windows editor and Explorer where applicable.
 - [ ] Measure Linux-filesystem and mounted-Windows-filesystem workloads separately. Filesystem results must not be reported as terminal renderer or protocol results.
 
@@ -117,25 +119,27 @@ Compi remains WSL-native while allowing a session to start directly in a project
 - [ ] Keep input, local scrollback, selection, tab switching, and window controls responsive while another session emits sustained output.
 - [ ] Validate normal, narrow, wide, maximized, minimized, mixed-DPI, and multi-monitor behavior.
 - [ ] Verify physical 100/120 Hz frame pacing and physical `Ctrl+C` under sustained output.
-- [ ] Run the 30-minute mixed memory, GPU-memory, handle, and process-leak soak.
+- [x] Run the 30-minute mixed memory, GPU-memory, handle, and process-leak soak.
 - [ ] Pass all three acceptance tiers from the same release build used for performance measurements.
 
-Current measured baseline on 2026-09-02:
+Current measured baselines:
 
 - Six release-mode warm launches reached the first window frame in 344–409 ms (median 358 ms) and the first terminal frame in 381–467 ms (median 400 ms). The launch targets are not met.
 - Under sustained output on the Meta Virtual Monitor, terminal paint p50 was 229–234 µs and p95 was 453–458 µs. Frame-interval p50 was about 28.1 ms and p95 about 35.5 ms; this is not physical-display release evidence.
-- The release GUI executable is 12.0 MB and the daemon is 991 KB.
+- The release GUI executable is 12.0 MB and the daemon is 1.4 MB.
 - The blank GPUI client used 86.15 MiB private bytes at p50; a warm one-session client used 90.09 MiB at p50. The daemon used about 2 MiB, and a diagnostic one/two/four-session run measured about 0.6 MiB of marginal daemon private memory per blank session.
 - Protocol flood recovery passes, including controlling-client attachment, `Ctrl+C`, snapshot recovery, and a clean prompt marker.
+- On 2026-09-03, final warm diagnostics measured first-window p95 at 376 ms, ready-for-input p95 at 544 ms, and input-to-render p95 at 153 ms. Profiling attributes roughly 321–369 ms of typical first-window latency to `gpui::Application::new`; disabling thin LTO did not improve it. Reducing the absent-daemon detection wait from 250 ms to 25 ms produced a best cold first-terminal p95 of 935 ms, but fresh unsigned daemon launches later incurred a repeatable 3.17-second host-side process-start delay even though instrumented daemon initialization took 36 ms. The targets remain unmet, and these Meta Virtual Monitor measurements are not physical-display evidence.
+- A 30-minute run with three sustained-output sessions and repeated transient-client create/kill churn passed. Daemon handles remained at 152–153 while the load was active and dropped to 115 after cleanup; client private memory remained 89.29–89.54 MiB, and daemon private memory peaked at 37.31 MiB with bounded terminal state.
 
 Detailed evidence and remaining manual checks: [`ACCEPTANCE_RESULTS_2026-09-02.md`](ACCEPTANCE_RESULTS_2026-09-02.md).
 
 ## 5. Establish repeatable Windows releases
 
 - [ ] Produce versioned installer and portable artifacts from tagged builds.
-- [ ] Embed the same version metadata in the GUI, daemon, installer, and artifact names.
+- [x] Embed the same version metadata in the GUI, daemon, installer, and artifact names.
 - [ ] Sign both executables and the installer.
-- [ ] Publish checksums and concise install, upgrade, uninstall, and troubleshooting instructions.
+- [x] Publish checksums and concise install, upgrade, uninstall, and troubleshooting instructions.
 - [ ] Qualify the exact signed artifacts on supported clean Windows 10 and Windows 11 WSL2 environments.
 
 ## 6. Milestone 4: agent sessions

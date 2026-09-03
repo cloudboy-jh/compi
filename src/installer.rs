@@ -7,12 +7,15 @@ use gpui::{
 };
 use std::env;
 use std::fs;
+use std::mem::size_of;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use windows::Wdk::System::SystemServices::RtlGetVersion;
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const WINDOW_WIDTH: f32 = 600.0;
@@ -139,7 +142,8 @@ impl InstallerApp {
                 SurfaceState::Ready,
                 (*operation != InstallerOperation::Remove)
                     .then(|| {
-                        crate::wsl::ensure_default_wsl2()
+                        ensure_supported_windows()
+                            .and_then(|_| crate::wsl::ensure_default_wsl2())
                             .err()
                             .map(|error| error.to_string())
                     })
@@ -723,6 +727,35 @@ fn restore_previous_package(package_path: &std::path::Path, backup_path: Option<
     }
 }
 
+fn ensure_supported_windows() -> Result<()> {
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+        ..OSVERSIONINFOW::default()
+    };
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status.0 < 0 {
+        return Err(
+            format!("could not determine the Windows version (NTSTATUS {status:?})").into(),
+        );
+    }
+    validate_windows_version(
+        version.dwMajorVersion,
+        version.dwMinorVersion,
+        version.dwBuildNumber,
+    )
+}
+
+fn validate_windows_version(major: u32, minor: u32, build: u32) -> Result<()> {
+    if major > 10 || (major == 10 && build >= 19_041) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Compi requires Windows 10 version 2004 (build 19041) or newer; this system reports {major}.{minor}.{build}"
+        )
+        .into())
+    }
+}
+
 fn application_data_directory() -> PathBuf {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -783,5 +816,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("payload is invalid"));
+    }
+
+    #[test]
+    fn recognizes_the_current_supported_windows_version() {
+        ensure_supported_windows().unwrap();
+    }
+
+    #[test]
+    fn rejects_windows_versions_before_windows_10_2004() {
+        assert!(validate_windows_version(10, 0, 19_041).is_ok());
+        let error = validate_windows_version(10, 0, 18_363).unwrap_err();
+        assert!(error.to_string().contains("build 19041"));
     }
 }

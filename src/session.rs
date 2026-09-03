@@ -4,10 +4,11 @@ use crate::frame;
 use crate::pipe;
 use crate::protocol::{
     CONTROL_FRAME, ErrorCode, SCREEN_FRAME, ServerControl, ServerMessage, SessionInfo,
-    SessionStatus, encode_server,
+    SessionStatus, WorkingDirectory, encode_server,
 };
 use crate::session_store::SessionStore;
 use crate::terminal::{ScreenMessage, TerminalState, encode_screen};
+use crate::wsl::{self, WslLaunch};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
@@ -40,6 +41,7 @@ pub struct Session {
     commands: SyncSender<SessionCommand>,
     worker: Mutex<Option<JoinHandle<()>>>,
     store: SessionStore,
+    working_directory: Option<WorkingDirectory>,
 }
 
 struct SessionRuntime {
@@ -127,8 +129,14 @@ impl SessionManager {
         }
     }
 
-    pub fn create(&self, cols: i16, rows: i16) -> Result<Arc<Session>> {
+    pub fn create(
+        &self,
+        cols: i16,
+        rows: i16,
+        working_directory: Option<String>,
+    ) -> Result<Arc<Session>> {
         validate_dimensions(cols, rows)?;
+        let launch = wsl::resolve_launch(working_directory.as_deref())?;
         let created_at_ms = now_ms();
         let ordinal = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("s-{created_at_ms:x}-{ordinal:x}");
@@ -141,24 +149,32 @@ impl SessionManager {
             created_at_ms,
             exit_code: None,
             error: None,
+            working_directory: launch.metadata.clone(),
         })?;
-        let session =
-            match Session::spawn(id.clone(), created_at_ms, cols, rows, self.store.clone()) {
-                Ok(session) => session,
-                Err(error) => {
-                    let _ = self.store.record(&SessionInfo {
-                        id,
-                        status: SessionStatus::Failed,
-                        attached: false,
-                        cols,
-                        rows,
-                        created_at_ms,
-                        exit_code: None,
-                        error: Some(error.to_string()),
-                    });
-                    return Err(error);
-                }
-            };
+        let session = match Session::spawn(
+            id.clone(),
+            created_at_ms,
+            cols,
+            rows,
+            launch.clone(),
+            self.store.clone(),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self.store.record(&SessionInfo {
+                    id,
+                    status: SessionStatus::Failed,
+                    attached: false,
+                    cols,
+                    rows,
+                    created_at_ms,
+                    exit_code: None,
+                    error: Some(error.to_string()),
+                    working_directory: launch.metadata,
+                });
+                return Err(error);
+            }
+        };
         let mut sessions = match self.sessions.lock() {
             Ok(sessions) => sessions,
             Err(_) => {
@@ -245,9 +261,15 @@ impl Session {
         created_at_ms: u64,
         cols: i16,
         rows: i16,
+        launch: WslLaunch,
         store: SessionStore,
     ) -> Result<Arc<Self>> {
-        let mut conpty = ConptySession::spawn(cols, rows)?;
+        let mut conpty = ConptySession::spawn(
+            cols,
+            rows,
+            launch.distribution.as_deref(),
+            &launch.directory,
+        )?;
         let (input, mut output) = conpty.take_io()?;
         let (command_sender, command_receiver) = sync_channel(64);
         let session = Arc::new(Self {
@@ -266,6 +288,7 @@ impl Session {
             commands: command_sender,
             worker: Mutex::new(None),
             store,
+            working_directory: launch.metadata,
         });
 
         let output_session = session.clone();
@@ -441,6 +464,7 @@ impl Session {
                 created_at_ms: self.created_at_ms,
                 exit_code: state.exit_code,
                 error: state.error.clone(),
+                working_directory: self.working_directory.clone(),
             })
             .unwrap_or_else(|_| SessionInfo {
                 id: self.id.clone(),
@@ -451,6 +475,7 @@ impl Session {
                 created_at_ms: self.created_at_ms,
                 exit_code: None,
                 error: Some("session state lock was poisoned".into()),
+                working_directory: self.working_directory.clone(),
             })
     }
 
@@ -660,6 +685,7 @@ impl Session {
             created_at_ms: self.created_at_ms,
             exit_code: state.exit_code,
             error: state.error.clone(),
+            working_directory: self.working_directory.clone(),
         }
     }
 }

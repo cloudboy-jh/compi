@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -22,6 +22,7 @@ pub enum ClientMessage {
     CreateSession {
         cols: i16,
         rows: i16,
+        working_directory: Option<String>,
     },
     Attach {
         session_id: String,
@@ -91,6 +92,15 @@ pub enum SessionStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkingDirectory {
+    pub requested: String,
+    pub resolved_wsl_path: String,
+    pub distribution: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionInfo {
     pub id: String,
     pub status: SessionStatus,
@@ -100,6 +110,8 @@ pub struct SessionInfo {
     pub created_at_ms: u64,
     pub exit_code: Option<u32>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<WorkingDirectory>,
 }
 
 pub fn encode_client(message: &ClientControl) -> serde_json::Result<Vec<u8>> {
@@ -149,7 +161,7 @@ mod tests {
         };
         let json = String::from_utf8(encode_server(&message).unwrap()).unwrap();
 
-        assert!(json.contains("\"protocol_version\":5"));
+        assert!(json.contains("\"protocol_version\":6"));
         assert_eq!(decode_server(json.as_bytes()).unwrap(), message);
     }
 }

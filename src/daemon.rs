@@ -17,17 +17,22 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 use windows::core::PCWSTR;
 
 pub fn run(instance: Option<&str>) -> Result<()> {
+    let started_at = Instant::now();
     let names = identity::instance_names(instance)?;
     let _singleton = DaemonSingleton::acquire(&names.mutex)?;
+    crate::perf::log_startup_metric("daemon_singleton_ready_ms", started_at.elapsed());
     let manager = Arc::new(SessionManager::persistent(instance)?);
+    crate::perf::log_startup_metric("daemon_store_ready_ms", started_at.elapsed());
     wsl::ensure_default_wsl2()?;
+    crate::perf::log_startup_metric("daemon_wsl_ready_ms", started_at.elapsed());
     let security = PipeSecurity::for_current_user()?;
+    crate::perf::log_startup_metric("daemon_security_ready_ms", started_at.elapsed());
     let stopping = Arc::new(AtomicBool::new(false));
     if crate::perf::enabled() {
         let sampler_manager = manager.clone();
@@ -48,6 +53,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
     }
     let connections = Arc::new(Mutex::new(HashMap::<u64, ConnectionSink>::new()));
     let handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+    crate::perf::log_startup_metric("daemon_ready_ms", started_at.elapsed());
     let connection_ids = AtomicU64::new(1);
 
     let result = serve(
@@ -122,10 +128,11 @@ fn serve(
                 connections.remove(&connection_id);
             }
         });
-        handlers
+        let mut active_handlers = handlers
             .lock()
-            .map_err(|_| "handler registry lock was poisoned")?
-            .push(handler);
+            .map_err(|_| "handler registry lock was poisoned")?;
+        reap_finished_handlers(&mut active_handlers);
+        active_handlers.push(handler);
 
         if stopping.load(Ordering::Acquire) {
             break;
@@ -133,6 +140,17 @@ fn serve(
         server = pipe::create_server(&names.pipe, security, false)?;
     }
     Ok(())
+}
+fn reap_finished_handlers(handlers: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index].is_finished() {
+            let handler = handlers.swap_remove(index);
+            let _ = handler.join();
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn handle_connection(
@@ -239,7 +257,11 @@ fn handle_connection(
                     },
                 })?;
             }
-            ClientMessage::CreateSession { cols, rows } => match manager.create(cols, rows) {
+            ClientMessage::CreateSession {
+                cols,
+                rows,
+                working_directory,
+            } => match manager.create(cols, rows, working_directory) {
                 Ok(session) => sink.send_control(&ServerControl {
                     request_id: Some(request.request_id),
                     message: ServerMessage::SessionCreated {

@@ -67,7 +67,7 @@ compi client
 
 - `compi-daemon` is one native Windows process per Windows user.
 - Each session owns one ConPTY and one `wsl.exe` child process.
-- P0 launches interactive bash in the user's default WSL distribution.
+- P0 launches interactive Bash in the user's default WSL distribution. An explicit working directory pins that distribution for path resolution and process launch; distribution selection remains post-P0.
 - **WSL2 only.** WSL1 is not tested or targeted. ConPTY works identically with both, but WSL2 provides full system-call compatibility, real process management, and native Docker support. Every Compi user is already on WSL2.
 - A session ends when the shell exits, the user kills it, the daemon stops, Windows reboots, or WSL terminates.
 - The daemon is supervised and restarts after failure, but shells lost with the daemon are reported as dead, not silently replaced.
@@ -124,6 +124,8 @@ The adoption risk is correctness, not polish.
 - Preserve normal login versus interactive bash semantics.
 - Do not rewrite PATH, reorder environment variables, or inject shell startup scripts.
 - Preserve `.bashrc`, `inputrc`, readline behavior, history, key bindings, SSH agent access, and credential helpers.
+- Accept an optional absolute WSL or Windows working directory at session creation. Resolve and validate it once through the default WSL2 distribution, then pass it to `wsl.exe --cd` without shell interpolation.
+- Track valid `file://` OSC 7 paths as live terminal state so new tabs can inherit the active directory. Do not inject `cd`, rewrite startup files, or treat OSC 7 state as recoverable process state.
 - `git push`, interactive TUIs, editors, agents, and Ctrl+C/Ctrl+Z must behave as they do in an established WSL terminal.
 - **WSL2 only.** WSL1 is not tested or targeted. ConPTY works identically with both, but WSL2 provides full system-call compatibility, real process management, and native Docker support. Every Compi user is already on WSL2.
 - Every live session must be visible and killable.
@@ -177,6 +179,7 @@ JSON payloads for:
 - hello and protocol version
 - list sessions
 - create session
+- Protocol v6 create-session messages carry an optional working directory; session metadata distinguishes requested paths from resolved WSL paths and the selected distribution.
 - attach and detach
 - input
 - resize
@@ -189,6 +192,7 @@ JSON payloads for:
 - Attach returns a complete snapshot with a sequence baseline.
 - Subsequent screen deltas carry monotonically increasing sequence numbers.
 - A gap triggers a snapshot request.
+- Snapshots and deltas carry validated OSC 7 current-directory state.
 - The first implementation may encode screen snapshots and deltas as JSON behind the permanent frame envelope.
 - Compact binary screen payloads are introduced only after profiling proves JSON is a bottleneck.
 - P0 permits one attached controlling client per session. A second attach returns `already_attached`; automatic takeover and multi-viewer behavior are deferred.
@@ -285,7 +289,6 @@ P0 ends after Milestone 3.
 - Scrollback persistence across daemon restart
 - Theme/preferences UI
 - Forced terminal theme
-- Windows-path translation conveniences
 - Sixel protocol support
 - Default-terminal registration
 - Memory, steering, or multi-agent orchestration

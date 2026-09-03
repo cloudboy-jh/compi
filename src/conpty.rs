@@ -23,8 +23,6 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
-const WSL_COMMAND_LINE: &str = "wsl.exe --cd ~ --exec /bin/bash -i";
-
 pub struct ConptySession {
     hpc: Option<HPCON>,
     process: OwnedHandle,
@@ -34,7 +32,12 @@ pub struct ConptySession {
 }
 
 impl ConptySession {
-    pub fn spawn(cols: i16, rows: i16) -> Result<Self> {
+    pub fn spawn(
+        cols: i16,
+        rows: i16,
+        distribution: Option<&str>,
+        directory: &str,
+    ) -> Result<Self> {
         if cols <= 0 || rows <= 0 {
             return Err("terminal dimensions must be positive".into());
         }
@@ -50,7 +53,7 @@ impl ConptySession {
                 0,
             )?;
 
-            let process_result = create_wsl_process(hpc);
+            let process_result = create_wsl_process(hpc, distribution, directory);
             drop(pty_input);
             drop(pty_output);
 
@@ -168,7 +171,11 @@ unsafe fn anonymous_pipe() -> Result<(OwnedHandle, OwnedHandle)> {
     }))
 }
 
-unsafe fn create_wsl_process(hpc: HPCON) -> Result<(OwnedHandle, OwnedHandle)> {
+unsafe fn create_wsl_process(
+    hpc: HPCON,
+    distribution: Option<&str>,
+    directory: &str,
+) -> Result<(OwnedHandle, OwnedHandle)> {
     let mut attribute_bytes = 0_usize;
     let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut attribute_bytes) };
     if attribute_bytes == 0 {
@@ -207,7 +214,8 @@ unsafe fn create_wsl_process(hpc: HPCON) -> Result<(OwnedHandle, OwnedHandle)> {
     startup.StartupInfo.hStdError = HANDLE::default();
     startup.lpAttributeList = attributes;
 
-    let mut command: Vec<u16> = OsStr::new(WSL_COMMAND_LINE)
+    let command_line = wsl_command_line(distribution, directory);
+    let mut command: Vec<u16> = OsStr::new(&command_line)
         .encode_wide()
         .chain(once(0))
         .collect();
@@ -254,6 +262,46 @@ unsafe fn create_kill_on_close_job(process: &OwnedHandle) -> Result<OwnedHandle>
     Ok(job)
 }
 
+fn wsl_command_line(distribution: Option<&str>, directory: &str) -> String {
+    let distribution = distribution
+        .map(|distribution| format!(" --distribution {}", quote_windows_argument(distribution)))
+        .unwrap_or_default();
+    format!(
+        "wsl.exe{distribution} --cd {} --exec /bin/bash -i",
+        quote_windows_argument(directory)
+    )
+}
+
+fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument
+            .chars()
+            .any(|character| character.is_whitespace() || character == '"')
+    {
+        return argument.to_owned();
+    }
+
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        if character == '\\' {
+            backslashes += 1;
+        } else if character == '"' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+            quoted.push(character);
+            backslashes = 0;
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 fn raw_handle(handle: &OwnedHandle) -> HANDLE {
     HANDLE(handle.as_raw_handle() as RawHandle)
 }
@@ -269,10 +317,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn starts_interactive_bash_in_wsl_home() {
+    fn starts_interactive_bash_in_default_wsl_home() {
         assert_eq!(
-            WSL_COMMAND_LINE.split_whitespace().collect::<Vec<_>>(),
-            ["wsl.exe", "--cd", "~", "--exec", "/bin/bash", "-i"]
+            wsl_command_line(None, "~"),
+            "wsl.exe --cd ~ --exec /bin/bash -i"
         );
+    }
+
+    #[test]
+    fn quotes_distribution_and_directory_for_create_process() {
+        assert_eq!(
+            wsl_command_line(Some("Ubuntu Dev"), "/mnt/c/Agent Projects/π"),
+            "wsl.exe --distribution \"Ubuntu Dev\" --cd \"/mnt/c/Agent Projects/π\" --exec /bin/bash -i"
+        );
+    }
+
+    #[test]
+    fn escapes_quotes_and_trailing_backslashes_in_windows_arguments() {
+        assert_eq!(quote_windows_argument(r#"a\"b\"#), r#""a\\\"b\\""#);
     }
 }

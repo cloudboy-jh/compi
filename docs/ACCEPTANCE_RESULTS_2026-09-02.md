@@ -16,13 +16,25 @@
 |---|---|---|
 | `cargo fmt --all -- --check` | Pass | Exit 0 in the final chained gate. |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Pass | Exit 0. Cargo still reports upstream future-incompatibility in `proc-macro-error2 v2.0.1`; this is not a current Clippy failure. |
-| `cargo test --all-targets` | Pass | 29 tests across five suites. This includes the Windows daemon lifecycle integration test. |
+| `cargo test --all-targets` | Pass | 52 tests across six suites as of 2026-09-03, including Windows daemon lifecycle, transient-connection cleanup, working-directory, protocol-v6, metadata-v2 migration, and terminal recovery coverage. |
 | Output-flood control and recovery | Pass | The integration test keeps the controlling client attached during three seconds of unbounded `yes` output, sends byte 3 (`Ctrl+C`), recovers delta gaps by snapshot, observes `FLOOD_INTERRUPTED`, and exits cleanly. |
 | `cargo build --release --bins --target-dir target/verify-release` | Pass | Built with the Windows 10 SDK 10.0.22621.0 `fxc.exe` directory on `PATH`. |
 | Product artifact names | Pass | Top-level release output contains only `compi.exe` and `compi-daemon.exe`. The probe exists only under `examples` when explicitly requested. |
-| Product artifact sizes | Pass | `compi.exe`: 12.0 MB. `compi-daemon.exe`: 991 KB. |
+| Product artifact sizes | Pass | `compi.exe`: 12.0 MB. `compi-daemon.exe`: 1.4 MB in the 2026-09-03 portable package. |
 
 The default `target/release` rebuild could not replace the running `compi-daemon.exe` (`Access is denied`). Verification therefore used an isolated target directory; no normal daemon sessions were terminated.
+
+## 2026-09-03 implementation and qualification update
+
+- Protocol v6 and persisted metadata v2 now carry validated requested/resolved working-directory data, the selected default WSL2 distribution, warnings, and OSC 7 current-directory state. Metadata v1 is upgraded atomically.
+- Explicit absolute WSL and Windows paths are validated in the selected default WSL2 distribution. New tabs inherit a valid OSC 7 path; omitted paths still start at `~`.
+- A release UI smoke launched in `C:\Users\johns\OneDrive\Desktop\Proj\compi` and rendered a Bash prompt at `/mnt/c/Users/johns/OneDrive/Desktop/Proj/compi`.
+- A 30-minute automated soak passed with three sustained-output sessions plus repeated create/kill and transient-client churn. Daemon handles stayed at 152–153 during active load and fell to 115 after cleanup. Client private memory stayed between 89.29 and 89.54 MiB; daemon private memory peaked at 37.31 MiB.
+- Final warm diagnostics measured first-window p95 at 376 ms, ready-for-input p95 at 544 ms, and input-to-render p95 at 153 ms. `gpui::Application::new` consumed roughly 321–369 ms in typical samples, and disabling thin LTO produced no improvement. Reducing the initial absent-daemon wait from 250 ms to 25 ms lowered the best cold first-terminal p95 to 935 ms; subsequent fresh unsigned daemon launches showed a repeatable 3.17-second host-side process-start delay despite 36 ms of instrumented daemon initialization.
+- The final unsigned `0.1.0` setup and portable ZIP build successfully, their embedded product versions agree, and both generated SHA-256 values match the packaged bytes. The release workflow requires signing secrets and creates a draft GitHub release.
+
+The 2026-09-03 launch measurements used the Meta Virtual Monitor and are diagnostic only. Code signing, a version-to-version upgrade, physical-display/keyboard checks, the full compatibility matrix, and clean Windows 10/11 qualification remain release blockers.
+
 
 ## Native client checks
 

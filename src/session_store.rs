@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::protocol::{SessionInfo, SessionStatus};
+use crate::protocol::{SessionInfo, SessionStatus, WorkingDirectory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -16,7 +16,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::PCWSTR;
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const MAX_TERMINAL_RECORDS: usize = 100;
 const TERMINAL_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
@@ -48,6 +48,8 @@ struct PersistedSession {
     exit_code: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_directory: Option<WorkingDirectory>,
 }
 
 impl SessionStore {
@@ -66,10 +68,15 @@ impl SessionStore {
             .ok_or("LOCALAPPDATA is not set")?
             .join("Compi");
         fs::create_dir_all(&directory)?;
-        let file_name = instance
-            .map(|instance| format!("sessions-{instance}-v1.json"))
-            .unwrap_or_else(|| "sessions-v1.json".to_owned());
-        Self::open_path(directory.join(file_name))
+        let suffix = instance
+            .map(|instance| format!("-{instance}"))
+            .unwrap_or_default();
+        let path = directory.join(format!("sessions{suffix}-v2.json"));
+        let legacy_path = directory.join(format!("sessions{suffix}-v1.json"));
+        if !path.is_file() && legacy_path.is_file() {
+            fs::rename(&legacy_path, &path)?;
+        }
+        Self::open_path(path)
     }
 
     fn open_path(path: PathBuf) -> Result<Self> {
@@ -78,7 +85,8 @@ impl SessionStore {
         if path.is_file() {
             let bytes = fs::read(&path)?;
             match serde_json::from_slice::<Manifest>(&bytes) {
-                Ok(manifest) if manifest.format_version == FORMAT_VERSION => {
+                Ok(manifest) if matches!(manifest.format_version, 1 | FORMAT_VERSION) => {
+                    rewrite |= manifest.format_version != FORMAT_VERSION;
                     for record in manifest.sessions {
                         records.insert(record.id.clone(), record);
                     }
@@ -197,6 +205,7 @@ impl PersistedSession {
             rows: info.rows,
             exit_code: info.exit_code,
             error: info.error.clone(),
+            working_directory: info.working_directory.clone(),
         }
     }
 
@@ -210,6 +219,7 @@ impl PersistedSession {
             created_at_ms: self.created_at_ms,
             exit_code: self.exit_code,
             error: self.error.clone(),
+            working_directory: self.working_directory.clone(),
         }
     }
 }
@@ -330,6 +340,12 @@ mod tests {
                 created_at_ms: 1,
                 exit_code: None,
                 error: None,
+                working_directory: Some(WorkingDirectory {
+                    requested: "/home/dev/project".to_owned(),
+                    resolved_wsl_path: "/home/dev/project".to_owned(),
+                    distribution: "Ubuntu".to_owned(),
+                    warning: None,
+                }),
             })
             .unwrap();
         drop(store);
@@ -338,6 +354,13 @@ mod tests {
         let sessions = reopened.list();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::Dead);
+        assert_eq!(
+            sessions[0]
+                .working_directory
+                .as_ref()
+                .map(|directory| directory.resolved_wsl_path.as_str()),
+            Some("/home/dev/project")
+        );
         assert!(!sessions[0].attached);
         assert!(
             sessions[0]
@@ -346,6 +369,32 @@ mod tests {
                 .unwrap()
                 .contains("previous daemon")
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn upgrades_version_one_manifest_in_place() {
+        let path = test_path("upgrade");
+        let manifest = Manifest {
+            format_version: 1,
+            sessions: vec![PersistedSession {
+                id: "s-1-1".to_owned(),
+                created_at_ms: 1,
+                updated_at_ms: now_ms(),
+                status: SessionStatus::Exited,
+                cols: 80,
+                rows: 24,
+                exit_code: Some(0),
+                error: None,
+                working_directory: None,
+            }],
+        };
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let store = SessionStore::open_path(path.clone()).unwrap();
+        assert_eq!(store.list().len(), 1);
+        let upgraded: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded.format_version, FORMAT_VERSION);
         let _ = fs::remove_file(path);
     }
 
@@ -388,6 +437,7 @@ mod tests {
                     rows: 24,
                     exit_code: None,
                     error: None,
+                    working_directory: None,
                 },
             );
         }

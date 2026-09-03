@@ -1,0 +1,79 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw "Formatting failed" }
+          cargo clippy --all-targets --all-features -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "Clippy failed" }
+          cargo test --all-targets
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
+
+      - name: Import Windows signing certificate
+        shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:SIGNING_PFX_BASE64 -or -not $env:SIGNING_PFX_PASSWORD) {
+            throw "Windows signing certificate secrets are required"
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "compi-signing.pfx"
+          [System.IO.File]::WriteAllBytes(
+            $pfxPath,
+            [Convert]::FromBase64String($env:SIGNING_PFX_BASE64)
+          )
+          $password = ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate.Thumbprint) { throw "Signing certificate import failed" }
+          "COMPI_SIGNING_THUMBPRINT=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Remove-Item -Force $pfxPath
+
+      - name: Build signed distribution
+        shell: pwsh
+        run: |
+          .\tools\build-installer.ps1 `
+            -SigningCertificateThumbprint $env:COMPI_SIGNING_THUMBPRINT `
+            -ExpectedTag "${{ github.ref_name }}" `
+            -RequireSigning
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Compi-${{ github.ref_name }}-Windows-x64
+          path: target/distribution/*
+          if-no-files-found: error
+
+      - name: Create draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: target/distribution/*

@@ -89,8 +89,8 @@ fn persistent_multi_session_lifecycle() {
 
     let mut control = daemon.client();
     assert!(control.list_sessions().unwrap().is_empty());
-    let first = control.create_session(80, 24).unwrap();
-    let second = control.create_session(80, 24).unwrap();
+    let first = control.create_session(80, 24, None).unwrap();
+    let second = control.create_session(80, 24, None).unwrap();
     assert_ne!(first.id, second.id);
     assert_eq!(control.list_sessions().unwrap().len(), 2);
 
@@ -295,14 +295,108 @@ fn persistent_multi_session_lifecycle() {
 }
 
 #[test]
-fn repeated_kills_release_daemon_process_handles() {
+fn creates_sessions_in_wsl_and_windows_working_directories() {
+    let daemon = DaemonGuard::start();
+    let instance = daemon.instance.clone();
+    let windows_directory = std::env::temp_dir().join(format!(
+        "compi-working-directory-{}-Agent Projects-π",
+        std::process::id()
+    ));
+    fs::create_dir_all(&windows_directory).unwrap();
+    let mut requested = windows_directory.to_string_lossy().into_owned();
+    if requested.as_bytes().get(1) == Some(&b':') {
+        let drive = requested[..1].to_ascii_lowercase();
+        requested.replace_range(..1, &drive);
+    }
+
+    let mut control = daemon.client();
+    let windows_session = control
+        .create_session(80, 24, Some(requested.clone()))
+        .unwrap();
+    let directory = windows_session.working_directory.as_ref().unwrap();
+    assert_eq!(directory.requested, requested);
+    assert!(directory.resolved_wsl_path.starts_with('/'));
+
+    let mut attached = daemon.client();
+    attached
+        .request(ClientMessage::Attach {
+            session_id: windows_session.id.clone(),
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+    attached
+        .request(ClientMessage::Input {
+            data: b"printf '\\033]7;file://localhost%s\\a' \"$PWD\"; echo WORKDIR_$((20+22))\r"
+                .to_vec(),
+        })
+        .unwrap();
+    let snapshot = collect_snapshot_until_marker(&mut attached, b"WORKDIR_42");
+    assert_eq!(
+        snapshot.current_directory.as_deref(),
+        Some(directory.resolved_wsl_path.as_str())
+    );
+    attached
+        .request(ClientMessage::Input {
+            data: b"exit\r".to_vec(),
+        })
+        .unwrap();
+    collect_until_exit(&mut attached, &windows_session.id);
+    drop(attached);
+
+    let wsl_session = control
+        .create_session(80, 24, Some("/tmp".to_owned()))
+        .unwrap();
+    assert_eq!(
+        wsl_session
+            .working_directory
+            .as_ref()
+            .map(|directory| directory.resolved_wsl_path.as_str()),
+        Some("/tmp")
+    );
+    control.kill_session(wsl_session.id).unwrap();
+    assert!(
+        control
+            .create_session(
+                80,
+                24,
+                Some("/definitely-missing-compi-working-directory".to_owned())
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist")
+    );
+
+    drop(control);
+    daemon.shutdown();
+    cleanup_metadata(&instance);
+    fs::remove_dir_all(windows_directory).unwrap();
+}
+
+#[test]
+fn repeated_session_cycles_release_daemon_process_handles() {
     let daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     let mut control = daemon.client();
+    let mut cycle_client = daemon.client();
     let baseline = process_handle_count(daemon.child.id());
 
     for _ in 0..12 {
-        let session = control.create_session(80, 24).unwrap();
+        let session = control.create_session(80, 24, None).unwrap();
+        cycle_client
+            .request(ClientMessage::Attach {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .unwrap();
+        cycle_client
+            .request(ClientMessage::Resize {
+                cols: 100,
+                rows: 32,
+            })
+            .unwrap();
+        cycle_client.request(ClientMessage::Detach).unwrap();
         control.kill_session(session.id.clone()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -319,6 +413,10 @@ fn repeated_kills_release_daemon_process_handles() {
             assert!(Instant::now() < deadline, "killed session did not exit");
             thread::sleep(Duration::from_millis(25));
         }
+    }
+    for _ in 0..20 {
+        let mut transient = daemon.client();
+        transient.list_sessions().unwrap();
     }
 
     thread::sleep(Duration::from_millis(250));
@@ -337,7 +435,7 @@ fn repeated_kills_release_daemon_process_handles() {
 fn daemon_restart_reports_lost_sessions_as_dead() {
     let daemon = DaemonGuard::start();
     let mut client = daemon.client();
-    let lost = client.create_session(80, 24).unwrap();
+    let lost = client.create_session(80, 24, None).unwrap();
     drop(client);
 
     let instance = daemon.crash();
@@ -363,7 +461,7 @@ fn daemon_restart_reports_lost_sessions_as_dead() {
         .to_string();
     assert!(attach_error.contains("SessionExited"));
 
-    let replacement = client.create_session(80, 24).unwrap();
+    let replacement = client.create_session(80, 24, None).unwrap();
     drop(client);
     restarted.shutdown();
 
@@ -422,7 +520,7 @@ fn unique_instance() -> String {
 fn metadata_path(instance: &str) -> PathBuf {
     PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
         .join("Compi")
-        .join(format!("sessions-{instance}-v1.json"))
+        .join(format!("sessions-{instance}-v2.json"))
 }
 
 fn cleanup_metadata(instance: &str) {
