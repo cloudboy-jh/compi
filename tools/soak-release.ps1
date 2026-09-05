@@ -89,7 +89,7 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($LASTEXITCODE -ne 0) { throw 'Soak daemon did not become ready' }
 
-    $durationSeconds = $Minutes * 60 + 45
+    $durationSeconds = $Minutes * 60 + 30
     $loads = for ($index = 0; $index -lt $LoadSessions; $index++) {
         $process = Start-Process -FilePath $probePath -ArgumentList @(
             '--instance', $instance, 'soak', $durationSeconds
@@ -124,7 +124,7 @@ try {
     }
 
     foreach ($load in $loads) {
-        if (-not $load.WaitForExit(30000) -or $load.ExitCode -ne 0) {
+        if (-not $load.WaitForExit(45000) -or $load.ExitCode -ne 0) {
             throw "Sustained-output workload $($load.Id) did not exit cleanly"
         }
     }

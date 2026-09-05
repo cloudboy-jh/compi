@@ -29,6 +29,7 @@ mod session_store;
 #[cfg(windows)]
 pub mod supervisor;
 pub mod terminal;
+pub mod terminal_trace;
 #[cfg(windows)]
 mod theme;
 #[cfg(windows)]

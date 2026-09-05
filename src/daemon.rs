@@ -313,7 +313,7 @@ fn handle_connection(
                     Err(error) => send_session_error(&sink, request.request_id, &error),
                 }
             }
-            ClientMessage::Input { data } => {
+            ClientMessage::Input { data, latency_id } => {
                 let Some(session) = attached.as_ref() else {
                     send_error(
                         &sink,
@@ -323,7 +323,7 @@ fn handle_connection(
                     );
                     continue;
                 };
-                match session.write_input(sink.id(), &data) {
+                match session.write_input(sink.id(), &data, latency_id) {
                     Ok(()) => sink.send_control(&ServerControl {
                         request_id: Some(request.request_id),
                         message: ServerMessage::InputAccepted,

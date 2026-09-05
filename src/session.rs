@@ -8,8 +8,9 @@ use crate::protocol::{
 };
 use crate::session_store::SessionStore;
 use crate::terminal::{ScreenMessage, TerminalState, encode_screen};
+use crate::terminal_trace::TerminalTraceRecorder;
 use crate::wsl::{self, WslLaunch};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -26,6 +27,7 @@ use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_T
 const TRANSPORT_CHUNK: usize = 32 * 1024;
 const CLIENT_QUEUE_FRAMES: usize = 256;
 const CLIENT_SCREEN_QUEUE_FRAMES: usize = 32;
+const MAX_PENDING_LATENCY_IDS: usize = 4_096;
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -38,6 +40,8 @@ pub struct Session {
     created_at_ms: u64,
     state: Mutex<SessionRuntime>,
     input: Mutex<Option<File>>,
+    trace: Mutex<Option<TerminalTraceRecorder>>,
+    pending_latency: Mutex<VecDeque<PendingLatency>>,
     commands: SyncSender<SessionCommand>,
     worker: Mutex<Option<JoinHandle<()>>>,
     store: SessionStore,
@@ -52,6 +56,11 @@ struct SessionRuntime {
     error: Option<String>,
     terminal: TerminalState,
     client: Option<ConnectionSink>,
+}
+
+struct PendingLatency {
+    id: u64,
+    output_received: bool,
 }
 
 enum SessionCommand {
@@ -272,6 +281,20 @@ impl Session {
         )?;
         let (input, mut output) = conpty.take_io()?;
         let (command_sender, command_receiver) = sync_channel(64);
+        let trace = match TerminalTraceRecorder::from_env(&id, cols as u16, rows as u16) {
+            Ok(trace) => trace,
+            Err(error) => {
+                eprintln!("compi-daemon: could not enable terminal trace for {id}: {error}");
+                None
+            }
+        };
+        let trace_label = trace
+            .as_ref()
+            .and_then(|trace| trace.path().file_stem())
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned);
+        let mut terminal = TerminalState::new(cols as u16, rows as u16);
+        terminal.set_diagnostic_context(&id, trace_label.as_deref());
         let session = Arc::new(Self {
             id,
             created_at_ms,
@@ -281,10 +304,12 @@ impl Session {
                 rows,
                 exit_code: None,
                 error: None,
-                terminal: TerminalState::new(cols as u16, rows as u16),
+                terminal,
                 client: None,
             }),
             input: Mutex::new(Some(input)),
+            trace: Mutex::new(trace),
+            pending_latency: Mutex::new(VecDeque::new()),
             commands: command_sender,
             worker: Mutex::new(None),
             store,
@@ -300,13 +325,41 @@ impl Session {
                     Ok(read) => read,
                     Err(_) => break,
                 };
-                let (sink, delta, replies) = {
+                if crate::perf::enabled()
+                    && let Ok(mut pending) = output_session.pending_latency.lock()
+                {
+                    for latency in pending
+                        .iter_mut()
+                        .filter(|latency| !latency.output_received)
+                    {
+                        latency.output_received = true;
+                        crate::perf::log_input_latency_stage(latency.id, "pty_output", None);
+                    }
+                }
+                output_session.record_trace_output(&buffer[..read]);
+                let (sink, mut delta, replies) = {
                     let Ok(mut state) = output_session.state.lock() else {
                         break;
                     };
                     let (delta, replies) = state.terminal.advance(&buffer[..read]);
                     (state.client.clone(), delta, replies)
                 };
+                if let Some(delta) = delta.as_mut()
+                    && let Ok(mut pending) = output_session.pending_latency.lock()
+                {
+                    while pending
+                        .front()
+                        .is_some_and(|latency| latency.output_received)
+                    {
+                        let latency = pending.pop_front().expect("checked pending latency");
+                        crate::perf::log_input_latency_stage(
+                            latency.id,
+                            "terminal_state",
+                            Some(delta.sequence),
+                        );
+                        delta.latency_ids.push(latency.id);
+                    }
+                }
                 if !replies.is_empty() {
                     let Ok(mut input) = output_session.input.lock() else {
                         break;
@@ -379,6 +432,7 @@ impl Session {
                                 let delta = state.terminal.resize(cols as u16, rows as u16);
                                 (state.client.clone(), delta)
                             });
+                            self.record_trace_resize(cols as u16, rows as u16);
                             if let Some((Some(sink), Some(delta))) = update
                                 && sink.send_screen(&ScreenMessage::Delta { delta }).is_err()
                             {
@@ -592,17 +646,44 @@ impl Session {
         &self,
         connection_id: u64,
         bytes: &[u8],
+        latency_id: Option<u64>,
     ) -> std::result::Result<(), SessionError> {
         self.require_attached(connection_id)?;
-        let mut input = self
+        let mut input_guard = self
             .input
             .lock()
             .map_err(|_| SessionError::Internal("ConPTY input lock was poisoned".into()))?;
-        let input = input.as_mut().ok_or(SessionError::Exited)?;
-        input
-            .write_all(bytes)
-            .and_then(|_| input.flush())
-            .map_err(|error| SessionError::Internal(error.to_string()))
+        let input = input_guard.as_mut().ok_or(SessionError::Exited)?;
+        let mut pending_latency = latency_id
+            .filter(|_| crate::perf::enabled())
+            .map(|id| {
+                crate::perf::log_input_latency_stage(id, "daemon_input", None);
+                self.pending_latency
+                    .lock()
+                    .map(|mut pending| {
+                        if pending.len() >= MAX_PENDING_LATENCY_IDS {
+                            pending.pop_front();
+                        }
+                        pending.push_back(PendingLatency {
+                            id,
+                            output_received: false,
+                        });
+                    })
+                    .map_err(|_| SessionError::Internal("latency queue lock was poisoned".into()))
+            })
+            .transpose()?;
+        if let Err(error) = input.write_all(bytes).and_then(|_| input.flush()) {
+            if pending_latency.is_some()
+                && let Ok(mut pending) = self.pending_latency.lock()
+            {
+                pending.pop_back();
+            }
+            return Err(SessionError::Internal(error.to_string()));
+        }
+        pending_latency.take();
+        drop(input_guard);
+        self.record_trace_input(bytes);
+        Ok(())
     }
 
     pub fn resize(
@@ -628,6 +709,34 @@ impl Session {
             .map_err(SessionError::Internal)?;
         self.persist()
             .map_err(|error| SessionError::Internal(error.to_string()))
+    }
+
+    fn record_trace_input(&self, bytes: &[u8]) {
+        self.record_trace(|trace| trace.record_input(bytes));
+    }
+
+    fn record_trace_output(&self, bytes: &[u8]) {
+        self.record_trace(|trace| trace.record_output(bytes));
+    }
+
+    fn record_trace_resize(&self, cols: u16, rows: u16) {
+        self.record_trace(|trace| trace.record_resize(cols, rows));
+    }
+
+    fn record_trace(&self, record: impl FnOnce(&mut TerminalTraceRecorder) -> std::io::Result<()>) {
+        let Ok(mut trace) = self.trace.lock() else {
+            return;
+        };
+        let Some(recorder) = trace.as_mut() else {
+            return;
+        };
+        if let Err(error) = record(recorder) {
+            eprintln!(
+                "compi-daemon: terminal trace disabled after write failure for {}: {error}",
+                self.id
+            );
+            trace.take();
+        }
     }
 
     pub fn kill(&self) -> std::result::Result<(), SessionError> {

@@ -1,176 +1,102 @@
 # Compi next steps
 
-Compi currently implements the persistent WSL2 session daemon, authoritative terminal state, protocol-v5 transport, and usable GPUI client described by Milestones 0–3. The remaining work below closes the unfinished P0 release requirements before Milestone 4 begins.
+Compi is the native Windows client for persistent WSL human and agent sessions. It is not trying to become a generic cross-platform terminal or beat every existing terminal on raw startup and memory.
 
-## Completed product baseline
+The persistent daemon, protocol-v7 session lifecycle, metadata, supervision, installer, packaging, GPUI client, and terminal truth implementation are substantially complete. Release work remains paused for the operator-only physical keyboard/display gates and clean-machine qualification, not for known terminal-model feature gaps.
 
-- [x] Run multiple WSL2 Bash sessions through a persistent per-user Windows daemon.
-- [x] Detach and reattach the GPUI client without interrupting live shell work.
-- [x] Preserve authoritative terminal state, local scrollback, sequenced-delta recovery, and Kitty graphics over protocol v5.
-- [x] Support tabs, selection, mouse input, native titlebar controls, and tab-body window dragging.
-- [x] Support terminal-safe copy and paste, including `Ctrl+V`, `Ctrl+Shift+V`, and uninterrupted `Ctrl+C`.
-- [x] Start new sessions in the Linux user's home directory without injecting shell startup commands.
-- [x] Pass the full Rust regression suite, release build, and end-to-end persistence acceptance checks.
-- [x] Ship only `compi.exe` and `compi-daemon.exe` in normal product builds; retain the diagnostic probe as an explicitly built example.
-- [x] Use compact binary screen frames, inline cell text, bounded screen backpressure, visible-row paint models, cached row shaping, and background Kitty image decoding.
-- [x] Wake the GPUI client from terminal events and cap event application to a display-paced UI budget instead of repainting from a fixed polling loop.
-- [x] Provide a tiered terminal acceptance matrix in `docs/testcmds.md`.
+## Completed foundation
 
-## 1. Release contracts
+- Multiple independent WSL2 Bash sessions survive client detach, close, and reattach.
+- The daemon owns ConPTY/WSL processes, terminal state, bounded scrollback, sequenced screen recovery, and persisted lifecycle metadata.
+- Per-user supervision, install, repair, removal, portable packaging, version metadata, checksums, Windows CI, and release instrumentation exist.
+- Sessions start in the Linux home directory or a validated WSL/Windows project directory; OSC 7 reports can drive directory inheritance.
+- Client and daemon resource measurement, sustained-output testing, and create/kill soak coverage exist.
 
-The active roadmap follows the P0 contract in `Spec.md`: Windows client and daemon, WSL2 Bash through ConPTY, per-user named pipes, installer, supervision, compatibility, and release qualification. Milestone 4 begins only after those gates pass. Native Unix process hosting, Unix-domain IPC, remote transport, and agent-scale parking remain post-Milestone-4 work.
+Closing the GUI or a tab detaches the client and leaves the shell running. Shell exit, explicit session termination, daemon loss, WSL shutdown, sign-out, upgrade, and uninstall retain the lifecycle semantics already defined in `Spec.md`: dead processes are never presented as recoverable sessions.
 
-### Lifecycle truth table
+## Terminal truth sprint status
 
-| Event | Running shell truth | Daemon behavior | Client-visible result |
-|---|---|---|---|
-| GUI closes or crashes | Continues | Unchanged | Session becomes detached and can be reattached. |
-| Shell exits normally | Ends | Retains terminal status metadata | Session is `exited` with its exit code. |
-| User kills a session | Ends | Terminates and cleans up its ConPTY/WSL job | Session is `exited`; it is never recreated automatically. |
-| Daemon receives intentional shutdown | Ends | Marks active records dead, cleans up, and exits successfully | Supervisor does not restart it; no shell is reported as recovered. |
-| Daemon fails unexpectedly | Ends with the daemon | The scheduled `--supervise` process restarts a daemon child after a nonzero exit | On restart, prior `starting` and `running` records become `dead`. |
-| WSL shuts down | Ends | Detects each exited `wsl.exe`; daemon remains available | Affected sessions become `exited` or `failed`, never recoverable. |
-| Windows user signs out | Ends | Per-user daemon exits with the user session | At next sign-in, prior active records become `dead`. |
-| Compi is upgraded | Ends after an explicit warning | Supervision is paused, daemon is stopped, binaries are replaced, then supervision resumes | Active records become `dead`; upgrade never claims process continuity. |
-| Compi is uninstalled | Ends | Daemon and startup registration are removed before binaries | Binaries and application-owned state follow the documented uninstall policy. |
+The implementation sprint is complete. Keep signing, installer release work, and Milestone 4 agent-session features paused until the two remaining physical-keyboard checks close:
 
-### Persisted session-record contract
+- [x] Interactive Bash editing, completion, job control, and prompts.
+- [x] `less`.
+- [x] `vim` or `nvim`.
+- [x] `fzf` with an inline preview.
+- [x] OpenCode as the representative real agent harness.
 
-- Persist protocol-v6 metadata at `%LOCALAPPDATA%\Compi\sessions-v2.json`; the daemon is the only writer.
-- Store `format_version` and, per session, `id`, `created_at_ms`, `updated_at_ms`, `status`, `cols`, `rows`, optional `exit_code`, optional `error`, and optional working-directory metadata containing the requested path, resolved absolute WSL path, selected distribution, and non-blocking warning.
-- Valid persisted states are exactly `starting`, `running`, `exited`, `failed`, and `dead`.
-- Write through a sibling temporary file and atomically replace the prior manifest after each lifecycle transition. Ignore and quarantine a malformed manifest rather than inventing live state.
-- On daemon startup, map persisted `starting` and `running` records to `dead` with a daemon-loss reason before accepting clients.
-- Never persist process handles, client attachment state, terminal input, screen state, scrollback, or Kitty payloads as recoverable process state.
-- Retain at most 100 terminal records and prune terminal records older than 30 days on daemon startup.
-- Protocol v6 carries `dead`, working-directory metadata, and OSC 7 current-directory state; incompatible peers fail during the hello exchange.
+The five workflows were exercised through the real Compi GUI and captured terminal streams. OSC 8 hyperlinks and size-limited, write-only OSC 52 clipboard updates are implemented; unsupported or rejected sequences are categorized and rate-limited with session/trace context.
 
-### P0 release order
+### Compatibility failure workflow
 
-1. Establish Windows CI and attributable release measurements.
-2. Implement persisted dead-session reporting and lifecycle hardening.
-3. Add per-user daemon supervision.
-4. Build and verify install, upgrade, repair, and uninstall.
-5. Close terminal compatibility, startup, memory, display, and soak gates.
-6. Produce and qualify versioned signed Windows artifacts.
+Use this loop for every visible failure:
 
-## 2. Establish repeatable measurement and CI
+1. Reproduce the visible problem in a release build.
+2. Capture the exact input and terminal byte stream.
+3. Record unsupported or incorrectly handled CSI, ESC, OSC, DCS, and APC sequences.
+4. Reduce the failure to the smallest deterministic replay.
+5. Add a regression test that fails before the fix.
+6. Fix the terminal model or GUI input/render boundary.
+7. Re-run the focused test, full Rust suite, and affected interactive workflow.
 
-- [x] Add Windows CI for formatting, strict Clippy, all-target tests, and release binaries.
-- [x] Discover `fxc.exe` from the installed Windows SDK and set `GPUI_FXC_PATH` to the executable path for release builds.
-- [x] Measure blank-window client cost separately from one-session and additional-session costs.
-- [x] Record GUI and daemon private bytes, working set, handle count, and dedicated/shared GPU memory separately.
-- [x] Instrument cold versus warm daemon connection and a synthetic-input-to-rendered-marker ready-for-input round trip.
-- [ ] Run at least ten launch samples on a physical display and record p50, p95, and worst values under the `release-targets.md` measurement contract.
+### Ranked implementation checklist
 
-Memory work is evidence-driven. The current approximately 95 MiB failure is a `compi.exe` measurement; it does not justify daemon scrollback compression or PTY parking. Establish the blank GPUI baseline and marginal client/daemon cost first. If the 35 MiB release ceiling still fails, profile allocations and either optimize them or record an explicit approved release exception.
+Work in this order unless a reduced replay proves a lower item blocks an earlier workflow:
 
-## 3. Finish Milestone 3 and P0
+1. [x] Keyboard sequences, modifiers, `Ctrl+C`, `Ctrl+Z`, `Ctrl+D`, and application cursor/keypad modes. With a non-empty terminal selection, `Ctrl+C` copies without sending PTY input; without a selection, it sends the interrupt byte. `Ctrl+Shift+C` remains an explicit copy shortcut.
+2. [x] Cursor movement, save/restore, origin mode, margins, scroll regions, insert/delete behavior, and alternate-screen transitions.
+3. [x] Resize/reflow correctness and redraw behavior under sustained output.
+4. [x] Mouse reporting, focus reporting, wheel input, and Shift-based selection override.
+5. [x] OSC 8 hyperlink parsing, cell metadata, hit testing, safe Windows URL opening, and cursor feedback.
+6. [x] OSC 52 clipboard support with explicit size and security limits.
+7. [x] Unicode graphemes, combining marks, wide cells, emoji, selection, and copy behavior.
+8. [x] Unsupported-sequence diagnostics that identify the originating workflow without flooding logs.
 
-### Session lifecycle hardening
+### Required session controls
 
-- [x] Implement the persisted session-record contract above and display daemon-lost sessions as dead.
-- [ ] Exercise daemon crash, forced WSL shutdown, Windows sign-out, and malformed or stale metadata recovery.
-- [x] Verify that one controlling client remains enforced during reconnect races and concurrent client launches.
-- [x] Verify clean cleanup of ConPTY, WSL, job, pipe, and client resources after shell exit, explicit kill, and daemon shutdown.
-- [x] Add soak coverage for repeated create, attach, detach, resize, and kill cycles.
+- [x] Add an `End session` action only to the terminal session list, with inline confirmation and an `Ending…` state.
+- [x] Terminating either an attached or detached session ends its shell and descendant processes, updates its lifecycle state, and closes any attached tab. Closing a tab or the client remains detach-only and never ends the shell.
 
-### Installer and daemon supervision
+### Completion gates
 
-- [x] Register a per-user Task Scheduler entry at sign-in without requiring administrator privileges.
-- [x] Restart the daemon child only after an unexpected nonzero exit; intentional shutdown stops the supervising task without a restart loop.
-- [x] Start the GUI independently. If the daemon is unavailable, activate or await the registered task instead of creating an unmanaged daemon.
+- [x] All five workflows complete without visible corruption, stuck input, incorrect cursor state, broken resize, or a required restart.
+- [x] Every discovered compatibility failure has a deterministic regression test; bounded opt-in traces capture input, output, resize, timing, and workflow context for future reductions.
+- [ ] Physical `Ctrl+C` interrupts sustained output promptly.
+- [ ] With selected text, physical `Ctrl+C` copies the exact selection without interrupting the foreground process; with no selection, it sends `0x03`. `Ctrl+Shift+C` copies in both cases.
+- [x] The session list can end attached and detached sessions after inline confirmation; the process tree exits, lifecycle state updates, and ordinary tab/client close still preserves the session.
+- [x] Input-to-present latency is correlated at these boundaries:
+  1. GPUI key event receipt.
+  2. Client queue and daemon send.
+  3. Daemon input receipt.
+  4. PTY output receipt.
+  5. Terminal-state update and screen sequence.
+  6. Next frame presentation.
+- [x] A 120-keystroke interactive sample reported 29.347 ms p50, 36.861 ms p95, and 45.175 ms worst input-to-present latency with all 120 IDs complete and ordered.
+- [x] Terminal paint remains below the available frame budget; the highest recorded per-window paint p95 during the qualification work was 2.795 ms.
+- [x] A 30-minute mixed-TUI run completed 196 `less`/Vim/`fzf`/sustained-output/resize cycles and 62 resource samples. The final 15 minutes showed no monotonic private-byte, working-set, GPU-memory, or handle growth; the trace stayed within its 16 MiB bound.
 
-The task runs `compi-daemon.exe --supervise` under the current user's interactive token at least privilege. The supervising process launches the normal daemon as a child, writes `%LOCALAPPDATA%\Compi\daemon.log`, and retries nonzero exits after 1, 5, and 30 seconds. A successful intentional daemon exit ends supervision. Isolated `--instance` runs continue to launch directly and never use the registered task.
+### Architecture baselines, not terminal-correctness gates
 
-- [x] Build a per-user Windows installer for `compi.exe`, `compi-daemon.exe`, and required assets.
-- [x] Provide a branded GPUI setup surface plus an independent preview executable for ready, upgrade, installing, complete, error, and remove states.
-- [x] Detect unsupported Windows versions, missing WSL, WSL1-only defaults, and missing default distributions with actionable messages. Windows 10 version 2004 (build 19041) is the minimum.
-- [x] Define and implement upgrade, repair, and uninstall handling for locked binaries, startup registration, logs, and session metadata.
-- [ ] Verify install, upgrade, repair, and uninstall on a clean non-administrator Windows user profile. Install, repair, and complete uninstall passed under a non-elevated token after clearing local pre-release product state; a fresh profile and a real version-to-version upgrade remain.
+Current warm measurements are approximately 376 ms to first window, 544 ms to ready for input, and 89–96 MiB of client private memory. The earlier launch-marker input-to-render p95 was 153 ms; direct correlated input-to-present measurement now reports 36.861 ms p95 in an automated 120-keystroke run. These are baselines for the current GPUI architecture, not terminal compatibility failures and not reasons to replace GPUI.
 
-### Terminal compatibility
+Keep GPUI's provisional release budgets separate from the correctness gates above. The old 100 ms startup and 35 MiB client-memory aspirations are longer-term architecture targets; this sprint does not require them. Performance work during the sprint is limited to instrumenting the complete input-to-present path, staying within the available paint budget, and preventing resource growth.
 
-- [ ] Run the complete matrix in `docs/testcmds.md` against Bash, `top`, `less`, `vim`, `nano`, Git prompts, and alternate-screen applications.
-- [ ] Cover Ctrl, Alt, Shift, function, navigation, and application-key sequences with a physical keyboard.
-- [ ] Verify Unicode, combining marks, wide characters, emoji, bracketed paste, mouse reporting, and selection across wrapped rows.
-- [ ] Exercise Kitty image chunking, zlib payloads, placement, deletion, clipping, scrollback, resize, detach, and reattach.
-- [x] Confirm every client delta gap recovers from a fresh snapshot without duplicated or lost terminal state.
+## Immediate priority: physical and release qualification
 
-### Project working directories
+Terminal implementation is no longer the release blocker. Complete the remaining operator and release gates in this order:
 
-Compi remains WSL-native while allowing a session to start directly in a project stored on either filesystem. It resolves the requested directory once at spawn and then lets WSL and the shell access the project in place. Compi does not copy, mirror, synchronize, or virtualize project files.
+- Confirm sustained-output interruption and selection-aware copy with a physical keyboard; OS-synthesized key events already pass through the GPUI path but do not satisfy the physical-input gate.
+- Exercise daemon crash, forced WSL shutdown, Windows sign-out, and malformed or stale metadata recovery.
+- Verify fresh-profile install, real version-to-version upgrade, repair, and uninstall as a non-administrator.
+- Run physical-display pacing, mixed-DPI, multi-monitor, window-state, and launch measurements.
+- Produce, sign, and qualify the exact versioned installer and portable artifacts on supported Windows 10 and Windows 11 WSL2 systems.
+- Validate Git and project workflows under both `/home/...` and `/mnt/c/...` without reporting filesystem performance as terminal performance.
 
-P0 uses the default WSL2 distribution. An omitted directory starts Bash with `--cd ~` and does not run a discovery subprocess. An explicit absolute WSL or Windows path is resolved and validated against the default distribution before ConPTY launches; the resolved distribution is then pinned in the `wsl.exe` command. Session metadata keeps requested and resolved paths distinct. OSC 7 supplies live current-directory state but never rewrites the persisted spawn directory.
+## Milestone 4 agent sessions after release qualification
 
-- [x] Add an optional working directory to session creation and persist it as session metadata.
-- [x] Accept absolute WSL paths and absolute Windows paths. Resolve Windows paths through the selected WSL distribution before spawning Bash; keep `~` as the default when no directory is supplied.
-- [x] Track the shell's current directory through OSC 7 so a new tab can inherit the active session's directory without injecting `cd` commands or rewriting shell startup files.
-- [x] Warn, but do not block, when a Windows-hosted project is under OneDrive or another synchronized directory.
-- [x] Use the same resolved working directory contract for human and agent sessions so both operate on the same project in place.
-- [x] Cover WSL and Windows paths with spaces, Unicode, mixed case, missing directories, and unavailable distributions.
-- [ ] Verify Git and two representative agent harnesses against projects under both `/home/...` and `/mnt/c/...`, with edits immediately visible to the Windows editor and Explorer where applicable.
-- [ ] Measure Linux-filesystem and mounted-Windows-filesystem workloads separately. Filesystem results must not be reported as terminal renderer or protocol results.
+Milestone 4 remains paused until terminal truth and release qualification pass. When it resumes, human and agent sessions must share one process-hosting, authorization, lifecycle, attach/detach, reconnect, resize, termination, and screen-recovery model. Compi may add agent driver and discovery metadata, but memory, steering, credentials, and orchestration remain outside Compi.
 
-## 4. Close the release-feel gates
+## Deferred scope
 
-- [ ] Reduce warm first-window p95 below 100 ms and warm ready-for-input p95 below 200 ms, or record an explicit approved release exception.
-- [ ] Measure cold start with no daemon and keep first-terminal-frame p95 below 500 ms.
-- [ ] Keep input, local scrollback, selection, tab switching, and window controls responsive while another session emits sustained output.
-- [ ] Validate normal, narrow, wide, maximized, minimized, mixed-DPI, and multi-monitor behavior.
-- [ ] Verify physical 100/120 Hz frame pacing and physical `Ctrl+C` under sustained output.
-- [x] Run the 30-minute mixed memory, GPU-memory, handle, and process-leak soak.
-- [ ] Pass all three acceptance tiers from the same release build used for performance measurements.
-
-Current measured baselines:
-
-- Six release-mode warm launches reached the first window frame in 344–409 ms (median 358 ms) and the first terminal frame in 381–467 ms (median 400 ms). The launch targets are not met.
-- Under sustained output on the Meta Virtual Monitor, terminal paint p50 was 229–234 µs and p95 was 453–458 µs. Frame-interval p50 was about 28.1 ms and p95 about 35.5 ms; this is not physical-display release evidence.
-- The release GUI executable is 12.0 MB and the daemon is 1.4 MB.
-- The blank GPUI client used 86.15 MiB private bytes at p50; a warm one-session client used 90.09 MiB at p50. The daemon used about 2 MiB, and a diagnostic one/two/four-session run measured about 0.6 MiB of marginal daemon private memory per blank session.
-- Protocol flood recovery passes, including controlling-client attachment, `Ctrl+C`, snapshot recovery, and a clean prompt marker.
-- On 2026-09-03, final warm diagnostics measured first-window p95 at 376 ms, ready-for-input p95 at 544 ms, and input-to-render p95 at 153 ms. Profiling attributes roughly 321–369 ms of typical first-window latency to `gpui::Application::new`; disabling thin LTO did not improve it. Reducing the absent-daemon detection wait from 250 ms to 25 ms produced a best cold first-terminal p95 of 935 ms, but fresh unsigned daemon launches later incurred a repeatable 3.17-second host-side process-start delay even though instrumented daemon initialization took 36 ms. The targets remain unmet, and these Meta Virtual Monitor measurements are not physical-display evidence.
-- A 30-minute run with three sustained-output sessions and repeated transient-client create/kill churn passed. Daemon handles remained at 152–153 while the load was active and dropped to 115 after cleanup; client private memory remained 89.29–89.54 MiB, and daemon private memory peaked at 37.31 MiB with bounded terminal state.
-
-Detailed evidence and remaining manual checks: [`ACCEPTANCE_RESULTS_2026-09-02.md`](ACCEPTANCE_RESULTS_2026-09-02.md).
-
-## 5. Establish repeatable Windows releases
-
-- [ ] Produce versioned installer and portable artifacts from tagged builds.
-- [x] Embed the same version metadata in the GUI, daemon, installer, and artifact names.
-- [ ] Sign both executables and the installer.
-- [x] Publish checksums and concise install, upgrade, uninstall, and troubleshooting instructions.
-- [ ] Qualify the exact signed artifacts on supported clean Windows 10 and Windows 11 WSL2 environments.
-
-## 6. Milestone 4: agent sessions
-
-Start only after the P0 installer, supervision, compatibility, performance, and release gates pass.
-
-### Spawn contract
-
-- [ ] Decide whether agent creation starts the normal interactive WSL Bash for later input or accepts an explicit command, arguments, working directory, and environment.
-- [ ] Keep process hosting in Compi while leaving memory, steering, credentials, and orchestration outside Compi.
-- [ ] Reuse the human-session lifecycle and authorization model rather than creating a second management path.
-
-### Protocol and daemon
-
-- [ ] Add a session driver field with exactly `human` and `agent` variants.
-- [ ] Add optional agent name, repository, and external session ID metadata.
-- [ ] Version the protocol change and preserve explicit decoding errors for unsupported peers.
-- [ ] Add headless agent-session creation with no controlling client attached.
-
-### Client and acceptance
-
-- [ ] Display both drivers in the existing tab strip and detached-session switcher.
-- [ ] Show available agent metadata without making it mandatory for session operation.
-- [ ] Preserve attach, detach, reconnect, resize, kill, and snapshot recovery for both drivers.
-- [ ] Spawn a real agent process headlessly, discover it in the GUI, attach, detach, and reattach without interrupting it.
-- [ ] Exercise mixed human and agent sessions through daemon failure reporting and stale metadata recovery.
-
-## Deferred beyond Milestone 4
-
-- `PtySession` abstraction and native Unix process hosting.
-- Unix-domain IPC and any transport discovery mechanism.
-- Linux daemon, remote access, and macOS client work.
-- IOCP/epoll shared PTY polling, screen-state parking, scrollback compression, and client-buffer parking, after marginal measurements justify them.
+- Native Unix process hosting, Unix-domain IPC, Linux daemon, remote transport, and macOS client work.
+- IOCP/epoll shared PTY polling, screen-state parking, scrollback compression, and client-buffer parking until measurements justify them.
 - Daemon/reboot survival of running processes, multi-viewer broadcast, split layouts, ligatures, animation polish, persisted scrollback, preferences UI, forced themes, Sixel, default-terminal registration, and embedded multi-agent orchestration.

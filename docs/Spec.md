@@ -179,9 +179,10 @@ JSON payloads for:
 - hello and protocol version
 - list sessions
 - create session
-- Protocol v6 create-session messages carry an optional working directory; session metadata distinguishes requested paths from resolved WSL paths and the selected distribution.
+- Protocol v7 create-session messages carry an optional working directory; session metadata distinguishes requested paths from resolved WSL paths and the selected distribution.
 - attach and detach
 - input
+- Input messages may carry an optional diagnostic latency ID; the daemon returns correlated IDs on the screen delta produced after PTY output updates terminal state.
 - resize
 - kill
 - request snapshot

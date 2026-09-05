@@ -108,6 +108,7 @@ fn persistent_multi_session_lifecycle() {
     first_client
         .request(ClientMessage::Input {
             data: b"echo FIRST_$((20+22))\rexit\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let (first_output, first_exit) = collect_until_exit(&mut first_client, &first.id);
@@ -136,6 +137,7 @@ fn persistent_multi_session_lifecycle() {
     second_client
         .request(ClientMessage::Input {
             data: b"stty size; echo ATTACH_SIZE_$((20+22))\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let attach_output = collect_until_marker(&mut second_client, b"ATTACH_SIZE_42");
@@ -155,6 +157,7 @@ fn persistent_multi_session_lifecycle() {
     second_client
         .request(ClientMessage::Input {
             data: b"stty size; echo ACTIVE_SIZE_$((20+22))\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let resize_output = collect_until_marker(&mut second_client, b"ACTIVE_SIZE_42");
@@ -164,6 +167,7 @@ fn persistent_multi_session_lifecycle() {
             data: "printf '\\033[31mANSI_RED\\033[0m UNICODE_λ\\n'\r"
                 .as_bytes()
                 .to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let styled = collect_snapshot_until_marker(&mut second_client, b"UNICODE_\xce\xbb");
@@ -178,6 +182,7 @@ fn persistent_multi_session_lifecycle() {
     second_client
         .request(ClientMessage::Input {
             data: b"export TERM=xterm-256color; tput smcup; printf 'ALT_SCREEN'\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let alternate = collect_snapshot_until_marker(&mut second_client, b"ALT_SCREEN");
@@ -185,6 +190,7 @@ fn persistent_multi_session_lifecycle() {
     second_client
         .request(ClientMessage::Input {
             data: b"tput rmcup; echo ALT_RETURNED\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let main = collect_snapshot_until_marker(&mut second_client, b"ALT_RETURNED");
@@ -193,6 +199,7 @@ fn persistent_multi_session_lifecycle() {
     second_client
         .request(ClientMessage::Input {
             data: b"TERM=xterm-256color top\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let top = collect_snapshot_until_marker(&mut second_client, b"Tasks:");
@@ -200,12 +207,14 @@ fn persistent_multi_session_lifecycle() {
     second_client
         .request(ClientMessage::Input {
             data: b"q".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     thread::sleep(Duration::from_millis(200));
     second_client
         .request(ClientMessage::Input {
             data: b"echo TOP_RETURNED\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     collect_until_marker(&mut second_client, b"TOP_RETURNED");
@@ -223,6 +232,7 @@ fn persistent_multi_session_lifecycle() {
     reattached
         .request(ClientMessage::Input {
             data: b"sleep 1; echo REATTACHED_$((20+22))\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     drop(reattached);
@@ -245,6 +255,7 @@ fn persistent_multi_session_lifecycle() {
     after_crash
         .request(ClientMessage::Input {
             data: b"yes COMPI_FLOOD\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     thread::sleep(Duration::from_secs(3));
@@ -258,11 +269,15 @@ fn persistent_multi_session_lifecycle() {
         "output backpressure disconnected the attached client"
     );
     after_crash
-        .request(ClientMessage::Input { data: vec![3] })
+        .request(ClientMessage::Input {
+            data: vec![3],
+            latency_id: None,
+        })
         .unwrap();
     after_crash
         .request(ClientMessage::Input {
             data: b"echo FLOOD_INTERRUPTED\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let flood_output = collect_until_marker(&mut after_crash, b"FLOOD_INTERRUPTED");
@@ -274,6 +289,7 @@ fn persistent_multi_session_lifecycle() {
     after_crash
         .request(ClientMessage::Input {
             data: b"exit\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let (_, flood_exit) = collect_until_exit(&mut after_crash, &second.id);
@@ -329,6 +345,7 @@ fn creates_sessions_in_wsl_and_windows_working_directories() {
         .request(ClientMessage::Input {
             data: b"printf '\\033]7;file://localhost%s\\a' \"$PWD\"; echo WORKDIR_$((20+22))\r"
                 .to_vec(),
+            latency_id: None,
         })
         .unwrap();
     let snapshot = collect_snapshot_until_marker(&mut attached, b"WORKDIR_42");
@@ -339,6 +356,7 @@ fn creates_sessions_in_wsl_and_windows_working_directories() {
     attached
         .request(ClientMessage::Input {
             data: b"exit\r".to_vec(),
+            latency_id: None,
         })
         .unwrap();
     collect_until_exit(&mut attached, &windows_session.id);

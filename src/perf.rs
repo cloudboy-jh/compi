@@ -2,7 +2,8 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::mem::size_of;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
@@ -10,6 +11,8 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 
 static STARTUP_KIND: OnceLock<&'static str> = OnceLock::new();
+static NEXT_LATENCY_ID: AtomicU64 = AtomicU64::new(1);
+static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn enabled() -> bool {
     env::var_os("COMPI_PERF_LOG").is_some()
@@ -59,6 +62,28 @@ pub fn log_startup_metric(name: &str, elapsed: Duration) {
         elapsed.as_millis()
     );
     append_line("client-startup.log", &line);
+}
+
+pub fn begin_input_latency() -> Option<u64> {
+    enabled().then(|| {
+        (u64::from(std::process::id()) << 32) | NEXT_LATENCY_ID.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+pub fn log_input_latency_stage(id: u64, stage: &str, sequence: Option<u64>) {
+    if !enabled() {
+        return;
+    }
+    let line = format!(
+        "timestamp_us={} sample={} pid={} input_id={} stage={} sequence={}",
+        now_us(),
+        sample_id(),
+        std::process::id(),
+        id,
+        stage,
+        sequence.map_or_else(|| "-".to_owned(), |value| value.to_string())
+    );
+    append_line(&format!("latency-{}.log", std::process::id()), &line);
 }
 
 pub fn log_resource_sample(process_kind: &str, workload: &str, session_count: usize) {
@@ -118,6 +143,9 @@ fn current_process_metrics() -> ProcessMetrics {
 }
 
 fn append_line(file_name: &str, line: &str) {
+    let Ok(_guard) = LOG_LOCK.lock() else {
+        return;
+    };
     let Some(local_app_data) = env::var_os("LOCALAPPDATA") else {
         return;
     };
@@ -153,4 +181,11 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn now_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
 }

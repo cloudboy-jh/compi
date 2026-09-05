@@ -21,7 +21,7 @@ use gpui::{
 use image::{Frame as ImageFrame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use smallvec::smallvec;
-use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -37,7 +37,11 @@ use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
-use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, VK_ADD, VK_DECIMAL, VK_DIVIDE, VK_MULTIPLY, VK_NUMPAD0,
+    VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8,
+    VK_NUMPAD9, VK_SUBTRACT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, PostMessageW, SW_RESTORE, ShowWindowAsync, WM_NCLBUTTONDOWN,
 };
@@ -70,6 +74,7 @@ pub fn run(instance: Option<String>, initial_working_directory: Option<String>) 
             KeyBinding::new("ctrl-w", CloseTab, Some("Terminal")),
             KeyBinding::new("ctrl-tab", NextTab, Some("Terminal")),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("Terminal")),
+            KeyBinding::new("ctrl-c", CopyOrInterrupt, Some("Terminal")),
             KeyBinding::new("ctrl-shift-c", CopySelection, Some("Terminal")),
             KeyBinding::new("ctrl-v", PasteClipboard, Some("Terminal")),
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("Terminal")),
@@ -117,6 +122,7 @@ actions!(
         CloseTab,
         NextTab,
         PreviousTab,
+        CopyOrInterrupt,
         CopySelection,
         PasteClipboard,
         ToggleSessionSwitcher,
@@ -154,6 +160,12 @@ impl Selection {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CtrlCBehavior {
+    Copy(String),
+    Interrupt,
+}
+
 struct TabTransport {
     commands: Sender<ClientMessage>,
     stop: Arc<AtomicBool>,
@@ -161,9 +173,17 @@ struct TabTransport {
 
 impl TabTransport {
     fn send(&self, message: ClientMessage) -> crate::Result<()> {
+        let latency_id = match &message {
+            ClientMessage::Input { latency_id, .. } => *latency_id,
+            _ => None,
+        };
         self.commands
             .send(message)
-            .map_err(|_| "terminal connection writer stopped".into())
+            .map_err(|_| "terminal connection writer stopped")?;
+        if let Some(latency_id) = latency_id {
+            crate::perf::log_input_latency_stage(latency_id, "client_queued", None);
+        }
+        Ok(())
     }
 
     fn close(&self) {
@@ -261,6 +281,10 @@ impl TerminalTab {
 enum UiEvent {
     SessionsLoaded(Result<Vec<SessionInfo>, String>),
     SessionCreated(Result<SessionInfo, String>),
+    SessionEndFinished {
+        session_id: String,
+        result: Result<Vec<SessionInfo>, String>,
+    },
     TabConnected {
         tab_id: u64,
         transport: TabTransport,
@@ -304,6 +328,7 @@ struct CompiApp {
     ready_probe_sent_at: Option<Instant>,
     ready_probe_render_pending: bool,
     ready_probe_logged: bool,
+    pending_present_latency_ids: Vec<u64>,
     window_title: String,
     focus_handle: FocusHandle,
     ime_text: String,
@@ -316,6 +341,9 @@ struct CompiApp {
     next_tab_id: u64,
     sessions: Vec<SessionInfo>,
     switcher_open: bool,
+    end_confirmation: Option<String>,
+    ending_sessions: HashSet<String>,
+    close_after_end: HashSet<String>,
     loading_sessions: bool,
     attach_after_session_list: bool,
     global_error: Option<String>,
@@ -350,6 +378,7 @@ impl CompiApp {
             ready_probe_sent_at: None,
             ready_probe_render_pending: false,
             ready_probe_logged: false,
+            pending_present_latency_ids: Vec::new(),
             window_title: String::from("Compi"),
             focus_handle: cx.focus_handle(),
             ime_text: String::new(),
@@ -362,6 +391,9 @@ impl CompiApp {
             next_tab_id: 1,
             sessions: Vec::new(),
             switcher_open: false,
+            end_confirmation: None,
+            ending_sessions: HashSet::new(),
+            close_after_end: HashSet::new(),
             loading_sessions: !empty_window,
             attach_after_session_list: false,
             global_error: None,
@@ -416,12 +448,12 @@ impl CompiApp {
                 let batch_started_at = Instant::now();
                 if weak
                     .update(cx, |this, cx| {
-                        this.handle_event(first);
+                        this.handle_event(first, cx);
                         while batch_started_at.elapsed() < UI_EVENT_BUDGET {
                             let Ok(event) = event_rx.try_recv() else {
                                 break;
                             };
-                            this.handle_event(event);
+                            this.handle_event(event, cx);
                         }
                         cx.notify();
                     })
@@ -475,6 +507,45 @@ impl CompiApp {
         }
     }
 
+    fn begin_end_session(&mut self, session_id: String) {
+        if !self.ending_sessions.contains(&session_id)
+            && self
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id && session.status == SessionStatus::Running)
+        {
+            self.end_confirmation = Some(session_id);
+        }
+    }
+
+    fn cancel_end_session(&mut self, session_id: &str) {
+        if self.end_confirmation.as_deref() == Some(session_id) {
+            self.end_confirmation = None;
+        }
+    }
+
+    fn confirm_end_session(&mut self, session_id: String) {
+        if self.ending_sessions.contains(&session_id)
+            || !self
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id && session.status == SessionStatus::Running)
+        {
+            return;
+        }
+        self.end_confirmation = None;
+        self.ending_sessions.insert(session_id.clone());
+        if self.tabs.iter().any(|tab| tab.session_id == session_id) {
+            self.close_after_end.insert(session_id.clone());
+        }
+        let sender = self.event_tx.clone();
+        let instance = self.instance.clone();
+        thread::spawn(move || {
+            let result = terminate_session_and_wait(instance.as_deref(), &session_id);
+            let _ = sender.send(UiEvent::SessionEndFinished { session_id, result });
+        });
+    }
+
     fn attach_session(&mut self, session: SessionInfo) {
         if let Some(tab_id) = self
             .tabs
@@ -521,7 +592,7 @@ impl CompiApp {
         );
     }
 
-    fn handle_event(&mut self, event: UiEvent) {
+    fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
             UiEvent::SessionsLoaded(Ok(sessions)) => {
                 self.global_error = None;
@@ -558,6 +629,22 @@ impl CompiApp {
                 self.create_next_perf_session();
             }
             UiEvent::SessionCreated(Err(error)) => self.global_error = Some(error),
+            UiEvent::SessionEndFinished { session_id, result } => {
+                self.ending_sessions.remove(&session_id);
+                match result {
+                    Ok(sessions) => {
+                        self.global_error = None;
+                        self.sessions = sessions;
+                        if !self.tabs.iter().any(|tab| tab.session_id == session_id) {
+                            self.close_after_end.remove(&session_id);
+                        }
+                    }
+                    Err(error) => {
+                        self.close_after_end.remove(&session_id);
+                        self.global_error = Some(error);
+                    }
+                }
+            }
             UiEvent::TabConnected { tab_id, transport } => {
                 let (cols, rows) = (self.terminal_cols, self.terminal_rows);
                 let ready_probe = self
@@ -575,11 +662,20 @@ impl CompiApp {
                     if let Some(marker) = ready_probe {
                         tab.send(ClientMessage::Input {
                             data: format!("printf '%s\\n' '{marker}'\n").into_bytes(),
+                            latency_id: None,
                         });
                     }
                 }
             }
             UiEvent::TabScreen { tab_id, message } => {
+                let clipboard_write = match &message {
+                    ScreenMessage::Delta { delta } => delta.clipboard_writes.last().cloned(),
+                    ScreenMessage::Snapshot { .. } => None,
+                };
+                let latency_ids = match &message {
+                    ScreenMessage::Delta { delta } => delta.latency_ids.clone(),
+                    ScreenMessage::Snapshot { .. } => Vec::new(),
+                };
                 let mut request_snapshot = false;
                 let mut ready_probe_observed = false;
                 let sender = self.event_tx.clone();
@@ -594,6 +690,12 @@ impl CompiApp {
                                 snapshot_contains_marker(tab.mirror.snapshot(), marker)
                             });
                     }
+                }
+                if !request_snapshot && let Some(text) = clipboard_write {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                if !request_snapshot {
+                    self.pending_present_latency_ids.extend(latency_ids);
                 }
                 if request_snapshot {
                     if let Some(tab) = self.tab_mut(tab_id) {
@@ -627,11 +729,18 @@ impl CompiApp {
                 }
             }
             UiEvent::TabControl { tab_id, message } => match message {
-                ServerMessage::SessionExited { exit_code, .. } => {
-                    if let Some(tab) = self.tab_mut(tab_id) {
+                ServerMessage::SessionExited {
+                    session_id,
+                    exit_code,
+                } => {
+                    self.ending_sessions.remove(&session_id);
+                    if self.close_after_end.remove(&session_id) {
+                        self.close_tab_id(tab_id);
+                    } else if let Some(tab) = self.tab_mut(tab_id) {
                         tab.state = ConnectionState::Exited(exit_code);
                         tab.transport = None;
                     }
+                    self.refresh_sessions(false);
                 }
                 ServerMessage::Error { message, .. } => {
                     if let Some(tab) = self.tab_mut(tab_id) {
@@ -693,13 +802,27 @@ impl CompiApp {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
-        let application_cursor = tab
+        let (application_cursor, application_keypad) = tab
             .mirror
             .snapshot()
-            .is_some_and(|snapshot| snapshot.modes.application_cursor);
-        if let Some(bytes) = encode_keystroke(keystroke, application_cursor) {
+            .map(|snapshot| {
+                (
+                    snapshot.modes.application_cursor,
+                    snapshot.modes.application_keypad,
+                )
+            })
+            .unwrap_or_default();
+        let keypad = application_keypad.then(active_keypad_key).flatten();
+        if let Some(bytes) = encode_keystroke(keystroke, application_cursor, keypad) {
             tab.scroll_offset = 0;
-            tab.send(ClientMessage::Input { data: bytes });
+            let latency_id = crate::perf::begin_input_latency();
+            if let Some(latency_id) = latency_id {
+                crate::perf::log_input_latency_stage(latency_id, "key_receipt", None);
+            }
+            tab.send(ClientMessage::Input {
+                data: bytes,
+                latency_id,
+            });
         }
     }
 
@@ -781,6 +904,24 @@ impl CompiApp {
         cx.notify();
     }
 
+    fn copy_or_interrupt(&mut self, _: &CopyOrInterrupt, _: &mut Window, cx: &mut Context<Self>) {
+        match self.active_tab().map(ctrl_c_behavior) {
+            Some(CtrlCBehavior::Copy(text)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            Some(CtrlCBehavior::Interrupt) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.scroll_offset = 0;
+                    tab.send(ClientMessage::Input {
+                        data: vec![0x03],
+                        latency_id: None,
+                    });
+                }
+            }
+            None => {}
+        }
+    }
+
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.active_tab().and_then(selected_text) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -807,7 +948,10 @@ impl CompiApp {
         } else {
             text.into_bytes()
         };
-        tab.send(ClientMessage::Input { data });
+        tab.send(ClientMessage::Input {
+            data,
+            latency_id: None,
+        });
     }
 
     fn toggle_switcher(
@@ -838,6 +982,7 @@ impl CompiApp {
                 } else {
                     b"\x1b[O".to_vec()
                 },
+                latency_id: None,
             });
         }
     }
@@ -862,14 +1007,17 @@ impl CompiApp {
             .unwrap_or_default();
         if mouse_mode != MouseMode::None && !event.modifiers.shift {
             if let Some(data) = encode_mouse(
-                event.button,
+                Some(event.button),
                 false,
                 false,
                 point.col,
                 visible_row(tab, point.row),
                 event.modifiers,
             ) {
-                tab.send(ClientMessage::Input { data });
+                tab.send(ClientMessage::Input {
+                    data,
+                    latency_id: None,
+                });
             }
             return;
         }
@@ -911,16 +1059,18 @@ impl CompiApp {
             MouseMode::AnyMotion => true,
         };
         if report_motion && !event.modifiers.shift {
-            let button = event.pressed_button.unwrap_or(MouseButton::Left);
             if let Some(data) = encode_mouse(
-                button,
+                event.pressed_button,
                 false,
                 true,
                 point.col,
                 visible_row(tab, point.row),
                 event.modifiers,
             ) {
-                tab.send(ClientMessage::Input { data });
+                tab.send(ClientMessage::Input {
+                    data,
+                    latency_id: None,
+                });
             }
         } else if tab.selecting
             && event.dragging()
@@ -951,21 +1101,33 @@ impl CompiApp {
             .unwrap_or_default();
         if mouse_mode != MouseMode::None && !event.modifiers.shift {
             if let Some(data) = encode_mouse(
-                event.button,
+                Some(event.button),
                 true,
                 false,
                 point.col,
                 visible_row(tab, point.row),
                 event.modifiers,
             ) {
-                tab.send(ClientMessage::Input { data });
+                tab.send(ClientMessage::Input {
+                    data,
+                    latency_id: None,
+                });
             }
         } else {
             tab.selecting = false;
-            if let Some(selection) = tab.selection
+            let clicked_link = if let Some(selection) = tab.selection
                 && selection.anchor == selection.head
             {
                 tab.selection = None;
+                (event.button == MouseButton::Left && event.modifiers.control)
+                    .then(|| hyperlink_at(tab, selection.head))
+                    .flatten()
+                    .filter(|uri| is_allowed_hyperlink(uri))
+            } else {
+                None
+            };
+            if let Some(uri) = clicked_link {
+                cx.open_url(&uri);
             }
         }
         cx.notify();
@@ -998,7 +1160,10 @@ impl CompiApp {
                 event.modifiers,
                 true,
             );
-            tab.send(ClientMessage::Input { data });
+            tab.send(ClientMessage::Input {
+                data,
+                latency_id: None,
+            });
         } else {
             let lines = (delta.abs() / CELL_HEIGHT).ceil().max(1.0) as usize;
             if delta > 0.0 {
@@ -1299,21 +1464,31 @@ impl CompiApp {
     fn render_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.sessions.iter().map(|session| {
             let session = session.clone();
-            let can_select = session.status == SessionStatus::Running;
-            let status = match session.status {
-                SessionStatus::Starting => "Starting",
-                SessionStatus::Running if session.attached => "Open",
-                SessionStatus::Running => "Detached",
-                SessionStatus::Exited => "Exited",
-                SessionStatus::Failed => "Failed",
-                SessionStatus::Dead => "Dead",
+            let ending = self.ending_sessions.contains(&session.id);
+            let confirming = self.end_confirmation.as_deref() == Some(session.id.as_str());
+            let can_select = session.status == SessionStatus::Running && !ending;
+            let status = if ending {
+                "Ending…"
+            } else {
+                match session.status {
+                    SessionStatus::Starting => "Starting",
+                    SessionStatus::Running if session.attached => "Open",
+                    SessionStatus::Running => "Detached",
+                    SessionStatus::Exited => "Exited",
+                    SessionStatus::Failed => "Failed",
+                    SessionStatus::Dead => "Dead",
+                }
             };
             let detail = (session.status == SessionStatus::Dead)
                 .then(|| session.error.clone())
                 .flatten();
             let session_for_attach = session.clone();
+            let session_id_for_begin = session.id.clone();
+            let session_id_for_cancel = session.id.clone();
+            let session_id_for_confirm = session.id.clone();
             div()
                 .id(("session", session.created_at_ms))
+                .w_full()
                 .mx_2()
                 .px_3()
                 .py_2()
@@ -1339,8 +1514,8 @@ impl CompiApp {
                         .child(
                             div()
                                 .flex()
+                                .gap_2()
                                 .items_center()
-                                .justify_between()
                                 .child(
                                     div()
                                         .flex()
@@ -1384,7 +1559,102 @@ impl CompiApp {
                                     .text_color(color(MUTED))
                                     .child(detail),
                             )
-                        }),
+                        })
+                        .when(
+                            session.status == SessionStatus::Running && !ending,
+                            |details| {
+                                details.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when(!confirming, |actions| {
+                                            actions.child(
+                                                div()
+                                                    .id(("end-session", session.created_at_ms))
+                                                    .text_size(px(11.0))
+                                                    .text_color(color(MUTED))
+                                                    .hover(|style| {
+                                                        style
+                                                            .text_color(color(ERROR))
+                                                            .cursor_pointer()
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.begin_end_session(
+                                                            session_id_for_begin.clone(),
+                                                        );
+                                                        cx.stop_propagation();
+                                                        cx.notify();
+                                                    }))
+                                                    .child("End session"),
+                                            )
+                                        })
+                                        .when(confirming, |actions| {
+                                            actions
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(color(MUTED))
+                                                        .child("End this session?"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id((
+                                                            "cancel-end-session",
+                                                            session.created_at_ms,
+                                                        ))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_sm()
+                                                        .text_size(px(11.0))
+                                                        .text_color(color(MUTED))
+                                                        .hover(|style| {
+                                                            style
+                                                                .bg(color(SURFACE_HOVER))
+                                                                .cursor_pointer()
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.cancel_end_session(
+                                                                    &session_id_for_cancel,
+                                                                );
+                                                                cx.stop_propagation();
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                        .child("Cancel"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id((
+                                                            "confirm-end-session",
+                                                            session.created_at_ms,
+                                                        ))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_sm()
+                                                        .text_size(px(11.0))
+                                                        .text_color(color(ERROR))
+                                                        .hover(|style| {
+                                                            style
+                                                                .bg(color(SURFACE_HOVER))
+                                                                .cursor_pointer()
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.confirm_end_session(
+                                                                    session_id_for_confirm.clone(),
+                                                                );
+                                                                cx.stop_propagation();
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                        .child("End"),
+                                                )
+                                        }),
+                                )
+                            },
+                        ),
                 )
         });
 
@@ -1772,6 +2042,7 @@ impl EntityInputHandler for CompiApp {
             tab.scroll_offset = 0;
             tab.send(ClientMessage::Input {
                 data: text.as_bytes().to_vec(),
+                latency_id: None,
             });
         }
     }
@@ -1856,6 +2127,14 @@ impl Render for CompiApp {
                 }
             });
         }
+        if !self.pending_present_latency_ids.is_empty() {
+            let latency_ids = std::mem::take(&mut self.pending_present_latency_ids);
+            window.on_next_frame(move |_, _| {
+                for latency_id in latency_ids {
+                    crate::perf::log_input_latency_stage(latency_id, "frame_presented", None);
+                }
+            });
+        }
         div()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
@@ -1875,6 +2154,7 @@ impl Render for CompiApp {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
+            .on_action(cx.listener(Self::copy_or_interrupt))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_clipboard))
             .on_action(cx.listener(Self::toggle_switcher))
@@ -2090,11 +2370,12 @@ fn shape_row(row: &Row, window: &mut Window) -> Vec<ShapedRun> {
         } else {
             FontStyle::Normal
         };
-        let underline = style.attributes.underline.then_some(UnderlineStyle {
-            color: Some(foreground),
-            thickness: px(1.0),
-            wavy: false,
-        });
+        let underline =
+            (style.attributes.underline || style.hyperlink.is_some()).then_some(UnderlineStyle {
+                color: Some(foreground),
+                thickness: px(1.0),
+                wavy: false,
+            });
         let strikethrough = style.attributes.strike.then_some(StrikethroughStyle {
             color: Some(foreground),
             thickness: px(1.0),
@@ -2252,6 +2533,7 @@ fn same_text_style(left: &Cell, right: &Cell) -> bool {
     left.foreground == right.foreground
         && left.background == right.background
         && left.attributes == right.attributes
+        && left.hyperlink == right.hyperlink
 }
 
 fn effective_colors(cell: &Cell) -> (Hsla, Hsla) {
@@ -2327,6 +2609,35 @@ fn visible_to_absolute(tab: &TerminalTab, point: GridPoint) -> Option<GridPoint>
     })
 }
 
+fn hyperlink_at(tab: &TerminalTab, point: GridPoint) -> Option<String> {
+    let snapshot = tab.mirror.snapshot()?;
+    snapshot
+        .scrollback
+        .iter()
+        .chain(&snapshot.cells)
+        .nth(point.row)?
+        .cells
+        .get(point.col)?
+        .hyperlink
+        .as_ref()
+        .map(ToString::to_string)
+}
+
+fn is_allowed_hyperlink(uri: &str) -> bool {
+    if uri
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return false;
+    }
+    let lowercase = uri.to_ascii_lowercase();
+    ["https://", "http://"].into_iter().any(|prefix| {
+        lowercase
+            .strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+    })
+}
+
 fn visible_row(tab: &TerminalTab, row: usize) -> usize {
     row.min(tab.rows.saturating_sub(1) as usize)
 }
@@ -2364,6 +2675,12 @@ fn selected_text(tab: &TerminalTab) -> Option<String> {
         }
     }
     (!result.is_empty()).then_some(result)
+}
+
+fn ctrl_c_behavior(tab: &TerminalTab) -> CtrlCBehavior {
+    selected_text(tab)
+        .map(CtrlCBehavior::Copy)
+        .unwrap_or(CtrlCBehavior::Interrupt)
 }
 
 fn word_selection(tab: &TerminalTab, point: GridPoint) -> Option<Selection> {
@@ -2411,59 +2728,169 @@ fn line_selection(tab: &TerminalTab, point: GridPoint) -> Option<Selection> {
     })
 }
 
-fn encode_keystroke(keystroke: &Keystroke, application_cursor: bool) -> Option<Vec<u8>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeypadKey {
+    Digit(u8),
+    Decimal,
+    Divide,
+    Multiply,
+    Subtract,
+    Add,
+}
+
+fn active_keypad_key() -> Option<KeypadKey> {
+    [
+        (VK_NUMPAD0, KeypadKey::Digit(0)),
+        (VK_NUMPAD1, KeypadKey::Digit(1)),
+        (VK_NUMPAD2, KeypadKey::Digit(2)),
+        (VK_NUMPAD3, KeypadKey::Digit(3)),
+        (VK_NUMPAD4, KeypadKey::Digit(4)),
+        (VK_NUMPAD5, KeypadKey::Digit(5)),
+        (VK_NUMPAD6, KeypadKey::Digit(6)),
+        (VK_NUMPAD7, KeypadKey::Digit(7)),
+        (VK_NUMPAD8, KeypadKey::Digit(8)),
+        (VK_NUMPAD9, KeypadKey::Digit(9)),
+        (VK_DECIMAL, KeypadKey::Decimal),
+        (VK_DIVIDE, KeypadKey::Divide),
+        (VK_MULTIPLY, KeypadKey::Multiply),
+        (VK_SUBTRACT, KeypadKey::Subtract),
+        (VK_ADD, KeypadKey::Add),
+    ]
+    .into_iter()
+    .find_map(|(virtual_key, keypad)| {
+        (unsafe { GetKeyState(virtual_key.0 as i32) } < 0).then_some(keypad)
+    })
+}
+
+fn encode_keystroke(
+    keystroke: &Keystroke,
+    application_cursor: bool,
+    keypad: Option<KeypadKey>,
+) -> Option<Vec<u8>> {
+    if let Some(keypad) = keypad {
+        return Some(encode_application_keypad(keypad));
+    }
+
     let key = keystroke.key.as_str();
-    let cursor = |normal: &'static [u8], application: &'static [u8]| {
-        if application_cursor {
-            application
+    let modifier = xterm_modifier(&keystroke.modifiers);
+    let special = match key {
+        "tab" if keystroke.modifiers.shift => Some(if modifier == 2 {
+            b"\x1b[Z".to_vec()
         } else {
-            normal
-        }
-        .to_vec()
+            format!("\x1b[1;{modifier}Z").into_bytes()
+        }),
+        "up" => Some(encode_cursor_key(b'A', application_cursor, modifier)),
+        "down" => Some(encode_cursor_key(b'B', application_cursor, modifier)),
+        "right" => Some(encode_cursor_key(b'C', application_cursor, modifier)),
+        "left" => Some(encode_cursor_key(b'D', application_cursor, modifier)),
+        "home" => Some(encode_cursor_key(b'H', application_cursor, modifier)),
+        "end" => Some(encode_cursor_key(b'F', application_cursor, modifier)),
+        "insert" => Some(encode_tilde_key(2, modifier)),
+        "delete" => Some(encode_tilde_key(3, modifier)),
+        "pageup" => Some(encode_tilde_key(5, modifier)),
+        "pagedown" => Some(encode_tilde_key(6, modifier)),
+        "f1" => Some(encode_function_key(b'P', modifier)),
+        "f2" => Some(encode_function_key(b'Q', modifier)),
+        "f3" => Some(encode_function_key(b'R', modifier)),
+        "f4" => Some(encode_function_key(b'S', modifier)),
+        "f5" => Some(encode_tilde_key(15, modifier)),
+        "f6" => Some(encode_tilde_key(17, modifier)),
+        "f7" => Some(encode_tilde_key(18, modifier)),
+        "f8" => Some(encode_tilde_key(19, modifier)),
+        "f9" => Some(encode_tilde_key(20, modifier)),
+        "f10" => Some(encode_tilde_key(21, modifier)),
+        "f11" => Some(encode_tilde_key(23, modifier)),
+        "f12" => Some(encode_tilde_key(24, modifier)),
+        _ => None,
     };
-    let mut bytes = match key {
-        "enter" => b"\r".to_vec(),
-        "tab" if keystroke.modifiers.shift => b"\x1b[Z".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "space" => b" ".to_vec(),
-        "backspace" => vec![0x7f],
-        "escape" => vec![0x1b],
-        "up" => cursor(b"\x1b[A", b"\x1bOA"),
-        "down" => cursor(b"\x1b[B", b"\x1bOB"),
-        "right" => cursor(b"\x1b[C", b"\x1bOC"),
-        "left" => cursor(b"\x1b[D", b"\x1bOD"),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
-        "insert" => b"\x1b[2~".to_vec(),
-        "delete" => b"\x1b[3~".to_vec(),
-        "pageup" => b"\x1b[5~".to_vec(),
-        "pagedown" => b"\x1b[6~".to_vec(),
-        "f1" => b"\x1bOP".to_vec(),
-        "f2" => b"\x1bOQ".to_vec(),
-        "f3" => b"\x1bOR".to_vec(),
-        "f4" => b"\x1bOS".to_vec(),
-        "f5" => b"\x1b[15~".to_vec(),
-        "f6" => b"\x1b[17~".to_vec(),
-        "f7" => b"\x1b[18~".to_vec(),
-        "f8" => b"\x1b[19~".to_vec(),
-        "f9" => b"\x1b[20~".to_vec(),
-        "f10" => b"\x1b[21~".to_vec(),
-        "f11" => b"\x1b[23~".to_vec(),
-        "f12" => b"\x1b[24~".to_vec(),
-        _ if keystroke.modifiers.control && key.len() == 1 => {
-            let byte = key.as_bytes()[0].to_ascii_uppercase();
-            if byte.is_ascii_alphabetic() {
-                vec![byte & 0x1f]
-            } else {
-                return None;
-            }
+    if special.is_some() {
+        return special;
+    }
+
+    let mut bytes = if keystroke.modifiers.control {
+        vec![control_byte(key)?]
+    } else {
+        match key {
+            "enter" => b"\r".to_vec(),
+            "tab" => b"\t".to_vec(),
+            "space" => b" ".to_vec(),
+            "backspace" => vec![0x7f],
+            "escape" => vec![0x1b],
+            _ => keystroke.key_char.as_ref()?.as_bytes().to_vec(),
         }
-        _ => keystroke.key_char.as_ref()?.as_bytes().to_vec(),
     };
-    if keystroke.modifiers.alt && key != "escape" {
+    if keystroke.modifiers.alt {
         bytes.insert(0, 0x1b);
     }
     Some(bytes)
+}
+
+fn encode_cursor_key(key: u8, application_cursor: bool, modifier: u8) -> Vec<u8> {
+    if modifier > 1 {
+        format!("\x1b[1;{modifier}{}", key as char).into_bytes()
+    } else if application_cursor {
+        vec![0x1b, b'O', key]
+    } else {
+        vec![0x1b, b'[', key]
+    }
+}
+
+fn encode_function_key(key: u8, modifier: u8) -> Vec<u8> {
+    if modifier > 1 {
+        format!("\x1b[1;{modifier}{}", key as char).into_bytes()
+    } else {
+        vec![0x1b, b'O', key]
+    }
+}
+
+fn encode_tilde_key(key: u8, modifier: u8) -> Vec<u8> {
+    if modifier > 1 {
+        format!("\x1b[{key};{modifier}~").into_bytes()
+    } else {
+        format!("\x1b[{key}~").into_bytes()
+    }
+}
+
+fn encode_application_keypad(key: KeypadKey) -> Vec<u8> {
+    let key = match key {
+        KeypadKey::Digit(0) => b'p',
+        KeypadKey::Digit(1) => b'q',
+        KeypadKey::Digit(2) => b'r',
+        KeypadKey::Digit(3) => b's',
+        KeypadKey::Digit(4) => b't',
+        KeypadKey::Digit(5) => b'u',
+        KeypadKey::Digit(6) => b'v',
+        KeypadKey::Digit(7) => b'w',
+        KeypadKey::Digit(8) => b'x',
+        KeypadKey::Digit(9) => b'y',
+        KeypadKey::Digit(_) => unreachable!(),
+        KeypadKey::Decimal => b'n',
+        KeypadKey::Divide => b'o',
+        KeypadKey::Multiply => b'j',
+        KeypadKey::Subtract => b'm',
+        KeypadKey::Add => b'k',
+    };
+    vec![0x1b, b'O', key]
+}
+
+fn xterm_modifier(modifiers: &gpui::Modifiers) -> u8 {
+    1 + u8::from(modifiers.shift) + 2 * u8::from(modifiers.alt) + 4 * u8::from(modifiers.control)
+}
+
+fn control_byte(key: &str) -> Option<u8> {
+    if key == "space" {
+        return Some(0);
+    }
+    let [byte] = key.as_bytes() else {
+        return None;
+    };
+    match byte.to_ascii_uppercase() {
+        b'@' => Some(0),
+        byte @ b'A'..=b'Z' => Some(byte & 0x1f),
+        byte @ b'['..=b'_' => Some(byte & 0x1f),
+        b'?' => Some(0x7f),
+        _ => None,
+    }
 }
 
 fn is_application_shortcut(keystroke: &Keystroke) -> bool {
@@ -2472,7 +2899,7 @@ fn is_application_shortcut(keystroke: &Keystroke) -> bool {
     }
     matches!(
         (keystroke.modifiers.shift, keystroke.key.as_str()),
-        (false, "t" | "v" | "w" | "tab") | (true, "tab" | "c" | "v" | "p")
+        (false, "c" | "t" | "v" | "w" | "tab") | (true, "tab" | "c" | "v" | "p")
     )
 }
 
@@ -2491,7 +2918,7 @@ fn utf16_byte_index(text: &str, target: usize) -> usize {
 }
 
 fn encode_mouse(
-    button: MouseButton,
+    button: Option<MouseButton>,
     release: bool,
     motion: bool,
     col: usize,
@@ -2499,10 +2926,11 @@ fn encode_mouse(
     modifiers: gpui::Modifiers,
 ) -> Option<Vec<u8>> {
     let mut code = match button {
-        MouseButton::Left => 0,
-        MouseButton::Middle => 1,
-        MouseButton::Right => 2,
-        MouseButton::Navigate(_) => return None,
+        Some(MouseButton::Left) => 0,
+        Some(MouseButton::Middle) => 1,
+        Some(MouseButton::Right) => 2,
+        None => 3,
+        Some(MouseButton::Navigate(_)) => return None,
     };
     if motion {
         code += 32;
@@ -2673,7 +3101,14 @@ fn run_tab_connection(
         loop {
             match command_rx.try_recv() {
                 Ok(message) => {
+                    let latency_id = match &message {
+                        ClientMessage::Input { latency_id, .. } => *latency_id,
+                        _ => None,
+                    };
                     reader.send(message)?;
+                    if let Some(latency_id) = latency_id {
+                        crate::perf::log_input_latency_stage(latency_id, "client_sent", None);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
@@ -2700,6 +3135,35 @@ fn run_tab_connection(
             }
             None => thread::sleep(Duration::from_millis(2)),
         }
+    }
+}
+
+fn terminate_session_and_wait(
+    instance: Option<&str>,
+    session_id: &str,
+) -> Result<Vec<SessionInfo>, String> {
+    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let kill_error = client
+        .kill_session(session_id.to_owned())
+        .err()
+        .map(|error| error.to_string());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sessions = client.list_sessions().map_err(|error| error.to_string())?;
+        let running = sessions
+            .iter()
+            .any(|session| session.id == session_id && session.status == SessionStatus::Running);
+        if !running {
+            return Ok(sessions);
+        }
+        if let Some(error) = kill_error.as_ref() {
+            return Err(error.clone());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out ending session {session_id}"));
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2864,6 +3328,7 @@ mod tests {
                     foreground: Color::Default,
                     background: Color::Default,
                     attributes: TextAttributes::default(),
+                    hyperlink: None,
                 })
                 .collect(),
             wrapped,
@@ -2898,7 +3363,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_terminal_keys_without_stealing_ctrl_c() {
+    fn maps_terminal_control_modified_and_keypad_keys() {
         let ctrl_c = Keystroke {
             modifiers: gpui::Modifiers {
                 control: true,
@@ -2907,22 +3372,56 @@ mod tests {
             key: "c".into(),
             key_char: None,
         };
-        assert_eq!(encode_keystroke(&ctrl_c, false), Some(vec![3]));
+        assert_eq!(encode_keystroke(&ctrl_c, false, None), Some(vec![3]));
         let space = Keystroke {
             key: "space".into(),
             ..Default::default()
         };
-        assert_eq!(encode_keystroke(&space, false), Some(b" ".to_vec()));
+        assert_eq!(encode_keystroke(&space, false, None), Some(b" ".to_vec()));
         let up = Keystroke {
             key: "up".into(),
             ..Default::default()
         };
-        assert_eq!(encode_keystroke(&up, false), Some(b"\x1b[A".to_vec()));
-        assert_eq!(encode_keystroke(&up, true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(encode_keystroke(&up, false, None), Some(b"\x1b[A".to_vec()));
+        assert_eq!(encode_keystroke(&up, true, None), Some(b"\x1bOA".to_vec()));
+        let application_home = Keystroke {
+            key: "home".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_keystroke(&application_home, true, None),
+            Some(b"\x1bOH".to_vec())
+        );
+        let modified_up = Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            },
+            key: "up".into(),
+            key_char: None,
+        };
+        assert_eq!(
+            encode_keystroke(&modified_up, true, None),
+            Some(b"\x1b[1;6A".to_vec())
+        );
+        let ctrl_space = Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "space".into(),
+            key_char: None,
+        };
+        assert_eq!(encode_keystroke(&ctrl_space, false, None), Some(vec![0]));
+        assert_eq!(
+            encode_keystroke(&space, false, Some(KeypadKey::Digit(7))),
+            Some(b"\x1bOw".to_vec())
+        );
     }
 
     #[test]
-    fn reserves_paste_shortcuts_without_stealing_ctrl_c() {
+    fn reserves_clipboard_and_paste_shortcuts() {
         let shortcut = |key: &str, shift: bool| Keystroke {
             modifiers: gpui::Modifiers {
                 control: true,
@@ -2935,7 +3434,7 @@ mod tests {
 
         assert!(is_application_shortcut(&shortcut("v", false)));
         assert!(is_application_shortcut(&shortcut("v", true)));
-        assert!(!is_application_shortcut(&shortcut("c", false)));
+        assert!(is_application_shortcut(&shortcut("c", false)));
         assert!(is_application_shortcut(&shortcut("c", true)));
     }
 
@@ -2959,7 +3458,23 @@ mod tests {
             },
             true,
         );
+
         assert_eq!(data, b"\x1b[<16;3;5M");
+    }
+    #[test]
+    fn allows_only_web_hyperlinks() {
+        assert!(is_allowed_hyperlink("https://example.com/docs?q=1"));
+        assert!(is_allowed_hyperlink("HTTP://localhost:8080/"));
+        assert!(!is_allowed_hyperlink("file:///etc/passwd"));
+        assert!(!is_allowed_hyperlink("javascript:alert(1)"));
+        assert!(!is_allowed_hyperlink("https:///missing-host"));
+        assert!(!is_allowed_hyperlink("https://example.com/\nheader"));
+    }
+
+    #[test]
+    fn encodes_any_motion_without_a_pressed_button() {
+        let data = encode_mouse(None, false, true, 0, 0, gpui::Modifiers::default());
+        assert_eq!(data.as_deref(), Some(b"\x1b[<35;1;1M".as_slice()));
     }
 
     #[test]
@@ -2967,7 +3482,7 @@ mod tests {
         let snapshot = snapshot(vec![row("abcd", true)], vec![row("efgh", false)]);
         let mut mirror = ScreenMirror::default();
         mirror.apply(ScreenMessage::Snapshot { snapshot });
-        let tab = TerminalTab {
+        let mut tab = TerminalTab {
             id: 1,
             session_id: "session".into(),
             mirror,
@@ -2987,6 +3502,12 @@ mod tests {
             rows: 1,
         };
         assert_eq!(selected_text(&tab).as_deref(), Some("bcdefg"));
+        assert_eq!(
+            ctrl_c_behavior(&tab),
+            CtrlCBehavior::Copy("bcdefg".to_owned())
+        );
+        tab.selection = None;
+        assert_eq!(ctrl_c_behavior(&tab), CtrlCBehavior::Interrupt);
     }
 
     #[test]

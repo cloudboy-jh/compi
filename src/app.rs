@@ -195,9 +195,7 @@ fn soak(instance: Option<&str>, duration: Duration) -> Result<()> {
         ServerMessage::Attached { .. } => {}
         message => return Err(format!("unexpected attach response: {message:?}").into()),
     }
-    client.request(ClientMessage::Input {
-        data: b"i=0; while :; do printf 'COMPI_SOAK_%08d 0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$i\"; i=$((i+1)); sleep 0.02; done\r".to_vec(),
-    })?;
+    client.request(ClientMessage::Input { data: b"i=0; while :; do printf 'COMPI_SOAK_%08d 0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$i\"; i=$((i+1)); sleep 0.02; done\r".to_vec(), latency_id: None })?;
 
     let deadline = Instant::now() + duration;
     let mut mirror = ScreenMirror::default();
@@ -230,9 +228,13 @@ fn soak(instance: Option<&str>, duration: Duration) -> Result<()> {
         }
     }
 
-    client.request(ClientMessage::Input { data: vec![3] })?;
+    client.request(ClientMessage::Input {
+        data: vec![3],
+        latency_id: None,
+    })?;
     client.request(ClientMessage::Input {
         data: b"true; exit\r".to_vec(),
+        latency_id: None,
     })?;
     loop {
         match client.read_event()? {

@@ -2,15 +2,19 @@ use base64::Engine;
 use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::Read;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vte::{Params, Parser, Perform};
 
 pub const MAX_SCROLLBACK_BYTES: usize = 1024 * 1024;
 pub const MAX_GRAPHICS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_APC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OSC8_URI_BYTES: usize = 2048;
+const MAX_UNSUPPORTED_SIGNATURES: usize = 128;
+const MAX_OSC52_DECODED_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +44,7 @@ pub struct Cell {
     pub foreground: Color,
     pub background: Color,
     pub attributes: TextAttributes,
+    pub hyperlink: Option<SmolStr>,
 }
 
 impl Default for Cell {
@@ -50,6 +55,7 @@ impl Default for Cell {
             foreground: Color::Default,
             background: Color::Default,
             attributes: TextAttributes::default(),
+            hyperlink: None,
         }
     }
 }
@@ -104,6 +110,7 @@ pub struct TerminalModes {
     pub origin: bool,
     pub auto_wrap: bool,
     pub application_cursor: bool,
+    pub application_keypad: bool,
     pub mouse: MouseMode,
     pub sgr_mouse: bool,
     pub focus_events: bool,
@@ -163,7 +170,9 @@ pub struct ScreenDelta {
     pub title: String,
     pub current_directory: Option<String>,
     pub images: Option<Vec<KittyImage>>,
+    pub latency_ids: Vec<u64>,
     pub placements: Option<Vec<KittyPlacement>>,
+    pub clipboard_writes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,10 +295,52 @@ struct KittyTransfer {
 enum InputState {
     Normal,
     Escape,
+
     Apc(Vec<u8>),
     ApcEscape(Vec<u8>),
     ApcDiscard,
     ApcDiscardEscape,
+}
+#[derive(Default)]
+struct UnsupportedDiagnostics {
+    context: String,
+    counts: BTreeMap<String, u64>,
+}
+
+impl UnsupportedDiagnostics {
+    fn record(&mut self, signature: impl Into<String>) {
+        let mut signature = signature.into();
+        if !self.counts.contains_key(&signature) && self.counts.len() >= MAX_UNSUPPORTED_SIGNATURES
+        {
+            signature = "other".to_owned();
+        }
+        let count = self.counts.entry(signature.clone()).or_default();
+        *count = count.saturating_add(1);
+        if *count == 1 || count.is_power_of_two() {
+            eprintln!(
+                "compi-daemon: unsupported terminal sequence context={} signature={} count={}",
+                self.context, signature, count
+            );
+        }
+    }
+}
+
+impl Drop for UnsupportedDiagnostics {
+    fn drop(&mut self) {
+        if self.counts.is_empty() {
+            return;
+        }
+        let summary = self
+            .counts
+            .iter()
+            .map(|(signature, count)| format!("{signature}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "compi-daemon: unsupported terminal summary context={} counts={summary}",
+            self.context
+        );
+    }
 }
 struct ChangeBaseline {
     cols: usize,
@@ -313,6 +364,7 @@ pub struct TerminalState {
     cursor: CursorState,
     saved_cursor: CursorState,
     rendition: Rendition,
+    active_hyperlink: Option<SmolStr>,
     title: String,
     current_directory: Option<String>,
     modes: TerminalModes,
@@ -323,11 +375,13 @@ pub struct TerminalState {
     scrollback_generation: u64,
     graphics_generation: u64,
     replies: Vec<Vec<u8>>,
+    clipboard_writes: Vec<String>,
     images: HashMap<u32, KittyImage>,
     placements: Vec<KittyPlacement>,
     transfers: HashMap<u32, KittyTransfer>,
     next_image_id: u32,
     active_transfer: Option<u32>,
+    diagnostics: UnsupportedDiagnostics,
 }
 
 impl TerminalState {
@@ -346,6 +400,7 @@ impl TerminalState {
             },
             saved_cursor: CursorState::default(),
             rendition: Rendition::default(),
+            active_hyperlink: None,
             title: String::new(),
             current_directory: None,
             modes: TerminalModes {
@@ -357,6 +412,7 @@ impl TerminalState {
             pending_wrap: false,
             sequence: 0,
             replies: Vec::new(),
+            clipboard_writes: Vec::new(),
             images: HashMap::new(),
             scrollback_generation: 0,
             graphics_generation: 0,
@@ -364,7 +420,14 @@ impl TerminalState {
             transfers: HashMap::new(),
             next_image_id: 1,
             active_transfer: None,
+            diagnostics: UnsupportedDiagnostics::default(),
         }
+    }
+    pub fn set_diagnostic_context(&mut self, session_id: &str, trace_label: Option<&str>) {
+        self.diagnostics.context = match trace_label {
+            Some(label) => format!("session={session_id},trace={label}"),
+            None => format!("session={session_id}"),
+        };
     }
 
     pub fn snapshot(&self) -> ScreenSnapshot {
@@ -408,11 +471,24 @@ impl TerminalState {
             return None;
         }
         let before = self.change_baseline();
-        resize_buffer(&mut self.main, cols, rows, true);
-        resize_buffer(&mut self.alternate, cols, rows, false);
+        let cursor_in_main = (!self.active_alternate).then(|| {
+            (
+                self.main.scrollback.len() + usize::from(self.cursor.row),
+                usize::from(self.cursor.col),
+            )
+        });
+        let reflowed_cursor = reflow_main_buffer(&mut self.main, cols, rows, cursor_in_main);
+        resize_buffer_cells(&mut self.alternate, cols, rows);
         self.scrollback_generation = self.scrollback_generation.saturating_add(1);
-        self.cursor.col = self.cursor.col.min(cols.saturating_sub(1) as u16);
-        self.cursor.row = self.cursor.row.min(rows.saturating_sub(1) as u16);
+        if let Some((row, col)) = reflowed_cursor {
+            self.cursor.row = row.min(rows.saturating_sub(1)) as u16;
+            self.cursor.col = col.min(cols.saturating_sub(1)) as u16;
+        } else {
+            self.cursor.col = self.cursor.col.min(cols.saturating_sub(1) as u16);
+            self.cursor.row = self.cursor.row.min(rows.saturating_sub(1) as u16);
+        }
+        self.saved_cursor.col = self.saved_cursor.col.min(cols.saturating_sub(1) as u16);
+        self.saved_cursor.row = self.saved_cursor.row.min(rows.saturating_sub(1) as u16);
         self.scroll_top = 0;
         self.scroll_bottom = rows;
         self.pending_wrap = false;
@@ -436,6 +512,7 @@ impl TerminalState {
 
     fn finish_change(&mut self, before: ChangeBaseline) -> (Option<ScreenDelta>, Vec<Vec<u8>>) {
         let replies = std::mem::take(&mut self.replies);
+        let clipboard_writes = std::mem::take(&mut self.clipboard_writes);
         let row_hashes: Vec<_> = self.buffer().rows.iter().map(row_hash).collect();
         let all_rows = before.cols != self.cols()
             || before.rows != self.rows()
@@ -449,7 +526,8 @@ impl TerminalState {
             || before.cursor != self.cursor
             || before.modes != self.modes
             || before.title != self.title
-            || before.current_directory != self.current_directory;
+            || before.current_directory != self.current_directory
+            || !clipboard_writes.is_empty();
         if !changed {
             return (None, replies);
         }
@@ -484,7 +562,9 @@ impl TerminalState {
             title: self.title.clone(),
             current_directory: self.current_directory.clone(),
             images,
+            latency_ids: Vec::new(),
             placements,
+            clipboard_writes,
         };
         (Some(delta), replies)
     }
@@ -493,7 +573,6 @@ impl TerminalState {
         let state = std::mem::replace(&mut self.input_state, InputState::Normal);
         match state {
             InputState::Normal if byte == 0x1b => self.input_state = InputState::Escape,
-            InputState::Normal if byte == 0x9f => self.input_state = InputState::Apc(Vec::new()),
             InputState::Normal => self.feed_vte(&[byte]),
             InputState::Escape if byte == b'_' => self.input_state = InputState::Apc(Vec::new()),
             InputState::Escape => self.feed_vte(&[0x1b, byte]),
@@ -506,7 +585,7 @@ impl TerminalState {
                 self.input_state = InputState::Apc(payload);
             }
             InputState::Apc(_) => {
-                eprintln!("compi-daemon: discarded oversized APC sequence");
+                self.diagnostics.record("APC:oversized");
                 self.input_state = InputState::ApcDiscard;
             }
             InputState::ApcEscape(payload) if byte == b'\\' => self.dispatch_apc(&payload),
@@ -516,7 +595,7 @@ impl TerminalState {
                 self.input_state = InputState::Apc(payload);
             }
             InputState::ApcEscape(_) => {
-                eprintln!("compi-daemon: discarded oversized APC sequence");
+                self.diagnostics.record("APC:oversized");
                 self.input_state = InputState::ApcDiscard;
             }
             InputState::ApcDiscard if byte == 0x1b => {
@@ -574,6 +653,9 @@ impl TerminalState {
             self.append_combining(character);
             return;
         }
+        if self.append_grapheme_extension(character) {
+            return;
+        }
         let cols = self.cols();
         if self.pending_wrap && self.modes.auto_wrap {
             self.cursor.col = 0;
@@ -595,10 +677,12 @@ impl TerminalState {
             foreground: self.rendition.foreground,
             background: self.rendition.background,
             attributes: self.rendition.attributes.clone(),
+            hyperlink: self.active_hyperlink.clone(),
         };
         self.buffer_mut().rows[row].cells[col] = cell;
         if width == 2 {
             let mut continuation = self.blank_cell();
+            continuation.hyperlink = self.active_hyperlink.clone();
             continuation.text = SmolStr::new_static("");
             continuation.width = 0;
             self.buffer_mut().rows[row].cells[col + 1] = continuation;
@@ -613,12 +697,56 @@ impl TerminalState {
         }
     }
 
-    fn append_combining(&mut self, character: char) {
+    fn previous_base_cell(&self) -> Option<(usize, usize)> {
         let row = usize::from(self.cursor.row).min(self.rows() - 1);
-        let mut col = usize::from(self.cursor.col).saturating_sub(1);
+        let mut col = if self.pending_wrap {
+            usize::from(self.cursor.col)
+        } else {
+            usize::from(self.cursor.col).checked_sub(1)?
+        };
         while col > 0 && self.buffer().rows[row].cells[col].width == 0 {
             col -= 1;
         }
+        (self.buffer().rows[row].cells[col].width > 0).then_some((row, col))
+    }
+
+    fn append_grapheme_extension(&mut self, character: char) -> bool {
+        let Some((row, col)) = self.previous_base_cell() else {
+            return false;
+        };
+        let mut text = self.buffer().rows[row].cells[col].text.to_string();
+        text.push(character);
+        if text.graphemes(true).count() != 1 {
+            return false;
+        }
+        let new_width = UnicodeWidthStr::width(text.as_str()).clamp(1, 2);
+        let old_width = usize::from(self.buffer().rows[row].cells[col].width);
+        if new_width > old_width && col + new_width <= self.cols() {
+            let mut continuation = self.buffer().rows[row].cells[col].clone();
+            continuation.text = SmolStr::new_static("");
+            continuation.width = 0;
+            self.buffer_mut().rows[row].cells[col + 1] = continuation;
+            let next = col + new_width;
+            if next >= self.cols() {
+                self.cursor.col = (self.cols() - 1) as u16;
+                self.pending_wrap = true;
+            } else {
+                self.cursor.col = next as u16;
+            }
+        }
+        let cell = &mut self.buffer_mut().rows[row].cells[col];
+        cell.text = text.into();
+        cell.width = new_width as u8;
+        true
+    }
+
+    fn append_combining(&mut self, character: char) {
+        let (row, col) = self.previous_base_cell().unwrap_or_else(|| {
+            (
+                usize::from(self.cursor.row).min(self.rows() - 1),
+                usize::from(self.cursor.col).min(self.cols() - 1),
+            )
+        });
         let cell = &mut self.buffer_mut().rows[row].cells[col];
         let mut text = cell.text.to_string();
         text.push(character);
@@ -627,14 +755,13 @@ impl TerminalState {
 
     fn linefeed(&mut self, wrapped: bool) {
         let row = usize::from(self.cursor.row);
+        if let Some(current) = self.buffer_mut().rows.get_mut(row) {
+            current.wrapped = wrapped;
+        }
         if row + 1 >= self.scroll_bottom {
             self.scroll_up(1);
         } else {
             self.cursor.row = (row + 1).min(self.rows() - 1) as u16;
-        }
-        let current = usize::from(self.cursor.row);
-        if let Some(row) = self.buffer_mut().rows.get_mut(current) {
-            row.wrapped = wrapped;
         }
         self.pending_wrap = false;
     }
@@ -961,7 +1088,7 @@ impl TerminalState {
 
     fn dispatch_apc(&mut self, payload: &[u8]) {
         if !payload.starts_with(b"G") {
-            eprintln!("compi-daemon: unsupported APC sequence");
+            self.diagnostics.record("APC:unsupported");
             return;
         }
         let payload = &payload[1..];
@@ -1146,7 +1273,9 @@ impl TerminalState {
                         .retain(|placement| placement.placement_id != Some(id));
                 }
             }
-            mode => eprintln!("compi-daemon: unsupported Kitty delete mode {mode}"),
+            mode => self
+                .diagnostics
+                .record(format!("Kitty-delete:{}", mode.to_ascii_lowercase())),
         }
         if before
             != (
@@ -1159,8 +1288,8 @@ impl TerminalState {
         }
     }
 
-    fn unsupported(&self, kind: &str, value: u16) {
-        eprintln!("compi-daemon: unsupported terminal {kind} {value}");
+    fn unsupported(&mut self, kind: &str, value: u16) {
+        self.diagnostics.record(format!("{kind}:{value}"));
     }
 }
 
@@ -1192,7 +1321,7 @@ impl Perform for TerminalState {
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], ignore: bool, action: char) {
         if !ignore {
-            eprintln!("compi-daemon: unsupported DCS sequence {action}");
+            self.diagnostics.record(format!("DCS:{action}"));
         }
     }
 
@@ -1203,21 +1332,31 @@ impl Perform for TerminalState {
         else {
             return;
         };
-        if matches!(command, "0" | "2") {
-            self.title = params
-                .get(1)
-                .map(|value| String::from_utf8_lossy(value).into_owned())
-                .unwrap_or_default();
-        } else if command == "7"
-            && let Some(path) = params.get(1).and_then(|value| parse_osc7_path(value))
-        {
-            self.current_directory = Some(path);
+        match command {
+            "0" | "2" => {
+                self.title = params
+                    .get(1)
+                    .map(|value| String::from_utf8_lossy(value).into_owned())
+                    .unwrap_or_default();
+            }
+            "7" => {
+                if let Some(path) = params.get(1).and_then(|value| parse_osc7_path(value)) {
+                    self.current_directory = Some(path);
+                }
+            }
+            "8" => self.active_hyperlink = parse_osc8_uri(params),
+            "52" => {
+                if let Some(text) = parse_osc52_clipboard(params) {
+                    self.clipboard_writes.push(text);
+                }
+            }
+            _ => {}
         }
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore {
-            eprintln!("compi-daemon: ignored oversized CSI sequence");
+            self.diagnostics.record("CSI:oversized");
             return;
         }
         let private = intermediates == b"?";
@@ -1282,9 +1421,10 @@ impl Perform for TerminalState {
             ),
             ('c', _) => self.replies.push(b"\x1b[?1;2c".to_vec()),
             ('q', b" ") => self.cursor_style(first_param(params, 0)),
-            _ => eprintln!(
-                "compi-daemon: unsupported CSI action {action:?} intermediates {intermediates:?} params {params:?}"
-            ),
+            _ => self.diagnostics.record(format!(
+                "CSI:{action}:private={private}:intermediates={intermediates:?}:params={:?}",
+                flat_params(params)
+            )),
         }
         if !matches!(action, 'm' | 'h' | 'l' | 'n' | 'c' | 'q') {
             self.pending_wrap = false;
@@ -1307,10 +1447,14 @@ impl Perform for TerminalState {
             b'c' => {
                 let cols = self.cols() as u16;
                 let rows = self.rows() as u16;
+                let diagnostics = std::mem::take(&mut self.diagnostics);
                 *self = Self::new(cols, rows);
+                self.diagnostics = diagnostics;
             }
-            b'H' | b'=' | b'>' => {}
-            _ => eprintln!("compi-daemon: unsupported ESC sequence {byte:?}"),
+            b'=' => self.modes.application_keypad = true,
+            b'>' => self.modes.application_keypad = false,
+            b'H' => {}
+            _ => self.diagnostics.record(format!("ESC:{byte:02x}")),
         }
     }
 }
@@ -1341,6 +1485,48 @@ fn parse_osc7_path(value: &[u8]) -> Option<String> {
         .filter(|path| path.starts_with('/'))
 }
 
+fn parse_osc8_uri(params: &[&[u8]]) -> Option<SmolStr> {
+    let uri_len = params
+        .iter()
+        .skip(2)
+        .map(|part| part.len())
+        .sum::<usize>()
+        .saturating_add(params.len().saturating_sub(3));
+    if uri_len == 0 || uri_len > MAX_OSC8_URI_BYTES {
+        return None;
+    }
+    let mut uri = Vec::with_capacity(uri_len);
+    for (index, part) in params.iter().skip(2).enumerate() {
+        if index != 0 {
+            uri.push(b';');
+        }
+        uri.extend_from_slice(part);
+    }
+    let uri = std::str::from_utf8(&uri).ok()?;
+    if uri.chars().any(char::is_control) {
+        return None;
+    }
+    Some(SmolStr::new(uri))
+}
+
+fn parse_osc52_clipboard(params: &[&[u8]]) -> Option<String> {
+    let target = *params.get(1)?;
+    if !matches!(target, b"" | b"c") {
+        return None;
+    }
+    let encoded = *params.get(2)?;
+    if encoded == b"?" || encoded.len() > MAX_OSC52_DECODED_BYTES.saturating_add(2) / 3 * 4 {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    if decoded.len() > MAX_OSC52_DECODED_BYTES {
+        return None;
+    }
+    String::from_utf8(decoded).ok()
+}
+
 fn hex_digit(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -1369,7 +1555,7 @@ fn flat_params(params: &Params) -> Vec<u16> {
 fn row_memory(row: &Row) -> usize {
     row.cells
         .iter()
-        .map(|cell| 32 + cell.text.len())
+        .map(|cell| 32 + cell.text.len() + cell.hyperlink.as_ref().map_or(0, |uri| uri.len()))
         .sum::<usize>()
         + 1
 }
@@ -1379,30 +1565,124 @@ fn row_hash(row: &Row) -> u64 {
     hasher.finish()
 }
 
-fn resize_buffer(buffer: &mut Buffer, cols: usize, rows: usize, preserve_scrollback: bool) {
-    for row in &mut buffer.rows {
-        row.cells.resize(cols, Cell::default());
-        repair_wide_cells(row);
-    }
-    while buffer.rows.len() > rows {
-        let removed = buffer.rows.remove(0);
-        if preserve_scrollback {
-            buffer.push_scrollback(removed);
+fn reflow_main_buffer(
+    buffer: &mut Buffer,
+    cols: usize,
+    rows: usize,
+    cursor: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    let source: Vec<Row> = buffer
+        .scrollback
+        .drain(..)
+        .chain(buffer.rows.drain(..))
+        .collect();
+    let mut logical_lines: Vec<(Vec<Cell>, Option<usize>)> = Vec::new();
+    let mut line_cells = Vec::new();
+    let mut line_cursor = None;
+    for (row_index, row) in source.into_iter().enumerate() {
+        if let Some((cursor_row, cursor_col)) = cursor
+            && cursor_row == row_index
+        {
+            line_cursor =
+                Some(line_cells.len() + cursor_col.min(row.cells.len().saturating_sub(1)));
+        }
+        line_cells.extend(row.cells);
+        if !row.wrapped {
+            trim_reflow_line(&mut line_cells, line_cursor);
+            logical_lines.push((std::mem::take(&mut line_cells), line_cursor.take()));
         }
     }
-    while buffer.rows.len() < rows {
-        buffer.rows.push(Row::blank(cols));
+    if !line_cells.is_empty() || logical_lines.is_empty() {
+        trim_reflow_line(&mut line_cells, line_cursor);
+        logical_lines.push((line_cells, line_cursor));
     }
-    for row in &mut buffer.scrollback {
-        row.cells.resize(cols, Cell::default());
-        repair_wide_cells(row);
+
+    let mut physical_rows = Vec::new();
+    let mut mapped_cursor = None;
+    for (cells, cursor_offset) in logical_lines {
+        let line_start = physical_rows.len();
+        let mut row = Row::blank(cols);
+        let mut col = 0;
+        let mut source_col = 0;
+        while source_col < cells.len() {
+            let cell = &cells[source_col];
+            let width = usize::from(cell.width.max(1));
+            if col + width > cols {
+                row.wrapped = true;
+                physical_rows.push(row);
+                row = Row::blank(cols);
+                col = 0;
+            }
+            if cursor_offset.is_some_and(|offset| {
+                offset >= source_col && offset < source_col.saturating_add(width)
+            }) {
+                mapped_cursor = Some((
+                    physical_rows.len(),
+                    col + cursor_offset.unwrap().saturating_sub(source_col),
+                ));
+            }
+            if cell.width == 0 {
+                source_col += 1;
+                continue;
+            }
+            row.cells[col] = cell.clone();
+            if width == 2 && col + 1 < cols {
+                row.cells[col + 1] = cells
+                    .get(source_col + 1)
+                    .filter(|continuation| continuation.width == 0)
+                    .cloned()
+                    .unwrap_or_else(|| Cell {
+                        text: SmolStr::new_static(""),
+                        width: 0,
+                        ..Cell::default()
+                    });
+            }
+            col += width;
+            source_col += width;
+        }
+        if cursor_offset == Some(cells.len()) {
+            mapped_cursor = Some((physical_rows.len(), col.min(cols.saturating_sub(1))));
+        }
+        physical_rows.push(row);
+        if mapped_cursor.is_none() && cursor_offset.is_some() {
+            mapped_cursor = Some((line_start, 0));
+        }
     }
+
+    while physical_rows.len() < rows {
+        physical_rows.push(Row::blank(cols));
+    }
+    let viewport_start = physical_rows.len().saturating_sub(rows);
+    let viewport = physical_rows.split_off(viewport_start);
+    buffer.scrollback = physical_rows.into();
+    buffer.rows = viewport;
     buffer.scrollback_bytes = buffer.scrollback.iter().map(row_memory).sum();
     while buffer.scrollback_bytes > MAX_SCROLLBACK_BYTES {
         let Some(removed) = buffer.scrollback.pop_front() else {
             break;
         };
         buffer.scrollback_bytes = buffer.scrollback_bytes.saturating_sub(row_memory(&removed));
+    }
+    mapped_cursor.map(|(row, col)| (row.saturating_sub(viewport_start), col))
+}
+
+fn trim_reflow_line(cells: &mut Vec<Cell>, cursor: Option<usize>) {
+    let minimum = cursor.map_or(0, |offset| offset.saturating_add(1));
+    while cells.len() > minimum && cells.last().is_some_and(|cell| cell == &Cell::default()) {
+        cells.pop();
+    }
+}
+
+fn resize_buffer_cells(buffer: &mut Buffer, cols: usize, rows: usize) {
+    for row in &mut buffer.rows {
+        row.cells.resize(cols, Cell::default());
+        repair_wide_cells(row);
+    }
+    while buffer.rows.len() > rows {
+        buffer.rows.remove(0);
+    }
+    while buffer.rows.len() < rows {
+        buffer.rows.push(Row::blank(cols));
     }
 }
 
@@ -1430,15 +1710,18 @@ pub fn decode_screen(payload: &[u8]) -> Result<ScreenMessage, bincode::error::De
 mod tests {
     use super::*;
 
-    fn visible_text(snapshot: &ScreenSnapshot, row: usize) -> String {
-        snapshot.cells[row]
-            .cells
+    fn row_text(row: &Row) -> String {
+        row.cells
             .iter()
             .filter(|cell| cell.width != 0)
             .map(|cell| cell.text.as_str())
             .collect::<String>()
             .trim_end()
             .to_owned()
+    }
+
+    fn visible_text(snapshot: &ScreenSnapshot, row: usize) -> String {
+        row_text(&snapshot.cells[row])
     }
 
     #[test]
@@ -1451,6 +1734,20 @@ mod tests {
         assert_eq!(snapshot.cells[0].cells[2].width, 2);
         assert_eq!(snapshot.cells[0].cells[3].width, 0);
         assert_eq!(snapshot.title, "Compi");
+    }
+
+    #[test]
+    fn keeps_combining_emoji_and_flags_in_single_cells() {
+        let mut terminal = TerminalState::new(16, 2);
+        terminal.advance("e\u{301} 👩\u{200d}💻 🇺🇸".as_bytes());
+        let snapshot = terminal.snapshot();
+        let row = &snapshot.cells[0];
+        assert_eq!(row.cells[0].text, "e\u{301}");
+        assert_eq!((row.cells[0].width, row.cells[1].width), (1, 1));
+        assert_eq!(row.cells[2].text, "👩\u{200d}💻", "{:?}", row.cells);
+        assert_eq!((row.cells[2].width, row.cells[3].width), (2, 0));
+        assert_eq!(row.cells[5].text, "🇺🇸");
+        assert_eq!((row.cells[5].width, row.cells[6].width), (2, 0));
     }
 
     #[test]
@@ -1475,6 +1772,33 @@ mod tests {
     }
 
     #[test]
+    fn tracks_osc8_hyperlinks_on_printed_cells() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.advance(b"\x1b]8;;https://example.com/docs\x07link\x1b]8;;\x07 plain");
+        let snapshot = terminal.snapshot();
+        for cell in &snapshot.cells[0].cells[..4] {
+            assert_eq!(cell.hyperlink.as_deref(), Some("https://example.com/docs"));
+        }
+        assert!(snapshot.cells[0].cells[4].hyperlink.is_none());
+    }
+
+    #[test]
+    fn emits_only_valid_windows_clipboard_writes() {
+        let mut terminal = TerminalState::new(12, 2);
+        let (delta, _) = terminal.advance(b"\x1b]52;c;Y29waWVkIHRleHQ=\x07");
+        assert_eq!(delta.unwrap().clipboard_writes, ["copied text".to_owned()]);
+
+        assert!(
+            terminal
+                .advance(b"\x1b]52;p;bm90IHN1cHBvcnRlZA==\x07")
+                .0
+                .is_none()
+        );
+        assert!(terminal.advance(b"\x1b]52;c;?\x07").0.is_none());
+        assert!(terminal.advance(b"\x1b]52;c;not-base64\x07").0.is_none());
+    }
+
+    #[test]
     fn tracks_alternate_screen_and_bounded_scrollback() {
         let mut terminal = TerminalState::new(8, 2);
         terminal.advance(b"one\r\ntwo\r\nthree");
@@ -1485,6 +1809,63 @@ mod tests {
         terminal.advance(b"\x1b[?1049l");
         assert!(!terminal.snapshot().modes.alternate_screen);
         assert_eq!(visible_text(&terminal.snapshot(), 1), "three");
+    }
+
+    #[test]
+    fn marks_source_rows_as_wrapped_and_reflows_logical_lines() {
+        let mut terminal = TerminalState::new(5, 3);
+        terminal.advance(b"abcdefgh");
+        let initial = terminal.snapshot();
+        assert!(initial.cells[0].wrapped);
+        assert!(!initial.cells[1].wrapped);
+
+        terminal.resize(4, 3);
+        let narrow = terminal.snapshot();
+        let narrow_text: Vec<_> = narrow
+            .scrollback
+            .iter()
+            .chain(&narrow.cells)
+            .map(row_text)
+            .filter(|text| !text.is_empty())
+            .collect();
+        assert_eq!(narrow_text, ["abcd", "efgh"]);
+        assert!(narrow.scrollback.first().is_some_and(|row| row.wrapped));
+
+        terminal.resize(10, 3);
+        let wide = terminal.snapshot();
+        let wide_text: Vec<_> = wide
+            .scrollback
+            .iter()
+            .chain(&wide.cells)
+            .map(row_text)
+            .filter(|text| !text.is_empty())
+            .collect();
+        assert_eq!(wide_text, ["abcdefgh"]);
+        assert_eq!((wide.cursor.row, wide.cursor.col), (0, 8));
+    }
+    #[test]
+    fn counts_repeated_unsupported_sequences_by_signature() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_diagnostic_context("test-session", Some("workflow"));
+        terminal.advance(b"\x1b[?9001h\x1b[?9001l\x1b[?9001h");
+        assert_eq!(
+            terminal.diagnostics.counts.get("DEC mode:9001").copied(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn tracks_application_cursor_and_keypad_modes() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.advance(b"\x1b[?1h\x1b=");
+        let enabled = terminal.snapshot();
+        assert!(enabled.modes.application_cursor);
+        assert!(enabled.modes.application_keypad);
+
+        terminal.advance(b"\x1b[?1l\x1b>");
+        let disabled = terminal.snapshot();
+        assert!(!disabled.modes.application_cursor);
+        assert!(!disabled.modes.application_keypad);
     }
 
     #[test]

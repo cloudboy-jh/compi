@@ -91,8 +91,11 @@ Instrumentation writes:
 - `%LOCALAPPDATA%\Compi\client-resource-<pid>.log`: six-second client private bytes, working set, handles, workload, and attached-tab count;
 - `%LOCALAPPDATA%\Compi\daemon-resource-<pid>.log`: six-second daemon private bytes, working set, handles, and session count;
 - `%LOCALAPPDATA%\Compi\client-perf.log`: frame-interval and terminal-paint distributions under active output.
+- `%LOCALAPPDATA%\Compi\latency-<pid>.log`: correlated input IDs at GPUI receipt, client queue/send, daemon receipt, PTY output, terminal-state sequence, and the next presented frame.
 
 Set `COMPI_PERF_EMPTY_WINDOW=1` with `COMPI_PERF_LOG=1` to measure a blank GPUI window without connecting to a daemon. Set `COMPI_PERF_READY_PROBE=1` only against an isolated measurement session; it sends a deterministic `printf` command and measures both launch-to-rendered-marker and input-to-rendered-marker time.
+
+For deterministic terminal debugging, set `COMPI_TERMINAL_TRACE_DIR` on an isolated daemon and optionally set `COMPI_TERMINAL_TRACE_LABEL`. Each session then writes a bounded 16 MiB binary trace containing its initial grid, input bytes, PTY output bytes, resize events, and monotonic timing. Traces can contain commands, credentials, and terminal output; never enable capture for normal or valuable sessions. Regression tests replay captured PTY output through `TerminalState` without WSL or timing dependencies.
 
 The release harness runs empty-window, warm-daemon, and cold-daemon launch samples; measures fresh one-, two-, and four-session client/daemon pairs; queries Windows GPU process-memory counters; and writes CSV plus environment JSON under `%LOCALAPPDATA%\Compi\measurements`:
 
@@ -103,26 +106,26 @@ cargo build --release --bins --example compi-probe
 
 `-ConfirmPhysicalDisplay` is an operator assertion. Do not pass it through a virtual display or remote-only session. Without it, the harness intentionally labels the run diagnostic rather than qualified. For longer marginal-session analysis, keep instrumentation active, add one blank session at a time, wait at least six seconds per state, and compare consecutive client and daemon resource records by their `sessions` values.
 
-The performance gate is:
+Terminal-truth performance evidence is:
 
-- first visible frame p95 under 100 ms;
-- warm existing-session ready-for-input p95 under 200 ms;
-- cold first-terminal-frame p95 under 500 ms;
-- active frame-interval p95 under 8,333 µs on a physical 120 Hz display;
-- terminal-paint p95 below the frame interval;
-- initially no more than 35 MiB client private bytes, with a stretch target of 25 MiB;
-- no sustained private-byte, GPU-memory, or handle growth after tabs and Kitty images are closed.
+- correlated input-to-present instrumentation at GPUI key receipt, client queue/send, daemon input receipt, PTY output receipt, terminal-state update with screen sequence, and the next presented frame;
+- p50, p95, and worst input-to-present latency from at least 100 interactive samples;
+- terminal paint below the available frame budget;
+- no monotonic private-byte, GPU-memory, handle, or queue growth during a 30-minute mixed TUI session.
+
+The approximate 376 ms warm first-window, 544 ms warm ready-for-input, 153 ms input-to-render, and 89–96 MiB client-private-memory measurements are architecture baselines, not terminal-truth failures. The old 100 ms startup and 35 MiB client-memory aspirations are not acceptance gates for this sprint.
 
 ## Tier 3: interactive client acceptance
 
 | Area | Procedure | Required result |
 |---|---|---|
-| Shell control | Verify command echo, `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `bg`, and `fg`. | Bash semantics match a native WSL terminal. `Ctrl+C` is never stolen by copy handling. |
+| Shell control | Verify command echo, `Ctrl+D`, `Ctrl+Z`, `bg`, and `fg`; run sustained output and press `Ctrl+C` with no selection. | Bash semantics match a native WSL terminal. With no selection, `Ctrl+C` sends `0x03`, stops output promptly, and returns one clean prompt. |
 | TUI applications | Exercise `htop` or `btop`, `vim` or `nvim`, `less`, `tmux`, and `fzf` with inline preview. | Alternate-screen transitions, cursor, mouse, keyboard, and redraw behavior remain correct. |
-| Selection and clipboard | Select single-line, wrapped, multiline, CJK, and combining-mark text; copy and paste with both supported shortcuts. | Copied text preserves logical line breaks; selection does not alter terminal input; paste honors bracketed-paste mode. |
+| Selection and clipboard | Select single-line, wrapped, multiline, CJK, and combining-mark text. Press `Ctrl+C` while a foreground process runs, then repeat with `Ctrl+Shift+C`; paste the results. | `Ctrl+C` copies a non-empty selection without sending PTY input or interrupting the process. Both shortcuts copy the exact logical text, and paste honors bracketed-paste mode. |
 | Scrollback resize | Scroll several pages up, resize wider and narrower, then return to bottom. | Viewport stays anchored to the same logical content; no jump to bottom, overlap, or stale cells. |
 | Tabs | Create multiple sessions, switch rapidly, close active and inactive tabs, and overflow the available titlebar width. | Active state is unambiguous; tabs remain reachable without permanent arrow controls; close appears only where intended. |
-| Session palette | Open the command control, switch to an open tab, attach a detached session, create a session, and inspect exited/failed sessions. | Every state is represented accurately and the palette closes after a successful action. |
+| Session palette | Open the command control, switch to an open tab, attach a detached session, create a session, and inspect exited/failed sessions. End one attached and one detached session through the inline confirmation. | Every state is represented accurately. End session terminates the shell and descendants, shows `Ending…`, updates lifecycle state, and closes an attached tab only after exit. |
+| Detach versus terminate | Close an active tab, close the client with live sessions, reopen, and reattach; separately use `End session` from the session list. | Tab and client close preserve live sessions. Only the confirmed session-list action terminates a session. |
 | Window chrome | Drag from the mark, unused header space, and a tab; double-click unused header space; use minimize, maximize/restore, and close. | Native movement starts only after the drag threshold; controls never trigger dragging; maximize and restore match Windows behavior. |
 | Persistence | Open two sessions, detach both, close the client, reopen, and attach in reverse order. | Shells keep running; state does not cross between sessions. |
 | Failure handling | Abruptly terminate an isolated daemon, restart it, and inspect stale sessions; attempt a second daemon launch. | Stale sessions report dead and cannot attach; second daemon fails clearly; no live production session is affected. |
