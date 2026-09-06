@@ -1,6 +1,8 @@
-# Compi terminal acceptance matrix
+# Compi Windows terminal test recipes
 
-Run the automated tier on every change. Run the scripted and interactive tiers in a release build before a milestone or installer release. Use an isolated daemon instance for destructive lifecycle checks.
+These recipes describe the existing Windows/WSL implementation and its previous acceptance process. They are retained as regression inputs, not as the complete cross-platform acceptance matrix or current milestone ordering. The authoritative requirements are in [Spec.md](Spec.md); adapting this coverage is part of the [pending implementation work](NEXT_STEPS.md).
+
+The procedures below use the current Windows commands and terminology. Use release builds for scripted and interactive checks and an isolated daemon instance for destructive lifecycle checks. Historical dimensions, limits, and artifact assumptions must be revisited when their implementation contracts change.
 
 ## Test environment record
 

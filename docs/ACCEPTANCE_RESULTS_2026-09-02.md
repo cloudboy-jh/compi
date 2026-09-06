@@ -1,5 +1,7 @@
 # Compi acceptance results — 2026-09-02
 
+> Historical Windows/WSL evidence from the previous product baseline. Results and open gates below describe the recorded runs, not the current checkout or qualification of the new cross-platform product. [Spec.md](Spec.md) defines the current requirements; [NEXT_STEPS.md](NEXT_STEPS.md) defines the pending handoff.
+
 ## Environment
 
 - Windows 11 Home 10.0.26200, x64
