@@ -13,10 +13,11 @@ pub mod pipe;
 pub mod probe;
 pub mod pty;
 pub mod screen;
-pub mod session;
-mod session_store;
 #[cfg(windows)]
 pub mod supervisor;
+pub mod surface;
+pub mod workspace;
+mod workspace_store;
 #[cfg(windows)]
 pub mod wsl;
 

@@ -3,7 +3,10 @@ use crate::client::{DaemonClient, ServerEvent};
 #[cfg(windows)]
 use crate::console;
 use compi_client_core::{MirrorApply, ScreenMirror};
-use compi_protocol::{ClientMessage, ScreenMessage, ServerMessage, SessionInfo, SessionStatus};
+use compi_protocol::{
+    ClientMessage, PaneId, ScreenMessage, ServerMessage, SessionId, SplitAxis, SurfaceId,
+    SurfaceInfo, SurfaceStatus, TabId, WorkspaceMutation,
+};
 use std::env;
 use std::fs::{self, OpenOptions};
 #[cfg(windows)]
@@ -30,10 +33,13 @@ pub fn run() -> Result<()> {
 
     match args.first().map(String::as_str) {
         None => start(instance, None),
-        Some("start") => start(instance, optional_working_directory(&args, "start")?),
+        Some("start") => start(instance, optional_tail(&args, 1)?),
         Some("daemon-start") => start_daemon(instance),
-        Some("create") => create(instance, optional_working_directory(&args, "create")?),
-        Some("list") | Some("status") => list(instance),
+        Some("workspace") => workspace(instance),
+        Some("session") => session_command(instance, &args[1..]),
+        Some("tab") => tab_command(instance, &args[1..]),
+        Some("pane") => pane_command(instance, &args[1..]),
+        Some("surface") => surface_command(instance, &args[1..]),
         Some("soak") => {
             if args.len() != 2 {
                 return Err("soak requires exactly one duration in seconds".into());
@@ -45,18 +51,6 @@ pub fn run() -> Result<()> {
                 return Err("soak duration must be a positive integer".into());
             }
             soak(instance, Duration::from_secs(seconds))
-        }
-        Some("attach") => {
-            let id = args.get(1).ok_or("attach requires a session ID")?;
-            attach(instance, id.clone())
-        }
-        Some("inspect") => {
-            let id = args.get(1).ok_or("inspect requires a session ID")?;
-            inspect(instance, id.clone())
-        }
-        Some("kill") => {
-            let id = args.get(1).ok_or("kill requires a session ID")?;
-            kill(instance, id.clone())
         }
         Some("shutdown") => shutdown(instance),
         Some("check-system") | Some("--check-system") => crate::launch::check_system(),
@@ -70,18 +64,23 @@ pub fn run() -> Result<()> {
 
 fn usage() {
     println!(
-        "compi-probe - Milestone 2 diagnostic client\n\n\
-         Usage:\n  compi-probe start [working-directory]     Create and attach a session\n  \
-         compi-probe daemon-start                  Start the per-user daemon\n  \
-         compi-probe create [working-directory]    Create a detached session\n  \
-         compi-probe list                          List sessions\n  \
-         compi-probe attach <id>           Attach to a session\n  \
-         compi-probe inspect <id>          Print an authoritative screen snapshot\n  \
-         compi-probe kill <id>             Kill a session\n  \
-         compi-probe soak <seconds>        Run an attached sustained-output workload\n  \
-         compi-probe shutdown              Stop the daemon and all sessions\n\n\
-         compi-probe check-system          Check the native shell runtime\n\n\
-         Add `--instance <name>` before the command for an isolated development daemon.\n\
+        "compi-probe - workspace protocol diagnostic client\n\n\
+         Usage:\n  compi-probe start [working-directory]\n  \
+         compi-probe workspace\n  \
+         compi-probe session create <label>\n  \
+         compi-probe session rename <session-id> <label>\n  \
+         compi-probe session remove <session-id>\n  \
+         compi-probe tab create <session-id> <label> [working-directory]\n  \
+         compi-probe tab rename <tab-id> <label>\n  \
+         compi-probe tab move <session-id> <tab-id> <index>\n  \
+         compi-probe tab remove <tab-id>\n  \
+         compi-probe pane split-right|split-down <pane-id> [working-directory]\n  \
+         compi-probe pane remove <pane-id>\n  \
+         compi-probe surface attach|inspect|end|restart <surface-id>\n  \
+         compi-probe soak <seconds>\n  \
+         compi-probe shutdown\n  \
+         compi-probe check-system\n\n\
+         Add `--instance <name>` before the command for an isolated daemon.\n\
          Press Ctrl+] to detach without stopping the shell."
     );
 }
@@ -89,84 +88,164 @@ fn usage() {
 fn start(instance: Option<&str>, working_directory: Option<String>) -> Result<()> {
     let mut client = connect_or_start(instance)?;
     let (cols, rows) = console::dimensions();
-    let session = client.create_session(cols, rows, working_directory)?;
-    console::attach(client, session.id)
+    let surface = client.create_surface(cols, rows, working_directory)?;
+    if surface.status != SurfaceStatus::Running {
+        return Err(surface
+            .error
+            .unwrap_or_else(|| format!("surface is {:?}", surface.status).to_lowercase())
+            .into());
+    }
+    console::attach(client, surface)
 }
 
-fn create(instance: Option<&str>, working_directory: Option<String>) -> Result<()> {
+fn workspace(instance: Option<&str>) -> Result<()> {
+    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+    let workspace = client.workspace()?;
+    println!("{}", serde_json::to_string_pretty(&workspace)?);
+    Ok(())
+}
+
+fn session_command(instance: Option<&str>, args: &[String]) -> Result<()> {
+    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+    let operation = match args.first().map(String::as_str) {
+        Some("create") if args.len() == 2 => WorkspaceMutation::CreateSession {
+            label: args[1].clone(),
+        },
+        Some("rename") if args.len() == 3 => WorkspaceMutation::RenameSession {
+            session_id: SessionId::new(args[1].clone()),
+            label: args[2].clone(),
+        },
+        Some("remove") if args.len() == 2 => WorkspaceMutation::RemoveSession {
+            session_id: SessionId::new(args[1].clone()),
+        },
+        _ => return Err("invalid session command; run compi-probe help".into()),
+    };
+    print_receipt(client.mutate(operation)?)
+}
+
+fn tab_command(instance: Option<&str>, args: &[String]) -> Result<()> {
     let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
     let (cols, rows) = console::dimensions();
-    let session = client.create_session(cols, rows, working_directory)?;
-    println!("{}", session.id);
-    Ok(())
-}
-
-fn optional_working_directory(args: &[String], command: &str) -> Result<Option<String>> {
-    if args.len() > 2 {
-        return Err(format!("{command} accepts at most one working directory").into());
-    }
-    Ok(args.get(1).cloned())
-}
-
-fn list(instance: Option<&str>) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
-    let sessions = client.list_sessions()?;
-    if sessions.is_empty() {
-        println!("no sessions");
-        return Ok(());
-    }
-    for session in sessions {
-        println!("{}", format_session_line(session));
-    }
-    Ok(())
-}
-
-fn format_session_line(session: SessionInfo) -> String {
-    let status = match session.status {
-        SessionStatus::Starting => "starting",
-        SessionStatus::Running if session.attached => "attached",
-        SessionStatus::Running => "detached",
-        SessionStatus::Exited => "exited",
-        SessionStatus::Failed => "failed",
-        SessionStatus::Dead => "dead",
+    let operation = match args.first().map(String::as_str) {
+        Some("create") if matches!(args.len(), 3 | 4) => WorkspaceMutation::CreateTab {
+            session_id: SessionId::new(args[1].clone()),
+            label: args[2].clone(),
+            cols,
+            rows,
+            working_directory: args.get(3).cloned(),
+        },
+        Some("rename") if args.len() == 3 => WorkspaceMutation::RenameTab {
+            tab_id: TabId::new(args[1].clone()),
+            label: args[2].clone(),
+        },
+        Some("move") if args.len() == 4 => WorkspaceMutation::MoveTab {
+            session_id: SessionId::new(args[1].clone()),
+            tab_id: TabId::new(args[2].clone()),
+            index: args[3]
+                .parse()
+                .map_err(|_| "tab index must be a non-negative integer")?,
+        },
+        Some("remove") if args.len() == 2 => WorkspaceMutation::RemoveTab {
+            tab_id: TabId::new(args[1].clone()),
+        },
+        _ => return Err("invalid tab command; run compi-probe help".into()),
     };
-    let detail = session
-        .error
-        .or_else(|| session.exit_code.map(|code| format!("exit {code}")))
-        .unwrap_or_default();
-    format!(
-        "{}\t{}\t{}x{}\t{}",
-        session.id, status, session.cols, session.rows, detail
-    )
+    print_receipt(client.mutate(operation)?)
 }
 
-fn attach(instance: Option<&str>, session_id: String) -> Result<()> {
-    let client = DaemonClient::connect(instance, Duration::from_secs(2))?;
-    console::attach(client, session_id)
-}
-
-fn kill(instance: Option<&str>, session_id: String) -> Result<()> {
+fn pane_command(instance: Option<&str>, args: &[String]) -> Result<()> {
     let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
-    client.kill_session(session_id.clone())?;
-    println!("kill requested for {session_id}");
+    let (cols, rows) = console::dimensions();
+    let operation = match args.first().map(String::as_str) {
+        Some("split-right") | Some("split-down") if matches!(args.len(), 2 | 3) => {
+            WorkspaceMutation::SplitPane {
+                pane_id: PaneId::new(args[1].clone()),
+                axis: if args[0] == "split-right" {
+                    SplitAxis::Horizontal
+                } else {
+                    SplitAxis::Vertical
+                },
+                cols,
+                rows,
+                working_directory: args.get(2).cloned(),
+            }
+        }
+        Some("remove") if args.len() == 2 => WorkspaceMutation::RemovePane {
+            pane_id: PaneId::new(args[1].clone()),
+        },
+        _ => return Err("invalid pane command; run compi-probe help".into()),
+    };
+    print_receipt(client.mutate(operation)?)
+}
+
+fn surface_command(instance: Option<&str>, args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err("surface command requires an action and surface ID".into());
+    }
+    let surface_id = SurfaceId::new(args[1].clone());
+    match args[0].as_str() {
+        "attach" => {
+            let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+            let surface = find_surface(&mut client, &surface_id)?;
+            console::attach(client, surface)
+        }
+        "inspect" => inspect(instance, surface_id),
+        "end" => {
+            let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+            let surface = find_surface(&mut client, &surface_id)?;
+            print_receipt(client.end_surface(&surface)?)
+        }
+        "restart" => {
+            let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+            let surface = find_surface(&mut client, &surface_id)?;
+            let (cols, rows) = console::dimensions();
+            let receipt = client.mutate(WorkspaceMutation::RestartSurface {
+                surface_id: surface.id,
+                expected_lifetime: surface.process_lifetime_id,
+                cols,
+                rows,
+            })?;
+            print_receipt(receipt)
+        }
+        _ => Err("unknown surface action; run compi-probe help".into()),
+    }
+}
+
+fn optional_tail(args: &[String], required: usize) -> Result<Option<String>> {
+    if args.len() > required + 1 {
+        return Err("too many command arguments".into());
+    }
+    Ok(args.get(required).cloned())
+}
+
+fn find_surface(client: &mut DaemonClient, id: &SurfaceId) -> Result<SurfaceInfo> {
+    client
+        .workspace()?
+        .surface(id)
+        .cloned()
+        .ok_or_else(|| format!("surface {id} was not found").into())
+}
+
+fn print_receipt(receipt: compi_protocol::MutationReceipt) -> Result<()> {
+    println!(
+        "mutation={} revision={} state={} surfaces={}",
+        receipt.mutation_id,
+        receipt.revision,
+        receipt.operation_state,
+        receipt
+            .affected_surfaces
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     Ok(())
 }
 
-fn inspect(instance: Option<&str>, session_id: String) -> Result<()> {
+fn inspect(instance: Option<&str>, surface_id: SurfaceId) -> Result<()> {
     let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
-    let session = client
-        .list_sessions()?
-        .into_iter()
-        .find(|session| session.id == session_id)
-        .ok_or("session was not found")?;
-    match client.request(ClientMessage::Attach {
-        session_id,
-        cols: session.cols,
-        rows: session.rows,
-    })? {
-        ServerMessage::Attached { .. } => {}
-        message => return Err(format!("unexpected attach response: {message:?}").into()),
-    }
+    let surface = find_surface(&mut client, &surface_id)?;
+    client.attach_surface(&surface, surface.cols, surface.rows)?;
     loop {
         let event = if let Some(message) = client.take_pending_screen() {
             Some(ServerEvent::Screen(message))
@@ -180,7 +259,7 @@ fn inspect(instance: Option<&str>, session_id: String) -> Result<()> {
                 return Ok(());
             }
             Some(ServerEvent::Control {
-                message: ServerMessage::Error { code, message },
+                message: ServerMessage::Error { code, message, .. },
                 ..
             }) => return Err(format!("daemon error ({code:?}): {message}").into()),
             Some(_) => {}
@@ -191,16 +270,12 @@ fn inspect(instance: Option<&str>, session_id: String) -> Result<()> {
 
 fn soak(instance: Option<&str>, duration: Duration) -> Result<()> {
     let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
-    let session = client.create_session(100, 30, None)?;
-    match client.request(ClientMessage::Attach {
-        session_id: session.id.clone(),
-        cols: 100,
-        rows: 30,
-    })? {
-        ServerMessage::Attached { .. } => {}
-        message => return Err(format!("unexpected attach response: {message:?}").into()),
-    }
-    client.request(ClientMessage::Input { data: b"i=0; while :; do printf 'COMPI_SOAK_%08d 0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$i\"; i=$((i+1)); sleep 0.02; done\r".to_vec(), latency_id: None })?;
+    let surface = client.create_surface(100, 30, None)?;
+    client.attach_surface(&surface, 100, 30)?;
+    client.request(ClientMessage::Input {
+        data: b"i=0; while :; do printf 'COMPI_SOAK_%08d 0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$i\"; i=$((i+1)); sleep 0.02; done\r".to_vec(),
+        latency_id: None,
+    })?;
 
     let deadline = Instant::now() + duration;
     let mut mirror = ScreenMirror::default();
@@ -221,11 +296,11 @@ fn soak(instance: Option<&str>, duration: Duration) -> Result<()> {
                 }
             }
             Some(ServerEvent::Control {
-                message: ServerMessage::SessionExited { exit_code, .. },
+                message: ServerMessage::SurfaceExited { exit_code, .. },
                 ..
             }) => return Err(format!("soak shell exited early with code {exit_code}").into()),
             Some(ServerEvent::Control {
-                message: ServerMessage::Error { code, message },
+                message: ServerMessage::Error { code, message, .. },
                 ..
             }) => return Err(format!("daemon error ({code:?}): {message}").into()),
             Some(_) => {}
@@ -245,18 +320,18 @@ fn soak(instance: Option<&str>, duration: Duration) -> Result<()> {
         match client.read_event()? {
             Some(ServerEvent::Control {
                 message:
-                    ServerMessage::SessionExited {
-                        session_id,
+                    ServerMessage::SurfaceExited {
+                        identity,
                         exit_code,
                     },
                 ..
-            }) if session_id == session.id => {
+            }) if identity.surface_id == surface.id => {
                 if exit_code != 0 {
                     return Err(format!("soak shell exited with code {exit_code}").into());
                 }
                 println!(
-                    "session={} frames={frames} recovered_gaps={gaps}",
-                    session.id
+                    "surface={} frames={frames} recovered_gaps={gaps}",
+                    surface.id
                 );
                 return Ok(());
             }
@@ -272,7 +347,6 @@ fn shutdown(instance: Option<&str>) -> Result<()> {
     println!("daemon stopping");
     Ok(())
 }
-
 pub fn connect_or_start(instance: Option<&str>) -> Result<DaemonClient> {
     let started_at = Instant::now();
     match DaemonClient::connect(instance, Duration::from_millis(25)) {
@@ -453,17 +527,10 @@ mod console {
         }
     }
 
-    pub fn attach(mut client: DaemonClient, session_id: String) -> Result<()> {
+    pub fn attach(mut client: DaemonClient, surface: SurfaceInfo) -> Result<()> {
         let _terminal = TerminalState::configure()?;
         let mut size = dimensions();
-        match client.request(ClientMessage::Attach {
-            session_id,
-            cols: size.0,
-            rows: size.1,
-        })? {
-            ServerMessage::Attached { .. } => {}
-            response => return Err(format!("unexpected attach response: {response:?}").into()),
-        }
+        client.attach_surface(&surface, size.0, size.1)?;
         let mut mirror = ScreenMirror::default();
         let mut input = io::stdin().lock();
         let mut output = io::stdout().lock();
@@ -486,7 +553,7 @@ mod console {
                     }
                 },
                 Some(ServerEvent::Control {
-                    message: ServerMessage::SessionExited { exit_code, .. },
+                    message: ServerMessage::SurfaceExited { exit_code, .. },
                     ..
                 }) => {
                     write!(output, "\r\n[compi: shell exited {exit_code}]\r\n")?;
@@ -494,7 +561,7 @@ mod console {
                     return Ok(());
                 }
                 Some(ServerEvent::Control {
-                    message: ServerMessage::Error { code, message },
+                    message: ServerMessage::Error { code, message, .. },
                     ..
                 }) => return Err(format!("daemon error ({code:?}): {message}").into()),
                 _ => {}

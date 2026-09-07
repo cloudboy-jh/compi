@@ -4,10 +4,10 @@ use crate::pipe;
 use compi_client_core::{MirrorApply, ScreenMirror};
 use compi_protocol::frame;
 use compi_protocol::{
-    CONTROL_FRAME, ClientControl, ClientMessage, SCREEN_FRAME, ServerMessage, decode_server,
-    encode_client,
+    CONTROL_FRAME, ClientControl, ClientMessage, SCREEN_FRAME, ServerMessage, SurfaceInfo,
+    TerminalTarget, decode_server, decode_terminal_frame, encode_client,
 };
-use compi_protocol::{Color, ScreenSnapshot, TextAttributes, decode_screen};
+use compi_protocol::{Color, ScreenSnapshot, TextAttributes};
 use std::fs::File;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,28 +40,24 @@ pub fn dimensions() -> (i16, i16) {
     }
 }
 
-pub fn attach(mut client: DaemonClient, session_id: String) -> Result<()> {
+pub fn attach(mut client: DaemonClient, surface: SurfaceInfo) -> Result<()> {
     let _console = ConsoleState::configure()?;
     let initial_size = dimensions();
-    match client.request(ClientMessage::Attach {
-        session_id,
-        cols: initial_size.0,
-        rows: initial_size.1,
-    })? {
-        ServerMessage::Attached { .. } => {}
-        message => return Err(format!("unexpected attach response: {message:?}").into()),
-    }
+    client.attach_surface(&surface, initial_size.0, initial_size.1)?;
 
-    let (connection, next_request_id, mut pending_screen) = client.into_parts();
+    let (connection, next_request_id, mut pending_screen, target, _workspace) = client.into_parts();
+    let target = Arc::new(target.ok_or("terminal attachment target was not established")?);
     let pipe = Arc::new(connection);
     let write_lock = Arc::new(Mutex::new(()));
     let request_ids = Arc::new(AtomicU64::new(next_request_id));
     let running = Arc::new(AtomicBool::new(true));
+    let pump_target = target.clone();
     spawn_input_pump(
         pipe.clone(),
         write_lock.clone(),
         request_ids.clone(),
         running.clone(),
+        pump_target,
     );
     spawn_resize_pump(
         pipe.clone(),
@@ -69,6 +65,7 @@ pub fn attach(mut client: DaemonClient, session_id: String) -> Result<()> {
         request_ids.clone(),
         running.clone(),
         initial_size,
+        target.clone(),
     );
 
     let mut output = io::stdout().lock();
@@ -90,31 +87,38 @@ pub fn attach(mut client: DaemonClient, session_id: String) -> Result<()> {
             }
         };
         match message.kind {
-            SCREEN_FRAME => match mirror.apply(decode_screen(&message.payload)?) {
-                MirrorApply::Applied => {
-                    if let Some(snapshot) = mirror.snapshot() {
-                        render_snapshot(&mut output, snapshot)?;
+            SCREEN_FRAME => {
+                let terminal = decode_terminal_frame(&message.payload)?;
+                if terminal.identity != target.identity {
+                    continue;
+                }
+                match mirror.apply(terminal.message) {
+                    MirrorApply::Applied => {
+                        if let Some(snapshot) = mirror.snapshot() {
+                            render_snapshot(&mut output, snapshot)?;
+                        }
+                    }
+                    MirrorApply::Gap { .. } => {
+                        send(
+                            &pipe,
+                            &write_lock,
+                            &request_ids,
+                            &target,
+                            ClientMessage::RequestSnapshot,
+                        )?;
                     }
                 }
-                MirrorApply::Gap { .. } => {
-                    send(
-                        &pipe,
-                        &write_lock,
-                        &request_ids,
-                        ClientMessage::RequestSnapshot,
-                    )?;
-                }
-            },
+            }
             CONTROL_FRAME => match decode_server(&message.payload)?.message {
                 ServerMessage::Detached { .. } => break,
-                ServerMessage::SessionExited { exit_code, .. } => {
+                ServerMessage::SurfaceExited { exit_code, .. } => {
                     output.write_all(
                         format!("\r\n[compi: shell exited {exit_code}]\r\n").as_bytes(),
                     )?;
                     output.flush()?;
                     break;
                 }
-                ServerMessage::Error { code, message } => {
+                ServerMessage::Error { code, message, .. } => {
                     return Err(format!("daemon error ({code:?}): {message}").into());
                 }
                 _ => {}
@@ -226,6 +230,7 @@ fn spawn_input_pump(
     write_lock: Arc<Mutex<()>>,
     request_ids: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    target: Arc<TerminalTarget>,
 ) {
     thread::spawn(move || {
         let Ok(input) = (unsafe { GetStdHandle(STD_INPUT_HANDLE) }) else {
@@ -248,6 +253,7 @@ fn spawn_input_pump(
                         &pipe,
                         &write_lock,
                         &request_ids,
+                        &target,
                         ClientMessage::Input {
                             data: bytes[..detach_at].to_vec(),
                             latency_id: None,
@@ -257,7 +263,13 @@ fn spawn_input_pump(
                 {
                     break;
                 }
-                let _ = send(&pipe, &write_lock, &request_ids, ClientMessage::Detach);
+                let _ = send(
+                    &pipe,
+                    &write_lock,
+                    &request_ids,
+                    &target,
+                    ClientMessage::Detach,
+                );
                 running.store(false, Ordering::Release);
                 break;
             }
@@ -266,6 +278,7 @@ fn spawn_input_pump(
                 &pipe,
                 &write_lock,
                 &request_ids,
+                &target,
                 ClientMessage::Input {
                     data: bytes.to_vec(),
                     latency_id: None,
@@ -285,6 +298,7 @@ fn spawn_resize_pump(
     request_ids: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
     mut previous: (i16, i16),
+    target: Arc<TerminalTarget>,
 ) {
     thread::spawn(move || {
         while running.load(Ordering::Acquire) {
@@ -295,6 +309,7 @@ fn spawn_resize_pump(
                     &pipe,
                     &write_lock,
                     &request_ids,
+                    &target,
                     ClientMessage::Resize {
                         cols: current.0,
                         rows: current.1,
@@ -314,11 +329,13 @@ fn send(
     pipe: &File,
     lock: &Mutex<()>,
     request_ids: &AtomicU64,
+    target: &TerminalTarget,
     message: ClientMessage,
 ) -> Result<u64> {
     let request_id = request_ids.fetch_add(1, Ordering::Relaxed);
     let payload = encode_client(&ClientControl {
         request_id,
+        target: Some(target.clone()),
         message,
     })?;
     let _guard = lock.lock().map_err(|_| "pipe writer lock was poisoned")?;

@@ -1,8 +1,5 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
-use compi_protocol::{
-    CONTROL_FRAME, ClientControl, SCREEN_FRAME, ScreenMessage, ServerControl, decode_client,
-    decode_screen, decode_server, encode_client, encode_screen, encode_server, frame,
-};
+use compi_protocol::{SCREEN_FRAME, ScreenMessage, decode_screen, encode_screen, frame};
 use serde_json::Value;
 use std::io::Cursor;
 
@@ -24,19 +21,19 @@ fn assert_frame(original: &[u8], kind: u8, payload: &[u8]) {
 }
 
 #[test]
-fn control_peers_preserve_pre_extraction_v7_bytes() {
+fn captured_v7_control_frames_remain_decodable_json() {
     let fixtures: Value = serde_json::from_str(include_str!("fixtures/control-v7.json")).unwrap();
-    for fixture in fixtures["client"].as_array().unwrap() {
-        let (original, payload) = fixture_frame(fixture, CONTROL_FRAME);
-        let expected: ClientControl = serde_json::from_value(fixture["value"].clone()).unwrap();
-        assert_eq!(decode_client(&payload).unwrap(), expected);
-        assert_frame(&original, CONTROL_FRAME, &encode_client(&expected).unwrap());
-    }
-    for fixture in fixtures["server"].as_array().unwrap() {
-        let (original, payload) = fixture_frame(fixture, CONTROL_FRAME);
-        let expected: ServerControl = serde_json::from_value(fixture["value"].clone()).unwrap();
-        assert_eq!(decode_server(&payload).unwrap(), expected);
-        assert_frame(&original, CONTROL_FRAME, &encode_server(&expected).unwrap());
+    for fixture in fixtures["client"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(fixtures["server"].as_array().unwrap())
+    {
+        let (original, payload) = fixture_frame(fixture, 1);
+        let expected = fixture["value"].clone();
+        let decoded: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(decoded, expected);
+        assert_frame(&original, 1, &serde_json::to_vec(&decoded).unwrap());
     }
 }
 

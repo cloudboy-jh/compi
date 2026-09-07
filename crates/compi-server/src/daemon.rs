@@ -4,11 +4,11 @@ use crate::identity::PipeSecurity;
 use crate::identity::{self, InstanceNames};
 use crate::launch;
 use crate::pipe;
-use crate::session::{ConnectionSink, Session, SessionError, SessionManager};
+use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
 use compi_protocol::frame;
 use compi_protocol::{
     CONTROL_FRAME, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerControl, ServerMessage,
-    decode_client,
+    SurfaceId, TerminalTarget, decode_client,
 };
 use std::collections::HashMap;
 #[cfg(windows)]
@@ -36,7 +36,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
     let names = identity::instance_names(instance)?;
     let _singleton = DaemonSingleton::acquire(&names.mutex)?;
     crate::perf::log_startup_metric("daemon_singleton_ready_ms", started_at.elapsed());
-    let manager = Arc::new(SessionManager::persistent(instance)?);
+    let manager = Arc::new(SurfaceManager::persistent(instance)?);
     crate::perf::log_startup_metric("daemon_store_ready_ms", started_at.elapsed());
     launch::check_system()?;
     crate::perf::log_startup_metric("daemon_host_ready_ms", started_at.elapsed());
@@ -56,7 +56,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
                 crate::perf::log_resource_sample(
                     "daemon",
                     "server",
-                    sampler_manager.session_count(),
+                    sampler_manager.surface_count(),
                 );
             }
         });
@@ -89,8 +89,8 @@ pub fn run(instance: Option<&str>) -> Result<()> {
         }
     }
     let shutdown_reason = match &result {
-        Ok(()) => "session ended because the daemon stopped intentionally".to_owned(),
-        Err(error) => format!("session ended because the daemon failed: {error}"),
+        Ok(()) => "surface ended because the daemon stopped intentionally".to_owned(),
+        Err(error) => format!("surface ended because the daemon failed: {error}"),
     };
     manager.shutdown_all(&shutdown_reason);
     result
@@ -99,7 +99,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
 fn serve(
     names: &InstanceNames,
     #[cfg(windows)] security: &PipeSecurity,
-    manager: Arc<SessionManager>,
+    manager: Arc<SurfaceManager>,
     stopping: Arc<AtomicBool>,
     connections: Arc<Mutex<HashMap<u64, ConnectionSink>>>,
     handlers: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -176,7 +176,7 @@ fn reap_finished_handlers(handlers: &mut Vec<JoinHandle<()>>) {
 fn handle_connection(
     connection: Arc<File>,
     sink: ConnectionSink,
-    manager: Arc<SessionManager>,
+    manager: Arc<SurfaceManager>,
     stopping: Arc<AtomicBool>,
     wake_pipe: &str,
 ) -> Result<()> {
@@ -232,11 +232,14 @@ fn handle_connection(
         },
     })?;
 
-    let mut attached: Option<Arc<Session>> = None;
+    let mut attached: Option<Arc<Surface>> = None;
+    let mut workspace_events = manager.subscribe();
     let result = (|| -> Result<()> {
         while !stopping.load(Ordering::Acquire) && sink.is_alive() {
-            let Some(incoming) = read_next(&mut reader, &connection, &stopping)? else {
-                break;
+            send_workspace_events(&sink, &mut workspace_events, &manager)?;
+            let Some(incoming) = reader.poll(&connection)? else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
             };
             if incoming.kind != CONTROL_FRAME {
                 send_error(
@@ -269,137 +272,111 @@ fn handle_connection(
                 continue;
             }
 
+            let request_id = request.request_id;
+            let target = request.target;
             match request.message {
-                ClientMessage::ListSessions => {
-                    sink.send_control(&ServerControl {
-                        request_id: Some(request.request_id),
-                        message: ServerMessage::Sessions {
-                            sessions: manager.list(),
-                        },
-                    })?;
-                }
-                ClientMessage::CreateSession {
-                    cols,
-                    rows,
-                    working_directory,
-                } => match manager.create(cols, rows, working_directory) {
-                    Ok(session) => sink.send_control(&ServerControl {
-                        request_id: Some(request.request_id),
-                        message: ServerMessage::SessionCreated {
-                            session: session.info(),
-                        },
+                ClientMessage::GetWorkspace => match manager.snapshot() {
+                    Ok(workspace) => sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::Workspace { workspace },
                     })?,
-                    Err(error) => send_error(
-                        &sink,
-                        Some(request.request_id),
-                        ErrorCode::Internal,
-                        &error.to_string(),
-                    ),
+                    Err(error) => send_actor_error(&sink, request_id, &error),
                 },
+                ClientMessage::Mutate { mutation } => match manager.mutate(mutation) {
+                    Ok(receipt) => {
+                        send_workspace_events(&sink, &mut workspace_events, &manager)?;
+                        sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::MutationCommitted { receipt },
+                        })?;
+                    }
+                    Err(error) => send_actor_error(&sink, request_id, &error),
+                },
+                ClientMessage::MutationOutcome { mutation_id } => {
+                    match manager.outcome(mutation_id) {
+                        Ok(receipt) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::MutationOutcome { receipt },
+                        })?,
+                        Err(error) => send_actor_error(&sink, request_id, &error),
+                    }
+                }
                 ClientMessage::Attach {
-                    session_id,
+                    surface_id,
+                    expected_lifetime,
                     cols,
                     rows,
                 } => {
                     if attached.is_some() {
                         send_error(
                             &sink,
-                            Some(request.request_id),
+                            Some(request_id),
                             ErrorCode::AlreadyAttached,
-                            "connection is already attached to a session",
+                            "connection is already attached to a surface",
                         );
                         continue;
                     }
-                    let Some(session) = manager.get(&session_id) else {
-                        send_unavailable_session(&sink, request.request_id, &manager, &session_id);
+                    let Some(surface) = manager.get(&surface_id) else {
+                        send_unavailable_surface(&sink, request_id, &manager, &surface_id);
                         continue;
                     };
-                    match session.attach(sink.clone(), request.request_id, cols, rows) {
-                        Ok(()) => attached = Some(session),
-                        Err(error) => send_session_error(&sink, request.request_id, &error),
+                    match surface.attach(sink.clone(), request_id, &expected_lifetime, cols, rows) {
+                        Ok(()) => attached = Some(surface),
+                        Err(error) => send_surface_error(&sink, request_id, &error),
                     }
                 }
                 ClientMessage::Detach => {
-                    let Some(session) = attached.as_ref() else {
-                        send_error(
-                            &sink,
-                            Some(request.request_id),
-                            ErrorCode::NotAttached,
-                            "connection is not attached",
-                        );
+                    let Some((surface, target)) =
+                        attached_target(&attached, target.as_ref(), &sink, request_id)
+                    else {
                         continue;
                     };
-                    match session.detach(sink.id(), request.request_id) {
+                    match surface.detach(target, request_id) {
                         Ok(()) => attached = None,
-                        Err(error) => send_session_error(&sink, request.request_id, &error),
+                        Err(error) => send_surface_error(&sink, request_id, &error),
                     }
                 }
                 ClientMessage::Input { data, latency_id } => {
-                    let Some(session) = attached.as_ref() else {
-                        send_error(
-                            &sink,
-                            Some(request.request_id),
-                            ErrorCode::NotAttached,
-                            "connection is not attached",
-                        );
+                    let Some((surface, target)) =
+                        attached_target(&attached, target.as_ref(), &sink, request_id)
+                    else {
                         continue;
                     };
-                    match session.write_input(sink.id(), &data, latency_id) {
+                    match surface.write_input(target, &data, latency_id) {
                         Ok(()) => sink.send_control(&ServerControl {
-                            request_id: Some(request.request_id),
+                            request_id: Some(request_id),
                             message: ServerMessage::InputAccepted,
                         })?,
-                        Err(error) => send_session_error(&sink, request.request_id, &error),
+                        Err(error) => send_surface_error(&sink, request_id, &error),
                     }
                 }
                 ClientMessage::Resize { cols, rows } => {
-                    let Some(session) = attached.as_ref() else {
-                        send_error(
-                            &sink,
-                            Some(request.request_id),
-                            ErrorCode::NotAttached,
-                            "connection is not attached",
-                        );
+                    let Some((surface, target)) =
+                        attached_target(&attached, target.as_ref(), &sink, request_id)
+                    else {
                         continue;
                     };
-                    match session.resize(sink.id(), cols, rows) {
+                    match surface.resize(target, cols, rows) {
                         Ok(()) => sink.send_control(&ServerControl {
-                            request_id: Some(request.request_id),
+                            request_id: Some(request_id),
                             message: ServerMessage::Resized { cols, rows },
                         })?,
-                        Err(error) => send_session_error(&sink, request.request_id, &error),
+                        Err(error) => send_surface_error(&sink, request_id, &error),
                     }
                 }
                 ClientMessage::RequestSnapshot => {
-                    let Some(session) = attached.as_ref() else {
-                        send_error(
-                            &sink,
-                            Some(request.request_id),
-                            ErrorCode::NotAttached,
-                            "connection is not attached",
-                        );
+                    let Some((surface, target)) =
+                        attached_target(&attached, target.as_ref(), &sink, request_id)
+                    else {
                         continue;
                     };
-                    if let Err(error) = session.request_snapshot(sink.id(), request.request_id) {
-                        send_session_error(&sink, request.request_id, &error);
-                    }
-                }
-                ClientMessage::Kill { session_id } => {
-                    let Some(session) = manager.get(&session_id) else {
-                        send_unavailable_session(&sink, request.request_id, &manager, &session_id);
-                        continue;
-                    };
-                    match session.kill() {
-                        Ok(()) => sink.send_control(&ServerControl {
-                            request_id: Some(request.request_id),
-                            message: ServerMessage::KillRequested { session_id },
-                        })?,
-                        Err(error) => send_session_error(&sink, request.request_id, &error),
+                    if let Err(error) = surface.request_snapshot(target, request_id) {
+                        send_surface_error(&sink, request_id, &error);
                     }
                 }
                 ClientMessage::ShutdownDaemon => {
                     sink.send_control_sync(&ServerControl {
-                        request_id: Some(request.request_id),
+                        request_id: Some(request_id),
                         message: ServerMessage::DaemonStopping,
                     })?;
                     thread::sleep(Duration::from_millis(25));
@@ -433,29 +410,99 @@ fn read_next(
     Ok(None)
 }
 
-fn send_unavailable_session(
+fn send_workspace_events(
+    sink: &ConnectionSink,
+    events: &mut std::sync::mpsc::Receiver<crate::workspace::WorkspaceEvent>,
+    manager: &SurfaceManager,
+) -> Result<()> {
+    loop {
+        match events.try_recv() {
+            Ok(crate::workspace::WorkspaceEvent::Revision(revision)) => {
+                sink.send_control(&ServerControl {
+                    request_id: None,
+                    message: ServerMessage::WorkspaceChanged { revision },
+                })?;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let revision = manager.snapshot()?.revision;
+                sink.send_control(&ServerControl {
+                    request_id: None,
+                    message: ServerMessage::WorkspaceChanged { revision },
+                })?;
+                *events = manager.subscribe();
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn attached_target<'a>(
+    attached: &'a Option<Arc<Surface>>,
+    target: Option<&'a TerminalTarget>,
     sink: &ConnectionSink,
     request_id: u64,
-    manager: &SessionManager,
-    session_id: &str,
+) -> Option<(&'a Arc<Surface>, &'a TerminalTarget)> {
+    let Some(surface) = attached.as_ref() else {
+        send_error(
+            sink,
+            Some(request_id),
+            ErrorCode::NotAttached,
+            "connection is not attached",
+        );
+        return None;
+    };
+    let Some(target) = target else {
+        send_error(
+            sink,
+            Some(request_id),
+            ErrorCode::InvalidRequest,
+            "terminal operation requires an attachment and process-lifetime target",
+        );
+        return None;
+    };
+    Some((surface, target))
+}
+
+fn send_unavailable_surface(
+    sink: &ConnectionSink,
+    request_id: u64,
+    manager: &SurfaceManager,
+    surface_id: &SurfaceId,
 ) {
-    if let Some(session) = manager.get_info(session_id) {
-        let message = session
+    if let Some(surface) = manager.get_info(surface_id) {
+        let message = surface
             .error
-            .unwrap_or_else(|| format!("session is {:?}", session.status).to_lowercase());
-        send_error(sink, Some(request_id), ErrorCode::SessionExited, &message);
+            .unwrap_or_else(|| format!("surface is {:?}", surface.status).to_lowercase());
+        send_error(
+            sink,
+            Some(request_id),
+            ErrorCode::SurfaceUnavailable,
+            &message,
+        );
     } else {
         send_error(
             sink,
             Some(request_id),
-            ErrorCode::SessionNotFound,
-            "session was not found",
+            ErrorCode::SurfaceNotFound,
+            "surface was not found",
         );
     }
 }
 
-fn send_session_error(sink: &ConnectionSink, request_id: u64, error: &SessionError) {
+fn send_surface_error(sink: &ConnectionSink, request_id: u64, error: &SurfaceError) {
     send_error(sink, Some(request_id), error.code(), &error.to_string());
+}
+
+fn send_actor_error(sink: &ConnectionSink, request_id: u64, error: &crate::workspace::ActorError) {
+    let _ = sink.send_control(&ServerControl {
+        request_id: Some(request_id),
+        message: ServerMessage::Error {
+            code: error.code,
+            message: error.message.clone(),
+            current_revision: error.current_revision,
+        },
+    });
 }
 
 fn send_error_sync(sink: &ConnectionSink, request_id: Option<u64>, code: ErrorCode, message: &str) {
@@ -464,6 +511,7 @@ fn send_error_sync(sink: &ConnectionSink, request_id: Option<u64>, code: ErrorCo
         message: ServerMessage::Error {
             code,
             message: message.into(),
+            current_revision: None,
         },
     });
 }
@@ -474,6 +522,7 @@ fn send_error(sink: &ConnectionSink, request_id: Option<u64>, code: ErrorCode, m
         message: ServerMessage::Error {
             code,
             message: message.into(),
+            current_revision: None,
         },
     });
 }

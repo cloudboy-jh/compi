@@ -20,7 +20,7 @@ use compi_client_core::viewport::{
 use compi_client_core::{MirrorApply, ScreenMirror};
 use compi_protocol::{
     Cell, ClientMessage, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode,
-    Row, ScreenMessage, ScreenSnapshot, ServerMessage, SessionInfo, SessionStatus,
+    Row, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus,
 };
 use compi_server::client::{DaemonClient, ServerEvent};
 use compi_server::{perf, probe};
@@ -227,7 +227,7 @@ impl TabTransport {
 
 struct TerminalTab {
     id: u64,
-    session_id: String,
+    surface_id: SurfaceId,
     mirror: ScreenMirror,
     state: ConnectionState,
     error: Option<String>,
@@ -249,7 +249,7 @@ impl TerminalTab {
             .map(|snapshot| snapshot.title.trim())
             .filter(|title| !title.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| short_session_id(&self.session_id))
+            .unwrap_or_else(|| short_surface_id(&self.surface_id))
     }
 
     fn send(&mut self, message: ClientMessage) {
@@ -312,11 +312,11 @@ impl TerminalTab {
 }
 
 enum UiEvent {
-    SessionsLoaded(Result<Vec<SessionInfo>, String>),
-    SessionCreated(Result<SessionInfo, String>),
-    SessionEndFinished {
-        session_id: String,
-        result: Result<Vec<SessionInfo>, String>,
+    SurfacesLoaded(Result<compi_protocol::WorkspaceSnapshot, String>),
+    SurfaceCreated(Result<SurfaceInfo, String>),
+    SurfaceEndFinished {
+        surface_id: SurfaceId,
+        result: Result<Vec<SurfaceInfo>, String>,
     },
     TabConnected {
         tab_id: u64,
@@ -372,13 +372,14 @@ struct CompiApp {
     tab_scroll_handle: ScrollHandle,
     tab_drag_origin: Option<Point<Pixels>>,
     next_tab_id: u64,
-    sessions: Vec<SessionInfo>,
+    surfaces: Vec<SurfaceInfo>,
+    workspace_initialized: bool,
     switcher_open: bool,
-    end_confirmation: Option<String>,
-    ending_sessions: HashSet<String>,
-    close_after_end: HashSet<String>,
-    loading_sessions: bool,
-    attach_after_session_list: bool,
+    end_confirmation: Option<SurfaceId>,
+    ending_surfaces: HashSet<SurfaceId>,
+    close_after_end: HashSet<SurfaceId>,
+    loading_surfaces: bool,
+    attach_after_surface_list: bool,
     global_error: Option<String>,
     font_settings: FontSettings,
     typography: Arc<TerminalTypography>,
@@ -431,13 +432,14 @@ impl CompiApp {
             tab_scroll_handle: ScrollHandle::new(),
             tab_drag_origin: None,
             next_tab_id: 1,
-            sessions: Vec::new(),
+            surfaces: Vec::new(),
+            workspace_initialized: false,
             switcher_open: false,
             end_confirmation: None,
-            ending_sessions: HashSet::new(),
+            ending_surfaces: HashSet::new(),
             close_after_end: HashSet::new(),
-            loading_sessions: !empty_window,
-            attach_after_session_list: false,
+            loading_surfaces: !empty_window,
+            attach_after_surface_list: false,
             global_error: None,
             font_settings: config.font,
             typography,
@@ -452,7 +454,7 @@ impl CompiApp {
 
         this.update_dimensions(window);
         if !empty_window {
-            this.refresh_sessions(true);
+            this.refresh_surfaces(true);
         }
         this.subscriptions
             .push(cx.observe_window_bounds(window, |this, window, cx| {
@@ -516,88 +518,88 @@ impl CompiApp {
         this
     }
 
-    fn refresh_sessions(&mut self, attach_initial: bool) {
-        self.loading_sessions = true;
-        self.attach_after_session_list |= attach_initial;
+    fn refresh_surfaces(&mut self, attach_initial: bool) {
+        self.loading_surfaces = true;
+        self.attach_after_surface_list |= attach_initial;
         let sender = self.event_tx.clone();
         let instance = self.instance.clone();
         thread::spawn(move || {
             let result = probe::connect_or_start(instance.as_deref())
-                .and_then(|mut client| client.list_sessions())
+                .and_then(|mut client| client.workspace())
                 .map_err(|error| error.to_string());
-            let _ = sender.send(UiEvent::SessionsLoaded(result));
+            let _ = sender.send(UiEvent::SurfacesLoaded(result));
         });
     }
 
-    fn create_session(&mut self, working_directory: Option<String>) {
+    fn create_surface(&mut self, working_directory: Option<String>) {
         let sender = self.event_tx.clone();
         let cols = self.terminal_cols;
         let rows = self.terminal_rows;
         let instance = self.instance.clone();
         thread::spawn(move || {
             let result = probe::connect_or_start(instance.as_deref())
-                .and_then(|mut client| client.create_session(cols, rows, working_directory))
+                .and_then(|mut client| client.create_surface(cols, rows, working_directory))
                 .map_err(|error| error.to_string());
-            let _ = sender.send(UiEvent::SessionCreated(result));
+            let _ = sender.send(UiEvent::SurfaceCreated(result));
         });
     }
 
     fn create_inherited_session(&mut self) {
         let working_directory =
             inherited_working_directory(self.active_tab().and_then(|tab| tab.mirror.snapshot()));
-        self.create_session(working_directory);
+        self.create_surface(working_directory);
     }
 
     fn create_next_perf_session(&mut self) {
         if self.tabs.len() < self.perf_target_sessions {
-            self.create_session(None);
+            self.create_surface(None);
         }
     }
 
-    fn begin_end_session(&mut self, session_id: String) {
-        if !self.ending_sessions.contains(&session_id)
+    fn begin_end_surface(&mut self, surface_id: SurfaceId) {
+        if !self.ending_surfaces.contains(&surface_id)
             && self
-                .sessions
+                .surfaces
                 .iter()
-                .any(|session| session.id == session_id && session.status == SessionStatus::Running)
+                .any(|surface| surface.id == surface_id && surface.status == SurfaceStatus::Running)
         {
-            self.end_confirmation = Some(session_id);
+            self.end_confirmation = Some(surface_id);
         }
     }
 
-    fn cancel_end_session(&mut self, session_id: &str) {
-        if self.end_confirmation.as_deref() == Some(session_id) {
+    fn cancel_end_surface(&mut self, surface_id: &SurfaceId) {
+        if self.end_confirmation.as_ref() == Some(surface_id) {
             self.end_confirmation = None;
         }
     }
 
-    fn confirm_end_session(&mut self, session_id: String) {
-        if self.ending_sessions.contains(&session_id)
+    fn confirm_end_surface(&mut self, surface_id: SurfaceId) {
+        if self.ending_surfaces.contains(&surface_id)
             || !self
-                .sessions
+                .surfaces
                 .iter()
-                .any(|session| session.id == session_id && session.status == SessionStatus::Running)
+                .any(|surface| surface.id == surface_id && surface.status == SurfaceStatus::Running)
         {
             return;
         }
         self.end_confirmation = None;
-        self.ending_sessions.insert(session_id.clone());
-        if self.tabs.iter().any(|tab| tab.session_id == session_id) {
-            self.close_after_end.insert(session_id.clone());
+        self.ending_surfaces.insert(surface_id.clone());
+        if self.tabs.iter().any(|tab| tab.surface_id == surface_id) {
+            self.close_after_end.insert(surface_id.clone());
         }
         let sender = self.event_tx.clone();
         let instance = self.instance.clone();
         thread::spawn(move || {
-            let result = terminate_session_and_wait(instance.as_deref(), &session_id);
-            let _ = sender.send(UiEvent::SessionEndFinished { session_id, result });
+            let result = terminate_surface_and_wait(instance.as_deref(), &surface_id);
+            let _ = sender.send(UiEvent::SurfaceEndFinished { surface_id, result });
         });
     }
 
-    fn attach_session(&mut self, session: SessionInfo) {
+    fn attach_surface(&mut self, surface: SurfaceInfo) {
         if let Some(tab_id) = self
             .tabs
             .iter()
-            .find(|tab| tab.session_id == session.id)
+            .find(|tab| tab.surface_id == surface.id)
             .map(|tab| tab.id)
         {
             self.active_tab = Some(tab_id);
@@ -605,14 +607,14 @@ impl CompiApp {
             self.switcher_open = false;
             return;
         }
-        if session.status != SessionStatus::Running || session.attached {
+        if surface.status != SurfaceStatus::Running || surface.attached {
             return;
         }
         let tab_id = self.next_tab_id;
         self.next_tab_id = self.next_tab_id.saturating_add(1);
         self.tabs.push(TerminalTab {
             id: tab_id,
-            session_id: session.id.clone(),
+            surface_id: surface.id.clone(),
             mirror: ScreenMirror::default(),
             state: ConnectionState::Connecting,
             error: None,
@@ -631,7 +633,7 @@ impl CompiApp {
         self.switcher_open = false;
         spawn_tab_worker(
             tab_id,
-            session.id,
+            surface.id,
             self.terminal_cols,
             self.terminal_rows,
             self.event_tx.clone(),
@@ -641,53 +643,55 @@ impl CompiApp {
 
     fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
-            UiEvent::SessionsLoaded(Ok(sessions)) => {
+            UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.global_error = None;
-                self.loading_sessions = false;
-                let needs_initial_tab = self.attach_after_session_list && self.tabs.is_empty();
-                self.attach_after_session_list = false;
-                self.sessions = sessions;
+                self.loading_surfaces = false;
+                let needs_initial_tab = self.attach_after_surface_list && self.tabs.is_empty();
+                self.attach_after_surface_list = false;
+                self.workspace_initialized = workspace.initialized;
+                self.surfaces = workspace.surfaces;
                 if needs_initial_tab {
                     if let Some(working_directory) = self.initial_working_directory.take() {
-                        self.create_session(Some(working_directory));
-                    } else if let Some(session) = self
-                        .sessions
+                        self.create_surface(Some(working_directory));
+                    } else if let Some(surface) = self
+                        .surfaces
                         .iter()
-                        .find(|session| {
-                            session.status == SessionStatus::Running && !session.attached
+                        .find(|surface| {
+                            surface.status == SurfaceStatus::Running && !surface.attached
                         })
                         .cloned()
                     {
-                        self.attach_session(session);
+                        self.attach_surface(surface);
                         self.create_next_perf_session();
-                    } else {
-                        self.create_session(None);
+                    } else if !self.workspace_initialized {
+                        self.create_surface(None);
                     }
                 }
             }
-            UiEvent::SessionsLoaded(Err(error)) => {
-                self.loading_sessions = false;
+            UiEvent::SurfacesLoaded(Err(error)) => {
+                self.loading_surfaces = false;
                 self.global_error = Some(error);
             }
-            UiEvent::SessionCreated(Ok(session)) => {
+            UiEvent::SurfaceCreated(Ok(surface)) => {
                 self.global_error = None;
-                self.sessions.push(session.clone());
-                self.attach_session(session);
+                self.workspace_initialized = true;
+                self.surfaces.push(surface.clone());
+                self.attach_surface(surface);
                 self.create_next_perf_session();
             }
-            UiEvent::SessionCreated(Err(error)) => self.global_error = Some(error),
-            UiEvent::SessionEndFinished { session_id, result } => {
-                self.ending_sessions.remove(&session_id);
+            UiEvent::SurfaceCreated(Err(error)) => self.global_error = Some(error),
+            UiEvent::SurfaceEndFinished { surface_id, result } => {
+                self.ending_surfaces.remove(&surface_id);
                 match result {
-                    Ok(sessions) => {
+                    Ok(surfaces) => {
                         self.global_error = None;
-                        self.sessions = sessions;
-                        if !self.tabs.iter().any(|tab| tab.session_id == session_id) {
-                            self.close_after_end.remove(&session_id);
+                        self.surfaces = surfaces;
+                        if !self.tabs.iter().any(|tab| tab.surface_id == surface_id) {
+                            self.close_after_end.remove(&surface_id);
                         }
                     }
                     Err(error) => {
-                        self.close_after_end.remove(&session_id);
+                        self.close_after_end.remove(&surface_id);
                         self.global_error = Some(error);
                     }
                 }
@@ -773,18 +777,18 @@ impl CompiApp {
                 }
             }
             UiEvent::TabControl { tab_id, message } => match message {
-                ServerMessage::SessionExited {
-                    session_id,
+                ServerMessage::SurfaceExited {
+                    identity,
                     exit_code,
                 } => {
-                    self.ending_sessions.remove(&session_id);
-                    if self.close_after_end.remove(&session_id) {
+                    self.ending_surfaces.remove(&identity.surface_id);
+                    if self.close_after_end.remove(&identity.surface_id) {
                         self.close_tab_id(tab_id);
                     } else if let Some(tab) = self.tab_mut(tab_id) {
                         tab.state = ConnectionState::Exited(exit_code);
                         tab.transport = None;
                     }
-                    self.refresh_sessions(false);
+                    self.refresh_surfaces(false);
                 }
                 ServerMessage::Error { message, .. } => {
                     if let Some(tab) = self.tab_mut(tab_id) {
@@ -933,7 +937,7 @@ impl CompiApp {
         self.tabs.remove(index);
         self.active_tab = if self.tabs.is_empty() {
             self.switcher_open = true;
-            self.refresh_sessions(false);
+            self.refresh_surfaces(false);
             None
         } else {
             Some(self.tabs[index.min(self.tabs.len() - 1)].id)
@@ -1045,7 +1049,7 @@ impl CompiApp {
     ) {
         self.switcher_open = !self.switcher_open;
         if self.switcher_open {
-            self.refresh_sessions(false);
+            self.refresh_surfaces(false);
         }
         cx.notify();
     }
@@ -1497,7 +1501,7 @@ impl CompiApp {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.switcher_open = !this.switcher_open;
                         if this.switcher_open {
-                            this.refresh_sessions(false);
+                            this.refresh_surfaces(false);
                         }
                         cx.stop_propagation();
                         cx.notify();
@@ -1545,24 +1549,25 @@ impl CompiApp {
     }
 
     fn render_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.sessions.iter().map(|session| {
+        let rows = self.surfaces.iter().map(|session| {
             let session = session.clone();
-            let ending = self.ending_sessions.contains(&session.id);
-            let confirming = self.end_confirmation.as_deref() == Some(session.id.as_str());
-            let can_select = session.status == SessionStatus::Running && !ending;
+            let ending = self.ending_surfaces.contains(&session.id);
+            let confirming = self.end_confirmation.as_ref() == Some(&session.id);
+            let can_select = session.status == SurfaceStatus::Running && !ending;
             let status = if ending {
                 "Ending…"
             } else {
                 match session.status {
-                    SessionStatus::Starting => "Starting",
-                    SessionStatus::Running if session.attached => "Open",
-                    SessionStatus::Running => "Detached",
-                    SessionStatus::Exited => "Exited",
-                    SessionStatus::Failed => "Failed",
-                    SessionStatus::Dead => "Dead",
+                    SurfaceStatus::Starting => "Starting",
+                    SurfaceStatus::Ending => "Ending…",
+                    SurfaceStatus::Running if session.attached => "Open",
+                    SurfaceStatus::Running => "Detached",
+                    SurfaceStatus::Exited => "Exited",
+                    SurfaceStatus::Failed => "Failed",
+                    SurfaceStatus::Lost => "Lost",
                 }
             };
-            let detail = (session.status == SessionStatus::Dead)
+            let detail = (session.status == SurfaceStatus::Lost)
                 .then(|| session.error.clone())
                 .flatten();
             let session_for_attach = session.clone();
@@ -1582,7 +1587,7 @@ impl CompiApp {
                 .when(can_select, |row| {
                     row.hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.attach_session(session_for_attach.clone());
+                            this.attach_surface(session_for_attach.clone());
                             window.focus(&this.focus_handle);
                             cx.notify();
                         }))
@@ -1604,7 +1609,7 @@ impl CompiApp {
                                         .flex()
                                         .items_center()
                                         .gap_2()
-                                        .when(session.status == SessionStatus::Running, |title| {
+                                        .when(session.status == SurfaceStatus::Running, |title| {
                                             title.child(div().size(px(5.0)).rounded_full().bg(
                                                 color(if session.attached {
                                                     ACCENT
@@ -1613,7 +1618,7 @@ impl CompiApp {
                                                 }),
                                             ))
                                         })
-                                        .child(short_session_id(&session.id)),
+                                        .child(short_surface_id(&session.id)),
                                 )
                                 .child(
                                     div()
@@ -1622,7 +1627,7 @@ impl CompiApp {
                                         .text_color(
                                             if matches!(
                                                 session.status,
-                                                SessionStatus::Failed | SessionStatus::Dead
+                                                SurfaceStatus::Failed | SurfaceStatus::Lost
                                             ) {
                                                 color(ERROR)
                                             } else {
@@ -1644,7 +1649,7 @@ impl CompiApp {
                             )
                         })
                         .when(
-                            session.status == SessionStatus::Running && !ending,
+                            session.status == SurfaceStatus::Running && !ending,
                             |details| {
                                 details.child(
                                     div()
@@ -1663,13 +1668,13 @@ impl CompiApp {
                                                             .cursor_pointer()
                                                     })
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.begin_end_session(
+                                                        this.begin_end_surface(
                                                             session_id_for_begin.clone(),
                                                         );
                                                         cx.stop_propagation();
                                                         cx.notify();
                                                     }))
-                                                    .child("End session"),
+                                                    .child("End surface"),
                                             )
                                         })
                                         .when(confirming, |actions| {
@@ -1678,7 +1683,7 @@ impl CompiApp {
                                                     div()
                                                         .text_size(px(11.0))
                                                         .text_color(color(MUTED))
-                                                        .child("End this session?"),
+                                                        .child("End this surface?"),
                                                 )
                                                 .child(
                                                     div()
@@ -1698,7 +1703,7 @@ impl CompiApp {
                                                         })
                                                         .on_click(cx.listener(
                                                             move |this, _, _, cx| {
-                                                                this.cancel_end_session(
+                                                                this.cancel_end_surface(
                                                                     &session_id_for_cancel,
                                                                 );
                                                                 cx.stop_propagation();
@@ -1725,7 +1730,7 @@ impl CompiApp {
                                                         })
                                                         .on_click(cx.listener(
                                                             move |this, _, _, cx| {
-                                                                this.confirm_end_session(
+                                                                this.confirm_end_surface(
                                                                     session_id_for_confirm.clone(),
                                                                 );
                                                                 cx.stop_propagation();
@@ -1773,7 +1778,7 @@ impl CompiApp {
                                     .gap_2()
                                     .text_color(color(FOREGROUND))
                                     .child(chrome_icon(ChromeIcon::Search, color(MUTED)))
-                                    .child("Switch session"),
+                                    .child("Switch surface"),
                             )
                             .child(
                                 div()
@@ -1790,12 +1795,12 @@ impl CompiApp {
                                     .child("New"),
                             ),
                     )
-                    .when(self.loading_sessions, |panel| {
+                    .when(self.loading_surfaces, |panel| {
                         panel.child(
                             div()
                                 .p_4()
                                 .text_color(color(MUTED))
-                                .child("Loading sessions…"),
+                                .child("Loading surfaces…"),
                         )
                     })
                     .children(rows),
@@ -1812,9 +1817,9 @@ impl CompiApp {
             .and_then(|tab| tab.error.clone())
             .or_else(|| self.global_error.clone());
         let working_directory_warning = self.active_tab().and_then(|tab| {
-            self.sessions
+            self.surfaces
                 .iter()
-                .find(|session| session.id == tab.session_id)?
+                .find(|session| session.id == tab.surface_id)?
                 .working_directory
                 .as_ref()?
                 .warning
@@ -3013,7 +3018,7 @@ fn decode_kitty_image(image: &KittyImage) -> Result<Arc<RenderImage>, String> {
 
 fn spawn_tab_worker(
     tab_id: u64,
-    session_id: String,
+    surface_id: SurfaceId,
     cols: i16,
     rows: i16,
     sender: UiEventSender,
@@ -3027,7 +3032,7 @@ fn spawn_tab_worker(
             }
             let result = run_tab_connection(
                 tab_id,
-                &session_id,
+                &surface_id,
                 cols,
                 rows,
                 stop.clone(),
@@ -3049,7 +3054,7 @@ fn spawn_tab_worker(
 
 fn run_tab_connection(
     tab_id: u64,
-    session_id: &str,
+    surface_id: &SurfaceId,
     cols: i16,
     rows: i16,
     stop: Arc<AtomicBool>,
@@ -3057,52 +3062,42 @@ fn run_tab_connection(
     instance: Option<&str>,
 ) -> crate::Result<()> {
     let mut client = probe::connect_or_start(instance)?;
-    let Some(session) = client
-        .list_sessions()?
-        .into_iter()
-        .find(|session| session.id == session_id)
-    else {
+    let workspace = client.workspace()?;
+    let Some(surface) = workspace.surface(surface_id).cloned() else {
         stop.store(true, Ordering::Release);
         let _ = sender.send(UiEvent::TabControl {
             tab_id,
             message: ServerMessage::Error {
-                code: compi_protocol::ErrorCode::SessionNotFound,
-                message: "session no longer exists".into(),
+                code: compi_protocol::ErrorCode::SurfaceNotFound,
+                message: "surface no longer exists".into(),
+                current_revision: Some(workspace.revision),
             },
         });
         return Ok(());
     };
-    if session.status != SessionStatus::Running {
+    if surface.status != SurfaceStatus::Running {
         stop.store(true, Ordering::Release);
-        let message = if let Some(exit_code) = session.exit_code {
-            ServerMessage::SessionExited {
-                session_id: session.id,
-                exit_code,
-            }
-        } else {
-            ServerMessage::Error {
-                code: compi_protocol::ErrorCode::SessionExited,
-                message: session.error.unwrap_or_else(|| "session exited".into()),
-            }
-        };
-        let _ = sender.send(UiEvent::TabControl { tab_id, message });
+        let _ = sender.send(UiEvent::TabControl {
+            tab_id,
+            message: ServerMessage::Error {
+                code: compi_protocol::ErrorCode::SurfaceUnavailable,
+                message: surface
+                    .error
+                    .unwrap_or_else(|| format!("surface is {:?}", surface.status).to_lowercase()),
+                current_revision: Some(workspace.revision),
+            },
+        });
         return Ok(());
     }
-    match client.request(ClientMessage::Attach {
-        session_id: session_id.to_owned(),
-        cols,
-        rows,
-    })? {
-        ServerMessage::Attached { .. } => {}
-        message => return Err(format!("unexpected attach response: {message:?}").into()),
-    }
+    client.attach_surface(&surface, cols, rows)?;
     while let Some(message) = client.take_pending_screen() {
         let _ = sender.send(UiEvent::TabScreen { tab_id, message });
     }
-    let (connection, next_request_id, pending) = client.into_parts();
+    let (connection, next_request_id, pending, target, workspace) = client.into_parts();
     for message in pending {
         let _ = sender.send(UiEvent::TabScreen { tab_id, message });
     }
+    let target = target.ok_or("terminal attachment target was not established")?;
     let (command_tx, command_rx) = mpsc::channel();
     let transport = TabTransport {
         commands: command_tx,
@@ -3111,7 +3106,8 @@ fn run_tab_connection(
     if !sender.send(UiEvent::TabConnected { tab_id, transport }) {
         return Err("UI closed while attaching terminal".into());
     }
-    let mut reader = DaemonClient::from_parts(connection, next_request_id);
+    let mut reader =
+        DaemonClient::from_attached_parts(connection, next_request_id, target, workspace);
     loop {
         loop {
             match command_rx.try_recv() {
@@ -3136,8 +3132,8 @@ fn run_tab_connection(
                 }
             }
             Some(ServerEvent::Control { message, .. }) => {
-                let detached = matches!(message, ServerMessage::Detached { .. });
-                let exited = matches!(message, ServerMessage::SessionExited { .. });
+                let detached = matches!(&message, ServerMessage::Detached { .. });
+                let exited = matches!(&message, ServerMessage::SurfaceExited { .. });
                 if exited {
                     stop.store(true, Ordering::Release);
                 }
@@ -3153,39 +3149,46 @@ fn run_tab_connection(
     }
 }
 
-fn terminate_session_and_wait(
+fn terminate_surface_and_wait(
     instance: Option<&str>,
-    session_id: &str,
-) -> Result<Vec<SessionInfo>, String> {
+    surface_id: &SurfaceId,
+) -> Result<Vec<SurfaceInfo>, String> {
     let mut client = DaemonClient::connect(instance, Duration::from_secs(2))
         .map_err(|error| error.to_string())?;
-    let kill_error = client
-        .kill_session(session_id.to_owned())
-        .err()
-        .map(|error| error.to_string());
+    let surface = client
+        .workspace()
+        .map_err(|error| error.to_string())?
+        .surface(surface_id)
+        .cloned()
+        .ok_or_else(|| format!("surface {surface_id} was not found"))?;
+    client
+        .end_surface(&surface)
+        .map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let sessions = client.list_sessions().map_err(|error| error.to_string())?;
-        let running = sessions
-            .iter()
-            .any(|session| session.id == session_id && session.status == SessionStatus::Running);
-        if !running {
-            return Ok(sessions);
-        }
-        if let Some(error) = kill_error.as_ref() {
-            return Err(error.clone());
+        let surfaces = client.list_surfaces().map_err(|error| error.to_string())?;
+        let ending = surfaces.iter().any(|surface| {
+            &surface.id == surface_id
+                && matches!(
+                    surface.status,
+                    SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
+                )
+        });
+        if !ending {
+            return Ok(surfaces);
         }
         if Instant::now() >= deadline {
-            return Err(format!("timed out ending session {session_id}"));
+            return Err(format!("timed out ending surface {surface_id}"));
         }
         thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn short_session_id(id: &str) -> String {
-    id.rsplit('-')
+fn short_surface_id(id: &SurfaceId) -> String {
+    id.as_str()
+        .rsplit('-')
         .next()
-        .unwrap_or(id)
+        .unwrap_or(id.as_str())
         .chars()
         .take(8)
         .collect()

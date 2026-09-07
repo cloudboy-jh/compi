@@ -3,10 +3,10 @@
 use compi_client_core::{MirrorApply, ScreenMirror};
 use compi_protocol::frame;
 use compi_protocol::{
-    CONTROL_FRAME, ClientControl, ClientMessage, ErrorCode, ServerMessage, SessionStatus,
+    CONTROL_FRAME, ClientControl, ClientMessage, Color, ErrorCode, MutationId, MutationRequest,
+    ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus, WorkspaceMutation,
     decode_server, encode_client,
 };
-use compi_protocol::{Color, ScreenMessage, ScreenSnapshot};
 use compi_server::client::{DaemonClient, ServerEvent};
 use compi_server::identity;
 use compi_server::pipe;
@@ -83,29 +83,20 @@ impl Drop for DaemonGuard {
 }
 
 #[test]
-fn persistent_multi_session_lifecycle() {
+fn persistent_multi_surface_lifecycle() {
     let daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     reject_incompatible_protocol(&daemon.instance);
 
     let mut control = daemon.client();
-    assert!(control.list_sessions().unwrap().is_empty());
-    let first = control.create_session(80, 24, None).unwrap();
-    let second = control.create_session(80, 24, None).unwrap();
+    assert!(control.list_surfaces().unwrap().is_empty());
+    let first = control.create_surface(80, 24, None).unwrap();
+    let second = control.create_surface(80, 24, None).unwrap();
     assert_ne!(first.id, second.id);
-    assert_eq!(control.list_sessions().unwrap().len(), 2);
+    assert_eq!(control.list_surfaces().unwrap().len(), 2);
 
     let mut first_client = daemon.client();
-    assert!(matches!(
-        first_client
-            .request(ClientMessage::Attach {
-                session_id: first.id.clone(),
-                cols: 80,
-                rows: 24,
-            })
-            .unwrap(),
-        ServerMessage::Attached { .. }
-    ));
+    first_client.attach_surface(&first, 80, 24).unwrap();
     first_client
         .request(ClientMessage::Input {
             data: b"echo FIRST_$((20+22))\rexit\r".to_vec(),
@@ -117,20 +108,10 @@ fn persistent_multi_session_lifecycle() {
     assert_eq!(first_exit, 0);
 
     let mut second_client = daemon.client();
-    second_client
-        .request(ClientMessage::Attach {
-            session_id: second.id.clone(),
-            cols: 100,
-            rows: 40,
-        })
-        .unwrap();
+    second_client.attach_surface(&second, 100, 40).unwrap();
     let mut competing = daemon.client();
     let conflict = competing
-        .request(ClientMessage::Attach {
-            session_id: second.id.clone(),
-            cols: 80,
-            rows: 24,
-        })
+        .attach_surface(&second, 80, 24)
         .unwrap_err()
         .to_string();
     assert!(conflict.contains("AlreadyAttached"));
@@ -223,13 +204,7 @@ fn persistent_multi_session_lifecycle() {
     second_client.request(ClientMessage::Detach).unwrap();
     drop(second_client);
     let mut reattached = daemon.client();
-    reattached
-        .request(ClientMessage::Attach {
-            session_id: second.id.clone(),
-            cols: 90,
-            rows: 30,
-        })
-        .unwrap();
+    reattached.attach_surface(&second, 90, 30).unwrap();
     reattached
         .request(ClientMessage::Input {
             data: b"sleep 1; echo REATTACHED_$((20+22))\r".to_vec(),
@@ -239,13 +214,7 @@ fn persistent_multi_session_lifecycle() {
     drop(reattached);
     thread::sleep(Duration::from_secs(2));
     let mut after_crash = daemon.client();
-    after_crash
-        .request(ClientMessage::Attach {
-            session_id: second.id.clone(),
-            cols: 90,
-            rows: 30,
-        })
-        .unwrap();
+    after_crash.attach_surface(&second, 90, 30).unwrap();
     let crash_output = collect_until_marker(&mut after_crash, b"REATTACHED_42");
     assert!(
         crash_output
@@ -262,7 +231,7 @@ fn persistent_multi_session_lifecycle() {
     thread::sleep(Duration::from_secs(3));
     assert!(
         control
-            .list_sessions()
+            .list_surfaces()
             .unwrap()
             .iter()
             .find(|session| session.id == second.id)
@@ -297,12 +266,12 @@ fn persistent_multi_session_lifecycle() {
     assert_eq!(flood_exit, 0);
     drop(after_crash);
 
-    let sessions = control.list_sessions().unwrap();
+    let sessions = control.list_surfaces().unwrap();
     assert_eq!(sessions.len(), 2);
     assert!(sessions.iter().all(|session| {
         matches!(
             session.status,
-            SessionStatus::Exited | SessionStatus::Failed
+            SurfaceStatus::Exited | SurfaceStatus::Failed
         ) && !session.attached
     }));
 
@@ -312,7 +281,7 @@ fn persistent_multi_session_lifecycle() {
 }
 
 #[test]
-fn creates_sessions_in_wsl_and_windows_working_directories() {
+fn creates_surfaces_in_wsl_and_windows_working_directories() {
     let daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     let windows_directory = std::env::temp_dir().join(format!(
@@ -328,20 +297,14 @@ fn creates_sessions_in_wsl_and_windows_working_directories() {
 
     let mut control = daemon.client();
     let windows_session = control
-        .create_session(80, 24, Some(requested.clone()))
+        .create_surface(80, 24, Some(requested.clone()))
         .unwrap();
     let directory = windows_session.working_directory.as_ref().unwrap();
     assert_eq!(directory.requested, requested);
     assert!(directory.resolved_wsl_path.starts_with('/'));
 
     let mut attached = daemon.client();
-    attached
-        .request(ClientMessage::Attach {
-            session_id: windows_session.id.clone(),
-            cols: 80,
-            rows: 24,
-        })
-        .unwrap();
+    attached.attach_surface(&windows_session, 80, 24).unwrap();
     attached
         .request(ClientMessage::Input {
             data: b"printf '\\033]7;file://localhost%s\\a' \"$PWD\"; echo WORKDIR_$((20+22))\r"
@@ -364,7 +327,7 @@ fn creates_sessions_in_wsl_and_windows_working_directories() {
     drop(attached);
 
     let wsl_session = control
-        .create_session(80, 24, Some("/tmp".to_owned()))
+        .create_surface(80, 24, Some("/tmp".to_owned()))
         .unwrap();
     assert_eq!(
         wsl_session
@@ -373,17 +336,20 @@ fn creates_sessions_in_wsl_and_windows_working_directories() {
             .map(|directory| directory.resolved_wsl_path.as_str()),
         Some("/tmp")
     );
-    control.kill_session(wsl_session.id).unwrap();
+    control.end_surface(&wsl_session).unwrap();
+    let invalid = control
+        .create_surface(
+            80,
+            24,
+            Some("/definitely-missing-compi-working-directory".to_owned()),
+        )
+        .unwrap();
+    assert_eq!(invalid.status, SurfaceStatus::Failed);
     assert!(
-        control
-            .create_session(
-                80,
-                24,
-                Some("/definitely-missing-compi-working-directory".to_owned())
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("does not exist")
+        invalid
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not exist"))
     );
 
     drop(control);
@@ -393,7 +359,7 @@ fn creates_sessions_in_wsl_and_windows_working_directories() {
 }
 
 #[test]
-fn repeated_session_cycles_release_daemon_process_handles() {
+fn repeated_surface_cycles_release_daemon_process_handles() {
     let daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     let mut control = daemon.client();
@@ -401,14 +367,8 @@ fn repeated_session_cycles_release_daemon_process_handles() {
     let baseline = process_handle_count(daemon.child.id());
 
     for _ in 0..12 {
-        let session = control.create_session(80, 24, None).unwrap();
-        cycle_client
-            .request(ClientMessage::Attach {
-                session_id: session.id.clone(),
-                cols: 80,
-                rows: 24,
-            })
-            .unwrap();
+        let session = control.create_surface(80, 24, None).unwrap();
+        cycle_client.attach_surface(&session, 80, 24).unwrap();
         cycle_client
             .request(ClientMessage::Resize {
                 cols: 100,
@@ -416,17 +376,17 @@ fn repeated_session_cycles_release_daemon_process_handles() {
             })
             .unwrap();
         cycle_client.request(ClientMessage::Detach).unwrap();
-        control.kill_session(session.id.clone()).unwrap();
+        control.end_surface(&session).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let status = control
-                .list_sessions()
+                .list_surfaces()
                 .unwrap()
                 .into_iter()
                 .find(|candidate| candidate.id == session.id)
                 .unwrap()
                 .status;
-            if matches!(status, SessionStatus::Exited | SessionStatus::Failed) {
+            if matches!(status, SurfaceStatus::Exited | SurfaceStatus::Failed) {
                 break;
             }
             assert!(Instant::now() < deadline, "killed session did not exit");
@@ -435,7 +395,7 @@ fn repeated_session_cycles_release_daemon_process_handles() {
     }
     for _ in 0..20 {
         let mut transient = daemon.client();
-        transient.list_sessions().unwrap();
+        transient.list_surfaces().unwrap();
     }
 
     thread::sleep(Duration::from_millis(250));
@@ -451,54 +411,50 @@ fn repeated_session_cycles_release_daemon_process_handles() {
 }
 
 #[test]
-fn daemon_restart_reports_lost_sessions_as_dead() {
+fn daemon_restart_reports_active_surfaces_as_lost() {
     let daemon = DaemonGuard::start();
     let mut client = daemon.client();
-    let lost = client.create_session(80, 24, None).unwrap();
+    let lost = client.create_surface(80, 24, None).unwrap();
     drop(client);
 
     let instance = daemon.crash();
     let restarted = DaemonGuard::start_instance(instance.clone());
     let mut client = restarted.client();
     let dead = client
-        .list_sessions()
+        .list_surfaces()
         .unwrap()
         .into_iter()
         .find(|session| session.id == lost.id)
         .expect("lost session metadata was not retained");
-    assert_eq!(dead.status, SessionStatus::Dead);
+    assert_eq!(dead.status, SurfaceStatus::Lost);
     assert!(!dead.attached);
     assert!(dead.error.as_deref().unwrap().contains("previous daemon"));
 
     let attach_error = client
-        .request(ClientMessage::Attach {
-            session_id: lost.id,
-            cols: 80,
-            rows: 24,
-        })
+        .attach_surface(&dead, 80, 24)
         .unwrap_err()
         .to_string();
-    assert!(attach_error.contains("SessionExited"));
+    assert!(attach_error.contains("SurfaceUnavailable"));
 
-    let replacement = client.create_session(80, 24, None).unwrap();
+    let replacement = client.create_surface(80, 24, None).unwrap();
     drop(client);
     restarted.shutdown();
 
     let restarted = DaemonGuard::start_instance(instance.clone());
     let mut client = restarted.client();
     let replacement = client
-        .list_sessions()
+        .list_surfaces()
         .unwrap()
         .into_iter()
         .find(|session| session.id == replacement.id)
         .expect("intentional shutdown metadata was not retained");
-    assert_eq!(replacement.status, SessionStatus::Dead);
+    assert_eq!(replacement.status, SurfaceStatus::Lost);
     assert!(
         replacement
             .error
             .as_deref()
             .unwrap()
-            .contains("stopped intentionally")
+            .contains("previous daemon")
     );
     drop(client);
     restarted.shutdown();
@@ -506,15 +462,124 @@ fn daemon_restart_reports_lost_sessions_as_dead() {
 }
 
 #[test]
-fn daemon_quarantines_malformed_session_metadata() {
+fn mutation_publication_precedes_ack_and_restart_changes_lifetime() {
+    let daemon = DaemonGuard::start();
+    let instance = daemon.instance.clone();
+    let mut client = daemon.client();
+    let workspace = client.workspace().unwrap();
+    let mutation_id = MutationId::new("integration-initialize");
+    let request_id = client
+        .send(ClientMessage::Mutate {
+            mutation: MutationRequest {
+                server_id: workspace.server_id,
+                expected_generation: workspace.server_generation,
+                mutation_id: mutation_id.clone(),
+                expected_revision: workspace.revision,
+                operation: WorkspaceMutation::Initialize {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            },
+        })
+        .unwrap();
+    let mut published_revision = None;
+    let receipt = loop {
+        match client.read_event().unwrap().unwrap() {
+            ServerEvent::Control {
+                request_id: None,
+                message: ServerMessage::WorkspaceChanged { revision },
+            } => published_revision = Some(revision),
+            ServerEvent::Control {
+                request_id: Some(response_id),
+                message: ServerMessage::MutationCommitted { receipt },
+            } if response_id == request_id => break receipt,
+            _ => {}
+        }
+    };
+    assert_eq!(published_revision, Some(receipt.revision));
+    assert_eq!(
+        client.mutation_outcome(mutation_id).unwrap(),
+        receipt,
+        "outcome lookup must return the durable receipt"
+    );
+
+    let surface_id = receipt.affected_surfaces[0].clone();
+    let original = client
+        .wait_for_surface(&surface_id, Duration::from_secs(5))
+        .unwrap();
+    client.end_surface(&original).unwrap();
+    let exited = wait_for_surface_status(&mut client, &surface_id, SurfaceStatus::Exited);
+    client
+        .mutate(WorkspaceMutation::RestartSurface {
+            surface_id: surface_id.clone(),
+            expected_lifetime: exited.process_lifetime_id.clone(),
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+    let restarted = client
+        .wait_for_surface(&surface_id, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(restarted.id, original.id);
+    assert_ne!(restarted.process_lifetime_id, original.process_lifetime_id);
+    let stale = client
+        .attach_surface(&original, 80, 24)
+        .unwrap_err()
+        .to_string();
+    assert!(stale.contains("StaleLifetime"), "{stale}");
+    client.attach_surface(&restarted, 80, 24).unwrap();
+    client.request(ClientMessage::Detach).unwrap();
+    client.end_surface(&restarted).unwrap();
+    wait_for_surface_status(&mut client, &surface_id, SurfaceStatus::Exited);
+
+    drop(client);
+    daemon.shutdown();
+    cleanup_metadata(&instance);
+}
+
+fn wait_for_surface_status(
+    client: &mut DaemonClient,
+    surface_id: &SurfaceId,
+    expected: SurfaceStatus,
+) -> compi_protocol::SurfaceInfo {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let surface = client
+            .list_surfaces()
+            .unwrap()
+            .into_iter()
+            .find(|surface| &surface.id == surface_id)
+            .unwrap();
+        if surface.status == expected {
+            return surface;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected:?}, got {surface:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn daemon_quarantines_malformed_workspace_metadata() {
     let instance = unique_instance();
     let path = metadata_path(&instance);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, b"{not-json").unwrap();
 
     let daemon = DaemonGuard::start_instance(instance.clone());
-    assert!(daemon.client().list_sessions().unwrap().is_empty());
-    assert!(!path.exists());
+    let mut client = daemon.client();
+    let workspace = client.workspace().unwrap();
+    assert!(workspace.surfaces.is_empty());
+    assert!(
+        workspace
+            .recovery_message
+            .as_deref()
+            .is_some_and(|message| message.contains("quarantined"))
+    );
+    assert!(path.is_file());
     let prefix = path.file_stem().unwrap().to_string_lossy().into_owned();
     assert!(fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
         entry.ok().is_some_and(|entry| {
@@ -539,7 +604,7 @@ fn unique_instance() -> String {
 fn metadata_path(instance: &str) -> PathBuf {
     PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
         .join("Compi")
-        .join(format!("sessions-{instance}-v2.json"))
+        .join(format!("workspace-{instance}-v1.json"))
 }
 
 fn cleanup_metadata(instance: &str) {
@@ -568,6 +633,7 @@ fn reject_incompatible_protocol(instance: &str) {
     let mut connection = pipe::connect(&names.pipe, Duration::from_secs(2)).unwrap();
     let payload = encode_client(&ClientControl {
         request_id: 9,
+        target: None,
         message: ClientMessage::Hello {
             protocol_version: 999,
         },
@@ -595,7 +661,7 @@ fn read_snapshot(client: &mut DaemonClient) -> ScreenSnapshot {
         match event.unwrap() {
             ServerEvent::Screen(ScreenMessage::Snapshot { snapshot }) => return snapshot,
             ServerEvent::Control {
-                message: ServerMessage::Error { code, message },
+                message: ServerMessage::Error { code, message, .. },
                 ..
             } => panic!("daemon error ({code:?}): {message}"),
             _ => {}
@@ -624,7 +690,7 @@ fn collect_snapshot_until_marker(client: &mut DaemonClient, marker: &[u8]) -> Sc
                 }
             }
             ServerEvent::Control {
-                message: ServerMessage::Error { code, message },
+                message: ServerMessage::Error { code, message, .. },
                 ..
             } => panic!("daemon error ({code:?}): {message}"),
             ServerEvent::Control { .. } => {}
@@ -632,7 +698,7 @@ fn collect_snapshot_until_marker(client: &mut DaemonClient, marker: &[u8]) -> Sc
     }
 }
 
-fn collect_until_exit(client: &mut DaemonClient, session_id: &str) -> (Vec<u8>, u32) {
+fn collect_until_exit(client: &mut DaemonClient, surface_id: &SurfaceId) -> (Vec<u8>, u32) {
     let mut mirror = ScreenMirror::default();
     loop {
         let message = if let Some(pending) = client.take_pending_screen() {
@@ -644,12 +710,12 @@ fn collect_until_exit(client: &mut DaemonClient, session_id: &str) -> (Vec<u8>, 
             ServerEvent::Screen(message) => apply_screen(client, &mut mirror, message),
             ServerEvent::Control {
                 message:
-                    ServerMessage::SessionExited {
-                        session_id: exited,
+                    ServerMessage::SurfaceExited {
+                        identity,
                         exit_code,
                     },
                 ..
-            } if exited == session_id => return (mirror_text(&mirror), exit_code),
+            } if &identity.surface_id == surface_id => return (mirror_text(&mirror), exit_code),
             ServerEvent::Control { .. } => {}
         }
     }

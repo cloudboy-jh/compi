@@ -2,13 +2,17 @@ use crate::Result;
 use crate::launch::{self, LaunchDescription};
 use crate::pipe;
 use crate::pty::{PtySession, PtyWriter};
-use crate::session_store::SessionStore;
+use crate::workspace::{
+    ActorError, RuntimeObservation, WorkspaceActor, WorkspaceEffect, WorkspaceEvent,
+};
+use compi_protocol::ScreenMessage;
 use compi_protocol::frame;
 use compi_protocol::{
-    CONTROL_FRAME, ErrorCode, SCREEN_FRAME, ServerControl, ServerMessage, SessionInfo,
-    SessionStatus, WorkingDirectory, encode_server,
+    AttachmentId, CONTROL_FRAME, ErrorCode, MutationId, MutationReceipt, MutationRequest,
+    ProcessLifetimeId, SCREEN_FRAME, ServerControl, ServerMessage, SurfaceId, SurfaceInfo,
+    SurfaceStatus, TerminalFrame, TerminalIdentity, TerminalTarget, WorkingDirectory,
+    WorkspaceSnapshot, encode_server, encode_terminal_frame,
 };
-use compi_protocol::{ScreenMessage, encode_screen};
 use compi_terminal::TerminalState;
 use compi_terminal::trace::TerminalTraceRecorder;
 use std::collections::{HashMap, VecDeque};
@@ -21,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 #[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
 #[cfg(windows)]
@@ -33,34 +37,37 @@ const TRANSPORT_CHUNK: usize = 32 * 1024;
 const CLIENT_QUEUE_FRAMES: usize = 256;
 const CLIENT_SCREEN_QUEUE_FRAMES: usize = 32;
 const MAX_PENDING_LATENCY_IDS: usize = 4_096;
+static NEXT_ATTACHMENT: AtomicU64 = AtomicU64::new(1);
 
-pub struct SessionManager {
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
-    store: SessionStore,
-    next_id: AtomicU64,
+pub struct SurfaceManager {
+    surfaces: Arc<Mutex<HashMap<SurfaceId, Arc<Surface>>>>,
+    actor: WorkspaceActor,
 }
 
-pub struct Session {
-    id: String,
+pub struct Surface {
+    id: SurfaceId,
+    process_lifetime_id: ProcessLifetimeId,
+    identity: TerminalIdentity,
     created_at_ms: u64,
-    state: Mutex<SessionRuntime>,
+    launch_request: compi_protocol::LaunchRequest,
+    state: Mutex<SurfaceRuntime>,
     input: Mutex<Option<PtyWriter>>,
     trace: Mutex<Option<TerminalTraceRecorder>>,
     pending_latency: Mutex<VecDeque<PendingLatency>>,
-    commands: SyncSender<SessionCommand>,
+    commands: SyncSender<SurfaceCommand>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    store: SessionStore,
+    actor: WorkspaceActor,
     working_directory: Option<WorkingDirectory>,
 }
 
-struct SessionRuntime {
-    status: SessionStatus,
+struct SurfaceRuntime {
+    status: SurfaceStatus,
     cols: i16,
     rows: i16,
     exit_code: Option<u32>,
     error: Option<String>,
     terminal: TerminalState,
-    client: Option<ConnectionSink>,
+    client: Option<(ConnectionSink, AttachmentId)>,
 }
 
 struct PendingLatency {
@@ -68,13 +75,15 @@ struct PendingLatency {
     output_received: bool,
 }
 
-enum SessionCommand {
+enum SurfaceCommand {
     Resize {
         cols: i16,
         rows: i16,
         acknowledgement: SyncSender<std::result::Result<(), String>>,
     },
-    Kill,
+    Kill {
+        for_removal: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -95,197 +104,214 @@ struct Outgoing {
 }
 
 #[derive(Debug)]
-pub enum SessionError {
+pub enum SurfaceError {
     AlreadyAttached,
     NotAttached,
-    Exited,
+    Unavailable,
+    StaleLifetime,
     Internal(String),
 }
 
-impl SessionError {
+impl SurfaceError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::AlreadyAttached => ErrorCode::AlreadyAttached,
             Self::NotAttached => ErrorCode::NotAttached,
-            Self::Exited => ErrorCode::SessionExited,
+            Self::Unavailable => ErrorCode::SurfaceUnavailable,
+            Self::StaleLifetime => ErrorCode::StaleLifetime,
             Self::Internal(_) => ErrorCode::Internal,
         }
     }
 }
 
-impl fmt::Display for SessionError {
+impl fmt::Display for SurfaceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyAttached => write!(formatter, "session already has a controlling client"),
-            Self::NotAttached => write!(formatter, "connection is not attached to this session"),
-            Self::Exited => write!(formatter, "session is not running"),
+            Self::AlreadyAttached => write!(formatter, "surface already has a controlling client"),
+            Self::NotAttached => write!(formatter, "connection is not attached to this surface"),
+            Self::Unavailable => write!(formatter, "surface is not running"),
+            Self::StaleLifetime => write!(formatter, "surface process lifetime changed"),
             Self::Internal(message) => formatter.write_str(message),
         }
     }
 }
 
-impl std::error::Error for SessionError {}
+impl std::error::Error for SurfaceError {}
 
-impl SessionManager {
+impl SurfaceManager {
     pub fn new() -> Self {
-        Self::with_store(SessionStore::memory())
+        let (actor, effects) = WorkspaceActor::memory();
+        Self::with_actor(actor, effects)
     }
 
     pub fn persistent(instance: Option<&str>) -> Result<Self> {
-        Ok(Self::with_store(SessionStore::open(instance)?))
+        let (actor, effects) = WorkspaceActor::persistent(instance)?;
+        Ok(Self::with_actor(actor, effects))
     }
 
-    fn with_store(store: SessionStore) -> Self {
-        let next_id = store.next_ordinal();
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-            store,
-            next_id: AtomicU64::new(next_id),
+    fn with_actor(actor: WorkspaceActor, effects: Receiver<WorkspaceEffect>) -> Self {
+        let surfaces = Arc::new(Mutex::new(HashMap::new()));
+        let worker_surfaces = surfaces.clone();
+        let worker_actor = actor.clone();
+        thread::spawn(move || {
+            while let Ok(effect) = effects.recv() {
+                match effect {
+                    WorkspaceEffect::Launch(info) => {
+                        let launch = match launch::resolve_launch(
+                            info.launch.working_directory.as_deref(),
+                        ) {
+                            Ok(launch) => launch,
+                            Err(error) => {
+                                worker_actor.observe(RuntimeObservation::Failed {
+                                    surface_id: info.id,
+                                    process_lifetime_id: info.process_lifetime_id,
+                                    error: error.to_string(),
+                                });
+                                continue;
+                            }
+                        };
+                        let surface_id = info.id.clone();
+                        let lifetime = info.process_lifetime_id.clone();
+                        match Surface::spawn(info, launch, worker_actor.clone()) {
+                            Ok(surface) => {
+                                if let Ok(mut registry) = worker_surfaces.lock()
+                                    && let Some(previous) =
+                                        registry.insert(surface_id.clone(), surface)
+                                {
+                                    previous.join();
+                                }
+                            }
+                            Err(error) => worker_actor.observe(RuntimeObservation::Failed {
+                                surface_id,
+                                process_lifetime_id: lifetime,
+                                error: error.to_string(),
+                            }),
+                        }
+                    }
+                    WorkspaceEffect::End {
+                        surface_id,
+                        process_lifetime_id,
+                    } => {
+                        let surface = worker_surfaces
+                            .lock()
+                            .ok()
+                            .and_then(|registry| registry.get(&surface_id).cloned());
+                        match surface {
+                            Some(surface) if surface.process_lifetime_id == process_lifetime_id => {
+                                if let Err(error) = surface.kill(true) {
+                                    worker_actor.observe(RuntimeObservation::EndFailed {
+                                        surface_id,
+                                        process_lifetime_id,
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
+                            Some(_) => {}
+                            None => worker_actor.observe(RuntimeObservation::EndFailed {
+                                surface_id,
+                                process_lifetime_id,
+                                error: "surface runtime was not found".into(),
+                            }),
+                        }
+                    }
+                }
+            }
+        });
+        Self { surfaces, actor }
+    }
+
+    pub fn actor(&self) -> &WorkspaceActor {
+        &self.actor
+    }
+
+    pub fn snapshot(&self) -> std::result::Result<WorkspaceSnapshot, ActorError> {
+        let mut snapshot = self.actor.snapshot()?;
+        if let Ok(surfaces) = self.surfaces.lock() {
+            for persisted in &mut snapshot.surfaces {
+                if let Some(runtime) = surfaces.get(&persisted.id) {
+                    persisted.attached = runtime.info().attached;
+                }
+            }
         }
+        Ok(snapshot)
     }
 
-    pub fn create(
+    pub fn mutate(
         &self,
-        cols: i16,
-        rows: i16,
-        working_directory: Option<String>,
-    ) -> Result<Arc<Session>> {
-        validate_dimensions(cols, rows)?;
-        let launch = launch::resolve_launch(working_directory.as_deref())?;
-        let created_at_ms = now_ms();
-        let ordinal = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = format!("s-{created_at_ms:x}-{ordinal:x}");
-        self.store.record(&SessionInfo {
-            id: id.clone(),
-            status: SessionStatus::Starting,
-            attached: false,
-            cols,
-            rows,
-            created_at_ms,
-            exit_code: None,
-            error: None,
-            working_directory: launch.metadata.clone(),
-        })?;
-        let session = match Session::spawn(
-            id.clone(),
-            created_at_ms,
-            cols,
-            rows,
-            launch.clone(),
-            self.store.clone(),
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                let _ = self.store.record(&SessionInfo {
-                    id,
-                    status: SessionStatus::Failed,
-                    attached: false,
-                    cols,
-                    rows,
-                    created_at_ms,
-                    exit_code: None,
-                    error: Some(error.to_string()),
-                    working_directory: launch.metadata,
-                });
-                return Err(error);
-            }
-        };
-        let mut sessions = match self.sessions.lock() {
-            Ok(sessions) => sessions,
-            Err(_) => {
-                let _ = session.kill();
-                session.join();
-                return Err("session registry lock was poisoned".into());
-            }
-        };
-        sessions.insert(id, session.clone());
-        Ok(session)
+        request: MutationRequest,
+    ) -> std::result::Result<MutationReceipt, ActorError> {
+        self.actor.mutate(request)
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().ok()?.get(id).cloned()
+    pub fn outcome(
+        &self,
+        mutation_id: MutationId,
+    ) -> std::result::Result<Option<MutationReceipt>, ActorError> {
+        self.actor.outcome(mutation_id)
     }
 
-    pub fn list(&self) -> Vec<SessionInfo> {
-        let mut sessions: HashMap<_, _> = self
-            .store
-            .list()
-            .into_iter()
-            .map(|session| (session.id.clone(), session))
-            .collect();
-        if let Ok(live) = self.sessions.lock() {
-            for session in live.values().map(|session| session.info()) {
-                sessions.insert(session.id.clone(), session);
-            }
-        }
-        let mut sessions: Vec<_> = sessions.into_values().collect();
-        sessions.sort_by_key(|session| (session.created_at_ms, session.id.clone()));
-        sessions
+    pub fn subscribe(&self) -> Receiver<WorkspaceEvent> {
+        self.actor.subscribe()
     }
 
-    pub fn get_info(&self, id: &str) -> Option<SessionInfo> {
+    pub fn get(&self, id: &SurfaceId) -> Option<Arc<Surface>> {
+        self.surfaces.lock().ok()?.get(id).cloned()
+    }
+
+    pub fn get_info(&self, id: &SurfaceId) -> Option<SurfaceInfo> {
         self.get(id)
-            .map(|session| session.info())
-            .or_else(|| self.store.get(id))
+            .map(|surface| surface.info())
+            .or_else(|| self.snapshot().ok()?.surface(id).cloned())
     }
 
-    pub fn session_count(&self) -> usize {
-        self.sessions
+    pub fn surface_count(&self) -> usize {
+        self.surfaces
             .lock()
-            .map(|sessions| sessions.len())
+            .map(|surfaces| surfaces.len())
             .unwrap_or_default()
     }
 
-    pub fn shutdown_all(&self, reason: &str) {
-        let sessions: Vec<_> = self
-            .sessions
+    pub fn shutdown_all(&self, _reason: &str) {
+        let surfaces: Vec<_> = self
+            .surfaces
             .lock()
-            .map(|sessions| sessions.values().cloned().collect())
+            .map(|surfaces| surfaces.values().cloned().collect())
             .unwrap_or_default();
-        let active_ids: Vec<_> = sessions
-            .iter()
-            .filter(|session| {
-                matches!(
-                    session.info().status,
-                    SessionStatus::Starting | SessionStatus::Running
-                )
-            })
-            .map(|session| session.id.clone())
-            .collect();
-        for session in &sessions {
-            let _ = session.kill();
+        for surface in &surfaces {
+            let _ = surface.kill(false);
         }
-        for session in sessions {
-            session.join();
-        }
-        if let Err(error) = self.store.mark_dead(&active_ids, reason) {
-            eprintln!("compi-daemon: could not persist daemon shutdown state: {error}");
+        for surface in surfaces {
+            surface.join();
         }
     }
 }
 
-impl Default for SessionManager {
+impl Default for SurfaceManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Session {
+impl Surface {
     fn spawn(
-        id: String,
-        created_at_ms: u64,
-        cols: i16,
-        rows: i16,
+        info: SurfaceInfo,
         launch: LaunchDescription,
-        store: SessionStore,
+        actor: WorkspaceActor,
     ) -> Result<Arc<Self>> {
-        let mut pty = PtySession::spawn(&launch, cols, rows)?;
+        let mut pty = PtySession::spawn(&launch, info.cols, info.rows)?;
         let (input, mut output) = pty.take_io()?;
         let (command_sender, command_receiver) = sync_channel(64);
-        let trace = match TerminalTraceRecorder::from_env(&id, cols as u16, rows as u16) {
+        let trace = match TerminalTraceRecorder::from_env(
+            info.id.as_str(),
+            info.cols as u16,
+            info.rows as u16,
+        ) {
             Ok(trace) => trace,
             Err(error) => {
-                eprintln!("compi-daemon: could not enable terminal trace for {id}: {error}");
+                eprintln!(
+                    "compi-daemon: could not enable terminal trace for {}: {error}",
+                    info.id
+                );
                 None
             }
         };
@@ -294,15 +320,27 @@ impl Session {
             .and_then(|trace| trace.path().file_stem())
             .and_then(|stem| stem.to_str())
             .map(str::to_owned);
-        let mut terminal = TerminalState::new(cols as u16, rows as u16);
-        terminal.set_diagnostic_context(&id, trace_label.as_deref());
-        let session = Arc::new(Self {
-            id,
-            created_at_ms,
-            state: Mutex::new(SessionRuntime {
-                status: SessionStatus::Starting,
-                cols,
-                rows,
+        let mut terminal = TerminalState::new(info.cols as u16, info.rows as u16);
+        terminal.set_diagnostic_context(info.id.as_str(), trace_label.as_deref());
+        let workspace = actor
+            .snapshot()
+            .map_err(|error| format!("could not read workspace identity: {error}"))?;
+        let identity = TerminalIdentity {
+            server_id: workspace.server_id,
+            server_generation: workspace.server_generation,
+            surface_id: info.id.clone(),
+            process_lifetime_id: info.process_lifetime_id.clone(),
+        };
+        let surface = Arc::new(Self {
+            id: info.id,
+            process_lifetime_id: info.process_lifetime_id,
+            identity,
+            created_at_ms: info.created_at_ms,
+            launch_request: info.launch,
+            state: Mutex::new(SurfaceRuntime {
+                status: SurfaceStatus::Starting,
+                cols: info.cols,
+                rows: info.rows,
                 exit_code: None,
                 error: None,
                 terminal,
@@ -313,11 +351,11 @@ impl Session {
             pending_latency: Mutex::new(VecDeque::new()),
             commands: command_sender,
             worker: Mutex::new(None),
-            store,
+            actor,
             working_directory: launch.metadata,
         });
 
-        let output_session = session.clone();
+        let output_surface = surface.clone();
         let output_thread = thread::spawn(move || {
             let mut buffer = [0_u8; TRANSPORT_CHUNK];
             loop {
@@ -328,7 +366,7 @@ impl Session {
                     Err(_) => break,
                 };
                 if crate::perf::enabled()
-                    && let Ok(mut pending) = output_session.pending_latency.lock()
+                    && let Ok(mut pending) = output_surface.pending_latency.lock()
                 {
                     for latency in pending
                         .iter_mut()
@@ -338,16 +376,20 @@ impl Session {
                         crate::perf::log_input_latency_stage(latency.id, "pty_output", None);
                     }
                 }
-                output_session.record_trace_output(&buffer[..read]);
+                output_surface.record_trace_output(&buffer[..read]);
                 let (sink, mut delta, replies) = {
-                    let Ok(mut state) = output_session.state.lock() else {
+                    let Ok(mut state) = output_surface.state.lock() else {
                         break;
                     };
                     let (delta, replies) = state.terminal.advance(&buffer[..read]);
-                    (state.client.clone(), delta, replies)
+                    (
+                        state.client.as_ref().map(|(sink, _)| sink.clone()),
+                        delta,
+                        replies,
+                    )
                 };
                 if let Some(delta) = delta.as_mut()
-                    && let Ok(mut pending) = output_session.pending_latency.lock()
+                    && let Ok(mut pending) = output_surface.pending_latency.lock()
                 {
                     while pending
                         .front()
@@ -363,7 +405,7 @@ impl Session {
                     }
                 }
                 if !replies.is_empty() {
-                    let Ok(mut input) = output_session.input.lock() else {
+                    let Ok(mut input) = output_surface.input.lock() else {
                         break;
                     };
                     let Some(input) = input.as_mut() else {
@@ -378,58 +420,60 @@ impl Session {
                 }
                 if let (Some(sink), Some(delta)) = (sink, delta)
                     && sink
-                        .send_screen(&ScreenMessage::Delta {
-                            delta: crate::screen::delta(delta),
+                        .send_screen(&TerminalFrame {
+                            identity: output_surface.identity.clone(),
+                            message: ScreenMessage::Delta {
+                                delta: crate::screen::delta(delta),
+                            },
                         })
                         .is_err()
                 {
-                    output_session.detach_connection(sink.id);
+                    output_surface.detach_connection(sink.id);
                 }
             }
         });
 
         let (worker_start, worker_ready) = sync_channel(0);
-        let worker_session = session.clone();
+        let worker_surface = surface.clone();
         let worker = thread::spawn(move || {
             if worker_ready.recv().is_ok() {
-                worker_session.run_worker(pty, command_receiver, output_thread);
+                worker_surface.run_worker(pty, command_receiver, output_thread);
             }
-            worker_session.release_worker_handle();
+            worker_surface.release_worker_handle();
         });
-        *session
+        *surface
             .worker
             .lock()
-            .map_err(|_| "session worker lock was poisoned")? = Some(worker);
-        // Publish Running before releasing the worker: a fast child exit must
-        // not be overwritten with Running after the worker records Exited.
-        session
+            .map_err(|_| "surface worker lock was poisoned")? = Some(worker);
+        surface
             .state
             .lock()
-            .map_err(|_| "session state lock was poisoned")?
-            .status = SessionStatus::Running;
+            .map_err(|_| "surface state lock was poisoned")?
+            .status = SurfaceStatus::Running;
         worker_start
             .send(())
-            .map_err(|_| "session worker stopped before startup")?;
-        if let Err(error) = session.persist() {
-            let _ = session.kill();
-            session.join();
-            return Err(error);
-        }
-        Ok(session)
+            .map_err(|_| "surface worker stopped before startup")?;
+        surface.actor.observe(RuntimeObservation::Running {
+            surface_id: surface.id.clone(),
+            process_lifetime_id: surface.process_lifetime_id.clone(),
+            working_directory: surface.working_directory.clone(),
+        });
+        Ok(surface)
     }
 
     fn run_worker(
         &self,
         mut pty: PtySession,
-        commands: Receiver<SessionCommand>,
+        commands: Receiver<SurfaceCommand>,
         output_thread: JoinHandle<()>,
     ) {
         let mut failure = None;
         let mut termination_deadline = None;
+        let mut removal_requested = false;
         let exit_code = 'running: loop {
             loop {
                 match commands.try_recv() {
-                    Ok(SessionCommand::Resize {
+                    Ok(SurfaceCommand::Resize {
                         cols,
                         rows,
                         acknowledgement,
@@ -439,13 +483,16 @@ impl Session {
                                 state.cols = cols;
                                 state.rows = rows;
                                 let delta = state.terminal.resize(cols as u16, rows as u16);
-                                (state.client.clone(), delta)
+                                (state.client.as_ref().map(|(sink, _)| sink.clone()), delta)
                             });
                             self.record_trace_resize(cols as u16, rows as u16);
                             if let Some((Some(sink), Some(delta))) = update
                                 && sink
-                                    .send_screen(&ScreenMessage::Delta {
-                                        delta: crate::screen::delta(delta),
+                                    .send_screen(&TerminalFrame {
+                                        identity: self.identity.clone(),
+                                        message: ScreenMessage::Delta {
+                                            delta: crate::screen::delta(delta),
+                                        },
                                     })
                                     .is_err()
                             {
@@ -463,9 +510,10 @@ impl Session {
                             });
                         }
                     },
-                    Ok(SessionCommand::Kill) => {
+                    Ok(SurfaceCommand::Kill { for_removal }) => {
+                        removal_requested |= for_removal;
                         if let Err(error) = pty.terminate(137) {
-                            failure = Some(format!("session termination failed: {error}"));
+                            failure = Some(format!("surface termination failed: {error}"));
                         }
                         termination_deadline.get_or_insert_with(|| {
                             std::time::Instant::now() + Duration::from_secs(2)
@@ -505,58 +553,66 @@ impl Session {
             input.take();
         }
 
-        let sink = if let Ok(mut state) = self.state.lock() {
+        let client = if let Ok(mut state) = self.state.lock() {
             state.exit_code = Some(exit_code);
             state.status = if failure.is_some() {
-                SessionStatus::Failed
+                SurfaceStatus::Failed
             } else {
-                SessionStatus::Exited
+                SurfaceStatus::Exited
             };
-            state.error = failure;
+            state.error = failure.clone();
             state.client.take()
         } else {
             None
         };
-        if let Err(error) = self.persist() {
-            eprintln!(
-                "compi-daemon: could not persist terminal state for {}: {error}",
-                self.id
-            );
+        if let Some(error) = failure {
+            let observation = if removal_requested {
+                RuntimeObservation::EndFailed {
+                    surface_id: self.id.clone(),
+                    process_lifetime_id: self.process_lifetime_id.clone(),
+                    error,
+                }
+            } else {
+                RuntimeObservation::Failed {
+                    surface_id: self.id.clone(),
+                    process_lifetime_id: self.process_lifetime_id.clone(),
+                    error,
+                }
+            };
+            self.actor.observe(observation);
+        } else {
+            self.actor.observe(RuntimeObservation::Exited {
+                surface_id: self.id.clone(),
+                process_lifetime_id: self.process_lifetime_id.clone(),
+                exit_code,
+            });
         }
-        if let Some(sink) = sink {
+        if let Some((sink, _)) = client {
             let _ = sink.send_control(&ServerControl {
                 request_id: None,
-                message: ServerMessage::SessionExited {
-                    session_id: self.id.clone(),
+                message: ServerMessage::SurfaceExited {
+                    identity: self.identity.clone(),
                     exit_code,
                 },
             });
         }
     }
 
-    pub fn info(&self) -> SessionInfo {
+    pub fn info(&self) -> SurfaceInfo {
         self.state
             .lock()
-            .map(|state| SessionInfo {
+            .map(|state| self.info_from_state(&state))
+            .unwrap_or_else(|_| SurfaceInfo {
                 id: self.id.clone(),
-                status: state.status,
-                attached: state.client.as_ref().is_some_and(ConnectionSink::is_alive),
-                cols: state.cols,
-                rows: state.rows,
-                created_at_ms: self.created_at_ms,
-                exit_code: state.exit_code,
-                error: state.error.clone(),
-                working_directory: self.working_directory.clone(),
-            })
-            .unwrap_or_else(|_| SessionInfo {
-                id: self.id.clone(),
-                status: SessionStatus::Failed,
+                process_lifetime_id: self.process_lifetime_id.clone(),
+                status: SurfaceStatus::Failed,
                 attached: false,
                 cols: 0,
                 rows: 0,
                 created_at_ms: self.created_at_ms,
                 exit_code: None,
-                error: Some("session state lock was poisoned".into()),
+                error: Some("surface state lock was poisoned".into()),
+                launch: self.launch_request.clone(),
                 working_directory: self.working_directory.clone(),
             })
     }
@@ -565,59 +621,82 @@ impl Session {
         &self,
         sink: ConnectionSink,
         request_id: u64,
+        expected_lifetime: &ProcessLifetimeId,
         cols: i16,
         rows: i16,
-    ) -> std::result::Result<(), SessionError> {
+    ) -> std::result::Result<(), SurfaceError> {
         validate_dimensions(cols, rows)
-            .map_err(|error| SessionError::Internal(error.to_string()))?;
+            .map_err(|error| SurfaceError::Internal(error.to_string()))?;
+        if expected_lifetime != &self.process_lifetime_id {
+            return Err(SurfaceError::StaleLifetime);
+        }
         let mut state = self
             .state
             .lock()
-            .map_err(|_| SessionError::Internal("session state lock was poisoned".into()))?;
-        if state.status != SessionStatus::Running {
-            return Err(SessionError::Exited);
+            .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+        if state.status != SurfaceStatus::Running {
+            return Err(SurfaceError::Unavailable);
         }
-        if state.client.as_ref().is_some_and(ConnectionSink::is_alive) {
-            return Err(SessionError::AlreadyAttached);
+        if state
+            .client
+            .as_ref()
+            .is_some_and(|(sink, _)| sink.is_alive())
+        {
+            return Err(SurfaceError::AlreadyAttached);
         }
 
-        state.client = Some(sink.clone());
+        let attachment_id = AttachmentId::new(format!(
+            "attachment-{:x}-{:x}",
+            sink.id,
+            NEXT_ATTACHMENT.fetch_add(1, Ordering::Relaxed)
+        ));
+        state.client = Some((sink.clone(), attachment_id.clone()));
         let mut info = self.info_from_state(&state);
         info.attached = true;
         let snapshot = crate::screen::snapshot(state.terminal.snapshot());
         if let Err(error) = sink.send_control(&ServerControl {
             request_id: Some(request_id),
             message: ServerMessage::Attached {
-                session: info,
+                identity: self.identity.clone(),
+                surface: info,
+                attachment_id: attachment_id.clone(),
                 sequence: snapshot.sequence,
             },
         }) {
             state.client = None;
-            return Err(SessionError::Internal(error.to_string()));
+            return Err(SurfaceError::Internal(error.to_string()));
         }
-        if let Err(error) = sink.send_screen_recovery(&ScreenMessage::Snapshot { snapshot }) {
+        if let Err(error) = sink.send_screen_recovery(&TerminalFrame {
+            identity: self.identity.clone(),
+            message: ScreenMessage::Snapshot { snapshot },
+        }) {
             state.client = None;
-            return Err(SessionError::Internal(error.to_string()));
+            return Err(SurfaceError::Internal(error.to_string()));
         }
         drop(state);
-        self.resize(sink.id, cols, rows)
+        let target = TerminalTarget {
+            attachment_id,
+            identity: self.identity.clone(),
+        };
+        self.resize(&target, cols, rows)
     }
 
     pub fn detach(
         &self,
-        connection_id: u64,
+        target: &TerminalTarget,
         request_id: u64,
-    ) -> std::result::Result<(), SessionError> {
+    ) -> std::result::Result<(), SurfaceError> {
         let sink = {
             let mut state = self
                 .state
                 .lock()
-                .map_err(|_| SessionError::Internal("session state lock was poisoned".into()))?;
-            let Some(sink) = state.client.as_ref() else {
-                return Err(SessionError::NotAttached);
+                .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+            self.validate_target(target)?;
+            let Some((sink, attachment_id)) = state.client.as_ref() else {
+                return Err(SurfaceError::NotAttached);
             };
-            if sink.id != connection_id {
-                return Err(SessionError::NotAttached);
+            if attachment_id != &target.attachment_id || !sink.is_alive() {
+                return Err(SurfaceError::NotAttached);
             }
             let sink = sink.clone();
             state.client = None;
@@ -626,27 +705,26 @@ impl Session {
         sink.send_control(&ServerControl {
             request_id: Some(request_id),
             message: ServerMessage::Detached {
-                session_id: self.id.clone(),
+                surface_id: self.id.clone(),
             },
         })
-        .map_err(|error| SessionError::Internal(error.to_string()))
+        .map_err(|error| SurfaceError::Internal(error.to_string()))
     }
 
     pub fn request_snapshot(
         &self,
-        connection_id: u64,
+        target: &TerminalTarget,
         request_id: u64,
-    ) -> std::result::Result<(), SessionError> {
+    ) -> std::result::Result<(), SurfaceError> {
+        self.validate_target(target)?;
         let state = self
             .state
             .lock()
-            .map_err(|_| SessionError::Internal("session state lock was poisoned".into()))?;
-        let Some(sink) = state
-            .client
-            .as_ref()
-            .filter(|sink| sink.id == connection_id && sink.is_alive())
-        else {
-            return Err(SessionError::NotAttached);
+            .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+        let Some((sink, _attachment_id)) = state.client.as_ref().filter(|(sink, attachment_id)| {
+            attachment_id == &target.attachment_id && sink.is_alive()
+        }) else {
+            return Err(SurfaceError::NotAttached);
         };
         let snapshot = crate::screen::snapshot(state.terminal.snapshot());
         sink.send_control(&ServerControl {
@@ -655,8 +733,13 @@ impl Session {
                 sequence: snapshot.sequence,
             },
         })
-        .and_then(|_| sink.send_screen_recovery(&ScreenMessage::Snapshot { snapshot }))
-        .map_err(|error| SessionError::Internal(error.to_string()))
+        .and_then(|_| {
+            sink.send_screen_recovery(&TerminalFrame {
+                identity: self.identity.clone(),
+                message: ScreenMessage::Snapshot { snapshot },
+            })
+        })
+        .map_err(|error| SurfaceError::Internal(error.to_string()))
     }
 
     pub fn detach_connection(&self, connection_id: u64) {
@@ -664,7 +747,7 @@ impl Session {
             && state
                 .client
                 .as_ref()
-                .is_some_and(|sink| sink.id == connection_id)
+                .is_some_and(|(sink, _)| sink.id == connection_id)
         {
             state.client = None;
         }
@@ -672,16 +755,16 @@ impl Session {
 
     pub fn write_input(
         &self,
-        connection_id: u64,
+        target: &TerminalTarget,
         bytes: &[u8],
         latency_id: Option<u64>,
-    ) -> std::result::Result<(), SessionError> {
-        self.require_attached(connection_id)?;
+    ) -> std::result::Result<(), SurfaceError> {
+        self.require_attached(target)?;
         let mut input_guard = self
             .input
             .lock()
-            .map_err(|_| SessionError::Internal("PTY input lock was poisoned".into()))?;
-        let input = input_guard.as_mut().ok_or(SessionError::Exited)?;
+            .map_err(|_| SurfaceError::Internal("PTY input lock was poisoned".into()))?;
+        let input = input_guard.as_mut().ok_or(SurfaceError::Unavailable)?;
         let mut pending_latency = latency_id
             .filter(|_| crate::perf::enabled())
             .map(|id| {
@@ -697,7 +780,7 @@ impl Session {
                             output_received: false,
                         });
                     })
-                    .map_err(|_| SessionError::Internal("latency queue lock was poisoned".into()))
+                    .map_err(|_| SurfaceError::Internal("latency queue lock was poisoned".into()))
             })
             .transpose()?;
         if let Err(error) = input.write_all(bytes).and_then(|_| input.flush()) {
@@ -706,7 +789,7 @@ impl Session {
             {
                 pending.pop_back();
             }
-            return Err(SessionError::Internal(error.to_string()));
+            return Err(SurfaceError::Internal(error.to_string()));
         }
         pending_latency.take();
         drop(input_guard);
@@ -716,27 +799,32 @@ impl Session {
 
     pub fn resize(
         &self,
-        connection_id: u64,
+        target: &TerminalTarget,
         cols: i16,
         rows: i16,
-    ) -> std::result::Result<(), SessionError> {
+    ) -> std::result::Result<(), SurfaceError> {
         validate_dimensions(cols, rows)
-            .map_err(|error| SessionError::Internal(error.to_string()))?;
-        self.require_attached(connection_id)?;
+            .map_err(|error| SurfaceError::Internal(error.to_string()))?;
+        self.require_attached(target)?;
         let (acknowledgement, result) = sync_channel(0);
         self.commands
-            .try_send(SessionCommand::Resize {
+            .try_send(SurfaceCommand::Resize {
                 cols,
                 rows,
                 acknowledgement,
             })
-            .map_err(|error| SessionError::Internal(format!("resize queue failed: {error}")))?;
+            .map_err(|error| SurfaceError::Internal(format!("resize queue failed: {error}")))?;
         result
             .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| SessionError::Internal("timed out resizing PTY".into()))?
-            .map_err(SessionError::Internal)?;
-        self.persist()
-            .map_err(|error| SessionError::Internal(error.to_string()))
+            .map_err(|_| SurfaceError::Internal("timed out resizing PTY".into()))?
+            .map_err(SurfaceError::Internal)?;
+        self.actor.observe(RuntimeObservation::Resized {
+            surface_id: self.id.clone(),
+            process_lifetime_id: self.process_lifetime_id.clone(),
+            cols,
+            rows,
+        });
+        Ok(())
     }
 
     fn record_trace_input(&self, bytes: &[u8]) {
@@ -767,13 +855,16 @@ impl Session {
         }
     }
 
-    pub fn kill(&self) -> std::result::Result<(), SessionError> {
-        if self.info().status != SessionStatus::Running {
-            return Err(SessionError::Exited);
+    fn kill(&self, for_removal: bool) -> std::result::Result<(), SurfaceError> {
+        if !matches!(
+            self.info().status,
+            SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
+        ) {
+            return Err(SurfaceError::Unavailable);
         }
         self.commands
-            .try_send(SessionCommand::Kill)
-            .map_err(|error| SessionError::Internal(format!("kill queue failed: {error}")))
+            .try_send(SurfaceCommand::Kill { for_removal })
+            .map_err(|error| SurfaceError::Internal(format!("kill queue failed: {error}")))
     }
 
     pub fn join(&self) {
@@ -789,39 +880,49 @@ impl Session {
         }
     }
 
-    fn require_attached(&self, connection_id: u64) -> std::result::Result<(), SessionError> {
+    fn validate_target(&self, target: &TerminalTarget) -> std::result::Result<(), SurfaceError> {
+        if target.identity == self.identity {
+            Ok(())
+        } else if target.identity.surface_id == self.id {
+            Err(SurfaceError::StaleLifetime)
+        } else {
+            Err(SurfaceError::NotAttached)
+        }
+    }
+
+    fn require_attached(&self, target: &TerminalTarget) -> std::result::Result<(), SurfaceError> {
+        self.validate_target(target)?;
         let state = self
             .state
             .lock()
-            .map_err(|_| SessionError::Internal("session state lock was poisoned".into()))?;
-        if state.status != SessionStatus::Running {
-            return Err(SessionError::Exited);
+            .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+        if state.status != SurfaceStatus::Running {
+            return Err(SurfaceError::Unavailable);
         }
-        if state
-            .client
-            .as_ref()
-            .is_some_and(|sink| sink.id == connection_id && sink.is_alive())
-        {
+        if state.client.as_ref().is_some_and(|(sink, attachment_id)| {
+            attachment_id == &target.attachment_id && sink.is_alive()
+        }) {
             Ok(())
         } else {
-            Err(SessionError::NotAttached)
+            Err(SurfaceError::NotAttached)
         }
     }
 
-    fn persist(&self) -> Result<()> {
-        self.store.record(&self.info())
-    }
-
-    fn info_from_state(&self, state: &SessionRuntime) -> SessionInfo {
-        SessionInfo {
+    fn info_from_state(&self, state: &SurfaceRuntime) -> SurfaceInfo {
+        SurfaceInfo {
             id: self.id.clone(),
+            process_lifetime_id: self.process_lifetime_id.clone(),
             status: state.status,
-            attached: state.client.as_ref().is_some_and(ConnectionSink::is_alive),
+            attached: state
+                .client
+                .as_ref()
+                .is_some_and(|(sink, _)| sink.is_alive()),
             cols: state.cols,
             rows: state.rows,
             created_at_ms: self.created_at_ms,
             exit_code: state.exit_code,
             error: state.error.clone(),
+            launch: self.launch_request.clone(),
             working_directory: self.working_directory.clone(),
         }
     }
@@ -911,16 +1012,16 @@ impl ConnectionSink {
             .map_err(Into::into)
     }
 
-    pub fn send_screen(&self, message: &ScreenMessage) -> Result<bool> {
+    pub fn send_screen(&self, message: &TerminalFrame) -> Result<bool> {
         if self.queued_frames.load(Ordering::Acquire) >= CLIENT_SCREEN_QUEUE_FRAMES {
             return Ok(false);
         }
-        let payload = encode_screen(message)?;
+        let payload = encode_terminal_frame(message)?;
         self.send(SCREEN_FRAME, &payload).map(|_| true)
     }
 
-    fn send_screen_recovery(&self, message: &ScreenMessage) -> Result<()> {
-        let payload = encode_screen(message)?;
+    fn send_screen_recovery(&self, message: &TerminalFrame) -> Result<()> {
+        let payload = encode_terminal_frame(message)?;
         self.send(SCREEN_FRAME, &payload)
     }
 
@@ -965,15 +1066,8 @@ impl ConnectionSink {
 }
 
 fn validate_dimensions(cols: i16, rows: i16) -> Result<()> {
-    if cols <= 0 || rows <= 0 {
-        return Err("terminal dimensions must be positive".into());
+    if cols <= 0 || rows <= 0 || cols > 1_000 || rows > 1_000 {
+        return Err("terminal dimensions must be between 1 and 1000".into());
     }
     Ok(())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis() as u64
 }

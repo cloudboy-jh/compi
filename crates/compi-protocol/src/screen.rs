@@ -166,6 +166,12 @@ pub enum ScreenMessage {
     Delta { delta: ScreenDelta },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalFrame {
+    pub identity: crate::TerminalIdentity,
+    pub message: ScreenMessage,
+}
+
 pub fn encode_screen(message: &ScreenMessage) -> Result<Vec<u8>, bincode::error::EncodeError> {
     bincode::serde::encode_to_vec(message, bincode::config::standard())
 }
@@ -173,4 +179,14 @@ pub fn encode_screen(message: &ScreenMessage) -> Result<Vec<u8>, bincode::error:
 pub fn decode_screen(payload: &[u8]) -> Result<ScreenMessage, bincode::error::DecodeError> {
     bincode::serde::decode_from_slice(payload, bincode::config::standard())
         .map(|(message, _)| message)
+}
+
+pub fn encode_terminal_frame(
+    frame: &TerminalFrame,
+) -> Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(frame, bincode::config::standard())
+}
+
+pub fn decode_terminal_frame(payload: &[u8]) -> Result<TerminalFrame, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(payload, bincode::config::standard()).map(|(frame, _)| frame)
 }

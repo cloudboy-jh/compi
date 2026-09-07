@@ -2,7 +2,8 @@
 
 use compi_client_core::{MirrorApply, ScreenMirror};
 use compi_protocol::{
-    ClientMessage, PROTOCOL_VERSION, ScreenSnapshot, ServerMessage, SessionInfo, SessionStatus,
+    ClientMessage, PROTOCOL_VERSION, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceInfo,
+    SurfaceStatus,
 };
 use compi_server::client::{DaemonClient, ServerEvent};
 use std::fs;
@@ -184,18 +185,9 @@ struct Controller {
 }
 
 impl Controller {
-    fn attach(daemon: &DaemonGuard, id: &str, cols: i16, rows: i16) -> Self {
+    fn attach(daemon: &DaemonGuard, surface: &SurfaceInfo, cols: i16, rows: i16) -> Self {
         let mut client = daemon.client();
-        assert!(matches!(
-            client
-                .request(ClientMessage::Attach {
-                    session_id: id.to_owned(),
-                    cols,
-                    rows,
-                })
-                .unwrap(),
-            ServerMessage::Attached { .. }
-        ));
+        client.attach_surface(surface, cols, rows).unwrap();
         Self {
             client,
             mirror: ScreenMirror::default(),
@@ -231,7 +223,7 @@ impl Controller {
                     }
                 }
                 Some(ServerEvent::Control {
-                    message: ServerMessage::Error { code, message },
+                    message: ServerMessage::Error { code, message, .. },
                     ..
                 }) => {
                     panic!("daemon error {code:?}: {message}");
@@ -264,21 +256,21 @@ fn snapshot_text(snapshot: &ScreenSnapshot) -> String {
         .join("\n")
 }
 
-fn wait_status(client: &mut DaemonClient, id: &str, expected: SessionStatus) -> SessionInfo {
+fn wait_status(client: &mut DaemonClient, id: &SurfaceId, expected: SurfaceStatus) -> SurfaceInfo {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let session = client
-            .list_sessions()
+        let surface = client
+            .list_surfaces()
             .unwrap()
             .into_iter()
-            .find(|session| session.id == id)
+            .find(|surface| &surface.id == id)
             .unwrap();
-        if session.status == expected {
-            return session;
+        if surface.status == expected {
+            return surface;
         }
         assert!(
             Instant::now() < deadline,
-            "expected {expected:?}, got {session:?}"
+            "expected {expected:?}, got {surface:?}"
         );
         thread::sleep(Duration::from_millis(20));
     }
@@ -292,16 +284,12 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
     let cwd = fs::canonicalize(cwd).unwrap();
     let mut control = daemon.client();
     let session = control
-        .create_session(80, 24, Some(cwd.to_str().unwrap().to_owned()))
+        .create_surface(80, 24, Some(cwd.to_str().unwrap().to_owned()))
         .unwrap();
-    let mut attached = Controller::attach(&daemon, &session.id, 90, 30);
+    let mut attached = Controller::attach(&daemon, &session, 90, 30);
     let mut competing = daemon.client();
     let error = competing
-        .request(ClientMessage::Attach {
-            session_id: session.id.clone(),
-            cols: 80,
-            rows: 24,
-        })
+        .attach_surface(&session, 80, 24)
         .unwrap_err()
         .to_string();
     assert!(error.contains("AlreadyAttached"), "{error}");
@@ -329,7 +317,7 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
     attached.client.request(ClientMessage::Detach).unwrap();
     drop(attached);
 
-    let mut attached = Controller::attach(&daemon, &session.id, 112, 37);
+    let mut attached = Controller::attach(&daemon, &session, 112, 37);
     attached.until("INPUT_interactive-value");
     attached.input(
         b"test \"$saved_pid\" = \"$$\" && printf 'SAME_PROCESS_%s\\n' \"$((saved_value+1))\"\r",
@@ -340,7 +328,7 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let current = control
-            .list_sessions()
+            .list_surfaces()
             .unwrap()
             .into_iter()
             .find(|item| item.id == session.id)
@@ -354,11 +342,11 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
         );
         thread::sleep(Duration::from_millis(20));
     }
-    let mut attached = Controller::attach(&daemon, &session.id, 80, 24);
+    let mut attached = Controller::attach(&daemon, &session, 80, 24);
     attached.input(b"printf 'DISCONNECT_%s\\n' \"$((saved_value+2))\"\r");
     attached.until("DISCONNECT_43");
-    control.kill_session(session.id.clone()).unwrap();
-    wait_status(&mut control, &session.id, SessionStatus::Exited);
+    control.end_surface(&session).unwrap();
+    wait_status(&mut control, &session.id, SurfaceStatus::Exited);
     daemon.shutdown();
 }
 
@@ -373,7 +361,7 @@ fn incompatible_protocol_is_rejected_without_affecting_other_clients() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("IncompatibleProtocol"), "{error}");
-    assert!(daemon.client().list_sessions().unwrap().is_empty());
+    assert!(daemon.client().list_surfaces().unwrap().is_empty());
     daemon.shutdown();
 }
 
@@ -381,21 +369,17 @@ fn incompatible_protocol_is_rejected_without_affecting_other_clients() {
 fn natural_exit_retains_exit_status_and_rejects_reattach() {
     let mut daemon = DaemonGuard::start();
     let mut control = daemon.client();
-    let session = control.create_session(80, 24, None).unwrap();
-    let mut attached = Controller::attach(&daemon, &session.id, 80, 24);
+    let session = control.create_surface(80, 24, None).unwrap();
+    let mut attached = Controller::attach(&daemon, &session, 80, 24);
     attached.input(b"printf 'NATURAL_%s\\n' \"$((20+22))\"; exit 23\r");
-    let exited = wait_status(&mut control, &session.id, SessionStatus::Exited);
+    let exited = wait_status(&mut control, &session.id, SurfaceStatus::Exited);
     assert_eq!(exited.exit_code, Some(23));
     assert!(!exited.attached);
     let error = control
-        .request(ClientMessage::Attach {
-            session_id: session.id,
-            cols: 80,
-            rows: 24,
-        })
+        .attach_surface(&exited, 80, 24)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("SessionExited"), "{error}");
+    assert!(error.contains("SurfaceUnavailable"), "{error}");
     daemon.shutdown();
 }
 
@@ -433,15 +417,15 @@ fn explicit_kill_stops_shell_and_foreground_and_background_descendants() {
     let mut daemon = DaemonGuard::start();
     let mut control = daemon.client();
     let session = control
-        .create_session(80, 24, Some(daemon.directory.to_str().unwrap().to_owned()))
+        .create_surface(80, 24, Some(daemon.directory.to_str().unwrap().to_owned()))
         .unwrap();
-    let mut attached = Controller::attach(&daemon, &session.id, 80, 24);
+    let mut attached = Controller::attach(&daemon, &session, 80, 24);
     attached.input(b"stty -echo; echo $$ > shell.pid; sleep 300 & echo $! > background.pid; sh -c 'echo $$ > foreground.pid; exec sleep 300'\r");
     let pids = ["shell.pid", "background.pid", "foreground.pid"]
         .map(|name| read_pid(&daemon.directory.join(name)));
     assert!(pids.iter().all(|pid| process_running(*pid)));
-    control.kill_session(session.id.clone()).unwrap();
-    wait_status(&mut control, &session.id, SessionStatus::Exited);
+    control.end_surface(&session).unwrap();
+    wait_status(&mut control, &session.id, SurfaceStatus::Exited);
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let survivors: Vec<_> = pids
@@ -462,31 +446,27 @@ fn explicit_kill_stops_shell_and_foreground_and_background_descendants() {
 }
 
 #[test]
-fn daemon_restart_preserves_lost_metadata_but_never_claims_a_live_session() {
+fn daemon_restart_preserves_lost_surface_metadata_without_claiming_liveness() {
     let mut daemon = DaemonGuard::start();
     let mut control = daemon.client();
-    let session = control.create_session(80, 24, None).unwrap();
-    let mut attached = Controller::attach(&daemon, &session.id, 80, 24);
+    let session = control.create_surface(80, 24, None).unwrap();
+    let mut attached = Controller::attach(&daemon, &session, 80, 24);
     attached.input(b"printf 'BEFORE_CRASH_%s\\n' \"$((20+22))\"\r");
     attached.until("BEFORE_CRASH_42");
     drop(attached);
     drop(control);
     daemon.crash_and_restart();
     let mut control = daemon.client();
-    let lost = wait_status(&mut control, &session.id, SessionStatus::Dead);
+    let lost = wait_status(&mut control, &session.id, SurfaceStatus::Lost);
     assert!(!lost.attached);
     assert!(lost.error.is_some());
     let error = control
-        .request(ClientMessage::Attach {
-            session_id: session.id,
-            cols: 80,
-            rows: 24,
-        })
+        .attach_surface(&lost, 80, 24)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("SessionExited"), "{error}");
-    let replacement = control.create_session(80, 24, None).unwrap();
-    let mut attached = Controller::attach(&daemon, &replacement.id, 80, 24);
+    assert!(error.contains("SurfaceUnavailable"), "{error}");
+    let replacement = control.create_surface(80, 24, None).unwrap();
+    let mut attached = Controller::attach(&daemon, &replacement, 80, 24);
     attached.input(b"printf 'AFTER_RESTART_%s\\n' \"$((20+22))\"\r");
     attached.until("AFTER_RESTART_42");
     daemon.shutdown();
@@ -526,6 +506,6 @@ fn local_endpoint_is_private_and_duplicate_daemon_cannot_take_it_over() {
         thread::sleep(Duration::from_millis(20));
     };
     assert!(!status.success());
-    assert!(daemon.client().list_sessions().unwrap().is_empty());
+    assert!(daemon.client().list_surfaces().unwrap().is_empty());
     daemon.shutdown();
 }

@@ -1,6 +1,6 @@
 # Compi next steps
 
-Phase 0 contracts and Phase 1 package extraction are implemented. Phase 2 now has a runnable native Mac application and shared Unix server. Mac window, native text input, fullscreen editor, resize, native close, and ordinary reopen have been exercised against real PTYs. Full Phase 2 qualification remains open: native Linux/Windows execution, Windows PTY-backend acceptance, and physical Mac input/display checks are not claimed.
+Phases 0–3 are implemented: contracts, package extraction, native Mac/Unix runtime, and durable server-owned workspace state. Phase 3 has native Windows daemon/probe evidence, while full cross-platform qualification and the Phase 4 workspace client remain open. Earlier Mac PTY/window evidence and remaining physical-input/display gaps are retained below.
 
 ## Completed: Phase 0 — implementation contracts
 
@@ -109,6 +109,28 @@ The visual smoke ran at 144 DPI on a 2560×1440 primary display, with a 3440×14
 
 An explicit `--working-directory` invocation retains the existing new-work behavior. Omit it when reopening existing work. Splits, workspace migration, durable client slots, command-registry redesign, and themes remain excluded from this phase.
 
+## Completed: Phase 3 — durable workspace ownership
+
+### Implemented
+
+- Protocol v8 introduces distinct server, generation, session, tab, pane, surface, process-lifetime, mutation, and attachment identities. Terminal controls and screen frames carry enough identity to reject traffic from stale attachments or restarted processes.
+- A single-writer workspace actor serializes mutations and runtime observations through bounded queues. It validates server generation and expected revision, fingerprints mutation content with SHA-256, retains a bounded durable receipt history, persists before publication and acknowledgement, and schedules process effects only after durable intent.
+- The versioned `workspace-v1.json` store atomically replaces durable state. Legacy v1/v2 shell records migrate once into an imported session with one tab/pane/surface per record while retaining an exact backup. Interrupted migration reuses an identical backup; malformed current metadata is quarantined with a visible recovery message; active records reopen as `Lost`.
+- Stable surfaces now have a fresh process lifetime for every launch attempt and a fresh attachment identity for every controller. Restart preserves the surface ID, rejects old-lifetime attachment and terminal traffic, and resets terminal state through a fresh authoritative snapshot.
+- Session/tab/pane removal persists `Ending` intent before process cleanup and removes structure only after cleanup succeeds. Cleanup failure retains the affected structure and error for explicit recovery.
+- The daemon, typed client, diagnostic probe, Windows console, and existing GPUI surface integration use the new workspace protocol. Ordinary client launch initializes only a never-initialized workspace; intentionally empty or lost workspaces do not create shells implicitly. Full hierarchy presentation remains Phase 4.
+
+### Verification — 2026-09-07
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace --all-targets` | 72 tests passed across 12 suites, including all 21 server library tests and six native Windows daemon scenarios. |
+| `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` | Passed. Cargo still reports the upstream `proc-macro-error2` future-compatibility notice. |
+| Focused native Windows daemon integration | Multi-surface terminal lifecycle, publish-before-ack mutation receipts, outcome lookup, same-surface restart with a new lifetime, stale-lifetime rejection, daemon-loss recovery, and malformed-workspace quarantine passed. |
+| Isolated native probe smoke | Created a session and tab, split to two running surfaces, ended and restarted one stable surface with a new lifetime, removed the tab after process cleanup, observed zero remaining surfaces at revision 12, and shut down the isolated daemon. |
+
+**Next:** Phase 4 builds the full workspace client over these server contracts. Do not reintroduce shell-shaped “session” APIs or combine the UI work with another persistence/protocol rewrite.
+
 ## Current implementation: native refinement status
 
 **Status:** typography and glyph integration implemented; interaction refinement and full native qualification remain. The terminal now derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. The user has not selected a preferred reference terminal/font or clarified which interactions feel clanky.
@@ -122,7 +144,7 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 - Kept the bounded row-shaping cache and invalidated it when display scale changes. Native UI chrome continues to use the system font.
 - Verified the Mac build, all 54 workspace tests, warning-free workspace Clippy, diff hygiene, first terminal frame, and an AppKit event-loop smoke. Pixel-level comparison and physical-input qualification remain blocked by unavailable screen-capture/accessibility permissions.
 
-**Next:** begin Phase 3 workspace ownership and protocol migration while retaining the remaining Mac visual, physical-input, and interaction qualification as explicit open gates.
+**Next:** begin Phase 4 workspace client work while retaining the remaining Mac visual, physical-input, and interaction qualification as explicit open gates.
 
 ### 1. Establish the typography and glyph baseline — implementation complete, visual selection pending
 
@@ -173,7 +195,7 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 
 Continue in the [specification's migration and build order](Spec.md#migration-and-build-order):
 
-- **Phase 3:** introduce workspace ownership, durable mutations, process-lifetime identity, and metadata migration.
+- **Phase 3 — completed:** workspace ownership, durable mutations, process-lifetime identity, and metadata migration.
 - **Phase 4:** deliver the full workspace client, remembered window state, split overflow behavior, command palette, and whole-app themes.
 - **Phase 5:** qualify shared daily use and produce Mac/Windows dogfood artifacts with attributable resource measurements.
 - **Phase 6:** qualify distribution and extend process discovery/headless use.
