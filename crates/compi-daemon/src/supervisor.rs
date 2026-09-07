@@ -94,7 +94,7 @@ pub fn install(daemon_executable: &Path) -> Result<()> {
         .into());
     }
 
-    let sid = crate::identity::current_user_sid_string()?;
+    let sid = compi_protocol::identity::current_user_sid_string()?;
     let xml = task_xml(daemon_executable, &sid);
     let directory = env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)

@@ -21,18 +21,10 @@ def main():
     packages = {package["id"]: package["name"] for package in metadata["packages"]}
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
     members = {packages[identifier]: identifier for identifier in metadata["workspace_members"]}
-    graphics = {"gpui", "raw-window-handle", "winit", "compi-gpui", "compi-setup"}
-    os_runtime = {"windows", "windows-sys", "windows-core", "portable-pty", "winresource"}
+    graphics = {"gpui", "raw-window-handle", "winit", "compi-client", "compi-setup"}
     rules = {
-        "compi-protocol": graphics
-        | os_runtime
-        | {"compi-terminal", "compi-platform", "compi-client", "compi-daemon"},
-        "compi-terminal": graphics
-        | os_runtime
-        | {"compi-platform", "compi-client", "compi-daemon"},
-        "compi-platform": graphics
-        | {"portable-pty", "winresource", "compi-terminal", "compi-client", "compi-daemon"},
-        "compi-client": graphics | {"portable-pty", "compi-terminal", "compi-daemon"},
+        "compi-protocol": graphics | {"portable-pty", "compi-daemon"},
+        "compi-client": {"portable-pty", "compi-daemon"},
         "compi-daemon": graphics,
     }
     for name, forbidden in rules.items():

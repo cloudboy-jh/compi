@@ -1,25 +1,25 @@
 use crate::config::{FontSettings, LoadedConfig};
-use crate::typography::TerminalTypography;
-use base64::Engine as _;
 #[cfg(windows)]
-use compi_client::input::is_application_shortcut;
-use compi_client::input::{
+use crate::input::is_application_shortcut;
+use crate::input::{
     self, Key, KeypadKey, Modifiers, encode_keystroke, encode_mouse, utf16_byte_index,
 };
-use compi_client::probe;
-use compi_client::selection::{
+use crate::probe;
+use crate::selection::{
     CtrlCBehavior, GridPoint, Selection, ctrl_c_behavior, line_selection, selected_text,
     word_selection,
 };
-use compi_client::theme::{
+use crate::theme::{
     ACCENT, BACKGROUND, BORDER, ERROR, FOREGROUND, MUTED, SELECTION, SURFACE, SURFACE_HOVER,
 };
-use compi_client::viewport::{
+use crate::typography::TerminalTypography;
+use crate::viewport::{
     hyperlink_at, inherited_working_directory, is_allowed_hyperlink, visible_row, visible_rows,
     visible_to_absolute,
 };
-use compi_client::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
-use compi_platform::perf;
+use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
+use base64::Engine as _;
+use compi_protocol::perf;
 use compi_protocol::{
     Cell, ClientMessage, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode,
     Row, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus,
@@ -3314,7 +3314,7 @@ fn log_performance_sample(
     #[cfg(windows)] private_bytes: usize,
     #[cfg(windows)] handles: u32,
 ) {
-    let Ok(directory) = compi_platform::paths::data_dir() else {
+    let Ok(directory) = compi_protocol::paths::data_dir() else {
         return;
     };
     if fs::create_dir_all(&directory).is_err() {

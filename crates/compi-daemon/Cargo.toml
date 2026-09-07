@@ -5,16 +5,20 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-compi-client = { path = "../compi-client" }
-compi-platform = { path = "../compi-platform" }
 compi-protocol = { path = "../compi-protocol" }
-compi-terminal = { path = "../compi-terminal" }
+base64.workspace = true
+flate2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+smol_str.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+vte.workspace = true
 portable-pty = "0.9"
 
 [dev-dependencies]
+compi-client = { path = "../compi-client" }
 base64.workspace = true
 serde_json.workspace = true
 

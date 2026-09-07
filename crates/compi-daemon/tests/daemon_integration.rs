@@ -1,13 +1,13 @@
 #![cfg(windows)]
 
-use compi_client::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
-use compi_platform::{identity, pipe};
+use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::frame;
 use compi_protocol::{
     CONTROL_FRAME, ClientControl, ClientMessage, Color, ErrorCode, MutationId, MutationRequest,
     ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus, WorkspaceMutation,
     decode_server, encode_client,
 };
+use compi_protocol::{DaemonClient, ServerEvent, identity, pipe};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};

@@ -8,7 +8,7 @@ publish = false
 
 [target.'cfg(windows)'.dependencies]
 compi-client = { path = "../../crates/compi-client" }
-compi-platform = { path = "../../crates/compi-platform" }
+compi-protocol = { path = "../../crates/compi-protocol" }
 async-channel = "2.5"
 gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
 windows = { version = "0.62.2", features = [

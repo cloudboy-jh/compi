@@ -1,11 +1,11 @@
 use crate::Result;
 use crate::launch;
 use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
-#[cfg(windows)]
-use compi_platform::identity::PipeSecurity;
-use compi_platform::identity::{self, InstanceNames};
-use compi_platform::pipe;
 use compi_protocol::frame;
+#[cfg(windows)]
+use compi_protocol::identity::PipeSecurity;
+use compi_protocol::identity::{self, InstanceNames};
+use compi_protocol::pipe;
 use compi_protocol::{
     CONTROL_FRAME, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerControl, ServerMessage,
     SurfaceId, TerminalTarget, decode_client,
@@ -35,16 +35,16 @@ pub fn run(instance: Option<&str>) -> Result<()> {
     let started_at = Instant::now();
     let names = identity::instance_names(instance)?;
     let _singleton = DaemonSingleton::acquire(&names.mutex)?;
-    compi_platform::perf::log_startup_metric("daemon_singleton_ready_ms", started_at.elapsed());
+    compi_protocol::perf::log_startup_metric("daemon_singleton_ready_ms", started_at.elapsed());
     let manager = Arc::new(SurfaceManager::persistent(instance)?);
-    compi_platform::perf::log_startup_metric("daemon_store_ready_ms", started_at.elapsed());
+    compi_protocol::perf::log_startup_metric("daemon_store_ready_ms", started_at.elapsed());
     launch::check_system()?;
-    compi_platform::perf::log_startup_metric("daemon_host_ready_ms", started_at.elapsed());
+    compi_protocol::perf::log_startup_metric("daemon_host_ready_ms", started_at.elapsed());
     #[cfg(windows)]
     let security = PipeSecurity::for_current_user()?;
-    compi_platform::perf::log_startup_metric("daemon_security_ready_ms", started_at.elapsed());
+    compi_protocol::perf::log_startup_metric("daemon_security_ready_ms", started_at.elapsed());
     let stopping = Arc::new(AtomicBool::new(false));
-    if compi_platform::perf::enabled() {
+    if compi_protocol::perf::enabled() {
         let sampler_manager = manager.clone();
         let sampler_stopping = stopping.clone();
         thread::spawn(move || {
@@ -53,7 +53,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
                 if sampler_stopping.load(Ordering::Acquire) {
                     break;
                 }
-                compi_platform::perf::log_resource_sample(
+                compi_protocol::perf::log_resource_sample(
                     "daemon",
                     "server",
                     sampler_manager.surface_count(),
@@ -63,7 +63,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
     }
     let connections = Arc::new(Mutex::new(HashMap::<u64, ConnectionSink>::new()));
     let handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
-    compi_platform::perf::log_startup_metric("daemon_ready_ms", started_at.elapsed());
+    compi_protocol::perf::log_startup_metric("daemon_ready_ms", started_at.elapsed());
     let connection_ids = AtomicU64::new(1);
 
     let result = serve(

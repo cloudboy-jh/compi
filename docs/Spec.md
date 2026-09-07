@@ -301,16 +301,13 @@ Use a small Cargo workspace with actual dependency boundaries:
 
 | Crate | Responsibility |
 |---|---|
-| `compi-protocol` | IDs, wire DTOs, frame codecs, versions, protocol limits. No GPUI, PTY, or OS APIs. |
-| `compi-terminal` | Platform-independent authoritative engine, cells, modes, history, graphics state, replay tests. |
-| `compi-platform` | Shared OS endpoint identity, local transport, data paths, performance telemetry, and Windows task activation. |
-| `compi-client` | Daemon connection/startup, replica recovery, viewport/selection logic, history cache, terminal key encoding. No GPUI or terminal engine dependency. |
-| `compi-daemon` | Workspace actor, surface runtimes, persistence, and host adapters; builds `compi-daemon`. |
-| `compi-gpui` | GPUI renderer, workspace UI, command registry, and native window integration; builds `compi`. |
+| `compi-protocol` | Shared process contract: IDs, wire DTOs, codecs, endpoint identity, local transport, paths, and diagnostics. No PTY or UI dependency. |
+| `compi-daemon` | Workspace actor, terminal engine, surface runtimes, persistence, process supervision, and host adapters; builds `compi-daemon`. |
+| `compi-client` | Daemon connection, replica recovery, interaction logic, diagnostic probe, and GPUI application; builds `compi` and `compi-probe`. |
 
 The protocol must not depend on the terminal engine implementation. Convert between engine internals and wire DTOs at the daemon boundary. Client replication consumes the wire contract, not a daemon `TerminalState` instance.
 
-PTY and configuration support remain focused modules. `compi-platform` exists because both client and daemon require the same authenticated endpoint, transport, paths, and telemetry without creating a client-to-daemon dependency. Installer code is not part of the core application library.
+Keep PTY, terminal, transport, configuration, and platform concerns as focused modules inside their owning product crate. Extract another crate only for an independently consumed contract or shipped artifact. Installer code remains isolated from the product workspace.
 
 ## Platforms and process hosting
 
@@ -632,7 +629,7 @@ Diagnostic traces are opt-in and bounded. They can contain sensitive terminal ou
 - Server loss, stale endpoints, malformed workspace files, and explicit restart behavior.
 - Pure layout, command routing, client-state precedence, and shortcut tests independent of GPUI.
 
-CI must build/test neutral crates and the server on Linux, macOS, and Windows. It must build the native client on macOS and Windows. WSL runtime tests require a qualified runner; an unavailable WSL environment is reported as missing coverage, never a passing runtime test.
+CI must build and test the protocol, daemon, and client crates on Linux, macOS, and Windows. It must build the native client on macOS and Windows. WSL runtime tests require a qualified runner; an unavailable WSL environment is reported as missing coverage, never a passing runtime test.
 
 ### Daily-use qualification
 
@@ -655,7 +652,7 @@ Physical keyboard/display checks remain necessary for a public release. Their ab
 
 This map assigns implementation and proof obligations, not passing status. **P1–P6** refer to the migration phases below. **All hosts** means Linux/macOS/Windows headless or pure-core coverage; **both clients** means native macOS and Windows/WSL. A later qualification phase repeats behavior established earlier; it does not excuse missing implementation coverage.
 
-Existing evidence sources are [frame tests](../crates/compi-protocol/src/frame.rs), [control protocol tests](../crates/compi-protocol/src/lib.rs), [captured v7 wire fixtures](../crates/compi-protocol/tests/wire_v7.rs), [engine tests](../crates/compi-terminal/src/lib.rs), [replica boundary tests](../crates/compi-daemon/tests/terminal_compatibility.rs), [trace replay tests](../crates/compi-terminal/src/trace.rs), [metadata tests](../crates/compi-daemon/src/workspace_store.rs), [Windows daemon integration](../crates/compi-daemon/tests/daemon_integration.rs), [Windows recipes](testcmds.md), and [historical observations](ACCEPTANCE_RESULTS_2026-09-02.md). Core CI is configured for Linux/macOS/Windows; Windows runtime integration remains platform-gated and reports missing WSL coverage explicitly. Existing test presence and old reports are not current execution evidence; current exercised coverage is recorded in [Next steps](NEXT_STEPS.md).
+Existing evidence sources are [frame tests](../crates/compi-protocol/src/frame.rs), [control protocol tests](../crates/compi-protocol/src/lib.rs), [captured v7 wire fixtures](../crates/compi-protocol/tests/wire_v7.rs), [engine tests](../crates/compi-daemon/src/terminal/mod.rs), [replica boundary tests](../crates/compi-daemon/tests/terminal_compatibility.rs), [trace replay tests](../crates/compi-daemon/src/terminal/trace.rs), [metadata tests](../crates/compi-daemon/src/workspace_store.rs), [Windows daemon integration](../crates/compi-daemon/tests/daemon_integration.rs), [Windows recipes](testcmds.md), and [historical observations](ACCEPTANCE_RESULTS_2026-09-02.md). Core CI is configured for Linux/macOS/Windows; Windows runtime integration remains platform-gated and reports missing WSL coverage explicitly. Existing test presence and old reports are not current execution evidence; current exercised coverage is recorded in [Next steps](NEXT_STEPS.md).
 
 #### Automated and architectural acceptance
 
@@ -746,24 +743,24 @@ This is a compatibility-preserving dependency change, not the complete Phase 1 o
 
 **Scope**
 
-- Establish the Cargo workspace with platform-neutral `compi-protocol` and `compi-terminal`, shared `compi-platform`, and the reusable `compi-client`.
-- Extract the pre-migration protocol/framing and terminal screen DTOs/codecs into `compi-protocol`. Their current owners are `crates/compi-protocol/src/{lib,frame,screen}.rs`. Preserve public wire fields, serde names, enum/field ordering, bincode configuration, frame kind values, and protocol version **7**.
-- Extract the current `TerminalState`/parser, buffers, terminal semantics, and deterministic replay behavior into `compi-terminal`. Keep wire DTO definitions independent of engine implementation. Convert engine output to wire DTOs in the daemon/session boundary; use ownership transfer or shared immutable value types rather than avoidable whole-grid copies.
-- Move `ScreenMirror`, `MirrorApply`, pure interaction helpers, and daemon client transport into `compi-client`, consuming protocol DTOs and `compi-platform` services without depending on the daemon or terminal engine.
+- Establish three product crates: shared `compi-protocol`, process-owning `compi-daemon`, and user-facing `compi-client`.
+- Extract the pre-migration protocol/framing and terminal screen DTOs/codecs into `compi-protocol`. Preserve public wire fields, serde names, enum/field ordering, bincode configuration, frame kind values, and protocol version **7**.
+- Keep `TerminalState`, parser, buffers, terminal semantics, and deterministic replay behavior in the daemon's terminal module. Keep wire DTO definitions independent of engine implementation and convert engine output at the daemon/session boundary without avoidable whole-grid copies.
+- Keep `ScreenMirror`, `MirrorApply`, pure interaction helpers, daemon connection, probe, and GPUI renderer in `compi-client`, consuming only the shared protocol contract.
 - Migrate all affected imports in the daemon, client, renderer, probe, traces, and tests directly. No old-module re-export shims or duplicate parsers/codecs. Preserve opt-in bounded trace recording and UI-independent replay.
-- Add Linux/macOS/Windows CI jobs that build and run the core packages without graphics tooling; retain the Windows application/integration path separately. Daemon/GPUI packages and isolated installer dependencies are separated; native platform acceptance is still required.
+- Add Linux/macOS/Windows CI jobs that test the three product crates; retain the Windows application/integration path separately. The daemon's production dependency graph must remain free of GPUI and installer dependencies.
 
 **Observable acceptance**
 
 1. Before moving code, capture representative v7 control and screen wire fixtures using the current codecs. Both old and extracted decoders consume them with equal values; extracted encoding produces the same bytes, including snapshots, deltas, graphics, and optional control fields. The frame remains little-endian `u32` payload-byte count, then `u8` kind, then payload; the count excludes both header fields. Preserve the existing 16 MiB frame and 1 MiB control limits.
 2. Existing terminal/replay/replica behavioral cases run against their new owners on all three OSs. Replaying output and resize yields the same renderable state and terminal replies; a missing delta still requests recovery and resnapshot restores equivalence.
-3. Dependency inspection proves `compi-protocol` and `compi-terminal` have no GPUI, Windows API, PTY, installer, or window-system dependency; `compi-platform` has no terminal engine or daemon dependency; and `compi-client` has no terminal engine or daemon dependency.
+3. Dependency inspection proves `compi-protocol` has no PTY or graphics dependency, `compi-client` has no daemon or PTY dependency, and the daemon's production graph has no GPUI, client, or installer dependency.
 4. Windows binaries and probe still build. On a qualified Windows/WSL host, exercise real create/input/resize/detach/reattach/terminate plus the existing daemon integration regressions. Missing host access is reported as unverified, not a runtime pass or completed extraction gate.
 5. Terminal semantics, persistence format, control conflicts, and user-visible Windows behavior remain unchanged. No new Phase 0 identity/revision fields are slipped into v7.
 
 **Excluded:** engine replacement, `portable-pty`, Unix hosting/transport, workspace schema migration/actor, process-lifetime protocol changes, splits, theme picker, and UI redesign. These belong to later named phases.
 
-The reusable client extraction and daemon/GPUI/installer dependency separation are now implemented. Phase 1 closes only after its platform qualification gate passes. Phase 2 supplies the real Unix adapters and all-host runtime; a cfg-disabled no-op daemon on Unix never counts as acceptance.
+The three product boundaries and isolated installer are now implemented. Phase 1 closes only after its platform qualification gate passes. Phase 2 supplies the real Unix adapters and all-host runtime; a cfg-disabled no-op daemon on Unix never counts as acceptance.
 
 ### 2. Prove a real Mac terminal end to end
 

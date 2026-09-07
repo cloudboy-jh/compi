@@ -783,11 +783,19 @@ dependencies = [
 name = "compi-client"
 version = "0.1.0"
 dependencies = [
- "compi-platform",
+ "async-channel 2.5.0",
+ "base64",
  "compi-protocol",
+ "gpui",
+ "image",
  "libc",
+ "objc2",
+ "raw-window-handle",
  "serde_json",
+ "smallvec",
+ "toml 0.8.23",
  "windows 0.62.2",
+ "winresource",
 ]
 
 [[package]]
@@ -796,43 +804,18 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "compi-client",
- "compi-platform",
  "compi-protocol",
- "compi-terminal",
+ "flate2",
  "portable-pty",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "smol_str",
+ "unicode-segmentation",
+ "unicode-width",
+ "vte",
  "windows 0.62.2",
  "winresource",
-]
-
-[[package]]
-name = "compi-gpui"
-version = "0.1.0"
-dependencies = [
- "async-channel 2.5.0",
- "base64",
- "compi-client",
- "compi-platform",
- "compi-protocol",
- "gpui",
- "image",
- "objc2",
- "raw-window-handle",
- "smallvec",
- "toml 0.8.23",
- "windows 0.62.2",
- "winresource",
-]
-
-[[package]]
-name = "compi-platform"
-version = "0.1.0"
-dependencies = [
- "compi-protocol",
- "libc",
- "windows 0.62.2",
 ]
 
 [[package]]
@@ -841,24 +824,11 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bincode",
+ "libc",
  "serde",
  "serde_json",
  "smol_str",
-]
-
-[[package]]
-name = "compi-terminal"
-version = "0.1.0"
-dependencies = [
- "base64",
- "compi-protocol",
- "flate2",
- "serde",
- "serde_json",
- "smol_str",
- "unicode-segmentation",
- "unicode-width",
- "vte",
+ "windows 0.62.2",
 ]
 
 [[package]]

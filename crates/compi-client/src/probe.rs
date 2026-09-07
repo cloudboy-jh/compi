@@ -14,7 +14,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(windows)]
-use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+use windows::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+};
 
 pub fn run() -> Result<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -350,15 +352,15 @@ pub fn connect_or_start(instance: Option<&str>) -> Result<DaemonClient> {
     let started_at = Instant::now();
     match DaemonClient::connect(instance, Duration::from_millis(25)) {
         Ok(client) => {
-            compi_platform::perf::set_startup_kind("warm");
-            compi_platform::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
+            compi_protocol::perf::set_startup_kind("warm");
+            compi_protocol::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
             Ok(client)
         }
         Err(_) => {
-            compi_platform::perf::set_startup_kind("cold");
+            compi_protocol::perf::set_startup_kind("cold");
             start_daemon(instance)?;
             let client = DaemonClient::connect(instance, Duration::from_secs(5))?;
-            compi_platform::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
+            compi_protocol::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
             Ok(client)
         }
     }
@@ -371,7 +373,7 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
 
     #[cfg(windows)]
     if instance.is_none() {
-        compi_platform::supervisor::activate()?;
+        activate_daemon_task()?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if DaemonClient::connect(None, Duration::from_millis(100)).is_ok() {
@@ -395,7 +397,7 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
         .ok_or("LOCALAPPDATA is not set")?
         .join("Compi");
     #[cfg(unix)]
-    let directory = compi_platform::paths::data_dir()?;
+    let directory = compi_protocol::paths::data_dir()?;
     fs::create_dir_all(&directory)?;
     let suffix = instance.map(|name| format!("-{name}")).unwrap_or_default();
     let log_path = directory.join(format!("daemon{suffix}.log"));
@@ -495,6 +497,19 @@ fn daemon_executable() -> Result<std::path::PathBuf> {
             executable.display()
         )
         .into())
+    }
+}
+
+#[cfg(windows)]
+fn activate_daemon_task() -> Result<()> {
+    let status = Command::new(daemon_executable()?)
+        .arg("--activate-task")
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("failed to activate the registered Compi daemon task: {status}").into())
     }
 }
 

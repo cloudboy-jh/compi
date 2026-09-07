@@ -1,5 +1,5 @@
 use crate::Result;
-use compi_protocol::WorkingDirectory;
+use crate::WorkingDirectory;
 use std::env;
 use std::fs;
 use std::os::windows::fs::MetadataExt as _;

@@ -1,20 +1,20 @@
 use crate::Result;
 use crate::launch::{self, LaunchDescription};
 use crate::pty::{PtySession, PtyWriter};
+use crate::terminal::TerminalState;
+use crate::terminal::trace::TerminalTraceRecorder;
 use crate::workspace::{
     ActorError, RuntimeObservation, WorkspaceActor, WorkspaceEffect, WorkspaceEvent,
 };
-use compi_platform::pipe;
 use compi_protocol::ScreenMessage;
 use compi_protocol::frame;
+use compi_protocol::pipe;
 use compi_protocol::{
     AttachmentId, CONTROL_FRAME, ErrorCode, MutationId, MutationReceipt, MutationRequest,
     ProcessLifetimeId, SCREEN_FRAME, ServerControl, ServerMessage, SurfaceId, SurfaceInfo,
     SurfaceStatus, TerminalFrame, TerminalIdentity, TerminalTarget, WorkingDirectory,
     WorkspaceSnapshot, encode_server, encode_terminal_frame,
 };
-use compi_terminal::TerminalState;
-use compi_terminal::trace::TerminalTraceRecorder;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::File;
@@ -365,7 +365,7 @@ impl Surface {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
-                if compi_platform::perf::enabled()
+                if compi_protocol::perf::enabled()
                     && let Ok(mut pending) = output_surface.pending_latency.lock()
                 {
                     for latency in pending
@@ -373,7 +373,7 @@ impl Surface {
                         .filter(|latency| !latency.output_received)
                     {
                         latency.output_received = true;
-                        compi_platform::perf::log_input_latency_stage(
+                        compi_protocol::perf::log_input_latency_stage(
                             latency.id,
                             "pty_output",
                             None,
@@ -400,7 +400,7 @@ impl Surface {
                         .is_some_and(|latency| latency.output_received)
                     {
                         let latency = pending.pop_front().expect("checked pending latency");
-                        compi_platform::perf::log_input_latency_stage(
+                        compi_protocol::perf::log_input_latency_stage(
                             latency.id,
                             "terminal_state",
                             Some(delta.sequence),
@@ -770,9 +770,9 @@ impl Surface {
             .map_err(|_| SurfaceError::Internal("PTY input lock was poisoned".into()))?;
         let input = input_guard.as_mut().ok_or(SurfaceError::Unavailable)?;
         let mut pending_latency = latency_id
-            .filter(|_| compi_platform::perf::enabled())
+            .filter(|_| compi_protocol::perf::enabled())
             .map(|id| {
-                compi_platform::perf::log_input_latency_stage(id, "daemon_input", None);
+                compi_protocol::perf::log_input_latency_stage(id, "daemon_input", None);
                 self.pending_latency
                     .lock()
                     .map(|mut pending| {

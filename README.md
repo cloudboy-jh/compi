@@ -8,7 +8,7 @@ Compi is a native terminal workspace backed by a persistent server. The product 
 
 [docs/Spec.md](docs/Spec.md) is the authoritative product and technical contract. It calls for server-owned sessions, tabs, and split panes; remembered client presentation; a command palette; and selectable whole-app themes. The default is neutral Dark Glass with an acid-green accent, glass limited to sidebar/window chrome, and an opaque terminal canvas.
 
-These are requirements, not a claim that the complete workspace client is implemented. Phases 0–3 now provide the contracts, neutral package boundaries, native server/runtime foundation, and durable server-owned workspace hierarchy. Phase 4 client presentation, remembered windows, split layout, command palette, and themes remain outstanding. See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
+These are requirements, not a claim that the complete workspace client is implemented. Phases 0–3 now provide the shared process contract, native daemon/runtime foundation, and durable daemon-owned workspace hierarchy. Phase 4 client presentation, remembered windows, split layout, command palette, and themes remain outstanding. See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
 
 ## Current implementation
 
@@ -21,14 +21,14 @@ GPUI client <-> per-user daemon <-> portable-pty <-> native Mac/Unix shell
 
 The daemon owns shell lifecycle, authoritative terminal state, and the durable workspace hierarchy: sessions contain ordered tabs, tabs contain split trees, and pane leaves reference stable surfaces. Protocol v8 separates every identity type, adds optimistic durable mutations and receipts, and keys attachments and screen traffic to a server generation plus process lifetime. The current GPUI client consumes the new surface model but still presents its pre-Phase-4 tab/switcher UI; full split rendering and remembered client state remain later work.
 
-The Cargo workspace separates `compi-protocol`, `compi-terminal`, `compi-platform`, `compi-client`, `compi-daemon`, and `compi-gpui`. Protocol and terminal semantics remain platform-neutral; shared OS transport and paths live in `compi-platform`; reusable client transport, replicas, and interaction logic live in `compi-client`. The daemon has no graphics dependency, and the installer remains isolated under `installer/bootstrapper`.
+The Cargo workspace has three product crates: `compi-protocol` owns the shared process contract and local transport, `compi-daemon` owns shell lifecycle, terminal semantics, persistence, and OS hosting, and `compi-client` owns daemon consumption, replicas, the diagnostic probe, and the GPUI application. The daemon's production graph contains no graphics dependencies; the installer remains isolated under `installer/bootstrapper`.
 
-## Check the core boundaries
+## Check the product boundaries
 
 On macOS, Linux, or Windows:
 
 ```sh
-cargo test --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client
+cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
 cargo test --locked -p compi-daemon --test terminal_compatibility
 ```
 
@@ -43,7 +43,7 @@ cargo test --locked -p compi-daemon --test unix_daemon_integration
 Requires Rust and Xcode with its Metal compiler available through `xcrun`.
 
 ```sh
-cargo build --locked -p compi-gpui -p compi-daemon --bins
+cargo build --locked -p compi-client -p compi-daemon --bins
 ./target/debug/compi --instance development
 ```
 

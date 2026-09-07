@@ -98,7 +98,7 @@ impl WorkspaceStore {
     }
 
     pub fn open(instance: Option<&str>) -> Result<(Self, StoredWorkspace)> {
-        let directory = compi_platform::paths::data_dir()?;
+        let directory = compi_protocol::paths::data_dir()?;
         let suffix = instance
             .map(|instance| format!("-{instance}"))
             .unwrap_or_default();

@@ -19,9 +19,9 @@ The code changes in [Phase 1](Spec.md#1-extract-the-neutral-foundation) are impl
 ### Implemented extraction
 
 - Captured pre-extraction v7 fixtures for 12 client controls, 18 server controls, an initial screen snapshot, and nine output/resize steps. New codecs and engine output preserve those captured values and bytes.
-- Established `compi-protocol`, `compi-terminal`, `compi-platform`, and `compi-client`; separated screen DTOs/codecs, `TerminalState`, shared OS services, daemon transport, and `ScreenMirror` with direct consumer migration and no old-module shims.
-- Extracted pure input/mouse/paste/focus encoding, selection, viewport lookup, hyperlink policy, and shared theme constants out of GPUI.
-- Established `compi-daemon` and `compi-gpui`; moved engine-to-wire conversion to the daemon boundary without additional grid copies. Daemon production/build dependencies contain no GPUI, window renderer, or installer package.
+- Established the three product crates: `compi-protocol`, `compi-daemon`, and `compi-client`. Protocol values and local transport are shared; terminal state and OS hosting belong to the daemon; replicas, probe, interaction logic, and GPUI belong to the client.
+- Extracted pure input/mouse/paste/focus encoding, selection, viewport lookup, hyperlink policy, and shared theme constants into the client without compatibility shims.
+- Kept engine-to-wire conversion at the daemon boundary without additional grid copies. The daemon's production dependencies contain no GPUI, client application, or installer package.
 - Moved installer UI into its existing isolated `installer/bootstrapper` package. Preserved its locked registry versions while updating local package dependencies.
 - Added [three-host neutral CI](../.github/workflows/core-ci.yml), including v7 fixtures, replica recovery, resolved dependency-boundary checks, and a native Windows daemon build without graphics setup. [Windows CI](../.github/workflows/windows-ci.yml) retains product build/installer checks and explicitly reports unavailable WSL runtime coverage.
 
@@ -32,8 +32,8 @@ The code changes in [Phase 1](Spec.md#1-extract-the-neutral-foundation) are impl
 | `cargo test --workspace --all-targets` on macOS | 36 tests passed. Windows-gated runtime/UI tests did not execute. |
 | `cargo clippy --locked --workspace --all-targets -- -D warnings` on macOS | Passed for active host code. |
 | `cargo check --locked -p compi-daemon --all-targets --target x86_64-pc-windows-msvc` | Passed, including Windows daemon/client transport/probe/integration-test compilation. No native linking or runtime claim. |
-| Neutral crates `cargo check --all-targets --target x86_64-unknown-linux-gnu` | Passed. Cross-compilation is not Linux test execution. |
-| `tools/check-dependencies.py` for macOS, Linux, and Windows | All four checked production/build boundaries passed. Dev-only edges are excluded. |
+| Product crates `cargo check --all-targets --target x86_64-unknown-linux-gnu` | Passed. Cross-compilation is not Linux test execution. |
+| `tools/check-dependencies.py` for macOS, Linux, and Windows | All configured production/build boundaries passed. Dev-only edges are excluded. |
 | Separate executable linked to the extracted engine/protocol/server boundary | Repeated the original capture workload; both fixture files were byte-identical, including terminal replies, deltas, resize/reflow, modes, and graphics. Temporary capture/smoke programs were removed after verification. |
 | Isolated installer `cargo check --offline --manifest-path installer/bootstrapper/Cargo.toml --all-targets` on macOS | Passed package/lock resolution and unsupported-host targets only, not Windows installer UI or packaging. |
 | Windows app cross-check from macOS | Blocked in dependency `ring` before application type-checking: Windows C headers/toolchain unavailable (`assert.h` missing). Native app build and visual behavior remain unverified. |
@@ -70,12 +70,12 @@ Do not count a cross-check, a configured workflow, or an unsupported-host entryp
 
 | Check | Result |
 |---|---|
-| `cargo build -p compi-gpui -p compi-daemon --bins` plus `cargo build -p compi-client --example compi-probe` | Native Mac client, daemon, and probe built and launched. |
+| `cargo build -p compi-client -p compi-daemon --bins` plus `cargo build -p compi-client --example compi-probe` | Native Mac client, daemon, and probe built and launched. |
 | `cargo test --locked --workspace --all-targets` | 49 tests passed on macOS, including all six real Unix daemon scenarios. Windows-gated tests did not execute. |
 | `cargo clippy --locked --workspace --all-targets -- -D warnings` | Passed. Cargo still reports future-compatibility notices in upstream `block` and `proc-macro-error2`. |
 | Windows server all-targets cross-clippy with `-D warnings` | Passed, including the retained Windows integration suite and new immediate-descendant ownership test compilation. No native runtime claim. |
 | Linux daemon `cargo check --locked -p compi-daemon --all-targets --target x86_64-unknown-linux-gnu` | Passed; not Linux test execution. |
-| Dependency checker on macOS/Linux/Windows | All neutral and server production/build boundaries passed. |
+| Dependency checker on macOS/Linux/Windows | All configured product dependency boundaries passed. |
 | Independent executable using `LaunchDescription` and `PtySession` | Literal spaces/quotes/`$HOME` in argv, explicit environment, native cwd, real TTY stdin/stdout, and natural exit passed. Temporary project removed. |
 | Native Mac cold launch | App auto-started sibling daemon and native zsh; no prestarted server or manually created shell required. |
 | Native AppKit interaction | Debugger-invoked text-input callbacks executed a shell command, launched Vim, edited/saved a file, and returned to the shell. Native window resize to 720×420 propagated to an 83-column × 20-row PTY. Fullscreen Vim and readable terminal text were visually confirmed. No permanent automation hook was added. |
@@ -88,7 +88,7 @@ The native smoke used an Apple M5 Pro, macOS 26.6.2, arm64 debug builds, a 960×
 
 | Check | Result |
 |---|---|
-| Native prerequisites | Windows 11 x64, MSVC Rust 1.97.1, Windows SDK `fxc.exe`, and the default Ubuntu 24.04.1 WSL2 distribution were available. The dependency-boundary checker passed for all four neutral/server packages. |
+| Native prerequisites | Windows 11 x64, MSVC Rust 1.97.1, Windows SDK `fxc.exe`, and the default Ubuntu 24.04.1 WSL2 distribution were available. The dependency-boundary checker passed for every configured product boundary. |
 | Release build | The native app, daemon, and probe built with the Windows SDK shader compiler in an isolated `target/qualification` directory. An existing daemon kept the normal release executable locked and was left untouched. |
 | Native Windows/WSL regressions | All 56 selected core/server tests passed, including five real daemon integration scenarios and the suspended-before-job ConPTY regression that owns and terminates an immediate descendant after its launcher exits. |
 | Native client interaction | A release GPUI window opened a real WSL shell. Native window messages exercised shell input, Vim, resize, selection/copy, bracketed paste, close, and reopen. Vim saved combining text, CJK, emoji, and a ZWJ sequence byte-for-byte. PTY geometry changed from 87×21 to 64×15. |
@@ -148,7 +148,7 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 
 ### 1. Establish the typography and glyph baseline — implementation complete, visual selection pending
 
-- Inspect the current font selection, fixed cell metrics, row shaping/cache, cursor/selection geometry, and native input/repaint path in `crates/compi-gpui/src/gui.rs` and relevant `compi-client` helpers.
+- Inspect the current font selection, fixed cell metrics, row shaping/cache, cursor/selection geometry, and native input/repaint path in `crates/compi-client/src/gui.rs` and relevant client helpers.
 - Identify the actual missing prompt/path codepoints and available fonts. Distinguish ordinary Unicode/emoji from Powerline/Nerd Font private-use symbols; do not change the user's shell prompt to conceal missing glyphs.
 - Capture a compact comparison workload: the real prompt/path, ASCII, bold/italic text, combining accents, CJK, emoji sequences, and private-use icons. Include a fullscreen editor.
 - Present two or three restrained font/spacing candidates before treating a new default as settled. The direction is calmer Mac typography, not a new visual theme.

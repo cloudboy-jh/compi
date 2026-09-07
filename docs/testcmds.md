@@ -10,10 +10,10 @@ Record Windows build, WSL distribution and version, display scale, monitor refre
 
 ## Phase 1 dependency and compatibility checks
 
-The core packages can be tested on macOS, Linux, or Windows without GPUI:
+The three product crates can be tested together on macOS, Linux, or Windows:
 
 ```text
-cargo test --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client
+cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
 cargo test --locked -p compi-daemon --test terminal_compatibility
 ```
 
@@ -42,7 +42,7 @@ cargo test --locked -p compi-daemon --test unix_daemon_integration
 On a Mac with Rust and Xcode/Metal tooling:
 
 ```sh
-cargo build --locked -p compi-gpui -p compi-daemon --bins
+cargo build --locked -p compi-client -p compi-daemon --bins
 ./target/debug/compi --instance development
 ```
 

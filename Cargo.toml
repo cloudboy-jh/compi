@@ -2,19 +2,13 @@
 resolver = "3"
 members = [
     "crates/compi-protocol",
-    "crates/compi-terminal",
-    "crates/compi-platform",
-    "crates/compi-client",
     "crates/compi-daemon",
-    "crates/compi-gpui",
+    "crates/compi-client",
 ]
 default-members = [
     "crates/compi-protocol",
-    "crates/compi-terminal",
-    "crates/compi-platform",
-    "crates/compi-client",
     "crates/compi-daemon",
-    "crates/compi-gpui",
+    "crates/compi-client",
 ]
 exclude = ["installer/bootstrapper"]
 

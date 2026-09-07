@@ -1,7 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(any(windows, target_os = "macos", test))]
-use compi_gpui::config::FontOverrides;
+use compi_client::config::FontOverrides;
 #[cfg(any(windows, target_os = "macos", test))]
 use std::path::PathBuf;
 
@@ -83,9 +83,9 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut config = compi_gpui::config::load(args.config.as_deref(), args.font);
+    let mut config = compi_client::config::load(args.config.as_deref(), args.font);
     config.diagnostics.extend(args.diagnostics);
-    compi_gpui::gui::run(args.instance, args.working_directory, config);
+    compi_client::gui::run(args.instance, args.working_directory, config);
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

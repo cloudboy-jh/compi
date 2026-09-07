@@ -1,9 +1,9 @@
 #![cfg(unix)]
 
-use compi_client::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
+use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::{
-    ClientMessage, PROTOCOL_VERSION, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceInfo,
-    SurfaceStatus,
+    ClientMessage, DaemonClient, PROTOCOL_VERSION, ScreenSnapshot, ServerEvent, ServerMessage,
+    SurfaceId, SurfaceInfo, SurfaceStatus,
 };
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -63,9 +63,9 @@ impl DaemonGuard {
 
     fn wait_ready(&mut self) {
         let deadline = Instant::now() + TIMEOUT;
-        let names = compi_platform::identity::instance_names(Some(&self.instance)).unwrap();
+        let names = compi_protocol::identity::instance_names(Some(&self.instance)).unwrap();
         loop {
-            if compi_platform::pipe::connect(&names.pipe, Duration::from_millis(100)).is_ok() {
+            if compi_protocol::pipe::connect(&names.pipe, Duration::from_millis(100)).is_ok() {
                 return;
             }
             assert!(
@@ -102,9 +102,9 @@ impl DaemonGuard {
     }
 
     fn unhandshaken_client(&self) -> DaemonClient {
-        let names = compi_platform::identity::instance_names(Some(&self.instance)).unwrap();
+        let names = compi_protocol::identity::instance_names(Some(&self.instance)).unwrap();
         let connection =
-            compi_platform::pipe::connect(&names.pipe, Duration::from_secs(2)).unwrap();
+            compi_protocol::pipe::connect(&names.pipe, Duration::from_secs(2)).unwrap();
         let timeout = libc::timeval {
             tv_sec: 5,
             tv_usec: 0,
@@ -129,7 +129,7 @@ impl DaemonGuard {
     fn crash_and_restart(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
-        let names = compi_platform::identity::instance_names(Some(&self.instance)).unwrap();
+        let names = compi_protocol::identity::instance_names(Some(&self.instance)).unwrap();
         assert!(
             fs::symlink_metadata(&names.pipe)
                 .unwrap()
@@ -158,9 +158,9 @@ impl DaemonGuard {
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            if let Ok(names) = compi_platform::identity::instance_names(Some(&self.instance))
+            if let Ok(names) = compi_protocol::identity::instance_names(Some(&self.instance))
                 && let Ok(connection) =
-                    compi_platform::pipe::connect(&names.pipe, Duration::from_millis(100))
+                    compi_protocol::pipe::connect(&names.pipe, Duration::from_millis(100))
             {
                 let mut client = DaemonClient::from_parts(connection, 1);
                 let _ = client.send(ClientMessage::Hello {
@@ -475,7 +475,7 @@ fn daemon_restart_preserves_lost_surface_metadata_without_claiming_liveness() {
 #[test]
 fn local_endpoint_is_private_and_duplicate_daemon_cannot_take_it_over() {
     let mut daemon = DaemonGuard::start();
-    let names = compi_platform::identity::instance_names(Some(&daemon.instance)).unwrap();
+    let names = compi_protocol::identity::instance_names(Some(&daemon.instance)).unwrap();
     let endpoint = std::path::Path::new(&names.pipe);
     let socket = fs::symlink_metadata(endpoint).unwrap();
     assert!(socket.file_type().is_socket());

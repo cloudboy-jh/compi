@@ -1,4 +1,4 @@
-name: Neutral core CI
+name: Core CI
 
 on:
   push:
@@ -34,11 +34,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Check neutral production and headless dependency boundaries
+      - name: Check production dependency boundaries
         run: python tools/check-dependencies.py --target ${{ matrix.target }}
-      - name: Run core tests and captured v7 wire fixtures
-        run: cargo test --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client
-      - name: Run daemon and platform adapter unit tests
+      - name: Run all product crate tests
+        run: cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
+      - name: Run daemon unit tests
         run: cargo test --locked -p compi-daemon --lib
       - name: Verify engine-to-wire conversion and replica recovery
         run: cargo test --locked -p compi-daemon --test terminal_compatibility
@@ -61,8 +61,8 @@ jobs:
           }
           cargo test --locked -p compi-daemon --test daemon_integration
           if ($LASTEXITCODE -ne 0) { throw 'Windows/WSL daemon regressions failed' }
-      - name: Lint core packages
-        run: cargo clippy --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client --all-targets -- -D warnings
+      - name: Lint shared protocol and client packages
+        run: cargo clippy --locked -p compi-protocol -p compi-client --all-targets -- -D warnings
       - name: Build real Windows daemon without graphics setup
         if: runner.os == 'Windows'
         run: cargo build --locked --release -p compi-daemon --bin compi-daemon
@@ -74,5 +74,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build the native Mac application and sibling daemon
-        run: cargo build --locked -p compi-gpui -p compi-daemon --bins
+      - name: Build the native Mac client and sibling daemon
+        run: cargo build --locked -p compi-client -p compi-daemon --bins

@@ -43,7 +43,7 @@ impl LaunchDescription {
 
 #[cfg(windows)]
 pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
-    let launch = compi_platform::wsl::resolve_launch(working_directory)?;
+    let launch = compi_protocol::wsl::resolve_launch(working_directory)?;
     let mut argv = Vec::new();
     if let Some(distribution) = launch.distribution {
         argv.extend([OsString::from("--distribution"), distribution.into()]);
@@ -160,7 +160,7 @@ fn user_defaults() -> Result<(OsString, PathBuf)> {
 
 pub fn check_system() -> Result<()> {
     #[cfg(windows)]
-    compi_platform::wsl::ensure_default_wsl2()?;
+    compi_protocol::wsl::ensure_default_wsl2()?;
     #[cfg(unix)]
     let _ = resolve_launch(None)?;
     #[cfg(unix)]

@@ -143,7 +143,7 @@ impl InstallerApp {
                 (*operation != InstallerOperation::Remove)
                     .then(|| {
                         ensure_supported_windows()
-                            .and_then(|_| compi_platform::wsl::ensure_default_wsl2())
+                            .and_then(|_| compi_protocol::wsl::ensure_default_wsl2())
                             .err()
                             .map(|error| error.to_string())
                     })

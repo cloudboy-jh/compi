@@ -1,12 +1,12 @@
 use crate::Result;
-use compi_platform::{identity, pipe};
-use compi_protocol::frame;
-use compi_protocol::{
+use crate::frame;
+use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ErrorCode, MutationId, MutationReceipt,
     MutationRequest, PROTOCOL_VERSION, SCREEN_FRAME, ServerMessage, SurfaceId, SurfaceInfo,
     SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot, decode_server,
     decode_terminal_frame, encode_client,
 };
+use crate::{identity, pipe};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,13 +19,13 @@ pub enum ServerEvent {
         request_id: Option<u64>,
         message: ServerMessage,
     },
-    Screen(compi_protocol::ScreenMessage),
+    Screen(crate::ScreenMessage),
 }
 
 pub struct DaemonClient {
     connection: File,
     next_request_id: u64,
-    pending_screen: VecDeque<compi_protocol::ScreenMessage>,
+    pending_screen: VecDeque<crate::ScreenMessage>,
     poll_reader: pipe::PipeReader,
     target: Option<TerminalTarget>,
     workspace: Option<WorkspaceSnapshot>,
@@ -299,7 +299,7 @@ impl DaemonClient {
         }
     }
 
-    pub fn take_pending_screen(&mut self) -> Option<compi_protocol::ScreenMessage> {
+    pub fn take_pending_screen(&mut self) -> Option<crate::ScreenMessage> {
         self.pending_screen.pop_front()
     }
 
@@ -308,7 +308,7 @@ impl DaemonClient {
     ) -> (
         File,
         u64,
-        VecDeque<compi_protocol::ScreenMessage>,
+        VecDeque<crate::ScreenMessage>,
         Option<TerminalTarget>,
         Option<WorkspaceSnapshot>,
     ) {

@@ -18,17 +18,17 @@ fn run() -> compi_daemon::Result<()> {
         [flag] if flag == "--shutdown" => shutdown_daemon(),
         #[cfg(windows)]
         [flag] if flag == "--supervise" => {
-            compi_platform::supervisor::supervise(&std::env::current_exe()?)
+            compi_daemon::supervisor::supervise(&std::env::current_exe()?)
         }
         #[cfg(windows)]
         [flag] if flag == "--install-task" => {
-            compi_platform::supervisor::install(&std::env::current_exe()?)?;
-            println!("registered {}", compi_platform::supervisor::TASK_NAME);
+            compi_daemon::supervisor::install(&std::env::current_exe()?)?;
+            println!("registered {}", compi_daemon::supervisor::TASK_NAME);
             Ok(())
         }
         #[cfg(windows)]
         [flag, path, user_sid] if flag == "--write-task-xml" => {
-            compi_platform::supervisor::write_task_xml(
+            compi_daemon::supervisor::write_task_xml(
                 &std::env::current_exe()?,
                 std::path::Path::new(path),
                 user_sid,
@@ -36,16 +36,16 @@ fn run() -> compi_daemon::Result<()> {
         }
         #[cfg(windows)]
         [flag, path] if flag == "--remove-task-xml" => {
-            compi_platform::supervisor::remove_task_xml(std::path::Path::new(path))
+            compi_daemon::supervisor::remove_task_xml(std::path::Path::new(path))
         }
         #[cfg(windows)]
         [flag] if flag == "--uninstall-task" => {
-            compi_platform::supervisor::uninstall()?;
-            println!("removed {}", compi_platform::supervisor::TASK_NAME);
+            compi_daemon::supervisor::uninstall()?;
+            println!("removed {}", compi_daemon::supervisor::TASK_NAME);
             Ok(())
         }
         #[cfg(windows)]
-        [flag] if flag == "--activate-task" => compi_platform::supervisor::activate(),
+        [flag] if flag == "--activate-task" => compi_daemon::supervisor::activate(),
         #[cfg(unix)]
         _ => Err("usage: compi-daemon [--instance <name> | --check-system | --shutdown]".into()),
         #[cfg(windows)]
@@ -58,7 +58,7 @@ fn run() -> compi_daemon::Result<()> {
 
 #[cfg(any(windows, unix))]
 fn shutdown_daemon() -> compi_daemon::Result<()> {
-    use compi_client::DaemonClient;
+    use compi_protocol::DaemonClient;
     use std::thread;
     use std::time::{Duration, Instant};
 

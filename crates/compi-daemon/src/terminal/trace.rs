@@ -1,4 +1,4 @@
-use crate::TerminalState;
+use super::TerminalState;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, File, OpenOptions};

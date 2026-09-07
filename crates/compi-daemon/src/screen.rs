@@ -1,6 +1,6 @@
 //! Ownership-preserving conversion from engine output to protocol v7 values.
+use crate::terminal::{Delta, Snapshot};
 use compi_protocol::{ScreenDelta, ScreenSnapshot};
-use compi_terminal::{Delta, Snapshot};
 
 pub fn snapshot(state: Snapshot) -> ScreenSnapshot {
     ScreenSnapshot {

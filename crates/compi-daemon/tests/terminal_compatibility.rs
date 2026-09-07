@@ -1,8 +1,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_daemon::screen;
+use compi_daemon::terminal::TerminalState;
 use compi_protocol::ScreenMessage;
-use compi_terminal::TerminalState;
 use serde_json::Value;
 
 fn expected_screen(fixture: &Value) -> ScreenMessage {

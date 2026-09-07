@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::{DaemonClient, MirrorApply, ScreenMirror};
-use compi_platform::pipe;
 use compi_protocol::frame;
+use compi_protocol::pipe;
 use compi_protocol::{
     CONTROL_FRAME, ClientControl, ClientMessage, SCREEN_FRAME, ServerMessage, SurfaceInfo,
     TerminalTarget, decode_server, decode_terminal_frame, encode_client,

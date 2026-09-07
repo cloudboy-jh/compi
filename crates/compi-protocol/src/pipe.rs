@@ -1,7 +1,7 @@
 use crate::Result;
+use crate::frame::{self, Frame};
 #[cfg(windows)]
 use crate::identity::PipeSecurity;
-use compi_protocol::frame::{self, Frame};
 #[cfg(windows)]
 use std::ffi::OsStr;
 use std::fs::File;

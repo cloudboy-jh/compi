@@ -1,12 +1,25 @@
-//! Versioned control and screen protocol values. No engine, PTY, UI, or platform dependencies.
+//! Compi's shared process contract, local transport, and runtime support.
+mod client;
 pub mod frame;
+#[cfg_attr(unix, path = "identity_unix.rs")]
+pub mod identity;
+pub mod paths;
+pub mod perf;
+pub mod pipe;
 mod screen;
+#[cfg(windows)]
+pub mod wsl;
 
 pub use screen::{
     Cell, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode, Row, RowUpdate,
     ScreenDelta, ScreenMessage, ScreenSnapshot, TerminalFrame, TerminalModes, TextAttributes,
     decode_screen, decode_terminal_frame, encode_screen, encode_terminal_frame,
 };
+
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub use client::{DaemonClient, ServerEvent};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
