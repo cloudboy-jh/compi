@@ -1215,7 +1215,7 @@ impl Perform for TerminalState {
                     self.set_cursor(0, 0);
                 }
             }
-            ('m', _) => self.sgr(params),
+            ('m', b"") => self.sgr(params),
             ('h', _) => self.set_mode(private, params, true),
             ('l', _) => self.set_mode(private, params, false),
             ('s', _) => self.saved_cursor = self.cursor,
@@ -1530,6 +1530,22 @@ mod tests {
         assert_eq!(snapshot.cells[0].cells[2].width, 2);
         assert_eq!(snapshot.cells[0].cells[3].width, 0);
         assert_eq!(snapshot.title, "Compi");
+    }
+
+    #[test]
+    fn keyboard_option_commands_preserve_text_rendition() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.advance(b"\x1b[1;31mA\x1b[>4;2mB\x1b[>4;0mC\x1b[?4mD\x1b[0mE");
+        let snapshot = terminal.snapshot();
+        assert_eq!(visible_text(&snapshot, 0), "ABCDE");
+        for cell in &snapshot.cells[0].cells[..4] {
+            assert_eq!(cell.foreground, Color::Indexed(1));
+            assert!(cell.attributes.bold);
+            assert!(!cell.attributes.dim);
+            assert!(!cell.attributes.underline);
+        }
+        assert_eq!(snapshot.cells[0].cells[4].foreground, Color::Default);
+        assert!(!snapshot.cells[0].cells[4].attributes.bold);
     }
 
     #[test]

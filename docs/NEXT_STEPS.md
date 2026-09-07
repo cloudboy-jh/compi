@@ -84,10 +84,24 @@ Do not count a cross-check, a configured workflow, or an unsupported-host entryp
 
 The native smoke used an Apple M5 Pro, macOS 26.6.2, arm64 debug builds, a 960×640 logical-pixel window with 2× capture scale, and native zsh/Vim. One cold launch logged first terminal frame at 552 ms; one ordinary warm reattach logged 153 ms. Sampled resident memory was about 77 MiB for the one-tab client and 5.2 MiB for the one-shell daemon, excluding the shell and its children. These are single-run diagnostics, not release budgets, physical frame-pacing measurements, or input-to-presentation latency.
 
+### Native Windows qualification — 2026-09-07
+
+| Check | Result |
+|---|---|
+| Native prerequisites | Windows 11 x64, MSVC Rust 1.97.1, Windows SDK `fxc.exe`, and the default Ubuntu 24.04.1 WSL2 distribution were available. The dependency-boundary checker passed for all four neutral/server packages. |
+| Release build | The native app, daemon, and probe built with the Windows SDK shader compiler in an isolated `target/qualification` directory. An existing daemon kept the normal release executable locked and was left untouched. |
+| Native Windows/WSL regressions | All 56 selected core/server tests passed, including five real daemon integration scenarios and the suspended-before-job ConPTY regression that owns and terminates an immediate descendant after its launcher exits. |
+| Native client interaction | A release GPUI window opened a real WSL shell. Native window messages exercised shell input, Vim, resize, selection/copy, bracketed paste, close, and reopen. Vim saved combining text, CJK, emoji, and a ZWJ sequence byte-for-byte. PTY geometry changed from 87×21 to 64×15. |
+| Detach and cleanup | Native close exited the client with code 0 while preserving shell PID 164334, a shell variable, and background child 164619. Reopen recovered the same values. Isolated daemon shutdown then removed both processes. |
+| Parser defect found and fixed | Vim's xterm keyboard-option commands such as `CSI > 4 ; 2 m` were incorrectly interpreted as SGR because every CSI final `m` reached the rendition parser. SGR now accepts only an empty intermediate prefix; a focused regression fails before the fix and passes after it. A rebuilt release client no longer painted Vim's blank rows as underlined. |
+
+The visual smoke ran at 144 DPI on a 2560×1440 primary display, with a 3440×1440 100 Hz secondary display present. It verifies the actual native window and WSL execution path, but synthetic native input is not a claim about every physical keyboard layout, IME, mixed-DPI transition, or sustained frame pacing.
+
+
 ### Remaining Phase 2 gates and known limits
 
-1. Run native Linux CI and Windows/WSL regressions. No remote host was configured; local Docker had no running daemon. Cross-compilation is not native execution.
-2. Qualify Windows PTY ownership. `portable-pty` exposes its Windows child after resuming it, while the current backend assigns a kill-on-close job before resume. The safer existing backend is retained; the new immediate-descendant regression is compiled but has not run on Windows. Windows portable-PTY cutover/fallback acceptance remains open.
+1. Run native Linux CI. Windows/WSL core, daemon, working-directory, reconnect, resize, cleanup, and ownership regressions passed natively on 2026-09-07; cross-compilation remains insufficient evidence for Linux.
+2. The retained Windows suspended-before-job ConPTY backend is now runtime-qualified for immediate-descendant ownership and cleanup. A future `portable-pty` cutover still requires equivalent before-resume ownership proof; it is not required for the retained backend.
 3. Exercise physical Cmd/Ctrl/Option keys, clipboard, dead keys/IME, window dragging/traffic lights, fullscreen/scaling, and display pacing. Accessibility automation was unavailable. AppKit callback injection proved the native text/resize/close path, not physical input or all native controls.
 4. Unix cleanup contains the owned POSIX session, including job-control groups; descendants deliberately escaping with `setsid` are not contained. This is not a security sandbox. Ordinary foreground/background cleanup passed.
 5. v7's working-directory metadata is WSL-specific. Native cwd is honored at launch but not stored as fictitious WSL metadata; generic persisted launch metadata and fresh per-client launch context remain part of the later protocol/workspace cutover.
@@ -95,7 +109,7 @@ The native smoke used an Apple M5 Pro, macOS 26.6.2, arm64 debug builds, a 960×
 
 An explicit `--working-directory` invocation retains the existing new-work behavior. Omit it when reopening existing work. Splits, workspace migration, durable client slots, command-registry redesign, and themes remain excluded from this phase.
 
-## Current implementation: Mac refinement before workspace expansion
+## Current implementation: native refinement status
 
 **Status:** typography and glyph integration implemented; interaction refinement and full native qualification remain. The terminal now derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. The user has not selected a preferred reference terminal/font or clarified which interactions feel clanky.
 
@@ -108,7 +122,7 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 - Kept the bounded row-shaping cache and invalidated it when display scale changes. Native UI chrome continues to use the system font.
 - Verified the Mac build, all 54 workspace tests, warning-free workspace Clippy, diff hygiene, first terminal frame, and an AppKit event-loop smoke. Pixel-level comparison and physical-input qualification remain blocked by unavailable screen-capture/accessibility permissions.
 
-**Next:** manually compare the user's real prompt and restrained font/spacing candidates, then measure and fix demonstrated interaction roughness before Phase 3.
+**Next:** begin Phase 3 workspace ownership and protocol migration while retaining the remaining Mac visual, physical-input, and interaction qualification as explicit open gates.
 
 ### 1. Establish the typography and glyph baseline — implementation complete, visual selection pending
 
@@ -145,15 +159,15 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 - Check physical Cmd/Ctrl/Option keys, clipboard, dead keys/IME, font fallback, and scaling where access permits. AppKit debugger callbacks are useful supplementary evidence, not a replacement for the physical-input matrix.
 - Run focused regressions plus final workspace checks once integration is complete; keep permanent tests only for plausible failures such as grapheme/cell alignment, stale font caches, or input duplication.
 - Preserve Windows/WSL behavior and headless dependency isolation. Report unavailable native platform checks explicitly.
-- Finish with a runnable Mac build, before/after visual and interaction evidence, and updated qualification notes. Only then resume the Phase 3 workspace migration.
+- Finish with a runnable Mac build, before/after visual and interaction evidence, and updated qualification notes. These checks remain required for shared-baseline qualification even though the headless Phase 3 workspace migration proceeds first.
 
 ### Compaction handoff
 
 - The implemented Phase 2 baseline and all previous evidence/gaps are recorded above. Do not restart the extraction or PTY port.
-- Start the refinement with typography/glyph inspection; do not assume a chosen font, reference terminal, or diagnosed cause of “clanky.”
+- Typography and glyph integration are implemented. Do not restart that work without a demonstrated rendering failure; retain the user's font selection and Mac physical-input matrix as qualification tasks.
 - Keep Mac GPUI `font-kit` enabled. Its absence selects a no-op text system; the prior missing-all-text failure was fixed, not an outstanding GPU renderer problem.
-- Native smoke processes and temporary text/launch examples were removed. Production binaries remain in `target/debug`; ordinary launch is `./target/debug/compi --instance development`.
-- Current checks: `cargo test --workspace` passed all 54 tests; `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p compi-app --bin compi`, and `git diff --check` passed. Native Mac launch reached the first terminal frame in 382 ms, and a mixed interactive workload remained in the normal AppKit event loop. Pixel-level comparison and physical-input qualification remain blocked by unavailable screen-capture/accessibility permissions. Windows cross-compilation was attempted, but this machine lacks the target C headers required by `ring`.
+- Native smoke processes and temporary automation/evidence files were removed. Qualification binaries remain under ignored build output.
+- Current Windows checks: `cargo fmt --all -- --check`, `cargo test --locked --workspace --all-targets` (64 tests), `cargo clippy --locked --workspace --all-targets -- -D warnings`, dependency boundaries, and the isolated release app/daemon/probe build passed. Cargo still reports an upstream future-compatibility notice for `proc-macro-error2`. The native client smoke and remaining gaps are recorded above. The earlier Mac build and interaction evidence remains valid; its pixel-level comparison and physical-input matrix are still open.
 
 ## Next phases
 
