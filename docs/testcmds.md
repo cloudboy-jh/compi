@@ -10,38 +10,39 @@ Record Windows build, WSL distribution and version, display scale, monitor refre
 
 ## Phase 1 dependency and compatibility checks
 
-The neutral packages can be tested on macOS, Linux, or Windows without GPUI or a PTY:
+The core packages can be tested on macOS, Linux, or Windows without GPUI:
 
 ```text
-cargo test --locked -p compi-protocol -p compi-terminal -p compi-client-core
-cargo test --locked -p compi-server --test terminal_compatibility
+cargo test --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client
+cargo test --locked -p compi-daemon --test terminal_compatibility
 ```
 
 On native Windows, verify the headless build separately from application/installer setup:
 
 ```powershell
 python tools/check-dependencies.py --target x86_64-pc-windows-msvc
-cargo build --locked --release -p compi-server --bin compi-daemon
+cargo build --locked --release -p compi-daemon --bin compi-daemon
 wsl.exe --exec true
-cargo test --locked -p compi-server --test daemon_integration
+cargo test --locked -p compi-daemon --test daemon_integration
 ```
 
 The daemon build does not require GPUI or `GPUI_FXC_PATH`. A failed WSL readiness check is missing runtime coverage, not a reason to count skipped daemon tests as passing. The commands in Tier 1 below require a working default WSL distribution for the full integration suite.
 
 ## Phase 2 native Unix and Mac checks
 
-On macOS/Linux, build and exercise the real headless server without graphics dependencies:
+On macOS/Linux, build and exercise the real headless daemon without graphics dependencies:
 
 ```sh
-cargo build --locked -p compi-server --bin compi-daemon --example compi-probe
+cargo build --locked -p compi-daemon --bin compi-daemon
+cargo build --locked -p compi-client --example compi-probe
 ./target/debug/compi-daemon --check-system
-cargo test --locked -p compi-server --test unix_daemon_integration
+cargo test --locked -p compi-daemon --test unix_daemon_integration
 ```
 
 On a Mac with Rust and Xcode/Metal tooling:
 
 ```sh
-cargo build --locked -p compi-app -p compi-server --bins
+cargo build --locked -p compi-gpui -p compi-daemon --bins
 ./target/debug/compi --instance development
 ```
 
@@ -49,7 +50,7 @@ In the window, record `echo $$`, set a shell variable, run Vim or another fullsc
 
 An explicit `--working-directory /absolute/project/path` requests new work. Omit that option on ordinary reopen. Use an isolated instance for termination and crash scenarios; `compi-probe --instance development shutdown` intentionally ends all work in that instance.
 
-CI is configured to run the Unix integration suite natively on Mac/Linux. Windows/WSL tests still require a qualified Windows host. The Windows immediate-descendant ownership regression is part of `cargo test --locked -p compi-server --lib`; compiling it on another host does not qualify the retained ConPTY backend.
+CI is configured to run the Unix integration suite natively on Mac/Linux. Windows/WSL tests still require a qualified Windows host. The Windows immediate-descendant ownership regression is part of `cargo test --locked -p compi-daemon --lib`; compiling it on another host does not qualify the retained ConPTY backend.
 
 ## Tier 1: automated regression
 

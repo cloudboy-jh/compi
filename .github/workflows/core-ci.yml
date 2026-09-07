@@ -36,17 +36,19 @@ jobs:
           python-version: "3.x"
       - name: Check neutral production and headless dependency boundaries
         run: python tools/check-dependencies.py --target ${{ matrix.target }}
-      - name: Run neutral tests and captured v7 wire fixtures
-        run: cargo test --locked -p compi-protocol -p compi-terminal -p compi-client-core
-      - name: Run shared server and platform adapter unit tests
-        run: cargo test --locked -p compi-server --lib
+      - name: Run core tests and captured v7 wire fixtures
+        run: cargo test --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client
+      - name: Run daemon and platform adapter unit tests
+        run: cargo test --locked -p compi-daemon --lib
       - name: Verify engine-to-wire conversion and replica recovery
-        run: cargo test --locked -p compi-server --test terminal_compatibility
+        run: cargo test --locked -p compi-daemon --test terminal_compatibility
       - name: Build headless native daemon and development probe
-        run: cargo build --locked -p compi-server --bin compi-daemon --example compi-probe
+        run: |
+          cargo build --locked -p compi-daemon --bin compi-daemon
+          cargo build --locked -p compi-client --example compi-probe
       - name: Run real Unix PTY and persistent daemon regressions
         if: runner.os != 'Windows'
-        run: cargo test --locked -p compi-server --test unix_daemon_integration
+        run: cargo test --locked -p compi-daemon --test unix_daemon_integration
       - name: Run Windows daemon regressions when WSL is qualified
         if: runner.os == 'Windows'
         shell: pwsh
@@ -57,13 +59,13 @@ jobs:
             'WSL runtime: **unverified** — no working default distribution on this runner.' >> $env:GITHUB_STEP_SUMMARY
             exit 0
           }
-          cargo test --locked -p compi-server --test daemon_integration
+          cargo test --locked -p compi-daemon --test daemon_integration
           if ($LASTEXITCODE -ne 0) { throw 'Windows/WSL daemon regressions failed' }
-      - name: Lint neutral packages
-        run: cargo clippy --locked -p compi-protocol -p compi-terminal -p compi-client-core --all-targets -- -D warnings
+      - name: Lint core packages
+        run: cargo clippy --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client --all-targets -- -D warnings
       - name: Build real Windows daemon without graphics setup
         if: runner.os == 'Windows'
-        run: cargo build --locked --release -p compi-server --bin compi-daemon
+        run: cargo build --locked --release -p compi-daemon --bin compi-daemon
 
   mac-client:
     runs-on: macos-14
@@ -73,4 +75,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the native Mac application and sibling daemon
-        run: cargo build --locked -p compi-app -p compi-server --bins
+        run: cargo build --locked -p compi-gpui -p compi-daemon --bins

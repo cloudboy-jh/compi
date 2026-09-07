@@ -21,21 +21,21 @@ GPUI client <-> per-user daemon <-> portable-pty <-> native Mac/Unix shell
 
 The daemon owns shell lifecycle, authoritative terminal state, and the durable workspace hierarchy: sessions contain ordered tabs, tabs contain split trees, and pane leaves reference stable surfaces. Protocol v8 separates every identity type, adds optimistic durable mutations and receipts, and keys attachments and screen traffic to a server generation plus process lifetime. The current GPUI client consumes the new surface model but still presents its pre-Phase-4 tab/switcher UI; full split rendering and remembered client state remain later work.
 
-The Cargo workspace separates `compi-protocol`, `compi-terminal`, `compi-client-core`, `compi-server`, and `compi-app`. The neutral engine, wire codecs, replicas, and input/selection helpers build without GPUI or Windows APIs. The daemon's build graph is independent of GPUI and installer code; the installer remains isolated under `installer/bootstrapper`.
+The Cargo workspace separates `compi-protocol`, `compi-terminal`, `compi-platform`, `compi-client`, `compi-daemon`, and `compi-gpui`. Protocol and terminal semantics remain platform-neutral; shared OS transport and paths live in `compi-platform`; reusable client transport, replicas, and interaction logic live in `compi-client`. The daemon has no graphics dependency, and the installer remains isolated under `installer/bootstrapper`.
 
-## Check the neutral foundation
+## Check the core boundaries
 
 On macOS, Linux, or Windows:
 
 ```sh
-cargo test --locked -p compi-protocol -p compi-terminal -p compi-client-core
-cargo test --locked -p compi-server --test terminal_compatibility
+cargo test --locked -p compi-protocol -p compi-terminal -p compi-platform -p compi-client
+cargo test --locked -p compi-daemon --test terminal_compatibility
 ```
 
 The second command exercises engine-to-wire conversion and replica recovery. On macOS/Linux, exercise real PTYs, private sockets, resize, reconnect, exit, descendant cleanup, and daemon restart with:
 
 ```sh
-cargo test --locked -p compi-server --test unix_daemon_integration
+cargo test --locked -p compi-daemon --test unix_daemon_integration
 ```
 
 ## Run the native Mac client
@@ -43,7 +43,7 @@ cargo test --locked -p compi-server --test unix_daemon_integration
 Requires Rust and Xcode with its Metal compiler available through `xcrun`.
 
 ```sh
-cargo build --locked -p compi-app -p compi-server --bins
+cargo build --locked -p compi-gpui -p compi-daemon --bins
 ./target/debug/compi --instance development
 ```
 
@@ -72,7 +72,8 @@ Mac metadata and diagnostic logs live under `~/Library/Application Support/Compi
 For Linux headless use, or a diagnostic Mac console:
 
 ```sh
-cargo build --locked -p compi-server --bin compi-daemon --example compi-probe
+cargo build --locked -p compi-daemon --bin compi-daemon
+cargo build --locked -p compi-client --example compi-probe
 ./target/debug/examples/compi-probe --instance development start
 # Ctrl+] detaches without ending the shell.
 ```
@@ -91,7 +92,7 @@ cargo build --bins
 Build the Windows daemon alone, without GPUI or its shader compiler:
 
 ```powershell
-cargo build --locked --release -p compi-server --bin compi-daemon
+cargo build --locked --release -p compi-daemon --bin compi-daemon
 ```
 
 Pass a project path directly or with `--working-directory`; new tabs inherit valid OSC 7 directory reports from the active shell:

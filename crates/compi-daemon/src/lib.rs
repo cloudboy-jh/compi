@@ -1,5 +1,11 @@
 #[cfg(windows)]
-pub mod installer;
-
+pub mod conpty;
+pub mod daemon;
+pub mod launch;
+pub mod pty;
+pub mod screen;
+pub mod surface;
+pub mod workspace;
+mod workspace_store;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;

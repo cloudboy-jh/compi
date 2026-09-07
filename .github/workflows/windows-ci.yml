@@ -55,7 +55,7 @@ jobs:
         run: |
           cargo test --locked -p compi-protocol --test wire_v7
           if ($LASTEXITCODE -ne 0) { throw 'Wire compatibility tests failed' }
-          cargo test --locked -p compi-server --test terminal_compatibility
+          cargo test --locked -p compi-daemon --test terminal_compatibility
           if ($LASTEXITCODE -ne 0) { throw 'Terminal boundary tests failed' }
 
       - name: Run real daemon regressions when WSL is qualified
@@ -67,7 +67,7 @@ jobs:
             'WSL runtime: **unverified** — no working default distribution on this runner.' >> $env:GITHUB_STEP_SUMMARY
             exit 0
           }
-          cargo test --locked -p compi-server --test daemon_integration
+          cargo test --locked -p compi-daemon --test daemon_integration
           if ($LASTEXITCODE -ne 0) { throw 'Windows/WSL daemon regressions failed' }
           'WSL runtime: daemon integration regressions passed on this runner.' >> $env:GITHUB_STEP_SUMMARY
 

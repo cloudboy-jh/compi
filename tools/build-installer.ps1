@@ -92,7 +92,7 @@ try {
     & dotnet tool restore
     if ($LASTEXITCODE -ne 0) { throw 'Failed to restore the pinned WiX tool' }
 
-    & cargo build --release -p compi-app -p compi-server --bin compi --bin compi-daemon --target-dir $productTarget
+    & cargo build --release -p compi-gpui -p compi-daemon --bins --target-dir $productTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi product binaries' }
     Assert-FileVersion (Join-Path $productBin 'compi.exe')
     Assert-FileVersion (Join-Path $productBin 'compi-daemon.exe')

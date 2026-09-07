@@ -780,14 +780,42 @@ dependencies = [
 ]
 
 [[package]]
-name = "compi-app"
+name = "compi-client"
+version = "0.1.0"
+dependencies = [
+ "compi-platform",
+ "compi-protocol",
+ "libc",
+ "serde_json",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "compi-daemon"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "compi-client",
+ "compi-platform",
+ "compi-protocol",
+ "compi-terminal",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "windows 0.62.2",
+ "winresource",
+]
+
+[[package]]
+name = "compi-gpui"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
  "base64",
- "compi-client-core",
+ "compi-client",
+ "compi-platform",
  "compi-protocol",
- "compi-server",
  "gpui",
  "image",
  "objc2",
@@ -799,10 +827,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "compi-client-core"
+name = "compi-platform"
 version = "0.1.0"
 dependencies = [
  "compi-protocol",
+ "libc",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -814,23 +844,6 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
-]
-
-[[package]]
-name = "compi-server"
-version = "0.1.0"
-dependencies = [
- "base64",
- "compi-client-core",
- "compi-protocol",
- "compi-terminal",
- "libc",
- "portable-pty",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "windows 0.62.2",
- "winresource",
 ]
 
 [[package]]

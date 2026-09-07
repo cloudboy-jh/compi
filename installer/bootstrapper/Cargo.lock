@@ -768,10 +768,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "compi-client-core"
+name = "compi-client"
+version = "0.1.0"
+dependencies = [
+ "compi-platform",
+ "compi-protocol",
+ "libc",
+ "serde_json",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "compi-platform"
 version = "0.1.0"
 dependencies = [
  "compi-protocol",
+ "libc",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -789,7 +802,8 @@ name = "compi-setup"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
- "compi-client-core",
+ "compi-client",
+ "compi-platform",
  "gpui",
  "windows 0.62.2",
  "winresource",
