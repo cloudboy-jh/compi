@@ -1,0 +1,362 @@
+{
+  "client": [
+    {
+      "frame": "NAAAAAF7InJlcXVlc3RfaWQiOjEsInR5cGUiOiJoZWxsbyIsInByb3RvY29sX3ZlcnNpb24iOjd9",
+      "value": {
+        "protocol_version": 7,
+        "request_id": 1,
+        "type": "hello"
+      }
+    },
+    {
+      "frame": "JwAAAAF7InJlcXVlc3RfaWQiOjIsInR5cGUiOiJsaXN0X3Nlc3Npb25zIn0=",
+      "value": {
+        "request_id": 2,
+        "type": "list_sessions"
+      }
+    },
+    {
+      "frame": "VgAAAAF7InJlcXVlc3RfaWQiOjMsInR5cGUiOiJjcmVhdGVfc2Vzc2lvbiIsImNvbHMiOjEwMCwicm93cyI6MzAsIndvcmtpbmdfZGlyZWN0b3J5IjpudWxsfQ==",
+      "value": {
+        "cols": 100,
+        "request_id": 3,
+        "rows": 30,
+        "type": "create_session",
+        "working_directory": null
+      }
+    },
+    {
+      "frame": "aQAAAAF7InJlcXVlc3RfaWQiOjQsInR5cGUiOiJjcmVhdGVfc2Vzc2lvbiIsImNvbHMiOjgwLCJyb3dzIjoyNCwid29ya2luZ19kaXJlY3RvcnkiOiJDOlxcQWdlbnQgUHJvamVjdHNcXM+AIn0=",
+      "value": {
+        "cols": 80,
+        "request_id": 4,
+        "rows": 24,
+        "type": "create_session",
+        "working_directory": "C:\\Agent Projects\\π"
+      }
+    },
+    {
+      "frame": "VAAAAAF7InJlcXVlc3RfaWQiOjUsInR5cGUiOiJhdHRhY2giLCJzZXNzaW9uX2lkIjoiZml4dHVyZS1zZXNzaW9uIiwiY29scyI6MTIwLCJyb3dzIjo0MH0=",
+      "value": {
+        "cols": 120,
+        "request_id": 5,
+        "rows": 40,
+        "session_id": "fixture-session",
+        "type": "attach"
+      }
+    },
+    {
+      "frame": "IAAAAAF7InJlcXVlc3RfaWQiOjYsInR5cGUiOiJkZXRhY2gifQ==",
+      "value": {
+        "request_id": 6,
+        "type": "detach"
+      }
+    },
+    {
+      "frame": "RwAAAAF7InJlcXVlc3RfaWQiOjcsInR5cGUiOiJpbnB1dCIsImRhdGEiOlswLDMsMjcsMjU1XSwibGF0ZW5jeV9pZCI6MTIzNDU2fQ==",
+      "value": {
+        "data": [
+          0,
+          3,
+          27,
+          255
+        ],
+        "latency_id": 123456,
+        "request_id": 7,
+        "type": "input"
+      }
+    },
+    {
+      "frame": "YwAAAAF7InJlcXVlc3RfaWQiOjgsInR5cGUiOiJpbnB1dCIsImRhdGEiOlsxMDEsOTksMTA0LDExMSwzMiwxMDQsMTAxLDEwOCwxMDgsMTExLDEzXSwibGF0ZW5jeV9pZCI6bnVsbH0=",
+      "value": {
+        "data": [
+          101,
+          99,
+          104,
+          111,
+          32,
+          104,
+          101,
+          108,
+          108,
+          111,
+          13
+        ],
+        "latency_id": null,
+        "request_id": 8,
+        "type": "input"
+      }
+    },
+    {
+      "frame": "MwAAAAF7InJlcXVlc3RfaWQiOjksInR5cGUiOiJyZXNpemUiLCJjb2xzIjo0MCwicm93cyI6OH0=",
+      "value": {
+        "cols": 40,
+        "request_id": 9,
+        "rows": 8,
+        "type": "resize"
+      }
+    },
+    {
+      "frame": "KwAAAAF7InJlcXVlc3RfaWQiOjEwLCJ0eXBlIjoicmVxdWVzdF9zbmFwc2hvdCJ9",
+      "value": {
+        "request_id": 10,
+        "type": "request_snapshot"
+      }
+    },
+    {
+      "frame": "PgAAAAF7InJlcXVlc3RfaWQiOjExLCJ0eXBlIjoia2lsbCIsInNlc3Npb25faWQiOiJmaXh0dXJlLXNlc3Npb24ifQ==",
+      "value": {
+        "request_id": 11,
+        "session_id": "fixture-session",
+        "type": "kill"
+      }
+    },
+    {
+      "frame": "KgAAAAF7InJlcXVlc3RfaWQiOjEyLCJ0eXBlIjoic2h1dGRvd25fZGFlbW9uIn0=",
+      "value": {
+        "request_id": 12,
+        "type": "shutdown_daemon"
+      }
+    }
+  ],
+  "server": [
+    {
+      "frame": "NAAAAAF7InJlcXVlc3RfaWQiOjEsInR5cGUiOiJoZWxsbyIsInByb3RvY29sX3ZlcnNpb24iOjd9",
+      "value": {
+        "protocol_version": 7,
+        "request_id": 1,
+        "type": "hello"
+      }
+    },
+    {
+      "frame": "sAQAAAF7InR5cGUiOiJzZXNzaW9ucyIsInNlc3Npb25zIjpbeyJpZCI6InMtMCIsInN0YXR1cyI6InN0YXJ0aW5nIiwiYXR0YWNoZWQiOmZhbHNlLCJjb2xzIjoxMDAsInJvd3MiOjMwLCJjcmVhdGVkX2F0X21zIjoxMjM0NTY3ODksImV4aXRfY29kZSI6bnVsbCwiZXJyb3IiOm51bGx9LHsiaWQiOiJzLTEiLCJzdGF0dXMiOiJydW5uaW5nIiwiYXR0YWNoZWQiOnRydWUsImNvbHMiOjEwMCwicm93cyI6MzAsImNyZWF0ZWRfYXRfbXMiOjEyMzQ1Njc4OSwiZXhpdF9jb2RlIjpudWxsLCJlcnJvciI6bnVsbCwid29ya2luZ19kaXJlY3RvcnkiOnsicmVxdWVzdGVkIjoiQzpcXEFnZW50IFByb2plY3RzIiwicmVzb2x2ZWRfd3NsX3BhdGgiOiIvbW50L2MvQWdlbnQgUHJvamVjdHMiLCJkaXN0cmlidXRpb24iOiJVYnVudHUifX0seyJpZCI6InMtMiIsInN0YXR1cyI6ImV4aXRlZCIsImF0dGFjaGVkIjpmYWxzZSwiY29scyI6MTAwLCJyb3dzIjozMCwiY3JlYXRlZF9hdF9tcyI6MTIzNDU2Nzg5LCJleGl0X2NvZGUiOjE3LCJlcnJvciI6bnVsbCwid29ya2luZ19kaXJlY3RvcnkiOnsicmVxdWVzdGVkIjoiQzpcXEFnZW50IFByb2plY3RzIiwicmVzb2x2ZWRfd3NsX3BhdGgiOiIvbW50L2MvQWdlbnQgUHJvamVjdHMiLCJkaXN0cmlidXRpb24iOiJVYnVudHUifX0seyJpZCI6InMtMyIsInN0YXR1cyI6ImZhaWxlZCIsImF0dGFjaGVkIjpmYWxzZSwiY29scyI6MTAwLCJyb3dzIjozMCwiY3JlYXRlZF9hdF9tcyI6MTIzNDU2Nzg5LCJleGl0X2NvZGUiOm51bGwsImVycm9yIjoibGF1bmNoIGZhaWxlZCIsIndvcmtpbmdfZGlyZWN0b3J5Ijp7InJlcXVlc3RlZCI6IkM6XFxBZ2VudCBQcm9qZWN0cyIsInJlc29sdmVkX3dzbF9wYXRoIjoiL21udC9jL0FnZW50IFByb2plY3RzIiwiZGlzdHJpYnV0aW9uIjoiVWJ1bnR1In19LHsiaWQiOiJzLTQiLCJzdGF0dXMiOiJkZWFkIiwiYXR0YWNoZWQiOmZhbHNlLCJjb2xzIjoxMDAsInJvd3MiOjMwLCJjcmVhdGVkX2F0X21zIjoxMjM0NTY3ODksImV4aXRfY29kZSI6bnVsbCwiZXJyb3IiOiJsYXVuY2ggZmFpbGVkIiwid29ya2luZ19kaXJlY3RvcnkiOnsicmVxdWVzdGVkIjoiQzpcXEFnZW50IFByb2plY3RzIiwicmVzb2x2ZWRfd3NsX3BhdGgiOiIvbW50L2MvQWdlbnQgUHJvamVjdHMiLCJkaXN0cmlidXRpb24iOiJVYnVudHUiLCJ3YXJuaW5nIjoibG9zdCBhZnRlciByZXN0YXJ0In19XX0=",
+      "value": {
+        "sessions": [
+          {
+            "attached": false,
+            "cols": 100,
+            "created_at_ms": 123456789,
+            "error": null,
+            "exit_code": null,
+            "id": "s-0",
+            "rows": 30,
+            "status": "starting"
+          },
+          {
+            "attached": true,
+            "cols": 100,
+            "created_at_ms": 123456789,
+            "error": null,
+            "exit_code": null,
+            "id": "s-1",
+            "rows": 30,
+            "status": "running",
+            "working_directory": {
+              "distribution": "Ubuntu",
+              "requested": "C:\\Agent Projects",
+              "resolved_wsl_path": "/mnt/c/Agent Projects"
+            }
+          },
+          {
+            "attached": false,
+            "cols": 100,
+            "created_at_ms": 123456789,
+            "error": null,
+            "exit_code": 17,
+            "id": "s-2",
+            "rows": 30,
+            "status": "exited",
+            "working_directory": {
+              "distribution": "Ubuntu",
+              "requested": "C:\\Agent Projects",
+              "resolved_wsl_path": "/mnt/c/Agent Projects"
+            }
+          },
+          {
+            "attached": false,
+            "cols": 100,
+            "created_at_ms": 123456789,
+            "error": "launch failed",
+            "exit_code": null,
+            "id": "s-3",
+            "rows": 30,
+            "status": "failed",
+            "working_directory": {
+              "distribution": "Ubuntu",
+              "requested": "C:\\Agent Projects",
+              "resolved_wsl_path": "/mnt/c/Agent Projects"
+            }
+          },
+          {
+            "attached": false,
+            "cols": 100,
+            "created_at_ms": 123456789,
+            "error": "launch failed",
+            "exit_code": null,
+            "id": "s-4",
+            "rows": 30,
+            "status": "dead",
+            "working_directory": {
+              "distribution": "Ubuntu",
+              "requested": "C:\\Agent Projects",
+              "resolved_wsl_path": "/mnt/c/Agent Projects",
+              "warning": "lost after restart"
+            }
+          }
+        ],
+        "type": "sessions"
+      }
+    },
+    {
+      "frame": "sgAAAAF7InJlcXVlc3RfaWQiOjMsInR5cGUiOiJzZXNzaW9uX2NyZWF0ZWQiLCJzZXNzaW9uIjp7ImlkIjoicy0wIiwic3RhdHVzIjoic3RhcnRpbmciLCJhdHRhY2hlZCI6ZmFsc2UsImNvbHMiOjEwMCwicm93cyI6MzAsImNyZWF0ZWRfYXRfbXMiOjEyMzQ1Njc4OSwiZXhpdF9jb2RlIjpudWxsLCJlcnJvciI6bnVsbH19",
+      "value": {
+        "request_id": 3,
+        "session": {
+          "attached": false,
+          "cols": 100,
+          "created_at_ms": 123456789,
+          "error": null,
+          "exit_code": null,
+          "id": "s-0",
+          "rows": 30,
+          "status": "starting"
+        },
+        "type": "session_created"
+      }
+    },
+    {
+      "frame": "JAEAAAF7InR5cGUiOiJhdHRhY2hlZCIsInNlc3Npb24iOnsiaWQiOiJzLTEiLCJzdGF0dXMiOiJydW5uaW5nIiwiYXR0YWNoZWQiOnRydWUsImNvbHMiOjEwMCwicm93cyI6MzAsImNyZWF0ZWRfYXRfbXMiOjEyMzQ1Njc4OSwiZXhpdF9jb2RlIjpudWxsLCJlcnJvciI6bnVsbCwid29ya2luZ19kaXJlY3RvcnkiOnsicmVxdWVzdGVkIjoiQzpcXEFnZW50IFByb2plY3RzIiwicmVzb2x2ZWRfd3NsX3BhdGgiOiIvbW50L2MvQWdlbnQgUHJvamVjdHMiLCJkaXN0cmlidXRpb24iOiJVYnVudHUifX0sInNlcXVlbmNlIjoyNTZ9",
+      "value": {
+        "sequence": 256,
+        "session": {
+          "attached": true,
+          "cols": 100,
+          "created_at_ms": 123456789,
+          "error": null,
+          "exit_code": null,
+          "id": "s-1",
+          "rows": 30,
+          "status": "running",
+          "working_directory": {
+            "distribution": "Ubuntu",
+            "requested": "C:\\Agent Projects",
+            "resolved_wsl_path": "/mnt/c/Agent Projects"
+          }
+        },
+        "type": "attached"
+      }
+    },
+    {
+      "frame": "NQAAAAF7InJlcXVlc3RfaWQiOjUsInR5cGUiOiJkZXRhY2hlZCIsInNlc3Npb25faWQiOiJzLTEifQ==",
+      "value": {
+        "request_id": 5,
+        "session_id": "s-1",
+        "type": "detached"
+      }
+    },
+    {
+      "frame": "GQAAAAF7InR5cGUiOiJpbnB1dF9hY2NlcHRlZCJ9",
+      "value": {
+        "type": "input_accepted"
+      }
+    },
+    {
+      "frame": "NQAAAAF7InJlcXVlc3RfaWQiOjcsInR5cGUiOiJyZXNpemVkIiwiY29scyI6ODAsInJvd3MiOjI0fQ==",
+      "value": {
+        "cols": 80,
+        "request_id": 7,
+        "rows": 24,
+        "type": "resized"
+      }
+    },
+    {
+      "frame": "KgAAAAF7InR5cGUiOiJzbmFwc2hvdF9yZWFkeSIsInNlcXVlbmNlIjo2NTUzNn0=",
+      "value": {
+        "sequence": 65536,
+        "type": "snapshot_ready"
+      }
+    },
+    {
+      "frame": "OwAAAAF7InJlcXVlc3RfaWQiOjksInR5cGUiOiJraWxsX3JlcXVlc3RlZCIsInNlc3Npb25faWQiOiJzLTEifQ==",
+      "value": {
+        "request_id": 9,
+        "session_id": "s-1",
+        "type": "kill_requested"
+      }
+    },
+    {
+      "frame": "GgAAAAF7InR5cGUiOiJkYWVtb25fc3RvcHBpbmcifQ==",
+      "value": {
+        "type": "daemon_stopping"
+      }
+    },
+    {
+      "frame": "SwAAAAF7InJlcXVlc3RfaWQiOjExLCJ0eXBlIjoic2Vzc2lvbl9leGl0ZWQiLCJzZXNzaW9uX2lkIjoicy0yIiwiZXhpdF9jb2RlIjoxN30=",
+      "value": {
+        "exit_code": 17,
+        "request_id": 11,
+        "session_id": "s-2",
+        "type": "session_exited"
+      }
+    },
+    {
+      "frame": "SQAAAAF7InR5cGUiOiJlcnJvciIsImNvZGUiOiJpbmNvbXBhdGlibGVfcHJvdG9jb2wiLCJtZXNzYWdlIjoiZml4dHVyZSBlcnJvciJ9",
+      "value": {
+        "code": "incompatible_protocol",
+        "message": "fixture error",
+        "type": "error"
+      }
+    },
+    {
+      "frame": "UwAAAAF7InJlcXVlc3RfaWQiOjEzLCJ0eXBlIjoiZXJyb3IiLCJjb2RlIjoiaW52YWxpZF9yZXF1ZXN0IiwibWVzc2FnZSI6ImZpeHR1cmUgZXJyb3IifQ==",
+      "value": {
+        "code": "invalid_request",
+        "message": "fixture error",
+        "request_id": 13,
+        "type": "error"
+      }
+    },
+    {
+      "frame": "RQAAAAF7InR5cGUiOiJlcnJvciIsImNvZGUiOiJzZXNzaW9uX25vdF9mb3VuZCIsIm1lc3NhZ2UiOiJmaXh0dXJlIGVycm9yIn0=",
+      "value": {
+        "code": "session_not_found",
+        "message": "fixture error",
+        "type": "error"
+      }
+    },
+    {
+      "frame": "VAAAAAF7InJlcXVlc3RfaWQiOjE1LCJ0eXBlIjoiZXJyb3IiLCJjb2RlIjoiYWxyZWFkeV9hdHRhY2hlZCIsIm1lc3NhZ2UiOiJmaXh0dXJlIGVycm9yIn0=",
+      "value": {
+        "code": "already_attached",
+        "message": "fixture error",
+        "request_id": 15,
+        "type": "error"
+      }
+    },
+    {
+      "frame": "QAAAAAF7InR5cGUiOiJlcnJvciIsImNvZGUiOiJub3RfYXR0YWNoZWQiLCJtZXNzYWdlIjoiZml4dHVyZSBlcnJvciJ9",
+      "value": {
+        "code": "not_attached",
+        "message": "fixture error",
+        "type": "error"
+      }
+    },
+    {
+      "frame": "UgAAAAF7InJlcXVlc3RfaWQiOjE3LCJ0eXBlIjoiZXJyb3IiLCJjb2RlIjoic2Vzc2lvbl9leGl0ZWQiLCJtZXNzYWdlIjoiZml4dHVyZSBlcnJvciJ9",
+      "value": {
+        "code": "session_exited",
+        "message": "fixture error",
+        "request_id": 17,
+        "type": "error"
+      }
+    },
+    {
+      "frame": "PAAAAAF7InR5cGUiOiJlcnJvciIsImNvZGUiOiJpbnRlcm5hbCIsIm1lc3NhZ2UiOiJmaXh0dXJlIGVycm9yIn0=",
+      "value": {
+        "code": "internal",
+        "message": "fixture error",
+        "type": "error"
+      }
+    }
+  ]
+}

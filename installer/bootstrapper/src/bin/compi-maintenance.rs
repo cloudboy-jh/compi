@@ -2,7 +2,7 @@
 
 #[cfg(windows)]
 fn main() {
-    use compi::installer::InstallerOperation;
+    use compi_setup::installer::InstallerOperation;
 
     let mut args = std::env::args().skip(1);
     let mode = args.next();
@@ -28,7 +28,7 @@ fn main() {
     let delete_on_exit = (mode.as_deref() == Some("--remove-worker"))
         .then(|| std::env::current_exe().ok())
         .flatten();
-    compi::installer::run_product_action(product_code, operation);
+    compi_setup::installer::run_product_action(product_code, operation);
     if let Some(path) = delete_on_exit {
         schedule_self_delete(&path);
     }
@@ -37,8 +37,7 @@ fn main() {
 #[cfg(windows)]
 fn relaunch_remove_worker(product_code: &str) -> std::io::Result<()> {
     let source = std::env::current_exe()?;
-    let destination =
-        std::env::temp_dir().join(format!("Compi-Setup-{}.exe", std::process::id()));
+    let destination = std::env::temp_dir().join(format!("Compi-Setup-{}.exe", std::process::id()));
     std::fs::copy(source, &destination)?;
     std::process::Command::new(destination)
         .args(["--remove-worker", product_code])

@@ -5,7 +5,7 @@ static COMPI_MSI: &[u8] = include_bytes!("../payload/Compi.msi");
 
 #[cfg(windows)]
 fn main() {
-    use compi::installer::InstallerOperation;
+    use compi_setup::installer::InstallerOperation;
 
     let operation = match std::env::args().nth(1).as_deref() {
         None | Some("--install") => InstallerOperation::Install,
@@ -13,7 +13,7 @@ fn main() {
         Some("--remove") => InstallerOperation::Remove,
         Some(_) => std::process::exit(2),
     };
-    compi::installer::run(COMPI_MSI, operation);
+    compi_setup::installer::run(COMPI_MSI, operation);
 }
 
 #[cfg(not(windows))]

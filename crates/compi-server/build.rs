@@ -10,6 +10,6 @@ fn main() {
         resource.set("FileVersion", env!("CARGO_PKG_VERSION"));
         resource
             .compile()
-            .expect("failed to embed Compi Setup icon");
+            .expect("failed to embed Compi daemon resources");
     }
 }

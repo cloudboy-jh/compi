@@ -768,31 +768,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "compi"
+name = "compi-client-core"
 version = "0.1.0"
 dependencies = [
- "async-channel 2.5.0",
- "base64",
+ "compi-protocol",
+]
+
+[[package]]
+name = "compi-protocol"
+version = "0.1.0"
+dependencies = [
  "bincode",
- "flate2",
- "gpui",
- "image",
- "raw-window-handle",
  "serde",
  "serde_json",
- "smallvec",
  "smol_str",
- "unicode-width",
- "vte",
- "windows 0.62.2",
- "winresource",
 ]
 
 [[package]]
 name = "compi-setup"
 version = "0.1.0"
 dependencies = [
- "compi",
+ "async-channel 2.5.0",
+ "compi-client-core",
+ "gpui",
+ "windows 0.62.2",
  "winresource",
 ]
 
@@ -5103,16 +5102,6 @@ checksum = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150"
 dependencies = [
  "cc",
  "libc",
-]
-
-[[package]]
-name = "vte"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
-dependencies = [
- "arrayvec",
- "memchr",
 ]
 
 [[package]]

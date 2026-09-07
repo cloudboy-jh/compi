@@ -47,8 +47,29 @@ jobs:
       - name: Run strict Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Run all target tests
-        run: cargo test --all-targets
+      - name: Run workspace unit and example tests
+        run: cargo test --locked --workspace --lib --bins --examples
+
+      - name: Run wire and terminal boundary integration tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p compi-protocol --test wire_v7
+          if ($LASTEXITCODE -ne 0) { throw 'Wire compatibility tests failed' }
+          cargo test --locked -p compi-server --test terminal_compatibility
+          if ($LASTEXITCODE -ne 0) { throw 'Terminal boundary tests failed' }
+
+      - name: Run real daemon regressions when WSL is qualified
+        shell: pwsh
+        run: |
+          wsl.exe --exec true
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'MISSING COVERAGE: no working default WSL distribution; daemon runtime tests were not run.'
+            'WSL runtime: **unverified** — no working default distribution on this runner.' >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          cargo test --locked -p compi-server --test daemon_integration
+          if ($LASTEXITCODE -ne 0) { throw 'Windows/WSL daemon regressions failed' }
+          'WSL runtime: daemon integration regressions passed on this runner.' >> $env:GITHUB_STEP_SUMMARY
 
       - name: Build release binaries
         run: cargo build --release --bins

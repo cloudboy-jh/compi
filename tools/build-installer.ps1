@@ -13,8 +13,8 @@ if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $projectRoot 'target\distribution'
 }
 $manifest = Get-Content -Raw (Join-Path $projectRoot 'Cargo.toml')
-if ($manifest -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
-    throw 'Could not read the Compi version from Cargo.toml'
+if ($manifest -notmatch '(?ms)^\[workspace\.package\](?:(?!^\[).)*?^version\s*=\s*"([^"]+)"') {
+    throw 'Could not read the Compi workspace version from Cargo.toml'
 }
 $version = $Matches[1]
 $bootstrapperManifest = Get-Content -Raw (Join-Path $projectRoot 'installer\bootstrapper\Cargo.toml')
@@ -22,7 +22,7 @@ if ($bootstrapperManifest -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)
     throw "installer/bootstrapper/Cargo.toml must use Compi version $version"
 }
 if ($ExpectedTag -and $ExpectedTag -ne "v$version") {
-    throw "Release tag $ExpectedTag does not match Cargo package version $version"
+    throw "Release tag $ExpectedTag does not match Cargo workspace version $version"
 }
 if ($RequireSigning -and -not $SigningCertificateThumbprint) {
     throw 'A signing certificate thumbprint is required for this release build'
@@ -92,7 +92,7 @@ try {
     & dotnet tool restore
     if ($LASTEXITCODE -ne 0) { throw 'Failed to restore the pinned WiX tool' }
 
-    & cargo build --release --bin compi --bin compi-daemon --target-dir $productTarget
+    & cargo build --release -p compi-app -p compi-server --bin compi --bin compi-daemon --target-dir $productTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi product binaries' }
     Assert-FileVersion (Join-Path $productBin 'compi.exe')
     Assert-FileVersion (Join-Path $productBin 'compi-daemon.exe')

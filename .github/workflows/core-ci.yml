@@ -1,0 +1,76 @@
+name: Neutral core CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check neutral production and headless dependency boundaries
+        run: python tools/check-dependencies.py --target ${{ matrix.target }}
+      - name: Run neutral tests and captured v7 wire fixtures
+        run: cargo test --locked -p compi-protocol -p compi-terminal -p compi-client-core
+      - name: Run shared server and platform adapter unit tests
+        run: cargo test --locked -p compi-server --lib
+      - name: Verify engine-to-wire conversion and replica recovery
+        run: cargo test --locked -p compi-server --test terminal_compatibility
+      - name: Build headless native daemon and development probe
+        run: cargo build --locked -p compi-server --bin compi-daemon --example compi-probe
+      - name: Run real Unix PTY and persistent daemon regressions
+        if: runner.os != 'Windows'
+        run: cargo test --locked -p compi-server --test unix_daemon_integration
+      - name: Run Windows daemon regressions when WSL is qualified
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          wsl.exe --exec true
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'MISSING COVERAGE: no working default WSL distribution; daemon runtime tests were not run.'
+            'WSL runtime: **unverified** — no working default distribution on this runner.' >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          cargo test --locked -p compi-server --test daemon_integration
+          if ($LASTEXITCODE -ne 0) { throw 'Windows/WSL daemon regressions failed' }
+      - name: Lint neutral packages
+        run: cargo clippy --locked -p compi-protocol -p compi-terminal -p compi-client-core --all-targets -- -D warnings
+      - name: Build real Windows daemon without graphics setup
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release -p compi-server --bin compi-daemon
+
+  mac-client:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the native Mac application and sibling daemon
+        run: cargo build --locked -p compi-app -p compi-server --bins

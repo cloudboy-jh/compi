@@ -1,12 +1,55 @@
 # Compi Windows terminal test recipes
 
-These recipes describe the existing Windows/WSL implementation and its previous acceptance process. They are retained as regression inputs, not as the complete cross-platform acceptance matrix or current milestone ordering. The authoritative requirements are in [Spec.md](Spec.md); adapting this coverage is part of the [pending implementation work](NEXT_STEPS.md).
+These recipes describe the existing Windows/WSL implementation and its previous acceptance process, plus the native Unix/Mac bring-up commands below. They are retained as regression inputs, not the complete cross-platform acceptance matrix or current milestone ordering. The authoritative requirements are in [Spec.md](Spec.md); [Next steps](NEXT_STEPS.md) records implementation evidence and remaining native qualification.
 
 The procedures below use the current Windows commands and terminology. Use release builds for scripted and interactive checks and an isolated daemon instance for destructive lifecycle checks. Historical dimensions, limits, and artifact assumptions must be revisited when their implementation contracts change.
 
 ## Test environment record
 
 Record Windows build, WSL distribution and version, display scale, monitor refresh rate, Compi commit, build profile, and whether a warm daemon already existed. Run display checks at 100%, 150%, and the machine's normal scale when available.
+
+## Phase 1 dependency and compatibility checks
+
+The neutral packages can be tested on macOS, Linux, or Windows without GPUI or a PTY:
+
+```text
+cargo test --locked -p compi-protocol -p compi-terminal -p compi-client-core
+cargo test --locked -p compi-server --test terminal_compatibility
+```
+
+On native Windows, verify the headless build separately from application/installer setup:
+
+```powershell
+python tools/check-dependencies.py --target x86_64-pc-windows-msvc
+cargo build --locked --release -p compi-server --bin compi-daemon
+wsl.exe --exec true
+cargo test --locked -p compi-server --test daemon_integration
+```
+
+The daemon build does not require GPUI or `GPUI_FXC_PATH`. A failed WSL readiness check is missing runtime coverage, not a reason to count skipped daemon tests as passing. The commands in Tier 1 below require a working default WSL distribution for the full integration suite.
+
+## Phase 2 native Unix and Mac checks
+
+On macOS/Linux, build and exercise the real headless server without graphics dependencies:
+
+```sh
+cargo build --locked -p compi-server --bin compi-daemon --example compi-probe
+./target/debug/compi-daemon --check-system
+cargo test --locked -p compi-server --test unix_daemon_integration
+```
+
+On a Mac with Rust and Xcode/Metal tooling:
+
+```sh
+cargo build --locked -p compi-app -p compi-server --bins
+./target/debug/compi --instance development
+```
+
+In the window, record `echo $$`, set a shell variable, run Vim or another fullscreen program, and resize. Close the native window, then rerun the same command: the same live session/PID/variable must remain. Check Cmd-T/W/C/V, Ctrl-C, Option/dead keys, IME composition, traffic lights, titlebar dragging, font fallback, and scaling physically. The initial Mac pass verified text/resize/close callbacks through AppKit debugger injection, not the full physical-input matrix.
+
+An explicit `--working-directory /absolute/project/path` requests new work. Omit that option on ordinary reopen. Use an isolated instance for termination and crash scenarios; `compi-probe --instance development shutdown` intentionally ends all work in that instance.
+
+CI is configured to run the Unix integration suite natively on Mac/Linux. Windows/WSL tests still require a qualified Windows host. The Windows immediate-descendant ownership regression is part of `cargo test --locked -p compi-server --lib`; compiling it on another host does not qualify the retained ConPTY backend.
 
 ## Tier 1: automated regression
 

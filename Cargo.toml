@@ -1,10 +1,27 @@
-[package]
-name = "compi"
+[workspace]
+resolver = "3"
+members = [
+    "crates/compi-protocol",
+    "crates/compi-terminal",
+    "crates/compi-client-core",
+    "crates/compi-server",
+    "crates/compi-app",
+]
+default-members = [
+    "crates/compi-protocol",
+    "crates/compi-terminal",
+    "crates/compi-client-core",
+    "crates/compi-server",
+    "crates/compi-app",
+]
+exclude = ["installer/bootstrapper"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
 async-channel = "2.5"
 bincode = { version = "2.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -14,32 +31,8 @@ flate2 = "1.1"
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
 vte = "0.15"
-gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 smallvec = "1.15"
 smol_str = { version = "0.3", features = ["serde"] }
-raw-window-handle = "0.6"
-windows = { version = "0.62.2", features = [
-    "Wdk_System_SystemServices",
-    "Win32_Foundation",
-    "Win32_Globalization",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Console",
-    "Win32_System_IO",
-    "Win32_System_JobObjects",
-    "Win32_System_Memory",
-    "Win32_System_Pipes",
-    "Win32_System_Threading",
-    "Win32_System_SystemInformation",
-    "Win32_System_ProcessStatus",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_WindowsAndMessaging",
-] }
-
-[build-dependencies]
-winresource = "0.1"
 
 [profile.release]
 lto = "thin"
