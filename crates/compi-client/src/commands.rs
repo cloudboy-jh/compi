@@ -46,35 +46,35 @@ registry! {
     SwitchWorkspace, "switch_workspace", "Switch workspace", None, None;
     RenameWorkspace, "rename_workspace", "Rename workspace", None, None;
     RemoveWorkspace, "remove_workspace", "Remove workspace…", None, None;
-    NewTab, "new_tab", "New terminal tab", Some("cmd-t"), Some("ctrl-shift-t");
+    NewTab, "new_tab", "New terminal tab", Some("cmd-t"), Some("ctrl-t");
     SwitchTab, "switch_tab", "Switch terminal tab", None, None;
-    PreviousTab, "previous_tab", "Previous terminal tab", Some("cmd-shift-left"), Some("ctrl-shift-pageup");
-    NextTab, "next_tab", "Next terminal tab", Some("cmd-shift-right"), Some("ctrl-shift-pagedown");
+    PreviousTab, "previous_tab", "Previous terminal tab", Some("cmd-shift-left"), Some("ctrl-shift-tab");
+    NextTab, "next_tab", "Next terminal tab", Some("cmd-shift-right"), Some("ctrl-tab");
     RenameTab, "rename_tab", "Rename terminal tab", None, None;
     MoveTabLeft, "move_tab_left", "Move terminal tab left", Some("cmd-alt-shift-left"), Some("ctrl-shift-alt-left");
     MoveTabRight, "move_tab_right", "Move terminal tab right", Some("cmd-alt-shift-right"), Some("ctrl-shift-alt-right");
     RemoveTab, "remove_tab", "Remove terminal tab…", None, None;
-    DetachTab, "detach_tab", "Hide terminal tab (keep processes running)", Some("cmd-w"), Some("ctrl-shift-w");
-    RestoreHiddenTab, "restore_hidden_tab", "Restore hidden terminal tab", Some("cmd-shift-t"), None;
+    DetachTab, "detach_tab", "Hide terminal tab (keep processes running)", Some("cmd-w"), Some("ctrl-w");
+    RestoreHiddenTab, "restore_hidden_tab", "Restore hidden terminal tab", Some("cmd-shift-t"), Some("ctrl-shift-t");
     NewWindow, "new_window", "New window", Some("cmd-n"), Some("ctrl-shift-n");
     MoveTabToNewWindow, "move_tab_to_new_window", "Move terminal tab to new window", None, None;
     MoveTabToWindow, "move_tab_to_window", "Move terminal tab to another window", None, None;
-    SplitRight, "split_right", "Split right", Some("cmd-d"), Some("ctrl-shift-d");
-    SplitDown, "split_down", "Split down", Some("cmd-shift-d"), Some("ctrl-shift-e");
-    FocusLeft, "focus_left", "Focus pane left", Some("cmd-alt-left"), Some("ctrl-shift-left");
-    FocusRight, "focus_right", "Focus pane right", Some("cmd-alt-right"), Some("ctrl-shift-right");
-    FocusUp, "focus_up", "Focus pane above", Some("cmd-alt-up"), Some("ctrl-shift-up");
-    FocusDown, "focus_down", "Focus pane below", Some("cmd-alt-down"), Some("ctrl-shift-down");
-    ResizeSplitDecrease, "resize_split_decrease", "Move divider toward first pane", Some("cmd-alt-minus"), Some("ctrl-shift-alt-minus");
-    ResizeSplitIncrease, "resize_split_increase", "Move divider toward second pane", Some("cmd-alt-equal"), Some("ctrl-shift-alt-equal");
+    SplitRight, "split_right", "Split right", Some("cmd-d"), Some("alt-shift-plus");
+    SplitDown, "split_down", "Split down", Some("cmd-shift-d"), Some("alt-shift-minus");
+    FocusLeft, "focus_left", "Focus pane left", Some("cmd-alt-left"), Some("alt-left");
+    FocusRight, "focus_right", "Focus pane right", Some("cmd-alt-right"), Some("alt-right");
+    FocusUp, "focus_up", "Focus pane above", Some("cmd-alt-up"), Some("alt-up");
+    FocusDown, "focus_down", "Focus pane below", Some("cmd-alt-down"), Some("alt-down");
+    ResizeSplitDecrease, "resize_split_decrease", "Move divider toward first pane", Some("cmd-alt-minus"), Some("alt-shift-left");
+    ResizeSplitIncrease, "resize_split_increase", "Move divider toward second pane", Some("cmd-alt-equal"), Some("alt-shift-right");
     ResetSplitRatio, "reset_split_ratio", "Equalize focused split", None, None;
-    RemovePane, "remove_pane", "Remove pane…", None, None;
+    RemovePane, "remove_pane", "Remove pane…", None, Some("ctrl-shift-w");
     EndSurface, "end_surface", "End surface process…", None, None;
     RestartSurface, "restart_surface", "Restart exited, failed, or lost surface", None, None;
     ToggleSidebar, "toggle_sidebar", "Show/hide workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");
     ResetSidebarWidth, "reset_sidebar_width", "Reset sidebar width", None, None;
     Copy, "copy", "Copy selection", Some("cmd-c"), Some("ctrl-shift-c");
-    Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-shift-v");
+    Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-v");
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-shift-equal");
@@ -386,6 +386,38 @@ pub fn resolve_key(
     }
     if platform == Platform::Windows
         && key.control
+        && key.shift
+        && !key.alt
+        && !key.command
+        && key.key.eq_ignore_ascii_case("v")
+        && !overrides.contains_key("paste")
+    {
+        return route_command(Command::Paste, context);
+    }
+    if platform == Platform::Windows
+        && key.shift
+        && !key.control
+        && !key.alt
+        && !key.command
+        && key.key.eq_ignore_ascii_case("insert")
+        && !overrides.contains_key("paste")
+    {
+        return route_command(Command::Paste, context);
+    }
+    if platform == Platform::Windows
+        && key.control
+        && !key.shift
+        && !key.alt
+        && !key.command
+        && key.key.eq_ignore_ascii_case("insert")
+        && context.has_selection
+        && !overrides.contains_key("copy")
+    {
+        return route_command(Command::Copy, context);
+    }
+
+    if platform == Platform::Windows
+        && key.control
         && !key.shift
         && !key.alt
         && !key.command
@@ -397,6 +429,39 @@ pub fn resolve_key(
             KeyRoute::Terminal
         };
     }
+    if platform == Platform::Windows && key.alt && !key.control && !key.command {
+        let command = if key.key == "+"
+            || (key.shift
+                && ["plus", "equal", "="]
+                    .iter()
+                    .any(|candidate| key.key.eq_ignore_ascii_case(candidate)))
+        {
+            Some((Command::SplitRight, "split_right"))
+        } else if key.key == "_"
+            || (key.shift
+                && ["minus", "-"]
+                    .iter()
+                    .any(|candidate| key.key.eq_ignore_ascii_case(candidate)))
+        {
+            Some((Command::SplitDown, "split_down"))
+        } else if key.shift
+            && (key.key.eq_ignore_ascii_case("left") || key.key.eq_ignore_ascii_case("up"))
+        {
+            Some((Command::ResizeSplitDecrease, "resize_split_decrease"))
+        } else if key.shift
+            && (key.key.eq_ignore_ascii_case("right") || key.key.eq_ignore_ascii_case("down"))
+        {
+            Some((Command::ResizeSplitIncrease, "resize_split_increase"))
+        } else {
+            None
+        };
+        if let Some((command, binding_id)) = command
+            && !overrides.contains_key(binding_id)
+        {
+            return route_command(command, context);
+        }
+    }
+
     for spec in REGISTRY {
         if overrides.contains_key(spec.id) {
             continue;
@@ -556,7 +621,12 @@ mod tests {
             has_pane: true,
             workspace_count: 1,
             tab_count: 2,
+            hidden_tab_count: 1,
             pane_count: 2,
+            focus_left: true,
+            focus_right: true,
+            focus_up: true,
+            focus_down: true,
             terminal_available: true,
             can_paste: true,
             surface_status: Some(SurfaceStatus::Running),
@@ -574,28 +644,155 @@ mod tests {
     }
 
     #[test]
-    fn control_stays_terminal_input_except_windows_selection_copy() {
+    fn windows_native_shortcuts_and_terminal_control_routing() {
         let mut context = ready();
         let bindings = HashMap::new();
-        for platform in [Platform::Windows, Platform::Mac] {
-            for key in ["t", "w", "v", "a", "c", "d"] {
-                assert_eq!(
-                    resolve_key(
-                        platform,
-                        ctrl(key),
-                        InputOwner::Terminal,
-                        &context,
-                        &bindings
-                    ),
-                    KeyRoute::Terminal
-                );
-            }
+        for key in ["t", "w", "a", "c", "d"] {
+            assert_eq!(
+                resolve_key(
+                    Platform::Mac,
+                    ctrl(key),
+                    InputOwner::Terminal,
+                    &context,
+                    &bindings
+                ),
+                KeyRoute::Terminal
+            );
         }
+        for key in ["a", "c", "d"] {
+            assert_eq!(
+                resolve_key(
+                    Platform::Windows,
+                    ctrl(key),
+                    InputOwner::Terminal,
+                    &context,
+                    &bindings
+                ),
+                KeyRoute::Terminal
+            );
+        }
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ctrl("t"),
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::NewTab)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ctrl("w"),
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::DetachTab)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ctrl("tab"),
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::NextTab)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ShortcutKey {
+                    shift: true,
+                    ..ctrl("tab")
+                },
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::PreviousTab)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ShortcutKey {
+                    shift: true,
+                    ..ctrl("t")
+                },
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::RestoreHiddenTab)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ctrl("v"),
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::Paste)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ShortcutKey {
+                    shift: true,
+                    ..ctrl("v")
+                },
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::Paste)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ShortcutKey {
+                    key: "insert",
+                    shift: true,
+                    ..ShortcutKey::default()
+                },
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::Paste)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Mac,
+                ctrl("v"),
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Terminal
+        );
         context.has_selection = true;
         assert_eq!(
             resolve_key(
                 Platform::Windows,
                 ctrl("c"),
+                InputOwner::Terminal,
+                &context,
+                &bindings
+            ),
+            KeyRoute::Command(Command::Copy)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ShortcutKey {
+                    key: "insert",
+                    control: true,
+                    ..ShortcutKey::default()
+                },
                 InputOwner::Terminal,
                 &context,
                 &bindings
@@ -643,6 +840,73 @@ mod tests {
     }
 
     #[test]
+    fn windows_pane_shortcuts_follow_windows_terminal() {
+        let context = ready();
+        let bindings = HashMap::new();
+        let route = |key| {
+            resolve_key(
+                Platform::Windows,
+                key,
+                InputOwner::Terminal,
+                &context,
+                &bindings,
+            )
+        };
+        let alt = |key| ShortcutKey {
+            key,
+            alt: true,
+            ..ShortcutKey::default()
+        };
+        let alt_shift = |key| ShortcutKey {
+            shift: true,
+            ..alt(key)
+        };
+
+        // GPUI encodes Shift into printable punctuation on Windows.
+        assert_eq!(route(alt("+")), KeyRoute::Command(Command::SplitRight));
+        assert_eq!(route(alt("_")), KeyRoute::Command(Command::SplitDown));
+        assert_eq!(route(alt("=")), KeyRoute::Terminal);
+        assert_eq!(route(alt("-")), KeyRoute::Terminal);
+        assert_eq!(
+            route(alt_shift("plus")),
+            KeyRoute::Command(Command::SplitRight)
+        );
+        assert_eq!(
+            route(alt_shift("minus")),
+            KeyRoute::Command(Command::SplitDown)
+        );
+        assert_eq!(route(alt("left")), KeyRoute::Command(Command::FocusLeft));
+        assert_eq!(route(alt("right")), KeyRoute::Command(Command::FocusRight));
+        assert_eq!(route(alt("up")), KeyRoute::Command(Command::FocusUp));
+        assert_eq!(route(alt("down")), KeyRoute::Command(Command::FocusDown));
+        assert_eq!(
+            route(alt_shift("left")),
+            KeyRoute::Command(Command::ResizeSplitDecrease)
+        );
+        assert_eq!(
+            route(alt_shift("up")),
+            KeyRoute::Command(Command::ResizeSplitDecrease)
+        );
+        assert_eq!(
+            route(alt_shift("right")),
+            KeyRoute::Command(Command::ResizeSplitIncrease)
+        );
+        assert_eq!(
+            route(alt_shift("down")),
+            KeyRoute::Command(Command::ResizeSplitIncrease)
+        );
+        assert_eq!(
+            route(ShortcutKey {
+                key: "w",
+                control: true,
+                shift: true,
+                ..ShortcutKey::default()
+            }),
+            KeyRoute::Command(Command::RemovePane)
+        );
+    }
+
+    #[test]
     fn overlay_and_explicit_override_precedence_is_deterministic() {
         let context = ready();
         let overrides = HashMap::from([
@@ -687,10 +951,7 @@ mod tests {
         assert_eq!(
             resolve_key(
                 Platform::Windows,
-                ShortcutKey {
-                    shift: true,
-                    ..ctrl("t")
-                },
+                ctrl("t"),
                 InputOwner::Terminal,
                 &context,
                 &overrides

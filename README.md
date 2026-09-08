@@ -28,7 +28,7 @@ The Cargo workspace has three product crates: `compi-protocol` owns the shared p
 - Create, rename, reorder, hide, and restore terminal tabs; browse named workspaces in the optional sidebar.
 - Split right/down, move pane focus, and drag dividers. Small windows scroll the complete layout instead of rewriting it or automatically collapsing the sidebar.
 - Drag a tab out to create a native window, or drop it into another Compi window. The same tab, panes, and processes move; ordinary same-instance launches share one GUI host.
-- Window close and tab hide detach without ending processes. End, restart, and confirmed removal are separate actions; exited output remains available for inspection.
+- Window close and Ctrl-W tab hide detach without ending processes. A tab's close control requests confirmed removal and process termination; explicit End and Restart remain available for individual panes, and exited output remains readable.
 - Window slots remember geometry, navigation, hidden tabs, sidebar width, zoom, accepted theme, and provably valid viewport anchors. Every new/reopened window starts with its sidebar closed.
 - **Appearance…** and the palette's **Change theme** open one live-preview picker. Dark Glass is the default; Warm Carbon is optional. Escape cancels, Enter/Apply accepts. Glass is limited to chrome/sidebar, with opaque fallbacks; terminal canvases remain opaque.
 
@@ -91,7 +91,7 @@ Use `--config PATH` or `COMPI_CONFIG_FILE` to select another file. Invocation-lo
 Launch configuration uses `[shell]` (`executable`, `args`, `login`, `working_directory`, `distribution`), `[environment]`, and optional `[profiles.NAME]` selected by `default_profile`. Explicit program arguments remain literal; environment overrides are not persisted in workspace metadata. Named profiles override base launch fields/environment. `[keybindings]` maps command IDs (for example `split_right`) to shortcuts; an empty binding unbinds a command. Scrollback also retains its fixed 1 MiB byte bound; supported graphics storage is 0–4 MiB.
 
 
-Mac shortcuts include Cmd-T/W (new/hide tab), Cmd-D / Cmd-Shift-D (split right/down), Cmd-B (sidebar), Cmd-Shift-P (palette), Cmd-C/V, and Cmd-Q. Windows uses Ctrl-Shift-T/W, Ctrl-Shift-D/E, Ctrl-Shift-B, and Ctrl-Shift-P. Windows Ctrl-C copies a nonempty selection, otherwise sends terminal interrupt; Ctrl-Shift-C/V are explicit copy/paste. Palette/picker navigation does not leak into the terminal.
+Mac shortcuts include Cmd-T/W (new/hide tab), Cmd-D / Cmd-Shift-D (split right/down), Cmd-B (sidebar), Cmd-Shift-P (palette), Cmd-C/V, and Cmd-Q. Windows uses Ctrl-T/W for new/hide tab, Ctrl-Tab / Ctrl-Shift-Tab to cycle tabs, and Ctrl-Shift-T to restore a hidden tab. Windows pane controls match Windows Terminal: Alt-Shift-Plus/Minus split right/down, Alt-Arrow moves focus, Alt-Shift-Arrow resizes, and Ctrl-Shift-W removes the focused pane with confirmation. Native editing behavior includes selection-aware Ctrl-C, Ctrl-Insert copy, Ctrl-V / Shift-Insert paste, and Ctrl-Backspace previous-word deletion. Palette/picker navigation does not leak into the terminal.
 
 Mac metadata and diagnostic logs live under `~/Library/Application Support/Compi`; Linux uses `$XDG_STATE_HOME/compi` or `~/.local/state/compi`. Unix sockets use `$XDG_RUNTIME_DIR/compi` or a private `/tmp/compi-UID` directory. `COMPI_DATA_DIR` and `COMPI_RUNTIME_DIR` override those locations for isolated runs; overrides must be absolute, current-user-owned private directories.
 

@@ -79,9 +79,9 @@ const WINDOW_CONTROLS_WIDTH: f32 = 138.0;
 #[cfg(target_os = "macos")]
 const WINDOW_CONTROLS_WIDTH: f32 = 0.0;
 #[cfg(windows)]
-const TITLEBAR_BRAND_WIDTH: f32 = 40.0;
+const TITLEBAR_BRAND_WIDTH: f32 = 80.0;
 #[cfg(target_os = "macos")]
-const TITLEBAR_BRAND_WIDTH: f32 = 118.0;
+const TITLEBAR_BRAND_WIDTH: f32 = 158.0;
 #[cfg(windows)]
 const UI_FONT: &str = "Segoe UI";
 #[cfg(target_os = "macos")]
@@ -810,6 +810,8 @@ impl CompiApp {
 #[derive(Clone, Copy)]
 enum ChromeIcon {
     Mark,
+    Sidebar,
+    Add,
     Minimize,
     Maximize,
     Close,
@@ -829,8 +831,21 @@ fn chrome_icon(icon: ChromeIcon, tint: Hsla) -> impl IntoElement {
                     path.line_to(point(x(14.0), y(8.0)));
                     path.line_to(point(x(8.0), y(13.0)));
                     path.line_to(point(x(2.0), y(8.0)));
-                    path.move_to(point(x(6.0), y(11.0)));
-                    path.line_to(point(x(10.0), y(5.0)));
+                }
+                ChromeIcon::Sidebar => {
+                    path.move_to(point(x(2.5), y(3.0)));
+                    path.line_to(point(x(13.5), y(3.0)));
+                    path.line_to(point(x(13.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(3.0)));
+                    path.move_to(point(x(6.0), y(3.0)));
+                    path.line_to(point(x(6.0), y(13.0)));
+                }
+                ChromeIcon::Add => {
+                    path.move_to(point(x(3.0), y(8.0)));
+                    path.line_to(point(x(13.0), y(8.0)));
+                    path.move_to(point(x(8.0), y(3.0)));
+                    path.line_to(point(x(8.0), y(13.0)));
                 }
                 ChromeIcon::Minimize => {
                     path.move_to(point(x(3.0), y(11.0)));

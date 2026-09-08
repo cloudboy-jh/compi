@@ -74,7 +74,7 @@ Set `GPUI_FXC_PATH` as described below. First launch creates one shell; later wi
 8. Flood one pane with `yes` while typing/navigating another. End a surface with an owned background child, inspect its final output, restart explicitly, and remove a pane/tab/workspace with the appropriate confirmation.
 9. In an isolated state directory, exercise slot contention and failed atomic state writes. Failed window transfer retains the source; failed preference saving remains visibly unsaved without disabling the live presentation; a later successful save clears that warning.
 
-Windows shortcuts: Ctrl-Shift-T/W, Ctrl-Shift-D/E, Ctrl-Shift-B, Ctrl-Shift-P. Mac: Cmd-T/W, Cmd-D / Cmd-Shift-D, Cmd-B, Cmd-Shift-P. Physical input, IME, scaling/display pacing, and native Mac execution require separate attributed qualification; synthetic Win32 input is not that proof.
+Windows shortcuts: Ctrl-T/W, Ctrl-Tab / Ctrl-Shift-Tab, Ctrl-Shift-T restore, Alt-Shift-Plus/Minus split right/down, Alt-Arrow pane focus, Alt-Shift-Arrow pane resize, Ctrl-Shift-W remove pane, Ctrl-Shift-B sidebar, Ctrl-Shift-P palette. Mac: Cmd-T/W, Cmd-D / Cmd-Shift-D, Cmd-B, Cmd-Shift-P. Physical input, IME, scaling/display pacing, and native Mac execution require separate attributed qualification; synthetic Win32 input is not that proof.
 
 ## Tier 1: automated regression
 
@@ -97,7 +97,7 @@ if (-not $fxc) { throw "fxc.exe was not found below $sdkRoot" }
 $env:GPUI_FXC_PATH = $fxc.FullName
 ```
 
-`GPUI_FXC_PATH` must name `fxc.exe`, not its containing directory. The Windows CI workflow uses the same discovery rule.
+`GPUI_FXC_PATH` must name `fxc.exe`, not its containing directory. Native Windows builds and the tag-triggered release workflow use this discovery rule.
 
 Required result: every command exits zero. The release directory contains `compi.exe` and `compi-daemon.exe`; it does not contain `compi-probe.exe`.
 
@@ -190,12 +190,14 @@ The approximate 376 ms warm first-window, 544 ms warm ready-for-input, 153 ms in
 | Area | Procedure | Required result |
 |---|---|---|
 | Shell control | Verify command echo, `Ctrl+D`, `Ctrl+Z`, `bg`, and `fg`; run sustained output and press `Ctrl+C` with no selection. | Bash semantics match a native WSL terminal. With no selection, `Ctrl+C` sends `0x03`, stops output promptly, and returns one clean prompt. |
+| Windows keyboard | Type several words and press `Ctrl+Backspace`; repeat copy/paste with `Ctrl+Insert` and `Shift+Insert`. | `Ctrl+Backspace` removes the preceding word, selection copy reaches the clipboard, and paste inserts the exact clipboard contents without an extra newline. |
 | TUI applications | Exercise `htop` or `btop`, `vim` or `nvim`, `less`, `tmux`, and `fzf` with inline preview. | Alternate-screen transitions, cursor, mouse, keyboard, and redraw behavior remain correct. |
-| Selection and clipboard | Select single-line, wrapped, multiline, CJK, and combining-mark text. Press `Ctrl+C` while a foreground process runs, then repeat with `Ctrl+Shift+C`; paste the results. | `Ctrl+C` copies a non-empty selection without sending PTY input or interrupting the process. Both shortcuts copy the exact logical text, and paste honors bracketed-paste mode. |
+| Selection and clipboard | Select single-line, wrapped, multiline, CJK, and combining-mark text. Press `Ctrl+C` while a foreground process runs, then repeat with `Ctrl+Shift+C`; paste with both `Ctrl+V` and `Ctrl+Shift+V`. | `Ctrl+C` copies a non-empty selection without sending PTY input or interrupting the process. Both copy shortcuts preserve the exact logical text, both paste shortcuts insert the clipboard, and paste honors bracketed-paste mode. |
 | Scrollback resize | Scroll several pages up, resize wider and narrower, then return to bottom. | Viewport stays anchored to the same logical content; no jump to bottom, overlap, or stale cells. |
-| Tabs | Create multiple sessions, switch rapidly, close active and inactive tabs, and overflow the available titlebar width. | Active state is unambiguous; tabs remain reachable without permanent arrow controls; close appears only where intended. |
-| Session palette | Open the command control, switch to an open tab, attach a detached session, create a session, and inspect exited/failed sessions. End one attached and one detached session through the inline confirmation. | Every state is represented accurately. End session terminates the shell and descendants, shows `Ending…`, updates lifecycle state, and closes an attached tab only after exit. |
-| Detach versus terminate | Close an active tab, close the client with live sessions, reopen, and reattach; separately use `End session` from the session list. | Tab and client close preserve live sessions. Only the confirmed session-list action terminates a session. |
+| Tabs | Create tabs with `Ctrl+T`, cycle with `Ctrl+Tab` and `Ctrl+Shift+Tab`, hide one with `Ctrl+W`, restore it with `Ctrl+Shift+T`, close active and inactive tabs through their close controls, and overflow the available titlebar width. | The shortcuts select the expected tab without leaking input into its shell. The Compi terminal mark remains visible beside the sidebar toggle; fallback labels are concise; close always confirms before ending processes and removing the tab. |
+| Panes | Split with `Alt+Shift+Plus` and `Alt+Shift+Minus`; move focus with `Alt+Arrow`; resize with `Alt+Shift+Arrow`; press `Ctrl+Shift+W` on a disposable pane. | Splits open right/down, focus and the divider move in the requested direction, and pane removal requires confirmation without affecting another pane. |
+| Session palette | Open the command palette, switch to an open tab, attach a detached session, create a session, and inspect exited/failed sessions. End one attached and one detached session through confirmation. | Every state is represented accurately. End surface terminates the shell and descendants, shows `Ending…`, and retains the final readable grid. |
+| Detach versus terminate | Hide an active tab with `Ctrl+W`, close the client with live sessions, reopen and restore the tab; separately use the tab close control and confirm removal. | Hide and client close preserve live sessions. Confirmed tab close terminates its process trees and removes the tab. |
 | Window chrome | Drag from the mark, unused header space, and a tab; double-click unused header space; use minimize, maximize/restore, and close. | Native movement starts only after the drag threshold; controls never trigger dragging; maximize and restore match Windows behavior. |
 | Persistence | Open two sessions, detach both, close the client, reopen, and attach in reverse order. | Shells keep running; state does not cross between sessions. |
 | Failure handling | Abruptly terminate an isolated daemon, restart it, and inspect stale sessions; attempt a second daemon launch. | Stale sessions report dead and cannot attach; second daemon fails clearly; no live production session is affected. |

@@ -41,6 +41,15 @@ pub fn encode_keystroke(
         return Some(encode_application_keypad(keypad));
     }
 
+    if keystroke.key == "backspace" && keystroke.modifiers.control {
+        let mut bytes = Vec::with_capacity(1 + usize::from(keystroke.modifiers.alt));
+        if keystroke.modifiers.alt {
+            bytes.push(0x1b);
+        }
+        bytes.push(0x17);
+        return Some(bytes);
+    }
+
     let key = keystroke.key;
     let modifier = xterm_modifier(&keystroke.modifiers);
     let special = match key {
@@ -339,6 +348,18 @@ mod tests {
             key_char: None,
         };
         assert_eq!(encode_keystroke(&ctrl_space, false, None), Some(vec![0]));
+        let ctrl_backspace = Key {
+            modifiers: Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "backspace",
+            key_char: None,
+        };
+        assert_eq!(
+            encode_keystroke(&ctrl_backspace, false, None),
+            Some(vec![0x17])
+        );
         assert_eq!(
             encode_keystroke(&space, false, Some(KeypadKey::Digit(7))),
             Some(b"\x1bOw".to_vec())

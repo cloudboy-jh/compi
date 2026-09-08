@@ -1,6 +1,6 @@
 # Compi next steps
 
-The Phase 4 workspace client is implemented on top of Phases 0–3. Native Windows/WSL workspace verification passed; native Mac workspace qualification, Linux native CI, and remaining physical-input/display/resource gates are still open. Earlier platform evidence and its limits are retained below.
+The Phase 4 workspace client is implemented on top of Phases 0–3. Native Windows/WSL workspace qualification passed, and the current Windows terminal interaction pass is complete; native Mac workspace qualification, Linux native CI, performance/resource measurement, and remaining physical-input/display gates are still open. Earlier platform evidence and its limits are retained below.
 
 ## Completed: Phase 0 — implementation contracts
 
@@ -23,7 +23,7 @@ The code changes in [Phase 1](Spec.md#1-extract-the-neutral-foundation) are impl
 - Extracted pure input/mouse/paste/focus encoding, selection, viewport lookup, hyperlink policy, and shared theme constants into the client without compatibility shims.
 - Kept engine-to-wire conversion at the daemon boundary without additional grid copies. The daemon's production dependencies contain no GPUI, client application, or installer package.
 - Moved installer UI into its existing isolated `installer/bootstrapper` package. Preserved its locked registry versions while updating local package dependencies.
-- Added [three-host neutral CI](../.github/workflows/core-ci.yml), including v7 fixtures, replica recovery, resolved dependency-boundary checks, and a native Windows daemon build without graphics setup. [Windows CI](../.github/workflows/windows-ci.yml) retains product build/installer checks and explicitly reports unavailable WSL runtime coverage.
+- Added [three-host neutral CI](../.github/workflows/core-ci.yml), including v7 fixtures, replica recovery, resolved dependency-boundary checks, and a native Windows daemon build without graphics setup. The unreliable standalone hosted Windows product/installer workflow was removed; native Windows product verification remains in [the acceptance recipes](testcmds.md), while signed distribution remains tag-triggered in `windows-release.yml`.
 
 ### Verification from this pass
 
@@ -149,7 +149,7 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 Steps 1–5 are implemented. The Windows portion of step 6 passed; native Mac execution remains unavailable in this environment.
 
 1. **Workspace views and window state.** Replace the flat one-surface-per-UI-tab model with server-backed sessions, tabs, split trees, and independent surface views. Implement exclusively locked durable window slots, hidden membership, deterministic navigation fallback, state/config/CLI precedence, and lifetime-safe anchor restoration. Preserve the existing renderer, typography, input, and bounded replicas.
-2. **Primary tabs and secondary sidebar.** Build the window shell with theme tokens and Dark Glass styling from the start. Deliver top terminal tabs, expandable workspace browsing, tab reorder/hide/restore, manual sidebar toggle/resize/reset, and explicit empty/disconnected/exited/failed/ending/lost/conflict states. Restore the workspace's last selected tab/pane on switching; keep the sidebar hidden until summoned. Keep close/hide non-destructive; expose end, restart, and confirmed removal separately. No navigation action may implicitly create a replacement shell.
+2. **Primary tabs and secondary sidebar.** Build the window shell with theme tokens and Dark Glass styling from the start. Deliver top terminal tabs, expandable workspace browsing, tab reorder/hide/restore, manual sidebar toggle/resize/reset, and explicit empty/disconnected/exited/failed/ending/lost/conflict states. Restore the workspace's last selected tab/pane on switching; keep the sidebar hidden until summoned. Keep window close and explicit hide non-destructive; make tab close a confirmed removal action, and expose end/restart separately. No navigation action may implicitly create a replacement shell.
 3. **Nested splits and overflow.** Render all panes of the selected tab; add Split right/down, directional focus, draggable/keyboard-resizable dividers, and equalization. Enforce recursive 20-column by 4-row canvas minima using measured typography. Overflow scrolls the workspace without changing saved ratios, auto-collapsing the sidebar, or zooming panes. Coalesce PTY resizes; cancel stale drags and restore committed geometry on failure.
 4. **Tab tear-off and cross-window transfer.** Implement drag previews, insertion targets, new-window creation, and drop into existing windows of the same server instance. Reuse one handoff path; preserve full split trees and process identities, reconcile source/destination hidden membership, and handle cancellation, destination failure, and attachment conflicts without stealing control. Reopen transferred work from its remembered destination window.
 5. **Commands, configuration, and appearance.** Introduce one typed command registry as earlier actions land, then complete the palette, menus, platform shortcuts, and existing versioned TOML contract. Complete Dark Glass and Warm Carbon presets through one keyboard-accessible live-preview picker coordinating chrome, terminal background/text, borders, focus, selection, cursor, and ANSI colors. Only acceptance persists; terminal canvases stay opaque and chrome materials have readable opaque/reduced-transparency fallbacks.
@@ -195,6 +195,15 @@ Native evidence used Windows 11 x64, release builds, Windows SDK `fxc.exe`, WSL2
 
 Runtime verification found and fixed a GPUI animation request outside a render callback, divider conflicts caused by preview resize metadata, required-name validation incorrectly rejecting automatic terminal titles, false EOF on idle Windows GUI-host pipes, late close-state saving, and the live-to-read-only attachment transition. Focused regressions and the native reproductions cover the relevant boundaries; temporary smoke programs were removed after verification.
 
+### Windows terminal interaction refinement — 2026-09-08
+
+- Restored the original Compi mark at the far left, gave the sidebar its own icon, removed the redundant pane path/status header, collapsed path-only tab titles to their basename, and replaced the new-terminal text glyph with a vector plus.
+- Added native Windows editing behavior: `Ctrl+V` and `Ctrl+Shift+V` paste, `Shift+Insert` pastes, `Ctrl+Insert` copies, selection-aware `Ctrl+C` copies without stealing shell interrupts, and `Ctrl+Backspace` deletes the previous shell word.
+- Aligned tab behavior with Windows conventions: `Ctrl+T` creates, `Ctrl+Tab` and `Ctrl+Shift+Tab` navigate, `Ctrl+W` hides, and `Ctrl+Shift+T` restores hidden tabs.
+- Aligned pane behavior with Windows Terminal conventions: `Alt+Shift+Plus` splits right, `Alt+Shift+Minus` splits down, `Alt+Arrow` focuses, `Alt+Shift+Arrow` resizes, and `Ctrl+Shift+W` removes the focused pane after confirmation. The router accounts for GPUI folding Shift into printable `+` and `_` key values without binding plain `Alt+=` or `Alt+-`.
+- Targeted Win32 input through the actual GPUI window verified tab create/navigation/hide/restore, split-right, split-down, directional pane focus, a ratio change from 0.50 to 0.55, and confirmed pane removal. `PrintWindow` captures verified the revised chrome and focus movement. This is native event-path evidence, not physical-keyboard or IME qualification.
+- `cargo fmt --all -- --check`, warning-denied workspace Clippy, and all 99 workspace tests passed. The upstream `proc-macro-error2` future-compatibility notice remains.
+
 ### Remaining qualification
 
 1. Build and exercise the full workspace client on a native Mac. No Mac SDK/runtime or configured SSH host was available here.
@@ -204,7 +213,7 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 
 ## Current implementation: native refinement status
 
-**Status:** typography and glyph integration implemented; interaction refinement and full native qualification remain. The terminal now derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. Ghostty-like terminal tabs and a secondary Superterminal-style sidebar are now the chosen navigation direction; the preferred reference font and specific interaction roughness remain unqualified.
+**Status:** typography and glyph integration are implemented, and the current Windows terminal interaction pass is complete. Performance/resource measurement, native Mac workspace qualification, and the remaining physical-input/display matrix remain. The terminal derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. Ghostty-like terminal tabs and the secondary Superterminal-style sidebar are implemented.
 
 ### Completed — 2026-09-07
 
@@ -215,7 +224,7 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - Kept the bounded row-shaping cache and invalidated it when display scale changes. Native UI chrome continues to use the system font.
 - Verified the Mac build, all 54 workspace tests, warning-free workspace Clippy, diff hygiene, first terminal frame, and an AppKit event-loop smoke. Pixel-level comparison and physical-input qualification remain blocked by unavailable screen-capture/accessibility permissions.
 
-**Next:** qualify the implemented workspace client on Mac and continue Phase 5, retaining the remaining visual, physical-input, and interaction checks as explicit open gates.
+**Next:** measure interaction latency, frame pacing, and resource behavior under sustained terminal output; qualify the complete workspace client on Mac; then continue Phase 5 dogfooding while retaining physical-key, IME, font, and mixed-display checks as explicit gates.
 
 ### 1. Establish the typography and glyph baseline — implementation complete, visual selection pending
 
@@ -238,13 +247,12 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - Preserve grapheme clusters, combining marks, emoji variation selectors/ZWJ sequences, and narrow/wide cell behavior. Fix the actual failing layer; do not replace unknown symbols with substitutes.
 - Acceptance: the user's real shell path/prompt renders without missing-glyph boxes for supported symbols, and mixed text/icons/emoji do not overlap, clip, or shift the cursor. Copy/selection returns the original text.
 
-### 4. Separate latency from interaction roughness, then fix both
+### 4. Separate latency from interaction roughness — native control pass complete, measurements pending
 
 - Measure key receipt → PTY → replica → presentation, plus scroll/resize/frame pacing under idle and sustained-output workloads. Record build/display context and compare the same workload before/after; do not label startup timings as input latency.
 - Fix demonstrated stalls, unnecessary shaping/allocation, repaint scheduling, or queue behavior only where evidence points. Keep caches and transport queues bounded; no terminal-engine rewrite.
-- Refine native focus, tab activation/close, titlebar controls/dragging, scroll behavior, and resize coalescing. Preserve Cmd application shortcuts and Ctrl terminal semantics.
-- Do not add decorative animation to disguise stalls, or silently bundle splits, a palette redesign, or themes into this pass.
-- Acceptance: responsive typing during output, predictable focus/tab actions, smooth scrolling/resizing without duplicate input, flicker, or shell restarts.
+- The Windows native control pass now covers paste/copy/word deletion, tab create/navigation/hide/restore, pane split/focus/resize/removal, title semantics, sidebar identity, and new-terminal affordance. Preserve these contracts while qualifying Mac behavior.
+- Remaining acceptance: responsive typing during sustained output, smooth scrolling/resizing without duplicate input or flicker, and attributable latency/frame/resource measurements.
 
 ### 5. Qualify the refined Mac client
 
@@ -260,7 +268,7 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - Typography and glyph integration are implemented. Do not restart that work without a demonstrated rendering failure; retain the user's font selection and Mac physical-input matrix as qualification tasks.
 - Keep Mac GPUI `font-kit` enabled. Its absence selects a no-op text system; the prior missing-all-text failure was fixed, not an outstanding GPU renderer problem.
 - Native smoke processes and temporary automation/evidence files were removed. Qualification binaries remain under ignored build output.
-- Current Windows checks: `cargo fmt --all -- --check`, `cargo test --locked --workspace --all-targets` (64 tests), `cargo clippy --locked --workspace --all-targets -- -D warnings`, dependency boundaries, and the isolated release app/daemon/probe build passed. Cargo still reports an upstream future-compatibility notice for `proc-macro-error2`. The native client smoke and remaining gaps are recorded above. The earlier Mac build and interaction evidence remains valid; its pixel-level comparison and physical-input matrix are still open.
+- Current Windows checks: `cargo fmt --all -- --check`, `cargo test --locked --workspace --all-targets` (99 tests), `cargo clippy --locked --workspace --all-targets -- -D warnings`, dependency boundaries, isolated native builds, and targeted GPUI interaction passed. Cargo still reports an upstream future-compatibility notice for `proc-macro-error2`. The native event-path evidence and remaining physical-input/display gaps are recorded above. The earlier Mac build and interaction evidence remains valid; its pixel-level comparison and physical-input matrix are still open.
 
 ## Next phases
 

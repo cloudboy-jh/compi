@@ -241,7 +241,7 @@ For destructive confirmation and removal, a live target includes a pending spawn
 | WSL runtime ends | Affected surfaces end or fail; unrelated server state remains truthful. |
 | Reboot/sign-out/upgrade requiring server stop | No process-survival promise; disclose loss before intentional interruption. |
 
-Window-close controls always mean detach. A tab close-view control also means detach/hide, preserving Compi's non-destructive close behavior. Destructive removal and **End surface** are separately named actions, not hidden behind the same control.
+Window-close controls always mean detach. Ctrl-W and the explicit hide command detach a tab while preserving its work. A tab close control requests confirmed tab removal and process termination; destructive removal and **End surface** remain explicitly named in the confirmation and command surfaces.
 
 Termination must be asynchronous, show `Ending…`, escalate after a bounded grace period, and report failure rather than falsely marking surviving descendants dead. Platform tests must verify descendant cleanup, including WSL descendants. Do not assume closing a PTY or killing a launcher is sufficient.
 
@@ -466,7 +466,7 @@ Escape sequences are untrusted process output. Hyperlink opening validates schem
 - Workspace browsing exposes create, switch, rename, and remove actions for server sessions through the optional workspace sidebar and commands, labeled as workspaces in the UI. Ordinary terminal use does not require opening the sidebar or operating a large workspace selector first; no separate session navigation layer is shown.
 - The active workspace's non-hidden terminal tabs appear in the primary top tab bar. Each tab selects one terminal or a complete split layout, not an entire workspace. Switching workspaces restores the last selected tab and pane.
 - Detached/hidden tabs remain available through the workspace list and palette, with clear running/exited/lost state.
-- Tab labels show an explicit user label when set, otherwise a useful terminal title or cwd label.
+- Tab labels show an explicit user label when set, otherwise a useful terminal title or concise cwd basename. Never expose a full machine path as the naked fallback label.
 - Tabs can be reordered without restarting processes.
 - The visible tab renders its full split tree; focus is visibly identifiable without a thick decorative frame.
 - Empty, disconnected, exited, failed, ending, and lost states have explicit recovery actions.
@@ -478,7 +478,7 @@ Escape sequences are untrusted process output. Hyperlink opening validates schem
 - Sidebar width is draggable, clamped, and remembered.
 - Double-click reset restores the configured default width.
 - Top strip uses scrolling/overflow rather than compressing every label into an unreadable sliver.
-- A quiet chrome toggle, keyboard shortcut, and palette command show/hide the sidebar. When hidden, no permanent sidebar rail, large workspace selector, or reserved width remains. Its current visibility survives ordinary interaction within the window, but not window relaunch.
+- The established Compi terminal mark remains visible beside a distinct, quiet sidebar toggle. The keyboard shortcut and palette command also show/hide the sidebar. When hidden, no permanent sidebar rail, large workspace selector, or reserved width remains. Its current visibility survives ordinary interaction within the window, but not window relaunch.
 - Navigation areas scroll independently from the terminal.
 - Window controls reserve platform-appropriate space, including Mac traffic lights.
 - The layout must not depend on a single fixed window size or Windows-only titlebar geometry.
@@ -528,10 +528,9 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 
 ### Keyboard and input policy
 
-- macOS uses Command-based application shortcuts and preserves terminal Control input.
-- Windows uses terminal-safe application shortcuts, generally Control+Shift combinations.
-- Retain selection-aware Windows Control+C: copy when a non-empty selection exists, otherwise forward interrupt. Control+Shift+C remains explicit copy.
-- Platform-specific exceptions are configurable and tested, not scattered across widget handlers.
+- macOS follows native Command/Option application and editing conventions while preserving terminal Control input.
+- Windows follows native Windows Terminal tab, pane, and text-editing conventions. Ctrl-T/W create and hide tabs; Ctrl-Tab / Ctrl-Shift-Tab cycle them; Ctrl-Shift-T restores a hidden tab. Alt-Shift-Plus/Minus split right/down; Alt-Arrow moves pane focus; Alt-Shift-Arrow resizes; Ctrl-Shift-W removes the focused pane with confirmation. Ctrl-V and Shift-Insert paste; Ctrl-Backspace deletes the previous word; Ctrl-Insert and selection-aware Ctrl-C copy. With no selection, Ctrl-C forwards terminal interrupt. Ctrl-Shift-C/V remain explicit compatibility bindings.
+- Platform-specific behavior is centralized, configurable where it represents an application command, and tested rather than scattered across widget handlers.
 - Palette/menu focus owns its navigation keys while open; terminal focus resumes on dismissal.
 - Bracketed paste is honored. Pasting never implicitly executes an extra newline beyond the clipboard contents.
 - IME and composed text follow native input paths.

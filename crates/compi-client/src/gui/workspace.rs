@@ -1148,7 +1148,7 @@ impl CompiApp {
             line_height: self.typography.cell_height,
             padding_x: TERMINAL_PADDING,
             padding_y: TERMINAL_PADDING,
-            pane_chrome_height: 26.0,
+            pane_chrome_height: 0.0,
             divider_thickness: 5.0,
             scale_factor: self.typography_scale,
         }
@@ -2047,6 +2047,36 @@ fn open_local_path(path: &std::path::Path) -> Result<(), String> {
     result.map(|_| ()).map_err(|error| error.to_string())
 }
 
+fn concise_path_title(path: &str) -> String {
+    let path = path.trim();
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return if path.starts_with('/') {
+            "/".into()
+        } else {
+            "Terminal".into()
+        };
+    }
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("Terminal")
+        .to_owned()
+}
+
+fn concise_tab_title(title: &str) -> String {
+    let title = title.trim();
+    let bytes = title.as_bytes();
+    let is_drive_path = bytes.len() > 2 && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\');
+    if title.starts_with('/') || title.starts_with("~/") || title.starts_with('\\') || is_drive_path
+    {
+        concise_path_title(title)
+    } else {
+        title.to_owned()
+    }
+}
+
 impl CompiApp {
     fn tab_label(&self, tab: &WorkspaceTab) -> String {
         if !tab.label.trim().is_empty() {
@@ -2060,7 +2090,7 @@ impl CompiApp {
                 self.surface_views
                     .iter()
                     .find(|view| &view.surface_id == id)
-                    .map(SurfaceView::title)
+                    .map(|view| concise_tab_title(&view.title()))
             })
             .or_else(|| {
                 leaves.first().and_then(|(_, id)| {
@@ -2069,7 +2099,7 @@ impl CompiApp {
                         .surface(id)?
                         .working_directory
                         .as_ref()
-                        .map(|cwd| cwd.resolved_wsl_path.clone())
+                        .map(|cwd| concise_path_title(&cwd.resolved_wsl_path))
                 })
             })
             .unwrap_or_else(|| "Terminal".into())
@@ -2375,6 +2405,50 @@ impl CompiApp {
             .into_any_element()
     }
 
+    fn command_icon_button(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        icon: ChromeIcon,
+        command: Command,
+        active: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors();
+        let disabled = command.disabled_reason(&self.command_context(cx)).is_some();
+        div()
+            .id(id)
+            .size(px(32.0))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(color(if disabled {
+                colors.muted
+            } else if active {
+                colors.accent
+            } else {
+                colors.foreground
+            }))
+            .when(active, |button| button.bg(color(colors.surface_hover)))
+            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.execute(command, window, cx);
+                cx.stop_propagation();
+            }))
+            .child(chrome_icon(
+                icon,
+                color(if disabled {
+                    colors.muted
+                } else if active {
+                    colors.accent
+                } else {
+                    colors.foreground
+                }),
+            ))
+            .into_any_element()
+    }
+
     fn render_titlebar(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
         let visible: Vec<_> = self
@@ -2385,7 +2459,7 @@ impl CompiApp {
             .unwrap_or_default();
         let tabs = visible.into_iter().enumerate().map(|(index, tab)| {
             let id = tab.id.clone();
-            let hide_id = id.clone();
+            let close_id = id.clone();
             let selected = self
                 .selected_tab()
                 .is_some_and(|selected| selected.id == id);
@@ -2455,10 +2529,10 @@ impl CompiApp {
                         .cursor_pointer()
                         .text_color(color(colors.muted))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.hide_terminal(&hide_id);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_terminal(close_id.clone(), false);
+                            this.execute(Command::RemoveTab, window, cx);
                             cx.stop_propagation();
-                            cx.notify();
                         }))
                         .child(chrome_icon(ChromeIcon::Close, color(colors.muted))),
                 )
@@ -2490,7 +2564,20 @@ impl CompiApp {
             )
             .child(
                 div()
-                    .id("sidebar-mark-toggle")
+                    .id("app-mark-slot")
+                    .absolute()
+                    .left(px(TITLEBAR_BRAND_WIDTH - 80.0))
+                    .top_0()
+                    .h_full()
+                    .w(px(40.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(chrome_icon(ChromeIcon::Mark, color(colors.accent))),
+            )
+            .child(
+                div()
+                    .id("sidebar-toggle-slot")
                     .absolute()
                     .left(px(TITLEBAR_BRAND_WIDTH - 40.0))
                     .top_0()
@@ -2499,11 +2586,13 @@ impl CompiApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.execute(Command::ToggleSidebar, window, cx)
-                    }))
-                    .child(chrome_icon(ChromeIcon::Mark, color(colors.accent))),
+                    .child(self.command_icon_button(
+                        "sidebar-toggle",
+                        ChromeIcon::Sidebar,
+                        Command::ToggleSidebar,
+                        self.sidebar_open,
+                        cx,
+                    )),
             )
             .when(
                 self.drag_position
@@ -2529,26 +2618,28 @@ impl CompiApp {
                     .id("terminal-tabs")
                     .absolute()
                     .left(px(TITLEBAR_BRAND_WIDTH))
-                    .right(px(WINDOW_CONTROLS_WIDTH + 112.0))
+                    .right(px(WINDOW_CONTROLS_WIDTH))
                     .h_full()
                     .flex()
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll_handle)
                     .on_scroll_wheel(cx.listener(Self::on_tab_scroll))
-                    .children(tabs),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right(px(WINDOW_CONTROLS_WIDTH))
-                    .top_0()
-                    .h_full()
-                    .w(px(112.0))
-                    .flex()
-                    .items_center()
-                    .child(self.command_button("new-terminal", "+", Command::NewTab, cx))
-                    .child(self.command_button("workspace-toggle", "≡", Command::ToggleSidebar, cx))
-                    .child(self.command_button("command-menu", "···", Command::OpenPalette, cx)),
+                    .children(tabs)
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .px_1()
+                            .child(self.command_icon_button(
+                                "new-terminal",
+                                ChromeIcon::Add,
+                                Command::NewTab,
+                                false,
+                                cx,
+                            )),
+                    ),
             )
             .when(cfg!(windows), |bar| {
                 bar.child(
@@ -2705,7 +2796,7 @@ impl CompiApp {
                             .child("Workspaces")
                             .child(self.command_button(
                                 "create-workspace",
-                                "+",
+                                "New",
                                 Command::CreateWorkspace,
                                 cx,
                             )),
@@ -2771,7 +2862,7 @@ impl CompiApp {
         let Some(layout) = &self.layout else {
             return div().flex_1().size_full().flex().flex_col().items_center().justify_center().gap_3().bg(color(colors.background))
                 .child(div().text_size(px(18.0)).child("Your work stays here"))
-                .child(div().text_color(color(colors.muted)).child("Create a terminal tab or restore hidden work. Closing a view never ends a process."))
+                .child(div().text_color(color(colors.muted)).child("Create a terminal tab or restore hidden work. Hiding a tab keeps its processes running."))
                 .child(div().flex().gap_2()
                     .child(self.command_button("empty-new-terminal", "New terminal tab", Command::NewTab, cx))
                     .child(self.command_button("empty-new-workspace", "New workspace", Command::CreateWorkspace, cx))
@@ -2819,9 +2910,6 @@ impl CompiApp {
             let error = view
                 .and_then(|view| view.error.clone().or_else(|| view.image_error.clone()))
                 .or_else(|| surface.and_then(|surface| surface.error.clone()));
-            let label = view
-                .map(SurfaceView::title)
-                .unwrap_or_else(|| "Terminal".into());
             let input = cx.entity();
             let input_focus = self.focus_handle.clone();
             let composition = (focused && self.overlay.is_none() && !self.ime_text.is_empty())
@@ -2844,39 +2932,6 @@ impl CompiApp {
                         cx.stop_propagation();
                         cx.notify();
                     }),
-                )
-                .child(
-                    div()
-                        .h(px(26.0))
-                        .flex_none()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(color(if focused {
-                            colors.accent
-                        } else {
-                            colors.border
-                        }))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(format!(
-                                    "{}{} · {status}",
-                                    if focused { "› " } else { "" },
-                                    label
-                                )),
-                        )
-                        .child(self.command_button(
-                            ("pane-menu", index),
-                            "···",
-                            Command::OpenPalette,
-                            cx,
-                        )),
                 )
                 .child(
                     div()
@@ -4050,5 +4105,21 @@ fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
         LayoutNode::Split { first, second, .. } => {
             contains_surface(first, surface) || contains_surface(second, surface)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{concise_path_title, concise_tab_title};
+
+    #[test]
+    fn terminal_tab_titles_keep_identity_without_exposing_full_paths() {
+        assert_eq!(concise_tab_title("/home/user/projects/compi"), "compi");
+        assert_eq!(concise_tab_title(r"C:\Users\user\projects\compi"), "compi");
+        assert_eq!(concise_path_title("/"), "/");
+        assert_eq!(
+            concise_tab_title("user@host: ~/compi"),
+            "user@host: ~/compi"
+        );
     }
 }
