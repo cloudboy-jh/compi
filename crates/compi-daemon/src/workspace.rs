@@ -24,7 +24,7 @@ pub struct WorkspaceActor {
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceEffect {
-    Launch(SurfaceInfo),
+    Launch(SurfaceInfo, Option<Box<compi_protocol::LaunchContext>>),
     End {
         surface_id: SurfaceId,
         process_lifetime_id: ProcessLifetimeId,
@@ -475,6 +475,28 @@ fn prepare_mutation(
     let mut affected_panes = Vec::new();
     let mut affected_surfaces = Vec::new();
     let mut effects = Vec::new();
+    if let Some(context) = &request.launch {
+        validate_launch_context(context).map_err(|message| {
+            ActorError::new(
+                ErrorCode::InvalidRequest,
+                message,
+                Some(state.workspace.revision),
+            )
+        })?;
+        if !matches!(
+            request.operation,
+            WorkspaceMutation::Initialize { .. }
+                | WorkspaceMutation::CreateTab { .. }
+                | WorkspaceMutation::SplitPane { .. }
+                | WorkspaceMutation::RestartSurface { .. }
+        ) {
+            return Err(ActorError::new(
+                ErrorCode::InvalidRequest,
+                "launch context requires a launch operation",
+                Some(state.workspace.revision),
+            ));
+        }
+    }
     let operation_state = apply_mutation(
         &mut candidate,
         &request.operation,
@@ -485,6 +507,21 @@ fn prepare_mutation(
         &mut affected_surfaces,
         &mut effects,
     )?;
+    for effect in &mut effects {
+        if let WorkspaceEffect::Launch(info, context) = effect {
+            *context = request.launch.clone();
+            if let Some(context) = context {
+                info.launch.profile = Some(Box::new(context.profile.clone()));
+            }
+            if let Some(surface) = candidate
+                .surfaces
+                .iter_mut()
+                .find(|surface| surface.id == info.id)
+            {
+                surface.launch = info.launch.clone();
+            }
+        }
+    }
     candidate.revision = candidate.revision.saturating_add(1);
     let receipt = MutationReceipt {
         mutation_id: request.mutation_id.clone(),
@@ -549,7 +586,7 @@ fn apply_mutation(
                 label: "Default".into(),
                 tabs: vec![WorkspaceTab {
                     id: tab_id.clone(),
-                    label: "Shell".into(),
+                    label: String::new(),
                     layout: LayoutNode::Pane {
                         pane_id: pane_id.clone(),
                         surface_id: surface.id.clone(),
@@ -561,12 +598,12 @@ fn apply_mutation(
             affected_tabs.push(tab_id);
             affected_panes.push(pane_id);
             affected_surfaces.push(surface.id.clone());
-            effects.push(WorkspaceEffect::Launch(surface.clone()));
+            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
         WorkspaceMutation::CreateSession { label } => {
-            validate_label(label).map_err(invalid)?;
+            validate_label(label, true).map_err(invalid)?;
             let id = SessionId::new(allocate("session", ordinal));
             workspace.sessions.push(WorkspaceSession {
                 id: id.clone(),
@@ -578,7 +615,7 @@ fn apply_mutation(
             Ok("committed".into())
         }
         WorkspaceMutation::RenameSession { session_id, label } => {
-            validate_label(label).map_err(invalid)?;
+            validate_label(label, true).map_err(invalid)?;
             let session = workspace
                 .sessions
                 .iter_mut()
@@ -595,7 +632,7 @@ fn apply_mutation(
             rows,
             working_directory,
         } => {
-            validate_label(label).map_err(invalid)?;
+            validate_label(label, false).map_err(invalid)?;
             dimensions(*cols, *rows).map_err(invalid)?;
             let tab_id = TabId::new(allocate("tab", ordinal));
             let pane_id = PaneId::new(allocate("pane", ordinal));
@@ -617,12 +654,12 @@ fn apply_mutation(
             affected_tabs.push(tab_id);
             affected_panes.push(pane_id);
             affected_surfaces.push(surface.id.clone());
-            effects.push(WorkspaceEffect::Launch(surface.clone()));
+            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
         WorkspaceMutation::RenameTab { tab_id, label } => {
-            validate_label(label).map_err(invalid)?;
+            validate_label(label, false).map_err(invalid)?;
             let tab = find_tab_mut(&mut workspace.sessions, tab_id)
                 .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
             tab.label = label.clone();
@@ -657,8 +694,10 @@ fn apply_mutation(
             cols,
             rows,
             working_directory,
+            geometry,
         } => {
             dimensions(*cols, *rows).map_err(invalid)?;
+            validate_split_geometry(geometry, *axis).map_err(invalid)?;
             let new_pane = PaneId::new(allocate("pane", ordinal));
             let surface = new_surface(*cols, *rows, working_directory.clone(), ordinal);
             let mut replaced = false;
@@ -686,13 +725,13 @@ fn apply_mutation(
             }
             affected_panes.extend([pane_id.clone(), new_pane]);
             affected_surfaces.push(surface.id.clone());
-            effects.push(WorkspaceEffect::Launch(surface.clone()));
+            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
         WorkspaceMutation::SetSplitRatio {
             tab_id,
-            pane_id,
+            path,
             ratio,
         } => {
             if !ratio.is_finite() || *ratio <= 0.0 || *ratio >= 1.0 {
@@ -702,13 +741,13 @@ fn apply_mutation(
             }
             let tab = find_tab_mut(&mut workspace.sessions, tab_id)
                 .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
-            if !set_parent_ratio(&mut tab.layout, pane_id, *ratio) {
+            if !set_split_ratio(&mut tab.layout, path, *ratio) {
                 return Err(invalid(format!(
-                    "pane {pane_id} has no containing split in tab {tab_id}"
+                    "split path does not identify a divider in tab {tab_id}"
                 )));
             }
             affected_tabs.push(tab_id.clone());
-            affected_panes.push(pane_id.clone());
+            // Paths are revision-scoped structural addresses, not pane identities.
             Ok("committed".into())
         }
         WorkspaceMutation::EndSurface {
@@ -723,11 +762,11 @@ fn apply_mutation(
             verify_lifetime(surface, expected_lifetime, workspace.revision)?;
             if !matches!(
                 surface.status,
-                SurfaceStatus::Starting | SurfaceStatus::Running
+                SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
             ) {
                 return Err(ActorError::new(
                     ErrorCode::SurfaceUnavailable,
-                    format!("surface {surface_id} is not running"),
+                    format!("surface {surface_id} is not running or awaiting cleanup"),
                     Some(workspace.revision),
                 ));
             }
@@ -773,7 +812,7 @@ fn apply_mutation(
             surface.rows = *rows;
             surface.exit_code = None;
             surface.error = None;
-            effects.push(WorkspaceEffect::Launch(surface.clone()));
+            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
             affected_surfaces.push(surface_id.clone());
             Ok("starting".into())
         }
@@ -986,7 +1025,10 @@ fn new_surface(
         created_at_ms: now_ms(),
         exit_code: None,
         error: None,
-        launch: LaunchRequest { working_directory },
+        launch: LaunchRequest {
+            working_directory,
+            profile: None,
+        },
         working_directory: None,
     }
 }
@@ -1030,25 +1072,82 @@ fn split_pane(
     }
 }
 
-fn set_parent_ratio(node: &mut LayoutNode, target: &PaneId, ratio: f32) -> bool {
-    match node {
-        LayoutNode::Pane { .. } => false,
-        LayoutNode::Split {
-            ratio: current,
-            first,
-            second,
-            ..
-        } => {
-            if set_parent_ratio(first, target, ratio) || set_parent_ratio(second, target, ratio) {
-                true
-            } else if contains_pane(first, target) || contains_pane(second, target) {
-                *current = ratio;
-                true
-            } else {
-                false
-            }
-        }
+fn set_split_ratio(mut node: &mut LayoutNode, path: &[bool], ratio: f32) -> bool {
+    for second_child in path {
+        let LayoutNode::Split { first, second, .. } = node else {
+            return false;
+        };
+        node = if *second_child { second } else { first };
     }
+    if let LayoutNode::Split { ratio: current, .. } = node {
+        *current = ratio;
+        true
+    } else {
+        false
+    }
+}
+
+fn validate_split_geometry(
+    geometry: &compi_protocol::SplitGeometry,
+    axis: SplitAxis,
+) -> Result<(), String> {
+    let values = [
+        geometry.width,
+        geometry.height,
+        geometry.min_width,
+        geometry.min_height,
+        geometry.divider,
+    ];
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0 || *value > 1_000_000.0)
+    {
+        return Err("split geometry must contain finite positive dimensions".into());
+    }
+    let (width, height) = match axis {
+        SplitAxis::Horizontal => (
+            2.0 * geometry.min_width + geometry.divider,
+            geometry.min_height,
+        ),
+        SplitAxis::Vertical => (
+            geometry.min_width,
+            2.0 * geometry.min_height + geometry.divider,
+        ),
+    };
+    if geometry.width < width || geometry.height < height {
+        return Err("focused pane cannot contain two minimum-sized children".into());
+    }
+    Ok(())
+}
+
+fn validate_launch_context(context: &compi_protocol::LaunchContext) -> Result<(), String> {
+    if context.scrollback_lines > 100_000 || context.graphics_bytes > 4 * 1024 * 1024 {
+        return Err("launch resource limits exceed supported bounds".into());
+    }
+    let profile = &context.profile;
+    if profile
+        .executable
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
+        || profile
+            .working_directory
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.contains('\0'))
+        || profile
+            .distribution
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.contains('\0'))
+        || profile.args.len() > 256
+        || profile.args.iter().any(|value| value.contains('\0'))
+        || context.env.len() > 256
+        || context
+            .env
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+    {
+        return Err("invalid launch profile or environment entry".into());
+    }
+    Ok(())
 }
 
 fn contains_pane(node: &LayoutNode, target: &PaneId) -> bool {
@@ -1209,8 +1308,8 @@ fn verify_lifetime(
     }
 }
 
-fn validate_label(label: &str) -> std::result::Result<(), String> {
-    if label.trim().is_empty() {
+fn validate_label(label: &str, required: bool) -> std::result::Result<(), String> {
+    if required && label.trim().is_empty() {
         Err("workspace labels must not be empty".into())
     } else if label.len() > 256 {
         Err("workspace labels must not exceed 256 bytes".into())
@@ -1283,6 +1382,7 @@ mod tests {
             mutation_id: MutationId::new(id),
             expected_revision: revision,
             operation,
+            launch: None,
         }
     }
 
@@ -1388,6 +1488,13 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     working_directory: None,
+                    geometry: compi_protocol::SplitGeometry {
+                        width: 800.0,
+                        height: 480.0,
+                        min_width: 160.0,
+                        min_height: 80.0,
+                        divider: 4.0,
+                    },
                 },
             ))
             .unwrap();
@@ -1397,7 +1504,7 @@ mod tests {
         ));
         assert!(matches!(
             effects.recv().unwrap(),
-            WorkspaceEffect::Launch(_)
+            WorkspaceEffect::Launch(_, _)
         ));
     }
 
@@ -1416,7 +1523,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        let WorkspaceEffect::Launch(surface) = effects.recv().unwrap() else {
+        let WorkspaceEffect::Launch(surface, _) = effects.recv().unwrap() else {
             unreachable!()
         };
         actor.observe(RuntimeObservation::Failed {
@@ -1477,7 +1584,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        let WorkspaceEffect::Launch(surface) = effects.recv().unwrap() else {
+        let WorkspaceEffect::Launch(surface, _) = effects.recv().unwrap() else {
             unreachable!()
         };
         actor.observe(RuntimeObservation::Running {
@@ -1531,5 +1638,253 @@ mod tests {
         let removed = wait_revision(&actor, retained.revision + 1);
         assert!(removed.sessions[0].tabs.is_empty());
         assert!(removed.surface(&surface.id).is_none());
+    }
+    #[test]
+    fn nested_divider_paths_and_rejected_geometry_preserve_other_work() {
+        let (actor, _effects) = WorkspaceActor::memory();
+        actor
+            .mutate(request(
+                &actor,
+                "init-paths",
+                0,
+                WorkspaceMutation::Initialize {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        let geometry = compi_protocol::SplitGeometry {
+            width: 800.0,
+            height: 480.0,
+            min_width: 160.0,
+            min_height: 80.0,
+            divider: 4.0,
+        };
+        for index in 0..3 {
+            let before = actor.snapshot().unwrap();
+            let tab = &before.sessions[0].tabs[0];
+            fn leaves(node: &LayoutNode, output: &mut Vec<PaneId>) {
+                match node {
+                    LayoutNode::Pane { pane_id, .. } => output.push(pane_id.clone()),
+                    LayoutNode::Split { first, second, .. } => {
+                        leaves(first, output);
+                        leaves(second, output);
+                    }
+                }
+            }
+            let mut panes = Vec::new();
+            leaves(&tab.layout, &mut panes);
+            let pane_id = if index == 2 {
+                panes.last().unwrap().clone()
+            } else {
+                panes[0].clone()
+            };
+            let operation = WorkspaceMutation::SplitPane {
+                pane_id,
+                axis: if index == 0 {
+                    SplitAxis::Horizontal
+                } else {
+                    SplitAxis::Vertical
+                },
+                cols: 40,
+                rows: 12,
+                working_directory: None,
+                geometry,
+            };
+            actor
+                .mutate(request(
+                    &actor,
+                    &format!("nested-{index}"),
+                    before.revision,
+                    operation,
+                ))
+                .unwrap();
+        }
+        let before = actor.snapshot().unwrap();
+        let tab_id = before.sessions[0].tabs[0].id.clone();
+        let operation = WorkspaceMutation::SetSplitRatio {
+            tab_id,
+            path: vec![],
+            ratio: 0.7,
+        };
+        actor
+            .mutate(request(
+                &actor,
+                "outer-path",
+                before.revision,
+                operation.clone(),
+            ))
+            .unwrap();
+        let committed = actor.snapshot().unwrap();
+        assert!(matches!(&committed.sessions[0].tabs[0].layout,
+            LayoutNode::Split { ratio, first, second, .. } if *ratio == 0.7
+                && matches!(**first, LayoutNode::Split { ratio: 0.5, .. })
+                && matches!(**second, LayoutNode::Split { ratio: 0.5, .. })));
+        assert_eq!(committed.surfaces, before.surfaces);
+        let stale = actor
+            .mutate(request(&actor, "stale-path", before.revision, operation))
+            .unwrap_err();
+        assert_eq!(stale.code, ErrorCode::RevisionConflict);
+        let pane = match &committed.sessions[0].tabs[0].layout {
+            LayoutNode::Split { first, .. } => match &**first {
+                LayoutNode::Split { first, .. } => match &**first {
+                    LayoutNode::Pane { pane_id, .. } => pane_id.clone(),
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let rejected = actor.mutate(request(
+            &actor,
+            "too-small",
+            committed.revision,
+            WorkspaceMutation::SplitPane {
+                pane_id: pane,
+                axis: SplitAxis::Horizontal,
+                cols: 20,
+                rows: 4,
+                working_directory: None,
+                geometry: compi_protocol::SplitGeometry {
+                    width: 160.0,
+                    ..geometry
+                },
+            },
+        ));
+        assert_eq!(rejected.unwrap_err().code, ErrorCode::InvalidRequest);
+        assert_eq!(actor.snapshot().unwrap(), committed);
+    }
+
+    #[test]
+    fn terminal_tabs_allow_automatic_titles_but_workspaces_require_names() {
+        let (actor, _effects) = WorkspaceActor::memory();
+        let receipt = actor
+            .mutate(request(
+                &actor,
+                "named-workspace",
+                0,
+                WorkspaceMutation::CreateSession {
+                    label: "Project".into(),
+                },
+            ))
+            .unwrap();
+        let session_id = receipt.affected_sessions[0].clone();
+        let before = actor.snapshot().unwrap();
+        let created = actor
+            .mutate(request(
+                &actor,
+                "automatic-title",
+                before.revision,
+                WorkspaceMutation::CreateTab {
+                    session_id,
+                    label: String::new(),
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        let snapshot = actor.snapshot().unwrap();
+        assert!(snapshot.sessions[0].tabs[0].label.is_empty());
+        let surface_id = created.affected_surfaces[0].clone();
+        actor
+            .mutate(request(
+                &actor,
+                "explicit-title",
+                snapshot.revision,
+                WorkspaceMutation::RenameTab {
+                    tab_id: created.affected_tabs[0].clone(),
+                    label: "Editor".into(),
+                },
+            ))
+            .unwrap();
+        let renamed = actor.snapshot().unwrap();
+        actor
+            .mutate(request(
+                &actor,
+                "restore-automatic-title",
+                renamed.revision,
+                WorkspaceMutation::RenameTab {
+                    tab_id: created.affected_tabs[0].clone(),
+                    label: String::new(),
+                },
+            ))
+            .unwrap();
+        let restored = actor.snapshot().unwrap();
+        assert!(restored.sessions[0].tabs[0].label.is_empty());
+        assert_eq!(restored.surface(&surface_id), snapshot.surface(&surface_id));
+        let error = actor
+            .mutate(request(
+                &actor,
+                "blank-workspace",
+                restored.revision,
+                WorkspaceMutation::CreateSession {
+                    label: String::new(),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(actor.snapshot().unwrap(), restored);
+    }
+
+    #[test]
+    fn launch_environment_is_ephemeral_and_ending_can_retry() {
+        let (actor, effects) = WorkspaceActor::memory();
+        let mut context = compi_protocol::LaunchContext::default();
+        context.profile.executable = Some("/bin/sh".into());
+        context
+            .env
+            .insert("SECRET_TOKEN".into(), "not-persisted".into());
+        let mut mutation = request(
+            &actor,
+            "ephemeral",
+            0,
+            WorkspaceMutation::Initialize {
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+            },
+        );
+        mutation.launch = Some(Box::new(context));
+        actor.mutate(mutation).unwrap();
+        let WorkspaceEffect::Launch(surface, Some(context)) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(context.env["SECRET_TOKEN"], "not-persisted");
+        let snapshot = actor.snapshot().unwrap();
+        assert_eq!(
+            snapshot.surfaces[0]
+                .launch
+                .profile
+                .as_ref()
+                .unwrap()
+                .executable
+                .as_deref(),
+            Some("/bin/sh")
+        );
+        let published = serde_json::to_string(&snapshot).unwrap();
+        assert!(!published.contains("SECRET_TOKEN") && !published.contains("not-persisted"));
+        actor.observe(RuntimeObservation::EndFailed {
+            surface_id: surface.id.clone(),
+            process_lifetime_id: surface.process_lifetime_id.clone(),
+            error: "cleanup failed".into(),
+        });
+        let failed = wait_revision(&actor, snapshot.revision + 1);
+        actor
+            .mutate(request(
+                &actor,
+                "retry-end",
+                failed.revision,
+                WorkspaceMutation::EndSurface {
+                    surface_id: surface.id,
+                    expected_lifetime: surface.process_lifetime_id,
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::End { .. }
+        ));
     }
 }

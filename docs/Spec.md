@@ -39,7 +39,7 @@ The baseline must be useful for daily development, not merely demonstrate a surv
 - Typing, scrolling, selection, clipboard, tab switching, and pane focus remain responsive during output floods.
 - Tabs and panes have room to breathe. Layout controls do not compete with terminal content.
 - A narrow window remains usable through overflow handling, minimum pane dimensions, and manual sidebar collapse.
-- Switching between sidebar and top strip does not change or restart the workspace.
+- Showing or hiding the optional workspace sidebar leaves the primary top terminal tabs available and does not change or restart the workspace.
 - Native window behavior, keyboard conventions, fonts, clipboard, and DPI handling fit the host platform.
 - Reattaching does not replay raw output through a second terminal parser or wait for full scrollback transfer before painting.
 - Persistence is visible through restored work, not through a dashboard the user must operate.
@@ -59,7 +59,7 @@ The baseline includes:
 - Client replication isolated from rendering.
 - Workspace, sessions, tabs, panes, and surfaces.
 - Persisted, nested split trees with draggable dividers.
-- Sidebar or top tab strip, with a resizable sidebar.
+- Primary top terminal tabs, an optional resizable workspace sidebar, and tab tear-off into native windows.
 - Command palette and configurable platform-aware shortcuts.
 - Client-local window and presentation state.
 - Server-owned terminal and workspace state.
@@ -98,6 +98,8 @@ Workspace
 
 A session contains tabs. A tab contains panes. A pane displays a surface. Those identities must not be interchangeable in source code or protocol messages.
 
+**Client terminology:** present each named server `Session` as a **Workspace**, with the user-facing hierarchy **Workspace → Terminal tabs → Panes**. The server `Workspace` root is the collection of these groups, not an additional navigation layer. Protocol IDs, persistence records, and technical terminology below retain their existing meanings; this is a UI naming contract, not a domain-model rename.
+
 ### Structural invariants
 
 - IDs are stable opaque identifiers, never process IDs, labels, paths, or array positions.
@@ -134,12 +136,13 @@ Commands are named **Split right** and **Split down**, not ambiguous vertical/ho
 | Grid, terminal modes, cursor, history, graphics                      | Server          | In memory across client disconnects; disk terminal checkpoints are not baseline    |
 | Visible terminal replicas and history cache                          | Client          | Disposable; rebuilt from server state                                              |
 | Window size, position where supported, maximized state               | Client          | Per-client state file                                                              |
-| Sidebar/strip choice, sidebar width/collapse, font zoom, selected theme preset | Client     | Per-client state file                                                              |
+| Sidebar width, font zoom, selected theme preset                       | Client          | Per-client state file                                                              |
+| Sidebar visibility                                                   | Client          | Current window only; every new/relaunched window starts closed                     |
 | Selected session/tab and pane focus                                 | Client          | Per-client state where meaningful                                                  |
 | Scroll position and selection                                        | Client          | Keyed by server identity/generation, surface ID, and process lifetime; restored only when anchors remain valid |
 | User configuration                                                   | User-owned file | Never rewritten to remember transient UI changes                                   |
 
-The split tree belongs to the workspace. Whether that workspace is presented with a sidebar or a top strip belongs to the client.
+The split tree belongs to the workspace. Top terminal tabs are the primary navigation; the optional workspace sidebar supplements them. Sidebar presentation and window placement belong to the client.
 
 Client state wins over configuration for remembered window geometry, layout presentation, and the selected theme preset. Configuration seeds the first run. Resetting client state restores configured defaults. An explicit CLI override applies to that invocation without silently rewriting either file. Theme previews are transient; only an explicitly accepted selection is remembered.
 
@@ -150,13 +153,14 @@ A durable `ClientId` identifies one remembered window-state slot, scoped to the 
 - An instance has one primary slot. Ordinary launch claims it when free; otherwise it claims the oldest unclaimed auxiliary slot, ordered by creation ordinal, or creates an auxiliary slot from configured defaults. **New window** uses the same allocation rule. Opening one window does not automatically reopen every remembered window.
 - Allocation is serialized through a local registry lock. Each active window holds an OS-released exclusive slot lock until exit; a crash releases ownership without deleting remembered state. No two windows write the same state file. Lock or storage errors are surfaced, not bypassed with an unlocked writer.
 - Slots use versioned atomic state files. Closing or crashing a window preserves its slot; relaunch reuses the deterministic available slot. Malformed state is quarantined with a visible recovery message and configured defaults, without changing server work. A failed save leaves the live presentation usable but explicitly unsaved.
-- Each slot remembers window geometry, sidebar/strip choice, sidebar width and manual collapse, font zoom, accepted theme, selected session, last selected tab per session, last focused pane per tab, and a set of hidden tab IDs. Navigation and hidden membership are scoped by stable server/workspace identity, not server generation, so they survive a server restart.
+- Each slot remembers window geometry, sidebar width, font zoom, accepted theme, selected session, last selected tab per session, last focused pane per tab, and a set of hidden tab IDs. Sidebar visibility is transient and starts closed for every new or relaunched window, regardless of prior state or initial-layout configuration. Navigation and hidden membership are scoped by stable server/workspace identity, not server generation, so they survive a server restart.
 - Hidden membership is an exclusion set: tabs not hidden in this slot are listed in server order, including newly created tabs from another window. Hiding releases this window's attachments to that tab, changes no server structure, and does not hide it in other windows. Window close releases attachments but does not add tabs to the hidden set.
 - Restoring a hidden tab removes its exclusion, selects its session/tab, and attempts attachment. The workspace list and palette include hidden tabs with their actual lifecycle state. A control conflict leaves an explicit unavailable pane with retry/open-other-work actions; it never steals control, unhides other tabs, or creates a replacement shell.
 - On an authoritative workspace snapshot, prune references to removed objects. Keep hidden membership and navigation during temporary disconnection. If the selected tab is removed or hidden, choose the next non-hidden tab in server order, then the previous one; if none exists, show an empty session view with create/restore actions. If a session disappears, choose its next surviving session, then the previous one; at initial restore with no valid remembered position, choose the first session and first non-hidden tab.
 - Remembered focus is restored only within the selected tab; an invalid pane reference falls back to its first leaf in tree traversal order. Merely switching sessions/tabs restores their last valid navigation and releases screen/control attachments from the previous visible tab.
 - If every tab is hidden, or the workspace is intentionally emptied, show the empty view. Never seed another shell to repair navigation. First-run seeding occurs exactly once for a new, uninitialized workspace and is committed durably with its initialized marker.
 - CLI overrides affect only that invocation. State saving excludes override-derived values unless a later explicit user action changes the setting. Reset client layout clears the slot's remembered geometry, presentation, navigation, and hidden set to configured defaults; it neither deletes work nor changes another slot. Only accepted theme choices are durable, never previews.
+- Tab tear-off uses the same exclusive slot allocation, but explicitly initializes the destination view to the transferred tab rather than restoring unrelated navigation. Other existing tabs start hidden in that destination slot and remain discoverable. Seed theme, zoom, and sidebar width from the source without durably recording its transient previews or CLI overrides; the new sidebar starts closed. An existing destination keeps its own presentation, including current sidebar visibility. Successful transfer hides the tab in the source slot and reveals/selects it in the destination slot; unrelated windows and the tab's session membership are unchanged.
 
 Client-state write failures cannot change server mutation results. Per-slot serialization and revision-based server conflicts are separate mechanisms: independent windows may remember different views of the same workspace while the server remains its sole structural writer.
 
@@ -459,25 +463,36 @@ Escape sequences are untrusted process output. Hyperlink opening validates schem
 
 ### Workspace navigation
 
-- A session selector names the current body of work and exposes create, switch, rename, and remove actions.
-- The active session's tabs appear in the sidebar or top strip.
+- Workspace browsing exposes create, switch, rename, and remove actions for server sessions through the optional workspace sidebar and commands, labeled as workspaces in the UI. Ordinary terminal use does not require opening the sidebar or operating a large workspace selector first; no separate session navigation layer is shown.
+- The active workspace's non-hidden terminal tabs appear in the primary top tab bar. Each tab selects one terminal or a complete split layout, not an entire workspace. Switching workspaces restores the last selected tab and pane.
 - Detached/hidden tabs remain available through the workspace list and palette, with clear running/exited/lost state.
 - Tab labels show an explicit user label when set, otherwise a useful terminal title or cwd label.
 - Tabs can be reordered without restarting processes.
 - The visible tab renders its full split tree; focus is visibly identifiable without a thick decorative frame.
 - Empty, disconnected, exited, failed, ending, and lost states have explicit recovery actions.
 
-### Sidebar and strip
+### Primary tabs and optional sidebar
 
-- Sidebar is the first-run default and can be switched to a top strip at runtime.
+- Ghostty-like top terminal tabs are first-class navigation. The secondary Superterminal-style sidebar offers full workspace management with expandable workspaces and their terminal tabs, lifecycle status, organization, and hidden-work discovery/restoration. It supplements the tab bar rather than replacing it; its actions are also reachable through commands.
+- The sidebar starts closed in every new or relaunched window, including tear-off windows. Open visibility is not persisted or inherited. It opens only through deliberate user action, never because of reconnect, workspace switching, or tab creation/transfer. Opening it leaves the top tab bar present.
 - Sidebar width is draggable, clamped, and remembered.
 - Double-click reset restores the configured default width.
 - Top strip uses scrolling/overflow rather than compressing every label into an unreadable sliver.
-- Manual sidebar collapse and expansion recover terminal space on small windows. The control remains reachable when collapsed, and the collapsed state is remembered.
+- A quiet chrome toggle, keyboard shortcut, and palette command show/hide the sidebar. When hidden, no permanent sidebar rail, large workspace selector, or reserved width remains. Its current visibility survives ordinary interaction within the window, but not window relaunch.
 - Navigation areas scroll independently from the terminal.
 - Window controls reserve platform-appropriate space, including Mac traffic lights.
 - The layout must not depend on a single fixed window size or Windows-only titlebar geometry.
 - Narrowing a window does not automatically collapse the sidebar, zoom a pane, or switch to a single-pane presentation. Presentation changes do not rewrite the persisted split tree.
+
+### Tab tear-off and window transfer
+
+- Dragging within the tab bar reorders tabs. Releasing a tab outside its window creates a new native window containing that same tab and its full split layout. Dropping onto an existing Compi window for the same server instance transfers it there; this is not a cross-server or cross-session move.
+- Use a lightweight drag preview and clear insertion targets. Until a drop is accepted, keep the original view attached. Escape or drag cancellation leaves navigation, attachments, and server structure unchanged.
+- Transfer the existing tab, panes, surfaces, and process lifetimes, not copies or replacement shells. Preserve pane focus and only valid viewport/selection anchors. Destination geometry may resize PTYs but must not change saved split ratios.
+- Coordinate an explicit attachment handoff so source and destination never concurrently send input or resize the transferred surfaces. Do not steal control from an unrelated window. If window creation or attachment fails, keep or restore the source view and report the actual failure; partial handoffs must reconcile every pane without falsely reporting success.
+- Reconcile the two slots' hidden membership and navigation only with a truthful transfer outcome. Client-state save failures remain visible; the server-owned tab must remain discoverable even after either window crashes.
+- Moving the last tab out leaves an empty source view with create/restore actions. It does not close the source window or create another shell automatically. Closing the destination detaches normally and preserves the moved work for relaunch.
+- A new tear-off window inherits source theme, font zoom, and sidebar width under the durable slot rules, but its sidebar starts closed. An existing destination keeps its own theme, font zoom, sidebar width, and current visibility. Workspace membership (server session) remains unchanged even when the destination was previously viewing another workspace.
 
 ### Constrained split layout
 
@@ -485,12 +500,12 @@ The baseline minimum terminal canvas is **20 columns by 4 rows per pane**, exclu
 
 - A leaf's minimum is its canvas minimum plus chrome. For a right split, recursive minimum width is the sum of child widths plus the divider and minimum height is their maximum; a down split uses the inverse. Layout runs on the full tree, not just visible leaves.
 - The workspace canvas is at least that recursive minimum and at least the available viewport size on each axis. When it exceeds the viewport, expose horizontal/vertical workspace scrollbars. This scrolls the split layout, independently of terminal history and navigation scrolling. Ordinary terminal wheel events keep their terminal semantics; workspace scrollbars and focus reveal provide access to overflow.
-- Allocate each split using its saved ratio, clamped to both children's recursive minima. Clamp only the effective layout ratio. Window resize, font zoom, DPI changes, sidebar collapse, and switching sidebar/strip never persist the clamp or mutate the tree.
+- Allocate each split using its saved ratio, clamped to both children's recursive minima. Clamp only the effective layout ratio. Window resize, font zoom, DPI changes, and sidebar visibility/width changes never persist the clamp or mutate the tree.
 - Scrolling the workspace does not resize PTYs. A pane's PTY dimensions follow its full allocated canvas, not its clipped intersection with the viewport. Offscreen panes in the selected tab remain part of its active attachments; clipping must not end processes or masquerade as hiding a tab.
 - Focusing a pane scrolls the workspace just enough to reveal it. If a pane exceeds the viewport, reveal its cursor region; keep the outer scroll controls reachable. Preserve focus and permit navigation to every leaf without pane zoom or single-pane presentation.
 - Divider dragging and keyboard resizing clamp to the feasible interval. If no movement is possible, disable resizing with an explanation. Preview locally and coalesce PTY resizes; on commit failure/conflict restore the latest committed ratio and corresponding PTY sizes. A tree revision change cancels a stale drag rather than committing against a different layout.
 - Enable a new split only when the current workspace has no overflow and the focused pane's allocated rectangle can contain both new minimum-sized children and the divider. Send that measured rectangle with the expected workspace revision; server validation checks finite dimensions and the proposed minima/ratio, while window geometry remains client-owned. A smaller window in another client does not invalidate the shared tree.
-- Expanding the window removes overflow when it fits and returns to the saved ratios where feasible. Never automatically collapse/expand the sidebar. Its saved width/collapse remains unchanged by temporary rendering constraints; its expand/collapse control and workspace scroll controls remain reachable at the native window minimum.
+- Expanding the window removes overflow when it fits and returns to the saved ratios where feasible. Never automatically collapse/expand the sidebar. Its saved width and current visibility remain unchanged by temporary rendering constraints; its show/hide control and workspace scroll controls remain reachable at the native window minimum.
 
 ### Command registry
 
@@ -498,11 +513,11 @@ One typed registry drives the command palette, keybindings, menus, and enabled/d
 
 Baseline commands cover:
 
-- Create, switch, rename, and remove session.
-- New tab, switch tab, reorder tab, detach tab, restore hidden tab.
+- Create, switch, rename, and remove workspace (operating on server sessions).
+- New tab, switch tab, reorder tab, detach tab, restore hidden tab, new window, and move tab to a new window.
 - Split right/down, focus pane, resize split, remove pane.
 - End surface and restart exited/failed/lost surface.
-- Toggle sidebar/strip, collapse/expand sidebar, reset sidebar width.
+- Show/hide workspace sidebar and reset sidebar width.
 - Copy, paste, select all where appropriate, and clear scrollback.
 - Font zoom in/out/reset.
 - Change theme through the live-preview theme picker.
@@ -525,13 +540,15 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 
 Use a versioned TOML configuration with documented defaults. A configuration file, an **Open configuration** command, and a small in-app theme picker are baseline; a full graphical preferences application is not required.
 
-Configuration includes profiles, shell/login behavior, starting directory, environment overrides, fonts, font size, line height, the initial whole-app theme preset, initial layout, keybinding overrides, scrollback/graphics limits, and clipboard policy.
+Configuration includes profiles, shell/login behavior, starting directory, environment overrides, fonts, font size, line height, the initial whole-app theme preset and sidebar width, keybinding overrides, scrollback/graphics limits, and terminal-initiated clipboard policy. Sidebar visibility is never a persisted or configured startup state.
 
 Invalid configuration must produce a useful diagnostic and a safe recovery path. Apply independent valid settings where possible; never silently launch an unintended executable. Configuration and client state are separate files.
 
+The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindings`, `shell`, `environment`, `profiles.NAME`, `limits`, and `clipboard` tables, with `default_profile` selecting a named profile. `appearance.theme` accepts `dark-glass` or `warm-carbon`; `layout.sidebar_width` is 200–600 logical pixels. `limits.scrollback_lines` is 0–100,000 alongside the fixed 1 MiB history byte bound; `limits.graphics_bytes` is 0–4 MiB so inline graphics remain within the current transport envelope. `clipboard.policy` controls OSC 52 (`allow`/`deny`), not explicit user Copy/Paste. Explicit program argv is literal; use `login` deliberately for shell profiles.
+
 ### Theme presets and access
 
-- The first-run theme is **Dark Glass**: neutral-dark application surfaces, restrained glass in the sidebar and window chrome, and an acid-green accent. Warm Carbon is an optional whole-app preset, not a mandatory application color system.
+- The first-run theme is **Dark Glass**: neutral-dark application surfaces, restrained glass in titlebar/tab chrome and the optional sidebar, and an acid-green accent. Its identity remains visible with the sidebar closed. Warm Carbon is an optional whole-app preset, not a mandatory application color system.
 - Each preset supplies a coordinated application and terminal appearance: chrome, opaque terminal canvas, text, borders, focus, selection, cursor, and ANSI colors. Selecting a preset changes the whole appearance together.
 - The baseline offers whole-app presets, not independent terminal-palette or accent overrides, custom theme files, or automatic system light/dark switching.
 - A visible **Appearance…** menu action and the command palette's **Change theme** command open the same picker. Choosing a theme never requires editing TOML.
@@ -636,8 +653,8 @@ CI must build and test the protocol, daemon, and client crates on Linux, macOS, 
 On both macOS and Windows/WSL:
 
 1. Open a native window into a real shell without an installer.
-2. Create sessions, reorder tabs, and build nested splits.
-3. Resize the window and dividers; manually collapse/expand the sidebar; switch sidebar/strip and relaunch. Verify presentation choices persist without changing the split tree.
+2. Create and switch user-facing workspaces, reorder terminal tabs, and build nested splits; restore each workspace's last selected tab/pane without a separate session navigation layer.
+3. Resize the window and dividers; manually show/hide and resize the sidebar while retaining top tabs; tear off a split tab into a new window and transfer it to an existing window; cancel a drag and exercise failed-transfer recovery; relaunch. Verify remembered sidebar width and transferred-tab placement without changing process identities or the split tree. Every new/relaunched window starts with the sidebar closed; reconnect, workspace switching, and tab actions do not open it.
 4. Run shell editing/job control, Git, `less`, Vim/Neovim, `fzf` preview, and a real agent harness.
 5. Verify Unicode, clipboard, mouse reporting, links, graphics, and wrapped selection.
 6. Close and reopen the client; recover the same live processes and split tree.
@@ -680,7 +697,7 @@ The D-number matches the numbered daily-use procedure above. All rows qualify on
 |---|---|---|---|
 | D1 | Source launch opens a real shell without installation; first run seeds once, later launches do not duplicate work. | P2 shell/startup; P3 initialized workspace. | Windows development launch recipe; Mac launch and durable seeding missing. |
 | D2 | Create sessions, reorder tabs, and build nested splits without respawning moved work. | P3 hierarchy; P4 UI. | Existing tabs are shell sessions, not hierarchy/split coverage. |
-| D3 | Resize window/dividers, manually collapse/expand sidebar, switch sidebar/strip, relaunch; presentation persists and tree remains unchanged by window constraints. | P4 layout/client state. | Windows display recipe; new split/sidebar persistence coverage missing. |
+| D3 | Resize window/dividers, show/hide/resize the secondary sidebar, tear off/transfer tabs, cancel/fail a transfer, and relaunch; primary tabs remain available, sidebar width persists but new/relaunched windows start closed, and processes/tree survive window changes. | P4 layout/client state/window transfer. | Both native clients require split/sidebar, handoff, and window persistence coverage. |
 | D4 | Shell editing/job control, Git, `less`, Vim/Neovim, `fzf` preview, and a real agent harness work interactively. | P1 preserved engine; P2 host/input. | Windows shell/TUI recipes retained; both-platform current runs required. |
 | D5 | Unicode and exact wrapped selection copy, bracketed paste, mouse/focus/Shift override, validated links, OSC 52 policy, and graphics work; reattach never repeats clipboard/bell effects. | P1 core; P2 native adapters; P4 command focus. | Windows clipboard/graphics/TUI recipes retained; Mac IME/clipboard and snapshot-side-effect coverage missing. |
 | D6 | Close/crash/reopen client onto the same live processes and split tree with valid navigation/anchors. | P2 persistence; P3 tree; P4 client state. | Windows detach recipe/integration retained; hierarchy and Unix scenarios missing. |
@@ -723,6 +740,7 @@ These are expected outcomes to turn into behavior checks in the assigned phases,
 | CLI theme override, canceled preview, failed state write, and reset client layout. | Overrides/previews do not leak into saved preference; failed save is visible; reset is slot-local and non-destructive. | P4, C1/C2 |
 | Nested split tree exceeds the window after shrinking/font zoom/DPI change. | Minimum-sized canvas scrolls; all leaves remain reachable, PTYs size to allocated panes, tree/ratios/sidebar collapse are unchanged. | P4, A9/D3/D9 |
 | Divider drag races a tree change or its final commit fails. | Cancel stale drag or restore committed layout and PTY sizes; never commit against another tree revision. | P4, A2/A9 |
+| Tear off a split tab, drop into another window, cancel, or fail midway through attachment handoff. | Same tab/tree/process lifetimes, exclusive control, independent window presentation, truthful recovery, and no implicit shell creation; transferred membership survives relaunch. | P4, A7/A9/D3 |
 
 ## Migration and build order
 
@@ -786,14 +804,17 @@ Done when the protocol and headless tools manipulate the hierarchy, survive clie
 
 ### 4. Deliver the full workspace client
 
-- Build session navigation, tab ordering, and nested splits.
-- Add draggable dividers, pane focus, sidebar/strip switching, and a resizable, manually collapsible sidebar.
+- Build workspace navigation over existing server sessions, terminal tab ordering, and nested splits, without a separate user-facing session layer.
+- Add draggable dividers, pane focus, primary top terminal tabs, and a secondary resizable workspace sidebar hidden until explicitly summoned. Remember sidebar width, not visibility across relaunch; every new window starts closed.
+- Add tab tear-off into new native windows and transfer into existing windows, with explicit attachment handoff, failure recovery, and durable per-window membership.
 - Add the command registry, palette, and platform keybindings.
-- Add whole-app theme presets and the keyboard-accessible live-preview picker, with glass limited to sidebar/window chrome and readable opaque fallbacks.
+- Establish theme tokens and Dark Glass styling while building the window shell, then complete whole-app presets and the keyboard-accessible live-preview picker. Limit glass to titlebar/tab chrome and sidebar, keep terminal canvases opaque, and provide readable opaque/reduced-transparency fallbacks.
 - Persist client-local state independently of server structure.
 - Implement non-destructive detach and clearly named termination/removal actions.
 
-Done when the full daily-use workspace can be created and reopened on Mac and Windows without process restarts caused by layout changes.
+Done when the full daily-use workspace can be created, moved between native windows, and reopened on Mac and Windows without process restarts caused by layout or window changes.
+
+**Implementation status (2026-09-07):** the full client is implemented with native Windows/WSL evidence in [Next steps](NEXT_STEPS.md#phase-4-implemented-native-mac-qualification-pending). Protocol v9 contains the narrow launch/split/clear-history extensions needed by this client; there is no new PTY or terminal-engine replacement. Native Mac execution and shared-baseline qualification remain open. Viewport restoration requires matching server generation, process lifetime, snapshot sequence, dimensions, and content fingerprint; uncertain anchors are discarded. Divider commits may refresh metadata-only revisions only while the captured tree and server identity remain unchanged, and only explicitly rejected revision conflicts may be retried.
 
 ### 5. Qualify the shared baseline
 
@@ -836,7 +857,8 @@ Compi's new baseline is complete when:
 - Real PTYs and local transports work through platform adapters.
 - Workspaces, sessions, tabs, panes, and surfaces are distinct, functioning concepts.
 - Nested split trees persist without owning the lifetime of their processes through the client.
-- Sidebar/strip choice, sidebar width/collapse, window state, focus, and the accepted theme preset remain client-local.
+- Primary terminal tabs remain usable without the optional sidebar. Sidebar width, window state, focus, and accepted theme remain client-local and remembered; sidebar visibility is transient and every new/relaunched window starts closed.
+- Terminal tabs and their complete split layouts move into new or existing native windows without changing process lifetimes, stealing control, or losing discoverable work on failure.
 - The command palette exposes the ordinary workspace and process controls.
 - Users can discover, preview, cancel, select, and restore their selected whole-app theme across relaunch without editing configuration or interrupting terminal work.
 - Closing and reopening returns to live work without duplication, data corruption, or implicit termination.

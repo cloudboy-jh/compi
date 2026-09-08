@@ -14,6 +14,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_MUTATION: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug)]
+pub struct DaemonError {
+    pub code: ErrorCode,
+    pub message: String,
+    pub current_revision: Option<u64>,
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon error ({:?}): {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
 pub enum ServerEvent {
     Control {
         request_id: Option<u64>,
@@ -84,6 +103,7 @@ impl DaemonClient {
                     mutation_id: MutationId::new(next_mutation_id()),
                     expected_revision: workspace.revision,
                     operation: operation.clone(),
+                    launch: None,
                 },
             })?;
             loop {
@@ -259,8 +279,17 @@ impl DaemonClient {
                     request_id: Some(response_id),
                     message,
                 }) if response_id == request_id => {
-                    if let ServerMessage::Error { code, message, .. } = &message {
-                        return Err(format!("daemon error ({code:?}): {message}").into());
+                    if let ServerMessage::Error {
+                        code,
+                        message,
+                        current_revision,
+                    } = &message
+                    {
+                        return Err(Box::new(DaemonError {
+                            code: *code,
+                            message: message.clone(),
+                            current_revision: *current_revision,
+                        }));
                     }
                     return Ok(message);
                 }
@@ -422,6 +451,7 @@ fn terminal_operation(message: &ClientMessage) -> bool {
             | ClientMessage::Input { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::RequestSnapshot
+            | ClientMessage::ClearScrollback
     )
 }
 
@@ -436,9 +466,15 @@ fn next_mutation_id() -> String {
 
 fn unexpected_response(message: ServerMessage) -> crate::Error {
     match message {
-        ServerMessage::Error { code, message, .. } => {
-            format!("daemon error ({code:?}): {message}").into()
-        }
+        ServerMessage::Error {
+            code,
+            message,
+            current_revision,
+        } => Box::new(DaemonError {
+            code,
+            message,
+            current_revision,
+        }),
         message => format!("unexpected daemon response: {message:?}").into(),
     }
 }

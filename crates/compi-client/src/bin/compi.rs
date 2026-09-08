@@ -11,6 +11,8 @@ struct Arguments {
     working_directory: Option<String>,
     config: Option<PathBuf>,
     font: FontOverrides,
+    theme: Option<String>,
+    sidebar_width: Option<f32>,
     diagnostics: Vec<String>,
 }
 
@@ -23,6 +25,8 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
     let mut family = None;
     let mut size = None;
     let mut line_height = None;
+    let mut theme = None;
+    let mut sidebar_width = None;
     while let Some(argument) = args.next() {
         let setting = match argument.as_str() {
             "--instance" => &mut instance,
@@ -31,6 +35,8 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
             "--font-family" => &mut family,
             "--font-size" => &mut size,
             "--line-height" => &mut line_height,
+            "--theme" => &mut theme,
+            "--sidebar-width" => &mut sidebar_width,
             _ if !argument.starts_with('-') && working_directory.is_none() => {
                 working_directory = Some(argument);
                 continue;
@@ -63,11 +69,14 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
         size: numeric_override(size, "--font-size"),
         line_height: numeric_override(line_height, "--line-height"),
     };
+    let sidebar_width = numeric_override(sidebar_width, "--sidebar-width");
     Ok(Arguments {
         instance,
         working_directory,
         config: config.map(PathBuf::from),
         font,
+        theme,
+        sidebar_width,
         diagnostics,
     })
 }
@@ -78,14 +87,32 @@ fn main() {
         Ok(args) => args,
         Err(error) => {
             eprintln!(
-                "{error}\nUsage: compi [--instance NAME] [--working-directory PATH | PATH] [--config PATH] [--font-family FAMILY] [--font-size SIZE] [--line-height MULTIPLIER]"
+                "{error}\nUsage: compi [--instance NAME] [--working-directory PATH | PATH] [--config PATH] [--font-family FAMILY] [--font-size SIZE] [--line-height MULTIPLIER] [--theme NAME] [--sidebar-width WIDTH]"
             );
             std::process::exit(2);
         }
     };
     let mut config = compi_client::config::load(args.config.as_deref(), args.font);
+    config.apply_presentation_overrides(args.theme.as_deref(), args.sidebar_width);
     config.diagnostics.extend(args.diagnostics);
-    compi_client::gui::run(args.instance, args.working_directory, config);
+    let request = compi_client::window_host::LaunchRequest::new(args.working_directory, config);
+    match compi_client::window_host::acquire(args.instance.as_deref(), request) {
+        Ok(compi_client::window_host::HostAcquisition::Forwarded) => {}
+        Ok(compi_client::window_host::HostAcquisition::Host(mut host, request)) => {
+            let receiver = host.take_receiver();
+            compi_client::gui::run(
+                args.instance,
+                request.initial_working_directory,
+                request.config,
+                Some(receiver),
+            );
+            drop(host);
+        }
+        Err(error) => {
+            eprintln!("Could not open Compi window: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -114,6 +141,10 @@ mod tests {
                 "1.5",
                 "--font-family",
                 "CLI Font",
+                "--theme",
+                "warm-carbon",
+                "--sidebar-width",
+                "360",
                 "/project with spaces",
             ]
             .map(str::to_owned),
@@ -130,5 +161,21 @@ mod tests {
         assert_eq!(args.font.line_height, Some(1.5));
         assert_eq!(args.diagnostics.len(), 1);
         assert!(args.diagnostics[0].contains("--font-size"));
+
+        let mut config = compi_client::config::LoadedConfig {
+            theme: compi_client::theme::ThemePreset::DarkGlass,
+            configured_theme: compi_client::theme::ThemePreset::DarkGlass,
+            sidebar_width: 240.0,
+            configured_sidebar_width: 240.0,
+            ..Default::default()
+        };
+        config.apply_presentation_overrides(args.theme.as_deref(), args.sidebar_width);
+        assert_eq!(config.theme, compi_client::theme::ThemePreset::WarmCarbon);
+        assert_eq!(config.sidebar_width, 360.0);
+        assert_eq!(
+            config.configured_theme,
+            compi_client::theme::ThemePreset::DarkGlass
+        );
+        assert_eq!(config.configured_sidebar_width, 240.0);
     }
 }

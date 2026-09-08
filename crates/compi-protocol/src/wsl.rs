@@ -29,15 +29,24 @@ pub fn ensure_default_wsl2() -> Result<()> {
     default_wsl2_distribution().map(|_| ())
 }
 
-pub fn resolve_launch(working_directory: Option<&str>) -> Result<WslLaunch> {
+pub fn resolve_launch(
+    working_directory: Option<&str>,
+    requested_distribution: Option<&str>,
+) -> Result<WslLaunch> {
+    let selected = requested_distribution
+        .map(selected_wsl2_distribution)
+        .transpose()?;
     let Some(requested) = working_directory else {
         return Ok(WslLaunch {
-            distribution: None,
+            distribution: selected.map(|distribution| distribution.name),
             directory: "~".to_owned(),
             metadata: None,
         });
     };
-    let distribution = default_wsl2_distribution()?;
+    let distribution = match selected {
+        Some(distribution) => distribution,
+        None => default_wsl2_distribution()?,
+    };
     if requested.is_empty() {
         return Err("working directory must not be empty".into());
     }
@@ -116,6 +125,32 @@ pub fn resolve_launch(working_directory: Option<&str>) -> Result<WslLaunch> {
             warning,
         }),
     })
+}
+
+fn selected_wsl2_distribution(name: &str) -> Result<DefaultDistribution> {
+    let output = run_wsl(["--list", "--verbose"])?;
+    if !output.status.success() {
+        return Err("could not inspect WSL distributions".into());
+    }
+    let listing = decode_wsl_output(&output.stdout);
+    for line in listing.lines() {
+        let fields: Vec<_> = line
+            .trim_start()
+            .trim_start_matches('*')
+            .split_whitespace()
+            .collect();
+        if fields.len() >= 3 && fields[..fields.len() - 2].join(" ") == name {
+            let version = fields[fields.len() - 1].parse::<u32>().unwrap_or(0);
+            if version != 2 {
+                return Err(format!("configured WSL distribution {name} must use WSL2").into());
+            }
+            return Ok(DefaultDistribution {
+                name: name.into(),
+                version,
+            });
+        }
+    }
+    Err(format!("configured WSL distribution {name} was not found").into())
 }
 
 fn default_wsl2_distribution() -> Result<DefaultDistribution> {
@@ -235,18 +270,6 @@ fn decode_wsl_output(output: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn omitted_directory_preserves_fast_default_launch() {
-        assert_eq!(
-            resolve_launch(None).unwrap(),
-            WslLaunch {
-                distribution: None,
-                directory: "~".to_owned(),
-                metadata: None,
-            }
-        );
-    }
 
     #[test]
     fn parses_utf8_default_wsl_distribution() {

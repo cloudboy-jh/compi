@@ -167,16 +167,6 @@ fn control_byte(key: &str) -> Option<u8> {
     }
 }
 
-pub fn is_application_shortcut(keystroke: &Key<'_>) -> bool {
-    if !keystroke.modifiers.control {
-        return false;
-    }
-    matches!(
-        (keystroke.modifiers.shift, keystroke.key),
-        (false, "c" | "t" | "v" | "w" | "tab") | (true, "tab" | "c" | "v" | "p")
-    )
-}
-
 pub fn utf16_byte_index(text: &str, target: usize) -> usize {
     let mut utf16_offset = 0;
     for (byte_offset, character) in text.char_indices() {
@@ -353,26 +343,6 @@ mod tests {
             encode_keystroke(&space, false, Some(KeypadKey::Digit(7))),
             Some(b"\x1bOw".to_vec())
         );
-    }
-
-    #[test]
-    fn reserves_clipboard_and_paste_shortcuts() {
-        fn shortcut(key: &str, shift: bool) -> Key<'_> {
-            Key {
-                modifiers: Modifiers {
-                    control: true,
-                    shift,
-                    ..Default::default()
-                },
-                key,
-                key_char: None,
-            }
-        }
-
-        assert!(is_application_shortcut(&shortcut("v", false)));
-        assert!(is_application_shortcut(&shortcut("v", true)));
-        assert!(is_application_shortcut(&shortcut("c", false)));
-        assert!(is_application_shortcut(&shortcut("c", true)));
     }
 
     #[test]

@@ -57,6 +57,7 @@ struct Buffer {
     rows: Vec<Row>,
     scrollback: VecDeque<Row>,
     scrollback_bytes: usize,
+    scrollback_line_limit: usize,
 }
 
 impl Buffer {
@@ -65,13 +66,16 @@ impl Buffer {
             rows: vec![Row::blank(cols); rows],
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
+            scrollback_line_limit: 10_000,
         }
     }
 
     fn push_scrollback(&mut self, row: Row) {
         self.scrollback_bytes += row_memory(&row);
         self.scrollback.push_back(row);
-        while self.scrollback_bytes > MAX_SCROLLBACK_BYTES {
+        while self.scrollback_bytes > MAX_SCROLLBACK_BYTES
+            || self.scrollback.len() > self.scrollback_line_limit
+        {
             let Some(removed) = self.scrollback.pop_front() else {
                 break;
             };
@@ -187,6 +191,7 @@ pub struct TerminalState {
     next_image_id: u32,
     active_transfer: Option<u32>,
     diagnostics: UnsupportedDiagnostics,
+    graphics_byte_limit: usize,
 }
 
 impl TerminalState {
@@ -226,7 +231,21 @@ impl TerminalState {
             next_image_id: 1,
             active_transfer: None,
             diagnostics: UnsupportedDiagnostics::default(),
+            graphics_byte_limit: MAX_GRAPHICS_BYTES,
         }
+    }
+
+    pub fn set_resource_limits(&mut self, scrollback_lines: usize, graphics_bytes: usize) {
+        self.main.scrollback_line_limit = scrollback_lines;
+        self.alternate.scrollback_line_limit = scrollback_lines;
+        self.graphics_byte_limit = graphics_bytes;
+    }
+
+    pub fn clear_scrollback(&mut self) {
+        self.main.scrollback.clear();
+        self.main.scrollback_bytes = 0;
+        self.scrollback_generation = self.scrollback_generation.saturating_add(1);
+        self.sequence = self.sequence.saturating_add(1);
     }
     pub fn set_diagnostic_context(&mut self, session_id: &str, trace_label: Option<&str>) {
         self.diagnostics.context = match trace_label {
@@ -931,20 +950,41 @@ impl TerminalState {
             return;
         }
         if matches!(action, "t" | "T") {
+            let retained_bytes = self
+                .images
+                .values()
+                .map(|image| decoded_base64_size(image.data.as_bytes()))
+                .chain(self.transfers.values().map(|transfer| transfer.bytes.len()))
+                .fold(0usize, usize::saturating_add);
+            let decoded_bound = decoded_base64_size(encoded);
+            if self.graphics_byte_limit == 0
+                || retained_bytes.saturating_add(decoded_bound) > self.graphics_byte_limit
+                || (!self.transfers.contains_key(&id) && self.transfers.len() >= 64)
+            {
+                self.transfers.remove(&id);
+                if self.active_transfer == Some(id) {
+                    self.active_transfer = None;
+                }
+                return;
+            }
             let placement = (action == "T").then(|| self.kitty_placement(id, &values));
             let transfer = self.transfers.entry(id).or_default();
             transfer.format = values
                 .get("f")
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(32);
+                .unwrap_or(if transfer.format == 0 {
+                    32
+                } else {
+                    transfer.format
+                });
             transfer.width = values
                 .get("s")
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(0);
+                .unwrap_or(transfer.width);
             transfer.height = values
                 .get("v")
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(0);
+                .unwrap_or(transfer.height);
             transfer.compressed |= values.get("o") == Some(&"z");
             transfer.placement = transfer.placement.or(placement);
             match base64::engine::general_purpose::STANDARD.decode(encoded) {
@@ -978,20 +1018,25 @@ impl TerminalState {
         let Some(mut transfer) = self.transfers.remove(&id) else {
             return self.images.contains_key(&id);
         };
+        let current_bytes = self
+            .images
+            .values()
+            .map(|image| decoded_base64_size(image.data.as_bytes()))
+            .chain(self.transfers.values().map(|pending| pending.bytes.len()))
+            .fold(0usize, usize::saturating_add);
+        let available = self.graphics_byte_limit.saturating_sub(current_bytes);
         if transfer.compressed {
             let mut decoded = Vec::new();
-            if let Err(error) = ZlibDecoder::new(&transfer.bytes[..]).read_to_end(&mut decoded) {
+            if let Err(error) = ZlibDecoder::new(&transfer.bytes[..])
+                .take(available.saturating_add(1) as u64)
+                .read_to_end(&mut decoded)
+            {
                 eprintln!("compi-daemon: invalid compressed Kitty image: {error}");
                 return false;
             }
             transfer.bytes = decoded;
         }
-        let current_bytes: usize = self
-            .images
-            .values()
-            .map(|image| image.data.len().saturating_mul(3) / 4)
-            .sum();
-        if current_bytes.saturating_add(transfer.bytes.len()) > MAX_GRAPHICS_BYTES {
+        if current_bytes.saturating_add(transfer.bytes.len()) > self.graphics_byte_limit {
             eprintln!("compi-daemon: Kitty graphics memory limit exceeded");
             return false;
         }
@@ -1462,7 +1507,9 @@ fn reflow_main_buffer(
     buffer.scrollback = physical_rows.into();
     buffer.rows = viewport;
     buffer.scrollback_bytes = buffer.scrollback.iter().map(row_memory).sum();
-    while buffer.scrollback_bytes > MAX_SCROLLBACK_BYTES {
+    while buffer.scrollback_bytes > MAX_SCROLLBACK_BYTES
+        || buffer.scrollback.len() > buffer.scrollback_line_limit
+    {
         let Some(removed) = buffer.scrollback.pop_front() else {
             break;
         };
@@ -1500,6 +1547,16 @@ fn repair_wide_cells(row: &mut Row) {
             row.cells[index] = Cell::default();
         }
     }
+}
+
+fn decoded_base64_size(encoded: &[u8]) -> usize {
+    let padding = encoded
+        .iter()
+        .rev()
+        .take(2)
+        .take_while(|byte| **byte == b'=')
+        .count();
+    (encoded.len().saturating_add(3) / 4 * 3).saturating_sub(padding)
 }
 
 #[cfg(test)]
@@ -1752,6 +1809,10 @@ mod tests {
         terminal.advance(b"\x1b_Gm=0;AwQ=\x1b\\");
         let snapshot = terminal.snapshot();
         assert_eq!(snapshot.images[0].data, "AQIDBA==");
+        assert_eq!(
+            (snapshot.images[0].width, snapshot.images[0].height),
+            (1, 1)
+        );
         assert_eq!(snapshot.placements[0].placement_id, Some(3));
         let (_, replies) = terminal.advance(b"\x1b_Ga=q,i=8\x1b\\");
         assert_eq!(replies, vec![b"\x1b_Gi=8;OK\x1b\\".to_vec()]);
@@ -1763,5 +1824,79 @@ mod tests {
             .find(|image| image.id == 9)
             .unwrap();
         assert_eq!(compressed.data, "AQIDBA==");
+    }
+
+    #[test]
+    fn configured_history_limit_and_clear_preserve_live_canvas() {
+        let mut terminal = TerminalState::new(16, 2);
+        terminal.set_resource_limits(2, MAX_GRAPHICS_BYTES);
+        terminal.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let before = terminal.snapshot();
+        assert_eq!(
+            before.scrollback.iter().map(row_text).collect::<Vec<_>>(),
+            ["two", "three"]
+        );
+        terminal.clear_scrollback();
+        let cleared = terminal.snapshot();
+        assert!(cleared.scrollback.is_empty());
+        assert_eq!(cleared.cells, before.cells);
+        assert_eq!(cleared.cursor, before.cursor);
+        assert!(cleared.sequence > before.sequence);
+        terminal.advance(b"\r\nsix");
+        assert_eq!(
+            terminal
+                .snapshot()
+                .scrollback
+                .iter()
+                .map(row_text)
+                .collect::<Vec<_>>(),
+            ["four"]
+        );
+    }
+
+    #[test]
+    fn configured_graphics_limit_counts_decoded_chunk_bytes() {
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.set_resource_limits(10, 4);
+        terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=8,m=1;AQI=\x1b\\");
+        terminal.advance(b"\x1b_Gm=0;AwQ=\x1b\\");
+        assert_eq!(terminal.snapshot().images[0].data, "AQIDBA==");
+        terminal.advance(b"\x1b_Ga=t,f=32,s=1,v=1,i=9;AQIDBA==\x1b\\");
+        assert_eq!(
+            terminal
+                .snapshot()
+                .images
+                .iter()
+                .map(|image| image.id)
+                .collect::<Vec<_>>(),
+            [8]
+        );
+    }
+
+    #[test]
+    fn decompression_respects_other_pending_graphics_transfers() {
+        use std::io::Write;
+        let data = vec![1_u8; 800];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        let mut compressed =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        compressed.write_all(&data).unwrap();
+        let compressed =
+            base64::engine::general_purpose::STANDARD.encode(compressed.finish().unwrap());
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.set_resource_limits(10, 1024);
+        terminal.advance(format!("\x1b_Ga=t,f=32,s=200,v=1,i=1,m=1;{encoded}\x1b\\").as_bytes());
+        terminal.advance(format!("\x1b_Ga=t,f=32,s=200,v=1,i=2,o=z;{compressed}\x1b\\").as_bytes());
+        assert!(terminal.snapshot().images.is_empty());
+        terminal.advance(b"\x1b_Gi=1,m=0;\x1b\\");
+        assert_eq!(
+            terminal
+                .snapshot()
+                .images
+                .iter()
+                .map(|image| image.id)
+                .collect::<Vec<_>>(),
+            [1]
+        );
     }
 }

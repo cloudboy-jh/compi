@@ -272,6 +272,7 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
                     .working_directory
                     .as_ref()
                     .map(|directory| directory.requested.clone()),
+                profile: None,
             },
             working_directory: session.working_directory,
         });
@@ -511,6 +512,7 @@ mod tests {
             error: None,
             launch: LaunchRequest {
                 working_directory: None,
+                profile: None,
             },
             working_directory: None,
         });
@@ -610,6 +612,7 @@ mod tests {
             error: None,
             launch: LaunchRequest {
                 working_directory: None,
+                profile: None,
             },
             working_directory: None,
         });

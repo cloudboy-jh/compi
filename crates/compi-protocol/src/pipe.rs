@@ -245,7 +245,7 @@ impl Listener {
                 {
                     return Err("refusing to replace an unowned or non-socket endpoint".into());
                 }
-                match std::os::unix::net::UnixStream::connect(&path) {
+                match open_unix_nonblocking(name, Duration::ZERO) {
                     Ok(_) => return Err("a live server already owns this endpoint".into()),
                     Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
                     Err(error) => return Err(error.into()),
@@ -259,6 +259,11 @@ impl Listener {
         let owner = Self { listener, path };
         std::fs::set_permissions(&owner.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(owner)
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        self.listener.set_nonblocking(nonblocking)?;
+        Ok(())
     }
 
     pub fn accept(&self) -> Result<File> {
@@ -279,23 +284,116 @@ impl Drop for Listener {
 pub fn connect(name: &str, timeout: Duration) -> Result<File> {
     let deadline = Instant::now() + timeout;
     loop {
-        match std::os::unix::net::UnixStream::connect(name) {
+        match open_unix_nonblocking(name, deadline.saturating_duration_since(Instant::now())) {
             Ok(stream) => {
                 check_peer(&stream)?;
+                stream.set_nonblocking(false)?;
                 return Ok(File::from(std::os::fd::OwnedFd::from(stream)));
             }
             Err(error) => {
-                if !matches!(
+                let retryable = matches!(
                     error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) || Instant::now() >= deadline
-                {
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::WouldBlock
+                ) || error.raw_os_error() == Some(libc::EINPROGRESS);
+                if !retryable || Instant::now() >= deadline {
                     return Err(error.into());
                 }
                 thread::sleep(Duration::from_millis(10));
             }
         }
     }
+}
+
+// A blocking UnixStream::connect can wait indefinitely when a live socket's
+// backlog is full. Use a nonblocking attempt even for probes and timeout=ZERO;
+// ordinary daemon connections are restored to blocking mode after authentication.
+#[cfg(unix)]
+fn open_unix_nonblocking(
+    name: &str,
+    timeout: Duration,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if name.as_bytes().contains(&0) || name.len() >= address.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path is too long or contains NUL",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, byte) in address.sun_path.iter_mut().zip(name.bytes()) {
+        *target = byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = length as u8;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    if unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    stream.set_nonblocking(true)?;
+    if unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            length as libc::socklen_t,
+        )
+    } < 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+            if ready > 0 {
+                let mut status: libc::c_int = 0;
+                let mut length = std::mem::size_of_val(&status) as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut status as *mut libc::c_int).cast(),
+                        &mut length,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if status != 0 {
+                    return Err(io::Error::from_raw_os_error(status));
+                }
+                break;
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+        }
+    }
+    Ok(stream)
 }
 
 #[cfg(unix)]

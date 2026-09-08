@@ -374,6 +374,16 @@ fn handle_connection(
                         send_surface_error(&sink, request_id, &error);
                     }
                 }
+                ClientMessage::ClearScrollback => {
+                    let Some((surface, target)) =
+                        attached_target(&attached, target.as_ref(), &sink, request_id)
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = surface.clear_scrollback(target, request_id) {
+                        send_surface_error(&sink, request_id, &error);
+                    }
+                }
                 ClientMessage::ShutdownDaemon => {
                     sink.send_control_sync(&ServerControl {
                         request_id: Some(request_id),

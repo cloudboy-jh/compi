@@ -8,7 +8,7 @@ Compi is a native terminal workspace backed by a persistent server. The product 
 
 [docs/Spec.md](docs/Spec.md) is the authoritative product and technical contract. It calls for server-owned sessions, tabs, and split panes; remembered client presentation; a command palette; and selectable whole-app themes. The default is neutral Dark Glass with an acid-green accent, glass limited to sidebar/window chrome, and an opaque terminal canvas.
 
-These are requirements, not a claim that the complete workspace client is implemented. Phases 0–3 now provide the shared process contract, native daemon/runtime foundation, and durable daemon-owned workspace hierarchy. Phase 4 client presentation, remembered windows, split layout, command palette, and themes remain outstanding. See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
+The Phase 4 workspace client is implemented, with native Windows/WSL verification. Native Mac workspace qualification and the broader Phase 5 daily-use/resource qualification remain open. See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) for the exact evidence and remaining gates.
 
 ## Current implementation
 
@@ -19,9 +19,20 @@ GPUI client <-> per-user daemon <-> portable-pty <-> native Mac/Unix shell
                                \-> ConPTY       <-> Windows/WSL2 Bash
 ```
 
-The daemon owns shell lifecycle, authoritative terminal state, and the durable workspace hierarchy: sessions contain ordered tabs, tabs contain split trees, and pane leaves reference stable surfaces. Protocol v8 separates every identity type, adds optimistic durable mutations and receipts, and keys attachments and screen traffic to a server generation plus process lifetime. The current GPUI client consumes the new surface model but still presents its pre-Phase-4 tab/switcher UI; full split rendering and remembered client state remain later work.
+The daemon owns shell lifecycle, authoritative terminal state, and the durable workspace hierarchy. The client presents **Workspace → Terminal tabs → Panes**: a user-facing workspace is the server's `Session`, not another navigation layer. Primary top tabs contain terminal split trees; the full workspace sidebar stays hidden until summoned. Protocol v9 retains durable mutations, receipts, and process-lifetime identities, and adds measured split requests, path-addressed dividers, invocation-local launch context, and authoritative Clear scrollback.
 
 The Cargo workspace has three product crates: `compi-protocol` owns the shared process contract and local transport, `compi-daemon` owns shell lifecycle, terminal semantics, persistence, and OS hosting, and `compi-client` owns daemon consumption, replicas, the diagnostic probe, and the GPUI application. The daemon's production graph contains no graphics dependencies; the installer remains isolated under `installer/bootstrapper`.
+
+### Workspace controls
+
+- Create, rename, reorder, hide, and restore terminal tabs; browse named workspaces in the optional sidebar.
+- Split right/down, move pane focus, and drag dividers. Small windows scroll the complete layout instead of rewriting it or automatically collapsing the sidebar.
+- Drag a tab out to create a native window, or drop it into another Compi window. The same tab, panes, and processes move; ordinary same-instance launches share one GUI host.
+- Window close and tab hide detach without ending processes. End, restart, and confirmed removal are separate actions; exited output remains available for inspection.
+- Window slots remember geometry, navigation, hidden tabs, sidebar width, zoom, accepted theme, and provably valid viewport anchors. Every new/reopened window starts with its sidebar closed.
+- **Appearance…** and the palette's **Change theme** open one live-preview picker. Dark Glass is the default; Warm Carbon is optional. Escape cancels, Enter/Apply accepts. Glass is limited to chrome/sidebar, with opaque fallbacks; terminal canvases remain opaque.
+
+Use matching client/daemon builds. Protocol v9 intentionally rejects older live daemons rather than interrupting their processes. Try a separate `--instance phase4` when an older daemon still owns valuable work.
 
 ## Check the product boundaries
 
@@ -60,12 +71,27 @@ family = "Menlo"
 size = 14.0
 line_height = 1.35
 fallbacks = ["JetBrainsMono Nerd Font Mono"]
+
+[appearance]
+theme = "dark-glass"
+
+[layout]
+sidebar_width = 280.0
+
+[limits]
+scrollback_lines = 10000
+graphics_bytes = 4194304
+
+[clipboard]
+policy = "deny" # Terminal-initiated OSC 52 writes; explicit Copy/Paste still work.
 ```
 
-Use `--config PATH` or `COMPI_CONFIG_FILE` to select another file. Invocation-local `--font-family`, `--font-size`, and `--line-height` values take precedence. Invalid fields are ignored independently and reported in the client without discarding valid siblings.
+Use `--config PATH` or `COMPI_CONFIG_FILE` to select another file. Invocation-local `--font-family`, `--font-size`, `--line-height`, `--theme`, and `--sidebar-width` override presentation without rewriting configuration or remembered defaults. Independent invalid presentation fields are diagnosed; invalid selected launch configuration blocks new launches instead of silently choosing another executable.
+
+Launch configuration uses `[shell]` (`executable`, `args`, `login`, `working_directory`, `distribution`), `[environment]`, and optional `[profiles.NAME]` selected by `default_profile`. Explicit program arguments remain literal; environment overrides are not persisted in workspace metadata. Named profiles override base launch fields/environment. `[keybindings]` maps command IDs (for example `split_right`) to shortcuts; an empty binding unbinds a command. Scrollback also retains its fixed 1 MiB byte bound; supported graphics storage is 0–4 MiB.
 
 
-Mac shortcuts include Cmd-T (new tab), Cmd-W (detach tab), Cmd-C/V (copy/paste), Cmd-Shift-P (session switcher), and Cmd-Q (quit client). Ctrl-C remains terminal interrupt.
+Mac shortcuts include Cmd-T/W (new/hide tab), Cmd-D / Cmd-Shift-D (split right/down), Cmd-B (sidebar), Cmd-Shift-P (palette), Cmd-C/V, and Cmd-Q. Windows uses Ctrl-Shift-T/W, Ctrl-Shift-D/E, Ctrl-Shift-B, and Ctrl-Shift-P. Windows Ctrl-C copies a nonempty selection, otherwise sends terminal interrupt; Ctrl-Shift-C/V are explicit copy/paste. Palette/picker navigation does not leak into the terminal.
 
 Mac metadata and diagnostic logs live under `~/Library/Application Support/Compi`; Linux uses `$XDG_STATE_HOME/compi` or `~/.local/state/compi`. Unix sockets use `$XDG_RUNTIME_DIR/compi` or a private `/tmp/compi-UID` directory. `COMPI_DATA_DIR` and `COMPI_RUNTIME_DIR` override those locations for isolated runs; overrides must be absolute, current-user-owned private directories.
 

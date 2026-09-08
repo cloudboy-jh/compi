@@ -52,6 +52,30 @@ An explicit `--working-directory /absolute/project/path` requests new work. Omit
 
 CI is configured to run the Unix integration suite natively on Mac/Linux. Windows/WSL tests still require a qualified Windows host. The Windows immediate-descendant ownership regression is part of `cargo test --locked -p compi-daemon --lib`; compiling it on another host does not qualify the retained ConPTY backend.
 
+## Phase 4 native workspace checks
+
+Use matching v9 client/daemon binaries and an isolated instance. Do not stop an older daemon that owns valuable work merely to try the new client.
+
+```powershell
+cargo test --locked --workspace --all-targets --release
+cargo build --locked --release --workspace --bins --examples
+.\target\release\compi.exe --instance phase4
+```
+
+Set `GPUI_FXC_PATH` as described below. First launch creates one shell; later windows/relaunches do not repair hidden or intentionally empty work by creating replacement shells.
+
+1. With the sidebar closed, create/rename/reorder terminal tabs. Open the sidebar explicitly, create/switch a workspace, and verify the top tabs remain primary. Hide and restore a tab without changing its process.
+2. Build nested Split right/down layouts. Drag a divider repeatedly within 32 ms intervals, including while PTY resize metadata arrives. The final ratio must commit without a GPUI panic or self-generated revision conflict.
+3. Shrink the window with the sidebar open. Every pane keeps at least a 20-column by 4-row canvas; workspace scrolling and directional focus reach clipped panes. Expanding restores saved ratios; visibility/width changes do not rewrite the tree.
+4. Tear a three-pane tab into a new window, cancel another drag with Escape, then drop into an existing window. Verify the same shell PIDs/variables and split tree; the destination retains its own appearance. Moving the final tab leaves an empty source view.
+5. Launch the same instance from another process. It should create another native window in the existing GUI host, not report a false closed-pipe error or launch another shell. Exercise attachment conflicts without takeover.
+6. Preview Warm Carbon through Appearance or Change theme; cancel restores Dark Glass. Accept and reopen to verify per-window persistence. Terminal contents, processes, and user TOML remain unchanged.
+7. Select text in a static terminal workload, close, and reopen at the same geometry. Selection/scroll anchors restore only from the identical authoritative baseline. Changed output, lifetime, generation, or geometry invalidates uncertain anchors. The sidebar starts closed regardless of its previous visibility.
+8. Flood one pane with `yes` while typing/navigating another. End a surface with an owned background child, inspect its final output, restart explicitly, and remove a pane/tab/workspace with the appropriate confirmation.
+9. In an isolated state directory, exercise slot contention and failed atomic state writes. Failed window transfer retains the source; failed preference saving remains visibly unsaved without disabling the live presentation; a later successful save clears that warning.
+
+Windows shortcuts: Ctrl-Shift-T/W, Ctrl-Shift-D/E, Ctrl-Shift-B, Ctrl-Shift-P. Mac: Cmd-T/W, Cmd-D / Cmd-Shift-D, Cmd-B, Cmd-Shift-P. Physical input, IME, scaling/display pacing, and native Mac execution require separate attributed qualification; synthetic Win32 input is not that proof.
+
 ## Tier 1: automated regression
 
 ```powershell

@@ -478,6 +478,7 @@ fn mutation_publication_precedes_ack_and_restart_changes_lifetime() {
                     rows: 24,
                     working_directory: None,
                 },
+                launch: None,
             },
         })
         .unwrap();

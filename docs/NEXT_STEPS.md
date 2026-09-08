@@ -1,6 +1,6 @@
 # Compi next steps
 
-Phases 0–3 are implemented: contracts, package extraction, native Mac/Unix runtime, and durable server-owned workspace state. Phase 3 has native Windows daemon/probe evidence, while full cross-platform qualification and the Phase 4 workspace client remain open. Earlier Mac PTY/window evidence and remaining physical-input/display gaps are retained below.
+The Phase 4 workspace client is implemented on top of Phases 0–3. Native Windows/WSL workspace verification passed; native Mac workspace qualification, Linux native CI, and remaining physical-input/display/resource gates are still open. Earlier platform evidence and its limits are retained below.
 
 ## Completed: Phase 0 — implementation contracts
 
@@ -129,11 +129,82 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 | Focused native Windows daemon integration | Multi-surface terminal lifecycle, publish-before-ack mutation receipts, outcome lookup, same-surface restart with a new lifetime, stale-lifetime rejection, daemon-loss recovery, and malformed-workspace quarantine passed. |
 | Isolated native probe smoke | Created a session and tab, split to two running surfaces, ended and restarted one stable surface with a new lifetime, removed the tab after process cleanup, observed zero remaining surfaces at revision 12, and shut down the isolated daemon. |
 
-**Next:** Phase 4 builds the full workspace client over these server contracts. Do not reintroduce shell-shaped “session” APIs or combine the UI work with another persistence/protocol rewrite.
+**Client integration:** Phase 4 now consumes these server contracts. Do not reintroduce shell-shaped “session” APIs or restart the persistence/PTY extraction.
+
+## Phase 4: implemented, native Mac qualification pending
+
+### Agreed UI direction — 2026-09-07
+
+- **Primary:** Ghostty-like top terminal tabs. Each tab opens one terminal or its complete split layout, not an entire workspace. Creating, switching, reordering, and hiding tabs must work without opening the sidebar.
+- **User-facing hierarchy:** Workspace → Terminal tabs → Panes. A named UI workspace maps to the existing server `Session`; the server's `Workspace` root remains the collection of all such groups. Do not introduce a separate session navigation layer or rename the protocol/persistence model for UI terminology.
+- **Secondary:** a full Superterminal-style sidebar for browsing expandable workspaces and their tabs, organizing work, and finding/restoring hidden work. It supplements the top tab bar; it never replaces it. Every new or relaunched window starts with the sidebar closed, including tear-off windows. Remember width, not open visibility; expose a quiet chrome toggle, shortcut, and palette command, with no permanent rail, large selector, or reserved width when hidden. Reconnect, workspace switching, and tab creation/transfer never open it automatically.
+- **Native windows:** dragging a terminal tab outside its window creates a new window containing that same tab and all its splits. Dropping onto another window transfers the tab there. Preserve workspace membership (server `Session`), surface identities, process lifetimes, contents, and valid focus/viewport state; never clone or respawn work.
+- **Safe transfer:** keep the source attached during the drag; Escape cancels without moving anything. Accept a drop through an explicit attachment handoff, never concurrent controllers or PTY resize fights. Failed window creation/attachment keeps or restores the source view with a visible error. Moving the last tab leaves an empty source window, not a replacement shell.
+- **Presentation ownership:** existing destination windows keep their own theme, zoom, and sidebar state. A new tear-off window inherits the source's theme, zoom, and sidebar width but starts with its sidebar closed, without making transient theme previews or CLI overrides durable, and then remembers its settings independently.
+- **Dark Glass and themes:** establish shared theme tokens with the window shell. Dark Glass is the default: neutral-dark surfaces, acid-green accent, and restrained native materials in titlebar/tab chrome and the sidebar. Terminal canvases remain opaque; unsupported materials and reduced-transparency settings receive readable opaque chrome. Offer Warm Carbon as a coordinated whole-app alternative through one live-preview picker; cancel restores the prior theme, and only acceptance persists.
+- These decisions replace the earlier sidebar-first, sidebar-or-strip presentation plan. They are implemented; the native Windows evidence and remaining qualification gates are recorded below.
+
+### Implementation sequence and qualification
+
+Steps 1–5 are implemented. The Windows portion of step 6 passed; native Mac execution remains unavailable in this environment.
+
+1. **Workspace views and window state.** Replace the flat one-surface-per-UI-tab model with server-backed sessions, tabs, split trees, and independent surface views. Implement exclusively locked durable window slots, hidden membership, deterministic navigation fallback, state/config/CLI precedence, and lifetime-safe anchor restoration. Preserve the existing renderer, typography, input, and bounded replicas.
+2. **Primary tabs and secondary sidebar.** Build the window shell with theme tokens and Dark Glass styling from the start. Deliver top terminal tabs, expandable workspace browsing, tab reorder/hide/restore, manual sidebar toggle/resize/reset, and explicit empty/disconnected/exited/failed/ending/lost/conflict states. Restore the workspace's last selected tab/pane on switching; keep the sidebar hidden until summoned. Keep close/hide non-destructive; expose end, restart, and confirmed removal separately. No navigation action may implicitly create a replacement shell.
+3. **Nested splits and overflow.** Render all panes of the selected tab; add Split right/down, directional focus, draggable/keyboard-resizable dividers, and equalization. Enforce recursive 20-column by 4-row canvas minima using measured typography. Overflow scrolls the workspace without changing saved ratios, auto-collapsing the sidebar, or zooming panes. Coalesce PTY resizes; cancel stale drags and restore committed geometry on failure.
+4. **Tab tear-off and cross-window transfer.** Implement drag previews, insertion targets, new-window creation, and drop into existing windows of the same server instance. Reuse one handoff path; preserve full split trees and process identities, reconcile source/destination hidden membership, and handle cancellation, destination failure, and attachment conflicts without stealing control. Reopen transferred work from its remembered destination window.
+5. **Commands, configuration, and appearance.** Introduce one typed command registry as earlier actions land, then complete the palette, menus, platform shortcuts, and existing versioned TOML contract. Complete Dark Glass and Warm Carbon presets through one keyboard-accessible live-preview picker coordinating chrome, terminal background/text, borders, focus, selection, cursor, and ANSI colors. Only acceptance persists; terminal canvases stay opaque and chrome materials have readable opaque/reduced-transparency fallbacks.
+6. **Native acceptance and handoff.** Exercise the complete workflow in real Mac and Windows/WSL windows. Keep focused regressions for slot races, navigation/anchor invalidation, split constraints, stale divider commits, transfer failure/cancellation, command focus, and theme precedence. Record attributable results in the existing roadmap and acceptance recipes.
+
+### Phase 4 completion gate
+
+- Create and switch user-facing workspaces and terminal tabs, build nested splits, reorder, hide/restore, and explicitly end/restart/remove work through the native client. No separate session navigation layer appears.
+- Tear off a multi-pane tab, drop it into an existing window, cancel a drag, and recover from a failed transfer. Verify unchanged surface/process identities and no overlapping control or resize ownership.
+- Close/crash/reopen windows with their own navigation, hidden tabs, presentation, and the same live work. Sidebar width persists but every new/relaunched window starts with the sidebar closed; reconnect and tab actions do not summon it. Empty views never reseed; failed saves and attachment conflicts stay visible.
+- Shrink windows, change zoom/DPI, reveal offscreen panes, and toggle/resize the sidebar without changing the saved split tree. Flood one pane while typing in another without cross-pane input or state corruption.
+- Verify command/picker focus, theme preview/cancel/accept/relaunch, and safe configuration recovery without resetting terminal work.
+- Run focused regressions and final workspace/dependency checks once integrated. Native Mac and Windows evidence is required for the new UI; existing Linux CI and physical-input/display gaps remain explicitly tracked, not claimed as passed.
+
+Do not restart Phase 3 persistence/protocol work, replace the terminal engine, or port PTY backends in this phase. Any narrow attachment-handoff contract change must preserve the existing identity, revision, and ownership guarantees. Extended dogfooding, sustained resource budgets, and dogfood artifacts remain Phase 5; packaging/signing remains Phase 6.
+
+### Implemented boundaries
+
+- `gui.rs` and `gui/workspace.rs`: top terminal tabs, optional expandable workspace sidebar, all-pane rendering, native input/overlays, lifecycle actions, split overflow, window transfer, and whole-app appearance.
+- `client_state.rs`: exclusively locked remembered slots, atomic state writes, quarantine/recovery, hidden membership, navigation fallback, and sequence/identity/fingerprint-validated viewport anchors.
+- `layout.rs` and `commands.rs`: shared measured layout constraints and one typed command registry with platform shortcuts and disabled-action explanations.
+- `config.rs` and `theme.rs`: versioned read-only TOML, launch profiles/environment/limits, override provenance, Dark Glass/Warm Carbon, and transient preview semantics.
+- `window_host.rs`: authenticated, bounded same-user local forwarding so ordinary same-instance invocations create windows in one GUI process.
+- Protocol v9/server integration: measured split admission, root-relative divider paths, ephemeral environment context with persistable launch profiles, authoritative Clear scrollback, retained read-only exited grids, and retirement of obsolete runtime/controllers.
+
+### Windows verification: 2026-09-07
+
+| Check | Result |
+|---|---|
+| Release workspace regressions | 97 passed, including six native Windows/WSL daemon integration scenarios and three real GUI-host named-pipe regressions. Unix-gated runtime tests did not execute. |
+| Workspace Clippy with `-D warnings` | Passed. The upstream `proc-macro-error2` future-compatibility notice remains. |
+| Native release app, daemon, and development examples | Built in isolated `target/qualification`; no installer or task registration needed. |
+| Linux all-targets cross-check | Passed after restoring the daemon's explicit Unix `libc` dependency. Not native Linux test execution. |
+| Dependency boundaries | Passed for Windows, Linux, and macOS target graphs. Not a Mac app build or runtime claim. |
+| Actual GPUI window | Workspace/tab creation, rename, ordering, hide/restore, nested splits, pane focus, and sidebar controls exercised through targeted Win32 input. |
+| Layout and transfer | Divider commit, minimum-sized overflow with sidebar open, offscreen focus, drag cancellation, three-pane tear-off, existing-window transfer, and failed-destination rollback verified without process replacement. |
+| Process and input behavior | Native close/reopen preserved live work; input succeeded while another pane ran `yes`; explicit end removed an owned background child; restart changed the lifetime and confirmed removal collapsed the pane tree. |
+| Appearance and persistence | Whole-app theme preview/cancel/accept, independent destination appearance, visible failed-save recovery, hidden-on-reopen sidebar, and selection restoration from an unchanged authoritative snapshot verified. |
+| Ordinary multiwindow launch | A separate invocation exited successfully after creating a second window in the existing GUI process; no replacement shells or control takeover. |
+| Isolated protocol smoke | Literal argv/environment, configured history bound, Clear scrollback, four-pane tree with outer-divider targeting, retained exited snapshots, stale controller rejection after restart, cleanup/removal, and intentionally empty workspace behavior passed. |
+
+Native evidence used Windows 11 x64, release builds, Windows SDK `fxc.exe`, WSL2, Cascadia Mono at 14 logical pixels, and 144-DPI native windows. Win32 messages and actual GPUI `PrintWindow` captures are synthetic native interaction evidence, not physical-keyboard/IME or display-pacing qualification. No application automation hooks were added.
+
+Runtime verification found and fixed a GPUI animation request outside a render callback, divider conflicts caused by preview resize metadata, required-name validation incorrectly rejecting automatic terminal titles, false EOF on idle Windows GUI-host pipes, late close-state saving, and the live-to-read-only attachment transition. Focused regressions and the native reproductions cover the relevant boundaries; temporary smoke programs were removed after verification.
+
+### Remaining qualification
+
+1. Build and exercise the full workspace client on a native Mac. No Mac SDK/runtime or configured SSH host was available here.
+2. Run native Linux CI; Windows-host cross-compilation is not a substitute.
+3. Retain physical keys, dead keys/IME, exact user font/glyph selection, mixed displays/DPI, native controls, and sustained pacing/resource qualification as explicit gates.
+4. Continue Phase 5 daily-use/soak measurements and dogfood artifacts. Packaging/signing remains Phase 6.
 
 ## Current implementation: native refinement status
 
-**Status:** typography and glyph integration implemented; interaction refinement and full native qualification remain. The terminal now derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. The user has not selected a preferred reference terminal/font or clarified which interactions feel clanky.
+**Status:** typography and glyph integration implemented; interaction refinement and full native qualification remain. The terminal now derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. Ghostty-like terminal tabs and a secondary Superterminal-style sidebar are now the chosen navigation direction; the preferred reference font and specific interaction roughness remain unqualified.
 
 ### Completed — 2026-09-07
 
@@ -144,7 +215,7 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 - Kept the bounded row-shaping cache and invalidated it when display scale changes. Native UI chrome continues to use the system font.
 - Verified the Mac build, all 54 workspace tests, warning-free workspace Clippy, diff hygiene, first terminal frame, and an AppKit event-loop smoke. Pixel-level comparison and physical-input qualification remain blocked by unavailable screen-capture/accessibility permissions.
 
-**Next:** begin Phase 4 workspace client work while retaining the remaining Mac visual, physical-input, and interaction qualification as explicit open gates.
+**Next:** qualify the implemented workspace client on Mac and continue Phase 5, retaining the remaining visual, physical-input, and interaction checks as explicit open gates.
 
 ### 1. Establish the typography and glyph baseline — implementation complete, visual selection pending
 
@@ -196,7 +267,7 @@ An explicit `--working-directory` invocation retains the existing new-work behav
 Continue in the [specification's migration and build order](Spec.md#migration-and-build-order):
 
 - **Phase 3 — completed:** workspace ownership, durable mutations, process-lifetime identity, and metadata migration.
-- **Phase 4:** deliver the full workspace client, remembered window state, split overflow behavior, command palette, and whole-app themes.
+- **Phase 4: implementation complete, Mac qualification pending:** primary terminal tabs, secondary hidden workspace sidebar, nested splits/overflow, remembered windows, tab tear-off/transfer, palette, configuration, and whole-app themes.
 - **Phase 5:** qualify shared daily use and produce Mac/Windows dogfood artifacts with attributable resource measurements.
 - **Phase 6:** qualify distribution and extend process discovery/headless use.
 

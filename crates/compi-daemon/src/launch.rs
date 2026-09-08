@@ -43,7 +43,7 @@ impl LaunchDescription {
 
 #[cfg(windows)]
 pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
-    let launch = compi_protocol::wsl::resolve_launch(working_directory)?;
+    let launch = compi_protocol::wsl::resolve_launch(working_directory, None)?;
     let mut argv = Vec::new();
     if let Some(distribution) = launch.distribution {
         argv.extend([OsString::from("--distribution"), distribution.into()]);
@@ -155,6 +155,112 @@ fn user_defaults() -> Result<(OsString, PathBuf)> {
             std::ffi::OsStr::from_bytes(shell.to_bytes()).to_owned(),
             PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
         ));
+    }
+}
+
+/// Resolve explicit client launch context without persisting environment values.
+pub fn resolve_profile(
+    request: &compi_protocol::LaunchRequest,
+    context: Option<&compi_protocol::LaunchContext>,
+) -> Result<LaunchDescription> {
+    let empty = compi_protocol::LaunchProfile::default();
+    let profile = context
+        .map(|context| &context.profile)
+        .or(request.profile.as_deref())
+        .unwrap_or(&empty);
+    let directory = request
+        .working_directory
+        .as_deref()
+        .or(profile.working_directory.as_deref());
+    let mut args: Vec<OsString> = Vec::new();
+    if profile.login.unwrap_or(
+        cfg!(target_os = "macos") && profile.executable.is_none() && profile.args.is_empty(),
+    ) {
+        args.push("-l".into());
+    }
+    if profile.args.is_empty() && profile.executable.is_none() {
+        args.push("-i".into());
+    } else {
+        args.extend(profile.args.iter().map(OsString::from));
+    }
+    #[cfg(unix)]
+    {
+        if profile.distribution.is_some() {
+            return Err("WSL distribution is not supported on this host".into());
+        }
+        let (account_shell, account_home) = user_defaults()?;
+        let executable = profile
+            .executable
+            .as_ref()
+            .map(OsString::from)
+            .or_else(|| std::env::var_os("SHELL").filter(|shell| !shell.is_empty()))
+            .unwrap_or(account_shell);
+        validate_executable(&executable)?;
+        let cwd = directory
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or(account_home);
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err(format!(
+                "working directory must be an existing absolute directory: {}",
+                cwd.display()
+            )
+            .into());
+        }
+        let mut env = vec![("SHELL".into(), executable.clone())];
+        if let Some(context) = context {
+            env.extend(
+                context
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.into(), value.into())),
+            );
+        }
+        Ok(LaunchDescription {
+            executable,
+            argv: args,
+            cwd: Some(std::fs::canonicalize(cwd)?),
+            env,
+            metadata: None,
+        })
+    }
+    #[cfg(windows)]
+    {
+        let resolved =
+            compi_protocol::wsl::resolve_launch(directory, profile.distribution.as_deref())?;
+        let executable = profile.executable.as_deref().unwrap_or("/bin/bash");
+        if !executable.starts_with('/') {
+            return Err("configured WSL executable must be an absolute Linux path".into());
+        }
+        let mut argv: Vec<OsString> = Vec::new();
+        if let Some(distribution) = resolved.distribution {
+            argv.extend(["--distribution".into(), distribution.into()]);
+        }
+        argv.extend(["--cd".into(), resolved.directory.into(), "--exec".into()]);
+        if let Some(context) = context
+            && !context.env.is_empty()
+        {
+            argv.push("/usr/bin/env".into());
+            argv.extend(
+                context
+                    .env
+                    .iter()
+                    .map(|(key, value)| OsString::from(format!("{key}={value}"))),
+            );
+        }
+        argv.push(executable.into());
+        argv.extend(args);
+        Ok(LaunchDescription {
+            executable: r"C:\Windows\System32\wsl.exe".into(),
+            argv,
+            cwd: None,
+            env: Vec::new(),
+            metadata: resolved.metadata,
+        })
     }
 }
 

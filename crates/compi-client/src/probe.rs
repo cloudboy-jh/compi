@@ -157,18 +157,65 @@ fn tab_command(instance: Option<&str>, args: &[String]) -> Result<()> {
 fn pane_command(instance: Option<&str>, args: &[String]) -> Result<()> {
     let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
     let (cols, rows) = console::dimensions();
+    let workspace = client.workspace()?;
     let operation = match args.first().map(String::as_str) {
         Some("split-right") | Some("split-down") if matches!(args.len(), 2 | 3) => {
+            let pane_id = PaneId::new(args[1].clone());
+            let axis = if args[0] == "split-right" {
+                SplitAxis::Horizontal
+            } else {
+                SplitAxis::Vertical
+            };
+            let metrics = crate::layout::LayoutMetrics {
+                cell_width: 1.0,
+                line_height: 1.0,
+                padding_x: 0.0,
+                padding_y: 0.0,
+                pane_chrome_height: 0.0,
+                divider_thickness: 1.0,
+                scale_factor: 1.0,
+            };
+            let layout = workspace
+                .sessions
+                .iter()
+                .flat_map(|session| &session.tabs)
+                .map(|tab| {
+                    crate::layout::compute_layout(
+                        &tab.layout,
+                        crate::layout::Size {
+                            width: f32::from(cols),
+                            height: f32::from(rows),
+                        },
+                        metrics,
+                    )
+                })
+                .find(|layout| layout.pane(&pane_id).is_some())
+                .ok_or("pane was not found")?;
+            let rect = layout.split_feasibility(&pane_id, axis)?;
+            let (cols, rows) = match axis {
+                SplitAxis::Horizontal => (
+                    ((rect.width - 1.0) / 2.0).floor() as i16,
+                    rect.height.floor() as i16,
+                ),
+                SplitAxis::Vertical => (
+                    rect.width.floor() as i16,
+                    ((rect.height - 1.0) / 2.0).floor() as i16,
+                ),
+            };
             WorkspaceMutation::SplitPane {
-                pane_id: PaneId::new(args[1].clone()),
-                axis: if args[0] == "split-right" {
-                    SplitAxis::Horizontal
-                } else {
-                    SplitAxis::Vertical
-                },
+                pane_id,
+                axis,
                 cols,
                 rows,
                 working_directory: args.get(2).cloned(),
+                // The headless probe uses terminal-cell units, without native pane chrome.
+                geometry: compi_protocol::SplitGeometry {
+                    width: rect.width,
+                    height: rect.height,
+                    min_width: 20.0,
+                    min_height: 4.0,
+                    divider: 1.0,
+                },
             }
         }
         Some("remove") if args.len() == 2 => WorkspaceMutation::RemovePane {
@@ -176,7 +223,20 @@ fn pane_command(instance: Option<&str>, args: &[String]) -> Result<()> {
         },
         _ => return Err("invalid pane command; run compi-probe help".into()),
     };
-    print_receipt(client.mutate(operation)?)
+    let ordinal = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    print_receipt(client.submit_mutation(compi_protocol::MutationRequest {
+        server_id: workspace.server_id,
+        expected_generation: workspace.server_generation,
+        expected_revision: workspace.revision,
+        mutation_id: compi_protocol::MutationId::new(format!(
+            "probe-{}-{ordinal}",
+            std::process::id()
+        )),
+        operation,
+        launch: None,
+    })?)
 }
 
 fn surface_command(instance: Option<&str>, args: &[String]) -> Result<()> {

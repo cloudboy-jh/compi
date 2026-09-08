@@ -1,11 +1,14 @@
 //! Client-side daemon transport, terminal replicas, and interaction logic.
 
+pub mod client_state;
+pub mod commands;
 pub mod config;
 #[cfg(windows)]
 pub mod console;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod gui;
 pub mod input;
+pub mod layout;
 pub mod probe;
 mod replica;
 pub mod selection;
@@ -13,6 +16,8 @@ pub mod theme;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod typography;
 pub mod viewport;
+#[cfg(any(windows, target_os = "macos"))]
+pub mod window_host;
 
 pub use compi_protocol::{DaemonClient, ServerEvent};
 pub use replica::{MirrorApply, ScreenMirror};

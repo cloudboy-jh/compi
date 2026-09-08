@@ -19,12 +19,12 @@ pub use screen::{
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub use client::{DaemonClient, ServerEvent};
+pub use client::{DaemonClient, DaemonError, ServerEvent};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -134,6 +134,7 @@ pub enum ClientMessage {
         rows: i16,
     },
     RequestSnapshot,
+    ClearScrollback,
     ShutdownDaemon,
 }
 
@@ -231,10 +232,42 @@ pub struct WorkingDirectory {
     pub warning: Option<String>,
 }
 
+/// Persistable launch choices. Environment overrides travel separately and are never stored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchProfile {
+    pub executable: Option<String>,
+    pub args: Vec<String>,
+    pub login: Option<bool>,
+    pub working_directory: Option<String>,
+    pub distribution: Option<String>,
+}
+
+/// Invocation-local launch context, retained only until the accepted launch effect runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchContext {
+    pub profile: LaunchProfile,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub scrollback_lines: usize,
+    pub graphics_bytes: usize,
+}
+
+impl Default for LaunchContext {
+    fn default() -> Self {
+        Self {
+            profile: LaunchProfile::default(),
+            env: std::collections::BTreeMap::new(),
+            scrollback_lines: 10_000,
+            graphics_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaunchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Box<LaunchProfile>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,6 +361,18 @@ pub struct MutationRequest {
     pub mutation_id: MutationId,
     pub expected_revision: u64,
     pub operation: WorkspaceMutation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<Box<LaunchContext>>,
+}
+
+/// Measured focused-pane rectangle and minimum child allocations in logical pixels.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct SplitGeometry {
+    pub width: f32,
+    pub height: f32,
+    pub min_width: f32,
+    pub min_height: f32,
+    pub divider: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -373,10 +418,11 @@ pub enum WorkspaceMutation {
         cols: i16,
         rows: i16,
         working_directory: Option<String>,
+        geometry: SplitGeometry,
     },
     SetSplitRatio {
         tab_id: TabId,
-        pane_id: PaneId,
+        path: Vec<bool>,
         ratio: f32,
     },
     RemovePane {
@@ -447,6 +493,7 @@ mod tests {
             error: None,
             launch: LaunchRequest {
                 working_directory: None,
+                profile: None,
             },
             working_directory: None,
         };

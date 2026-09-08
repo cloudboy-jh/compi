@@ -1,17 +1,19 @@
+use crate::client_state::{ClientState, SavedViewport, StateSlot, WindowGeometry};
+use crate::commands::{self, Command};
 use crate::config::{FontSettings, LoadedConfig};
-#[cfg(windows)]
-use crate::input::is_application_shortcut;
 use crate::input::{
     self, Key, KeypadKey, Modifiers, encode_keystroke, encode_mouse, utf16_byte_index,
 };
+use crate::layout::{self, LayoutMetrics, WorkspaceLayout};
 use crate::probe;
-use crate::selection::{
-    CtrlCBehavior, GridPoint, Selection, ctrl_c_behavior, line_selection, selected_text,
-    word_selection,
+use crate::selection::{GridPoint, Selection, line_selection, selected_text, word_selection};
+use crate::theme::{ThemeColors, ThemePreset};
+use compi_protocol::{
+    LayoutNode, MutationId, MutationRequest, PaneId, SessionId, SplitAxis, TabId,
+    WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
-use crate::theme::{
-    ACCENT, BACKGROUND, BORDER, ERROR, FOREGROUND, MUTED, SELECTION, SURFACE, SURFACE_HOVER,
-};
+use sha2::{Digest, Sha256};
+mod workspace;
 use crate::typography::TerminalTypography;
 use crate::viewport::{
     hyperlink_at, inherited_working_directory, is_allowed_hyperlink, visible_row, visible_rows,
@@ -22,15 +24,15 @@ use base64::Engine as _;
 use compi_protocol::perf;
 use compi_protocol::{
     Cell, ClientMessage, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode,
-    Row, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus,
+    Row, ScreenMessage, ServerMessage, SurfaceId, SurfaceStatus,
 };
 use gpui::{
     App, Application, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
     EntityInputHandler, FocusHandle, Focusable, FontId, FontStyle, FontWeight, GlyphId, Hsla,
-    KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathBuilder, Pixels, Point, Render, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    WindowControlArea, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 use image::{Frame as ImageFrame, RgbaImage};
 #[cfg(target_os = "macos")]
@@ -43,7 +45,7 @@ use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
@@ -66,6 +68,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, PostMessageW, SW_RESTORE, ShowWindowAsync, WM_NCLBUTTONDOWN,
 };
+use workspace::{DividerDrag, Overlay, TransferSeed, open_compi_window};
 
 const DEFAULT_COLS: i16 = 100;
 const DEFAULT_ROWS: i16 = 30;
@@ -83,13 +86,8 @@ const TITLEBAR_BRAND_WIDTH: f32 = 118.0;
 const UI_FONT: &str = "Segoe UI";
 #[cfg(target_os = "macos")]
 const UI_FONT: &str = ".SystemUIFont";
-const NEW_TAB_WIDTH: f32 = 40.0;
-const SESSION_SWITCHER_WIDTH: f32 = 40.0;
-const TITLEBAR_DRAG_WIDTH: f32 = 16.0;
-const TITLEBAR_ACTIONS_WIDTH: f32 = NEW_TAB_WIDTH + SESSION_SWITCHER_WIDTH + TITLEBAR_DRAG_WIDTH;
 const TAB_DRAG_THRESHOLD: f32 = 4.0;
 const TERMINAL_PADDING: f32 = 8.0;
-const RECONNECT_DELAY: Duration = Duration::from_millis(350);
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
 const UI_EVENT_YIELD: Duration = Duration::from_micros(8_333);
 
@@ -97,98 +95,57 @@ pub fn run(
     instance: Option<String>,
     initial_working_directory: Option<String>,
     config: LoadedConfig,
+    launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
 ) {
-    let started_at = Instant::now();
-    let application = Application::new();
-    log_startup_metric("application_created_ms", started_at.elapsed());
-    application.run(move |cx: &mut App| {
-        #[cfg(windows)]
-        cx.bind_keys([
-            KeyBinding::new("ctrl-t", NewTab, Some("Terminal")),
-            KeyBinding::new("ctrl-w", CloseTab, Some("Terminal")),
-            KeyBinding::new("ctrl-tab", NextTab, Some("Terminal")),
-            KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("Terminal")),
-            KeyBinding::new("ctrl-c", CopyOrInterrupt, Some("Terminal")),
-            KeyBinding::new("ctrl-shift-c", CopySelection, Some("Terminal")),
-            KeyBinding::new("ctrl-v", PasteClipboard, Some("Terminal")),
-            KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("Terminal")),
-            KeyBinding::new("ctrl-shift-p", ToggleSessionSwitcher, Some("Terminal")),
-        ]);
-        #[cfg(target_os = "macos")]
-        {
-            cx.bind_keys([
-                KeyBinding::new("cmd-t", NewTab, Some("Terminal")),
-                KeyBinding::new("cmd-w", CloseTab, Some("Terminal")),
-                KeyBinding::new("ctrl-tab", NextTab, Some("Terminal")),
-                KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("Terminal")),
-                KeyBinding::new("cmd-shift-]", NextTab, Some("Terminal")),
-                KeyBinding::new("cmd-shift-[", PreviousTab, Some("Terminal")),
-                KeyBinding::new("cmd-c", CopySelection, Some("Terminal")),
-                KeyBinding::new("cmd-v", PasteClipboard, Some("Terminal")),
-                KeyBinding::new("cmd-shift-p", ToggleSessionSwitcher, Some("Terminal")),
-                KeyBinding::new("cmd-q", Quit, None),
-            ]);
-            cx.on_action(|_: &Quit, cx| cx.quit());
+    Application::new().run(move |cx: &mut App| {
+        if let Err(error) = open_compi_window(
+            instance.clone(),
+            initial_working_directory,
+            config,
+            None,
+            cx,
+        ) {
+            eprintln!("Could not open Compi: {error}");
+            cx.quit();
+            return;
         }
-
-        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Compi".into()),
-                        appears_transparent: true,
-                        #[cfg(target_os = "macos")]
-                        traffic_light_position: Some(point(px(12.0), px(13.0))),
-                        #[cfg(windows)]
-                        traffic_light_position: None,
-                    }),
-                    focus: true,
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    cx.new(|cx| {
-                        CompiApp::new(
-                            started_at,
-                            instance,
-                            initial_working_directory,
-                            config,
-                            window,
-                            cx,
-                        )
-                    })
-                },
-            )
-            .expect("failed to open Compi window");
-        log_startup_metric("window_opened_ms", started_at.elapsed());
-
-        window
-            .update(cx, |view, window, cx| {
-                window.set_window_title("Compi");
-                window.focus(&view.focus_handle);
-                cx.activate(true);
+        if let Some(requests) = launch_requests {
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(40))
+                        .await;
+                    loop {
+                        let request = match requests.try_recv() {
+                            Ok(request) => request,
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => return,
+                        };
+                        let instance = instance.clone();
+                        let _ = cx.update(|cx| {
+                            if let Err(error) = open_compi_window(
+                                instance,
+                                request.initial_working_directory,
+                                request.config,
+                                None,
+                                cx,
+                            ) {
+                                eprintln!("Could not open Compi window: {error}");
+                            }
+                        });
+                    }
+                }
             })
-            .expect("failed to activate Compi window");
-
-        cx.on_window_closed(|cx| cx.quit()).detach();
+            .detach();
+        }
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
     });
 }
-
-actions!(
-    compi,
-    [
-        NewTab,
-        CloseTab,
-        NextTab,
-        PreviousTab,
-        CopyOrInterrupt,
-        CopySelection,
-        PasteClipboard,
-        ToggleSessionSwitcher,
-        Quit,
-    ]
-);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionState {
@@ -221,13 +178,16 @@ impl TabTransport {
 
     fn close(&self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.send(ClientMessage::Detach);
     }
 }
 
-struct TerminalTab {
+struct SurfaceView {
     id: u64,
     surface_id: SurfaceId,
+    pane_id: PaneId,
+    lifetime: compi_protocol::ProcessLifetimeId,
+    stop: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     mirror: ScreenMirror,
     state: ConnectionState,
     error: Option<String>,
@@ -235,14 +195,18 @@ struct TerminalTab {
     scroll_offset: usize,
     selection: Option<Selection>,
     selecting: bool,
-    image_cache: HashMap<u32, (String, Arc<RenderImage>)>,
-    image_pending: HashMap<u32, String>,
+    image_cache: HashMap<u32, ([u8; 32], Arc<RenderImage>)>,
+    image_pending: HashMap<u32, [u8; 32]>,
+    image_rejected: HashMap<u32, [u8; 32]>,
+    image_cache_bytes: usize,
+    image_error: Option<String>,
     row_render_cache: Arc<Mutex<RowRenderCache>>,
+    viewport_fingerprint: Option<(u64, [u8; 32])>,
     cols: i16,
     rows: i16,
 }
 
-impl TerminalTab {
+impl SurfaceView {
     fn title(&self) -> String {
         self.mirror
             .snapshot()
@@ -253,6 +217,10 @@ impl TerminalTab {
     }
 
     fn send(&mut self, message: ClientMessage) {
+        if matches!(message, ClientMessage::Input { .. }) && self.state != ConnectionState::Attached
+        {
+            return;
+        }
         let Some(transport) = self.transport.as_ref() else {
             return;
         };
@@ -264,42 +232,73 @@ impl TerminalTab {
 
     fn refresh_images(&mut self, tab_id: u64, sender: UiEventSender) {
         let Some(snapshot) = self.mirror.snapshot() else {
-            self.image_cache.clear();
-            self.image_pending.clear();
             return;
         };
-        let images = snapshot.images.clone();
-        let active_ids: Vec<u32> = images.iter().map(|image| image.id).collect();
-        self.image_cache
-            .retain(|image_id, _| active_ids.contains(image_id));
-        self.image_pending
-            .retain(|image_id, _| active_ids.contains(image_id));
-        for image in images {
-            let cached = self
+        let active_ids: HashSet<u32> = snapshot.images.iter().map(|image| image.id).collect();
+        self.image_cache.retain(|id, _| active_ids.contains(id));
+        self.image_pending.retain(|id, _| active_ids.contains(id));
+        self.image_rejected.retain(|id, _| active_ids.contains(id));
+        self.image_cache_bytes = self
+            .image_cache
+            .values()
+            .map(|(_, image)| decoded_image_bytes(image))
+            .sum();
+        if self.image_rejected.is_empty() {
+            self.image_error = None;
+        }
+        for image in &snapshot.images {
+            let mut hash = Sha256::new();
+            hash.update(image.format.to_le_bytes());
+            hash.update(image.width.to_le_bytes());
+            hash.update(image.height.to_le_bytes());
+            hash.update(image.data.as_bytes());
+            let fingerprint: [u8; 32] = hash.finalize().into();
+            if self
                 .image_cache
                 .get(&image.id)
-                .is_some_and(|(data, _)| data == &image.data);
-            let pending = self
-                .image_pending
-                .get(&image.id)
-                .is_some_and(|data| data == &image.data);
-            if cached || pending {
+                .is_some_and(|(cached, _)| *cached == fingerprint)
+                || self.image_pending.get(&image.id) == Some(&fingerprint)
+                || self.image_rejected.get(&image.id) == Some(&fingerprint)
+            {
                 continue;
             }
-            self.image_pending.insert(image.id, image.data.clone());
-            let data = image.data.clone();
-            thread::spawn({
-                let sender = sender.clone();
-                move || {
-                    let result = decode_kitty_image(&image);
-                    let _ = sender.send(UiEvent::KittyImageDecoded {
-                        tab_id,
-                        image_id: image.id,
-                        data,
-                        result,
-                    });
-                }
-            });
+            if let Some((_, previous)) = self.image_cache.remove(&image.id) {
+                self.image_cache_bytes = self
+                    .image_cache_bytes
+                    .saturating_sub(decoded_image_bytes(&previous));
+            }
+            self.image_pending.remove(&image.id);
+            self.image_rejected.remove(&image.id);
+            let job = ImageDecodeJob {
+                tab_id,
+                image: image.clone(),
+                fingerprint,
+                sender: sender.clone(),
+            };
+            if IMAGE_DECODERS.try_send(job).is_ok() {
+                self.image_pending.insert(image.id, fingerprint);
+            } else {
+                self.image_rejected.insert(image.id, fingerprint);
+                self.image_error = Some(
+                    "Image decoding queue is full. Reconnect to retry unchanged images.".into(),
+                );
+            }
+        }
+    }
+
+    fn discard_replica(&mut self) {
+        self.mirror = ScreenMirror::default();
+        self.viewport_fingerprint = None;
+        self.selection = None;
+        self.scroll_offset = 0;
+        self.selecting = false;
+        self.image_cache.clear();
+        self.image_pending.clear();
+        self.image_rejected.clear();
+        self.image_cache_bytes = 0;
+        self.image_error = None;
+        if let Ok(mut cache) = self.row_render_cache.lock() {
+            cache.clear();
         }
     }
 
@@ -310,13 +309,12 @@ impl TerminalTab {
             .unwrap_or(0)
     }
 }
-
 enum UiEvent {
+    StateSaveFinished,
     SurfacesLoaded(Result<compi_protocol::WorkspaceSnapshot, String>),
-    SurfaceCreated(Result<SurfaceInfo, String>),
-    SurfaceEndFinished {
-        surface_id: SurfaceId,
-        result: Result<Vec<SurfaceInfo>, String>,
+    MutationFinished {
+        result: Result<(WorkspaceSnapshot, compi_protocol::MutationReceipt), String>,
+        select_created: bool,
     },
     TabConnected {
         tab_id: u64,
@@ -329,7 +327,7 @@ enum UiEvent {
     KittyImageDecoded {
         tab_id: u64,
         image_id: u32,
-        data: String,
+        data: [u8; 32],
         result: Result<Arc<RenderImage>, String>,
     },
     TabControl {
@@ -346,7 +344,81 @@ struct UiEventSender(async_channel::Sender<UiEvent>);
 
 impl UiEventSender {
     fn send(&self, event: UiEvent) -> bool {
-        self.0.send_blocking(event).is_ok()
+        let route = event
+            .surface_worker()
+            .and_then(|id| EVENT_ROUTES.lock().ok()?.get(&id).cloned());
+        route
+            .unwrap_or_else(|| self.0.clone())
+            .send_blocking(event)
+            .is_ok()
+    }
+}
+
+static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MUTATION_ID: AtomicU64 = AtomicU64::new(1);
+static MUTATION_RUN_NONCE: LazyLock<u128> = LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+});
+static EVENT_ROUTES: LazyLock<Mutex<HashMap<u64, async_channel::Sender<UiEvent>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const SURFACE_IMAGE_CACHE_LIMIT: usize = 64 * 1024 * 1024;
+
+struct ImageDecodeJob {
+    tab_id: u64,
+    image: KittyImage,
+    fingerprint: [u8; 32],
+    sender: UiEventSender,
+}
+
+static IMAGE_DECODERS: LazyLock<mpsc::SyncSender<ImageDecodeJob>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::sync_channel::<ImageDecodeJob>(8);
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..2 {
+        let receiver = receiver.clone();
+        thread::spawn(move || {
+            loop {
+                let job = {
+                    let Ok(receiver) = receiver.lock() else {
+                        return;
+                    };
+                    receiver.recv()
+                };
+                let Ok(job) = job else {
+                    return;
+                };
+                let result = decode_kitty_image(&job.image);
+                let _ = job.sender.send(UiEvent::KittyImageDecoded {
+                    tab_id: job.tab_id,
+                    image_id: job.image.id,
+                    data: job.fingerprint,
+                    result,
+                });
+            }
+        });
+    }
+    sender
+});
+
+fn decoded_image_bytes(image: &RenderImage) -> usize {
+    image
+        .as_bytes(0)
+        .map_or(SURFACE_IMAGE_CACHE_LIMIT + 1, <[u8]>::len)
+}
+
+impl UiEvent {
+    fn surface_worker(&self) -> Option<u64> {
+        match self {
+            Self::TabConnected { tab_id, .. }
+            | Self::TabScreen { tab_id, .. }
+            | Self::TabControl { tab_id, .. }
+            | Self::TabDisconnected { tab_id, .. }
+            | Self::KittyImageDecoded { tab_id, .. } => Some(*tab_id),
+            _ => None,
+        }
     }
 }
 
@@ -354,32 +426,48 @@ struct CompiApp {
     started_at: Instant,
     instance: Option<String>,
     initial_working_directory: Option<String>,
-    empty_window: bool,
-    perf_target_sessions: usize,
     first_snapshot_logged: bool,
-    ready_probe_marker: Option<String>,
-    ready_probe_sent_at: Option<Instant>,
-    ready_probe_render_pending: bool,
-    ready_probe_logged: bool,
     pending_present_latency_ids: Vec<u64>,
     window_title: String,
     focus_handle: FocusHandle,
     ime_text: String,
     ime_marked_range: Option<Range<usize>>,
     ime_selected_range: Range<usize>,
-    tabs: Vec<TerminalTab>,
-    active_tab: Option<u64>,
+    surface_views: Vec<SurfaceView>,
+    focused_view: Option<u64>,
     tab_scroll_handle: ScrollHandle,
+    workspace_scroll: ScrollHandle,
+    sidebar_scroll: ScrollHandle,
+    sidebar_open: bool,
+    sidebar_width: f32,
+    sidebar_drag: bool,
+    workspace_scroll_drag: Option<bool>,
+    expanded_workspaces: HashSet<SessionId>,
     tab_drag_origin: Option<Point<Pixels>>,
-    next_tab_id: u64,
-    surfaces: Vec<SurfaceInfo>,
-    workspace_initialized: bool,
-    switcher_open: bool,
-    end_confirmation: Option<SurfaceId>,
-    ending_surfaces: HashSet<SurfaceId>,
-    close_after_end: HashSet<SurfaceId>,
+    dragging_tab: Option<TabId>,
+    drag_position: Option<Point<Pixels>>,
+    titlebar_drag: bool,
+    workspace: Option<WorkspaceSnapshot>,
+    state_slot: Option<Arc<Mutex<StateSlot>>>,
+    slot_id: String,
+    state_writes: Arc<Mutex<(Option<ClientState>, bool)>>,
+    state_save_error: Arc<Mutex<Option<String>>>,
+    state: ClientState,
+    defaults: ClientState,
+    config: LoadedConfig,
+    theme: ThemePreset,
+    glass: bool,
+    zoom: f32,
+    overlay: Option<Overlay>,
+    overlay_index: usize,
+    overlay_scroll: ScrollHandle,
+    overlay_revision: Option<u64>,
+    layout: Option<WorkspaceLayout>,
+    divider_drag: Option<DividerDrag>,
+    preview_layout: Option<LayoutNode>,
+    last_resize: Instant,
     loading_surfaces: bool,
-    attach_after_surface_list: bool,
+    mutation_pending: bool,
     global_error: Option<String>,
     font_settings: FontSettings,
     typography: Arc<TerminalTypography>,
@@ -390,461 +478,23 @@ struct CompiApp {
     subscriptions: Vec<Subscription>,
     terminal_cols: i16,
     terminal_rows: i16,
+    transferred_seed: Option<TransferSeed>,
 }
 
 impl CompiApp {
-    fn new(
-        started_at: Instant,
-        instance: Option<String>,
-        initial_working_directory: Option<String>,
-        config: LoadedConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let (event_tx, event_rx) = async_channel::unbounded();
-        let empty_window = perf::empty_window_enabled();
-        let ready_probe_marker =
-            perf::ready_probe_enabled().then(|| format!("COMPI_READY_{}", std::process::id()));
-        let perf_target_sessions = perf::target_session_count();
-        let event_tx = UiEventSender(event_tx);
-        let typography = Arc::new(TerminalTypography::resolve(&config.font, 1.0, window));
-        let typography_scale = window.scale_factor();
-        let global_warning = diagnostic_warning(&config.diagnostics, &typography.diagnostics);
-        let mut this = Self {
-            started_at,
-            instance,
-            initial_working_directory,
-            empty_window,
-            perf_target_sessions,
-            first_snapshot_logged: false,
-            ready_probe_marker,
-            ready_probe_sent_at: None,
-            ready_probe_render_pending: false,
-            ready_probe_logged: false,
-            pending_present_latency_ids: Vec::new(),
-            window_title: String::from("Compi"),
-            focus_handle: cx.focus_handle(),
-            ime_text: String::new(),
-            ime_marked_range: None,
-            ime_selected_range: 0..0,
-            tabs: Vec::new(),
-            active_tab: None,
-            tab_scroll_handle: ScrollHandle::new(),
-            tab_drag_origin: None,
-            next_tab_id: 1,
-            surfaces: Vec::new(),
-            workspace_initialized: false,
-            switcher_open: false,
-            end_confirmation: None,
-            ending_surfaces: HashSet::new(),
-            close_after_end: HashSet::new(),
-            loading_surfaces: !empty_window,
-            attach_after_surface_list: false,
-            global_error: None,
-            font_settings: config.font,
-            typography,
-            typography_scale,
-            config_diagnostics: config.diagnostics,
-            global_warning,
-            event_tx,
-            subscriptions: Vec::new(),
-            terminal_cols: DEFAULT_COLS,
-            terminal_rows: DEFAULT_ROWS,
-        };
-
-        this.update_dimensions(window);
-        if !empty_window {
-            this.refresh_surfaces(true);
-        }
-        this.subscriptions
-            .push(cx.observe_window_bounds(window, |this, window, cx| {
-                this.update_dimensions(window);
-                cx.notify();
-            }));
-        this.subscriptions
-            .push(cx.observe_window_activation(window, |this, window, cx| {
-                this.report_focus(window.is_window_active());
-                cx.notify();
-            }));
-        let first_frame_started_at = started_at;
-        window.on_next_frame(move |_, _| {
-            log_startup_metric("first_window_frame_ms", first_frame_started_at.elapsed());
-        });
-        if perf::enabled() {
-            cx.spawn(async move |weak, cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(6)).await;
-                    if weak
-                        .update(cx, |this, _| {
-                            let workload = if this.empty_window {
-                                "empty_window"
-                            } else {
-                                "terminal"
-                            };
-                            perf::log_resource_sample("client", workload, this.tabs.len());
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .detach();
-        }
-
-        cx.spawn(async move |weak, cx| {
-            while let Ok(first) = event_rx.recv().await {
-                let batch_started_at = Instant::now();
-                if weak
-                    .update(cx, |this, cx| {
-                        this.handle_event(first, cx);
-                        while batch_started_at.elapsed() < UI_EVENT_BUDGET {
-                            let Ok(event) = event_rx.try_recv() else {
-                                break;
-                            };
-                            this.handle_event(event, cx);
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                cx.background_executor().timer(UI_EVENT_YIELD).await;
-            }
-        })
-        .detach();
-
-        this
+    fn surface_view_mut(&mut self, tab_id: u64) -> Option<&mut SurfaceView> {
+        self.surface_views.iter_mut().find(|tab| tab.id == tab_id)
     }
 
-    fn refresh_surfaces(&mut self, attach_initial: bool) {
-        self.loading_surfaces = true;
-        self.attach_after_surface_list |= attach_initial;
-        let sender = self.event_tx.clone();
-        let instance = self.instance.clone();
-        thread::spawn(move || {
-            let result = probe::connect_or_start(instance.as_deref())
-                .and_then(|mut client| client.workspace())
-                .map_err(|error| error.to_string());
-            let _ = sender.send(UiEvent::SurfacesLoaded(result));
-        });
+    fn focused_view(&self) -> Option<&SurfaceView> {
+        let active = self.focused_view?;
+        self.surface_views.iter().find(|tab| tab.id == active)
     }
 
-    fn create_surface(&mut self, working_directory: Option<String>) {
-        let sender = self.event_tx.clone();
-        let cols = self.terminal_cols;
-        let rows = self.terminal_rows;
-        let instance = self.instance.clone();
-        thread::spawn(move || {
-            let result = probe::connect_or_start(instance.as_deref())
-                .and_then(|mut client| client.create_surface(cols, rows, working_directory))
-                .map_err(|error| error.to_string());
-            let _ = sender.send(UiEvent::SurfaceCreated(result));
-        });
+    fn focused_view_mut(&mut self) -> Option<&mut SurfaceView> {
+        let active = self.focused_view?;
+        self.surface_views.iter_mut().find(|tab| tab.id == active)
     }
-
-    fn create_inherited_session(&mut self) {
-        let working_directory =
-            inherited_working_directory(self.active_tab().and_then(|tab| tab.mirror.snapshot()));
-        self.create_surface(working_directory);
-    }
-
-    fn create_next_perf_session(&mut self) {
-        if self.tabs.len() < self.perf_target_sessions {
-            self.create_surface(None);
-        }
-    }
-
-    fn begin_end_surface(&mut self, surface_id: SurfaceId) {
-        if !self.ending_surfaces.contains(&surface_id)
-            && self
-                .surfaces
-                .iter()
-                .any(|surface| surface.id == surface_id && surface.status == SurfaceStatus::Running)
-        {
-            self.end_confirmation = Some(surface_id);
-        }
-    }
-
-    fn cancel_end_surface(&mut self, surface_id: &SurfaceId) {
-        if self.end_confirmation.as_ref() == Some(surface_id) {
-            self.end_confirmation = None;
-        }
-    }
-
-    fn confirm_end_surface(&mut self, surface_id: SurfaceId) {
-        if self.ending_surfaces.contains(&surface_id)
-            || !self
-                .surfaces
-                .iter()
-                .any(|surface| surface.id == surface_id && surface.status == SurfaceStatus::Running)
-        {
-            return;
-        }
-        self.end_confirmation = None;
-        self.ending_surfaces.insert(surface_id.clone());
-        if self.tabs.iter().any(|tab| tab.surface_id == surface_id) {
-            self.close_after_end.insert(surface_id.clone());
-        }
-        let sender = self.event_tx.clone();
-        let instance = self.instance.clone();
-        thread::spawn(move || {
-            let result = terminate_surface_and_wait(instance.as_deref(), &surface_id);
-            let _ = sender.send(UiEvent::SurfaceEndFinished { surface_id, result });
-        });
-    }
-
-    fn attach_surface(&mut self, surface: SurfaceInfo) {
-        if let Some(tab_id) = self
-            .tabs
-            .iter()
-            .find(|tab| tab.surface_id == surface.id)
-            .map(|tab| tab.id)
-        {
-            self.active_tab = Some(tab_id);
-            self.reveal_tab(tab_id);
-            self.switcher_open = false;
-            return;
-        }
-        if surface.status != SurfaceStatus::Running || surface.attached {
-            return;
-        }
-        let tab_id = self.next_tab_id;
-        self.next_tab_id = self.next_tab_id.saturating_add(1);
-        self.tabs.push(TerminalTab {
-            id: tab_id,
-            surface_id: surface.id.clone(),
-            mirror: ScreenMirror::default(),
-            state: ConnectionState::Connecting,
-            error: None,
-            transport: None,
-            scroll_offset: 0,
-            selection: None,
-            selecting: false,
-            image_cache: HashMap::new(),
-            image_pending: HashMap::new(),
-            cols: self.terminal_cols,
-            row_render_cache: Arc::new(Mutex::new(RowRenderCache::default())),
-            rows: self.terminal_rows,
-        });
-        self.active_tab = Some(tab_id);
-        self.reveal_tab(tab_id);
-        self.switcher_open = false;
-        spawn_tab_worker(
-            tab_id,
-            surface.id,
-            self.terminal_cols,
-            self.terminal_rows,
-            self.event_tx.clone(),
-            self.instance.clone(),
-        );
-    }
-
-    fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
-        match event {
-            UiEvent::SurfacesLoaded(Ok(workspace)) => {
-                self.global_error = None;
-                self.loading_surfaces = false;
-                let needs_initial_tab = self.attach_after_surface_list && self.tabs.is_empty();
-                self.attach_after_surface_list = false;
-                self.workspace_initialized = workspace.initialized;
-                self.surfaces = workspace.surfaces;
-                if needs_initial_tab {
-                    if let Some(working_directory) = self.initial_working_directory.take() {
-                        self.create_surface(Some(working_directory));
-                    } else if let Some(surface) = self
-                        .surfaces
-                        .iter()
-                        .find(|surface| {
-                            surface.status == SurfaceStatus::Running && !surface.attached
-                        })
-                        .cloned()
-                    {
-                        self.attach_surface(surface);
-                        self.create_next_perf_session();
-                    } else if !self.workspace_initialized {
-                        self.create_surface(None);
-                    }
-                }
-            }
-            UiEvent::SurfacesLoaded(Err(error)) => {
-                self.loading_surfaces = false;
-                self.global_error = Some(error);
-            }
-            UiEvent::SurfaceCreated(Ok(surface)) => {
-                self.global_error = None;
-                self.workspace_initialized = true;
-                self.surfaces.push(surface.clone());
-                self.attach_surface(surface);
-                self.create_next_perf_session();
-            }
-            UiEvent::SurfaceCreated(Err(error)) => self.global_error = Some(error),
-            UiEvent::SurfaceEndFinished { surface_id, result } => {
-                self.ending_surfaces.remove(&surface_id);
-                match result {
-                    Ok(surfaces) => {
-                        self.global_error = None;
-                        self.surfaces = surfaces;
-                        if !self.tabs.iter().any(|tab| tab.surface_id == surface_id) {
-                            self.close_after_end.remove(&surface_id);
-                        }
-                    }
-                    Err(error) => {
-                        self.close_after_end.remove(&surface_id);
-                        self.global_error = Some(error);
-                    }
-                }
-            }
-            UiEvent::TabConnected { tab_id, transport } => {
-                let (cols, rows) = (self.terminal_cols, self.terminal_rows);
-                let ready_probe = self
-                    .ready_probe_marker
-                    .clone()
-                    .filter(|_| self.ready_probe_sent_at.is_none());
-                if ready_probe.is_some() {
-                    self.ready_probe_sent_at = Some(Instant::now());
-                }
-                if let Some(tab) = self.tab_mut(tab_id) {
-                    tab.transport = Some(transport);
-                    tab.state = ConnectionState::Attached;
-                    tab.error = None;
-                    tab.send(ClientMessage::Resize { cols, rows });
-                    if let Some(marker) = ready_probe {
-                        tab.send(ClientMessage::Input {
-                            data: format!("printf '%s\\n' '{marker}'\n").into_bytes(),
-                            latency_id: None,
-                        });
-                    }
-                }
-            }
-            UiEvent::TabScreen { tab_id, message } => {
-                let clipboard_write = match &message {
-                    ScreenMessage::Delta { delta } => delta.clipboard_writes.last().cloned(),
-                    ScreenMessage::Snapshot { .. } => None,
-                };
-                let latency_ids = match &message {
-                    ScreenMessage::Delta { delta } => delta.latency_ids.clone(),
-                    ScreenMessage::Snapshot { .. } => Vec::new(),
-                };
-                let mut request_snapshot = false;
-                let mut ready_probe_observed = false;
-                let sender = self.event_tx.clone();
-                let ready_probe_marker = self.ready_probe_marker.clone();
-                if let Some(tab) = self.tab_mut(tab_id) {
-                    request_snapshot = matches!(tab.mirror.apply(message), MirrorApply::Gap { .. });
-                    if !request_snapshot {
-                        tab.state = ConnectionState::Attached;
-                        tab.refresh_images(tab_id, sender);
-                        ready_probe_observed =
-                            ready_probe_marker.as_deref().is_some_and(|marker| {
-                                snapshot_contains_marker(tab.mirror.snapshot(), marker)
-                            });
-                    }
-                }
-                if !request_snapshot && let Some(text) = clipboard_write {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-                if !request_snapshot {
-                    self.pending_present_latency_ids.extend(latency_ids);
-                }
-                if request_snapshot {
-                    if let Some(tab) = self.tab_mut(tab_id) {
-                        tab.send(ClientMessage::RequestSnapshot);
-                    }
-                } else if !self.first_snapshot_logged {
-                    self.first_snapshot_logged = true;
-                    perf::log_startup_metric("first_terminal_frame_ms", self.started_at.elapsed());
-                }
-                self.ready_probe_render_pending |= ready_probe_observed;
-            }
-            UiEvent::KittyImageDecoded {
-                tab_id,
-                image_id,
-                data,
-                result,
-            } => {
-                if let Some(tab) = self.tab_mut(tab_id)
-                    && tab.image_pending.get(&image_id) == Some(&data)
-                {
-                    tab.image_pending.remove(&image_id);
-                    match result {
-                        Ok(image) => {
-                            tab.image_cache.insert(image_id, (data, image));
-                        }
-                        Err(error) => tab.error = Some(format!("Kitty image {image_id}: {error}")),
-                    }
-                }
-            }
-            UiEvent::TabControl { tab_id, message } => match message {
-                ServerMessage::SurfaceExited {
-                    identity,
-                    exit_code,
-                } => {
-                    self.ending_surfaces.remove(&identity.surface_id);
-                    if self.close_after_end.remove(&identity.surface_id) {
-                        self.close_tab_id(tab_id);
-                    } else if let Some(tab) = self.tab_mut(tab_id) {
-                        tab.state = ConnectionState::Exited(exit_code);
-                        tab.transport = None;
-                    }
-                    self.refresh_surfaces(false);
-                }
-                ServerMessage::Error { message, .. } => {
-                    if let Some(tab) = self.tab_mut(tab_id) {
-                        tab.error = Some(message);
-                        tab.state = ConnectionState::Failed;
-                    }
-                }
-                _ => {}
-            },
-            UiEvent::TabDisconnected { tab_id, error } => {
-                if let Some(tab) = self.tab_mut(tab_id) {
-                    tab.transport = None;
-                    if !matches!(tab.state, ConnectionState::Exited(_)) {
-                        tab.state = ConnectionState::Reconnecting;
-                        tab.error = Some(error);
-                    }
-                }
-            }
-        }
-    }
-
-    fn tab_mut(&mut self, tab_id: u64) -> Option<&mut TerminalTab> {
-        self.tabs.iter_mut().find(|tab| tab.id == tab_id)
-    }
-
-    fn active_tab(&self) -> Option<&TerminalTab> {
-        let active = self.active_tab?;
-        self.tabs.iter().find(|tab| tab.id == active)
-    }
-
-    fn active_tab_mut(&mut self) -> Option<&mut TerminalTab> {
-        let active = self.active_tab?;
-        self.tabs.iter_mut().find(|tab| tab.id == active)
-    }
-
-    fn update_dimensions(&mut self, window: &Window) {
-        let viewport = window.viewport_size();
-        let cell_width = self.typography.cell_width;
-        let cell_height = self.typography.cell_height;
-        let width = (f32::from(viewport.width) - TERMINAL_PADDING * 2.0).max(cell_width);
-        let height =
-            (f32::from(viewport.height) - CHROME_HEIGHT - TERMINAL_PADDING * 2.0).max(cell_height);
-        let cols = (width / cell_width).floor().clamp(2.0, i16::MAX as f32) as i16;
-        let rows = (height / cell_height).floor().clamp(1.0, i16::MAX as f32) as i16;
-        if (cols, rows) == (self.terminal_cols, self.terminal_rows) {
-            return;
-        }
-        self.terminal_cols = cols;
-        self.terminal_rows = rows;
-        for tab in &mut self.tabs {
-            tab.cols = cols;
-            tab.rows = rows;
-            tab.send(ClientMessage::Resize { cols, rows });
-        }
-    }
-
     fn refresh_typography(&mut self, window: &Window) -> bool {
         let scale = window.scale_factor();
         if (scale - self.typography_scale).abs() <= f32::EPSILON {
@@ -852,13 +502,13 @@ impl CompiApp {
         }
         let typography = Arc::new(TerminalTypography::resolve(
             &self.font_settings,
-            1.0,
+            self.zoom,
             window,
         ));
         self.global_warning = diagnostic_warning(&self.config_diagnostics, &typography.diagnostics);
         self.typography = typography;
         self.typography_scale = scale;
-        for tab in &self.tabs {
+        for tab in &self.surface_views {
             if let Ok(mut cache) = tab.row_render_cache.lock() {
                 cache.clear();
             }
@@ -867,14 +517,10 @@ impl CompiApp {
     }
 
     fn handle_keystroke(&mut self, keystroke: &Keystroke) -> bool {
-        if self.switcher_open {
+        if self.overlay.is_some() {
             return true;
         }
-        #[cfg(windows)]
-        if is_application_shortcut(&terminal_key(keystroke)) {
-            return true;
-        }
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab) = self.focused_view_mut() else {
             return false;
         };
         let (application_cursor, application_keypad) = tab
@@ -915,69 +561,6 @@ impl CompiApp {
         false
     }
 
-    fn new_tab(&mut self, _: &NewTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.create_inherited_session();
-        cx.notify();
-    }
-
-    fn close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(active) = self.active_tab {
-            self.close_tab_id(active);
-            cx.notify();
-        }
-    }
-
-    fn close_tab_id(&mut self, id: u64) {
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
-            return;
-        };
-        if let Some(transport) = self.tabs[index].transport.as_ref() {
-            transport.close();
-        }
-        self.tabs.remove(index);
-        self.active_tab = if self.tabs.is_empty() {
-            self.switcher_open = true;
-            self.refresh_surfaces(false);
-            None
-        } else {
-            Some(self.tabs[index.min(self.tabs.len() - 1)].id)
-        };
-        if let Some(active) = self.active_tab {
-            self.reveal_tab(active);
-        }
-    }
-
-    fn next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_tab(1);
-        cx.notify();
-    }
-
-    fn previous_tab(&mut self, _: &PreviousTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_tab(-1);
-        cx.notify();
-    }
-
-    fn cycle_tab(&mut self, direction: isize) {
-        if self.tabs.is_empty() {
-            return;
-        }
-        let current = self
-            .active_tab
-            .and_then(|active| self.tabs.iter().position(|tab| tab.id == active))
-            .unwrap_or(0) as isize;
-        let next = (current + direction).rem_euclid(self.tabs.len() as isize) as usize;
-        let tab_id = self.tabs[next].id;
-        self.active_tab = Some(tab_id);
-        self.reveal_tab(tab_id);
-        self.switcher_open = false;
-    }
-
-    fn reveal_tab(&self, tab_id: u64) {
-        if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
-            self.tab_scroll_handle.scroll_to_item(index);
-        }
-    }
-
     fn on_tab_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
         let delta = event.delta.pixel_delta(px(32.0));
         let delta = if f32::from(delta.x).abs() > f32::EPSILON {
@@ -993,41 +576,20 @@ impl CompiApp {
         cx.notify();
     }
 
-    fn copy_or_interrupt(&mut self, _: &CopyOrInterrupt, _: &mut Window, cx: &mut Context<Self>) {
-        match self
-            .active_tab()
-            .map(|tab| ctrl_c_behavior(tab.mirror.snapshot(), tab.selection))
-        {
-            Some(CtrlCBehavior::Copy(text)) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-            Some(CtrlCBehavior::Interrupt) => {
-                if let Some(tab) = self.active_tab_mut() {
-                    tab.scroll_offset = 0;
-                    tab.send(ClientMessage::Input {
-                        data: vec![0x03],
-                        latency_id: None,
-                    });
-                }
-            }
-            None => {}
-        }
-    }
-
-    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self
-            .active_tab()
+            .focused_view()
             .and_then(|tab| selected_text(tab.mirror.snapshot(), tab.selection))
         {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
-    fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab) = self.focused_view_mut() else {
             return;
         };
         let bracketed = tab
@@ -1040,22 +602,8 @@ impl CompiApp {
             latency_id: None,
         });
     }
-
-    fn toggle_switcher(
-        &mut self,
-        _: &ToggleSessionSwitcher,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.switcher_open = !self.switcher_open;
-        if self.switcher_open {
-            self.refresh_surfaces(false);
-        }
-        cx.notify();
-    }
-
     fn report_focus(&mut self, focused: bool) {
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab) = self.focused_view_mut() else {
             return;
         };
         if tab
@@ -1080,7 +628,7 @@ impl CompiApp {
         let Some(point) = self.grid_point(event.position) else {
             return;
         };
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab) = self.focused_view_mut() else {
             return;
         };
         let mouse_mode = tab
@@ -1129,7 +677,7 @@ impl CompiApp {
         let Some(point) = self.grid_point(event.position) else {
             return;
         };
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab) = self.focused_view_mut() else {
             return;
         };
         let mouse_mode = tab
@@ -1172,7 +720,7 @@ impl CompiApp {
         let Some(point) = self.grid_point(event.position) else {
             return;
         };
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab) = self.focused_view_mut() else {
             return;
         };
         let mouse_mode = tab
@@ -1211,6 +759,7 @@ impl CompiApp {
                 cx.open_url(uri);
             }
         }
+        self.save_state();
         cx.notify();
     }
 
@@ -1223,9 +772,10 @@ impl CompiApp {
         let Some(point) = self.grid_point(event.position) else {
             return;
         };
+        cx.stop_propagation();
         let cell_height = self.typography.cell_height;
         let delta = f32::from(event.delta.pixel_delta(px(cell_height)).y);
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab) = self.focused_view_mut() else {
             return;
         };
         let mouse_mode = tab
@@ -1251,704 +801,15 @@ impl CompiApp {
             } else {
                 tab.scroll_offset = tab.scroll_offset.saturating_sub(lines);
             }
+            self.save_state();
             cx.notify();
         }
-    }
-
-    fn grid_point(&self, position: gpui::Point<Pixels>) -> Option<GridPoint> {
-        let x = f32::from(position.x) - TERMINAL_PADDING;
-        let y = f32::from(position.y) - CHROME_HEIGHT - TERMINAL_PADDING;
-        if x < 0.0 || y < 0.0 {
-            return None;
-        }
-        let col = (x / self.typography.cell_width).floor() as usize;
-        let row = (y / self.typography.cell_height).floor() as usize;
-        if col >= self.terminal_cols as usize || row >= self.terminal_rows as usize {
-            return None;
-        }
-        Some(GridPoint { row, col })
-    }
-
-    fn begin_titlebar_drag(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        _: &mut Context<Self>,
-    ) {
-        self.tab_drag_origin = Some(event.position);
-        window.focus(&self.focus_handle);
-        #[cfg(target_os = "macos")]
-        if event.click_count == 2 {
-            self.tab_drag_origin = None;
-            window.titlebar_double_click();
-        }
-    }
-
-    fn begin_tab_drag(
-        &mut self,
-        tab_id: u64,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_tab = Some(tab_id);
-        self.reveal_tab(tab_id);
-        self.switcher_open = false;
-        self.begin_titlebar_drag(event, window, cx);
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn on_titlebar_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !event.dragging() {
-            self.tab_drag_origin = None;
-            return;
-        }
-        let Some(origin) = self.tab_drag_origin else {
-            return;
-        };
-        if drag_threshold_crossed(origin, event.position) {
-            self.tab_drag_origin = None;
-            start_native_window_move(window);
-            cx.stop_propagation();
-        }
-    }
-
-    fn end_tab_drag(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.tab_drag_origin = None;
-    }
-
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let multiple_tabs = self.tabs.len() > 1;
-        let tabs = self.tabs.iter().map(|tab| {
-            let id = tab.id;
-            let active = self.active_tab == Some(id);
-            let exceptional_state = match tab.state {
-                ConnectionState::Connecting | ConnectionState::Reconnecting => Some(color(MUTED)),
-                ConnectionState::Exited(_) => Some(color(MUTED)),
-                ConnectionState::Failed => Some(color(ERROR)),
-                ConnectionState::Attached => None,
-            };
-            div()
-                .id(("tab", id as usize))
-                .h_full()
-                .flex_none()
-                .w(px(TAB_WIDTH))
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_2()
-                .border_b_2()
-                .border_color(if multiple_tabs && active {
-                    color(ACCENT)
-                } else {
-                    gpui::transparent_black()
-                })
-                .bg(if multiple_tabs && active {
-                    color(SURFACE)
-                } else {
-                    color(BACKGROUND)
-                })
-                .text_color(if active {
-                    color(FOREGROUND)
-                } else {
-                    color(MUTED)
-                })
-                .hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event, window, cx| {
-                        this.begin_tab_drag(id, event, window, cx);
-                    }),
-                )
-                .on_mouse_move(cx.listener(Self::on_titlebar_mouse_move))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::end_tab_drag))
-                .when_some(exceptional_state, |tab, state_color| {
-                    tab.child(div().size(px(5.0)).rounded_full().bg(state_color))
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(tab.title()),
-                )
-                .when(multiple_tabs && active, |tab| {
-                    tab.child(
-                        div()
-                            .id(("close-tab", id as usize))
-                            .size(px(22.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_color(color(MUTED))
-                            .hover(|style| {
-                                style
-                                    .bg(color(BORDER))
-                                    .text_color(color(FOREGROUND))
-                                    .cursor_pointer()
-                            })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_tab_id(id);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }))
-                            .child(chrome_icon(ChromeIcon::Close, color(MUTED))),
-                    )
-                })
-        });
-
-        div()
-            .h(px(CHROME_HEIGHT))
-            .w_full()
-            .relative()
-            .overflow_hidden()
-            .bg(color(BACKGROUND))
-            .border_b_1()
-            .border_color(color(BORDER).opacity(0.55))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_titlebar_drag))
-            .on_mouse_move(cx.listener(Self::on_titlebar_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::end_tab_drag))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_tab_drag))
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(px(TITLEBAR_BRAND_WIDTH - 40.0))
-                    .w(px(40.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_titlebar_drag))
-                    .on_mouse_move(cx.listener(Self::on_titlebar_mouse_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::end_tab_drag))
-                    .child(chrome_icon(ChromeIcon::Mark, color(ACCENT))),
-            )
-            .child(
-                div()
-                    .id("tab-strip")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(px(TITLEBAR_BRAND_WIDTH))
-                    .right(px(WINDOW_CONTROLS_WIDTH + TITLEBAR_ACTIONS_WIDTH))
-                    .min_w(px(0.0))
-                    .flex()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.tab_scroll_handle)
-                    .on_scroll_wheel(cx.listener(Self::on_tab_scroll))
-                    .children(tabs)
-                    .child(div().h_full().min_w(px(16.0)).flex_1()),
-            )
-            .child(
-                div()
-                    .id("new-tab")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(WINDOW_CONTROLS_WIDTH
-                        + TITLEBAR_DRAG_WIDTH
-                        + SESSION_SWITCHER_WIDTH))
-                    .w(px(NEW_TAB_WIDTH))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(color(MUTED))
-                    .hover(|style| {
-                        style
-                            .bg(color(SURFACE_HOVER))
-                            .text_color(color(FOREGROUND))
-                            .cursor_pointer()
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.create_inherited_session();
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .child(chrome_icon(ChromeIcon::Plus, color(MUTED))),
-            )
-            .child(
-                div()
-                    .id("session-switcher")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(WINDOW_CONTROLS_WIDTH + TITLEBAR_DRAG_WIDTH))
-                    .w(px(SESSION_SWITCHER_WIDTH))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(color(MUTED))
-                    .hover(|style| {
-                        style
-                            .bg(color(SURFACE_HOVER))
-                            .text_color(color(FOREGROUND))
-                            .cursor_pointer()
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.switcher_open = !this.switcher_open;
-                        if this.switcher_open {
-                            this.refresh_surfaces(false);
-                        }
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .child(chrome_icon(ChromeIcon::Search, color(MUTED))),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(WINDOW_CONTROLS_WIDTH))
-                    .w(px(TITLEBAR_DRAG_WIDTH)),
-            )
-            .when(cfg!(windows), |titlebar| {
-                titlebar.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .right_0()
-                        .w(px(WINDOW_CONTROLS_WIDTH))
-                        .flex()
-                        .bg(color(BACKGROUND))
-                        .child(window_control(
-                            "minimize-window",
-                            ChromeIcon::Minimize,
-                            WindowControlArea::Min,
-                            false,
-                        ))
-                        .child(window_control(
-                            "maximize-window",
-                            ChromeIcon::Maximize,
-                            WindowControlArea::Max,
-                            false,
-                        ))
-                        .child(window_control(
-                            "close-window",
-                            ChromeIcon::Close,
-                            WindowControlArea::Close,
-                            true,
-                        )),
-                )
-            })
-    }
-
-    fn render_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.surfaces.iter().map(|session| {
-            let session = session.clone();
-            let ending = self.ending_surfaces.contains(&session.id);
-            let confirming = self.end_confirmation.as_ref() == Some(&session.id);
-            let can_select = session.status == SurfaceStatus::Running && !ending;
-            let status = if ending {
-                "Ending…"
-            } else {
-                match session.status {
-                    SurfaceStatus::Starting => "Starting",
-                    SurfaceStatus::Ending => "Ending…",
-                    SurfaceStatus::Running if session.attached => "Open",
-                    SurfaceStatus::Running => "Detached",
-                    SurfaceStatus::Exited => "Exited",
-                    SurfaceStatus::Failed => "Failed",
-                    SurfaceStatus::Lost => "Lost",
-                }
-            };
-            let detail = (session.status == SurfaceStatus::Lost)
-                .then(|| session.error.clone())
-                .flatten();
-            let session_for_attach = session.clone();
-            let session_id_for_begin = session.id.clone();
-            let session_id_for_cancel = session.id.clone();
-            let session_id_for_confirm = session.id.clone();
-            div()
-                .id(("session", session.created_at_ms))
-                .w_full()
-                .mx_2()
-                .px_3()
-                .py_2()
-                .flex()
-                .items_center()
-                .justify_between()
-                .rounded_sm()
-                .when(can_select, |row| {
-                    row.hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.attach_surface(session_for_attach.clone());
-                            window.focus(&this.focus_handle);
-                            cx.notify();
-                        }))
-                })
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .flex_1()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .when(session.status == SurfaceStatus::Running, |title| {
-                                            title.child(div().size(px(5.0)).rounded_full().bg(
-                                                color(if session.attached {
-                                                    ACCENT
-                                                } else {
-                                                    MUTED
-                                                }),
-                                            ))
-                                        })
-                                        .child(short_surface_id(&session.id)),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_sm()
-                                        .text_color(
-                                            if matches!(
-                                                session.status,
-                                                SurfaceStatus::Failed | SurfaceStatus::Lost
-                                            ) {
-                                                color(ERROR)
-                                            } else {
-                                                color(MUTED)
-                                            },
-                                        )
-                                        .child(status),
-                                ),
-                        )
-                        .when_some(detail, |details, detail| {
-                            details.child(
-                                div()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(11.0))
-                                    .text_color(color(MUTED))
-                                    .child(detail),
-                            )
-                        })
-                        .when(
-                            session.status == SurfaceStatus::Running && !ending,
-                            |details| {
-                                details.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .when(!confirming, |actions| {
-                                            actions.child(
-                                                div()
-                                                    .id(("end-session", session.created_at_ms))
-                                                    .text_size(px(11.0))
-                                                    .text_color(color(MUTED))
-                                                    .hover(|style| {
-                                                        style
-                                                            .text_color(color(ERROR))
-                                                            .cursor_pointer()
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.begin_end_surface(
-                                                            session_id_for_begin.clone(),
-                                                        );
-                                                        cx.stop_propagation();
-                                                        cx.notify();
-                                                    }))
-                                                    .child("End surface"),
-                                            )
-                                        })
-                                        .when(confirming, |actions| {
-                                            actions
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.0))
-                                                        .text_color(color(MUTED))
-                                                        .child("End this surface?"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id((
-                                                            "cancel-end-session",
-                                                            session.created_at_ms,
-                                                        ))
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded_sm()
-                                                        .text_size(px(11.0))
-                                                        .text_color(color(MUTED))
-                                                        .hover(|style| {
-                                                            style
-                                                                .bg(color(SURFACE_HOVER))
-                                                                .cursor_pointer()
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.cancel_end_surface(
-                                                                    &session_id_for_cancel,
-                                                                );
-                                                                cx.stop_propagation();
-                                                                cx.notify();
-                                                            },
-                                                        ))
-                                                        .child("Cancel"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id((
-                                                            "confirm-end-session",
-                                                            session.created_at_ms,
-                                                        ))
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded_sm()
-                                                        .text_size(px(11.0))
-                                                        .text_color(color(ERROR))
-                                                        .hover(|style| {
-                                                            style
-                                                                .bg(color(SURFACE_HOVER))
-                                                                .cursor_pointer()
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.confirm_end_surface(
-                                                                    session_id_for_confirm.clone(),
-                                                                );
-                                                                cx.stop_propagation();
-                                                                cx.notify();
-                                                            },
-                                                        ))
-                                                        .child("End"),
-                                                )
-                                        }),
-                                )
-                            },
-                        ),
-                )
-        });
-
-        div()
-            .absolute()
-            .top(px(CHROME_HEIGHT + 12.0))
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .child(
-                div()
-                    .w(px(520.0))
-                    .max_h(px(420.0))
-                    .bg(color(SURFACE))
-                    .border_1()
-                    .border_color(color(BORDER))
-                    .rounded_md()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(color(BORDER).opacity(0.7))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_color(color(FOREGROUND))
-                                    .child(chrome_icon(ChromeIcon::Search, color(MUTED)))
-                                    .child("Switch surface"),
-                            )
-                            .child(
-                                div()
-                                    .id("switcher-new-session")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_color(color(ACCENT))
-                                    .hover(|style| style.bg(color(SURFACE_HOVER)).cursor_pointer())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.create_inherited_session();
-                                        cx.notify();
-                                    }))
-                                    .child("New"),
-                            ),
-                    )
-                    .when(self.loading_surfaces, |panel| {
-                        panel.child(
-                            div()
-                                .p_4()
-                                .text_color(color(MUTED))
-                                .child("Loading surfaces…"),
-                        )
-                    })
-                    .children(rows),
-            )
-    }
-
-    fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = self
-            .active_tab()
-            .and_then(|tab| PaintModel::from_tab(tab, self.typography.clone()));
-        let status = self.active_tab().map(|tab| tab.state);
-        let error = self
-            .active_tab()
-            .and_then(|tab| tab.error.clone())
-            .or_else(|| self.global_error.clone());
-        let working_directory_warning = self.active_tab().and_then(|tab| {
-            self.surfaces
-                .iter()
-                .find(|session| session.id == tab.surface_id)?
-                .working_directory
-                .as_ref()?
-                .warning
-                .clone()
-        });
-        let warning = error
-            .is_none()
-            .then(|| {
-                [
-                    self.global_warning.as_deref(),
-                    working_directory_warning.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("\n")
-            })
-            .filter(|warning| !warning.is_empty());
-        let input = cx.entity();
-        let input_focus = self.focus_handle.clone();
-        let composition =
-            (!self.ime_text.is_empty()).then(|| SharedString::from(self.ime_text.clone()));
-        div()
-            .id("terminal")
-            .size_full()
-            .p(px(TERMINAL_PADDING))
-            .bg(color(BACKGROUND))
-            .overflow_hidden()
-            .cursor(gpui::CursorStyle::IBeam)
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_terminal_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
-            .on_scroll_wheel(cx.listener(Self::on_terminal_scroll))
-            .child(
-                canvas(
-                    move |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        window.handle_input(
-                            &input_focus,
-                            ElementInputHandler::new(bounds, input.clone()),
-                            cx,
-                        );
-                        if let Some(paint) = paint {
-                            paint_terminal(bounds, &paint, window);
-                            if let Some(composition) = composition {
-                                paint_composition(
-                                    bounds,
-                                    paint.cursor,
-                                    composition,
-                                    &paint.typography,
-                                    window,
-                                    cx,
-                                );
-                            }
-                        }
-                    },
-                )
-                .size_full(),
-            )
-            .when(error.is_some(), |terminal| {
-                terminal.child(
-                    div()
-                        .absolute()
-                        .bottom_2()
-                        .left_2()
-                        .right_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_sm()
-                        .bg(color(SURFACE))
-                        .border_1()
-                        .border_color(color(ERROR))
-                        .text_sm()
-                        .text_color(color(ERROR))
-                        .child(error.unwrap_or_default()),
-                )
-            })
-            .when(warning.is_some(), |terminal| {
-                terminal.child(
-                    div()
-                        .absolute()
-                        .bottom_2()
-                        .left_2()
-                        .right_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_sm()
-                        .bg(color(SURFACE))
-                        .border_1()
-                        .border_color(color(ACCENT))
-                        .text_sm()
-                        .text_color(color(FOREGROUND))
-                        .child(warning.unwrap_or_default()),
-                )
-            })
-            .when(
-                matches!(
-                    status,
-                    Some(ConnectionState::Connecting | ConnectionState::Reconnecting)
-                ),
-                |terminal| {
-                    terminal.child(
-                        div()
-                            .absolute()
-                            .top_2()
-                            .right_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(color(SURFACE))
-                            .text_sm()
-                            .text_color(color(MUTED))
-                            .child(if status == Some(ConnectionState::Connecting) {
-                                "Connecting"
-                            } else {
-                                "Reconnecting"
-                            }),
-                    )
-                },
-            )
     }
 }
 
 #[derive(Clone, Copy)]
 enum ChromeIcon {
     Mark,
-    Plus,
-    Search,
     Minimize,
     Maximize,
     Close,
@@ -1970,25 +831,6 @@ fn chrome_icon(icon: ChromeIcon, tint: Hsla) -> impl IntoElement {
                     path.line_to(point(x(2.0), y(8.0)));
                     path.move_to(point(x(6.0), y(11.0)));
                     path.line_to(point(x(10.0), y(5.0)));
-                }
-                ChromeIcon::Plus => {
-                    path.move_to(point(x(3.0), y(8.0)));
-                    path.line_to(point(x(13.0), y(8.0)));
-                    path.move_to(point(x(8.0), y(3.0)));
-                    path.line_to(point(x(8.0), y(13.0)));
-                }
-                ChromeIcon::Search => {
-                    path.move_to(point(x(9.5), y(3.5)));
-                    path.line_to(point(x(6.0), y(2.5)));
-                    path.line_to(point(x(3.0), y(4.5)));
-                    path.line_to(point(x(2.5), y(8.0)));
-                    path.line_to(point(x(4.5), y(11.0)));
-                    path.line_to(point(x(8.0), y(11.5)));
-                    path.line_to(point(x(10.5), y(9.5)));
-                    path.line_to(point(x(11.0), y(6.0)));
-                    path.line_to(point(x(9.5), y(3.5)));
-                    path.move_to(point(x(10.0), y(10.0)));
-                    path.line_to(point(x(14.0), y(14.0)));
                 }
                 ChromeIcon::Minimize => {
                     path.move_to(point(x(3.0), y(11.0)));
@@ -2021,6 +863,7 @@ fn window_control(
     icon: ChromeIcon,
     area: WindowControlArea,
     destructive: bool,
+    colors: &'static ThemeColors,
 ) -> impl IntoElement {
     div()
         .id(id)
@@ -2030,25 +873,30 @@ fn window_control(
         .flex()
         .items_center()
         .justify_center()
-        .text_color(color(MUTED))
+        .text_color(color(colors.muted))
         .hover(move |style| {
             style
                 .bg(if destructive {
-                    color(ERROR)
+                    color(colors.error)
                 } else {
-                    color(SURFACE_HOVER)
+                    color(colors.surface_hover)
                 })
-                .text_color(color(FOREGROUND))
+                .text_color(color(colors.foreground))
         })
         .window_control_area(area)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(move |_, window, _| match area {
+        .on_click(move |_, window, cx| match area {
             WindowControlArea::Min => window.minimize_window(),
             WindowControlArea::Max => toggle_window_maximized(window),
-            WindowControlArea::Close => window.remove_window(),
+            WindowControlArea::Close => {
+                if let Some(view) = window.root::<CompiApp>().flatten() {
+                    view.update(cx, |this, _| this.flush_state());
+                }
+                window.remove_window();
+            }
             WindowControlArea::Drag => {}
         })
-        .child(chrome_icon(icon, color(MUTED)))
+        .child(chrome_icon(icon, color(colors.muted)))
 }
 fn drag_threshold_crossed(origin: Point<Pixels>, current: Point<Pixels>) -> bool {
     let dx = f32::from(current.x - origin.x);
@@ -2124,7 +972,6 @@ impl Focusable for CompiApp {
         self.focus_handle.clone()
     }
 }
-
 impl EntityInputHandler for CompiApp {
     fn text_for_range(
         &mut self,
@@ -2161,22 +1008,32 @@ impl EntityInputHandler for CompiApp {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = std::mem::take(&mut self.ime_text);
-        self.replace_text_in_range(None, &text, window, cx);
+        if self.overlay.is_some() {
+            self.ime_marked_range = None;
+            cx.notify();
+        } else {
+            let text = std::mem::take(&mut self.ime_text);
+            self.replace_text_in_range(None, &text, window, cx);
+        }
     }
 
     fn replace_text_in_range(
         &mut self,
-        _: Option<Range<usize>>,
+        range: Option<Range<usize>>,
         text: &str,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.overlay.is_some() {
+            self.edit_overlay_text(range, text);
+            cx.notify();
+            return;
+        }
         self.ime_text.clear();
         self.ime_marked_range = None;
         self.ime_selected_range = 0..0;
         if !text.is_empty()
-            && let Some(tab) = self.active_tab_mut()
+            && let Some(tab) = self.focused_view_mut()
         {
             tab.scroll_offset = 0;
             tab.send(ClientMessage::Input {
@@ -2225,8 +1082,11 @@ impl EntityInputHandler for CompiApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.overlay.is_some() {
+            return Some(Bounds::new(bounds.origin, size(px(2.0), px(24.0))));
+        }
         let cursor = self
-            .active_tab()
+            .focused_view()
             .and_then(|tab| tab.mirror.snapshot())
             .map(|snapshot| snapshot.cursor)?;
         let typography = &self.typography;
@@ -2248,69 +1108,9 @@ impl EntityInputHandler for CompiApp {
         Some(self.ime_selected_range.end)
     }
 }
-
 impl Render for CompiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.refresh_typography(window) {
-            self.update_dimensions(window);
-        }
-        let title = self
-            .active_tab()
-            .map(|tab| format!("{} · Compi", tab.title()))
-            .unwrap_or_else(|| String::from("Compi"));
-        if title != self.window_title {
-            window.set_window_title(&title);
-            self.window_title = title;
-        }
-        if self.ready_probe_render_pending && !self.ready_probe_logged {
-            self.ready_probe_render_pending = false;
-            self.ready_probe_logged = true;
-            let started_at = self.started_at;
-            let sent_at = self.ready_probe_sent_at;
-            window.on_next_frame(move |_, _| {
-                perf::log_startup_metric("ready_for_input_ms", started_at.elapsed());
-                if let Some(sent_at) = sent_at {
-                    perf::log_startup_metric("input_to_render_ms", sent_at.elapsed());
-                }
-            });
-        }
-        if !self.pending_present_latency_ids.is_empty() {
-            let latency_ids = std::mem::take(&mut self.pending_present_latency_ids);
-            window.on_next_frame(move |_, _| {
-                for latency_id in latency_ids {
-                    perf::log_input_latency_stage(latency_id, "frame_presented", None);
-                }
-            });
-        }
-        div()
-            .key_context("Terminal")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.handle_keystroke(&event.keystroke) {
-                    cx.stop_propagation();
-                }
-            }))
-            .size_full()
-            .relative()
-            .flex()
-            .flex_col()
-            .font_family(UI_FONT)
-            .text_size(px(13.0))
-            .text_color(color(FOREGROUND))
-            .bg(color(BACKGROUND))
-            .on_action(cx.listener(Self::new_tab))
-            .on_action(cx.listener(Self::close_tab))
-            .on_action(cx.listener(Self::next_tab))
-            .on_action(cx.listener(Self::previous_tab))
-            .on_action(cx.listener(Self::copy_or_interrupt))
-            .on_action(cx.listener(Self::copy_selection))
-            .on_action(cx.listener(Self::paste_clipboard))
-            .on_action(cx.listener(Self::toggle_switcher))
-            .child(self.render_titlebar(cx))
-            .child(self.render_terminal(cx))
-            .when(self.switcher_open, |client| {
-                client.child(self.render_switcher(cx))
-            })
+        self.render_workspace_window(window, cx)
     }
 }
 
@@ -2327,10 +1127,17 @@ struct PaintModel {
     images: HashMap<u32, Arc<RenderImage>>,
     row_render_cache: Arc<Mutex<RowRenderCache>>,
     typography: Arc<TerminalTypography>,
+    theme: ThemePreset,
+    focused: bool,
 }
 
 impl PaintModel {
-    fn from_tab(tab: &TerminalTab, typography: Arc<TerminalTypography>) -> Option<Self> {
+    fn from_tab(
+        tab: &SurfaceView,
+        typography: Arc<TerminalTypography>,
+        theme: ThemePreset,
+        focused: bool,
+    ) -> Option<Self> {
         let snapshot = tab.mirror.snapshot()?;
         let (visible_rows, base_row) = visible_rows(snapshot, tab.scroll_offset);
         Some(Self {
@@ -2349,6 +1156,8 @@ impl PaintModel {
                 .collect(),
             row_render_cache: tab.row_render_cache.clone(),
             typography,
+            theme,
+            focused,
         })
     }
 }
@@ -2361,10 +1170,18 @@ fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Windo
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         paint_images(bounds, model, base, false, typography, window);
         for (row_index, row) in visible.iter().enumerate() {
-            paint_row_backgrounds(bounds, row_index, row, typography, window);
+            paint_row_backgrounds(bounds, row_index, row, typography, model.theme, window);
         }
         if let Some(selection) = model.selection {
-            paint_selection(bounds, selection, base, visible.len(), typography, window);
+            paint_selection(
+                bounds,
+                selection,
+                base,
+                visible.len(),
+                typography,
+                model.theme,
+                window,
+            );
         }
         paint_cursor(bounds, model, base, typography, window);
         for (row_index, row) in visible.iter().enumerate() {
@@ -2374,6 +1191,7 @@ fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Windo
                 row,
                 &model.row_render_cache,
                 typography,
+                model.theme,
                 window,
             );
         }
@@ -2389,16 +1207,17 @@ fn paint_row_backgrounds(
     row_index: usize,
     row: &Row,
     typography: &TerminalTypography,
+    theme: ThemePreset,
     window: &mut Window,
 ) {
     let mut start = 0;
     while start < row.cells.len() {
-        let background = effective_colors(&row.cells[start]).1;
+        let background = effective_colors(&row.cells[start], theme).1;
         let mut end = start + 1;
-        while end < row.cells.len() && effective_colors(&row.cells[end]).1 == background {
+        while end < row.cells.len() && effective_colors(&row.cells[end], theme).1 == background {
             end += 1;
         }
-        if background != color(BACKGROUND) {
+        if background != color(theme.colors().background) {
             window.paint_quad(fill(
                 Bounds::new(
                     point(
@@ -2494,6 +1313,7 @@ fn paint_row_text(
     row: &Row,
     cache: &Arc<Mutex<RowRenderCache>>,
     typography: &TerminalTypography,
+    theme: ThemePreset,
     window: &mut Window,
 ) {
     let fingerprint = row_fingerprint(row);
@@ -2502,7 +1322,7 @@ fn paint_row_text(
         .ok()
         .and_then(|cache| cache.get(fingerprint, row));
     let runs = cached.unwrap_or_else(|| {
-        let shaped = Arc::new(shape_row(row, typography, window));
+        let shaped = Arc::new(shape_row(row, typography, theme, window));
         if let Ok(mut cache) = cache.lock() {
             cache.insert(fingerprint, row.clone(), shaped.clone());
         }
@@ -2561,16 +1381,17 @@ fn paint_composition(
     cursor: CursorState,
     text: SharedString,
     typography: &TerminalTypography,
+    theme: ThemePreset,
     window: &mut Window,
     cx: &mut App,
 ) {
     let run = TextRun {
         len: text.len(),
         font: typography.font.clone(),
-        color: color(FOREGROUND),
+        color: color(theme.colors().foreground),
         background_color: None,
         underline: Some(UnderlineStyle {
-            color: Some(color(ACCENT)),
+            color: Some(color(theme.colors().accent)),
             thickness: px(1.0),
             wavy: false,
         }),
@@ -2590,12 +1411,17 @@ fn paint_composition(
             point(origin.x, cell_top),
             size(line.width, px(typography.cell_height)),
         ),
-        color(BACKGROUND),
+        color(theme.colors().background),
     ));
     let _ = line.paint(origin, px(typography.cell_height), window, cx);
 }
 
-fn shape_row(row: &Row, typography: &TerminalTypography, window: &mut Window) -> Vec<ShapedRun> {
+fn shape_row(
+    row: &Row,
+    typography: &TerminalTypography,
+    theme: ThemePreset,
+    window: &mut Window,
+) -> Vec<ShapedRun> {
     let mut shaped = Vec::new();
     let mut start = 0;
     while start < row.cells.len() {
@@ -2628,7 +1454,7 @@ fn shape_row(row: &Row, typography: &TerminalTypography, window: &mut Window) ->
             });
             end += usize::from(cell.width.max(1));
         }
-        let (foreground, _) = effective_colors(style);
+        let (foreground, _) = effective_colors(style, theme);
         let color = if style.attributes.dim {
             foreground.opacity(0.58)
         } else {
@@ -2699,6 +1525,7 @@ fn paint_selection(
     base: usize,
     visible_rows: usize,
     typography: &TerminalTypography,
+    theme: ThemePreset,
     window: &mut Window,
 ) {
     let (start, end) = selection.ordered();
@@ -2733,7 +1560,7 @@ fn paint_selection(
                     px(typography.cell_height),
                 ),
             ),
-            color(SELECTION).opacity(0.82),
+            color(theme.colors().selection).opacity(0.82),
         ));
     }
 }
@@ -2745,7 +1572,7 @@ fn paint_cursor(
     typography: &TerminalTypography,
     window: &mut Window,
 ) {
-    if !model.cursor.visible || model.scroll_offset != 0 {
+    if !model.focused || !model.cursor.visible || model.scroll_offset != 0 {
         return;
     }
     let absolute_row = model.scrollback_len + usize::from(model.cursor.row);
@@ -2769,7 +1596,10 @@ fn paint_cursor(
         ),
         CursorShape::Bar => Bounds::new(point(x, y), size(px(2.0), px(typography.cell_height))),
     };
-    window.paint_quad(fill(cursor_bounds, color(ACCENT).opacity(0.78)));
+    window.paint_quad(fill(
+        cursor_bounds,
+        color(model.theme.colors().cursor).opacity(0.78),
+    ));
 }
 
 fn paint_images(
@@ -2837,9 +1667,9 @@ fn same_text_style(left: &Cell, right: &Cell) -> bool {
         && left.hyperlink == right.hyperlink
 }
 
-fn effective_colors(cell: &Cell) -> (Hsla, Hsla) {
-    let foreground = terminal_color(cell.foreground, true);
-    let background = terminal_color(cell.background, false);
+fn effective_colors(cell: &Cell, theme: ThemePreset) -> (Hsla, Hsla) {
+    let foreground = terminal_color(cell.foreground, true, theme);
+    let background = terminal_color(cell.background, false, theme);
     if cell.attributes.inverse {
         (background, foreground)
     } else {
@@ -2856,46 +1686,23 @@ fn diagnostic_warning(config: &[String], typography: &[String]) -> Option<String
     (!warning.is_empty()).then_some(warning)
 }
 
-fn terminal_color(value: Color, foreground: bool) -> Hsla {
+fn terminal_color(value: Color, foreground: bool, theme: ThemePreset) -> Hsla {
     match value {
-        Color::Default => color(if foreground { FOREGROUND } else { BACKGROUND }),
+        Color::Default => color(if foreground {
+            theme.colors().foreground
+        } else {
+            theme.colors().background
+        }),
         Color::Rgb(red, green, blue) => {
             color((u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue))
         }
-        Color::Indexed(index) => color(ansi_color(index)),
+        Color::Indexed(index) => color(theme.colors().indexed(index)),
     }
-}
-
-fn ansi_color(index: u8) -> u32 {
-    const ANSI: [u32; 16] = [
-        0x1d1b18, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xd8d2c7, 0x5c5660,
-        0xff7a85, 0xb4d88a, 0xffd68a, 0x84c4ff, 0xdd91e8, 0x78dce8, 0xf5f0e8,
-    ];
-    if index < 16 {
-        return ANSI[index as usize];
-    }
-    if index < 232 {
-        let value = index - 16;
-        let component = |part: u8| {
-            if part == 0 {
-                0
-            } else {
-                55 + 40 * u32::from(part)
-            }
-        };
-        let red = component(value / 36);
-        let green = component((value % 36) / 6);
-        let blue = component(value % 6);
-        return (red << 16) | (green << 8) | blue;
-    }
-    let gray = 8 + 10 * u32::from(index - 232);
-    (gray << 16) | (gray << 8) | gray
 }
 
 fn color(value: u32) -> Hsla {
     rgb(value).into()
 }
-
 #[cfg(windows)]
 fn active_keypad_key() -> Option<KeypadKey> {
     [
@@ -2984,28 +1791,53 @@ fn terminal_button(button: MouseButton) -> input::MouseButton {
 }
 
 fn decode_kitty_image(image: &KittyImage) -> Result<Arc<RenderImage>, String> {
+    const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+    let decoded_size = (image.width as usize)
+        .checked_mul(image.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes <= MAX_IMAGE_BYTES)
+        .ok_or("Image dimensions exceed the 64 MiB decoded image limit")?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&image.data)
         .map_err(|error| error.to_string())?;
     let mut buffer = match image.format {
         32 => RgbaImage::from_raw(image.width, image.height, bytes)
-            .ok_or_else(|| "RGBA payload length does not match dimensions".to_string())?,
+            .ok_or("RGBA payload length does not match dimensions")?,
         24 => {
-            let expected = image.width as usize * image.height as usize * 3;
+            let expected = decoded_size / 4 * 3;
             if bytes.len() != expected {
                 return Err("RGB payload length does not match dimensions".into());
             }
-            let mut rgba = Vec::with_capacity(image.width as usize * image.height as usize * 4);
+            let mut rgba = Vec::with_capacity(decoded_size);
             for pixel in bytes.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
             }
             RgbaImage::from_raw(image.width, image.height, rgba)
-                .ok_or_else(|| "could not create RGB image".to_string())?
+                .ok_or("Could not create RGB image")?
         }
-        100 => image::load_from_memory(&bytes)
-            .map_err(|error| error.to_string())?
-            .into_rgba8(),
-        format => return Err(format!("unsupported Kitty image format {format}")),
+        100 => {
+            let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+                .with_guessed_format()
+                .map_err(|error| error.to_string())?
+                .into_dimensions()
+                .map_err(|error| error.to_string())?;
+            if u64::from(width) * u64::from(height) * 4 > MAX_IMAGE_BYTES as u64 {
+                return Err("PNG dimensions exceed the 64 MiB decoded image limit".into());
+            }
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .map_err(|error| error.to_string())?;
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(MAX_IMAGE_BYTES as u64);
+            limits.max_image_width = Some(8192);
+            limits.max_image_height = Some(8192);
+            reader.limits(limits);
+            reader
+                .decode()
+                .map_err(|error| error.to_string())?
+                .into_rgba8()
+        }
+        format => return Err(format!("Unsupported Kitty image format {format}")),
     };
     let raw: &mut [u8] = buffer.as_mut();
     for pixel in raw.as_chunks_mut::<4>().0 {
@@ -3015,6 +1847,11 @@ fn decode_kitty_image(image: &KittyImage) -> Result<Arc<RenderImage>, String> {
         buffer
     )])))
 }
+struct WorkerLifecycle {
+    stop: Arc<AtomicBool>,
+    previous_closed: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+}
 
 fn spawn_tab_worker(
     tab_id: u64,
@@ -3023,32 +1860,43 @@ fn spawn_tab_worker(
     rows: i16,
     sender: UiEventSender,
     instance: Option<String>,
+    lifecycle: WorkerLifecycle,
 ) {
+    let WorkerLifecycle {
+        stop,
+        previous_closed,
+        closed,
+    } = lifecycle;
     thread::spawn(move || {
-        let stop = Arc::new(AtomicBool::new(false));
-        loop {
+        while !previous_closed.load(Ordering::Acquire) {
             if stop.load(Ordering::Acquire) {
+                closed.store(true, Ordering::Release);
                 return;
             }
-            let result = run_tab_connection(
-                tab_id,
-                &surface_id,
-                cols,
-                rows,
-                stop.clone(),
-                &sender,
-                instance.as_deref(),
-            );
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            let error = result
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "daemon connection closed".into());
-            let _ = sender.send(UiEvent::TabDisconnected { tab_id, error });
-            thread::sleep(RECONNECT_DELAY);
+            thread::sleep(Duration::from_millis(2));
         }
+        if stop.load(Ordering::Acquire) {
+            closed.store(true, Ordering::Release);
+            return;
+        }
+        let result = run_tab_connection(
+            tab_id,
+            &surface_id,
+            cols,
+            rows,
+            stop.clone(),
+            &sender,
+            instance.as_deref(),
+        );
+        closed.store(true, Ordering::Release);
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let error = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "Daemon connection closed".into());
+        let _ = sender.send(UiEvent::TabDisconnected { tab_id, error });
     });
 }
 
@@ -3075,7 +1923,7 @@ fn run_tab_connection(
         });
         return Ok(());
     };
-    if surface.status != SurfaceStatus::Running {
+    if surface.status == SurfaceStatus::Lost {
         stop.store(true, Ordering::Release);
         let _ = sender.send(UiEvent::TabControl {
             tab_id,
@@ -3087,6 +1935,9 @@ fn run_tab_connection(
                 current_revision: Some(workspace.revision),
             },
         });
+        return Ok(());
+    }
+    if stop.load(Ordering::Acquire) {
         return Ok(());
     }
     client.attach_surface(&surface, cols, rows)?;
@@ -3109,6 +1960,12 @@ fn run_tab_connection(
     let mut reader =
         DaemonClient::from_attached_parts(connection, next_request_id, target, workspace);
     loop {
+        if stop.load(Ordering::Acquire) {
+            // A successor waits for this worker, so acknowledge release before
+            // allowing another connection to request this surface's controller.
+            let _ = reader.request(ClientMessage::Detach)?;
+            return Ok(());
+        }
         loop {
             match command_rx.try_recv() {
                 Ok(message) => {
@@ -3133,14 +1990,10 @@ fn run_tab_connection(
             }
             Some(ServerEvent::Control { message, .. }) => {
                 let detached = matches!(&message, ServerMessage::Detached { .. });
-                let exited = matches!(&message, ServerMessage::SurfaceExited { .. });
-                if exited {
-                    stop.store(true, Ordering::Release);
-                }
                 if !sender.send(UiEvent::TabControl { tab_id, message }) {
                     return Ok(());
                 }
-                if detached && stop.load(Ordering::Acquire) || exited {
+                if detached && stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
             }
@@ -3148,42 +2001,6 @@ fn run_tab_connection(
         }
     }
 }
-
-fn terminate_surface_and_wait(
-    instance: Option<&str>,
-    surface_id: &SurfaceId,
-) -> Result<Vec<SurfaceInfo>, String> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))
-        .map_err(|error| error.to_string())?;
-    let surface = client
-        .workspace()
-        .map_err(|error| error.to_string())?
-        .surface(surface_id)
-        .cloned()
-        .ok_or_else(|| format!("surface {surface_id} was not found"))?;
-    client
-        .end_surface(&surface)
-        .map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let surfaces = client.list_surfaces().map_err(|error| error.to_string())?;
-        let ending = surfaces.iter().any(|surface| {
-            &surface.id == surface_id
-                && matches!(
-                    surface.status,
-                    SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
-                )
-        });
-        if !ending {
-            return Ok(surfaces);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("timed out ending surface {surface_id}"));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 fn short_surface_id(id: &SurfaceId) -> String {
     id.as_str()
         .rsplit('-')
@@ -3192,23 +2009,6 @@ fn short_surface_id(id: &SurfaceId) -> String {
         .chars()
         .take(8)
         .collect()
-}
-
-fn snapshot_contains_marker(snapshot: Option<&ScreenSnapshot>, marker: &str) -> bool {
-    let Some(snapshot) = snapshot else {
-        return false;
-    };
-    snapshot
-        .scrollback
-        .iter()
-        .chain(&snapshot.cells)
-        .any(|row| {
-            row.cells
-                .iter()
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-                .contains(marker)
-        })
 }
 
 fn log_startup_metric(name: &str, elapsed: Duration) {
