@@ -479,6 +479,9 @@ Escape sequences are untrusted process output. Hyperlink opening validates schem
 - Double-click reset restores the configured default width.
 - Top strip uses scrolling/overflow rather than compressing every label into an unreadable sliver.
 - The established Compi terminal mark remains visible beside a distinct, quiet sidebar toggle. The keyboard shortcut and palette command also show/hide the sidebar. When hidden, no permanent sidebar rail, large workspace selector, or reserved width remains. Its current visibility survives ordinary interaction within the window, but not window relaunch.
+- The header keeps New terminal fixed beside the scrolling tab strip, followed by focused-pane actions for Split right, Split down, and Zoom pane. These actions use the command registry's current enablement, disabled reason, and configured shortcut. Remove pane remains in the palette, pane context menu, and shortcut only.
+- When header width cannot preserve a usable active tab, the three pane actions collapse into one compact menu before they can collide with native window controls. The compact menu exposes the same commands and states.
+- Pane zoom is explicit, window-local presentation state scoped per tab. It renders the focused pane across the content area without changing the authoritative split tree or disconnecting other surfaces. Directional focus retargets the presented pane; splitting restores the full layout before using the existing split mutation; stale or removed pane targets clear zoom safely.
 - Navigation areas scroll independently from the terminal.
 - Window controls reserve platform-appropriate space, including Mac traffic lights.
 - The layout must not depend on a single fixed window size or Windows-only titlebar geometry.

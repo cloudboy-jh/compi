@@ -61,6 +61,7 @@ registry! {
     MoveTabToWindow, "move_tab_to_window", "Move terminal tab to another window", None, None;
     SplitRight, "split_right", "Split right", Some("cmd-d"), Some("alt-shift-plus");
     SplitDown, "split_down", "Split down", Some("cmd-shift-d"), Some("alt-shift-minus");
+    TogglePaneZoom, "toggle_pane_zoom", "Zoom pane", None, None;
     FocusLeft, "focus_left", "Focus pane left", Some("cmd-alt-left"), Some("alt-left");
     FocusRight, "focus_right", "Focus pane right", Some("cmd-alt-right"), Some("alt-right");
     FocusUp, "focus_up", "Focus pane above", Some("cmd-alt-up"), Some("alt-up");
@@ -93,6 +94,17 @@ impl CommandSpec {
         match platform {
             Platform::Mac => self.mac_shortcut,
             Platform::Windows | Platform::Linux => self.windows_shortcut,
+        }
+    }
+    pub fn configured_shortcut<'a>(
+        &'static self,
+        platform: Platform,
+        overrides: &'a HashMap<String, String>,
+    ) -> Option<&'a str> {
+        match overrides.get(self.id) {
+            Some(binding) if binding.is_empty() => None,
+            Some(binding) => Some(binding.as_str()),
+            None => self.shortcut(platform),
         }
     }
     /// Every query word must occur in the human label or stable command ID.
@@ -145,6 +157,7 @@ pub struct CommandContext {
     pub current_revision: u64,
     pub split_right_reason: Option<&'static str>,
     pub split_down_reason: Option<&'static str>,
+    pub pane_zoomed: bool,
     pub resize_reason: Option<&'static str>,
     pub focus_left: bool,
     pub focus_right: bool,
@@ -278,10 +291,21 @@ impl Command {
                 (!c.has_pane || !available).then_some("No pane in that direction")
             }
             ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio => {
-                if !c.has_pane || c.pane_count < 2 {
+                if c.pane_zoomed {
+                    Some("Restore the split layout before resizing a divider")
+                } else if !c.has_pane || c.pane_count < 2 {
                     Some("The focused pane has no split")
                 } else {
                     c.resize_reason
+                }
+            }
+            TogglePaneZoom => {
+                if !c.has_pane {
+                    Some("Select a pane first")
+                } else if !c.pane_zoomed && c.pane_count < 2 {
+                    Some("This tab has only one pane")
+                } else {
+                    None
                 }
             }
             RemovePane => (!c.has_pane).then_some("Select a pane first"),
@@ -959,6 +983,24 @@ mod tests {
             KeyRoute::Terminal
         );
     }
+    #[test]
+    fn displayed_shortcuts_follow_overrides_and_explicit_unbinding() {
+        let spec = Command::SplitRight.spec();
+        let mut overrides = HashMap::from([("split_right".to_owned(), "ctrl-alt-r".to_owned())]);
+        assert_eq!(
+            spec.configured_shortcut(Platform::Windows, &overrides),
+            Some("ctrl-alt-r")
+        );
+        overrides.insert("split_right".to_owned(), String::new());
+        assert_eq!(
+            spec.configured_shortcut(Platform::Windows, &overrides),
+            None
+        );
+        assert_eq!(
+            spec.configured_shortcut(Platform::Windows, &HashMap::new()),
+            spec.windows_shortcut
+        );
+    }
 
     #[test]
     fn stale_targets_and_lifecycle_prevent_unsafe_actions() {
@@ -978,6 +1020,22 @@ mod tests {
         assert!(Command::SplitDown.disabled_reason(&context).is_none());
         context.has_pane = false;
         assert!(Command::SplitDown.disabled_reason(&context).is_some());
+    }
+    #[test]
+    fn pane_zoom_preserves_restore_but_blocks_split_resizing() {
+        let mut context = ready();
+        assert!(Command::TogglePaneZoom.disabled_reason(&context).is_none());
+        context.pane_zoomed = true;
+        assert!(
+            Command::ResizeSplitIncrease
+                .disabled_reason(&context)
+                .is_some()
+        );
+        assert!(Command::ResetSplitRatio.disabled_reason(&context).is_some());
+        assert!(Command::TogglePaneZoom.disabled_reason(&context).is_none());
+        context.pane_zoomed = false;
+        context.pane_count = 1;
+        assert!(Command::TogglePaneZoom.disabled_reason(&context).is_some());
     }
 
     #[test]

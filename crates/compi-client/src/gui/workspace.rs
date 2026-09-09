@@ -20,6 +20,7 @@ pub(super) enum TextPurpose {
 #[derive(Clone)]
 pub(super) enum Overlay {
     Palette,
+    PaneActions,
     Theme {
         accepted: ThemePreset,
     },
@@ -233,11 +234,13 @@ impl CompiApp {
             overlay_index: 0,
             overlay_scroll: ScrollHandle::new(),
             overlay_revision: None,
+            pane_zoom: PaneZoomState::default(),
             layout: None,
             divider_drag: None,
             preview_layout: None,
             last_resize: Instant::now() - Duration::from_secs(1),
             loading_surfaces: false,
+            zoom_layout: None,
             mutation_pending: false,
             global_error: None,
             font_settings: config.font.clone(),
@@ -361,6 +364,29 @@ impl CompiApp {
 
     fn selected_tab(&self) -> Option<&WorkspaceTab> {
         self.state.selected_tab(self.workspace.as_ref()?)
+    }
+    fn zoomed_pane(&self) -> Option<&PaneId> {
+        let tab = self.selected_tab()?;
+        self.pane_zoom.pane(&tab.id)
+    }
+
+    fn pane_zoomed(&self) -> bool {
+        self.zoomed_pane().is_some()
+    }
+
+    fn visible_layout(&self) -> Option<&WorkspaceLayout> {
+        self.zoom_layout.as_ref().or(self.layout.as_ref())
+    }
+
+    fn reconcile_pane_zoom(&mut self, workspace: &WorkspaceSnapshot) {
+        self.pane_zoom.retain_valid(|tab_id, pane_id| {
+            workspace
+                .sessions
+                .iter()
+                .flat_map(|session| &session.tabs)
+                .find(|tab| &tab.id == tab_id)
+                .is_some_and(|tab| layout_contains_pane(&tab.layout, pane_id))
+        });
     }
 
     fn remember_geometry(&mut self, window: &Window) {
@@ -612,16 +638,20 @@ impl CompiApp {
         }) {
             return;
         }
+        let generation_changed = self
+            .workspace
+            .as_ref()
+            .is_some_and(|old| old.server_generation != workspace.server_generation);
+        if generation_changed {
+            self.pane_zoom.clear_all();
+        }
+        self.reconcile_pane_zoom(&workspace);
         let changed = self.workspace.as_ref().is_none_or(|old| {
             old.server_generation != workspace.server_generation
                 || old.revision != workspace.revision
         });
         if changed {
-            if self
-                .workspace
-                .as_ref()
-                .is_some_and(|old| old.server_generation != workspace.server_generation)
-            {
+            if generation_changed {
                 for view in &mut self.surface_views {
                     view.stop.store(true, Ordering::Release);
                     if let Some(transport) = view.transport.take() {
@@ -1103,9 +1133,13 @@ impl CompiApp {
         if self.focused_view().is_some_and(|view| view.pane_id == pane) {
             return;
         }
+        let tab_id = self.selected_tab().map(|tab| tab.id.clone());
         self.report_focus(false);
         if let Some(workspace) = &self.workspace {
             self.state.focus_pane(workspace, &pane);
+        }
+        if let Some(tab_id) = &tab_id {
+            self.pane_zoom.retarget(tab_id, pane.clone());
         }
         self.focused_view = self
             .surface_views
@@ -1113,7 +1147,9 @@ impl CompiApp {
             .find(|view| view.pane_id == pane)
             .map(|view| view.id);
         self.report_focus(self.overlay.is_none());
-        if let Some(layout) = &self.layout {
+        if self.pane_zoomed() {
+            self.workspace_scroll.set_offset(point(px(0.0), px(0.0)));
+        } else if let Some(layout) = &self.layout {
             let offset = self.workspace_scroll.offset();
             let cursor = self
                 .focused_view()
@@ -1155,13 +1191,13 @@ impl CompiApp {
     }
 
     fn rebuild_layout(&mut self, window: &Window, force: bool) -> bool {
-        let Some(tab) = self.selected_tab() else {
+        let Some(tab_id) = self.selected_tab().map(|tab| tab.id.clone()) else {
             self.layout = None;
+            self.zoom_layout = None;
             return false;
         };
         let viewport = window.viewport_size();
         let metrics = self.metrics();
-        let tree = self.preview_layout.as_ref().unwrap_or(&tab.layout);
         let available = layout::Size {
             width: (f32::from(viewport.width)
                 - if self.sidebar_open {
@@ -1172,8 +1208,18 @@ impl CompiApp {
             .max(1.0),
             height: (f32::from(viewport.height) - CHROME_HEIGHT).max(1.0),
         };
-        let mut layout = layout::compute_layout(tree, available, metrics);
+        let mut layout = {
+            let tab = self
+                .selected_tab()
+                .expect("the selected tab was resolved above");
+            let tree = self.preview_layout.as_ref().unwrap_or(&tab.layout);
+            layout::compute_layout(tree, available, metrics)
+        };
         if layout.has_overflow() {
+            let tab = self
+                .selected_tab()
+                .expect("the selected tab was resolved above");
+            let tree = self.preview_layout.as_ref().unwrap_or(&tab.layout);
             layout = layout::compute_layout(
                 tree,
                 layout::Size {
@@ -1183,10 +1229,28 @@ impl CompiApp {
                 metrics,
             );
         }
+        let zoom_tree = self
+            .pane_zoom
+            .pane(&tab_id)
+            .and_then(|pane_id| layout.pane(pane_id))
+            .map(|pane| LayoutNode::Pane {
+                pane_id: pane.pane_id.clone(),
+                surface_id: pane.surface_id.clone(),
+            });
+        if self.pane_zoom.pane(&tab_id).is_some() && zoom_tree.is_none() {
+            self.pane_zoom.clear(&tab_id);
+        }
+        let zoom_layout = zoom_tree
+            .as_ref()
+            .map(|tree| layout::compute_layout(tree, available, metrics));
         let mut needs_frame = false;
         if force || self.last_resize.elapsed() >= Duration::from_millis(32) {
             for pane in &layout.panes {
-                let (cols, rows) = pane.grid_size(metrics);
+                let geometry = zoom_layout
+                    .as_ref()
+                    .and_then(|zoom| zoom.pane(&pane.pane_id))
+                    .unwrap_or(pane);
+                let (cols, rows) = geometry.grid_size(metrics);
                 if let Some(view) = self
                     .surface_views
                     .iter_mut()
@@ -1200,8 +1264,13 @@ impl CompiApp {
             }
             self.last_resize = Instant::now();
         } else if layout.panes.iter().any(|pane| {
+            let geometry = zoom_layout
+                .as_ref()
+                .and_then(|zoom| zoom.pane(&pane.pane_id))
+                .unwrap_or(pane);
             self.surface_views.iter().any(|view| {
-                view.pane_id == pane.pane_id && (view.cols, view.rows) != pane.grid_size(metrics)
+                view.pane_id == pane.pane_id
+                    && (view.cols, view.rows) != geometry.grid_size(metrics)
             })
         }) {
             needs_frame = true;
@@ -1211,12 +1280,13 @@ impl CompiApp {
             self.terminal_rows = dimensions.1;
         }
         self.layout = Some(layout);
+        self.zoom_layout = zoom_layout;
         needs_frame
     }
 
     pub(super) fn grid_point(&self, position: Point<Pixels>) -> Option<GridPoint> {
         let view = self.focused_view()?;
-        let pane = self.layout.as_ref()?.pane(&view.pane_id)?;
+        let pane = self.visible_layout()?.pane(&view.pane_id)?;
         let offset = self.workspace_scroll.offset();
         let x = f32::from(position.x)
             - if self.sidebar_open {
@@ -1320,6 +1390,7 @@ impl CompiApp {
             current_revision: workspace.map_or(0, |workspace| workspace.revision),
             split_right_reason: split_reason(SplitAxis::Horizontal),
             split_down_reason: split_reason(SplitAxis::Vertical),
+            pane_zoomed: self.pane_zoomed(),
             resize_reason: if self
                 .layout
                 .as_ref()
@@ -1426,7 +1497,10 @@ impl CompiApp {
                     if !matches!(
                         self.overlay,
                         Some(
-                            Overlay::Theme { .. } | Overlay::Confirm { .. } | Overlay::Diagnostics
+                            Overlay::PaneActions
+                                | Overlay::Theme { .. }
+                                | Overlay::Confirm { .. }
+                                | Overlay::Diagnostics
                         )
                     ) =>
                 {
@@ -1471,8 +1545,12 @@ impl CompiApp {
                     }
                 }
                 _ => {
-                    // Printable and composing input belongs to the native text-input handler.
-                    if key.key_char.is_some() && !key.modifiers.control && !key.modifiers.platform {
+                    // Printable and composing input belongs to native text fields, never menus.
+                    if !matches!(self.overlay, Some(Overlay::PaneActions))
+                        && key.key_char.is_some()
+                        && !key.modifiers.control
+                        && !key.modifiers.platform
+                    {
                         return false;
                     }
                 }
@@ -1516,7 +1594,12 @@ impl CompiApp {
     pub(super) fn edit_overlay_text(&mut self, range: Option<Range<usize>>, text: &str) {
         if matches!(
             self.overlay,
-            Some(Overlay::Theme { .. } | Overlay::Confirm { .. } | Overlay::Diagnostics)
+            Some(
+                Overlay::PaneActions
+                    | Overlay::Theme { .. }
+                    | Overlay::Confirm { .. }
+                    | Overlay::Diagnostics
+            )
         ) {
             return;
         }
@@ -1682,6 +1765,14 @@ impl CompiApp {
             }
             Command::MoveTabToWindow => self.open_overlay(Overlay::Windows, ""),
             Command::SplitRight | Command::SplitDown => {
+                if tab_id
+                    .as_ref()
+                    .is_some_and(|tab_id| self.pane_zoom.clear(tab_id))
+                {
+                    self.zoom_layout = None;
+                    self.workspace_scroll.set_offset(point(px(0.0), px(0.0)));
+                    self.rebuild_layout(window, true);
+                }
                 if let Some(pane_id) = pane_id {
                     let axis = if command == Command::SplitRight {
                         SplitAxis::Horizontal
@@ -1719,6 +1810,14 @@ impl CompiApp {
                             Err(reason) => self.global_error = Some(reason.into()),
                         }
                     }
+                }
+            }
+            Command::TogglePaneZoom => {
+                if let (Some(tab_id), Some(pane_id)) = (tab_id, pane_id) {
+                    self.pane_zoom.toggle(tab_id, pane_id);
+                    self.divider_drag = None;
+                    self.preview_layout = None;
+                    self.workspace_scroll.set_offset(point(px(0.0), px(0.0)));
                 }
             }
             Command::FocusLeft | Command::FocusRight | Command::FocusUp | Command::FocusDown => {
@@ -2137,11 +2236,44 @@ impl CompiApp {
         }
         status
     }
+    fn command_label(&self, command: Command) -> &'static str {
+        if command == Command::TogglePaneZoom && self.pane_zoomed() {
+            "Restore split layout"
+        } else {
+            command.spec().label
+        }
+    }
+
+    fn configured_shortcut(&self, command: Command) -> Option<&str> {
+        let platform = if cfg!(target_os = "macos") {
+            commands::Platform::Mac
+        } else {
+            commands::Platform::Windows
+        };
+        command
+            .spec()
+            .configured_shortcut(platform, &self.config.keybindings)
+    }
 
     fn overlay_choices(&self, cx: &App) -> Vec<Choice> {
         let query = self.ime_text.to_lowercase();
         let mut choices = Vec::new();
         match &self.overlay {
+            Some(Overlay::PaneActions) => {
+                let context = self.command_context(cx);
+                for command in [
+                    Command::SplitRight,
+                    Command::SplitDown,
+                    Command::TogglePaneZoom,
+                ] {
+                    choices.push(Choice {
+                        title: self.command_label(command).into(),
+                        detail: self.configured_shortcut(command).unwrap_or("").into(),
+                        reason: command.disabled_reason(&context).map(str::to_owned),
+                        action: ChoiceAction::Command(command),
+                    });
+                }
+            }
             Some(Overlay::Theme { .. }) => {
                 for theme in ThemePreset::ALL {
                     choices.push(Choice {
@@ -2164,14 +2296,8 @@ impl CompiApp {
                     .filter(|spec| spec.matches_query(&self.ime_text))
                 {
                     choices.push(Choice {
-                        title: spec.label.into(),
-                        detail: if cfg!(target_os = "macos") {
-                            spec.mac_shortcut
-                        } else {
-                            spec.windows_shortcut
-                        }
-                        .unwrap_or("")
-                        .into(),
+                        title: self.command_label(spec.command).into(),
+                        detail: self.configured_shortcut(spec.command).unwrap_or("").into(),
                         reason: spec.command.disabled_reason(&context).map(str::to_owned),
                         action: ChoiceAction::Command(spec.command),
                     });
@@ -2298,7 +2424,7 @@ impl CompiApp {
             .on_mouse_move(cx.listener(Self::on_workspace_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_workspace_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_workspace_mouse_up))
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(window, cx))
             .child(
                 div()
                     .flex()
@@ -2414,7 +2540,15 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
-        let disabled = command.disabled_reason(&self.command_context(cx)).is_some();
+        let reason = command
+            .disabled_reason(&self.command_context(cx))
+            .map(str::to_owned);
+        let disabled = reason.is_some();
+        let label = self.command_label(command);
+        let title = match self.configured_shortcut(command) {
+            Some(shortcut) => format!("{label} · {shortcut}"),
+            None => label.to_owned(),
+        };
         div()
             .id(id)
             .size(px(32.0))
@@ -2427,30 +2561,78 @@ impl CompiApp {
             } else if active {
                 colors.accent
             } else {
-                colors.foreground
+                colors.muted
             }))
             .when(active, |button| button.bg(color(colors.surface_hover)))
-            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+            .hover(move |style| {
+                if disabled {
+                    style
+                } else {
+                    style.bg(color(colors.surface_hover)).cursor_pointer()
+                }
+            })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.execute(command, window, cx);
-                cx.stop_propagation();
-            }))
+            .when(!disabled, |button| {
+                button.on_click(cx.listener(move |this, _, window, cx| {
+                    this.execute(command, window, cx);
+                    cx.stop_propagation();
+                }))
+            })
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: title.clone(),
+                    reason: reason.clone(),
+                    colors,
+                })
+                .into()
+            })
             .child(chrome_icon(
                 icon,
-                color(if disabled {
-                    colors.muted
-                } else if active {
-                    colors.accent
-                } else {
-                    colors.foreground
-                }),
+                color(if active { colors.accent } else { colors.muted }),
             ))
             .into_any_element()
     }
 
-    fn render_titlebar(&self, cx: &Context<Self>) -> AnyElement {
+    fn pane_actions_menu_button(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
+        let active = matches!(self.overlay, Some(Overlay::PaneActions));
+        div()
+            .id("pane-actions-menu")
+            .size(px(32.0))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(active, |button| button.bg(color(colors.surface_hover)))
+            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_overlay(Overlay::PaneActions, "");
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: "Pane actions".into(),
+                    reason: None,
+                    colors,
+                })
+                .into()
+            })
+            .child(chrome_icon(
+                ChromeIcon::PaneActions,
+                color(if active { colors.accent } else { colors.muted }),
+            ))
+            .into_any_element()
+    }
+
+    fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let colors = self.colors();
+        let window_width = f32::from(window.viewport_size().width);
+        let metrics = header_metrics(window_width);
+        let trailing_width =
+            WINDOW_CONTROLS_WIDTH + HEADER_BUTTON_SLOT_WIDTH + metrics.pane_actions_width;
+        let tab_region_right = (window_width - trailing_width).max(TITLEBAR_BRAND_WIDTH);
         let visible: Vec<_> = self
             .workspace
             .as_ref()
@@ -2466,7 +2648,7 @@ impl CompiApp {
             div()
                 .id(("terminal-tab", index))
                 .h_full()
-                .w(px(TAB_WIDTH))
+                .w(px(metrics.tab_width))
                 .flex_none()
                 .px_3()
                 .flex()
@@ -2599,9 +2781,10 @@ impl CompiApp {
                     .is_some_and(|position| f32::from(position.y) <= CHROME_HEIGHT),
                 |bar| {
                     let x = f32::from(self.drag_position.unwrap().x);
-                    let insertion = ((x - TITLEBAR_BRAND_WIDTH) / TAB_WIDTH).round().max(0.0)
-                        * TAB_WIDTH
-                        + TITLEBAR_BRAND_WIDTH;
+                    let insertion = (((x - TITLEBAR_BRAND_WIDTH) / metrics.tab_width).round()
+                        * metrics.tab_width
+                        + TITLEBAR_BRAND_WIDTH)
+                        .clamp(TITLEBAR_BRAND_WIDTH, tab_region_right);
                     bar.child(
                         div()
                             .absolute()
@@ -2618,28 +2801,78 @@ impl CompiApp {
                     .id("terminal-tabs")
                     .absolute()
                     .left(px(TITLEBAR_BRAND_WIDTH))
-                    .right(px(WINDOW_CONTROLS_WIDTH))
+                    .right(px(trailing_width))
                     .h_full()
                     .flex()
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll_handle)
                     .on_scroll_wheel(cx.listener(Self::on_tab_scroll))
-                    .children(tabs)
-                    .child(
-                        div()
-                            .h_full()
-                            .flex_none()
+                    .children(tabs),
+            )
+            .child(
+                div()
+                    .id("new-terminal-slot")
+                    .absolute()
+                    .right(px(WINDOW_CONTROLS_WIDTH + metrics.pane_actions_width))
+                    .top_0()
+                    .h_full()
+                    .w(px(HEADER_BUTTON_SLOT_WIDTH))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(self.command_icon_button(
+                        "new-terminal",
+                        ChromeIcon::Add,
+                        Command::NewTab,
+                        false,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .id("pane-actions-slot")
+                    .absolute()
+                    .right(px(WINDOW_CONTROLS_WIDTH))
+                    .top_0()
+                    .h_full()
+                    .w(px(metrics.pane_actions_width))
+                    .border_l_1()
+                    .border_color(color(colors.border))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(match metrics.pane_actions {
+                        PaneActionsMode::Full => div()
                             .flex()
                             .items_center()
-                            .px_1()
                             .child(self.command_icon_button(
-                                "new-terminal",
-                                ChromeIcon::Add,
-                                Command::NewTab,
+                                "split-right",
+                                ChromeIcon::SplitRight,
+                                Command::SplitRight,
                                 false,
                                 cx,
-                            )),
-                    ),
+                            ))
+                            .child(self.command_icon_button(
+                                "split-down",
+                                ChromeIcon::SplitDown,
+                                Command::SplitDown,
+                                false,
+                                cx,
+                            ))
+                            .child(self.command_icon_button(
+                                "toggle-pane-zoom",
+                                if self.pane_zoomed() {
+                                    ChromeIcon::PaneRestore
+                                } else {
+                                    ChromeIcon::PaneZoom
+                                },
+                                Command::TogglePaneZoom,
+                                self.pane_zoomed(),
+                                cx,
+                            ))
+                            .into_any_element(),
+                        PaneActionsMode::Compact => self.pane_actions_menu_button(cx),
+                    }),
             )
             .when(cfg!(windows), |bar| {
                 bar.child(
@@ -2859,7 +3092,7 @@ impl CompiApp {
 
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
-        let Some(layout) = &self.layout else {
+        let Some(layout) = self.visible_layout() else {
             return div().flex_1().size_full().flex().flex_col().items_center().justify_center().gap_3().bg(color(colors.background))
                 .child(div().text_size(px(18.0)).child("Your work stays here"))
                 .child(div().text_color(color(colors.muted)).child("Create a terminal tab or restore hidden work. Hiding a tab keeps its processes running."))
@@ -3111,7 +3344,9 @@ impl CompiApp {
 
     fn render_workspace_scrollbar(&self, horizontal: bool, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
-        let layout = self.layout.as_ref().unwrap();
+        let layout = self
+            .visible_layout()
+            .expect("scrollbars render only with a visible layout");
         let offset = self.workspace_scroll.offset();
         let (viewport, canvas, scroll) = if horizontal {
             (
@@ -3174,7 +3409,93 @@ impl CompiApp {
             .into_any_element()
     }
 
+    fn render_pane_actions_menu(&self, cx: &Context<Self>) -> AnyElement {
+        let colors = self.colors();
+        let rows = self
+            .overlay_choices(cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let selected = index == self.overlay_index;
+                div()
+                    .id(("pane-action-choice", index))
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .bg(color(if selected {
+                        colors.surface_hover
+                    } else {
+                        colors.surface
+                    }))
+                    .text_color(color(if choice.reason.is_some() {
+                        colors.muted
+                    } else {
+                        colors.foreground
+                    }))
+                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.overlay_index = index;
+                        this.activate_overlay(window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(choice.title)
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(color(colors.muted))
+                                    .child(choice.detail),
+                            ),
+                    )
+                    .when_some(choice.reason, |row, reason| {
+                        row.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(color(colors.muted))
+                                .child(reason),
+                        )
+                    })
+            });
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.dismiss_overlay();
+                    window.focus(&this.focus_handle);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(CHROME_HEIGHT + 4.0))
+                    .right(px(WINDOW_CONTROLS_WIDTH + 4.0))
+                    .w(px(260.0))
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color(colors.border))
+                    .bg(color(colors.surface))
+                    .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
     fn render_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        if matches!(self.overlay, Some(Overlay::PaneActions)) {
+            return self.render_pane_actions_menu(cx);
+        }
         let colors = self.colors();
         let choices = self.overlay_choices(cx);
         let title = match &self.overlay {
@@ -3400,7 +3721,7 @@ impl CompiApp {
 
 impl CompiApp {
     fn scroll_workspace_to(&mut self, position: Point<Pixels>, horizontal: bool) {
-        let Some(layout) = &self.layout else {
+        let Some(layout) = self.visible_layout() else {
             return;
         };
         let old = self.workspace_scroll.offset();
@@ -3546,13 +3867,20 @@ impl CompiApp {
                 && event.position.x < viewport.width
                 && event.position.y < viewport.height;
             if inside {
+                let header = header_metrics(f32::from(viewport.width));
+                let tab_region_right = f32::from(viewport.width)
+                    - WINDOW_CONTROLS_WIDTH
+                    - HEADER_BUTTON_SLOT_WIDTH
+                    - header.pane_actions_width;
                 if f32::from(event.position.y) <= CHROME_HEIGHT
+                    && f32::from(event.position.x) >= TITLEBAR_BRAND_WIDTH
+                    && f32::from(event.position.x) < tab_region_right
                     && let Some(session_id) = self.state.selected_session.clone()
                 {
                     let x = f32::from(event.position.x)
                         - TITLEBAR_BRAND_WIDTH
                         - f32::from(self.tab_scroll_handle.offset().x);
-                    let visible_index = (x / TAB_WIDTH).floor().max(0.0) as usize;
+                    let visible_index = (x / header.tab_width).floor().max(0.0) as usize;
                     let session = self.workspace.as_ref().and_then(|workspace| {
                         workspace
                             .sessions
@@ -3740,6 +4068,8 @@ impl CompiApp {
             other.surface_views.extend(views);
             other.workspace = Some(workspace.clone());
             other.state.restore_tab(&workspace, &tab_id);
+            other.pane_zoom.clear(&tab_id);
+            other.zoom_layout = None;
             if let Some(focus) = &focus {
                 other.state.focus_pane(&workspace, focus);
             }
@@ -3773,6 +4103,8 @@ impl CompiApp {
                 let _ = target.update(cx, |_, window, _| window.remove_window());
             }
         } else {
+            self.pane_zoom.clear(&tab_id);
+            self.zoom_layout = None;
             self.state.hide_tab(&workspace, &tab_id);
             self.sync_visible_views();
             self.save_state();
@@ -4099,6 +4431,15 @@ impl CompiApp {
     }
 }
 
+fn layout_contains_pane(tree: &LayoutNode, pane: &PaneId) -> bool {
+    match tree {
+        LayoutNode::Pane { pane_id, .. } => pane_id == pane,
+        LayoutNode::Split { first, second, .. } => {
+            layout_contains_pane(first, pane) || layout_contains_pane(second, pane)
+        }
+    }
+}
+
 fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
     match tree {
         LayoutNode::Pane { surface_id, .. } => surface_id == surface,
@@ -4110,7 +4451,12 @@ fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{concise_path_title, concise_tab_title};
+    use super::{
+        COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
+        PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
+        WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, header_metrics,
+    };
+    use compi_protocol::{PaneId, TabId};
 
     #[test]
     fn terminal_tab_titles_keep_identity_without_exposing_full_paths() {
@@ -4121,5 +4467,67 @@ mod tests {
             concise_tab_title("user@host: ~/compi"),
             "user@host: ~/compi"
         );
+    }
+
+    #[test]
+    fn pane_zoom_tracks_tabs_and_directional_focus_independently() {
+        let tab_a = TabId::from("tab-a");
+        let tab_b = TabId::from("tab-b");
+        let pane_a = PaneId::from("pane-a");
+        let pane_b = PaneId::from("pane-b");
+        let pane_c = PaneId::from("pane-c");
+        let mut zoom = PaneZoomState::default();
+
+        assert!(zoom.toggle(tab_a.clone(), pane_a));
+        assert!(zoom.toggle(tab_b.clone(), pane_b.clone()));
+        zoom.retarget(&tab_a, pane_c.clone());
+
+        assert_eq!(zoom.pane(&tab_a), Some(&pane_c));
+        assert_eq!(zoom.pane(&tab_b), Some(&pane_b));
+    }
+
+    #[test]
+    fn split_and_authoritative_invalidation_clear_zoom_safely() {
+        let tab_a = TabId::from("tab-a");
+        let tab_b = TabId::from("tab-b");
+        let pane_a = PaneId::from("pane-a");
+        let pane_b = PaneId::from("pane-b");
+        let mut zoom = PaneZoomState::default();
+        zoom.toggle(tab_a.clone(), pane_a);
+        zoom.toggle(tab_b.clone(), pane_b.clone());
+
+        assert!(zoom.clear(&tab_a));
+        assert!(zoom.pane(&tab_a).is_none());
+        assert_eq!(zoom.pane(&tab_b), Some(&pane_b));
+
+        zoom.retain_valid(|tab, pane| tab != &tab_b || pane != &pane_b);
+        assert!(zoom.pane(&tab_b).is_none());
+    }
+
+    #[test]
+    fn narrow_header_collapses_before_active_tab_becomes_a_sliver() {
+        let wide_threshold = TITLEBAR_BRAND_WIDTH
+            + WINDOW_CONTROLS_WIDTH
+            + HEADER_BUTTON_SLOT_WIDTH
+            + PANE_ACTIONS_FULL_WIDTH
+            + TAB_WIDTH;
+        assert_eq!(
+            header_metrics(wide_threshold).pane_actions,
+            PaneActionsMode::Full
+        );
+        assert_eq!(
+            header_metrics(wide_threshold - 1.0).pane_actions,
+            PaneActionsMode::Compact
+        );
+
+        let minimum = header_metrics(420.0);
+        assert_eq!(minimum.pane_actions, PaneActionsMode::Compact);
+        assert!(minimum.tab_width >= COMPACT_TAB_WIDTH);
+        let occupied = TITLEBAR_BRAND_WIDTH
+            + WINDOW_CONTROLS_WIDTH
+            + HEADER_BUTTON_SLOT_WIDTH
+            + PANE_ACTIONS_COMPACT_WIDTH
+            + minimum.tab_width;
+        assert!(occupied <= 420.0);
     }
 }

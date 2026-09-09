@@ -74,6 +74,10 @@ const DEFAULT_COLS: i16 = 100;
 const DEFAULT_ROWS: i16 = 30;
 const CHROME_HEIGHT: f32 = 40.0;
 const TAB_WIDTH: f32 = 176.0;
+const COMPACT_TAB_WIDTH: f32 = 120.0;
+const HEADER_BUTTON_SLOT_WIDTH: f32 = 40.0;
+const PANE_ACTIONS_FULL_WIDTH: f32 = 104.0;
+const PANE_ACTIONS_COMPACT_WIDTH: f32 = 40.0;
 #[cfg(windows)]
 const WINDOW_CONTROLS_WIDTH: f32 = 138.0;
 #[cfg(target_os = "macos")]
@@ -422,6 +426,83 @@ impl UiEvent {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneActionsMode {
+    Full,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeaderMetrics {
+    pane_actions: PaneActionsMode,
+    pane_actions_width: f32,
+    tab_width: f32,
+}
+
+fn header_metrics(window_width: f32) -> HeaderMetrics {
+    let full_fixed = TITLEBAR_BRAND_WIDTH
+        + WINDOW_CONTROLS_WIDTH
+        + HEADER_BUTTON_SLOT_WIDTH
+        + PANE_ACTIONS_FULL_WIDTH;
+    let pane_actions = if window_width - full_fixed >= TAB_WIDTH {
+        PaneActionsMode::Full
+    } else {
+        PaneActionsMode::Compact
+    };
+    let pane_actions_width = match pane_actions {
+        PaneActionsMode::Full => PANE_ACTIONS_FULL_WIDTH,
+        PaneActionsMode::Compact => PANE_ACTIONS_COMPACT_WIDTH,
+    };
+    let available = window_width
+        - TITLEBAR_BRAND_WIDTH
+        - WINDOW_CONTROLS_WIDTH
+        - HEADER_BUTTON_SLOT_WIDTH
+        - pane_actions_width;
+    HeaderMetrics {
+        pane_actions,
+        pane_actions_width,
+        tab_width: available.clamp(COMPACT_TAB_WIDTH, TAB_WIDTH),
+    }
+}
+
+#[derive(Default)]
+struct PaneZoomState {
+    panes: HashMap<TabId, PaneId>,
+}
+
+impl PaneZoomState {
+    fn pane(&self, tab: &TabId) -> Option<&PaneId> {
+        self.panes.get(tab)
+    }
+
+    fn toggle(&mut self, tab: TabId, pane: PaneId) -> bool {
+        if self.panes.remove(&tab).is_some() {
+            false
+        } else {
+            self.panes.insert(tab, pane);
+            true
+        }
+    }
+
+    fn retarget(&mut self, tab: &TabId, pane: PaneId) {
+        if let Some(target) = self.panes.get_mut(tab) {
+            *target = pane;
+        }
+    }
+
+    fn clear(&mut self, tab: &TabId) -> bool {
+        self.panes.remove(tab).is_some()
+    }
+
+    fn clear_all(&mut self) {
+        self.panes.clear();
+    }
+
+    fn retain_valid(&mut self, mut valid: impl FnMut(&TabId, &PaneId) -> bool) {
+        self.panes.retain(|tab, pane| valid(tab, pane));
+    }
+}
+
 struct CompiApp {
     started_at: Instant,
     instance: Option<String>,
@@ -462,11 +543,13 @@ struct CompiApp {
     overlay_index: usize,
     overlay_scroll: ScrollHandle,
     overlay_revision: Option<u64>,
+    pane_zoom: PaneZoomState,
     layout: Option<WorkspaceLayout>,
     divider_drag: Option<DividerDrag>,
     preview_layout: Option<LayoutNode>,
     last_resize: Instant,
     loading_surfaces: bool,
+    zoom_layout: Option<WorkspaceLayout>,
     mutation_pending: bool,
     global_error: Option<String>,
     font_settings: FontSettings,
@@ -807,11 +890,43 @@ impl CompiApp {
     }
 }
 
+struct HeaderTooltip {
+    title: String,
+    reason: Option<String>,
+    colors: &'static ThemeColors,
+}
+
+impl Render for HeaderTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(color(self.colors.border))
+            .bg(color(self.colors.surface))
+            .text_size(px(11.0))
+            .text_color(color(self.colors.foreground))
+            .child(self.title.clone())
+            .when_some(self.reason.clone(), |tooltip, reason| {
+                tooltip.child(div().text_color(color(self.colors.muted)).child(reason))
+            })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ChromeIcon {
     Mark,
     Sidebar,
     Add,
+    SplitRight,
+    SplitDown,
+    PaneZoom,
+    PaneRestore,
+    PaneActions,
     Minimize,
     Maximize,
     Close,
@@ -846,6 +961,72 @@ fn chrome_icon(icon: ChromeIcon, tint: Hsla) -> impl IntoElement {
                     path.line_to(point(x(13.0), y(8.0)));
                     path.move_to(point(x(8.0), y(3.0)));
                     path.line_to(point(x(8.0), y(13.0)));
+                }
+                ChromeIcon::SplitRight => {
+                    path.move_to(point(x(2.5), y(3.0)));
+                    path.line_to(point(x(13.5), y(3.0)));
+                    path.line_to(point(x(13.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(3.0)));
+                    path.move_to(point(x(7.0), y(3.0)));
+                    path.line_to(point(x(7.0), y(13.0)));
+                    path.move_to(point(x(9.0), y(8.0)));
+                    path.line_to(point(x(12.0), y(8.0)));
+                    path.move_to(point(x(10.5), y(6.5)));
+                    path.line_to(point(x(10.5), y(9.5)));
+                }
+                ChromeIcon::SplitDown => {
+                    path.move_to(point(x(2.5), y(3.0)));
+                    path.line_to(point(x(13.5), y(3.0)));
+                    path.line_to(point(x(13.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(3.0)));
+                    path.move_to(point(x(2.5), y(7.0)));
+                    path.line_to(point(x(13.5), y(7.0)));
+                    path.move_to(point(x(6.5), y(10.0)));
+                    path.line_to(point(x(9.5), y(10.0)));
+                    path.move_to(point(x(8.0), y(8.5)));
+                    path.line_to(point(x(8.0), y(11.5)));
+                }
+                ChromeIcon::PaneZoom => {
+                    path.move_to(point(x(2.5), y(6.0)));
+                    path.line_to(point(x(2.5), y(2.5)));
+                    path.line_to(point(x(6.0), y(2.5)));
+                    path.move_to(point(x(10.0), y(2.5)));
+                    path.line_to(point(x(13.5), y(2.5)));
+                    path.line_to(point(x(13.5), y(6.0)));
+                    path.move_to(point(x(13.5), y(10.0)));
+                    path.line_to(point(x(13.5), y(13.5)));
+                    path.line_to(point(x(10.0), y(13.5)));
+                    path.move_to(point(x(6.0), y(13.5)));
+                    path.line_to(point(x(2.5), y(13.5)));
+                    path.line_to(point(x(2.5), y(10.0)));
+                }
+                ChromeIcon::PaneRestore => {
+                    path.move_to(point(x(2.5), y(6.0)));
+                    path.line_to(point(x(6.0), y(6.0)));
+                    path.line_to(point(x(6.0), y(2.5)));
+                    path.move_to(point(x(10.0), y(2.5)));
+                    path.line_to(point(x(10.0), y(6.0)));
+                    path.line_to(point(x(13.5), y(6.0)));
+                    path.move_to(point(x(13.5), y(10.0)));
+                    path.line_to(point(x(10.0), y(10.0)));
+                    path.line_to(point(x(10.0), y(13.5)));
+                    path.move_to(point(x(6.0), y(13.5)));
+                    path.line_to(point(x(6.0), y(10.0)));
+                    path.line_to(point(x(2.5), y(10.0)));
+                }
+                ChromeIcon::PaneActions => {
+                    path.move_to(point(x(2.5), y(3.0)));
+                    path.line_to(point(x(11.5), y(3.0)));
+                    path.line_to(point(x(11.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(13.0)));
+                    path.line_to(point(x(2.5), y(3.0)));
+                    path.move_to(point(x(7.0), y(3.0)));
+                    path.line_to(point(x(7.0), y(13.0)));
+                    path.move_to(point(x(11.5), y(6.0)));
+                    path.line_to(point(x(14.0), y(8.0)));
+                    path.line_to(point(x(11.5), y(10.0)));
                 }
                 ChromeIcon::Minimize => {
                     path.move_to(point(x(3.0), y(11.0)));
