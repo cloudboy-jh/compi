@@ -1,23 +1,47 @@
-//! Read-only TOML schema version 1. Tables: `font`, `appearance`, `layout`,
+//! Writable TOML schema version 1. Tables: `font`, `appearance`, `layout`,
 //! `keybindings`, `shell`, `environment`, `profiles.<name>`, `limits`, `clipboard`.
 //! `default_profile` selects a named profile over the base shell/environment.
 //! Missing settings retain defaults; invalid independent settings are diagnosed.
-//! CLI overrides are invocation-local; this module never creates or rewrites files.
+//! GUI writes preserve comments and unrelated keys through an atomic replacement.
 
+#[cfg(unix)]
+use std::fs::File;
 use std::{
     collections::HashMap,
     ffi::OsString,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use compi_protocol::LaunchContext;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::ThemePreset;
+use crate::theme::{BackgroundEffect, ThemePreset};
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
 pub const MIN_SIDEBAR_WIDTH: f32 = 200.0;
 pub const MAX_SIDEBAR_WIDTH: f32 = 600.0;
+pub const DEFAULT_TERMINAL_OPACITY: f32 = 1.0;
+pub const MIN_TERMINAL_OPACITY: f32 = 0.1;
+pub const MAX_TERMINAL_OPACITY: f32 = 1.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppearanceSettings {
+    pub theme: ThemePreset,
+    pub terminal_opacity: f32,
+    pub background_effect: BackgroundEffect,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreset::default(),
+            terminal_opacity: DEFAULT_TERMINAL_OPACITY,
+            background_effect: BackgroundEffect::default(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueSource {
@@ -33,6 +57,8 @@ pub struct ConfigProvenance {
     pub font_size: ValueSource,
     pub line_height: ValueSource,
     pub theme: ValueSource,
+    pub terminal_opacity: ValueSource,
+    pub background_effect: ValueSource,
     pub sidebar_width: ValueSource,
 }
 
@@ -82,8 +108,8 @@ pub struct LoadedConfig {
     pub font: FontSettings,
     /// Pre-CLI defaults used for durable presentation and tear-off inheritance.
     pub configured_font: FontSettings,
-    pub theme: ThemePreset,
-    pub configured_theme: ThemePreset,
+    pub appearance: AppearanceSettings,
+    pub configured_appearance: AppearanceSettings,
     pub sidebar_width: f32,
     pub configured_sidebar_width: f32,
     pub keybindings: HashMap<String, String>,
@@ -101,8 +127,8 @@ impl Default for LoadedConfig {
         Self {
             font: FontSettings::default(),
             configured_font: FontSettings::default(),
-            theme: ThemePreset::default(),
-            configured_theme: ThemePreset::default(),
+            appearance: AppearanceSettings::default(),
+            configured_appearance: AppearanceSettings::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             configured_sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             keybindings: HashMap::new(),
@@ -125,7 +151,7 @@ impl LoadedConfig {
     ) {
         if let Some(value) = theme {
             if let Some(theme) = ThemePreset::parse(value) {
-                self.theme = theme;
+                self.appearance.theme = theme;
                 self.provenance.theme = ValueSource::CommandLine;
             } else {
                 invalid(self, "--theme", "dark-glass or warm-carbon", "CLI");
@@ -146,6 +172,22 @@ impl LoadedConfig {
         }
     }
 
+    /// Persist user-facing global appearance without rewriting comments,
+    /// launch configuration, or unknown future keys.
+    pub fn save_global_appearance(&mut self, appearance: AppearanceSettings) -> Result<(), String> {
+        save_appearance(&self.path, appearance)?;
+        self.configured_appearance = appearance;
+        self.provenance.terminal_opacity = ValueSource::Configuration;
+        self.provenance.background_effect = ValueSource::Configuration;
+        if self.provenance.theme != ValueSource::CommandLine {
+            self.appearance.theme = appearance.theme;
+            self.provenance.theme = ValueSource::Configuration;
+        }
+        self.appearance.terminal_opacity = appearance.terminal_opacity;
+        self.appearance.background_effect = appearance.background_effect;
+        Ok(())
+    }
+
     /// Check a same-user forwarded configuration before it reaches native UI or
     /// launch code. A stored launch error is a valid, inspectable configuration;
     /// callers must separately require `launch.as_ref()` when creating work.
@@ -161,8 +203,10 @@ impl LoadedConfig {
         }
         if !valid_sidebar_width(f64::from(self.sidebar_width))
             || !valid_sidebar_width(f64::from(self.configured_sidebar_width))
+            || !valid_terminal_opacity(f64::from(self.appearance.terminal_opacity))
+            || !valid_terminal_opacity(f64::from(self.configured_appearance.terminal_opacity))
         {
-            return Err("Forwarded configuration has invalid sidebar width".to_owned());
+            return Err("Forwarded configuration has invalid presentation values".to_owned());
         }
         for (id, shortcut) in &self.keybindings {
             if crate::commands::by_id(id).is_none() {
@@ -212,6 +256,14 @@ fn valid_sidebar_width(width: f64) -> bool {
     )
 }
 
+fn valid_terminal_opacity(opacity: f64) -> bool {
+    valid_number(
+        opacity,
+        f64::from(MIN_TERMINAL_OPACITY),
+        f64::from(MAX_TERMINAL_OPACITY),
+    )
+}
+
 fn table<'a>(
     document: &'a toml::Table,
     key: &str,
@@ -228,19 +280,45 @@ fn table<'a>(
 }
 
 fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
-    if let Some(appearance) = table(document, "appearance", loaded)
-        && let Some(value) = appearance.get("theme")
-    {
-        if let Some(theme) = value.as_str().and_then(ThemePreset::parse) {
-            loaded.theme = theme;
-            loaded.provenance.theme = ValueSource::Configuration;
-        } else {
-            invalid(
-                loaded,
-                "appearance.theme",
-                "dark-glass or warm-carbon",
-                "configuration",
-            );
+    if let Some(appearance) = table(document, "appearance", loaded) {
+        if let Some(value) = appearance.get("theme") {
+            if let Some(theme) = value.as_str().and_then(ThemePreset::parse) {
+                loaded.appearance.theme = theme;
+                loaded.provenance.theme = ValueSource::Configuration;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.theme",
+                    "dark-glass or warm-carbon",
+                    "configuration",
+                );
+            }
+        }
+        if let Some(value) = appearance.get("terminal_opacity") {
+            if let Some(opacity) = number(value).filter(|value| valid_terminal_opacity(*value)) {
+                loaded.appearance.terminal_opacity = opacity as f32;
+                loaded.provenance.terminal_opacity = ValueSource::Configuration;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.terminal_opacity",
+                    "a finite number from 0.1 through 1.0",
+                    "configuration",
+                );
+            }
+        }
+        if let Some(value) = appearance.get("background_effect") {
+            if let Some(effect) = value.as_str().and_then(BackgroundEffect::parse) {
+                loaded.appearance.background_effect = effect;
+                loaded.provenance.background_effect = ValueSource::Configuration;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.background_effect",
+                    "clear or blurred",
+                    "configuration",
+                );
+            }
         }
     }
     if let Some(layout) = table(document, "layout", loaded) {
@@ -493,10 +571,124 @@ pub fn load(path: Option<&Path>, overrides: FontOverrides) -> LoadedConfig {
         Err(error) => loaded.diagnostics.push(error),
     }
     loaded.configured_font = loaded.font.clone();
-    loaded.configured_theme = loaded.theme;
+    loaded.configured_appearance = loaded.appearance;
     loaded.configured_sidebar_width = loaded.sidebar_width;
     apply_overrides(overrides, &mut loaded);
     loaded
+}
+
+fn save_appearance(path: &Path, appearance: AppearanceSettings) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("No configuration path could be resolved; see Diagnostics".to_owned());
+    }
+    if !valid_terminal_opacity(f64::from(appearance.terminal_opacity)) {
+        return Err("Terminal opacity must be between 0.1 and 1.0".to_owned());
+    }
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "version = 1\n".to_owned(),
+        Err(error) => return Err(format!("Cannot read {}: {error}", path.display())),
+    };
+    let mut document = source.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        format!(
+            "Cannot update malformed TOML in {}: {error}",
+            path.display()
+        )
+    })?;
+    if document
+        .get("version")
+        .and_then(toml_edit::Item::as_integer)
+        != Some(1)
+    {
+        return Err(format!(
+            "Cannot update {}: expected version = 1",
+            path.display()
+        ));
+    }
+    match document.get("appearance") {
+        Some(item) if !item.is_table() => {
+            return Err(format!(
+                "Cannot update {}: appearance must be a table",
+                path.display()
+            ));
+        }
+        None => {
+            document["appearance"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        Some(_) => {}
+    }
+    let table = document["appearance"]
+        .as_table_mut()
+        .expect("appearance was created or validated as a table");
+    table["theme"] = toml_edit::value(appearance.theme.id());
+    let opacity = (f64::from(appearance.terminal_opacity) * 1_000_000.0).round() / 1_000_000.0;
+    table["terminal_opacity"] = toml_edit::value(opacity);
+    table["background_effect"] = toml_edit::value(appearance.background_effect.id());
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(document.to_string().as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        replace_config_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| format!("Cannot save {}: {error}", path.display()))
+}
+
+#[cfg(unix)]
+fn replace_config_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)?;
+    if let Some(parent) = destination.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_config_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        },
+        core::PCWSTR,
+    };
+    let temporary: Vec<u16> = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )?;
+    }
+    Ok(())
 }
 
 // Environment lookup is injected so all native path rules can be exercised on any host.
@@ -699,7 +891,7 @@ mod tests {
         };
         apply_source(source, &mut loaded);
         loaded.configured_font = loaded.font.clone();
-        loaded.configured_theme = loaded.theme;
+        loaded.configured_appearance = loaded.appearance;
         loaded.configured_sidebar_width = loaded.sidebar_width;
         apply_overrides(overrides, &mut loaded);
         loaded
@@ -712,7 +904,7 @@ mod tests {
             FontOverrides::default(),
         );
         assert!(loaded.launch.is_err());
-        assert_eq!(loaded.theme, ThemePreset::WarmCarbon);
+        assert_eq!(loaded.appearance.theme, ThemePreset::WarmCarbon);
         assert_eq!(loaded.font.size, 18.0);
         assert!(loaded.validate_launch().is_ok());
         let missing_profile = parse(
@@ -757,15 +949,15 @@ mod tests {
             },
         );
         loaded.apply_presentation_overrides(Some("dark-glass"), Some(400.0));
-        assert_eq!(loaded.theme, ThemePreset::DarkGlass);
-        assert_eq!(loaded.configured_theme, ThemePreset::WarmCarbon);
+        assert_eq!(loaded.appearance.theme, ThemePreset::DarkGlass);
+        assert_eq!(loaded.configured_appearance.theme, ThemePreset::WarmCarbon);
         assert_eq!(loaded.sidebar_width, 400.0);
         assert_eq!(loaded.configured_sidebar_width, 320.0);
         assert_eq!(loaded.font.size, 24.0);
         assert_eq!(loaded.configured_font.size, 16.0);
         assert_eq!(loaded.provenance.font_size, ValueSource::CommandLine);
         loaded.apply_presentation_overrides(Some("unknown"), Some(f32::NAN));
-        assert_eq!(loaded.theme, ThemePreset::DarkGlass);
+        assert_eq!(loaded.appearance.theme, ThemePreset::DarkGlass);
         assert_eq!(loaded.sidebar_width, 400.0);
     }
 
@@ -838,6 +1030,49 @@ mod tests {
             assert_eq!(loaded.diagnostics.len(), 1);
             assert!(loaded.diagnostics[0].contains("example.toml"));
         }
+    }
+
+    #[test]
+    fn global_appearance_save_is_atomic_preserves_toml_and_respects_cli_precedence() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "# retained comment\nversion = 1\n[appearance]\ntheme = 'warm-carbon'\n[future]\nanswer = 42\n",
+        )
+        .unwrap();
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        loaded.apply_presentation_overrides(Some("dark-glass"), None);
+        loaded
+            .save_global_appearance(AppearanceSettings {
+                theme: ThemePreset::WarmCarbon,
+                terminal_opacity: 0.72,
+                background_effect: BackgroundEffect::Clear,
+            })
+            .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# retained comment"));
+        assert!(saved.contains("[future]"));
+        assert!(saved.contains("answer = 42"));
+        assert!(saved.lines().any(|line| line == "terminal_opacity = 0.72"));
+        assert!(saved.contains("background_effect = \"clear\""));
+        assert_eq!(loaded.appearance.theme, ThemePreset::DarkGlass);
+        assert_eq!(loaded.configured_appearance.theme, ThemePreset::WarmCarbon);
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.appearance.terminal_opacity, 0.72);
+        assert_eq!(
+            reloaded.appearance.background_effect,
+            BackgroundEffect::Clear
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

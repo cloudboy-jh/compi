@@ -63,7 +63,7 @@ The baseline includes:
 - Command palette and configurable platform-aware shortcuts.
 - Client-local window and presentation state.
 - Server-owned terminal and workspace state.
-- Shell/profile, working-directory, environment, font, and whole-app theme-preset configuration, with an accessible live-preview theme picker.
+- Shell/profile, working-directory, environment, font, and scoped whole-app appearance configuration through TOML, Quick Appearance, and Settings.
 - Discoverable detached work and explicit process-level termination.
 - Headless diagnostics and cross-platform tests.
 
@@ -136,15 +136,16 @@ Commands are named **Split right** and **Split down**, not ambiguous vertical/ho
 | Grid, terminal modes, cursor, history, graphics                      | Server          | In memory across client disconnects; disk terminal checkpoints are not baseline    |
 | Visible terminal replicas and history cache                          | Client          | Disposable; rebuilt from server state                                              |
 | Window size, position where supported, maximized state               | Client          | Per-client state file                                                              |
-| Sidebar width, font zoom, selected theme preset                       | Client          | Per-client state file                                                              |
+| Sidebar width and font zoom                                         | Client          | Per-client state file                                                              |
+| Explicit per-window theme, terminal opacity, and background effect  | Client          | Per-client state file                                                              |
 | Sidebar visibility                                                   | Client          | Current window only; every new/relaunched window starts closed                     |
-| Selected session/tab and pane focus                                 | Client          | Per-client state where meaningful                                                  |
+| Selected session/tab and pane focus                                  | Client          | Per-client state where meaningful                                                  |
 | Scroll position and selection                                        | Client          | Keyed by server identity/generation, surface ID, and process lifetime; restored only when anchors remain valid |
-| User configuration                                                   | User-owned file | Never rewritten to remember transient UI changes                                   |
+| User configuration and global appearance defaults                    | User-owned file | Read on launch; only explicit **Global defaults** appearance changes rewrite its `appearance` table atomically |
 
 The split tree belongs to the workspace. Top terminal tabs are the primary navigation; the optional workspace sidebar supplements them. Sidebar presentation and window placement belong to the client.
 
-Client state wins over configuration for remembered window geometry, layout presentation, and the selected theme preset. Configuration seeds the first run. Resetting client state restores configured defaults. An explicit CLI override applies to that invocation without silently rewriting either file. Theme previews are transient; only an explicitly accepted selection is remembered.
+Global TOML supplies appearance defaults. Explicit per-window appearance overrides in private client JSON win over those defaults; an explicit CLI theme override wins for that invocation and is never made durable implicitly. Remembered window geometry, sidebar width, font zoom, and navigation remain client-owned. Direct **Global defaults** changes preserve comments and unrelated TOML keys; **This window** changes never rewrite TOML. Resetting window appearance clears its overrides and resumes inheritance.
 
 ### Durable client identity and navigation
 
@@ -153,14 +154,14 @@ A durable `ClientId` identifies one remembered window-state slot, scoped to the 
 - An instance has one primary slot. Ordinary launch claims it when free; otherwise it claims the oldest unclaimed auxiliary slot, ordered by creation ordinal, or creates an auxiliary slot from configured defaults. **New window** uses the same allocation rule. Opening one window does not automatically reopen every remembered window.
 - Allocation is serialized through a local registry lock. Each active window holds an OS-released exclusive slot lock until exit; a crash releases ownership without deleting remembered state. No two windows write the same state file. Lock or storage errors are surfaced, not bypassed with an unlocked writer.
 - Slots use versioned atomic state files. Closing or crashing a window preserves its slot; relaunch reuses the deterministic available slot. Malformed state is quarantined with a visible recovery message and configured defaults, without changing server work. A failed save leaves the live presentation usable but explicitly unsaved.
-- Each slot remembers window geometry, sidebar width, font zoom, accepted theme, selected session, last selected tab per session, last focused pane per tab, and a set of hidden tab IDs. Sidebar visibility is transient and starts closed for every new or relaunched window, regardless of prior state or initial-layout configuration. Navigation and hidden membership are scoped by stable server/workspace identity, not server generation, so they survive a server restart.
+- Each slot remembers window geometry, sidebar width, font zoom, explicit appearance overrides, selected session, last selected tab per session, last focused pane per tab, and a set of hidden tab IDs. Sidebar visibility is transient and starts closed for every new or relaunched window, regardless of prior state or initial-layout configuration. Navigation and hidden membership are scoped by stable server/workspace identity, not server generation, so they survive a server restart.
 - Hidden membership is an exclusion set: tabs not hidden in this slot are listed in server order, including newly created tabs from another window. Hiding releases this window's attachments to that tab, changes no server structure, and does not hide it in other windows. Window close releases attachments but does not add tabs to the hidden set.
 - Restoring a hidden tab removes its exclusion, selects its session/tab, and attempts attachment. The workspace list and palette include hidden tabs with their actual lifecycle state. A control conflict leaves an explicit unavailable pane with retry/open-other-work actions; it never steals control, unhides other tabs, or creates a replacement shell.
 - On an authoritative workspace snapshot, prune references to removed objects. Keep hidden membership and navigation during temporary disconnection. If the selected tab is removed or hidden, choose the next non-hidden tab in server order, then the previous one; if none exists, show an empty session view with create/restore actions. If a session disappears, choose its next surviving session, then the previous one; at initial restore with no valid remembered position, choose the first session and first non-hidden tab.
 - Remembered focus is restored only within the selected tab; an invalid pane reference falls back to its first leaf in tree traversal order. Merely switching sessions/tabs restores their last valid navigation and releases screen/control attachments from the previous visible tab.
 - If every tab is hidden, or the workspace is intentionally emptied, show the empty view. Never seed another shell to repair navigation. First-run seeding occurs exactly once for a new, uninitialized workspace and is committed durably with its initialized marker.
-- CLI overrides affect only that invocation. State saving excludes override-derived values unless a later explicit user action changes the setting. Reset client layout clears the slot's remembered geometry, presentation, navigation, and hidden set to configured defaults; it neither deletes work nor changes another slot. Only accepted theme choices are durable, never previews.
-- Tab tear-off uses the same exclusive slot allocation, but explicitly initializes the destination view to the transferred tab rather than restoring unrelated navigation. Other existing tabs start hidden in that destination slot and remain discoverable. Seed theme, zoom, and sidebar width from the source without durably recording its transient previews or CLI overrides; the new sidebar starts closed. An existing destination keeps its own presentation, including current sidebar visibility. Successful transfer hides the tab in the source slot and reveals/selects it in the destination slot; unrelated windows and the tab's session membership are unchanged.
+- CLI overrides affect only that invocation and are excluded from state saving. Reset client layout clears the slot's remembered geometry, presentation overrides, navigation, and hidden set to configured defaults; it neither deletes work nor changes another slot. Resetting window appearance clears only its appearance overrides.
+- Tab tear-off uses the same exclusive slot allocation, but explicitly initializes the destination view to the transferred tab rather than restoring unrelated navigation. Other existing tabs start hidden in that destination slot and remain discoverable. Seed the resolved theme, opacity, background effect, zoom, and sidebar width from the source without durably recording CLI overrides; the new sidebar starts closed. An existing destination keeps its own presentation, including current sidebar visibility. Successful transfer hides the tab in the source slot and reveals/selects it in the destination slot; unrelated windows and the tab's session membership are unchanged.
 
 Client-state write failures cannot change server mutation results. Per-slot serialization and revision-based server conflicts are separate mechanisms: independent windows may remember different views of the same workspace while the server remains its sole structural writer.
 
@@ -523,8 +524,8 @@ Baseline commands cover:
 - Show/hide workspace sidebar and reset sidebar width.
 - Copy, paste, select all where appropriate, and clear scrollback.
 - Font zoom in/out/reset.
-- Change theme through the live-preview theme picker.
-- Open configuration, reset client layout, reconnect, and open diagnostics.
+- Open Quick Appearance and full Settings for theme, terminal opacity, clear/blurred background, scope, interface, keyboard, and daemon controls.
+- Open the TOML configuration file, reset client layout, reconnect the current window, safely restart the daemon, and open diagnostics.
 - Quit client, explicitly separate from stopping the server.
 
 The palette supports query filtering, keyboard navigation, Enter to execute, Escape to dismiss, visible shortcuts, and explanations for disabled actions. It is not a terminal mode.
@@ -532,7 +533,7 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 ### Keyboard and input policy
 
 - macOS follows native Command/Option application and editing conventions while preserving terminal Control input.
-- Windows follows native Windows Terminal tab, pane, and text-editing conventions. Ctrl-T/W create and hide tabs; Ctrl-Tab / Ctrl-Shift-Tab cycle them; Ctrl-Shift-T restores a hidden tab. Alt-Shift-Plus/Minus split right/down; Alt-Arrow moves pane focus; Alt-Shift-Arrow resizes; Ctrl-Shift-W removes the focused pane with confirmation. Ctrl-V and Shift-Insert paste; Ctrl-Backspace deletes the previous word; Ctrl-Insert and selection-aware Ctrl-C copy. With no selection, Ctrl-C forwards terminal interrupt. Ctrl-Shift-C/V remain explicit compatibility bindings.
+- Windows follows native Windows Terminal tab, pane, text-editing, and zoom conventions. Ctrl-T/W create and hide tabs; Ctrl-Tab / Ctrl-Shift-Tab cycle them; Ctrl-Shift-T restores a hidden tab. Ctrl-Plus/Minus change font zoom, Ctrl-0 resets it, and Ctrl-Comma opens Settings. Alt-Shift-Plus/Minus split right/down; Alt-Arrow moves pane focus; Alt-Shift-Arrow resizes; Ctrl-Shift-W removes the focused pane with confirmation. Ctrl-V and Shift-Insert paste; Ctrl-Backspace deletes the previous word; Ctrl-Insert and selection-aware Ctrl-C copy. With no selection, Ctrl-C forwards terminal interrupt. Ctrl-Shift-C/V remain explicit compatibility bindings.
 - Platform-specific behavior is centralized, configurable where it represents an application command, and tested rather than scattered across widget handlers.
 - Palette/menu focus owns its navigation keys while open; terminal focus resumes on dismissal.
 - Bracketed paste is honored. Pasting never implicitly executes an extra newline beyond the clipboard contents.
@@ -540,29 +541,27 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 
 ## Configuration and appearance
 
-Use a versioned TOML configuration with documented defaults. A configuration file, an **Open configuration** command, and a small in-app theme picker are baseline; a full graphical preferences application is not required.
+Use a versioned TOML configuration with documented defaults. An **Open configuration file** command, compact **Quick Appearance**, and a comprehensive in-window **Settings** panel are baseline. Settings edits appearance directly; launch profiles, fonts, limits, and advanced keybindings remain inspectable/editable through TOML.
 
-Configuration includes profiles, shell/login behavior, starting directory, environment overrides, fonts, font size, line height, the initial whole-app theme preset and sidebar width, keybinding overrides, scrollback/graphics limits, and terminal-initiated clipboard policy. Sidebar visibility is never a persisted or configured startup state.
+Configuration includes profiles, shell/login behavior, starting directory, environment overrides, fonts, font size, line height, the global theme preset, terminal opacity, background effect, sidebar width, keybinding overrides, scrollback/graphics limits, and terminal-initiated clipboard policy. Sidebar visibility is never a persisted or configured startup state.
 
 Invalid configuration must produce a useful diagnostic and a safe recovery path. Apply independent valid settings where possible; never silently launch an unintended executable. Configuration and client state are separate files.
 
-The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindings`, `shell`, `environment`, `profiles.NAME`, `limits`, and `clipboard` tables, with `default_profile` selecting a named profile. `appearance.theme` accepts `dark-glass` or `warm-carbon`; `layout.sidebar_width` is 200–600 logical pixels. `limits.scrollback_lines` is 0–100,000 alongside the fixed 1 MiB history byte bound; `limits.graphics_bytes` is 0–4 MiB so inline graphics remain within the current transport envelope. `clipboard.policy` controls OSC 52 (`allow`/`deny`), not explicit user Copy/Paste. Explicit program argv is literal; use `login` deliberately for shell profiles.
+The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindings`, `shell`, `environment`, `profiles.NAME`, `limits`, and `clipboard` tables, with `default_profile` selecting a named profile. `appearance.theme` accepts `dark-glass` or `warm-carbon`; `appearance.terminal_opacity` accepts 0.1–1.0; `appearance.background_effect` accepts `clear` or `blurred`. `layout.sidebar_width` is 200–600 logical pixels. `limits.scrollback_lines` is 0–100,000 alongside the fixed 1 MiB history byte bound; `limits.graphics_bytes` is 0–4 MiB so inline graphics remain within the current transport envelope. `clipboard.policy` controls OSC 52 (`allow`/`deny`), not explicit user Copy/Paste. Explicit program argv is literal; use `login` deliberately for shell profiles.
 
 ### Theme presets and access
 
-- The first-run theme is **Dark Glass**: neutral-dark application surfaces, restrained glass in titlebar/tab chrome and the optional sidebar, and an acid-green accent. Its identity remains visible with the sidebar closed. Warm Carbon is an optional whole-app preset, not a mandatory application color system.
-- Each preset supplies a coordinated application and terminal appearance: chrome, opaque terminal canvas, text, borders, focus, selection, cursor, and ANSI colors. Selecting a preset changes the whole appearance together.
+- The first-run theme is **Dark Glass**: neutral-dark application surfaces, restrained glass in titlebar/tab chrome and the optional sidebar, and an acid-green accent. Its identity remains visible with the sidebar closed. Warm Carbon is an optional whole-app preset.
+- Each preset supplies coordinated chrome, terminal palette, text, borders, focus, selection, cursor, and ANSI colors. Terminal opacity and clear/blurred background effect are orthogonal appearance settings.
 - The baseline offers whole-app presets, not independent terminal-palette or accent overrides, custom theme files, or automatic system light/dark switching.
-- A visible **Appearance…** menu action and the command palette's **Change theme** command open the same picker. Choosing a theme never requires editing TOML.
-- The picker lists named presets and previews them live in the current window. Keyboard navigation changes the preview; Enter or an explicit apply action accepts it; Escape or dismissal cancels it and restores the previously selected preset.
-- Only an accepted theme selection is saved to client state. Previewing or selecting a theme does not rewrite user configuration, restart a process, detach a surface, or reset terminal contents.
-- The picker owns keyboard input while open and returns focus on dismissal. Labels, focus, and selection remain readable and keyboard-accessible.
-- The appearance UI is limited to theme selection. Fonts and other existing configuration remain available through TOML and the already-defined font-zoom commands; separate graphical font, transparency, palette, accent, and reset controls are not baseline.
+- **Quick Appearance** exposes the two preset previews, background effect, and a continuous 10–100% opacity slider. **Settings** exposes the same controls plus explicit **Global defaults** and **This window** scopes, interface state, terminal summary, keyboard/configuration access, and daemon controls.
+- Appearance changes apply immediately and persist to the selected scope. Global changes atomically update only the TOML appearance table and clear the current window's overrides; window changes write only explicitly changed appearance fields to private JSON. **Use global defaults** clears those fields.
+- Appearance changes never restart a process, detach a surface, reset terminal contents, or make a CLI override durable. Explicit terminal cell backgrounds and foreground text remain opaque.
 
 ### Glass and readability
 
-- Glass is limited to the sidebar and window chrome. Terminal canvases remain opaque in every baseline preset; there is no terminal-transparency control.
-- Use native background materials where supported. Provide a readable opaque equivalent when materials are unavailable or the platform requests reduced transparency. Identical blur across platforms is not required.
+- Terminal canvases are opaque by default and support user-selected 10–100% opacity with clear or blurred native background appearance. Explicit application cell backgrounds remain opaque.
+- Use native background materials where supported. Fall back to a readable opaque presentation when materials are unavailable or the platform requests reduced transparency. Identical blur across platforms is not required.
 - Presets must provide readable text and controls, adequate contrast, and visible focus in both material and opaque presentations. Color alone must not be the only indication of focus or lifecycle state.
 
 ### Brand
@@ -810,7 +809,7 @@ Done when the protocol and headless tools manipulate the hierarchy, survive clie
 - Add draggable dividers, pane focus, primary top terminal tabs, and a secondary resizable workspace sidebar hidden until explicitly summoned. Remember sidebar width, not visibility across relaunch; every new window starts closed.
 - Add tab tear-off into new native windows and transfer into existing windows, with explicit attachment handoff, failure recovery, and durable per-window membership.
 - Add the command registry, palette, and platform keybindings.
-- Establish theme tokens and Dark Glass styling while building the window shell, then complete whole-app presets and the keyboard-accessible live-preview picker. Limit glass to titlebar/tab chrome and sidebar, keep terminal canvases opaque, and provide readable opaque/reduced-transparency fallbacks.
+- Establish theme tokens and Dark Glass styling while building the window shell, then complete whole-app presets, Quick Appearance, and Settings. Support scoped 10–100% terminal opacity with clear/blurred native backgrounds, keep explicit terminal cell backgrounds opaque, and provide readable opaque/reduced-transparency fallbacks.
 - Persist client-local state independently of server structure.
 - Implement non-destructive detach and clearly named termination/removal actions.
 

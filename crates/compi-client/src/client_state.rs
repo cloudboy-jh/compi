@@ -4,8 +4,11 @@
 //! its last snapshot and state; connection generations are deliberately not keys.
 use crate::{
     Result,
-    config::{DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH},
-    theme::ThemePreset,
+    config::{
+        DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MAX_TERMINAL_OPACITY, MIN_SIDEBAR_WIDTH,
+        MIN_TERMINAL_OPACITY,
+    },
+    theme::{BackgroundEffect, ThemePreset},
 };
 use compi_protocol::{
     LayoutNode, PaneId, ServerId, SessionId, TabId, TerminalIdentity, WorkspaceSession,
@@ -19,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CLIENT_STATE_VERSION: u32 = 1;
+pub const CLIENT_STATE_VERSION: u32 = 2;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_REFERENCES: usize = 16_384;
 const MAX_ID_BYTES: usize = 256;
@@ -69,13 +72,36 @@ pub struct WindowGeometry {
     pub maximized: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowAppearanceOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<ThemePreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_effect: Option<BackgroundEffect>,
+}
+
+impl WindowAppearanceOverrides {
+    fn valid(&self) -> bool {
+        self.terminal_opacity.is_none_or(|opacity| {
+            opacity.is_finite() && (MIN_TERMINAL_OPACITY..=MAX_TERMINAL_OPACITY).contains(&opacity)
+        })
+    }
+
+    fn is_default(value: &Self) -> bool {
+        *value == Self::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientState {
     pub version: u32,
     pub geometry: Option<WindowGeometry>,
     pub sidebar_width: f32,
     pub font_zoom: f32,
-    pub theme: ThemePreset,
+    #[serde(default, skip_serializing_if = "WindowAppearanceOverrides::is_default")]
+    pub appearance: WindowAppearanceOverrides,
     pub selected_session: Option<SessionId>,
     pub selected_tabs: HashMap<String, TabId>,
     pub focused_panes: HashMap<String, PaneId>,
@@ -91,7 +117,7 @@ impl Default for ClientState {
             geometry: None,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             font_zoom: 1.0,
-            theme: ThemePreset::DarkGlass,
+            appearance: WindowAppearanceOverrides::default(),
             selected_session: None,
             selected_tabs: HashMap::new(),
             focused_panes: HashMap::new(),
@@ -368,7 +394,7 @@ impl ClientState {
             return false;
         };
         self.geometry = None;
-        self.theme = source.theme;
+        self.appearance = source.appearance;
         self.font_zoom = source.font_zoom;
         self.sidebar_width = source.sidebar_width;
         self.selected_session = None;
@@ -392,8 +418,16 @@ impl ClientState {
     /// Bound file-derived presentation without consulting or creating server work.
     /// Returns whether recoverable values were sanitized; structural excess is an error.
     fn sanitize(&mut self, defaults: &ClientState) -> Result<bool> {
-        if self.version != CLIENT_STATE_VERSION {
-            return Err(format!("unsupported client-state version {}", self.version).into());
+        let mut changed = false;
+        match self.version {
+            CLIENT_STATE_VERSION => {}
+            // Version 1 stored a materialized theme copied from configuration.
+            // Ignore that legacy field so global TOML remains authoritative.
+            1 => {
+                self.version = CLIENT_STATE_VERSION;
+                changed = true;
+            }
+            version => return Err(format!("unsupported client-state version {version}").into()),
         }
         if self.selected_tabs.len() > MAX_REFERENCES
             || self.focused_panes.len() > MAX_REFERENCES
@@ -402,7 +436,10 @@ impl ClientState {
         {
             return Err("client state exceeds its navigation reference limit".into());
         }
-        let mut changed = false;
+        if !self.appearance.valid() {
+            self.appearance.terminal_opacity = None;
+            changed = true;
+        }
         changed |= sanitize_number(
             &mut self.sidebar_width,
             defaults.sidebar_width,
@@ -725,7 +762,7 @@ impl StateSlot {
             || !geometry_valid
             || !(MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&state.sidebar_width)
             || !(0.5..=3.0).contains(&state.font_zoom)
-            || state.selected_tabs.len() > MAX_REFERENCES
+            || !state.appearance.valid()
             || state.focused_panes.len() > MAX_REFERENCES
             || state.hidden_tabs.len() > MAX_REFERENCES
             || state.viewports.len() > MAX_REFERENCES
@@ -900,6 +937,30 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn legacy_materialized_theme_migrates_to_inherited_global_appearance() {
+        let mut state: ClientState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "geometry": null,
+            "sidebar_width": 280.0,
+            "font_zoom": 1.0,
+            "theme": "warm-carbon",
+            "selected_session": null,
+            "selected_tabs": {},
+            "focused_panes": {},
+            "hidden_tabs": [],
+            "viewports": {}
+        }))
+        .unwrap();
+        assert!(state.sanitize(&ClientState::default()).unwrap());
+        assert_eq!(state.version, CLIENT_STATE_VERSION);
+        assert_eq!(state.appearance, WindowAppearanceOverrides::default());
+
+        state.appearance.terminal_opacity = Some(f32::NAN);
+        assert!(state.sanitize(&ClientState::default()).unwrap());
+        assert_eq!(state.appearance.terminal_opacity, None);
     }
 
     #[test]

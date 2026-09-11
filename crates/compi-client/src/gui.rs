@@ -1,13 +1,15 @@
-use crate::client_state::{ClientState, SavedViewport, StateSlot, WindowGeometry};
+use crate::client_state::{
+    ClientState, SavedViewport, StateSlot, WindowAppearanceOverrides, WindowGeometry,
+};
 use crate::commands::{self, Command};
-use crate::config::{FontSettings, LoadedConfig};
+use crate::config::{AppearanceSettings, FontSettings, LoadedConfig};
 use crate::input::{
     self, Key, KeypadKey, Modifiers, encode_keystroke, encode_mouse, utf16_byte_index,
 };
 use crate::layout::{self, LayoutMetrics, WorkspaceLayout};
 use crate::probe;
 use crate::selection::{GridPoint, Selection, line_selection, selected_text, word_selection};
-use crate::theme::{ThemeColors, ThemePreset};
+use crate::theme::{BackgroundEffect, ThemeColors, ThemePreset};
 use compi_protocol::{
     LayoutNode, MutationId, MutationRequest, PaneId, SessionId, SplitAxis, TabId,
     WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
@@ -316,6 +318,7 @@ impl SurfaceView {
 enum UiEvent {
     StateSaveFinished,
     SurfacesLoaded(Result<compi_protocol::WorkspaceSnapshot, String>),
+    DaemonRestarted(Result<compi_protocol::WorkspaceSnapshot, String>),
     MutationFinished {
         result: Result<(WorkspaceSnapshot, compi_protocol::MutationReceipt), String>,
         select_created: bool,
@@ -503,6 +506,13 @@ impl PaneZoomState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsScope {
+    #[default]
+    Global,
+    Window,
+}
+
 struct CompiApp {
     started_at: Instant,
     instance: Option<String>,
@@ -537,7 +547,12 @@ struct CompiApp {
     defaults: ClientState,
     config: LoadedConfig,
     theme: ThemePreset,
+    terminal_opacity: f32,
+    opacity_drag_origin: Option<f32>,
+    background_effect: BackgroundEffect,
     glass: bool,
+    settings_scope: SettingsScope,
+    daemon_restarting: bool,
     zoom: f32,
     overlay: Option<Overlay>,
     overlay_index: usize,
@@ -701,6 +716,22 @@ impl CompiApp {
         }
     }
 
+    fn activates_hyperlink(
+        button: MouseButton,
+        modifiers: gpui::Modifiers,
+        has_link: bool,
+    ) -> bool {
+        button == MouseButton::Left && modifiers.secondary() && has_link
+    }
+
+    fn terminal_owns_mouse(
+        mouse_mode: MouseMode,
+        modifiers: gpui::Modifiers,
+        activates_hyperlink: bool,
+    ) -> bool {
+        mouse_mode != MouseMode::None && !modifiers.shift && !activates_hyperlink
+    }
+
     fn on_terminal_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -719,7 +750,14 @@ impl CompiApp {
             .snapshot()
             .map(|snapshot| snapshot.modes.mouse)
             .unwrap_or_default();
-        if mouse_mode != MouseMode::None && !event.modifiers.shift {
+        let activates_hyperlink = Self::activates_hyperlink(
+            event.button,
+            event.modifiers,
+            visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
+                .and_then(|point| hyperlink_at(tab.mirror.snapshot(), point))
+                .is_some_and(is_allowed_hyperlink),
+        );
+        if Self::terminal_owns_mouse(mouse_mode, event.modifiers, activates_hyperlink) {
             if let Some(data) = encode_mouse(
                 Some(terminal_button(event.button)),
                 false,
@@ -811,7 +849,14 @@ impl CompiApp {
             .snapshot()
             .map(|snapshot| snapshot.modes.mouse)
             .unwrap_or_default();
-        if mouse_mode != MouseMode::None && !event.modifiers.shift {
+        let activates_hyperlink = Self::activates_hyperlink(
+            event.button,
+            event.modifiers,
+            visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
+                .and_then(|point| hyperlink_at(tab.mirror.snapshot(), point))
+                .is_some_and(is_allowed_hyperlink),
+        );
+        if Self::terminal_owns_mouse(mouse_mode, event.modifiers, activates_hyperlink) {
             if let Some(data) = encode_mouse(
                 Some(terminal_button(event.button)),
                 true,
@@ -831,15 +876,18 @@ impl CompiApp {
                 && selection.anchor == selection.head
             {
                 tab.selection = None;
-                (event.button == MouseButton::Left && event.modifiers.control)
+                (event.button == MouseButton::Left && event.modifiers.secondary())
                     .then(|| hyperlink_at(tab.mirror.snapshot(), selection.head))
                     .flatten()
                     .filter(|uri| is_allowed_hyperlink(uri))
+                    .map(str::to_owned)
             } else {
                 None
             };
-            if let Some(uri) = clicked_link {
-                cx.open_url(uri);
+            if let Some(uri) = clicked_link
+                && let Err(error) = open_web_url(&uri)
+            {
+                self.global_error = Some(format!("Could not open link: {error}"));
             }
         }
         self.save_state();
@@ -1986,6 +2034,17 @@ fn terminal_button(button: MouseButton) -> input::MouseButton {
     }
 }
 
+fn open_web_url(uri: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let result = std::process::Command::new("rundll32.exe")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(uri)
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(uri).spawn();
+    result.map(|_| ()).map_err(|error| error.to_string())
+}
+
 fn decode_kitty_image(image: &KittyImage) -> Result<Arc<RenderImage>, String> {
     const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
     let decoded_size = (image.width as usize)
@@ -2346,6 +2405,31 @@ mod tests {
 
         assert!(!drag_threshold_crossed(origin, point(px(12.0), px(12.0))));
         assert!(drag_threshold_crossed(origin, point(px(14.0), px(10.0))));
+    }
+
+    #[test]
+    fn hyperlink_activation_uses_platform_modifier_and_overrides_tui_mouse_reporting() {
+        let modifiers = gpui::Modifiers::secondary_key();
+        assert!(CompiApp::activates_hyperlink(
+            MouseButton::Left,
+            modifiers,
+            true
+        ));
+        assert!(!CompiApp::terminal_owns_mouse(
+            MouseMode::AnyMotion,
+            modifiers,
+            true
+        ));
+        assert!(CompiApp::terminal_owns_mouse(
+            MouseMode::AnyMotion,
+            modifiers,
+            false
+        ));
+        assert!(!CompiApp::activates_hyperlink(
+            MouseButton::Right,
+            modifiers,
+            true
+        ));
     }
 
     #[test]

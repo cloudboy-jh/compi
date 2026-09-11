@@ -6,6 +6,8 @@ pub(super) struct TransferSeed {
     tab_id: TabId,
     source_state: ClientState,
     display_theme: ThemePreset,
+    display_terminal_opacity: f32,
+    display_background_effect: BackgroundEffect,
     display_sidebar_width: f32,
     display_zoom: f32,
 }
@@ -21,9 +23,8 @@ pub(super) enum TextPurpose {
 pub(super) enum Overlay {
     Palette,
     PaneActions,
-    Theme {
-        accepted: ThemePreset,
-    },
+    QuickAppearance,
+    Settings,
     Text {
         purpose: TextPurpose,
         title: &'static str,
@@ -34,6 +35,10 @@ pub(super) enum Overlay {
         revision: u64,
     },
     Workspaces,
+    ConfirmDaemonRestart {
+        details: String,
+        revision: u64,
+    },
     Tabs {
         hidden_only: bool,
     },
@@ -58,7 +63,6 @@ pub(super) fn open_compi_window(
     let snapshot =
         probe::connect_or_start(instance.as_deref()).and_then(|mut client| client.workspace())?;
     let defaults = ClientState {
-        theme: config.configured_theme,
         sidebar_width: config.configured_sidebar_width,
         ..ClientState::default()
     };
@@ -173,10 +177,31 @@ impl CompiApp {
             .map(|seed| seed.display_theme)
             .unwrap_or_else(|| {
                 if config.provenance.theme == crate::config::ValueSource::CommandLine {
-                    config.theme
+                    config.appearance.theme
                 } else {
-                    state.theme
+                    state
+                        .appearance
+                        .theme
+                        .unwrap_or(config.configured_appearance.theme)
                 }
+            });
+        let terminal_opacity = transferred_seed
+            .as_ref()
+            .map(|seed| seed.display_terminal_opacity)
+            .unwrap_or_else(|| {
+                state
+                    .appearance
+                    .terminal_opacity
+                    .unwrap_or(config.configured_appearance.terminal_opacity)
+            });
+        let background_effect = transferred_seed
+            .as_ref()
+            .map(|seed| seed.display_background_effect)
+            .unwrap_or_else(|| {
+                state
+                    .appearance
+                    .background_effect
+                    .unwrap_or(config.configured_appearance.background_effect)
             });
         let sidebar_width = transferred_seed
             .as_ref()
@@ -227,8 +252,13 @@ impl CompiApp {
             state_save_error: Arc::new(Mutex::new(None)),
             state,
             defaults,
-            glass: native_material_available(),
+            glass: terminal_opacity < 1.0,
             theme,
+            terminal_opacity,
+            opacity_drag_origin: None,
+            background_effect,
+            settings_scope: SettingsScope::Global,
+            daemon_restarting: false,
             zoom,
             overlay: None,
             overlay_index: 0,
@@ -263,6 +293,7 @@ impl CompiApp {
         if !slot_diagnostics.is_empty() {
             this.global_warning = Some(slot_diagnostics.join("\n"));
         }
+        this.apply_window_background(window);
         this.rebuild_layout(window, true);
         if this.transferred_seed.is_none() {
             this.sync_visible_views();
@@ -360,6 +391,90 @@ impl CompiApp {
 
     fn colors(&self) -> &'static ThemeColors {
         self.theme.colors()
+    }
+
+    fn apply_window_background(&mut self, window: &mut Window) {
+        let translucent = self.terminal_opacity < 1.0 && native_material_available();
+        let appearance = if !translucent {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            match self.background_effect {
+                BackgroundEffect::Clear => WindowBackgroundAppearance::Transparent,
+                BackgroundEffect::Blurred => WindowBackgroundAppearance::Blurred,
+            }
+        };
+        self.glass = translucent;
+        window.set_background_appearance(appearance);
+    }
+
+    fn preview_terminal_opacity(&mut self, opacity: f32, window: &mut Window) {
+        self.opacity_drag_origin
+            .get_or_insert(self.terminal_opacity);
+        self.terminal_opacity = opacity.clamp(
+            crate::config::MIN_TERMINAL_OPACITY,
+            crate::config::MAX_TERMINAL_OPACITY,
+        );
+        self.apply_window_background(window);
+    }
+
+    fn appearance(&self) -> AppearanceSettings {
+        AppearanceSettings {
+            theme: self.theme,
+            terminal_opacity: self.terminal_opacity,
+            background_effect: self.background_effect,
+        }
+    }
+
+    fn scoped_appearance(&self) -> AppearanceSettings {
+        match self.settings_scope {
+            SettingsScope::Global => self.config.configured_appearance,
+            SettingsScope::Window => self.appearance(),
+        }
+    }
+
+    fn apply_scoped_appearance(&mut self, appearance: AppearanceSettings, window: &mut Window) {
+        let previous = self.appearance();
+        match self.settings_scope {
+            SettingsScope::Global => {
+                if let Err(error) = self.config.save_global_appearance(appearance) {
+                    self.global_error = Some(error);
+                    return;
+                }
+                self.state.appearance = WindowAppearanceOverrides::default();
+                self.set_theme(self.config.appearance.theme);
+                self.terminal_opacity = appearance.terminal_opacity;
+                self.background_effect = appearance.background_effect;
+            }
+            SettingsScope::Window => {
+                if self.config.provenance.theme != crate::config::ValueSource::CommandLine
+                    && appearance.theme != previous.theme
+                {
+                    self.state.appearance.theme = Some(appearance.theme);
+                }
+                if appearance.terminal_opacity != previous.terminal_opacity {
+                    self.state.appearance.terminal_opacity = Some(appearance.terminal_opacity);
+                }
+                if appearance.background_effect != previous.background_effect {
+                    self.state.appearance.background_effect = Some(appearance.background_effect);
+                }
+                if self.config.provenance.theme != crate::config::ValueSource::CommandLine {
+                    self.set_theme(appearance.theme);
+                }
+                self.terminal_opacity = appearance.terminal_opacity;
+                self.background_effect = appearance.background_effect;
+            }
+        }
+        self.apply_window_background(window);
+        self.save_state();
+    }
+
+    fn reset_window_appearance(&mut self, window: &mut Window) {
+        self.state.appearance = WindowAppearanceOverrides::default();
+        self.set_theme(self.config.appearance.theme);
+        self.terminal_opacity = self.config.configured_appearance.terminal_opacity;
+        self.background_effect = self.config.configured_appearance.background_effect;
+        self.apply_window_background(window);
+        self.save_state();
     }
 
     fn selected_tab(&self) -> Option<&WorkspaceTab> {
@@ -484,6 +599,49 @@ impl CompiApp {
                 .map_err(|error| error.to_string());
             sender.send(UiEvent::SurfacesLoaded(result));
         });
+    }
+
+    fn begin_daemon_restart(&mut self) {
+        if self.daemon_restarting {
+            return;
+        }
+        self.daemon_restarting = true;
+        self.loading_surfaces = true;
+        self.global_error = None;
+        for view in &mut self.surface_views {
+            view.stop.store(true, Ordering::Release);
+            if let Some(transport) = view.transport.take() {
+                transport.close();
+            }
+        }
+        let sender = self.event_tx.clone();
+        let instance = self.instance.clone();
+        thread::spawn(move || {
+            let result = probe::restart_daemon(instance.as_deref())
+                .and_then(|mut client| client.workspace())
+                .map_err(|error| error.to_string());
+            sender.send(UiEvent::DaemonRestarted(result));
+        });
+    }
+
+    fn live_surface_details(&self) -> (usize, String) {
+        let surfaces = self
+            .workspace
+            .iter()
+            .flat_map(|workspace| &workspace.surfaces)
+            .filter(|surface| {
+                matches!(
+                    surface.status,
+                    SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
+                )
+            })
+            .collect::<Vec<_>>();
+        let details = surfaces
+            .iter()
+            .map(|surface| format!("• {}", surface.id))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (surfaces.len(), details)
     }
 
     fn mutate(&mut self, operation: WorkspaceMutation, select_created: bool) {
@@ -721,6 +879,21 @@ impl CompiApp {
         match event {
             UiEvent::StateSaveFinished => {}
             UiEvent::SurfacesLoaded(Ok(workspace)) => self.accept_workspace(workspace),
+            UiEvent::DaemonRestarted(result) => {
+                self.daemon_restarting = false;
+                self.loading_surfaces = false;
+                match result {
+                    Ok(workspace) => {
+                        self.global_error = None;
+                        self.accept_workspace(workspace);
+                    }
+                    Err(error) => {
+                        self.global_error = Some(format!(
+                            "Daemon restart failed: {error}. Use Reconnect to retry."
+                        ));
+                    }
+                }
+            }
             UiEvent::SurfacesLoaded(Err(error)) => {
                 self.loading_surfaces = false;
                 self.global_error = Some(format!("Disconnected: {error}. Use Reconnect to retry."));
@@ -871,6 +1044,15 @@ impl CompiApp {
                     }
                     if let Some((saved, identity)) = restore {
                         view.restore_viewport(saved, &identity);
+                    }
+                    if view
+                        .mirror
+                        .snapshot()
+                        .is_some_and(|snapshot| snapshot.modes.alternate_screen)
+                    {
+                        view.scroll_offset = 0;
+                        view.selection = None;
+                        view.selecting = false;
                     }
                     view.scroll_offset = view.scroll_offset.min(view.max_scroll_offset());
                     view.state = match status {
@@ -1196,17 +1378,17 @@ impl CompiApp {
             self.zoom_layout = None;
             return false;
         };
-        let viewport = window.viewport_size();
+        let (viewport_width, viewport_height) = logical_viewport_dimensions(window);
         let metrics = self.metrics();
         let available = layout::Size {
-            width: (f32::from(viewport.width)
+            width: (viewport_width
                 - if self.sidebar_open {
                     self.sidebar_width + 5.0
                 } else {
                     0.0
                 })
             .max(1.0),
-            height: (f32::from(viewport.height) - CHROME_HEIGHT).max(1.0),
+            height: (viewport_height - CHROME_HEIGHT).max(1.0),
         };
         let mut layout = {
             let tab = self
@@ -1223,8 +1405,8 @@ impl CompiApp {
             layout = layout::compute_layout(
                 tree,
                 layout::Size {
-                    width: (available.width - 10.0).max(1.0),
-                    height: (available.height - 10.0).max(1.0),
+                    width: (available.width - 8.0).max(1.0),
+                    height: (available.height - 8.0).max(1.0),
                 },
                 metrics,
             );
@@ -1288,7 +1470,7 @@ impl CompiApp {
         let view = self.focused_view()?;
         let pane = self.visible_layout()?.pane(&view.pane_id)?;
         let offset = self.workspace_scroll.offset();
-        let x = f32::from(position.x)
+        let x = pointer_coordinate(position.x, self.typography_scale)
             - if self.sidebar_open {
                 self.sidebar_width + 5.0
             } else {
@@ -1296,7 +1478,10 @@ impl CompiApp {
             }
             - pane.canvas.x
             - f32::from(offset.x);
-        let y = f32::from(position.y) - CHROME_HEIGHT - pane.canvas.y - f32::from(offset.y);
+        let y = pointer_coordinate(position.y, self.typography_scale)
+            - CHROME_HEIGHT
+            - pane.canvas.y
+            - f32::from(offset.y);
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -1304,6 +1489,33 @@ impl CompiApp {
         let row = (y / self.typography.cell_height).floor() as usize;
         (col < view.cols as usize && row < view.rows as usize).then_some(GridPoint { row, col })
     }
+}
+
+fn logical_viewport_dimensions(window: &Window) -> (f32, f32) {
+    let viewport = window.viewport_size();
+    (f32::from(viewport.width), f32::from(viewport.height))
+}
+
+fn pointer_coordinate(value: Pixels, scale_factor: f32) -> f32 {
+    #[cfg(windows)]
+    {
+        // GPUI 0.2.2 reports Windows pointer positions in device pixels while
+        // viewport dimensions and element layout already use logical pixels.
+        f32::from(value) / scale_factor.max(1.0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = scale_factor;
+        f32::from(value)
+    }
+}
+
+fn opacity_at_slider_position(position: Pixels, bounds: Bounds<Pixels>) -> f32 {
+    let progress = (f32::from(position - bounds.origin.x) / f32::from(bounds.size.width).max(1.0))
+        .clamp(0.0, 1.0);
+    let opacity = crate::config::MIN_TERMINAL_OPACITY
+        + progress * (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY);
+    (opacity * 100.0).round() / 100.0
 }
 
 fn collect_leaves(tree: &LayoutNode, output: &mut Vec<(PaneId, SurfaceId)>) {
@@ -1357,6 +1569,18 @@ impl CompiApp {
                 .and_then(|layout| pane.and_then(|pane| layout.focus_neighbor(pane, direction)))
                 .is_some()
         };
+        let live_surface_count = workspace.map_or(0, |workspace| {
+            workspace
+                .surfaces
+                .iter()
+                .filter(|surface| {
+                    matches!(
+                        surface.status,
+                        SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
+                    )
+                })
+                .count()
+        });
         let visible: Vec<_> = session
             .map(|session| self.state.visible_tabs(session).collect())
             .unwrap_or_default();
@@ -1381,8 +1605,10 @@ impl CompiApp {
                 .is_some_and(|view| view.transport.is_some()),
             can_paste: true,
             surface_status: status,
+            live_surface_count,
             mutation_pending: self.mutation_pending,
             transfer_in_progress: self.transferred_seed.is_some(),
+            daemon_restarting: self.daemon_restarting,
             other_window_available: cx.windows().len() > 1,
             revision: self
                 .overlay_revision
@@ -1413,11 +1639,11 @@ impl CompiApp {
         self.overlay_revision = self.workspace.as_ref().map(|workspace| workspace.revision);
         self.overlay = Some(overlay);
         self.overlay_index = 0;
-        if matches!(self.overlay, Some(Overlay::Theme { .. })) {
-            self.overlay_index = ThemePreset::ALL
-                .iter()
-                .position(|preset| *preset == self.theme)
-                .unwrap_or(0);
+        if matches!(
+            self.overlay,
+            Some(Overlay::QuickAppearance | Overlay::Settings)
+        ) {
+            self.settings_scope = SettingsScope::Global;
         }
         self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
         self.ime_text = text.to_owned();
@@ -1427,9 +1653,7 @@ impl CompiApp {
     }
 
     fn dismiss_overlay(&mut self) {
-        if let Some(Overlay::Theme { accepted }) = self.overlay.take() {
-            self.set_theme(accepted);
-        }
+        self.overlay = None;
         self.ime_text.clear();
         self.ime_marked_range = None;
         self.ime_selected_range = 0..0;
@@ -1486,11 +1710,6 @@ impl CompiApp {
                     } else {
                         (self.overlay_index + 1) % count
                     };
-                    if matches!(self.overlay, Some(Overlay::Theme { .. })) {
-                        self.set_theme(
-                            ThemePreset::ALL[self.overlay_index % ThemePreset::ALL.len()],
-                        );
-                    }
                     self.overlay_scroll.scroll_to_item(self.overlay_index);
                 }
                 "backspace" | "delete"
@@ -1498,7 +1717,8 @@ impl CompiApp {
                         self.overlay,
                         Some(
                             Overlay::PaneActions
-                                | Overlay::Theme { .. }
+                                | Overlay::QuickAppearance
+                                | Overlay::Settings
                                 | Overlay::Confirm { .. }
                                 | Overlay::Diagnostics
                         )
@@ -1596,7 +1816,8 @@ impl CompiApp {
             self.overlay,
             Some(
                 Overlay::PaneActions
-                    | Overlay::Theme { .. }
+                    | Overlay::QuickAppearance
+                    | Overlay::Settings
                     | Overlay::Confirm { .. }
                     | Overlay::Diagnostics
             )
@@ -1952,12 +2173,10 @@ impl CompiApp {
                 self.refresh_typography(window);
                 self.save_state();
             }
-            Command::ChangeTheme => self.open_overlay(
-                Overlay::Theme {
-                    accepted: self.theme,
-                },
-                "",
-            ),
+            Command::OpenQuickAppearance => {
+                self.open_overlay(Overlay::QuickAppearance, "");
+            }
+            Command::OpenSettings => self.open_overlay(Overlay::Settings, ""),
             Command::OpenConfiguration => {
                 let path = self.config.path.clone();
                 if !path.as_os_str().is_empty() {
@@ -1977,9 +2196,23 @@ impl CompiApp {
                 }
                 self.sidebar_width = self.state.sidebar_width;
                 self.zoom = self.state.font_zoom;
-                self.set_theme(self.state.theme);
-                self.font_settings = self.config.configured_font.clone();
-                self.typography_scale = 0.0;
+                self.set_theme(
+                    self.state
+                        .appearance
+                        .theme
+                        .unwrap_or(self.config.configured_appearance.theme),
+                );
+                self.terminal_opacity = self
+                    .state
+                    .appearance
+                    .terminal_opacity
+                    .unwrap_or(self.config.configured_appearance.terminal_opacity);
+                self.background_effect = self
+                    .state
+                    .appearance
+                    .background_effect
+                    .unwrap_or(self.config.configured_appearance.background_effect);
+                self.apply_window_background(window);
                 if let Some(workspace) = &self.workspace {
                     self.state.reconcile(None, workspace);
                 }
@@ -2000,6 +2233,26 @@ impl CompiApp {
                 self.global_error = None;
                 self.sync_visible_views();
                 self.refresh_surfaces(false);
+            }
+            Command::RestartDaemon => {
+                let (count, surfaces) = self.live_surface_details();
+                if count == 0 {
+                    self.begin_daemon_restart();
+                } else {
+                    self.open_overlay(
+                        Overlay::ConfirmDaemonRestart {
+                            details: format!(
+                                "Restarting now ends {count} live surface{} and all processes inside them:\n\n{surfaces}",
+                                if count == 1 { "" } else { "s" }
+                            ),
+                            revision: self
+                                .workspace
+                                .as_ref()
+                                .map_or(0, |workspace| workspace.revision),
+                        },
+                        "",
+                    );
+                }
             }
             Command::OpenDiagnostics => self.open_overlay(Overlay::Diagnostics, ""),
             Command::Quit => cx.quit(),
@@ -2027,14 +2280,7 @@ impl CompiApp {
             return;
         };
         match overlay {
-            Overlay::Theme { .. } => {
-                self.state.theme = self.theme;
-                self.overlay = None;
-                self.overlay_revision = None;
-                self.ime_text.clear();
-                self.save_state();
-                self.report_focus(true);
-            }
+            Overlay::QuickAppearance | Overlay::Settings => self.dismiss_overlay(),
             Overlay::Text { purpose, .. } => {
                 let label = self.ime_text.trim().to_owned();
                 if label.is_empty() {
@@ -2071,6 +2317,21 @@ impl CompiApp {
                 self.dismiss_overlay();
                 self.mutate(operation, false);
             }
+            Overlay::ConfirmDaemonRestart { revision, .. } => {
+                if self
+                    .workspace
+                    .as_ref()
+                    .is_none_or(|workspace| workspace.revision != revision)
+                {
+                    self.global_error = Some(
+                        "Workspace changed while confirmation was open. Cancel and review the live surfaces before restarting the daemon."
+                            .into(),
+                    );
+                    return;
+                }
+                self.dismiss_overlay();
+                self.begin_daemon_restart();
+            }
             Overlay::Diagnostics => self.dismiss_overlay(),
             _ => {
                 let choices = self.overlay_choices(cx);
@@ -2095,11 +2356,6 @@ impl CompiApp {
                                 self.transfer_tab(tab, Some(handle), window, cx);
                             }
                         }
-                        ChoiceAction::Theme(theme) => {
-                            self.set_theme(theme);
-                            self.state.theme = theme;
-                            self.save_state();
-                        }
                     }
                 }
             }
@@ -2115,7 +2371,6 @@ enum ChoiceAction {
     Workspace(SessionId),
     Tab(TabId),
     Window(AnyWindowHandle),
-    Theme(ThemePreset),
 }
 #[derive(Clone)]
 struct Choice {
@@ -2274,21 +2529,7 @@ impl CompiApp {
                     });
                 }
             }
-            Some(Overlay::Theme { .. }) => {
-                for theme in ThemePreset::ALL {
-                    choices.push(Choice {
-                        title: theme.label().into(),
-                        detail: if theme == ThemePreset::DarkGlass {
-                            "Neutral dark chrome, acid-green focus, opaque terminal"
-                        } else {
-                            "Warm chrome and coordinated terminal colors"
-                        }
-                        .into(),
-                        reason: None,
-                        action: ChoiceAction::Theme(theme),
-                    });
-                }
-            }
+            Some(Overlay::QuickAppearance | Overlay::Settings) => {}
             Some(Overlay::Palette) => {
                 let context = self.command_context(cx);
                 for spec in commands::REGISTRY
@@ -2628,7 +2869,7 @@ impl CompiApp {
 
     fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
-        let window_width = f32::from(window.viewport_size().width);
+        let (window_width, _) = logical_viewport_dimensions(window);
         let metrics = header_metrics(window_width);
         let trailing_width =
             WINDOW_CONTROLS_WIDTH + HEADER_BUTTON_SLOT_WIDTH + metrics.pane_actions_width;
@@ -3060,7 +3301,7 @@ impl CompiApp {
                             .child(self.command_button(
                                 "appearance-sidebar",
                                 "Appearance…",
-                                Command::ChangeTheme,
+                                Command::OpenQuickAppearance,
                                 cx,
                             )),
                     ),
@@ -3093,7 +3334,7 @@ impl CompiApp {
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
         let Some(layout) = self.visible_layout() else {
-            return div().flex_1().size_full().flex().flex_col().items_center().justify_center().gap_3().bg(color(colors.background))
+            return div().flex_1().size_full().flex().flex_col().items_center().justify_center().gap_3().bg(color(colors.background).opacity(self.terminal_opacity))
                 .child(div().text_size(px(18.0)).child("Your work stays here"))
                 .child(div().text_color(color(colors.muted)).child("Create a terminal tab or restore hidden work. Hiding a tab keeps its processes running."))
                 .child(div().flex().gap_2()
@@ -3119,6 +3360,19 @@ impl CompiApp {
                     self.theme,
                     focused && self.overlay.is_none(),
                 )
+            });
+            let terminal_scroll = view.and_then(|view| {
+                let snapshot = view.mirror.snapshot()?;
+                if snapshot.modes.alternate_screen || snapshot.scrollback.is_empty() {
+                    return None;
+                }
+                let track = (geometry.rect.height - 4.0).max(1.0);
+                let visible = snapshot.cells.len().max(1) as f32;
+                let history = snapshot.scrollback.len() as f32;
+                let thumb = (track * visible / (visible + history)).max(18.0).min(track);
+                let progress =
+                    1.0 - view.scroll_offset.min(snapshot.scrollback.len()) as f32 / history;
+                Some(((track - thumb) * progress, thumb))
             });
             let surface = self
                 .workspace
@@ -3154,7 +3408,7 @@ impl CompiApp {
                 .top(px(geometry.rect.y))
                 .w(px(geometry.rect.width))
                 .h(px(geometry.rect.height))
-                .bg(color(colors.background))
+                .bg(color(colors.background).opacity(self.terminal_opacity))
                 .flex()
                 .flex_col()
                 .on_mouse_down(
@@ -3251,13 +3505,15 @@ impl CompiApp {
                                     .flex()
                                     .gap_1()
                                     .bg(color(colors.surface))
-                                    .child(self.pane_command_button(
-                                        ("retry-pane", index),
-                                        "Retry attachment",
-                                        Command::Reconnect,
-                                        &pane_id,
-                                        cx,
-                                    ))
+                                    .when(status == "Unavailable", |actions| {
+                                        actions.child(self.pane_command_button(
+                                            ("retry-pane", index),
+                                            "Retry attachment",
+                                            Command::Reconnect,
+                                            &pane_id,
+                                            cx,
+                                        ))
+                                    })
                                     .when(
                                         matches!(status, "Exited" | "Failed" | "Lost"),
                                         |actions| {
@@ -3273,6 +3529,18 @@ impl CompiApp {
                             )
                         }),
                 )
+                .when_some(terminal_scroll, |pane, (position, length)| {
+                    pane.child(
+                        div()
+                            .absolute()
+                            .right(px(2.0))
+                            .top(px(2.0 + position))
+                            .w(px(2.0))
+                            .h(px(length))
+                            .rounded_sm()
+                            .bg(color(colors.muted).opacity(0.32)),
+                    )
+                })
         });
         let dividers = layout.dividers.iter().enumerate().map(|(index, divider)| {
             div()
@@ -3316,7 +3584,6 @@ impl CompiApp {
             .h_full()
             .relative()
             .overflow_hidden()
-            .bg(color(colors.background))
             .child(
                 div()
                     .id("workspace-canvas-scroll")
@@ -3370,12 +3637,12 @@ impl CompiApp {
                 "workspace-vertical-scrollbar"
             })
             .absolute()
-            .bg(color(colors.surface))
+            .bg(color(colors.muted).opacity(0.04))
             .when(horizontal, |bar| {
-                bar.left_0().bottom_0().w(px(viewport)).h(px(10.0))
+                bar.left_0().bottom_0().w(px(viewport)).h(px(8.0))
             })
             .when(!horizontal, |bar| {
-                bar.top_0().right_0().h(px(viewport)).w(px(10.0))
+                bar.top_0().right_0().h(px(viewport)).w(px(8.0))
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -3390,20 +3657,20 @@ impl CompiApp {
                 div()
                     .absolute()
                     .rounded_sm()
-                    .bg(color(colors.muted))
+                    .bg(color(colors.muted).opacity(0.38))
                     .when(horizontal, |thumb| {
                         thumb
                             .left(px(position))
-                            .top(px(2.0))
+                            .top(px(3.0))
                             .w(px(length))
-                            .h(px(6.0))
+                            .h(px(2.0))
                     })
                     .when(!horizontal, |thumb| {
                         thumb
                             .top(px(position))
-                            .left(px(2.0))
+                            .left(px(3.0))
                             .h(px(length))
-                            .w(px(6.0))
+                            .w(px(2.0))
                     }),
             )
             .into_any_element()
@@ -3492,17 +3759,578 @@ impl CompiApp {
             .into_any_element()
     }
 
+    fn render_appearance_controls(&self, cx: &Context<Self>) -> AnyElement {
+        let colors = self.colors();
+        let mut appearance = self.scoped_appearance();
+        if self.opacity_drag_origin.is_some() {
+            appearance.terminal_opacity = self.terminal_opacity;
+        }
+        let theme_locked = self.settings_scope == SettingsScope::Window
+            && self.config.provenance.theme == crate::config::ValueSource::CommandLine;
+        let scopes = [
+            (SettingsScope::Global, "Global defaults"),
+            (SettingsScope::Window, "This window"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (scope, label))| {
+            let active = self.settings_scope == scope;
+            div()
+                .id(("settings-scope", index))
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .bg(color(if active {
+                    colors.surface_hover
+                } else {
+                    colors.background
+                }))
+                .border_1()
+                .border_color(color(if active { colors.accent } else { colors.border }))
+                .text_color(color(if active {
+                    colors.foreground
+                } else {
+                    colors.muted
+                }))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings_scope = scope;
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .child(label)
+        });
+        let themes = ThemePreset::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, theme)| {
+                let selected = appearance.theme == theme;
+                let palette = theme.colors();
+                let swatches = [
+                    palette.background,
+                    palette.surface,
+                    palette.accent,
+                    palette.foreground,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(swatch, value)| {
+                    div()
+                        .id(("theme-swatch", index * 4 + swatch))
+                        .flex_1()
+                        .h(px(8.0))
+                        .bg(color(value))
+                });
+                div()
+                    .id(("theme-card", index))
+                    .flex_1()
+                    .min_w_0()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color(if selected {
+                        colors.accent
+                    } else {
+                        colors.border
+                    }))
+                    .bg(color(if selected {
+                        colors.surface_hover
+                    } else {
+                        colors.background
+                    }))
+                    .when(!theme_locked, |card| {
+                        card.cursor_pointer()
+                            .hover(move |style| style.bg(color(colors.surface_hover)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let mut next = this.scoped_appearance();
+                                next.theme = theme;
+                                this.apply_scoped_appearance(next, window);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(theme.label())
+                            .child(if selected { "Selected" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(color(colors.muted))
+                            .child(theme.description()),
+                    )
+                    .child(
+                        div()
+                            .h(px(8.0))
+                            .rounded_sm()
+                            .overflow_hidden()
+                            .flex()
+                            .children(swatches),
+                    )
+            });
+        let effects = BackgroundEffect::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, effect)| {
+                let active = appearance.background_effect == effect;
+                div()
+                    .id(("background-effect", index))
+                    .flex_1()
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(color(if active {
+                        colors.surface_hover
+                    } else {
+                        colors.background
+                    }))
+                    .border_1()
+                    .border_color(color(if active { colors.accent } else { colors.border }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let mut next = this.scoped_appearance();
+                        next.background_effect = effect;
+                        this.apply_scoped_appearance(next, window);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .child(effect.label())
+            });
+        let opacity_progress = ((appearance.terminal_opacity
+            - crate::config::MIN_TERMINAL_OPACITY)
+            / (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY))
+            .clamp(0.0, 1.0);
+        let opacity_input = cx.entity();
+        let opacity_slider_input = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                window.on_mouse_event({
+                    let input = opacity_input.clone();
+                    move |event: &MouseDownEvent, _, window, cx| {
+                        if event.button != MouseButton::Left || !bounds.contains(&event.position) {
+                            return;
+                        }
+                        let opacity = opacity_at_slider_position(event.position.x, bounds);
+                        input.update(cx, |this, cx| {
+                            this.preview_terminal_opacity(opacity, window);
+                            cx.stop_propagation();
+                            cx.notify();
+                        });
+                    }
+                });
+                window.on_mouse_event({
+                    let input = opacity_input.clone();
+                    move |event: &MouseMoveEvent, _, window, cx| {
+                        if !event.dragging() {
+                            return;
+                        }
+                        let opacity = opacity_at_slider_position(event.position.x, bounds);
+                        input.update(cx, |this, cx| {
+                            if this.opacity_drag_origin.is_some() {
+                                this.preview_terminal_opacity(opacity, window);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child("Save appearance to")
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(color(colors.muted))
+                                    .child(match self.settings_scope {
+                                        SettingsScope::Global => {
+                                            "TOML defaults used by every window"
+                                        }
+                                        SettingsScope::Window => {
+                                            "Private JSON override for this window only"
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(div().flex().gap_1().children(scopes)),
+            )
+            .child(div().flex().gap_2().children(themes))
+            .when(theme_locked, |section| {
+                section.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(color(colors.muted))
+                        .child("Theme is fixed by the current --theme command-line override."),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child("Background")
+                    .child(div().w(px(220.0)).flex().gap_1().children(effects)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child("Terminal opacity")
+                            .child(format!("{:.0}%", appearance.terminal_opacity * 100.0)),
+                    )
+                    .child(
+                        div()
+                            .id("opacity-slider")
+                            .relative()
+                            .mx_2()
+                            .h(px(24.0))
+                            .cursor(gpui::CursorStyle::ResizeLeftRight)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top(px(10.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(color(colors.border)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(10.0))
+                                    .w(gpui::relative(opacity_progress))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(color(colors.accent)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(gpui::relative(opacity_progress))
+                                    .top(px(5.0))
+                                    .ml(px(-7.0))
+                                    .size(px(14.0))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(color(colors.foreground))
+                                    .bg(color(colors.accent)),
+                            )
+                            .child(opacity_slider_input),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(color(colors.muted))
+                            .child(
+                                "10–100%. Text and explicit application backgrounds stay opaque.",
+                            ),
+                    ),
+            )
+            .when(self.settings_scope == SettingsScope::Window, |section| {
+                section.child(
+                    div().flex().justify_end().child(
+                        div()
+                            .id("reset-window-appearance")
+                            .px_3()
+                            .py_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(color(colors.border))
+                            .cursor_pointer()
+                            .child("Use global defaults")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_window_appearance(window);
+                                cx.stop_propagation();
+                                cx.notify();
+                            })),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_settings_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        let colors = self.colors();
+        let full = matches!(self.overlay, Some(Overlay::Settings));
+        let live_surfaces = self.command_context(cx).live_surface_count;
+        let panel = div()
+            .w_full()
+            .max_w(px(if full { 780.0 } else { 680.0 }))
+            .max_h(px(if full { 580.0 } else { 520.0 }))
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .border_1()
+            .border_color(color(colors.border))
+            .bg(color(colors.surface))
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(if full { "Settings" } else { "Quick Appearance" })
+                    .child(
+                        div()
+                            .id("settings-dismiss")
+                            .text_size(px(11.0))
+                            .text_color(color(colors.muted))
+                            .cursor_pointer()
+                            .child("Esc · Close")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss_overlay();
+                                window.focus(&this.focus_handle);
+                                cx.stop_propagation();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(color(colors.muted))
+                                    .child("APPEARANCE"),
+                            )
+                            .child(self.render_appearance_controls(cx)),
+                    )
+                    .when(full, |body| {
+                        body.child(
+                            div()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(color(colors.border))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(color(colors.muted))
+                                        .child("INTERFACE"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(format!(
+                                            "Workspace sidebar · {:.0}px",
+                                            self.sidebar_width
+                                        ))
+                                        .child(self.command_button(
+                                            "settings-reset-sidebar",
+                                            "Reset width",
+                                            Command::ResetSidebarWidth,
+                                            cx,
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(color(colors.border))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(color(colors.muted))
+                                        .child("TERMINAL"),
+                                )
+                                .child(format!(
+                                    "{} · {:.1}px · {:.2} line height · {:.0}% zoom",
+                                    self.font_settings.family,
+                                    self.font_settings.size,
+                                    self.font_settings.line_height,
+                                    self.zoom * 100.0
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(color(colors.muted))
+                                        .child("Fullscreen TUI modes keep the terminal canvas clean; explicit cell colors remain opaque."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(color(colors.border))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(color(colors.muted))
+                                        .child("KEYBOARD"),
+                                )
+                                .child(format!(
+                                    "{} commands are searchable in the command palette. TOML keybindings override platform defaults.",
+                                    commands::REGISTRY.len()
+                                ))
+                                .child(self.command_button(
+                                    "settings-open-config",
+                                    "Open configuration file",
+                                    Command::OpenConfiguration,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(color(colors.border))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(color(colors.muted))
+                                        .child("DAEMON"),
+                                )
+                                .child(format!(
+                                    "{} live surface{} · restart ends every live process",
+                                    live_surfaces,
+                                    if live_surfaces == 1 { "" } else { "s" }
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(self.command_button(
+                                            "settings-reconnect",
+                                            "Reconnect window",
+                                            Command::Reconnect,
+                                            cx,
+                                        ))
+                                        .child(self.command_button(
+                                            "settings-restart-daemon",
+                                            if live_surfaces == 0 {
+                                                "Restart daemon"
+                                            } else {
+                                                "Review and restart daemon…"
+                                            },
+                                            Command::RestartDaemon,
+                                            cx,
+                                        )),
+                                ),
+                        )
+                    }),
+            )
+            .when(!full, |panel| {
+                panel.child(
+                    div()
+                        .p_3()
+                        .border_t_1()
+                        .border_color(color(colors.border))
+                        .flex()
+                        .justify_end()
+                        .child(
+                            div()
+                                .id("open-full-settings")
+                                .px_3()
+                                .py_2()
+                                .rounded_sm()
+                                .bg(color(colors.accent))
+                                .text_color(color(colors.background))
+                                .cursor_pointer()
+                                .child("All settings")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_overlay(Overlay::Settings, "");
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            });
+        div()
+            .absolute()
+            .inset_0()
+            .pt(px(CHROME_HEIGHT + 18.0))
+            .px_4()
+            .flex()
+            .justify_center()
+            .bg(color(colors.background).opacity(0.46))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.dismiss_overlay();
+                    window.focus(&this.focus_handle);
+                    cx.notify();
+                }),
+            )
+            .child(panel)
+            .into_any_element()
+    }
+
     fn render_overlay(&self, cx: &Context<Self>) -> AnyElement {
         if matches!(self.overlay, Some(Overlay::PaneActions)) {
             return self.render_pane_actions_menu(cx);
+        }
+        if matches!(
+            self.overlay,
+            Some(Overlay::QuickAppearance | Overlay::Settings)
+        ) {
+            return self.render_settings_overlay(cx);
         }
         let colors = self.colors();
         let choices = self.overlay_choices(cx);
         let title = match &self.overlay {
             Some(Overlay::Palette) => "Commands",
-            Some(Overlay::Theme { .. }) => "Appearance",
+            Some(Overlay::QuickAppearance) => "Quick Appearance",
+            Some(Overlay::Settings) => "Settings",
             Some(Overlay::Text { title, .. }) => title,
             Some(Overlay::Confirm { .. }) => "Confirm destructive action",
+            Some(Overlay::ConfirmDaemonRestart { .. }) => "Restart daemon",
             Some(Overlay::Workspaces) => "Switch workspace",
             Some(Overlay::Tabs { hidden_only: true }) => "Restore hidden terminal tab",
             Some(Overlay::Tabs { .. }) => "Switch terminal tab",
@@ -3541,11 +4369,7 @@ impl CompiApp {
                 .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.overlay_index = index;
-                    if let ChoiceAction::Theme(theme) = choice.action {
-                        this.set_theme(theme);
-                    } else {
-                        this.activate_overlay(window, cx);
-                    }
+                    this.activate_overlay(window, cx);
                     cx.notify();
                 }))
                 .child(
@@ -3625,8 +4449,8 @@ impl CompiApp {
                     .when(matches!(self.overlay, Some(Overlay::Palette)), |panel| {
                         panel.child(div().px_3().pb_2().child(self.command_button(
                             "appearance-menu",
-                            "Appearance…",
-                            Command::ChangeTheme,
+                            "Quick Appearance…",
+                            Command::OpenQuickAppearance,
                             cx,
                         )))
                     })
@@ -3640,12 +4464,10 @@ impl CompiApp {
                             .children(rows),
                     )
                     .when_some(
-                        self.overlay.as_ref().and_then(|overlay| {
-                            if let Overlay::Confirm { title, .. } = overlay {
-                                Some(title.clone())
-                            } else {
-                                None
-                            }
+                        self.overlay.as_ref().and_then(|overlay| match overlay {
+                            Overlay::Confirm { title, .. } => Some(title.clone()),
+                            Overlay::ConfirmDaemonRestart { details, .. } => Some(details.clone()),
+                            _ => None,
                         }),
                         |panel, message| {
                             panel.child(div().p_3().text_color(color(colors.error)).child(message))
@@ -3676,9 +4498,9 @@ impl CompiApp {
                         matches!(
                             self.overlay,
                             Some(
-                                Overlay::Theme { .. }
-                                    | Overlay::Text { .. }
+                                Overlay::Text { .. }
                                     | Overlay::Confirm { .. }
+                                    | Overlay::ConfirmDaemonRestart { .. }
                             )
                         ),
                         |panel| {
@@ -3697,16 +4519,13 @@ impl CompiApp {
                                             .bg(color(colors.accent))
                                             .text_color(color(colors.background))
                                             .cursor_pointer()
-                                            .child(
-                                                if matches!(
-                                                    self.overlay,
-                                                    Some(Overlay::Confirm { .. })
-                                                ) {
-                                                    "Confirm"
-                                                } else {
-                                                    "Apply"
-                                                },
-                                            )
+                                            .child(match self.overlay {
+                                                Some(Overlay::ConfirmDaemonRestart { .. }) => {
+                                                    "End all work and restart daemon"
+                                                }
+                                                Some(Overlay::Confirm { .. }) => "Confirm",
+                                                _ => "Apply",
+                                            })
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.activate_overlay(window, cx)
                                             })),
@@ -3817,6 +4636,16 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(origin) = self.opacity_drag_origin.take() {
+            let opacity = self.terminal_opacity;
+            self.terminal_opacity = origin;
+            let mut next = self.scoped_appearance();
+            next.terminal_opacity = opacity;
+            self.apply_scoped_appearance(next, window);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.workspace_scroll_drag.take().is_some() {
             cx.notify();
             return;
@@ -3861,23 +4690,25 @@ impl CompiApp {
         if let Some(tab_id) = self.dragging_tab.take()
             && moved
         {
-            let viewport = window.viewport_size();
-            let inside = f32::from(event.position.x) >= 0.0
-                && f32::from(event.position.y) >= 0.0
-                && event.position.x < viewport.width
-                && event.position.y < viewport.height;
+            let (viewport_width, viewport_height) = logical_viewport_dimensions(window);
+            let pointer_x = pointer_coordinate(event.position.x, self.typography_scale);
+            let pointer_y = pointer_coordinate(event.position.y, self.typography_scale);
+            let inside = pointer_x >= 0.0
+                && pointer_y >= 0.0
+                && pointer_x < viewport_width
+                && pointer_y < viewport_height;
             if inside {
-                let header = header_metrics(f32::from(viewport.width));
-                let tab_region_right = f32::from(viewport.width)
+                let header = header_metrics(viewport_width);
+                let tab_region_right = viewport_width
                     - WINDOW_CONTROLS_WIDTH
                     - HEADER_BUTTON_SLOT_WIDTH
                     - header.pane_actions_width;
-                if f32::from(event.position.y) <= CHROME_HEIGHT
-                    && f32::from(event.position.x) >= TITLEBAR_BRAND_WIDTH
-                    && f32::from(event.position.x) < tab_region_right
+                if pointer_y <= CHROME_HEIGHT
+                    && pointer_x >= TITLEBAR_BRAND_WIDTH
+                    && pointer_x < tab_region_right
                     && let Some(session_id) = self.state.selected_session.clone()
                 {
-                    let x = f32::from(event.position.x)
+                    let x = pointer_x
                         - TITLEBAR_BRAND_WIDTH
                         - f32::from(self.tab_scroll_handle.offset().x);
                     let visible_index = (x / header.tab_width).floor().max(0.0) as usize;
@@ -3976,14 +4807,13 @@ impl CompiApp {
         } else {
             let mut config = self.config.clone();
             config.font = self.font_settings.clone();
-            let display_theme = match self.overlay {
-                Some(Overlay::Theme { accepted }) => accepted,
-                _ => self.theme,
-            };
+            let display_theme = self.theme;
             let seed = TransferSeed {
                 tab_id: tab_id.clone(),
                 source_state: self.state.clone(),
                 display_theme,
+                display_terminal_opacity: self.terminal_opacity,
+                display_background_effect: self.background_effect,
                 display_sidebar_width: self.sidebar_width,
                 display_zoom: self.zoom,
             };
@@ -4455,8 +5285,27 @@ mod tests {
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
         WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, header_metrics,
+        opacity_at_slider_position, pointer_coordinate,
     };
     use compi_protocol::{PaneId, TabId};
+    use gpui::{Bounds, point, px, size};
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pointer_coordinates_follow_logical_terminal_geometry() {
+        assert_eq!(pointer_coordinate(px(114.0), 1.5), 76.0);
+    }
+
+    #[test]
+    fn opacity_slider_maps_and_clamps_its_track() {
+        let bounds = Bounds {
+            origin: point(px(10.0), px(0.0)),
+            size: size(px(100.0), px(24.0)),
+        };
+        assert_eq!(opacity_at_slider_position(px(0.0), bounds), 0.1);
+        assert_eq!(opacity_at_slider_position(px(60.0), bounds), 0.55);
+        assert_eq!(opacity_at_slider_position(px(120.0), bounds), 1.0);
+    }
 
     #[test]
     fn terminal_tab_titles_keep_identity_without_exposing_full_paths() {

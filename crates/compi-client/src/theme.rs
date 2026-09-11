@@ -1,5 +1,6 @@
-//! Whole-application presets. Colors are opaque RGB; native chrome materials are a
-//! renderer concern and must never make terminal canvases translucent.
+//! Whole-application presets and native background material choices.
+//! Terminal opacity is applied only to the default terminal canvas; explicit
+//! ANSI and true-color cell backgrounds stay fully opaque.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +10,40 @@ pub enum ThemePreset {
     #[default]
     DarkGlass,
     WarmCarbon,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackgroundEffect {
+    Clear,
+    #[default]
+    Blurred,
+}
+
+impl BackgroundEffect {
+    pub const ALL: [Self; 2] = [Self::Clear, Self::Blurred];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Blurred => "blurred",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Clear => "Clear",
+            Self::Blurred => "Blurred",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "clear" => Some(Self::Clear),
+            "blurred" => Some(Self::Blurred),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +64,20 @@ pub struct ThemeColors {
 impl ThemePreset {
     pub const ALL: [Self; 2] = [Self::DarkGlass, Self::WarmCarbon];
 
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::DarkGlass => "dark-glass",
+            Self::WarmCarbon => "warm-carbon",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::DarkGlass => "Neutral charcoal with crisp lime focus.",
+            Self::WarmCarbon => "Softer warm neutrals for long sessions.",
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::DarkGlass => "Dark Glass",
@@ -44,11 +93,7 @@ impl ThemePreset {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "dark-glass" => Some(Self::DarkGlass),
-            "warm-carbon" => Some(Self::WarmCarbon),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|preset| preset.id() == value)
     }
 }
 

@@ -426,6 +426,29 @@ pub fn connect_or_start(instance: Option<&str>) -> Result<DaemonClient> {
     }
 }
 
+/// Stop the current daemon, wait for its endpoint to disappear, then start and
+/// reconnect to a fresh generation. Callers must confirm destructive live-work
+/// impact before entering this function.
+pub fn restart_daemon(instance: Option<&str>) -> Result<DaemonClient> {
+    let mut client = match DaemonClient::connect(instance, Duration::from_secs(2)) {
+        Ok(client) => client,
+        Err(_) => {
+            start_daemon(instance)?;
+            return DaemonClient::connect(instance, Duration::from_secs(5));
+        }
+    };
+    client.shutdown_daemon()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while DaemonClient::connect(instance, Duration::from_millis(50)).is_ok() {
+        if Instant::now() >= deadline {
+            return Err("daemon did not stop before restart timeout".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    start_daemon(instance)?;
+    DaemonClient::connect(instance, Duration::from_secs(5))
+}
+
 fn start_daemon(instance: Option<&str>) -> Result<()> {
     if DaemonClient::connect(instance, Duration::ZERO).is_ok() {
         return Ok(());
@@ -697,12 +720,16 @@ mod console {
     }
 
     fn render_snapshot(output: &mut impl Write, snapshot: &ScreenSnapshot) -> Result<()> {
-        output.write_all(b"\x1b[?25l\x1b[2J\x1b[H")?;
-        let mut previous = None;
+        // Synchronized updates avoid flashing a cleared frame between snapshots.
+        // Clearing each rewritten line and the trailing display still removes stale
+        // content after resizes without destroying the whole screen first.
+        output.write_all(b"\x1b[?2026h\x1b[?25l\x1b[H")?;
         for (row_index, row) in snapshot.cells.iter().enumerate() {
             if row_index != 0 {
                 output.write_all(b"\r\n")?;
             }
+            output.write_all(b"\x1b[0m\x1b[2K")?;
+            let mut previous = None;
             for cell in &row.cells {
                 if cell.width == 0 {
                     continue;
@@ -733,7 +760,7 @@ mod console {
         }
         write!(
             output,
-            "\x1b[0m\x1b[{};{}H{}",
+            "\x1b[0m\x1b[J\x1b[{};{}H{}\x1b[?2026l",
             snapshot.cursor.row + 1,
             snapshot.cursor.col + 1,
             if snapshot.cursor.visible {

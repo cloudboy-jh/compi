@@ -21,6 +21,27 @@ impl Platform {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandCategory {
+    Workspace,
+    Terminal,
+    Panes,
+    Appearance,
+    Application,
+}
+
+impl CommandCategory {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "Workspace",
+            Self::Terminal => "Terminal",
+            Self::Panes => "Panes",
+            Self::Appearance => "Appearance",
+            Self::Application => "Application",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CommandSpec {
     pub command: Command,
@@ -78,15 +99,17 @@ registry! {
     Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-v");
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
-    ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-shift-equal");
-    ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-shift-minus");
-    ZoomReset, "zoom_reset", "Reset font size", Some("cmd-0"), Some("ctrl-shift-0");
-    ChangeTheme, "change_theme", "Change theme…", None, None;
-    OpenConfiguration, "open_configuration", "Open configuration", Some("cmd-,"), Some("ctrl-shift-,");
+    ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
+    ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
+    ZoomReset, "zoom_reset", "Reset font size", Some("cmd-0"), Some("ctrl-0");
+    OpenQuickAppearance, "open_quick_appearance", "Open Quick Appearance", None, None;
+    OpenSettings, "open_settings", "Open Settings", Some("cmd-,"), Some("ctrl-,");
+    OpenConfiguration, "open_configuration", "Open configuration file", None, None;
     ResetClientLayout, "reset_client_layout", "Reset client layout", None, None;
-    Reconnect, "reconnect", "Reconnect to server", None, None;
+    Reconnect, "reconnect", "Reconnect window to daemon", None, None;
+    RestartDaemon, "restart_daemon", "Restart daemon…", None, None;
     OpenDiagnostics, "open_diagnostics", "Open diagnostics", None, None;
-    Quit, "quit", "Quit client (keep server running)", Some("cmd-q"), Some("ctrl-shift-q");
+    Quit, "quit", "Quit client (keep daemon running)", Some("cmd-q"), Some("ctrl-shift-q");
 }
 
 impl CommandSpec {
@@ -107,11 +130,22 @@ impl CommandSpec {
             None => self.shortcut(platform),
         }
     }
-    /// Every query word must occur in the human label or stable command ID.
+    /// Every query word must occur in command metadata.
     pub fn matches_query(&self, query: &str) -> bool {
         query.split_whitespace().all(|word| {
-            contains_ignore_case(self.label, word) || contains_ignore_case(self.id, word)
+            contains_ignore_case(self.label, word)
+                || contains_ignore_case(self.id, word)
+                || contains_ignore_case(self.category().label(), word)
+                || contains_ignore_case(self.aliases(), word)
         })
+    }
+
+    pub const fn category(&self) -> CommandCategory {
+        self.command.category()
+    }
+
+    pub const fn aliases(&self) -> &'static str {
+        self.command.aliases()
     }
     pub fn disabled_reason(&self, context: &CommandContext) -> Option<&'static str> {
         self.command.disabled_reason(context)
@@ -149,8 +183,10 @@ pub struct CommandContext {
     pub terminal_available: bool,
     pub can_paste: bool,
     pub surface_status: Option<SurfaceStatus>,
+    pub live_surface_count: usize,
     pub mutation_pending: bool,
     pub transfer_in_progress: bool,
+    pub daemon_restarting: bool,
     pub other_window_available: bool,
     /// Revision at which the current command targets/context were captured.
     pub revision: u64,
@@ -166,6 +202,42 @@ pub struct CommandContext {
 }
 
 impl Command {
+    pub const fn category(self) -> CommandCategory {
+        use Command::*;
+        match self {
+            CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace | SwitchTab
+            | PreviousTab | NextTab | RenameTab | MoveTabLeft | MoveTabRight | RemoveTab
+            | DetachTab | RestoreHiddenTab | NewWindow | MoveTabToNewWindow | MoveTabToWindow => {
+                CommandCategory::Workspace
+            }
+            NewTab | Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
+            | RestartSurface | EndSurface => CommandCategory::Terminal,
+            SplitRight | SplitDown | TogglePaneZoom | FocusLeft | FocusRight | FocusUp
+            | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
+            | RemovePane => CommandCategory::Panes,
+            OpenQuickAppearance | OpenSettings => CommandCategory::Appearance,
+            OpenPalette | ToggleSidebar | ResetSidebarWidth | OpenConfiguration
+            | ResetClientLayout | Reconnect | RestartDaemon | OpenDiagnostics | Quit => {
+                CommandCategory::Application
+            }
+        }
+    }
+
+    pub const fn aliases(self) -> &'static str {
+        use Command::*;
+        match self {
+            OpenPalette => "commands actions",
+            OpenQuickAppearance => "theme opacity transparency clear blur",
+            OpenSettings => "preferences configuration appearance terminal keyboard daemon",
+            OpenConfiguration => "toml edit file",
+            RestartDaemon => "server reboot",
+            Reconnect => "server attach retry",
+            DetachTab => "hide close keep running",
+            RestoreHiddenTab => "reopen unhide",
+            _ => "",
+        }
+    }
+
     pub fn spec(self) -> &'static CommandSpec {
         REGISTRY
             .iter()
@@ -183,7 +255,8 @@ impl Command {
                 | ZoomIn
                 | ZoomOut
                 | ZoomReset
-                | ChangeTheme
+                | OpenQuickAppearance
+                | OpenSettings
                 | OpenConfiguration
                 | ResetClientLayout
                 | Reconnect
@@ -192,6 +265,11 @@ impl Command {
         );
         if local {
             return None;
+        }
+        if self == RestartDaemon {
+            return c
+                .daemon_restarting
+                .then_some("Wait for the daemon restart to finish");
         }
         if c.revision != c.current_revision {
             return Some("Workspace changed; select the command again");
@@ -983,6 +1061,27 @@ mod tests {
             KeyRoute::Terminal
         );
     }
+
+    #[test]
+    fn windows_plus_zooms_while_comma_opens_settings() {
+        let context = ready();
+        let bindings = HashMap::new();
+        let route = |key| {
+            resolve_key(
+                Platform::Windows,
+                key,
+                InputOwner::Terminal,
+                &context,
+                &bindings,
+            )
+        };
+
+        // GPUI folds Shift into printable punctuation on Windows.
+        assert_eq!(route(ctrl("+")), KeyRoute::Command(Command::ZoomIn));
+        assert_eq!(route(ctrl("-")), KeyRoute::Command(Command::ZoomOut));
+        assert_eq!(route(ctrl("0")), KeyRoute::Command(Command::ZoomReset));
+        assert_eq!(route(ctrl(",")), KeyRoute::Command(Command::OpenSettings));
+    }
     #[test]
     fn displayed_shortcuts_follow_overrides_and_explicit_unbinding() {
         let spec = Command::SplitRight.spec();
@@ -1020,6 +1119,10 @@ mod tests {
         assert!(Command::SplitDown.disabled_reason(&context).is_none());
         context.has_pane = false;
         assert!(Command::SplitDown.disabled_reason(&context).is_some());
+        context.daemon_restarting = true;
+        assert!(Command::RestartDaemon.disabled_reason(&context).is_some());
+        context.daemon_restarting = false;
+        assert!(Command::RestartDaemon.disabled_reason(&context).is_none());
     }
     #[test]
     fn pane_zoom_preserves_restore_but_blocks_split_resizing() {
@@ -1042,6 +1145,12 @@ mod tests {
     fn query_words_and_shortcut_parser_accept_useful_inputs_not_typos() {
         assert!(search("terminal hidden").any(|spec| spec.command == Command::RestoreHiddenTab));
         assert!(!Command::NewTab.spec().matches_query("workspace remove"));
+        assert!(search("opacity").any(|spec| spec.command == Command::OpenQuickAppearance));
+        assert!(search("appearance settings").any(|spec| spec.command == Command::OpenSettings));
+        assert_eq!(
+            Command::RestartDaemon.spec().category(),
+            CommandCategory::Application
+        );
         assert!(shortcut_matches(
             "Ctrl+Shift+P",
             ShortcutKey {

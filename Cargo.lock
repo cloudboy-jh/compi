@@ -796,6 +796,7 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "windows 0.62.2",
  "winresource",
 ]

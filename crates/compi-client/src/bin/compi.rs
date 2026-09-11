@@ -163,17 +163,26 @@ mod tests {
         assert!(args.diagnostics[0].contains("--font-size"));
 
         let mut config = compi_client::config::LoadedConfig {
-            theme: compi_client::theme::ThemePreset::DarkGlass,
-            configured_theme: compi_client::theme::ThemePreset::DarkGlass,
+            appearance: compi_client::config::AppearanceSettings {
+                theme: compi_client::theme::ThemePreset::DarkGlass,
+                ..Default::default()
+            },
+            configured_appearance: compi_client::config::AppearanceSettings {
+                theme: compi_client::theme::ThemePreset::DarkGlass,
+                ..Default::default()
+            },
             sidebar_width: 240.0,
             configured_sidebar_width: 240.0,
             ..Default::default()
         };
         config.apply_presentation_overrides(args.theme.as_deref(), args.sidebar_width);
-        assert_eq!(config.theme, compi_client::theme::ThemePreset::WarmCarbon);
+        assert_eq!(
+            config.appearance.theme,
+            compi_client::theme::ThemePreset::WarmCarbon
+        );
         assert_eq!(config.sidebar_width, 360.0);
         assert_eq!(
-            config.configured_theme,
+            config.configured_appearance.theme,
             compi_client::theme::ThemePreset::DarkGlass
         );
         assert_eq!(config.configured_sidebar_width, 240.0);
