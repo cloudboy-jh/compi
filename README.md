@@ -39,6 +39,22 @@ Not yet. Compi already has a real client/server architecture, and the server run
 
 The workspace client is implemented and verified on Windows/WSL. Native macOS workspace qualification and broader performance/resource qualification remain open.
 
+## Distribution
+
+The **Release** workflow builds Windows x64 and Apple Silicon macOS 14+ artifacts:
+
+- `Compi-<version>-Setup.exe`: per-user Windows installer, including repair and uninstall.
+- `Compi-<version>-Windows-x64.zip`: portable Windows client and sibling daemon; extract both together. WSL2 is required for either Windows package.
+- `Compi-<version>-macOS-arm64.dmg`: open the disk image and drag `Compi.app` into Applications.
+- `Compi-<version>-macOS-arm64.app.zip`: alternative Mac app archive. Move the entire extracted bundle, not just its executable.
+- `SHA256SUMS.txt`: checksums for the release assets.
+
+A `v<workspace-version>` tag builds both platforms and creates one **draft** GitHub release only after both packaging checks pass. Drafts are not public downloads until published. Running the workflow manually produces downloadable Actions artifacts without creating a release; those contain platform-specific checksum manifests.
+
+Windows artifacts are unsigned unless both signing secrets are configured. SmartScreen may warn; for an artifact you trust, **More info → Run anyway** may be available unless device policy forbids it. Mac artifacts are ad-hoc signed for integrity, but have no Developer ID signature or notarization. If Gatekeeper blocks an artifact you trust, attempt to open it, then use **System Settings → Privacy & Security → Open Anyway**; older macOS versions also offer right-click → Open. Do not disable platform security globally.
+
+Build locally with `pwsh -File tools/build-installer.ps1` on Windows or `bash tools/build-macos.sh` on an ARM64 Mac. Both accept an optional expected version tag (`-ExpectedTag` / `--expected-tag`). Windows signing remains available through `-SigningCertificateThumbprint`, with `-RequireSigning` for builds that must not be unsigned.
+
 ## Run from source
 
 Requires Rust and the platform build tools. Windows also requires WSL2; macOS requires Xcode with the Metal compiler available through `xcrun`.

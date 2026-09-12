@@ -92,13 +92,13 @@ try {
     & dotnet tool restore
     if ($LASTEXITCODE -ne 0) { throw 'Failed to restore the pinned WiX tool' }
 
-    & cargo build --release -p compi-client -p compi-daemon --bins --target-dir $productTarget
+    & cargo build --locked --release -p compi-client -p compi-daemon --bins --target-dir $productTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi product binaries' }
     Assert-FileVersion (Join-Path $productBin 'compi.exe')
     Assert-FileVersion (Join-Path $productBin 'compi-daemon.exe')
     Invoke-SignArtifact (Join-Path $productBin 'compi.exe')
     Invoke-SignArtifact (Join-Path $productBin 'compi-daemon.exe')
-    & cargo build --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $maintenanceTarget
+    & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $maintenanceTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build the installed Compi maintenance surface' }
     Assert-FileVersion $maintenanceSource
     Invoke-SignArtifact $maintenanceSource
@@ -117,7 +117,7 @@ try {
     Invoke-SignArtifact $msiPath
 
     Copy-Item -Force $msiPath $payloadPath
-    & cargo build --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-setup --target-dir $bootstrapperTarget
+    & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-setup --target-dir $bootstrapperTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build the Compi Setup bootstrapper' }
     Assert-FileVersion $setupSource
     Invoke-SignArtifact $setupSource
@@ -129,7 +129,8 @@ try {
     }
     Compress-Archive -Path @(
         (Join-Path $productBin 'compi.exe'),
-        (Join-Path $productBin 'compi-daemon.exe')
+        (Join-Path $productBin 'compi-daemon.exe'),
+        (Join-Path $projectRoot 'LICENSE')
     ) -DestinationPath $portableDestination
 
     $checksumPath = Join-Path $OutputDirectory 'SHA256SUMS.txt'
