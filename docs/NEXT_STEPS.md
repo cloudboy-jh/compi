@@ -212,11 +212,22 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - At 144 DPI, the fixed logical viewport filled the complete area below the header with no false workspace overflow bars and kept all custom Windows controls reachable. Vim occupied the full alternate screen, accepted input, restored the main shell screen on exit, and showed no history scrollbar. Composed captures verified both unblurred clear and softened blurred terminal backgrounds at 70% while terminal foreground text stayed opaque.
 - Focused `compi-client` regressions passed 49 tests; the final isolated all-target workspace run passed 110 tests across 10 suites. Formatting and warning-denied workspace Clippy passed; Cargo still reports the upstream `proc-macro-error2` future-compatibility notice. Synthetic Win32 input and composed desktop captures verify the native event/render path, not physical-keyboard, IME, or sustained display-pacing qualification.
 
+### Core CI reliability — 2026-09-11
+
+- Reproduced the Unix natural-exit panic in WSL2 Ubuntu: the old test expected reattachment to fail, contradicting the retained read-only grid contract and native client. The regression now verifies final output, exit code, unchanged process lifetime, read-only resize/reconnect, and rejected process input. CI's other Unix timeout came from checking markers only on new events, even when the retained replica already contained the requested text; waits now inspect the current replica first.
+- Both six-scenario daemon integration suites serialize daemon lifetimes with in-process mutexes and use bounded, condition-driven polling. Windows markers cannot match echoed commands; built-in alternate-screen controls replace `top`/`tput`. Detached output uses an explicit release gate, and backpressure exercises over 16 MiB of in-place repaint output without draining the attached client before checking completion and recovery.
+- Polling also exposed a real Windows teardown race: `DisconnectNamedPipe` discarded unread protocol-error replies. Synchronous final responses now flush before disconnect, retaining the existing bounded writer wait and cancellation path.
+- The Windows dependency checker failure was UTF-8 Cargo metadata decoded as CP1252, not a forbidden dependency. Metadata decoding is explicit; resolution/launch errors report Cargo diagnostics and exit 2, distinct from boundary violations (exit 1). All three production boundary rules remain unchanged.
+- Full Linux execution exposed a previously masked v7 fixture dependency on JSON object insertion order. The protocol's test-only `serde_json/preserve_order` feature now makes that requirement explicit; neither fixture bytes nor production wire codecs changed.
+- Local verification: the exact locked three-crate test command passed 25 consecutive times on Windows 11/WSL2, 110 tests per run with zero failures or ignored tests. Native Linux execution inside WSL2 passed 89 tests, including all six Unix daemon scenarios, v7 byte fixtures, and terminal compatibility. Workspace formatting and warning-denied Clippy passed; Windows still reports the upstream `proc-macro-error2` future-compatibility notice.
+- Boundary checks passed for Windows, Linux, and macOS targets. A deliberately unavailable Rust toolchain produced readable exit 2 without a traceback; a temporary real Cargo graph verified that dev-only graphics remain allowed and a production PTY violation still exits 1.
+- Core CI now checks formatting, lints the whole workspace, and provisions a required default Ubuntu WSL2 distribution before Windows product tests. Hosted results are tracked by the README's main-branch badge; local results alone are not hosted-CI evidence. No new graphical client qualification, performance budget, installer/signing result, or physical-input/display claim is made here. Linux's graphical client remains unqualified.
+
 ### Remaining qualification
 
 1. Complete a focused UI/UX refinement pass without changing the workspace model, persistence/protocol contracts, or established navigation.
 2. Build and exercise the full workspace client on a native Mac. No Mac SDK/runtime or configured SSH host was available here.
-3. Run native Linux CI; Windows-host cross-compilation is not a substitute.
+3. Keep native Linux core CI passing; WSL2 Linux runtime suites now pass locally, but neither cross-compilation nor headless tests qualify the Linux graphical client.
 4. Retain physical keys, dead keys/IME, exact user font/glyph selection, mixed displays/DPI, native controls, and sustained pacing/resource qualification as explicit gates.
 5. Continue Phase 5 daily-use/soak measurements and dogfood artifacts. Packaging/signing remains Phase 6.
 
