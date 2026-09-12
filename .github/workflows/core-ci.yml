@@ -34,8 +34,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Check workspace formatting
+        run: cargo fmt --all -- --check
       - name: Check production dependency boundaries
         run: python tools/check-dependencies.py --target ${{ matrix.target }}
+      - name: Provision default WSL2 distribution
+        if: runner.os == 'Windows'
+        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7
+        with:
+          distribution: Ubuntu-24.04
+          set-as-default: 'true'
+          wsl-version: '2'
+      - name: Require working WSL runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          wsl.exe --exec /bin/bash -lc true
+          if ($LASTEXITCODE -ne 0) { throw 'A working default WSL2 distribution is required for Windows daemon tests' }
       - name: Run all product crate tests
         run: cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
       - name: Run daemon unit tests
@@ -49,20 +64,14 @@ jobs:
       - name: Run real Unix PTY and persistent daemon regressions
         if: runner.os != 'Windows'
         run: cargo test --locked -p compi-daemon --test unix_daemon_integration
-      - name: Run Windows daemon regressions when WSL is qualified
+      - name: Run Windows daemon regressions
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          wsl.exe --exec true
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning 'MISSING COVERAGE: no working default WSL distribution; daemon runtime tests were not run.'
-            'WSL runtime: **unverified** — no working default distribution on this runner.' >> $env:GITHUB_STEP_SUMMARY
-            exit 0
-          }
           cargo test --locked -p compi-daemon --test daemon_integration
           if ($LASTEXITCODE -ne 0) { throw 'Windows/WSL daemon regressions failed' }
-      - name: Lint shared protocol and client packages
-        run: cargo clippy --locked -p compi-protocol -p compi-client --all-targets -- -D warnings
+      - name: Lint all workspace targets
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build real Windows daemon without graphics setup
         if: runner.os == 'Windows'
         run: cargo build --locked --release -p compi-daemon --bin compi-daemon
