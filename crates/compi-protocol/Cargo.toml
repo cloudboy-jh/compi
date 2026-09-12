@@ -29,3 +29,5 @@ windows = { version = "0.62.2", features = [
 
 [dev-dependencies]
 base64.workspace = true
+# Historical JSON fixtures must round-trip their original object field order.
+serde_json = { workspace = true, features = ["preserve_order"] }
