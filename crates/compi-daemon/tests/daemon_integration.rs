@@ -973,17 +973,14 @@ fn mirror_text(mirror: &ScreenMirror) -> Vec<u8> {
 }
 
 fn snapshot_text(snapshot: &ScreenSnapshot) -> String {
-    snapshot
-        .scrollback
-        .iter()
-        .chain(&snapshot.cells)
-        .map(|row| {
-            row.cells
-                .iter()
-                .filter(|cell| cell.width != 0)
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::new();
+    for row in snapshot.scrollback.iter().chain(&snapshot.cells) {
+        for cell in row.cells.iter().filter(|cell| cell.width != 0) {
+            text.push_str(&cell.text);
+        }
+        if !row.wrapped {
+            text.push('\n');
+        }
+    }
+    text
 }

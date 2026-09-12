@@ -5281,11 +5281,13 @@ fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::pointer_coordinate;
     use super::{
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
         WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, header_metrics,
-        opacity_at_slider_position, pointer_coordinate,
+        opacity_at_slider_position,
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};

@@ -274,19 +274,16 @@ impl Controller {
 }
 
 fn snapshot_text(snapshot: &ScreenSnapshot) -> String {
-    snapshot
-        .scrollback
-        .iter()
-        .chain(&snapshot.cells)
-        .map(|row| {
-            row.cells
-                .iter()
-                .filter(|cell| cell.width != 0)
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::new();
+    for row in snapshot.scrollback.iter().chain(&snapshot.cells) {
+        for cell in row.cells.iter().filter(|cell| cell.width != 0) {
+            text.push_str(&cell.text);
+        }
+        if !row.wrapped {
+            text.push('\n');
+        }
+    }
+    text
 }
 
 fn wait_status(client: &mut DaemonClient, id: &SurfaceId, expected: SurfaceStatus) -> SurfaceInfo {
@@ -344,7 +341,8 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
             rows: 37,
         })
         .unwrap();
-    attached.input(b"printf 'RESIZED_%s ' \"$((20+22))\"; stty size\r");
+    // Force the size marker across a soft wrap, as long host prompts do on CI.
+    attached.input(b"printf 'RESIZED_%s \\033[112G' \"$((20+22))\"; stty size\r");
     attached.until("37 112");
     attached.input(b"read -r answer; printf 'INPUT_%s\\n' \"$answer\"\r");
     attached.input(b"interactive-value\r");
