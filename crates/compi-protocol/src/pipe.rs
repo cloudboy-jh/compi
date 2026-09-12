@@ -6,7 +6,6 @@ use crate::identity::PipeSecurity;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
-#[cfg(windows)]
 use std::io::Read;
 #[cfg(windows)]
 use std::iter::once;
@@ -45,6 +44,16 @@ pub struct PipeReader {
 }
 
 impl PipeReader {
+    pub(crate) fn read(&mut self, file: &File) -> Result<Option<Frame>> {
+        // Polling can read beyond one frame. Blocking requests must consume
+        // that prefix before touching the underlying connection again.
+        let mut buffered = self.buffer.as_slice();
+        let result = frame::read(&mut (&mut buffered).chain(file));
+        let consumed = self.buffer.len() - buffered.len();
+        self.buffer.drain(..consumed);
+        result.map_err(Into::into)
+    }
+
     #[cfg(windows)]
     pub fn poll(&mut self, file: &File) -> Result<Option<Frame>> {
         if let Some(frame) = self.take_frame()? {

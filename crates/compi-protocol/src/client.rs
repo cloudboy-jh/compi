@@ -302,7 +302,7 @@ impl DaemonClient {
 
     pub fn read_event(&mut self) -> Result<Option<ServerEvent>> {
         loop {
-            let Some(frame) = frame::read(&mut self.connection)? else {
+            let Some(frame) = self.poll_reader.read(&self.connection)? else {
                 return Ok(None);
             };
             if let Some(event) = self.decode_event(frame)? {
@@ -476,5 +476,54 @@ fn unexpected_response(message: ServerMessage) -> crate::Error {
             current_revision,
         }),
         message => format!("unexpected daemon response: {message:?}").into(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn blocking_read_preserves_frames_buffered_by_polling() {
+        let (receiver, mut sender) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        for version in [7, 9] {
+            let payload = crate::encode_server(&crate::ServerControl {
+                request_id: None,
+                message: ServerMessage::Hello {
+                    protocol_version: version,
+                },
+            })
+            .unwrap();
+            frame::write(&mut bytes, CONTROL_FRAME, &payload).unwrap();
+        }
+        sender.write_all(&bytes).unwrap();
+        drop(sender);
+        let mut client = DaemonClient::from_parts(File::from(OwnedFd::from(receiver)), 1);
+        assert!(matches!(
+            client.poll_event().unwrap(),
+            Some(ServerEvent::Control {
+                message: ServerMessage::Hello {
+                    protocol_version: 7
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            client.read_event().unwrap(),
+            Some(ServerEvent::Control {
+                message: ServerMessage::Hello {
+                    protocol_version: 9
+                },
+                ..
+            })
+        ));
+        assert!(client.read_event().unwrap().is_none());
     }
 }
