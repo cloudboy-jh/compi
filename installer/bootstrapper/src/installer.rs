@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use compi_client::theme::{ACCENT, BACKGROUND, BORDER, ERROR, FOREGROUND, MUTED, SURFACE};
+use compi_client::theme::{ThemeColors, ThemePreset};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, Focusable, IntoElement, ParentElement,
     PathBuilder, Render, Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
@@ -20,6 +20,7 @@ use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const WINDOW_WIDTH: f32 = 600.0;
 const WINDOW_HEIGHT: f32 = 460.0;
+const COLORS: &ThemeColors = ThemePreset::DarkGlass.colors();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallerOperation {
@@ -251,9 +252,9 @@ impl InstallerApp {
             .items_center()
             .justify_between()
             .pl_4()
-            .bg(rgb(SURFACE))
+            .bg(rgb(COLORS.surface))
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(COLORS.border))
             .window_control_area(WindowControlArea::Drag)
             .child(
                 div()
@@ -278,12 +279,12 @@ impl InstallerApp {
                         .items_center()
                         .justify_center()
                         .text_size(px(19.0))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(COLORS.muted))
                         .window_control_area(WindowControlArea::Close)
                         .hover(|style| {
                             style
                                 .bg(rgb(0x4a1f22))
-                                .text_color(rgb(FOREGROUND))
+                                .text_color(rgb(COLORS.foreground))
                                 .cursor_pointer()
                         })
                         .on_click(|_, window, _| window.remove_window())
@@ -345,7 +346,7 @@ impl InstallerApp {
                     .max_w(px(470.0))
                     .text_size(px(14.0))
                     .line_height(px(21.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(COLORS.muted))
                     .child(description),
             )
             .child(
@@ -365,7 +366,7 @@ impl InstallerApp {
                             .child(
                                 div()
                                     .text_size(px(12.0))
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(COLORS.muted))
                                     .child(destination),
                             ),
                     ),
@@ -386,7 +387,7 @@ impl InstallerApp {
                     .h(px(42.0))
                     .rounded_full()
                     .border_1()
-                    .border_color(rgb(ACCENT))
+                    .border_color(rgb(COLORS.accent))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -407,7 +408,7 @@ impl InstallerApp {
                 div()
                     .mt_2()
                     .text_size(px(13.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(COLORS.muted))
                     .child("Windows Installer is applying files and session registration."),
             )
     }
@@ -436,8 +437,8 @@ impl InstallerApp {
                     .w(px(42.0))
                     .h(px(42.0))
                     .rounded_full()
-                    .bg(rgb(ACCENT))
-                    .text_color(rgb(BACKGROUND))
+                    .bg(rgb(COLORS.accent))
+                    .text_color(rgb(COLORS.background))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -456,7 +457,7 @@ impl InstallerApp {
                 div()
                     .mt_2()
                     .text_size(px(13.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(COLORS.muted))
                     .child(detail),
             )
     }
@@ -472,7 +473,7 @@ impl InstallerApp {
                 div()
                     .text_size(px(12.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(ERROR))
+                    .text_color(rgb(COLORS.error))
                     .child("INSTALLATION STOPPED"),
             )
             .child(
@@ -488,14 +489,14 @@ impl InstallerApp {
                     .max_w(px(480.0))
                     .text_size(px(13.0))
                     .line_height(px(20.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(COLORS.muted))
                     .child(error.to_owned()),
             )
             .child(
                 div()
                     .mt_5()
                     .text_size(px(12.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(COLORS.muted))
                     .child(format!("Detailed log: {}", installer_log_path().display())),
             )
     }
@@ -512,11 +513,11 @@ impl InstallerApp {
             .justify_between()
             .px(px(38.0))
             .border_t_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(COLORS.border))
             .child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(COLORS.muted))
                     .child("Project files are never modified"),
             )
             .child(
@@ -531,8 +532,16 @@ impl InstallerApp {
                     .items_center()
                     .justify_center()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .bg(if enabled { rgb(ACCENT) } else { rgb(BORDER) })
-                    .text_color(if enabled { rgb(BACKGROUND) } else { rgb(MUTED) })
+                    .bg(if enabled {
+                        rgb(COLORS.accent)
+                    } else {
+                        rgb(COLORS.border)
+                    })
+                    .text_color(if enabled {
+                        rgb(COLORS.background)
+                    } else {
+                        rgb(COLORS.muted)
+                    })
                     .when(enabled, |button| {
                         button
                             .hover(|style| style.bg(rgb(0xcbea2f)).cursor_pointer())
@@ -569,8 +578,8 @@ impl Render for InstallerApp {
             .flex_col()
             .font_family("Segoe UI Variable")
             .text_size(px(13.0))
-            .text_color(rgb(FOREGROUND))
-            .bg(rgb(BACKGROUND))
+            .text_color(rgb(COLORS.foreground))
+            .bg(rgb(COLORS.background))
             .child(self.render_header())
             .child(content)
             .child(self.render_footer(cx))
@@ -602,17 +611,15 @@ fn status_row(ok: bool, label: &str) -> impl IntoElement {
         .flex()
         .items_center()
         .gap_3()
-        .child(
-            div()
-                .w(px(8.0))
-                .h(px(8.0))
-                .rounded_full()
-                .bg(rgb(if ok { ACCENT } else { ERROR })),
-        )
+        .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(if ok {
+            COLORS.accent
+        } else {
+            COLORS.error
+        })))
         .child(
             div()
                 .text_size(px(13.0))
-                .text_color(rgb(if ok { FOREGROUND } else { ERROR }))
+                .text_color(rgb(if ok { COLORS.foreground } else { COLORS.error }))
                 .child(label.to_owned()),
         )
 }
@@ -632,7 +639,7 @@ fn brand_mark() -> impl IntoElement {
             path.move_to(point(x(6.0), y(11.0)));
             path.line_to(point(x(10.0), y(5.0)));
             if let Ok(path) = path.build() {
-                window.paint_path(path, rgb(ACCENT));
+                window.paint_path(path, rgb(COLORS.accent));
             }
         },
     )
