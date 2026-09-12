@@ -3,21 +3,37 @@
 import argparse
 import json
 import subprocess
+import sys
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True)
     args = parser.parse_args()
-    metadata = json.loads(
-        subprocess.check_output(
-            [
-                "cargo", "metadata", "--locked", "--format-version", "1",
-                "--filter-platform", args.target,
-            ],
-            text=True,
-        )
-    )
+    command = [
+        "cargo", "metadata", "--locked", "--format-version", "1",
+        "--filter-platform", args.target,
+    ]
+    result = None
+    try:
+        result = subprocess.run(command, capture_output=True, check=True)
+        metadata = json.loads(result.stdout.decode("utf-8"))
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        if isinstance(error, subprocess.CalledProcessError):
+            status = error.returncode
+            stderr = error.stderr
+        elif result is not None:
+            status = result.returncode
+            stderr = result.stderr
+        else:
+            status = "not started"
+            stderr = b""
+        print(f"Dependency graph resolution failed for target {args.target}", file=sys.stderr)
+        print(f"Command: {subprocess.list2cmdline(command)}", file=sys.stderr)
+        print(f"Exit status: {status}", file=sys.stderr)
+        print(f"Reason: {error}", file=sys.stderr)
+        print(f"Stderr:\n{stderr.decode('utf-8', errors='replace').strip() or '(empty)'}", file=sys.stderr)
+        raise SystemExit(2) from None
     packages = {package["id"]: package["name"] for package in metadata["packages"]}
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
     members = {packages[identifier]: identifier for identifier in metadata["workspace_members"]}
