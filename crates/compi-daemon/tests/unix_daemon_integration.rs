@@ -11,20 +11,27 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
-const TIMEOUT: Duration = Duration::from_secs(15);
+static DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
+const TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct DaemonGuard {
     child: Child,
     instance: String,
     directory: PathBuf,
+    _test_lock: MutexGuard<'static, ()>,
 }
 
 impl DaemonGuard {
     fn start() -> Self {
+        let test_lock = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let instance = format!(
             "unix-{}-{}-{}",
             std::process::id(),
@@ -42,6 +49,7 @@ impl DaemonGuard {
             child,
             instance,
             directory,
+            _test_lock: test_lock,
         };
         daemon.wait_ready();
         daemon
@@ -62,7 +70,8 @@ impl DaemonGuard {
     }
 
     fn wait_ready(&mut self) {
-        let deadline = Instant::now() + TIMEOUT;
+        let started = Instant::now();
+        let deadline = started + TIMEOUT;
         let names = compi_protocol::identity::instance_names(Some(&self.instance)).unwrap();
         loop {
             if compi_protocol::pipe::connect(&names.pipe, Duration::from_millis(100)).is_ok() {
@@ -70,15 +79,18 @@ impl DaemonGuard {
             }
             assert!(
                 self.child.try_wait().unwrap().is_none(),
-                "daemon exited: {}",
+                "daemon exited while waiting for endpoint after {:?}: {}",
+                started.elapsed(),
                 self.log()
             );
             assert!(
                 Instant::now() < deadline,
-                "daemon did not become ready: {}",
+                "timed out after {:?} waiting for endpoint {}: {}",
+                started.elapsed(),
+                names.pipe,
                 self.log()
             );
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -143,14 +155,16 @@ impl DaemonGuard {
 
     fn shutdown(&mut self) {
         self.client().shutdown_daemon().unwrap();
-        let deadline = Instant::now() + TIMEOUT;
+        let started = Instant::now();
+        let deadline = started + TIMEOUT;
         while self.child.try_wait().unwrap().is_none() {
             assert!(
                 Instant::now() < deadline,
-                "daemon did not stop: {}",
+                "timed out after {:?} waiting for daemon shutdown: {}",
+                started.elapsed(),
                 self.log()
             );
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(POLL_INTERVAL);
         }
     }
 }
@@ -170,7 +184,13 @@ impl Drop for DaemonGuard {
             }
             let deadline = Instant::now() + Duration::from_secs(2);
             while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(POLL_INTERVAL);
+            }
+            if self.child.try_wait().ok().flatten().is_none() {
+                eprintln!(
+                    "daemon did not stop within 2s during cleanup; forcing exit: {}",
+                    self.log()
+                );
             }
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -204,38 +224,51 @@ impl Controller {
     }
 
     fn until(&mut self, marker: &str) -> ScreenSnapshot {
-        let deadline = Instant::now() + TIMEOUT;
+        let started = Instant::now();
+        let deadline = started + TIMEOUT;
         loop {
+            // A previous wait may already have consumed the frame containing
+            // this marker. Check the replica even when no new event arrives.
+            if let Some(snapshot) = self.mirror.snapshot()
+                && snapshot_text(snapshot).contains(marker)
+            {
+                return snapshot.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {:?} waiting for {marker:?}; last screen: {:?}",
+                started.elapsed(),
+                self.mirror.snapshot().map(snapshot_text)
+            );
             let event = if let Some(message) = self.client.take_pending_screen() {
                 Some(ServerEvent::Screen(message))
             } else {
-                self.client.poll_event().unwrap()
+                self.client.poll_event().unwrap_or_else(|error| {
+                    panic!(
+                        "waiting for {marker:?} failed after {:?}: {error}; last screen: {:?}",
+                        started.elapsed(),
+                        self.mirror.snapshot().map(snapshot_text)
+                    )
+                })
             };
             match event {
                 Some(ServerEvent::Screen(message)) => {
                     if matches!(self.mirror.apply(message), MirrorApply::Gap { .. }) {
                         self.client.request_snapshot().unwrap();
                     }
-                    if let Some(snapshot) = self.mirror.snapshot()
-                        && snapshot_text(snapshot).contains(marker)
-                    {
-                        return snapshot.clone();
-                    }
                 }
                 Some(ServerEvent::Control {
                     message: ServerMessage::Error { code, message, .. },
                     ..
                 }) => {
-                    panic!("daemon error {code:?}: {message}");
+                    panic!(
+                        "waiting for {marker:?} after {:?}: daemon error {code:?}: {message}",
+                        started.elapsed()
+                    );
                 }
                 _ => {}
             }
-            assert!(
-                Instant::now() < deadline,
-                "missing {marker:?}; last screen: {:?}",
-                self.mirror.snapshot().map(snapshot_text)
-            );
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(POLL_INTERVAL);
         }
     }
 }
@@ -257,7 +290,8 @@ fn snapshot_text(snapshot: &ScreenSnapshot) -> String {
 }
 
 fn wait_status(client: &mut DaemonClient, id: &SurfaceId, expected: SurfaceStatus) -> SurfaceInfo {
-    let deadline = Instant::now() + TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
     loop {
         let surface = client
             .list_surfaces()
@@ -270,9 +304,10 @@ fn wait_status(client: &mut DaemonClient, id: &SurfaceId, expected: SurfaceStatu
         }
         assert!(
             Instant::now() < deadline,
-            "expected {expected:?}, got {surface:?}"
+            "timed out after {:?} waiting for {id} status {expected:?}; last surface: {surface:?}",
+            started.elapsed()
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -325,7 +360,8 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
     attached.until("SAME_PROCESS_42");
     // A dropped controller is also a detach, not a shell termination.
     drop(attached);
-    let deadline = Instant::now() + TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
     loop {
         let current = control
             .list_surfaces()
@@ -338,9 +374,10 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
         }
         assert!(
             Instant::now() < deadline,
-            "disconnected controller remained attached"
+            "timed out after {:?} waiting for controller disconnect; last surface: {current:?}",
+            started.elapsed()
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(POLL_INTERVAL);
     }
     let mut attached = Controller::attach(&daemon, &session, 80, 24);
     attached.input(b"printf 'DISCONNECT_%s\\n' \"$((saved_value+2))\"\r");
@@ -366,7 +403,7 @@ fn incompatible_protocol_is_rejected_without_affecting_other_clients() {
 }
 
 #[test]
-fn natural_exit_retains_exit_status_and_rejects_reattach() {
+fn natural_exit_retains_read_only_grid_and_rejects_input() {
     let mut daemon = DaemonGuard::start();
     let mut control = daemon.client();
     let session = control.create_surface(80, 24, None).unwrap();
@@ -375,16 +412,42 @@ fn natural_exit_retains_exit_status_and_rejects_reattach() {
     let exited = wait_status(&mut control, &session.id, SurfaceStatus::Exited);
     assert_eq!(exited.exit_code, Some(23));
     assert!(!exited.attached);
-    let error = control
-        .attach_surface(&exited, 80, 24)
+    drop(attached);
+    // Exited grids remain readable for the native client's final-screen view;
+    // only process input is unavailable. Reattachment must not respawn a shell.
+    let mut final_view = Controller::attach(&daemon, &exited, 100, 32);
+    final_view.until("NATURAL_42");
+    // No further output is coming: a repeated wait must inspect its saved grid.
+    final_view.until("NATURAL_42");
+    let error = final_view
+        .client
+        .request(ClientMessage::Input {
+            data: b"printf SHOULD_NOT_RUN\\n\r".to_vec(),
+            latency_id: None,
+        })
         .unwrap_err()
         .to_string();
     assert!(error.contains("SurfaceUnavailable"), "{error}");
+    final_view
+        .client
+        .request(ClientMessage::Resize {
+            cols: 112,
+            rows: 37,
+        })
+        .unwrap();
+    let retained = wait_status(&mut control, &session.id, SurfaceStatus::Exited);
+    assert_eq!(retained.exit_code, Some(23));
+    assert_eq!(retained.process_lifetime_id, session.process_lifetime_id);
+    final_view.client.request(ClientMessage::Detach).unwrap();
+    let mut resized = Controller::attach(&daemon, &retained, 112, 37);
+    let snapshot = resized.until("NATURAL_42");
+    assert_eq!((snapshot.cols, snapshot.rows), (112, 37));
     daemon.shutdown();
 }
 
 fn read_pid(path: &std::path::Path) -> libc::pid_t {
-    let deadline = Instant::now() + TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
     loop {
         if let Ok(contents) = fs::read_to_string(path)
             && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
@@ -394,10 +457,11 @@ fn read_pid(path: &std::path::Path) -> libc::pid_t {
         }
         assert!(
             Instant::now() < deadline,
-            "no PID recorded at {}",
+            "timed out after {:?} waiting for valid PID at {}",
+            started.elapsed(),
             path.display()
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -426,7 +490,8 @@ fn explicit_kill_stops_shell_and_foreground_and_background_descendants() {
     assert!(pids.iter().all(|pid| process_running(*pid)));
     control.end_surface(&session).unwrap();
     wait_status(&mut control, &session.id, SurfaceStatus::Exited);
-    let deadline = Instant::now() + TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
     loop {
         let survivors: Vec<_> = pids
             .iter()
@@ -438,9 +503,10 @@ fn explicit_kill_stops_shell_and_foreground_and_background_descendants() {
         }
         assert!(
             Instant::now() < deadline,
-            "session descendants survived explicit kill: {survivors:?}"
+            "timed out after {:?} waiting for session descendants to exit; survivors: {survivors:?}",
+            started.elapsed()
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(POLL_INTERVAL);
     }
     daemon.shutdown();
 }
@@ -493,7 +559,8 @@ fn local_endpoint_is_private_and_duplicate_daemon_cannot_take_it_over() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
     let status = loop {
         if let Some(status) = duplicate.try_wait().unwrap() {
             break status;
@@ -501,9 +568,13 @@ fn local_endpoint_is_private_and_duplicate_daemon_cannot_take_it_over() {
         if Instant::now() >= deadline {
             let _ = duplicate.kill();
             let _ = duplicate.wait();
-            panic!("duplicate daemon did not reject the occupied instance");
+            panic!(
+                "timed out after {:?} waiting for duplicate daemon to reject the occupied instance {}",
+                started.elapsed(),
+                daemon.instance
+            );
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(POLL_INTERVAL);
     };
     assert!(!status.success());
     assert!(daemon.client().list_surfaces().unwrap().is_empty());

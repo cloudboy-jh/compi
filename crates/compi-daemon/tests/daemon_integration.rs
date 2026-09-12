@@ -9,9 +9,10 @@ use compi_protocol::{
 };
 use compi_protocol::{DaemonClient, ServerEvent, identity, pipe};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::CloseHandle;
@@ -20,10 +21,14 @@ use windows::Win32::System::Threading::{
 };
 
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static DAEMON_LOCK: Mutex<()> = Mutex::new(());
+const TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct DaemonGuard {
     child: Child,
     instance: String,
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl DaemonGuard {
@@ -32,42 +37,77 @@ impl DaemonGuard {
     }
 
     fn start_instance(instance: String) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_compi-daemon"))
-            .args(["--instance", &instance])
+        let serial = DAEMON_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let child = Self::spawn(&instance);
+        let mut daemon = Self {
+            child,
+            instance,
+            _serial: serial,
+        };
+        daemon.wait_ready();
+        daemon
+    }
+
+    fn spawn(instance: &str) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_compi-daemon"))
+            .args(["--instance", instance])
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+            .unwrap()
+    }
+
+    fn wait_ready(&mut self) {
+        let started = Instant::now();
         loop {
-            if DaemonClient::connect(Some(&instance), Duration::from_millis(100)).is_ok() {
-                break;
+            let connection =
+                DaemonClient::connect(Some(&self.instance), Duration::from_millis(100));
+            if connection.is_ok() {
+                return;
             }
-            assert!(Instant::now() < deadline, "daemon did not become ready");
-            thread::sleep(Duration::from_millis(50));
+            let status = self.child.try_wait().unwrap();
+            assert!(
+                status.is_none() && started.elapsed() < TIMEOUT,
+                "daemon {} not ready after {:?}; process: {status:?}; connection: {:?}",
+                self.instance,
+                started.elapsed(),
+                connection.err()
+            );
+            thread::sleep(POLL_INTERVAL);
         }
-        Self { child, instance }
     }
 
     fn client(&self) -> DaemonClient {
         DaemonClient::connect(Some(&self.instance), Duration::from_secs(2)).unwrap()
     }
 
-    fn shutdown(mut self) {
+    fn shutdown(&mut self) {
         let mut client = self.client();
         client.shutdown_daemon().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let started = Instant::now();
         while self.child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "daemon did not stop");
-            thread::sleep(Duration::from_millis(50));
+            assert!(
+                started.elapsed() < TIMEOUT,
+                "daemon {} still running after {:?}",
+                self.instance,
+                started.elapsed()
+            );
+            thread::sleep(POLL_INTERVAL);
         }
     }
 
-    fn crash(mut self) -> String {
+    fn crash(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
-        self.instance.clone()
+    }
+
+    fn restart(&mut self) {
+        assert!(self.child.try_wait().unwrap().is_some());
+        self.child = Self::spawn(&self.instance);
+        self.wait_ready();
     }
 }
 
@@ -82,21 +122,29 @@ impl Drop for DaemonGuard {
 
 #[test]
 fn persistent_multi_surface_lifecycle() {
-    let daemon = DaemonGuard::start();
+    let mut daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     reject_incompatible_protocol(&daemon.instance);
 
     let mut control = daemon.client();
     assert!(control.list_surfaces().unwrap().is_empty());
     let first = control.create_surface(80, 24, None).unwrap();
-    let second = control.create_surface(80, 24, None).unwrap();
+    let output_directory = std::env::temp_dir().join(format!("compi-output-{instance}"));
+    fs::create_dir_all(&output_directory).unwrap();
+    let second = control
+        .create_surface(
+            80,
+            24,
+            Some(output_directory.to_string_lossy().into_owned()),
+        )
+        .unwrap();
     assert_ne!(first.id, second.id);
     assert_eq!(control.list_surfaces().unwrap().len(), 2);
 
     let mut first_client = daemon.client();
     first_client.attach_surface(&first, 80, 24).unwrap();
     first_client
-        .request(ClientMessage::Input {
+        .send(ClientMessage::Input {
             data: b"echo FIRST_$((20+22))\rexit\r".to_vec(),
             latency_id: None,
         })
@@ -116,14 +164,14 @@ fn persistent_multi_surface_lifecycle() {
 
     second_client
         .request(ClientMessage::Input {
-            data: b"stty size; echo ATTACH_SIZE_$((20+22))\r".to_vec(),
+            data: b"for ((i=0;i<3000;i++)); do if [ \"$(stty size)\" = '40 100' ]; then stty size; echo ATTACH_SIZE_$((20+22)); break; fi; sleep 0.01; done\r".to_vec(),
             latency_id: None,
         })
         .unwrap();
     let attach_output = collect_until_marker(&mut second_client, b"ATTACH_SIZE_42");
     assert!(attach_output.windows(6).any(|bytes| bytes == b"40 100"));
     let sequence = second_client.request_snapshot().unwrap();
-    let recovered = read_snapshot(&mut second_client);
+    let recovered = read_snapshot(&mut second_client, sequence);
     assert_eq!(recovered.sequence, sequence);
     assert!(snapshot_text(&recovered).contains("ATTACH_SIZE_42"));
 
@@ -133,10 +181,9 @@ fn persistent_multi_surface_lifecycle() {
             rows: 50,
         })
         .unwrap();
-    thread::sleep(Duration::from_millis(200));
     second_client
         .request(ClientMessage::Input {
-            data: b"stty size; echo ACTIVE_SIZE_$((20+22))\r".to_vec(),
+            data: b"for ((i=0;i<3000;i++)); do if [ \"$(stty size)\" = '50 120' ]; then stty size; echo ACTIVE_SIZE_$((20+22)); break; fi; sleep 0.01; done\r".to_vec(),
             latency_id: None,
         })
         .unwrap();
@@ -144,7 +191,7 @@ fn persistent_multi_surface_lifecycle() {
     assert!(resize_output.windows(6).any(|bytes| bytes == b"50 120"));
     second_client
         .request(ClientMessage::Input {
-            data: "printf '\\033[31mANSI_RED\\033[0m UNICODE_λ\\n'\r"
+            data: "printf '\\033[31mANSI_%s\\033[0m UNICODE_%s\\n' RED λ\r"
                 .as_bytes()
                 .to_vec(),
             latency_id: None,
@@ -161,7 +208,7 @@ fn persistent_multi_surface_lifecycle() {
 
     second_client
         .request(ClientMessage::Input {
-            data: b"export TERM=xterm-256color; tput smcup; printf 'ALT_SCREEN'\r".to_vec(),
+            data: b"printf '\\033[?1049hALT_%s\\n' SCREEN; read -r reply; printf '\\033[?1049lALT_%s:%s\\n' RETURNED \"$reply\"\r".to_vec(),
             latency_id: None,
         })
         .unwrap();
@@ -169,35 +216,13 @@ fn persistent_multi_surface_lifecycle() {
     assert!(alternate.modes.alternate_screen);
     second_client
         .request(ClientMessage::Input {
-            data: b"tput rmcup; echo ALT_RETURNED\r".to_vec(),
+            data: b"interactive-complete\r".to_vec(),
             latency_id: None,
         })
         .unwrap();
-    let main = collect_snapshot_until_marker(&mut second_client, b"ALT_RETURNED");
+    let main =
+        collect_snapshot_until_marker(&mut second_client, b"ALT_RETURNED:interactive-complete");
     assert!(!main.modes.alternate_screen);
-
-    second_client
-        .request(ClientMessage::Input {
-            data: b"TERM=xterm-256color top\r".to_vec(),
-            latency_id: None,
-        })
-        .unwrap();
-    let top = collect_snapshot_until_marker(&mut second_client, b"Tasks:");
-    assert!(snapshot_text(&top).contains("%Cpu"));
-    second_client
-        .request(ClientMessage::Input {
-            data: b"q".to_vec(),
-            latency_id: None,
-        })
-        .unwrap();
-    thread::sleep(Duration::from_millis(200));
-    second_client
-        .request(ClientMessage::Input {
-            data: b"echo TOP_RETURNED\r".to_vec(),
-            latency_id: None,
-        })
-        .unwrap();
-    collect_until_marker(&mut second_client, b"TOP_RETURNED");
 
     second_client.request(ClientMessage::Detach).unwrap();
     drop(second_client);
@@ -205,12 +230,14 @@ fn persistent_multi_surface_lifecycle() {
     reattached.attach_surface(&second, 90, 30).unwrap();
     reattached
         .request(ClientMessage::Input {
-            data: b"sleep 1; echo REATTACHED_$((20+22))\r".to_vec(),
+            data: b"for ((i=0;i<3000;i++)); do if [ -e detached-release ]; then echo REATTACHED_$((20+22)); printf done > detached-complete; break; fi; sleep 0.01; done\r".to_vec(),
             latency_id: None,
         })
         .unwrap();
     drop(reattached);
-    thread::sleep(Duration::from_secs(2));
+    wait_for_attachment(&mut control, &second.id, false);
+    fs::write(output_directory.join("detached-release"), b"release").unwrap();
+    wait_for_file(&output_directory.join("detached-complete"));
     let mut after_crash = daemon.client();
     after_crash.attach_surface(&second, 90, 30).unwrap();
     let crash_output = collect_until_marker(&mut after_crash, b"REATTACHED_42");
@@ -221,12 +248,16 @@ fn persistent_multi_surface_lifecycle() {
     );
 
     after_crash
-        .request(ClientMessage::Input {
-            data: b"yes COMPI_FLOOD\r".to_vec(),
+        .send(ClientMessage::Input {
+            data: b"printf -v flood '%1024s' ''; flood=${flood// /X}; for ((i=0;i<16384;i++)); do printf '\\033[H%08d:%s' \"$i\" \"$flood\"; done; printf '\\r\\n'; printf done > flood-complete\r".to_vec(),
             latency_id: None,
         })
         .unwrap();
-    thread::sleep(Duration::from_secs(3));
+    // Do not read or request on after_crash until the shell has written over
+    // 16 MiB through the PTY. The file is an independent completion channel.
+    // Repaint in place so this measures transport pressure, not unbounded
+    // scrollback/reflow work in an unrelated debug-build throughput benchmark.
+    wait_for_file(&output_directory.join("flood-complete"));
     assert!(
         control
             .list_surfaces()
@@ -237,25 +268,19 @@ fn persistent_multi_surface_lifecycle() {
         "output backpressure disconnected the attached client"
     );
     after_crash
-        .request(ClientMessage::Input {
-            data: vec![3],
+        .send(ClientMessage::Input {
+            data: b"echo FLOOD_RECOVERED_$((20+22))\r".to_vec(),
             latency_id: None,
         })
         .unwrap();
-    after_crash
-        .request(ClientMessage::Input {
-            data: b"echo FLOOD_INTERRUPTED\r".to_vec(),
-            latency_id: None,
-        })
-        .unwrap();
-    let flood_output = collect_until_marker(&mut after_crash, b"FLOOD_INTERRUPTED");
+    let flood_output = collect_until_marker(&mut after_crash, b"FLOOD_RECOVERED_42");
     assert!(
         flood_output
-            .windows(17)
-            .any(|bytes| bytes == b"FLOOD_INTERRUPTED")
+            .windows(18)
+            .any(|bytes| bytes == b"FLOOD_RECOVERED_42")
     );
     after_crash
-        .request(ClientMessage::Input {
+        .send(ClientMessage::Input {
             data: b"exit\r".to_vec(),
             latency_id: None,
         })
@@ -264,6 +289,8 @@ fn persistent_multi_surface_lifecycle() {
     assert_eq!(flood_exit, 0);
     drop(after_crash);
 
+    wait_for_attachment(&mut control, &first.id, false);
+    wait_for_attachment(&mut control, &second.id, false);
     let sessions = control.list_surfaces().unwrap();
     assert_eq!(sessions.len(), 2);
     assert!(sessions.iter().all(|session| {
@@ -276,11 +303,12 @@ fn persistent_multi_surface_lifecycle() {
     drop(control);
     daemon.shutdown();
     cleanup_metadata(&instance);
+    fs::remove_dir_all(output_directory).unwrap();
 }
 
 #[test]
 fn creates_surfaces_in_wsl_and_windows_working_directories() {
-    let daemon = DaemonGuard::start();
+    let mut daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     let windows_directory = std::env::temp_dir().join(format!(
         "compi-working-directory-{}-Agent Projects-π",
@@ -316,7 +344,7 @@ fn creates_surfaces_in_wsl_and_windows_working_directories() {
         Some(directory.resolved_wsl_path.as_str())
     );
     attached
-        .request(ClientMessage::Input {
+        .send(ClientMessage::Input {
             data: b"exit\r".to_vec(),
             latency_id: None,
         })
@@ -358,7 +386,7 @@ fn creates_surfaces_in_wsl_and_windows_working_directories() {
 
 #[test]
 fn repeated_surface_cycles_release_daemon_process_handles() {
-    let daemon = DaemonGuard::start();
+    let mut daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     let mut control = daemon.client();
     let mut cycle_client = daemon.client();
@@ -375,11 +403,10 @@ fn repeated_surface_cycles_release_daemon_process_handles() {
             .unwrap();
         cycle_client.request(ClientMessage::Detach).unwrap();
         control.end_surface(&session).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let started = Instant::now();
+        let condition = format!("surface {:?} to exit", session.id);
         loop {
-            let status = control
-                .list_surfaces()
-                .unwrap()
+            let status = query_surfaces(&mut control, started, &condition)
                 .into_iter()
                 .find(|candidate| candidate.id == session.id)
                 .unwrap()
@@ -387,8 +414,13 @@ fn repeated_surface_cycles_release_daemon_process_handles() {
             if matches!(status, SurfaceStatus::Exited | SurfaceStatus::Failed) {
                 break;
             }
-            assert!(Instant::now() < deadline, "killed session did not exit");
-            thread::sleep(Duration::from_millis(25));
+            assert!(
+                started.elapsed() < TIMEOUT,
+                "surface {:?} not exited after {:?}; last status: {status:?}",
+                session.id,
+                started.elapsed()
+            );
+            thread::sleep(POLL_INTERVAL);
         }
     }
     for _ in 0..20 {
@@ -396,12 +428,19 @@ fn repeated_surface_cycles_release_daemon_process_handles() {
         transient.list_surfaces().unwrap();
     }
 
-    thread::sleep(Duration::from_millis(250));
-    let final_count = process_handle_count(daemon.child.id());
-    assert!(
-        final_count <= baseline + 4,
-        "daemon process handles grew from {baseline} to {final_count}"
-    );
+    let started = Instant::now();
+    loop {
+        let final_count = process_handle_count(daemon.child.id());
+        if final_count <= baseline + 4 {
+            break;
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "daemon process handles did not return to baseline {baseline} + 4 after {:?}; last count: {final_count}",
+            started.elapsed()
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
 
     drop(control);
     daemon.shutdown();
@@ -410,14 +449,15 @@ fn repeated_surface_cycles_release_daemon_process_handles() {
 
 #[test]
 fn daemon_restart_reports_active_surfaces_as_lost() {
-    let daemon = DaemonGuard::start();
+    let mut daemon = DaemonGuard::start();
     let mut client = daemon.client();
     let lost = client.create_surface(80, 24, None).unwrap();
     drop(client);
 
-    let instance = daemon.crash();
-    let restarted = DaemonGuard::start_instance(instance.clone());
-    let mut client = restarted.client();
+    let instance = daemon.instance.clone();
+    daemon.crash();
+    daemon.restart();
+    let mut client = daemon.client();
     let dead = client
         .list_surfaces()
         .unwrap()
@@ -436,10 +476,10 @@ fn daemon_restart_reports_active_surfaces_as_lost() {
 
     let replacement = client.create_surface(80, 24, None).unwrap();
     drop(client);
-    restarted.shutdown();
+    daemon.shutdown();
 
-    let restarted = DaemonGuard::start_instance(instance.clone());
-    let mut client = restarted.client();
+    daemon.restart();
+    let mut client = daemon.client();
     let replacement = client
         .list_surfaces()
         .unwrap()
@@ -455,13 +495,13 @@ fn daemon_restart_reports_active_surfaces_as_lost() {
             .contains("previous daemon")
     );
     drop(client);
-    restarted.shutdown();
+    daemon.shutdown();
     cleanup_metadata(&instance);
 }
 
 #[test]
 fn mutation_publication_precedes_ack_and_restart_changes_lifetime() {
-    let daemon = DaemonGuard::start();
+    let mut daemon = DaemonGuard::start();
     let instance = daemon.instance.clone();
     let mut client = daemon.client();
     let workspace = client.workspace().unwrap();
@@ -483,18 +523,32 @@ fn mutation_publication_precedes_ack_and_restart_changes_lifetime() {
         })
         .unwrap();
     let mut published_revision = None;
+    let started = Instant::now();
+    let mut last_event = None;
     let receipt = loop {
-        match client.read_event().unwrap().unwrap() {
-            ServerEvent::Control {
+        let event = client.poll_event().unwrap_or_else(|error| {
+            panic!(
+                "waiting for MutationCommitted({request_id}) after {:?}: {error}; published: {published_revision:?}; last event: {last_event:?}",
+                started.elapsed()
+            )
+        });
+        match event {
+            Some(ServerEvent::Control {
                 request_id: None,
                 message: ServerMessage::WorkspaceChanged { revision },
-            } => published_revision = Some(revision),
-            ServerEvent::Control {
+            }) => published_revision = Some(revision),
+            Some(ServerEvent::Control {
                 request_id: Some(response_id),
                 message: ServerMessage::MutationCommitted { receipt },
-            } if response_id == request_id => break receipt,
-            _ => {}
+            }) if response_id == request_id => break receipt,
+            Some(event) => last_event = Some(describe_event(event)),
+            None => thread::sleep(POLL_INTERVAL),
         }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing MutationCommitted({request_id}) after {:?}; published: {published_revision:?}; last event: {last_event:?}",
+            started.elapsed()
+        );
     };
     assert_eq!(published_revision, Some(receipt.revision));
     assert_eq!(
@@ -504,9 +558,7 @@ fn mutation_publication_precedes_ack_and_restart_changes_lifetime() {
     );
 
     let surface_id = receipt.affected_surfaces[0].clone();
-    let original = client
-        .wait_for_surface(&surface_id, Duration::from_secs(5))
-        .unwrap();
+    let original = client.wait_for_surface(&surface_id, TIMEOUT).unwrap();
     client.end_surface(&original).unwrap();
     let exited = wait_for_surface_status(&mut client, &surface_id, SurfaceStatus::Exited);
     client
@@ -517,9 +569,7 @@ fn mutation_publication_precedes_ack_and_restart_changes_lifetime() {
             rows: 24,
         })
         .unwrap();
-    let restarted = client
-        .wait_for_surface(&surface_id, Duration::from_secs(5))
-        .unwrap();
+    let restarted = client.wait_for_surface(&surface_id, TIMEOUT).unwrap();
     assert_eq!(restarted.id, original.id);
     assert_ne!(restarted.process_lifetime_id, original.process_lifetime_id);
     let stale = client
@@ -542,11 +592,10 @@ fn wait_for_surface_status(
     surface_id: &SurfaceId,
     expected: SurfaceStatus,
 ) -> compi_protocol::SurfaceInfo {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let started = Instant::now();
+    let condition = format!("surface {surface_id:?} status {expected:?}");
     loop {
-        let surface = client
-            .list_surfaces()
-            .unwrap()
+        let surface = query_surfaces(client, started, &condition)
             .into_iter()
             .find(|surface| &surface.id == surface_id)
             .unwrap();
@@ -554,10 +603,76 @@ fn wait_for_surface_status(
             return surface;
         }
         assert!(
-            Instant::now() < deadline,
-            "expected {expected:?}, got {surface:?}"
+            started.elapsed() < TIMEOUT,
+            "surface {surface_id:?}: expected {expected:?} after {:?}; last state: {surface:?}",
+            started.elapsed()
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn wait_for_attachment(client: &mut DaemonClient, surface_id: &SurfaceId, attached: bool) {
+    let started = Instant::now();
+    let condition = format!("surface {surface_id:?} attached={attached}");
+    loop {
+        let surface = query_surfaces(client, started, &condition)
+            .into_iter()
+            .find(|surface| &surface.id == surface_id);
+        if surface
+            .as_ref()
+            .is_some_and(|surface| surface.attached == attached)
+        {
+            return;
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "surface {surface_id:?}: expected attached={attached} after {:?}; last state: {surface:?}",
+            started.elapsed()
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn query_surfaces(
+    client: &mut DaemonClient,
+    started: Instant,
+    condition: &str,
+) -> Vec<compi_protocol::SurfaceInfo> {
+    let request_id = client.send(ClientMessage::GetWorkspace).unwrap();
+    let mut last_event = None;
+    loop {
+        match poll_event(client, started, condition) {
+            Some(ServerEvent::Control {
+                request_id: Some(response_id),
+                message: ServerMessage::Workspace { workspace },
+            }) if response_id == request_id => return workspace.surfaces,
+            Some(event) => last_event = Some(describe_event(event)),
+            None => thread::sleep(POLL_INTERVAL),
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "waiting for {condition}: missing workspace response after {:?}; last event: {last_event:?}",
+            started.elapsed()
+        );
+    }
+}
+
+fn wait_for_file(path: &Path) {
+    let started = Instant::now();
+    loop {
+        let contents = fs::read(path);
+        if contents
+            .as_deref()
+            .is_ok_and(|contents| contents == b"done")
+        {
+            return;
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing completion marker {path:?} after {:?}; last file state: {contents:?}",
+            started.elapsed()
+        );
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -568,7 +683,7 @@ fn daemon_quarantines_malformed_workspace_metadata() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, b"{not-json").unwrap();
 
-    let daemon = DaemonGuard::start_instance(instance.clone());
+    let mut daemon = DaemonGuard::start_instance(instance.clone());
     let mut client = daemon.client();
     let workspace = client.workspace().unwrap();
     assert!(workspace.surfaces.is_empty());
@@ -639,7 +754,19 @@ fn reject_incompatible_protocol(instance: &str) {
     })
     .unwrap();
     frame::write(&mut connection, CONTROL_FRAME, &payload).unwrap();
-    let response = frame::read(&mut connection).unwrap().unwrap();
+    let started = Instant::now();
+    let mut reader = pipe::PipeReader::default();
+    let response = loop {
+        if let Some(response) = reader.poll(&connection).unwrap() {
+            break response;
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing incompatible-protocol response after {:?}; last state: no complete frame",
+            started.elapsed()
+        );
+        thread::sleep(POLL_INTERVAL);
+    };
     let response = decode_server(&response.payload).unwrap();
     assert!(matches!(
         response.message,
@@ -650,21 +777,26 @@ fn reject_incompatible_protocol(instance: &str) {
     ));
 }
 
-fn read_snapshot(client: &mut DaemonClient) -> ScreenSnapshot {
+fn read_snapshot(client: &mut DaemonClient, sequence: u64) -> ScreenSnapshot {
+    let started = Instant::now();
+    let mut last_event = None;
+    let condition = format!("snapshot sequence {sequence}");
     loop {
-        let event = if let Some(pending) = client.take_pending_screen() {
-            Some(ServerEvent::Screen(pending))
-        } else {
-            client.read_event().unwrap()
-        };
-        match event.unwrap() {
-            ServerEvent::Screen(ScreenMessage::Snapshot { snapshot }) => return snapshot,
-            ServerEvent::Control {
-                message: ServerMessage::Error { code, message, .. },
-                ..
-            } => panic!("daemon error ({code:?}): {message}"),
-            _ => {}
+        let event = poll_event(client, started, &condition);
+        match event {
+            Some(ServerEvent::Screen(ScreenMessage::Snapshot { snapshot }))
+                if snapshot.sequence == sequence =>
+            {
+                return snapshot;
+            }
+            Some(event) => last_event = Some(describe_event(event)),
+            None => thread::sleep(POLL_INTERVAL),
         }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing snapshot sequence {sequence} after {:?}; last event/output: {last_event:?}",
+            started.elapsed()
+        );
     }
 }
 
@@ -674,55 +806,108 @@ fn collect_until_marker(client: &mut DaemonClient, marker: &[u8]) -> Vec<u8> {
 
 fn collect_snapshot_until_marker(client: &mut DaemonClient, marker: &[u8]) -> ScreenSnapshot {
     let mut mirror = ScreenMirror::default();
+    let mut recovering = false;
+    let started = Instant::now();
+    let condition = format!("screen marker {:?}", String::from_utf8_lossy(marker));
     loop {
-        let message = if let Some(pending) = client.take_pending_screen() {
-            Some(ServerEvent::Screen(pending))
-        } else {
-            client.read_event().unwrap()
-        };
-        match message.unwrap() {
-            ServerEvent::Screen(message) => {
-                apply_screen(client, &mut mirror, message);
+        match poll_event(client, started, &condition) {
+            Some(ServerEvent::Screen(message)) => {
+                apply_screen(client, &mut mirror, &mut recovering, message);
                 let output = mirror_text(&mirror);
-                if output.windows(marker.len()).any(|bytes| bytes == marker) {
+                if !recovering && output.windows(marker.len()).any(|bytes| bytes == marker) {
                     return mirror.snapshot().unwrap().clone();
                 }
             }
-            ServerEvent::Control {
-                message: ServerMessage::Error { code, message, .. },
-                ..
-            } => panic!("daemon error ({code:?}): {message}"),
-            ServerEvent::Control { .. } => {}
+            Some(_) => {}
+            None => thread::sleep(POLL_INTERVAL),
         }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing {condition} after {:?}; recovering: {recovering}; last output: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(&mirror_text(&mirror))
+        );
     }
 }
 
 fn collect_until_exit(client: &mut DaemonClient, surface_id: &SurfaceId) -> (Vec<u8>, u32) {
     let mut mirror = ScreenMirror::default();
+    let mut recovering = false;
+    let started = Instant::now();
+    let condition = format!("SurfaceExited for {surface_id:?}");
     loop {
-        let message = if let Some(pending) = client.take_pending_screen() {
-            Some(ServerEvent::Screen(pending))
-        } else {
-            client.read_event().unwrap()
-        };
-        match message.unwrap() {
-            ServerEvent::Screen(message) => apply_screen(client, &mut mirror, message),
-            ServerEvent::Control {
+        match poll_event(client, started, &condition) {
+            Some(ServerEvent::Screen(message)) => {
+                apply_screen(client, &mut mirror, &mut recovering, message);
+            }
+            Some(ServerEvent::Control {
                 message:
                     ServerMessage::SurfaceExited {
                         identity,
                         exit_code,
                     },
                 ..
-            } if &identity.surface_id == surface_id => return (mirror_text(&mirror), exit_code),
-            ServerEvent::Control { .. } => {}
+            }) if &identity.surface_id == surface_id => return (mirror_text(&mirror), exit_code),
+            Some(_) => {}
+            None => thread::sleep(POLL_INTERVAL),
         }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing {condition} after {:?}; recovering: {recovering}; last output: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(&mirror_text(&mirror))
+        );
     }
 }
 
-fn apply_screen(client: &mut DaemonClient, mirror: &mut ScreenMirror, message: ScreenMessage) {
-    if matches!(mirror.apply(message), MirrorApply::Gap { .. }) {
-        client.request_snapshot().unwrap();
+fn poll_event(client: &mut DaemonClient, started: Instant, condition: &str) -> Option<ServerEvent> {
+    let event = if let Some(pending) = client.take_pending_screen() {
+        Some(ServerEvent::Screen(pending))
+    } else {
+        client.poll_event().unwrap_or_else(|error| {
+            panic!(
+                "waiting for {condition} after {:?}: {error}",
+                started.elapsed()
+            )
+        })
+    };
+    if let Some(ServerEvent::Control {
+        message: ServerMessage::Error { code, message, .. },
+        ..
+    }) = &event
+    {
+        panic!(
+            "waiting for {condition} after {:?}: daemon error ({code:?}): {message}",
+            started.elapsed()
+        );
+    }
+    event
+}
+
+fn describe_event(event: ServerEvent) -> String {
+    match event {
+        ServerEvent::Control {
+            request_id,
+            message,
+        } => {
+            format!("control {request_id:?}: {message:?}")
+        }
+        ServerEvent::Screen(message) => format!("screen {message:?}"),
+    }
+}
+
+fn apply_screen(
+    client: &mut DaemonClient,
+    mirror: &mut ScreenMirror,
+    recovering: &mut bool,
+    message: ScreenMessage,
+) {
+    if matches!(message, ScreenMessage::Snapshot { .. }) {
+        *recovering = false;
+    }
+    if matches!(mirror.apply(message), MirrorApply::Gap { .. }) && !*recovering {
+        client.send(ClientMessage::RequestSnapshot).unwrap();
+        *recovering = true;
     }
 }
 

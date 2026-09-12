@@ -1179,7 +1179,18 @@ impl ConnectionSink {
                 while let Ok(message) = receiver.recv() {
                     writer_queued_frames.fetch_sub(1, Ordering::AcqRel);
                     let mut writer = &*writer_connection;
-                    let write_result = frame::write(&mut writer, message.kind, &message.payload);
+                    let write_result = frame::write(&mut writer, message.kind, &message.payload)
+                        .map_err(Into::into)
+                        .and_then(|()| {
+                            // DisconnectNamedPipe discards unread bytes. A synchronous
+                            // response must be consumed before its handler tears down
+                            // the connection; the caller's timeout cancels stalled IO.
+                            if message.acknowledgement.is_some() {
+                                pipe::flush(&writer_connection)
+                            } else {
+                                Ok(())
+                            }
+                        });
                     if let Some(acknowledgement) = message.acknowledgement {
                         let _ = acknowledgement.send(
                             write_result
