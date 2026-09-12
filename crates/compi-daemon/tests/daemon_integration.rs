@@ -289,16 +289,26 @@ fn persistent_multi_surface_lifecycle() {
     assert_eq!(flood_exit, 0);
     drop(after_crash);
 
-    wait_for_attachment(&mut control, &first.id, false);
-    wait_for_attachment(&mut control, &second.id, false);
-    let sessions = control.list_surfaces().unwrap();
-    assert_eq!(sessions.len(), 2);
-    assert!(sessions.iter().all(|session| {
-        matches!(
-            session.status,
-            SurfaceStatus::Exited | SurfaceStatus::Failed
-        ) && !session.attached
-    }));
+    let started = Instant::now();
+    let condition = "both surfaces durably exited and detached";
+    loop {
+        let sessions = query_surfaces(&mut control, started, condition);
+        assert_eq!(sessions.len(), 2);
+        if sessions.iter().all(|session| {
+            matches!(
+                session.status,
+                SurfaceStatus::Exited | SurfaceStatus::Failed
+            ) && !session.attached
+        }) {
+            break;
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "waiting for {condition} after {:?}; last surfaces: {sessions:?}",
+            started.elapsed()
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
 
     drop(control);
     daemon.shutdown();
