@@ -620,6 +620,10 @@ impl Surface {
         if let Ok(mut input) = self.input.lock() {
             input.take();
         }
+        // Retain the final grid, not a live trace file, after this process ends.
+        if let Ok(mut trace) = self.trace.lock() {
+            trace.take();
+        }
 
         let client = if let Ok(mut state) = self.state.lock() {
             state.exit_code = Some(exit_code);
