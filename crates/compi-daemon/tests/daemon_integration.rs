@@ -149,7 +149,7 @@ fn persistent_multi_surface_lifecycle() {
             latency_id: None,
         })
         .unwrap();
-    let (first_output, first_exit) = collect_until_exit(&mut first_client, &first.id);
+    let (first_output, first_exit) = collect_until_exit(&daemon, &mut first_client, &first.id);
     assert!(first_output.windows(8).any(|bytes| bytes == b"FIRST_42"));
     assert_eq!(first_exit, 0);
 
@@ -285,7 +285,7 @@ fn persistent_multi_surface_lifecycle() {
             latency_id: None,
         })
         .unwrap();
-    let (_, flood_exit) = collect_until_exit(&mut after_crash, &second.id);
+    let (_, flood_exit) = collect_until_exit(&daemon, &mut after_crash, &second.id);
     assert_eq!(flood_exit, 0);
     drop(after_crash);
 
@@ -349,7 +349,7 @@ fn creates_surfaces_in_wsl_and_windows_working_directories() {
             latency_id: None,
         })
         .unwrap();
-    collect_until_exit(&mut attached, &windows_session.id);
+    collect_until_exit(&daemon, &mut attached, &windows_session.id);
     drop(attached);
 
     let wsl_session = control
@@ -830,15 +830,20 @@ fn collect_snapshot_until_marker(client: &mut DaemonClient, marker: &[u8]) -> Sc
     }
 }
 
-fn collect_until_exit(client: &mut DaemonClient, surface_id: &SurfaceId) -> (Vec<u8>, u32) {
+fn collect_until_exit(
+    daemon: &DaemonGuard,
+    client: &mut DaemonClient,
+    surface_id: &SurfaceId,
+) -> (Vec<u8>, u32) {
     let mut mirror = ScreenMirror::default();
-    let mut recovering = false;
     let started = Instant::now();
     let condition = format!("SurfaceExited for {surface_id:?}");
-    loop {
+    let exit_code = loop {
         match poll_event(client, started, &condition) {
             Some(ServerEvent::Screen(message)) => {
-                apply_screen(client, &mut mirror, &mut recovering, message);
+                // Exit releases the controller. Do not issue gap recovery on
+                // an attachment that may already have been retired.
+                mirror.apply(message);
             }
             Some(ServerEvent::Control {
                 message:
@@ -847,15 +852,54 @@ fn collect_until_exit(client: &mut DaemonClient, surface_id: &SurfaceId) -> (Vec
                         exit_code,
                     },
                 ..
-            }) if &identity.surface_id == surface_id => return (mirror_text(&mirror), exit_code),
+            }) if &identity.surface_id == surface_id => break exit_code,
             Some(_) => {}
             None => thread::sleep(POLL_INTERVAL),
         }
         assert!(
             started.elapsed() < TIMEOUT,
-            "missing {condition} after {:?}; recovering: {recovering}; last output: {:?}",
+            "missing {condition} after {:?}; last output: {:?}",
             started.elapsed(),
             String::from_utf8_lossy(&mirror_text(&mirror))
+        );
+    };
+    let mut final_client = daemon.client();
+    let condition = format!("read-only final screen for {surface_id:?} after exit {exit_code}");
+    let exited = query_surfaces(&mut final_client, started, &condition)
+        .into_iter()
+        .find(|surface| &surface.id == surface_id)
+        .expect("exited surface metadata must be retained");
+    let request_id = final_client
+        .send(ClientMessage::Attach {
+            surface_id: exited.id,
+            expected_lifetime: exited.process_lifetime_id,
+            cols: exited.cols,
+            rows: exited.rows,
+        })
+        .unwrap();
+    let mut sequence = None;
+    let mut last_event = None;
+    loop {
+        match poll_event(&mut final_client, started, &condition) {
+            Some(ServerEvent::Control {
+                request_id: Some(response_id),
+                message:
+                    ServerMessage::Attached {
+                        sequence: baseline, ..
+                    },
+            }) if response_id == request_id => sequence = Some(baseline),
+            Some(ServerEvent::Screen(ScreenMessage::Snapshot { snapshot }))
+                if sequence == Some(snapshot.sequence) =>
+            {
+                return (snapshot_text(&snapshot).into_bytes(), exit_code);
+            }
+            Some(event) => last_event = Some(describe_event(event)),
+            None => thread::sleep(POLL_INTERVAL),
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing {condition} after {:?}; last event: {last_event:?}",
+            started.elapsed()
         );
     }
 }
