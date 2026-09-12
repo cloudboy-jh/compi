@@ -191,7 +191,7 @@ impl DaemonClient {
             .first()
             .cloned()
             .ok_or("workspace mutation did not create a surface")?;
-        self.wait_for_surface(&surface_id, Duration::from_secs(5))
+        self.wait_for_surface(&surface_id, Duration::from_secs(30))
     }
 
     pub fn end_surface(&mut self, surface: &SurfaceInfo) -> Result<MutationReceipt> {
@@ -221,7 +221,9 @@ impl DaemonClient {
                 SurfaceStatus::Starting | SurfaceStatus::Ending => {}
             }
             if Instant::now() >= deadline {
-                return Err(format!("timed out waiting for surface {surface_id}").into());
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for surface {surface_id}; last state: {surface:?}"
+                ).into());
             }
             std::thread::sleep(Duration::from_millis(20));
         }

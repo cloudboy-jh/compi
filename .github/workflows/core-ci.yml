@@ -52,7 +52,16 @@ jobs:
           wsl.exe --exec /bin/bash -lc true
           if ($LASTEXITCODE -ne 0) { throw 'A working default WSL2 distribution is required for Windows daemon tests' }
       - name: Run all product crate tests
+        env:
+          COMPI_TERMINAL_TRACE_DIR: ${{ runner.temp }}/compi-terminal-traces
         run: cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
+      - name: Preserve failed terminal runtime traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-traces-${{ matrix.os }}
+          path: ${{ runner.temp }}/compi-terminal-traces
+          if-no-files-found: ignore
       - name: Run daemon unit tests
         run: cargo test --locked -p compi-daemon --lib
       - name: Verify engine-to-wire conversion and replica recovery
