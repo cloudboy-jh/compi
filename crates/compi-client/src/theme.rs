@@ -1,6 +1,6 @@
 //! Whole-application presets and native background material choices.
-//! Terminal opacity is applied only to the default terminal canvas; explicit
-//! ANSI and true-color cell backgrounds stay fully opaque.
+//! Terminal opacity controls the default terminal canvas and window header;
+//! text, controls, and explicit ANSI/true-color cell backgrounds stay opaque.
 
 use serde::{Deserialize, Serialize};
 

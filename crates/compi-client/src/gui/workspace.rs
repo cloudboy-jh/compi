@@ -408,13 +408,16 @@ impl CompiApp {
     }
 
     fn preview_terminal_opacity(&mut self, opacity: f32, window: &mut Window) {
+        let was_translucent = self.terminal_opacity < 1.0;
         self.opacity_drag_origin
             .get_or_insert(self.terminal_opacity);
         self.terminal_opacity = opacity.clamp(
             crate::config::MIN_TERMINAL_OPACITY,
             crate::config::MAX_TERMINAL_OPACITY,
         );
-        self.apply_window_background(window);
+        if was_translucent != (self.terminal_opacity < 1.0) {
+            self.apply_window_background(window);
+        }
     }
 
     fn appearance(&self) -> AppearanceSettings {
@@ -1513,9 +1516,8 @@ fn pointer_coordinate(value: Pixels, scale_factor: f32) -> f32 {
 fn opacity_at_slider_position(position: Pixels, bounds: Bounds<Pixels>) -> f32 {
     let progress = (f32::from(position - bounds.origin.x) / f32::from(bounds.size.width).max(1.0))
         .clamp(0.0, 1.0);
-    let opacity = crate::config::MIN_TERMINAL_OPACITY
-        + progress * (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY);
-    (opacity * 100.0).round() / 100.0
+    crate::config::MIN_TERMINAL_OPACITY
+        + progress * (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY)
 }
 
 fn collect_leaves(tree: &LayoutNode, output: &mut Vec<(PaneId, SurfaceId)>) {
@@ -2869,6 +2871,11 @@ impl CompiApp {
 
     fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
+        let header_alpha = if self.glass {
+            self.terminal_opacity
+        } else {
+            1.0
+        };
         let (window_width, _) = logical_viewport_dimensions(window);
         let metrics = header_metrics(window_width);
         let trailing_width =
@@ -2900,13 +2907,7 @@ impl CompiApp {
                 } else {
                     colors.background
                 })
-                .opacity(if !self.glass {
-                    1.0
-                } else if selected {
-                    0.98
-                } else {
-                    0.82
-                }))
+                .opacity(header_alpha))
                 .border_b_1()
                 .border_color(color(if selected {
                     colors.accent
@@ -2918,7 +2919,11 @@ impl CompiApp {
                 } else {
                     colors.muted
                 }))
-                .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+                .hover(move |style| {
+                    style
+                        .bg(color(colors.surface_hover).opacity(header_alpha))
+                        .cursor_pointer()
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2965,7 +2970,7 @@ impl CompiApp {
             .w_full()
             .flex_none()
             .relative()
-            .bg(color(colors.background).opacity(if self.glass { 0.84 } else { 1.0 }))
+            .bg(color(colors.background).opacity(header_alpha))
             .border_b_1()
             .border_color(color(colors.border))
             .on_mouse_down(
@@ -4050,7 +4055,7 @@ impl CompiApp {
                             .text_size(px(11.0))
                             .text_color(color(colors.muted))
                             .child(
-                                "10–100%. Text and explicit application backgrounds stay opaque.",
+                                "10–100%. Terminal and header backgrounds fade together; text and controls stay opaque.",
                             ),
                     ),
             )
@@ -4294,8 +4299,11 @@ impl CompiApp {
             });
         div()
             .absolute()
-            .inset_0()
-            .pt(px(CHROME_HEIGHT + 18.0))
+            .top(px(CHROME_HEIGHT))
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .pt(px(18.0))
             .px_4()
             .flex()
             .justify_center()
@@ -5305,7 +5313,7 @@ mod tests {
             size: size(px(100.0), px(24.0)),
         };
         assert_eq!(opacity_at_slider_position(px(0.0), bounds), 0.1);
-        assert_eq!(opacity_at_slider_position(px(60.0), bounds), 0.55);
+        assert!((opacity_at_slider_position(px(37.3), bounds) - 0.3457).abs() < 0.000001);
         assert_eq!(opacity_at_slider_position(px(120.0), bounds), 1.0);
     }
 

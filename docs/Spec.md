@@ -554,13 +554,13 @@ The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindin
 - The first-run theme is **Dark Glass**: neutral-dark application surfaces, restrained glass in titlebar/tab chrome and the optional sidebar, and an acid-green accent. Its identity remains visible with the sidebar closed. Warm Carbon is an optional whole-app preset.
 - Each preset supplies coordinated chrome, terminal palette, text, borders, focus, selection, cursor, and ANSI colors. Terminal opacity and clear/blurred background effect are orthogonal appearance settings.
 - The baseline offers whole-app presets, not independent terminal-palette or accent overrides, custom theme files, or automatic system light/dark switching.
-- **Quick Appearance** exposes the two preset previews, background effect, and a continuous 10–100% opacity slider. **Settings** exposes the same controls plus explicit **Global defaults** and **This window** scopes, interface state, terminal summary, keyboard/configuration access, and daemon controls.
+- **Quick Appearance** exposes the two preset previews, background effect, and one continuous 10–100% **Terminal opacity** slider. That same value controls the terminal canvas and window-header/tab backgrounds; there is no separate header setting. **Settings** exposes the same controls plus explicit **Global defaults** and **This window** scopes, interface state, terminal summary, keyboard/configuration access, and daemon controls.
 - Appearance changes apply immediately and persist to the selected scope. Global changes atomically update only the TOML appearance table and clear the current window's overrides; window changes write only explicitly changed appearance fields to private JSON. **Use global defaults** clears those fields.
 - Appearance changes never restart a process, detach a surface, reset terminal contents, or make a CLI override durable. Explicit terminal cell backgrounds and foreground text remain opaque.
 
 ### Glass and readability
 
-- Terminal canvases are opaque by default and support user-selected 10–100% opacity with clear or blurred native background appearance. Explicit application cell backgrounds remain opaque.
+- Terminal canvases and window headers are opaque by default and share user-selected 10–100% opacity with clear or blurred native background appearance. Header text, icons, window controls, and explicit application cell backgrounds remain opaque. Dragging previews both backgrounds continuously; the selected scope is saved on release.
 - Use native background materials where supported. Fall back to a readable opaque presentation when materials are unavailable or the platform requests reduced transparency. Identical blur across platforms is not required.
 - Presets must provide readable text and controls, adequate contrast, and visible focus in both material and opaque presentations. Color alone must not be the only indication of focus or lifecycle state.
 
