@@ -2,6 +2,8 @@
 
 # Compi
 
+[![Core CI](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml/badge.svg?branch=main)](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml)
+
 **A terminal and multiplexer in one.**
 
 Compi is a **superterminal**: it feels like a normal native terminal, but its shells, tabs, split panes, and history live in a persistent background server. Close every window and your work keeps running. Open Compi again and pick up where you left off.
@@ -72,3 +74,6 @@ cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
 - [Product and technical specification](docs/Spec.md)
 - [Implementation status and next steps](docs/NEXT_STEPS.md)
 - [Windows terminal test recipes](docs/testcmds.md)
+
+## License
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Jack Horton.
