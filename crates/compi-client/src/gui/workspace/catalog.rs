@@ -19,7 +19,12 @@ pub(in crate::gui) struct CatalogState {
 
 impl CompiApp {
     pub(super) fn open_theme_catalog(&mut self, scope: SettingsScope) {
+        let parent = self
+            .overlay
+            .clone()
+            .filter(|overlay| matches!(overlay, Overlay::Settings | Overlay::QuickAppearance));
         self.open_overlay(Overlay::ThemeCatalog, "");
+        self.overlay_return = parent;
         self.settings_scope = scope;
         self.theme_catalog = Some(CatalogState {
             original: self.theme,
@@ -95,6 +100,90 @@ impl CompiApp {
             self.preview_catalog_theme(theme);
             self.overlay_scroll.scroll_to_item(next);
         }
+    }
+
+    pub(super) fn handle_catalog_key(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
+            return false;
+        }
+        match key.key.as_str() {
+            "escape" => self.dismiss_overlay(),
+            "tab" => {
+                self.overlay_focus = if key.modifiers.shift {
+                    (self.overlay_focus + 7) % 8
+                } else {
+                    (self.overlay_focus + 1) % 8
+                };
+            }
+            "up" | "down" if self.overlay_focus == 0 => {
+                self.move_catalog_selection(key.key == "up");
+            }
+            "left" | "right" if (1..=4).contains(&self.overlay_focus) => {
+                self.overlay_focus = if key.key == "left" {
+                    if self.overlay_focus == 1 {
+                        4
+                    } else {
+                        self.overlay_focus - 1
+                    }
+                } else if self.overlay_focus == 4 {
+                    1
+                } else {
+                    self.overlay_focus + 1
+                };
+                let filter = [
+                    ThemeFilter::All,
+                    ThemeFilter::Dark,
+                    ThemeFilter::Light,
+                    ThemeFilter::Favorites,
+                ][self.overlay_focus - 1];
+                if let Some(catalog) = &mut self.theme_catalog {
+                    catalog.filter = filter;
+                    catalog.licenses = false;
+                }
+                self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+            }
+            "enter" | "space" => match self.overlay_focus {
+                0 | 7 => self.apply_catalog_theme(window, cx),
+                1..=4 => {
+                    let filter = [
+                        ThemeFilter::All,
+                        ThemeFilter::Dark,
+                        ThemeFilter::Light,
+                        ThemeFilter::Favorites,
+                    ][self.overlay_focus - 1];
+                    if let Some(catalog) = &mut self.theme_catalog {
+                        catalog.filter = filter;
+                        catalog.licenses = false;
+                    }
+                    self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+                }
+                5 => {
+                    if let Some(catalog) = &mut self.theme_catalog {
+                        catalog.licenses = !catalog.licenses;
+                    }
+                }
+                6 => self.dismiss_overlay(),
+                _ => {}
+            },
+            _ if self.overlay_focus == 0 => return false,
+            _ if key.key_char.is_some()
+                || matches!(key.key.as_str(), "backspace" | "delete" | "home" | "end")
+                || ((key.modifiers.platform || key.modifiers.control)
+                    && matches!(key.key.as_str(), "a" | "c" | "v")) =>
+            {
+                self.overlay_focus = 0;
+                cx.notify();
+                return false;
+            }
+            _ => return true,
+        }
+        cx.notify();
+        true
     }
 
     pub(super) fn apply_catalog_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -210,12 +299,24 @@ impl CompiApp {
     pub(super) fn render_theme_catalog_entry(
         &self,
         theme: ThemePreset,
+        focused: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
         let locked = self.settings_scope == SettingsScope::Window
             && self.config.provenance.theme == crate::config::ValueSource::CommandLine;
+        let row_background = if focused {
+            blend_rgb(colors.surface, colors.accent, 0.1)
+        } else {
+            colors.surface
+        };
+        let button_background = blend_rgb(colors.surface, colors.foreground, 0.11);
+        let button_hover = blend_rgb(colors.surface, colors.foreground, 0.17);
         div()
+            .min_h(px(52.0))
+            .py_1()
+            .rounded_sm()
+            .bg(color(row_background))
             .flex()
             .items_center()
             .gap_3()
@@ -226,38 +327,42 @@ impl CompiApp {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(theme.label())
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(theme.label()))
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(color(colors.muted))
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(color(modal_text_color(colors.muted, colors)))
                             .child(theme.description()),
                     ),
             )
             .child(
                 div()
                     .id("browse-theme-catalog")
-                    .px_3()
-                    .py_2()
+                    .min_h(px(32.0))
+                    .px_2()
                     .rounded_sm()
-                    .border_1()
-                    .border_color(color(colors.border))
-                    .text_color(color(if locked {
-                        colors.muted
-                    } else {
-                        colors.foreground
-                    }))
+                    .bg(color(button_background))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color(ui_text_color(
+                        if locked {
+                            colors.muted
+                        } else {
+                            colors.foreground
+                        },
+                        button_background,
+                    )))
                     .when(!locked, |button| {
                         button
                             .cursor_pointer()
-                            .hover(|style| style.bg(color(colors.surface_hover)))
+                            .hover(move |style| style.bg(color(button_hover)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.open_theme_catalog(this.settings_scope);
                                 cx.stop_propagation();
                                 cx.notify();
                             }))
                     })
-                    .child(format!("Browse {} themes", ThemePreset::ALL.len())),
+                    .child("Change…"),
             )
             .into_any_element()
     }
@@ -283,8 +388,8 @@ impl CompiApp {
                     .child(chrome_icon(ChromeIcon::Mark, color(colors.accent)))
                     .child(
                         div()
-                            .text_size(px(10.0))
-                            .text_color(color(colors.foreground))
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.foreground, colors)))
                             .child("compi / src"),
                     ),
             )
@@ -295,15 +400,22 @@ impl CompiApp {
                     .flex()
                     .flex_col()
                     .font_family("monospace")
-                    .text_size(px(10.0))
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
                     .child(
                         div()
                             .flex()
                             .gap_1()
-                            .child(div().text_color(color(colors.accent)).child("$"))
                             .child(
                                 div()
-                                    .text_color(color(colors.foreground))
+                                    .text_color(color(ui_text_color(
+                                        colors.accent,
+                                        colors.background,
+                                    )))
+                                    .child("$"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(color(modal_text_color(colors.foreground, colors)))
                                     .child("git status"),
                             ),
                     )
@@ -311,10 +423,17 @@ impl CompiApp {
                         div()
                             .flex()
                             .gap_2()
-                            .child(div().text_color(color(colors.ansi[2])).child("main"))
                             .child(
                                 div()
-                                    .text_color(color(colors.muted))
+                                    .text_color(color(ui_text_color(
+                                        colors.ansi[2],
+                                        colors.background,
+                                    )))
+                                    .child("main"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(color(modal_text_color(colors.muted, colors)))
                                     .child("working tree clean"),
                             ),
                     ),
@@ -322,11 +441,15 @@ impl CompiApp {
             .into_any_element()
     }
 
-    pub(super) fn render_theme_catalog(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_theme_catalog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let Some(catalog) = &self.theme_catalog else {
             return div().into_any_element();
         };
         let colors = self.colors();
+        let (viewport_width, viewport_height) = overlay_viewport_size(window);
+        let overlay_height = viewport_height.max(1.0);
+        let panel_width = (viewport_width - 64.0).clamp(1.0, 780.0);
+        let panel_height = (overlay_height - 48.0).clamp(1.0, 560.0);
         let candidate = catalog.candidate;
         let filters = [
             (ThemeFilter::All, "All"),
@@ -337,21 +460,13 @@ impl CompiApp {
         .into_iter()
         .enumerate()
         .map(|(index, (filter, label))| {
-            let active = catalog.filter == filter;
-            div()
-                .id(("theme-filter", index))
-                .px_3()
-                .py_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .bg(color(if active {
-                    colors.surface_hover
-                } else {
-                    colors.surface
-                }))
-                .border_1()
-                .border_color(color(if active { colors.accent } else { colors.border }))
-                .on_click(cx.listener(move |this, _, _, cx| {
+            self.settings_segment_button(
+                ("theme-filter", index),
+                label,
+                catalog.filter == filter,
+                self.overlay_focus == index + 1,
+                cx.listener(move |this, _, _, cx| {
+                    this.overlay_focus = index + 1;
                     if let Some(catalog) = &mut this.theme_catalog {
                         catalog.filter = filter;
                         catalog.licenses = false;
@@ -359,12 +474,13 @@ impl CompiApp {
                     this.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
                     cx.stop_propagation();
                     cx.notify();
-                }))
-                .child(label)
+                }),
+            )
         });
         let rows = self.catalog_themes().enumerate().map(|(index, theme)| {
             let selected = theme == candidate;
             let favorite = self.config.theme_favorites.contains(&theme);
+            let selected_background = blend_rgb(colors.surface, colors.accent, 0.14);
             div()
                 .id(("catalog-theme", index))
                 .px_3()
@@ -375,13 +491,14 @@ impl CompiApp {
                 .border_b_1()
                 .border_color(color(colors.border))
                 .bg(color(if selected {
-                    colors.surface_hover
+                    selected_background
                 } else {
                     colors.surface
                 }))
                 .cursor_pointer()
                 .hover(|style| style.bg(color(colors.surface_hover)))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    this.overlay_focus = 0;
                     this.preview_catalog_theme(theme);
                     cx.stop_propagation();
                     cx.notify();
@@ -395,17 +512,18 @@ impl CompiApp {
                         .gap_1()
                         .child(
                             div()
-                                .text_color(color(if selected {
-                                    colors.accent
+                                .font_weight(if selected {
+                                    FontWeight::SEMIBOLD
                                 } else {
-                                    colors.foreground
-                                }))
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(color(modal_text_color(colors.foreground, colors)))
                                 .child(theme.label()),
                         )
                         .child(
                             div()
-                                .text_size(px(11.0))
-                                .text_color(color(colors.muted))
+                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .text_color(color(modal_text_color(colors.muted, colors)))
                                 .child(format!(
                                     "{} · {}",
                                     theme.family(),
@@ -420,11 +538,14 @@ impl CompiApp {
                         .px_1()
                         .py_2()
                         .text_size(px(19.0))
-                        .text_color(color(if favorite {
-                            colors.accent
-                        } else {
-                            colors.muted
-                        }))
+                        .text_color(color(modal_text_color(
+                            if favorite {
+                                colors.accent
+                            } else {
+                                colors.muted
+                            },
+                            colors,
+                        )))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.toggle_theme_favorite(theme, window, cx);
@@ -440,7 +561,7 @@ impl CompiApp {
                 .min_h_0()
                 .overflow_y_scroll()
                 .p_3()
-                .text_size(px(11.0))
+                .text_size(px(UI_SMALL_TEXT_SIZE))
                 .child(crate::theme::THEME_ATTRIBUTION)
                 .into_any_element()
         } else {
@@ -455,7 +576,7 @@ impl CompiApp {
                     body.child(
                         div()
                             .p_4()
-                            .text_color(color(colors.muted))
+                            .text_color(color(modal_text_color(colors.muted, colors)))
                             .child("No matching themes. Try another search or filter."),
                     )
                 })
@@ -463,14 +584,15 @@ impl CompiApp {
         };
         div()
             .absolute()
-            .top(px(CHROME_HEIGHT))
-            .bottom_0()
+            .top_0()
             .left_0()
-            .right_0()
+            .w(px(viewport_width))
+            .h(px(overlay_height))
             .p_4()
             .flex()
             .justify_center()
-            .bg(color(colors.background).opacity(0.35))
+            .items_center()
+            .bg(color(colors.background).opacity(MODAL_SCRIM_OPACITY))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -481,9 +603,8 @@ impl CompiApp {
             )
             .child(
                 div()
-                    .w_full()
-                    .max_w(px(850.0))
-                    .h_full()
+                    .w(px(panel_width))
+                    .h(px(panel_height))
                     .min_h_0()
                     .flex()
                     .flex_col()
@@ -491,6 +612,7 @@ impl CompiApp {
                     .border_1()
                     .border_color(color(colors.border))
                     .bg(color(colors.surface))
+                    .text_color(color(modal_text_color(colors.foreground, colors)))
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
@@ -500,11 +622,16 @@ impl CompiApp {
                             .flex()
                             .justify_between()
                             .items_center()
-                            .child(div().text_size(px(16.0)).child("Theme catalog"))
                             .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .text_color(color(colors.muted))
+                                    .text_size(px(18.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Theme catalog"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.muted, colors)))
                                     .child(if catalog.scope == SettingsScope::Global {
                                         "Global defaults · Esc cancels"
                                     } else {
@@ -521,27 +648,32 @@ impl CompiApp {
                             .flex()
                             .flex_wrap()
                             .gap_2()
-                            .children(filters)
                             .child(
                                 div()
-                                    .id("theme-licenses")
-                                    .px_2()
-                                    .py_1()
-                                    .cursor_pointer()
-                                    .text_color(color(colors.muted))
-                                    .child(if catalog.licenses {
-                                        "Back to themes"
-                                    } else {
-                                        "Licenses"
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(catalog) = &mut this.theme_catalog {
-                                            catalog.licenses = !catalog.licenses;
-                                        }
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    })),
-                            ),
+                                    .flex()
+                                    .p(px(2.0))
+                                    .rounded_md()
+                                    .bg(color(blend_rgb(colors.surface, colors.foreground, 0.06)))
+                                    .children(filters),
+                            )
+                            .child(self.settings_action_button(
+                                "theme-licenses",
+                                if catalog.licenses {
+                                    "Back to themes"
+                                } else {
+                                    "Licenses"
+                                },
+                                self.overlay_focus == 5,
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.overlay_focus = 5;
+                                    if let Some(catalog) = &mut this.theme_catalog {
+                                        catalog.licenses = !catalog.licenses;
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )),
                     )
                     .child(body)
                     .child(
@@ -558,46 +690,41 @@ impl CompiApp {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_size(px(11.0))
-                                    .text_color(color(colors.muted))
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.muted, colors)))
                                     .child(format!(
                                         "Previewing {}. Opacity stays unchanged.",
                                         candidate.label()
                                     )),
                             )
-                            .child(
-                                div()
-                                    .id("cancel-theme-preview")
-                                    .px_3()
-                                    .py_2()
-                                    .cursor_pointer()
-                                    .child("Cancel")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.dismiss_overlay();
-                                        window.focus(&this.focus_handle);
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("apply-catalog-theme")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .bg(color(colors.accent))
-                                    .text_color(color(colors.background))
-                                    .child(if catalog.scope == SettingsScope::Global {
-                                        "Apply globally"
-                                    } else {
-                                        "Apply to this window"
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.apply_catalog_theme(window, cx);
-                                        cx.stop_propagation();
-                                    })),
-                            ),
+                            .child(self.settings_action_button(
+                                "cancel-theme-preview",
+                                "Cancel",
+                                self.overlay_focus == 6,
+                                false,
+                                cx.listener(|this, _, window, cx| {
+                                    this.overlay_focus = 6;
+                                    this.dismiss_overlay();
+                                    window.focus(&this.focus_handle);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(self.settings_primary_button(
+                                "apply-catalog-theme",
+                                if catalog.scope == SettingsScope::Global {
+                                    "Use globally"
+                                } else {
+                                    "Use in this window"
+                                },
+                                self.overlay_focus == 7,
+                                cx.listener(|this, _, window, cx| {
+                                    this.overlay_focus = 7;
+                                    this.apply_catalog_theme(window, cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )),
                     ),
             )
             .into_any_element()

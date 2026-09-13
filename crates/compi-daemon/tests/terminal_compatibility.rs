@@ -174,8 +174,9 @@ fn resize_reflows_text_but_preserves_image_grid_anchor_and_payload() {
     let resized = screen::snapshot(terminal.snapshot());
     assert_eq!(resized.images, initial.images);
     assert_eq!(resized.placements, initial.placements);
+    assert!(resized.scrollback.is_empty());
     assert_eq!(
-        resized.scrollback[0]
+        resized.cells[0]
             .cells
             .iter()
             .map(|cell| cell.text.as_str())

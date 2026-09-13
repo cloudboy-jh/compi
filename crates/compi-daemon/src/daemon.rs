@@ -7,8 +7,8 @@ use compi_protocol::identity::PipeSecurity;
 use compi_protocol::identity::{self, InstanceNames};
 use compi_protocol::pipe;
 use compi_protocol::{
-    CONTROL_FRAME, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerControl, ServerMessage,
-    SurfaceId, TerminalTarget, decode_client,
+    CONTROL_FRAME, ClientMessage, ErrorCode, PROTOCOL_VERSION, RuntimeMetrics, ServerControl,
+    ServerMessage, SurfaceId, SurfaceStatus, TerminalTarget, decode_client,
 };
 use std::collections::HashMap;
 #[cfg(windows)]
@@ -280,6 +280,41 @@ fn handle_connection(
                         request_id: Some(request_id),
                         message: ServerMessage::Workspace { workspace },
                     })?,
+                    Err(error) => send_actor_error(&sink, request_id, &error),
+                },
+                ClientMessage::GetRuntimeMetrics => match manager.snapshot() {
+                    Ok(workspace) => {
+                        let live_surfaces = workspace
+                            .surfaces
+                            .iter()
+                            .filter(|surface| {
+                                matches!(
+                                    surface.status,
+                                    SurfaceStatus::Starting
+                                        | SurfaceStatus::Running
+                                        | SurfaceStatus::Ending
+                                )
+                            })
+                            .count();
+                        let attached_surfaces = workspace
+                            .surfaces
+                            .iter()
+                            .filter(|surface| surface.attached)
+                            .count();
+                        sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::RuntimeMetrics {
+                                metrics: RuntimeMetrics {
+                                    process: compi_protocol::perf::process_metrics(),
+                                    surfaces: workspace.surfaces.len().min(u32::MAX as usize)
+                                        as u32,
+                                    live_surfaces: live_surfaces.min(u32::MAX as usize) as u32,
+                                    attached_surfaces: attached_surfaces.min(u32::MAX as usize)
+                                        as u32,
+                                },
+                            },
+                        })?;
+                    }
                     Err(error) => send_actor_error(&sink, request_id, &error),
                 },
                 ClientMessage::Mutate { mutation } => match manager.mutate(mutation) {

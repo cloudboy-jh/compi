@@ -124,6 +124,28 @@ impl Drop for DaemonGuard {
 }
 
 #[test]
+fn runtime_metrics_report_daemon_resources_and_workspace_counts() {
+    let mut daemon = DaemonGuard::start();
+    let mut client = daemon.client();
+
+    let metrics = client.runtime_metrics().unwrap();
+
+    assert_eq!(metrics.surfaces, 0);
+    assert_eq!(metrics.live_surfaces, 0);
+    assert_eq!(metrics.attached_surfaces, 0);
+    assert!(metrics.process.private_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(
+        metrics
+            .process
+            .working_set_bytes
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(metrics.process.handles.is_some_and(|handles| handles > 0));
+    assert!(metrics.process.cpu_time_ns.is_some());
+    daemon.shutdown();
+}
+
+#[test]
 fn kitty_4k_payload_and_placement_survive_detach_and_reconnect() {
     let mut daemon = DaemonGuard::start();
     let directory = std::env::temp_dir().join(format!("compi-kitty-{}", daemon.instance));

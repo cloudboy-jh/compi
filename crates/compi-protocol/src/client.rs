@@ -2,9 +2,9 @@ use crate::Result;
 use crate::frame;
 use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ErrorCode, MutationId, MutationReceipt,
-    MutationRequest, PROTOCOL_VERSION, SCREEN_FRAME, ServerMessage, SurfaceId, SurfaceInfo,
-    SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot, decode_server,
-    decode_terminal_frame, encode_client,
+    MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, ServerMessage, SurfaceId,
+    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
+    decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use std::collections::VecDeque;
@@ -78,6 +78,12 @@ impl DaemonClient {
     pub fn workspace(&mut self) -> Result<WorkspaceSnapshot> {
         match self.request(ClientMessage::GetWorkspace)? {
             ServerMessage::Workspace { workspace } => Ok(workspace),
+            message => Err(unexpected_response(message)),
+        }
+    }
+    pub fn runtime_metrics(&mut self) -> Result<RuntimeMetrics> {
+        match self.request(ClientMessage::GetRuntimeMetrics)? {
+            ServerMessage::RuntimeMetrics { metrics } => Ok(metrics),
             message => Err(unexpected_response(message)),
         }
     }

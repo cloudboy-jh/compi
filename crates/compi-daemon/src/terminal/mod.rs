@@ -1636,11 +1636,20 @@ fn reflow_main_buffer(
     rows: usize,
     cursor: Option<(usize, usize)>,
 ) -> Option<(usize, usize)> {
-    let source: Vec<Row> = buffer
+    let mut source: Vec<Row> = buffer
         .scrollback
         .drain(..)
         .chain(buffer.rows.drain(..))
         .collect();
+    if let Some((cursor_row, _)) = cursor {
+        let blank = Cell::default();
+        let last_used_row = source
+            .iter()
+            .rposition(|row| row.wrapped || row.cells.iter().any(|cell| cell != &blank))
+            .unwrap_or(cursor_row)
+            .max(cursor_row);
+        source.truncate(last_used_row.saturating_add(1).min(source.len()));
+    }
     let mut logical_lines: Vec<(Vec<Cell>, Option<usize>)> = Vec::new();
     let mut line_cells = Vec::new();
     let mut line_cursor = None;
@@ -1927,7 +1936,7 @@ mod tests {
             .filter(|text| !text.is_empty())
             .collect();
         assert_eq!(narrow_text, ["abcd", "efgh"]);
-        assert!(narrow.scrollback.first().is_some_and(|row| row.wrapped));
+        assert!(narrow.cells.first().is_some_and(|row| row.wrapped));
 
         terminal.resize(10, 3);
         let wide = terminal.snapshot();
@@ -1941,6 +1950,22 @@ mod tests {
         assert_eq!(wide_text, ["abcdefgh"]);
         assert_eq!((wide.cursor.row, wide.cursor.col), (0, 8));
     }
+
+    #[test]
+    fn height_resizes_do_not_turn_unused_rows_into_scrollback() {
+        let mut terminal = TerminalState::new(20, 24);
+        terminal.advance(b"prompt");
+
+        for rows in [40, 12, 30, 8, 24] {
+            terminal.resize(20, rows);
+        }
+
+        let snapshot = terminal.snapshot();
+        assert!(snapshot.scrollback.is_empty());
+        assert_eq!(visible_text(&snapshot, 0), "prompt");
+        assert_eq!((snapshot.cursor.row, snapshot.cursor.col), (0, 6));
+    }
+
     #[test]
     fn counts_repeated_unsupported_sequences_by_signature() {
         let mut terminal = TerminalState::new(8, 2);

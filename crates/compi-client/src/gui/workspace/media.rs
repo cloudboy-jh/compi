@@ -493,15 +493,15 @@ impl CompiApp {
                             .gap_1()
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .child(preview.image.name.clone()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(color(colors.muted))
+                                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.muted, colors)))
                                     .child(format!(
                                         "{} × {} · {:.1} KiB",
                                         preview.image.width,
@@ -543,7 +543,7 @@ impl CompiApp {
                         .py_2()
                         .rounded_sm()
                         .bg(color(colors.surface))
-                        .text_size(px(11.0))
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
                         .child(format!(
                             "Preparing {} image(s)…",
                             self.pending_image_inputs.len()
@@ -682,6 +682,7 @@ impl CompiApp {
             .right_0()
             .p_3()
             .bg(color(colors.background).opacity(0.8))
+            .text_color(color(modal_text_color(colors.foreground, colors)))
             .flex()
             .flex_col()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -783,8 +784,8 @@ impl CompiApp {
                             .flex_none()
                             .px_3()
                             .py_2()
-                            .text_size(px(11.0))
-                            .text_color(color(colors.muted))
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, colors)))
                             .child(status),
                     ),
             )
@@ -800,6 +801,8 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = self.colors();
         div()
+            .min_h(px(44.0))
+            .min_w(px(44.0))
             .id(id)
             .px_2()
             .py_1()

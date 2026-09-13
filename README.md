@@ -19,6 +19,7 @@ A terminal gives you a shell. A multiplexer keeps that shell alive and organizes
 - **Native experience** — native windows and shortcuts on macOS and Windows, with WSL2 as the Windows shell environment.
 - **Real terminal compatibility** — Unicode, reflow, selection, mouse input, bracketed paste, and Kitty graphics.
 - **Headless core** — the server owns processes and terminal state; the client is a disposable view of them.
+- **Built-in observability** — Settings shows live client/server resources, render timing, cache use, and an optional per-window FPS overlay.
 
 ```text
 Compi client  ⇄  Compi server  ⇄  shells and PTYs
@@ -98,7 +99,8 @@ cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
 ## Documentation
 
 - [Product and technical specification](docs/Spec.md)
-- [Implementation status and next steps](docs/NEXT_STEPS.md)
+- [Next steps](docs/NEXT_STEPS.md)
+- [Completed work and verification history](docs/COMPLETED.md)
 - [Windows terminal test recipes](docs/testcmds.md)
 
 ## License

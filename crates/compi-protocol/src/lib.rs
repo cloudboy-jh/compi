@@ -24,8 +24,8 @@ pub use client::{DaemonClient, DaemonError, ServerEvent};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Version 10 admits screen frames larger than the version 9 reader's 16-MiB cap.
-pub const PROTOCOL_VERSION: u32 = 10;
+// Version 11 adds opt-in runtime resource metrics for the native client.
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -118,6 +118,7 @@ pub enum ClientMessage {
     Hello {
         protocol_version: u32,
     },
+    GetRuntimeMetrics,
     GetWorkspace,
     Mutate {
         mutation: MutationRequest,
@@ -158,6 +159,9 @@ pub struct ServerControl {
 pub enum ServerMessage {
     Hello {
         protocol_version: u32,
+    },
+    RuntimeMetrics {
+        metrics: RuntimeMetrics,
     },
     Workspace {
         workspace: WorkspaceSnapshot,
@@ -237,6 +241,28 @@ pub struct WorkingDirectory {
     pub distribution: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+}
+/// Cross-platform process counters. Unsupported counters remain absent rather
+/// than being reported as a misleading zero.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProcessMetrics {
+    pub cpu_time_ns: Option<u64>,
+    pub private_bytes: Option<u64>,
+    pub resident_bytes: Option<u64>,
+    pub virtual_bytes: Option<u64>,
+    pub working_set_bytes: Option<u64>,
+    pub handles: Option<u64>,
+    pub file_descriptors: Option<u64>,
+    pub threads: Option<u64>,
+}
+
+/// One inexpensive daemon snapshot used by the in-app Performance surface.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeMetrics {
+    pub process: ProcessMetrics,
+    pub surfaces: u32,
+    pub live_surfaces: u32,
+    pub attached_surfaces: u32,
 }
 
 /// Persistable launch choices. Environment overrides travel separately and are never stored.

@@ -2,7 +2,10 @@ use super::*;
 use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle};
 use sha2::{Digest, Sha256};
 pub(super) mod catalog;
+pub(in crate::gui) mod dialogs;
 pub(super) mod media;
+pub(in crate::gui) mod performance;
+pub(in crate::gui) mod settings;
 
 #[derive(Clone)]
 pub(super) struct TransferSeed {
@@ -49,6 +52,13 @@ pub(super) enum Overlay {
     },
     Windows,
     Diagnostics,
+}
+
+pub(super) const MODAL_SCRIM_OPACITY: f32 = 0.72;
+
+pub(super) fn overlay_viewport_size(window: &Window) -> (f32, f32) {
+    let viewport = window.viewport_size();
+    (f32::from(viewport.width), f32::from(viewport.height))
 }
 
 pub(super) struct DividerDrag {
@@ -225,6 +235,7 @@ impl CompiApp {
             .map_or(state.font_zoom, |seed| seed.display_zoom);
         let typography = Arc::new(TerminalTypography::resolve(&config.font, zoom, window));
         let global_warning = diagnostic_warning(&config.diagnostics, &typography.diagnostics);
+        let performance_enabled = Arc::new(AtomicBool::new(state.show_fps));
         let mut this = Self {
             started_at,
             instance,
@@ -273,9 +284,17 @@ impl CompiApp {
             settings_scope: SettingsScope::Global,
             daemon_restarting: false,
             zoom,
+            overlay_return: None,
             overlay: None,
             overlay_index: 0,
             overlay_scroll: ScrollHandle::new(),
+            overlay_focus: 0,
+            overlay_generation: 0,
+            overlay_closing_since: None,
+            settings_section: SettingsSection::Appearance,
+            performance_enabled: performance_enabled.clone(),
+            performance: performance::PerformanceMonitor::default(),
+            performance_notice: None,
             overlay_revision: None,
             pane_zoom: PaneZoomState::default(),
             layout: None,
@@ -360,6 +379,7 @@ impl CompiApp {
         let sender = this.event_tx.clone();
         let instance = this.instance.clone();
         let appearance_path = this.config.path.clone();
+        let performance_enabled = this.performance_enabled.clone();
         let alive = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let mut appearance_stamp = fs::metadata(&appearance_path)
@@ -376,14 +396,37 @@ impl CompiApp {
                 let instance = instance.clone();
                 let appearance_path = appearance_path.clone();
                 let previous_stamp = appearance_stamp;
+                let collect_performance = performance_enabled.load(Ordering::Acquire);
                 appearance_stamp = cx
                     .background_executor()
                     .spawn(async move {
-                        let result =
-                            DaemonClient::connect(instance.as_deref(), Duration::from_secs(2))
-                                .and_then(|mut client| client.workspace())
-                                .map_err(|error| error.to_string());
-                        sender.send(UiEvent::SurfacesLoaded(result));
+                        match DaemonClient::connect(instance.as_deref(), Duration::from_secs(2)) {
+                            Ok(mut client) => {
+                                sender.send(UiEvent::SurfacesLoaded(
+                                    client.workspace().map_err(|error| error.to_string()),
+                                ));
+                                if collect_performance {
+                                    let sample = client.runtime_metrics().map(|daemon| {
+                                        performance::PerformanceSample {
+                                            sampled_at: Instant::now(),
+                                            render: render_performance_snapshot(),
+                                            client: perf::process_metrics(),
+                                            daemon,
+                                        }
+                                    });
+                                    sender.send(UiEvent::PerformanceSample(
+                                        sample.map_err(|error| error.to_string()),
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                let error = error.to_string();
+                                sender.send(UiEvent::SurfacesLoaded(Err(error.clone())));
+                                if collect_performance {
+                                    sender.send(UiEvent::PerformanceSample(Err(error)));
+                                }
+                            }
+                        }
                         let stamp = fs::metadata(&appearance_path)
                             .ok()
                             .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
@@ -934,6 +977,8 @@ impl CompiApp {
                 self.global_warning =
                     diagnostic_warning(&self.config_diagnostics, &self.typography.diagnostics);
             }
+            UiEvent::PerformanceSample(Ok(sample)) => self.performance.observe(sample),
+            UiEvent::PerformanceSample(Err(error)) => self.performance.record_error(error),
             UiEvent::ImagePrepared {
                 request,
                 origin,
@@ -1716,11 +1761,15 @@ impl CompiApp {
     }
 
     fn open_overlay(&mut self, overlay: Overlay, text: &str) {
-        self.dismiss_overlay();
+        self.finish_dismiss_overlay();
         self.report_focus(false);
         self.overlay_revision = self.workspace.as_ref().map(|workspace| workspace.revision);
+        self.overlay_return = None;
         self.overlay = Some(overlay);
         self.overlay_index = 0;
+        self.overlay_focus = 0;
+        self.overlay_generation = self.overlay_generation.wrapping_add(1);
+        self.overlay_closing_since = None;
         if matches!(
             self.overlay,
             Some(Overlay::QuickAppearance | Overlay::Settings)
@@ -1735,9 +1784,30 @@ impl CompiApp {
     }
 
     fn dismiss_overlay(&mut self) {
+        if matches!(self.overlay, Some(Overlay::ThemeCatalog))
+            && let Some(parent) = self.overlay_return.take()
+        {
+            self.cancel_catalog_preview();
+            self.overlay = Some(parent);
+            self.overlay_generation = self.overlay_generation.wrapping_add(1);
+            self.overlay_closing_since = None;
+            self.overlay_focus = self.settings_section as usize;
+            self.ime_text.clear();
+            self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+            return;
+        }
+        if self.overlay.is_some() && self.overlay_closing_since.is_none() {
+            self.cancel_catalog_preview();
+            self.overlay_closing_since = Some(Instant::now());
+        }
+    }
+
+    fn finish_dismiss_overlay(&mut self) {
         self.cancel_catalog_preview();
         self.image_inspector = None;
+        self.overlay_return = None;
         self.overlay = None;
+        self.overlay_closing_since = None;
         self.ime_text.clear();
         self.ime_marked_range = None;
         self.ime_selected_range = 0..0;
@@ -1782,15 +1852,14 @@ impl CompiApp {
             return true;
         }
         if self.overlay.is_some() {
-            if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
-                match key.key.as_str() {
-                    "up" | "down" => {
-                        self.move_catalog_selection(key.key == "up");
-                        cx.notify();
-                        return true;
-                    }
-                    _ => {}
-                }
+            if self.overlay_closing_since.is_some() {
+                return true;
+            }
+            if self.handle_settings_key(key, window, cx)
+                || self.handle_dialog_key(key, window, cx)
+                || self.handle_catalog_key(key, window, cx)
+            {
+                return true;
             }
             match key.key.as_str() {
                 "escape" => {
@@ -2722,6 +2791,24 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        record_frame_metrics();
+        let performance_visible = matches!(self.overlay, Some(Overlay::Settings))
+            && self.settings_section == SettingsSection::Performance;
+        let sample_fps = self.state.show_fps || performance_visible;
+        self.performance_enabled
+            .store(sample_fps, Ordering::Release);
+        if sample_fps {
+            let view_id = cx.entity_id();
+            window.on_next_frame(move |_, cx| cx.notify(view_id));
+        }
+        if let Some(started) = self.overlay_closing_since {
+            if started.elapsed() >= dialogs::OVERLAY_CLOSE_DURATION {
+                self.finish_dismiss_overlay();
+            } else {
+                let view_id = cx.entity_id();
+                window.on_next_frame(move |_, cx| cx.notify(view_id));
+            }
+        }
         if let Some((appearance, favorites)) = self.pending_appearance_reload.take() {
             self.sync_global_appearance(appearance, favorites, window);
         }
@@ -2803,7 +2890,8 @@ impl CompiApp {
             .flex()
             .flex_col()
             .font_family(UI_FONT)
-            .text_size(px(13.0))
+            .text_size(px(UI_BODY_TEXT_SIZE))
+            .font_weight(FontWeight::MEDIUM)
             .text_color(color(colors.foreground))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.handle_app_key(event, window, cx)
@@ -2871,8 +2959,11 @@ impl CompiApp {
             .when(self.overlay.is_none(), |root| {
                 root.child(self.render_image_previews(cx))
             })
+            .when(self.state.show_fps, |root| {
+                root.child(self.render_fps_overlay())
+            })
             .when(self.overlay.is_some(), |root| {
-                root.child(self.render_overlay(cx))
+                root.child(self.render_overlay(window, cx))
             })
             .when(
                 self.dragging_tab.is_some() && self.drag_position.is_some(),
@@ -2909,7 +3000,7 @@ impl CompiApp {
             .px_2()
             .py_1()
             .rounded_sm()
-            .text_size(px(12.0))
+            .text_size(px(UI_SMALL_TEXT_SIZE))
             .text_color(color(if reason.is_some() {
                 colors.muted
             } else {
@@ -3394,7 +3485,7 @@ impl CompiApp {
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(10.0))
+                                        .text_size(px(UI_MICRO_TEXT_SIZE))
                                         .text_color(color(colors.muted))
                                         .child(self.tab_status(tab)),
                                 )
@@ -3657,7 +3748,7 @@ impl CompiApp {
                                     .p_2()
                                     .bg(color(colors.surface))
                                     .text_color(color(colors.error))
-                                    .text_size(px(11.0))
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
                                     .child(error),
                             )
                         })
@@ -3837,802 +3928,6 @@ impl CompiApp {
                             .h(px(length))
                             .w(px(2.0))
                     }),
-            )
-            .into_any_element()
-    }
-
-    fn render_pane_actions_menu(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
-        let rows = self
-            .overlay_choices(cx)
-            .into_iter()
-            .enumerate()
-            .map(|(index, choice)| {
-                let selected = index == self.overlay_index;
-                div()
-                    .id(("pane-action-choice", index))
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .bg(color(if selected {
-                        colors.surface_hover
-                    } else {
-                        colors.surface
-                    }))
-                    .text_color(color(if choice.reason.is_some() {
-                        colors.muted
-                    } else {
-                        colors.foreground
-                    }))
-                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.overlay_index = index;
-                        this.activate_overlay(window, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(choice.title)
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(color(colors.muted))
-                                    .child(choice.detail),
-                            ),
-                    )
-                    .when_some(choice.reason, |row, reason| {
-                        row.child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(color(colors.muted))
-                                .child(reason),
-                        )
-                    })
-            });
-        div()
-            .absolute()
-            .inset_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.dismiss_overlay();
-                    window.focus(&this.focus_handle);
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(CHROME_HEIGHT + 4.0))
-                    .right(px(WINDOW_CONTROLS_WIDTH + 4.0))
-                    .w(px(260.0))
-                    .flex()
-                    .flex_col()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(color(colors.border))
-                    .bg(color(colors.surface))
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .children(rows),
-            )
-            .into_any_element()
-    }
-
-    fn render_appearance_controls(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
-        let mut appearance = self.scoped_appearance();
-        if self.opacity_drag_origin.is_some() {
-            appearance.terminal_opacity = self.terminal_opacity;
-        }
-        let theme_locked = self.settings_scope == SettingsScope::Window
-            && self.config.provenance.theme == crate::config::ValueSource::CommandLine;
-        let scopes = [
-            (SettingsScope::Global, "Global defaults"),
-            (SettingsScope::Window, "This window"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (scope, label))| {
-            let active = self.settings_scope == scope;
-            div()
-                .id(("settings-scope", index))
-                .px_3()
-                .py_2()
-                .rounded_sm()
-                .bg(color(if active {
-                    colors.surface_hover
-                } else {
-                    colors.background
-                }))
-                .border_1()
-                .border_color(color(if active { colors.accent } else { colors.border }))
-                .text_color(color(if active {
-                    colors.foreground
-                } else {
-                    colors.muted
-                }))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.settings_scope = scope;
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
-                .child(label)
-        });
-        let effects = BackgroundEffect::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, effect)| {
-                let active = appearance.background_effect == effect;
-                div()
-                    .id(("background-effect", index))
-                    .flex_1()
-                    .px_3()
-                    .py_2()
-                    .rounded_sm()
-                    .bg(color(if active {
-                        colors.surface_hover
-                    } else {
-                        colors.background
-                    }))
-                    .border_1()
-                    .border_color(color(if active { colors.accent } else { colors.border }))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let mut next = this.scoped_appearance();
-                        next.background_effect = effect;
-                        this.apply_scoped_appearance(next, window, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .child(effect.label())
-            });
-        let opacity_progress = ((appearance.terminal_opacity
-            - crate::config::MIN_TERMINAL_OPACITY)
-            / (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY))
-            .clamp(0.0, 1.0);
-        let opacity_input = cx.entity();
-        let opacity_slider_input = canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                window.on_mouse_event({
-                    let input = opacity_input.clone();
-                    move |event: &MouseDownEvent, _, window, cx| {
-                        if event.button != MouseButton::Left || !bounds.contains(&event.position) {
-                            return;
-                        }
-                        let opacity = opacity_at_slider_position(event.position.x, bounds);
-                        input.update(cx, |this, cx| {
-                            this.preview_terminal_opacity(opacity, window);
-                            cx.stop_propagation();
-                            cx.notify();
-                        });
-                    }
-                });
-                window.on_mouse_event({
-                    let input = opacity_input.clone();
-                    move |event: &MouseMoveEvent, _, window, cx| {
-                        if !event.dragging() {
-                            return;
-                        }
-                        let opacity = opacity_at_slider_position(event.position.x, bounds);
-                        input.update(cx, |this, cx| {
-                            if this.opacity_drag_origin.is_some() {
-                                this.preview_terminal_opacity(opacity, window);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                        });
-                    }
-                });
-            },
-        )
-        .absolute()
-        .inset_0();
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child("Save appearance to")
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(color(colors.muted))
-                                    .child(match self.settings_scope {
-                                        SettingsScope::Global => {
-                                            "TOML defaults used by every window"
-                                        }
-                                        SettingsScope::Window => {
-                                            "Private JSON override for this window only"
-                                        }
-                                    }),
-                            ),
-                    )
-                    .child(div().flex().gap_1().children(scopes)),
-            )
-            .child(self.render_theme_catalog_entry(appearance.theme, cx))
-            .when(theme_locked, |section| {
-                section.child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(color(colors.muted))
-                        .child("Theme is fixed by the current --theme command-line override."),
-                )
-            })
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child("Background")
-                    .child(div().w(px(220.0)).flex().gap_1().children(effects)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .child("Terminal opacity")
-                            .child(format!("{:.0}%", appearance.terminal_opacity * 100.0)),
-                    )
-                    .child(
-                        div()
-                            .id("opacity-slider")
-                            .relative()
-                            .mx_2()
-                            .h(px(24.0))
-                            .cursor(gpui::CursorStyle::ResizeLeftRight)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .right_0()
-                                    .top(px(10.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(color(colors.border)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top(px(10.0))
-                                    .w(gpui::relative(opacity_progress))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(color(colors.accent)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(gpui::relative(opacity_progress))
-                                    .top(px(5.0))
-                                    .ml(px(-7.0))
-                                    .size(px(14.0))
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(color(colors.foreground))
-                                    .bg(color(colors.accent)),
-                            )
-                            .child(opacity_slider_input),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(color(colors.muted))
-                            .child(
-                                "10–100%. Terminal and header backgrounds fade together; text and controls stay opaque.",
-                            ),
-                    ),
-            )
-            .when(self.settings_scope == SettingsScope::Window, |section| {
-                section.child(
-                    div().flex().justify_end().child(
-                        div()
-                            .id("reset-window-appearance")
-                            .px_3()
-                            .py_2()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(color(colors.border))
-                            .cursor_pointer()
-                            .child("Use global defaults")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.reset_window_appearance(window);
-                                cx.stop_propagation();
-                                cx.notify();
-                            })),
-                    ),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_settings_overlay(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
-        let full = matches!(self.overlay, Some(Overlay::Settings));
-        let live_surfaces = self.command_context(cx).live_surface_count;
-        let panel = div()
-            .w_full()
-            .max_w(px(if full { 780.0 } else { 680.0 }))
-            .max_h(px(if full { 580.0 } else { 520.0 }))
-            .flex()
-            .flex_col()
-            .rounded_md()
-            .border_1()
-            .border_color(color(colors.border))
-            .bg(color(colors.surface))
-            .overflow_hidden()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(if full { "Settings" } else { "Quick Appearance" })
-                    .child(
-                        div()
-                            .id("settings-dismiss")
-                            .text_size(px(11.0))
-                            .text_color(color(colors.muted))
-                            .cursor_pointer()
-                            .child("Esc · Close")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dismiss_overlay();
-                                window.focus(&this.focus_handle);
-                                cx.stop_propagation();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("settings-scroll")
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(color(colors.muted))
-                                    .child("APPEARANCE"),
-                            )
-                            .child(self.render_appearance_controls(cx)),
-                    )
-                    .when(full, |body| {
-                        body.child(
-                            div()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(color(colors.border))
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(color(colors.muted))
-                                        .child("INTERFACE"),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .items_center()
-                                        .child(format!(
-                                            "Workspace sidebar · {:.0}px",
-                                            self.sidebar_width
-                                        ))
-                                        .child(self.command_button(
-                                            "settings-reset-sidebar",
-                                            "Reset width",
-                                            Command::ResetSidebarWidth,
-                                            cx,
-                                        )),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(color(colors.border))
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(color(colors.muted))
-                                        .child("TERMINAL"),
-                                )
-                                .child(format!(
-                                    "{} · {:.1}px · {:.2} line height · {:.0}% zoom",
-                                    self.font_settings.family,
-                                    self.font_settings.size,
-                                    self.font_settings.line_height,
-                                    self.zoom * 100.0
-                                ))
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(color(colors.muted))
-                                        .child("Fullscreen TUI modes keep the terminal canvas clean; explicit cell colors remain opaque."),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(color(colors.border))
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(color(colors.muted))
-                                        .child("KEYBOARD"),
-                                )
-                                .child(format!(
-                                    "{} commands are searchable in the command palette. TOML keybindings override platform defaults.",
-                                    commands::REGISTRY.len()
-                                ))
-                                .child(self.command_button(
-                                    "settings-open-config",
-                                    "Open configuration file",
-                                    Command::OpenConfiguration,
-                                    cx,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(color(colors.border))
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(color(colors.muted))
-                                        .child("DAEMON"),
-                                )
-                                .child(format!(
-                                    "{} live surface{} · restart ends every live process",
-                                    live_surfaces,
-                                    if live_surfaces == 1 { "" } else { "s" }
-                                ))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_2()
-                                        .child(self.command_button(
-                                            "settings-reconnect",
-                                            "Reconnect window",
-                                            Command::Reconnect,
-                                            cx,
-                                        ))
-                                        .child(self.command_button(
-                                            "settings-restart-daemon",
-                                            if live_surfaces == 0 {
-                                                "Restart daemon"
-                                            } else {
-                                                "Review and restart daemon…"
-                                            },
-                                            Command::RestartDaemon,
-                                            cx,
-                                        )),
-                                ),
-                        )
-                    }),
-            )
-            .when(!full, |panel| {
-                panel.child(
-                    div()
-                        .p_3()
-                        .border_t_1()
-                        .border_color(color(colors.border))
-                        .flex()
-                        .justify_end()
-                        .child(
-                            div()
-                                .id("open-full-settings")
-                                .px_3()
-                                .py_2()
-                                .rounded_sm()
-                                .bg(color(colors.accent))
-                                .text_color(color(colors.background))
-                                .cursor_pointer()
-                                .child("All settings")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_overlay(Overlay::Settings, "");
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            });
-        div()
-            .absolute()
-            .top(px(CHROME_HEIGHT))
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .pt(px(18.0))
-            .px_4()
-            .flex()
-            .justify_center()
-            .bg(color(colors.background).opacity(0.46))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.dismiss_overlay();
-                    window.focus(&this.focus_handle);
-                    cx.notify();
-                }),
-            )
-            .child(panel)
-            .into_any_element()
-    }
-
-    fn render_overlay(&self, cx: &Context<Self>) -> AnyElement {
-        if matches!(self.overlay, Some(Overlay::ImageInspector)) {
-            return self.render_image_inspector(cx);
-        }
-        if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
-            return self.render_theme_catalog(cx);
-        }
-        if matches!(self.overlay, Some(Overlay::PaneActions)) {
-            return self.render_pane_actions_menu(cx);
-        }
-        if matches!(
-            self.overlay,
-            Some(Overlay::QuickAppearance | Overlay::Settings)
-        ) {
-            return self.render_settings_overlay(cx);
-        }
-        let colors = self.colors();
-        let choices = self.overlay_choices(cx);
-        let title = match &self.overlay {
-            Some(Overlay::Palette) => "Commands",
-            Some(Overlay::QuickAppearance) => "Quick Appearance",
-            Some(Overlay::Settings) => "Settings",
-            Some(Overlay::Text { title, .. }) => title,
-            Some(Overlay::Confirm { .. }) => "Confirm destructive action",
-            Some(Overlay::ConfirmDaemonRestart { .. }) => "Restart daemon",
-            Some(Overlay::Workspaces) => "Switch workspace",
-            Some(Overlay::Tabs { hidden_only: true }) => "Restore hidden terminal tab",
-            Some(Overlay::Tabs { .. }) => "Switch terminal tab",
-            Some(Overlay::Windows) => "Move terminal tab to window",
-            _ => "Diagnostics",
-        };
-        let editable = matches!(
-            self.overlay,
-            Some(
-                Overlay::Palette
-                    | Overlay::Text { .. }
-                    | Overlay::Workspaces
-                    | Overlay::Tabs { .. }
-                    | Overlay::Windows
-            )
-        );
-        let rows = choices.into_iter().enumerate().map(|(index, choice)| {
-            let selected = index == self.overlay_index;
-            div()
-                .id(("command-choice", index))
-                .px_3()
-                .py_2()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .bg(color(if selected {
-                    colors.surface_hover
-                } else {
-                    colors.surface
-                }))
-                .text_color(color(if choice.reason.is_some() {
-                    colors.muted
-                } else {
-                    colors.foreground
-                }))
-                .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.overlay_index = index;
-                    this.activate_overlay(window, cx);
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .child(format!(
-                            "{}{}",
-                            if selected { "› " } else { "" },
-                            choice.title
-                        ))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(color(colors.muted))
-                                .child(choice.detail),
-                        ),
-                )
-                .when_some(choice.reason, |row, reason| {
-                    row.child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(color(colors.muted))
-                            .child(reason),
-                    )
-                })
-        });
-        div()
-            .absolute()
-            .inset_0()
-            .bg(color(colors.background).opacity(0.35))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.dismiss_overlay();
-                    window.focus(&this.focus_handle);
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(CHROME_HEIGHT + 16.0))
-                    .left(px(24.0))
-                    .right(px(24.0))
-                    .max_w(px(700.0))
-                    .max_h(px(540.0))
-                    .flex()
-                    .flex_col()
-                    .bg(color(colors.surface))
-                    .border_1()
-                    .border_color(color(colors.border))
-                    .rounded_md()
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .px_3()
-                            .py_3()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .child(title)
-                            .child(
-                                div()
-                                    .id("overlay-dismiss")
-                                    .text_color(color(colors.muted))
-                                    .cursor_pointer()
-                                    .child("Esc · Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.dismiss_overlay();
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .when(editable, |panel| panel.child(self.render_editor(cx)))
-                    .when(matches!(self.overlay, Some(Overlay::Palette)), |panel| {
-                        panel.child(div().px_3().pb_2().child(self.command_button(
-                            "appearance-menu",
-                            "Quick Appearance…",
-                            Command::OpenQuickAppearance,
-                            cx,
-                        )))
-                    })
-                    .child(
-                        div()
-                            .id("overlay-list")
-                            .min_h_0()
-                            .max_h(px(360.0))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.overlay_scroll)
-                            .children(rows),
-                    )
-                    .when_some(
-                        self.overlay.as_ref().and_then(|overlay| match overlay {
-                            Overlay::Confirm { title, .. } => Some(title.clone()),
-                            Overlay::ConfirmDaemonRestart { details, .. } => Some(details.clone()),
-                            _ => None,
-                        }),
-                        |panel, message| {
-                            panel.child(div().p_3().text_color(color(colors.error)).child(message))
-                        },
-                    )
-                    .when(
-                        matches!(self.overlay, Some(Overlay::Diagnostics)),
-                        |panel| {
-                            panel.child(
-                                div()
-                                    .id("diagnostics-scroll")
-                                    .p_3()
-                                    .max_h(px(360.0))
-                                    .overflow_y_scroll()
-                                    .child(format!(
-                                        "Window slot: {}\nTheme: {}\nFont: {:?}\n{}\n{}\n{}",
-                                        self.slot_id.as_str(),
-                                        self.theme.label(),
-                                        self.font_settings,
-                                        self.config_diagnostics.join("\n"),
-                                        self.global_warning.as_deref().unwrap_or(""),
-                                        self.global_error.as_deref().unwrap_or("")
-                                    )),
-                            )
-                        },
-                    )
-                    .when(
-                        matches!(
-                            self.overlay,
-                            Some(
-                                Overlay::Text { .. }
-                                    | Overlay::Confirm { .. }
-                                    | Overlay::ConfirmDaemonRestart { .. }
-                            )
-                        ),
-                        |panel| {
-                            panel.child(
-                                div()
-                                    .p_3()
-                                    .border_t_1()
-                                    .border_color(color(colors.border))
-                                    .flex()
-                                    .justify_end()
-                                    .child(
-                                        div()
-                                            .id("overlay-apply")
-                                            .px_3()
-                                            .py_2()
-                                            .bg(color(colors.accent))
-                                            .text_color(color(colors.background))
-                                            .cursor_pointer()
-                                            .child(match self.overlay {
-                                                Some(Overlay::ConfirmDaemonRestart { .. }) => {
-                                                    "End all work and restart daemon"
-                                                }
-                                                Some(Overlay::Confirm { .. }) => "Confirm",
-                                                _ => "Apply",
-                                            })
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.activate_overlay(window, cx)
-                                            })),
-                                    ),
-                            )
-                        },
-                    ),
             )
             .into_any_element()
     }
@@ -5102,15 +4397,23 @@ impl CompiApp {
         let marked = self.ime_marked_range.clone();
         let input = cx.entity();
         let focus = self.focus_handle.clone();
+        let editor_focused = !matches!(
+            self.overlay,
+            Some(Overlay::Text { .. } | Overlay::ThemeCatalog)
+        ) || self.overlay_focus == 0;
         div()
             .relative()
             .mx_3()
             .mb_2()
             .px_3()
             .py_2()
-            .h(px(38.0))
+            .h(px(44.0))
             .border_1()
-            .border_color(color(colors.accent))
+            .border_color(color(if editor_focused {
+                colors.accent
+            } else {
+                colors.border
+            }))
             .child(
                 canvas(
                     move |_, _, _| (),
@@ -5128,11 +4431,14 @@ impl CompiApp {
                         let run = TextRun {
                             len: displayed.len(),
                             font: gpui::font(UI_FONT),
-                            color: color(if text.is_empty() {
-                                colors.muted
-                            } else {
-                                colors.foreground
-                            }),
+                            color: color(modal_text_color(
+                                if text.is_empty() {
+                                    colors.muted
+                                } else {
+                                    colors.foreground
+                                },
+                                colors,
+                            )),
                             background_color: None,
                             underline: None,
                             strikethrough: None,
@@ -5164,14 +4470,16 @@ impl CompiApp {
                                 ));
                             }
                             let _ = line.paint(origin, px(20.0), window, cx);
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(origin.x + caret, origin.y),
-                                    size(px(1.0), px(20.0)),
-                                ),
-                                color(colors.cursor),
-                            ));
-                            if let Some(marked) = marked {
+                            if editor_focused {
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(origin.x + caret, origin.y),
+                                        size(px(1.0), px(20.0)),
+                                    ),
+                                    color(colors.cursor),
+                                ));
+                            }
+                            if editor_focused && let Some(marked) = marked {
                                 let start = line.x_for_index(utf16_byte_index(&text, marked.start));
                                 let end = line.x_for_index(utf16_byte_index(&text, marked.end));
                                 window.paint_quad(fill(
@@ -5207,7 +4515,7 @@ impl CompiApp {
             .px_2()
             .py_1()
             .rounded_sm()
-            .text_size(px(11.0))
+            .text_size(px(UI_SMALL_TEXT_SIZE))
             .text_color(color(colors.foreground))
             .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

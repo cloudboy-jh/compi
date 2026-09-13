@@ -6,7 +6,7 @@ This document is Compi's authoritative product and technical baseline. It replac
 
 The existing repository is the implementation starting point. Its terminal correctness, persistence, replication, rendering, and lifecycle work should be retained where it satisfies this contract. Windows-specific restrictions are not requirements to preserve.
 
-The [README](../README.md) distinguishes the current implementation from this baseline. [Next steps](NEXT_STEPS.md) records the completed Phase 0 contracts, Phase 1 extraction evidence, and pending platform qualification. Dated acceptance reports and Windows test recipes are historical implementation evidence, not authority for the new scope or proof of cross-platform qualification.
+The [README](../README.md) distinguishes the current implementation from this baseline. [Next steps](NEXT_STEPS.md) tracks unfinished work; [completed work](COMPLETED.md) records implemented phases and dated verification evidence. Dated acceptance reports and Windows test recipes are historical implementation evidence, not authority for the new scope or proof of cross-platform qualification.
 
 ## Product
 
@@ -454,7 +454,7 @@ Escape sequences are untrusted process output. Hyperlink opening validates schem
 - Each surface admits at most 64 MiB of retained base64 image data and pending-transfer reservations. Individual decoded images and each visible pane's decoded cache are bounded to 64 MiB. A raw 3840×2160 RGBA image is 31.64 MiB and occupies 42.19 MiB as retained base64.
 - Capacity pressure may reclaim unreferenced images, never pixels referenced by retained placements. Rejected transfers return Kitty errors without replacing previously committed pixels or placements. Immutable payloads are shared between snapshots; placement-only updates do not retransmit image pixels.
 - Decoded images are requested only for visible placements. Offscreen cache entries and their native sprite-atlas textures are released independently of authoritative image retention. Saturated decode queues retry without requiring reconnection.
-- Protocol 10 permits bounded screen frames up to 128 MiB while retaining the 1 MiB control-frame limit. Writer budgets include in-flight data; queued recovery and client pending-screen backlogs remain bounded. Polling drains at most 1 MiB of available data per call instead of throttling a large frame at one 32 KiB read per polling interval.
+- Protocol 11 retains protocol 10's bounded screen frames up to 128 MiB and the 1 MiB control-frame limit, and adds an on-demand daemon runtime-metrics response. Writer budgets include in-flight data; queued recovery and client pending-screen backlogs remain bounded. Polling drains at most 1 MiB of available data per call instead of throttling a large frame at one 32 KiB read per polling interval.
 - Main-screen image anchors follow scrolling into retained history; expired history anchors are removed. Resize preserves pixel data and grid coordinates/extents while text reflows. Image-aware logical-line reanchoring is not implemented; this is not a claim of full graphics reflow or Kitty/sixel parity.
 - These are per-surface, per-cache and per-connection bounds, not a daemon-wide memory ceiling. Many retained surfaces, transfer buffers, frame serialization and GPU allocations require separate resource qualification.
 
@@ -534,8 +534,8 @@ Baseline commands cover:
 - Show/hide workspace sidebar and reset sidebar width.
 - Copy, paste, select all where appropriate, and clear scrollback.
 - Font zoom in/out/reset.
-- Open Quick Appearance and full Settings for theme, terminal opacity, clear/blurred background, scope, interface, keyboard, and daemon controls.
-- Open the TOML configuration file, reset client layout, reconnect the current window, safely restart the daemon, and open diagnostics.
+- Open compact Quick Appearance and responsive two-pane Settings for appearance, interface, terminal, keyboard, performance, and advanced controls.
+- Open the TOML configuration file, reset client layout, rebuild client rendering caches without touching terminal processes, reconnect the current window, safely restart the daemon, and open diagnostics.
 - Quit client, explicitly separate from stopping the server.
 
 The palette supports query filtering, keyboard navigation, Enter to execute, Escape to dismiss, visible shortcuts, and explanations for disabled actions. It is not a terminal mode.
@@ -561,6 +561,8 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 ## Configuration and appearance
 
 Use a versioned TOML configuration with documented defaults. An **Open configuration file** command, compact **Quick Appearance**, and a comprehensive in-window **Settings** panel are baseline. Settings edits appearance directly; launch profiles, fonts, limits, and advanced keybindings remain inspectable/editable through TOML.
+
+Settings uses a persistent section rail at normal widths and wrapped section controls in narrow windows. Overlay focus stays trapped; Settings and form dialogs use Tab/Shift-Tab for actionable controls, list dialogs use arrow navigation, Escape cancels or returns from nested theme browsing, and destructive confirmations default to Cancel. Modal text and focus treatments meet WCAG AA contrast against every bundled application surface.
 
 Configuration includes profiles, shell/login behavior, starting directory, environment overrides, fonts, font size, line height, the global theme preset, terminal opacity, background effect, sidebar width, keybinding overrides, scrollback/graphics limits, and terminal-initiated clipboard policy. Sidebar visibility is never a persisted or configured startup state.
 
@@ -638,6 +640,8 @@ Measure separately:
 - Input event through queue, server, PTY, engine, and frame presentation.
 - Paint CPU time versus actual frame pacing.
 - Private memory, working set, GPU memory, threads, handles/file descriptors, and process counts.
+
+The built-in Performance section samples only while visible or while its per-window FPS overlay is enabled. It reports client and daemon CPU, preferred resident/private memory, handles or file descriptors where supported, daemon surface counts, bounded render timing, display refresh when available, and shaped-row/decoded-image cache occupancy. Rendered-update FPS is an application redraw measure, not swap-chain presentation telemetry. Rebuild renderer clears client visual caches and preserves daemon-owned terminal state; reconnect remains a separate transport recovery action.
 
 Baseline gates:
 
@@ -814,7 +818,7 @@ The three product boundaries and isolated installer are now implemented. Phase 1
 
 Done when a Mac window opens a native shell, handles interactive programs and resize, then closes/reopens onto the same live surface. Windows/WSL still passes its regression path.
 
-**Implementation status (2026-09-06):** the shared Unix server, native Mac GPUI client, launch description, private Unix transport/paths, and Linux runtime CI coverage are implemented. Real Mac verification includes native shell startup, readable rendering, AppKit text input, Vim editing, resize, native close, and ordinary reattachment to the live session. This is not full phase qualification: physical Mac input/display checks and native Linux/Windows regressions remain outstanding. Windows retains the suspended-before-job ConPTY backend pending portable-PTY ownership acceptance. See [Phase 2 evidence and remaining gates](NEXT_STEPS.md#current-phase-2--native-mac-runtime-implemented).
+**Implementation status (2026-09-06):** the shared Unix server, native Mac GPUI client, launch description, private Unix transport/paths, and Linux runtime CI coverage are implemented. Real Mac verification includes native shell startup, readable rendering, AppKit text input, Vim editing, resize, native close, and ordinary reattachment to the live session. This is not full phase qualification: physical Mac input/display checks and native Linux/Windows regressions remain outstanding. Windows retains the suspended-before-job ConPTY backend pending portable-PTY ownership acceptance. See the [Phase 2 implementation evidence](COMPLETED.md#phase-2--native-mac-runtime-implemented) and [remaining qualification](NEXT_STEPS.md#4-native-mac-and-shared-platform-qualification).
 
 ### 3. Introduce workspace ownership and migration
 
@@ -838,7 +842,7 @@ Done when the protocol and headless tools manipulate the hierarchy, survive clie
 
 Done when the full daily-use workspace can be created, moved between native windows, and reopened on Mac and Windows without process restarts caused by layout or window changes.
 
-**Implementation status (2026-09-07):** the full client is implemented with native Windows/WSL evidence in [Next steps](NEXT_STEPS.md#phase-4-implemented-native-mac-qualification-pending). Protocol v9 contains the narrow launch/split/clear-history extensions needed by this client; there is no new PTY or terminal-engine replacement. Native Mac execution and shared-baseline qualification remain open. Viewport restoration requires matching server generation, process lifetime, snapshot sequence, dimensions, and content fingerprint; uncertain anchors are discarded. Divider commits may refresh metadata-only revisions only while the captured tree and server identity remain unchanged, and only explicitly rejected revision conflicts may be retried.
+**Implementation status (2026-09-07):** the full client is implemented with native Windows/WSL evidence in [completed work](COMPLETED.md#phase-4--workspace-client-implemented). Protocol v9 contains the narrow launch/split/clear-history extensions needed by this client; there is no new PTY or terminal-engine replacement. Native Mac execution and shared-baseline qualification remain open in [next steps](NEXT_STEPS.md#4-native-mac-and-shared-platform-qualification). Viewport restoration requires matching server generation, process lifetime, snapshot sequence, dimensions, and content fingerprint; uncertain anchors are discarded. Divider commits may refresh metadata-only revisions only while the captured tree and server identity remain unchanged, and only explicitly rejected revision conflicts may be retried.
 
 ### 5. Qualify the shared baseline
 
@@ -895,6 +899,7 @@ Compi is not a Windows application waiting for a Mac port. It is one persistent 
 
 - [Compi repository](https://github.com/cloudboy-jh/compi): existing implementation to migrate and preserve where compatible.
 - [SuperTerminal repository](https://github.com/sonnylazuardi/superterminal): reference for workspace structure, native terminal-first interaction, and platform separation, not a mandate to copy its stack.
-- [Next steps](NEXT_STEPS.md): Phase 0 contracts, extraction and native Mac runtime evidence, and remaining platform qualification.
+- [Next steps](NEXT_STEPS.md): unfinished implementation and qualification work.
+- [Completed work](COMPLETED.md): implemented phases and dated verification evidence.
 - [Windows terminal test recipes](testcmds.md): existing exercises to adapt to the cross-platform qualification matrix.
 - [Historical Windows acceptance results](ACCEPTANCE_RESULTS_2026-09-02.md): dated evidence from the previous implementation, not current baseline qualification.

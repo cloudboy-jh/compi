@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CLIENT_STATE_VERSION: u32 = 2;
+pub const CLIENT_STATE_VERSION: u32 = 3;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_REFERENCES: usize = 16_384;
 const MAX_ID_BYTES: usize = 256;
@@ -102,6 +102,8 @@ pub struct ClientState {
     pub font_zoom: f32,
     #[serde(default, skip_serializing_if = "WindowAppearanceOverrides::is_default")]
     pub appearance: WindowAppearanceOverrides,
+    #[serde(default)]
+    pub show_fps: bool,
     pub selected_session: Option<SessionId>,
     pub selected_tabs: HashMap<String, TabId>,
     pub focused_panes: HashMap<String, PaneId>,
@@ -118,6 +120,7 @@ impl Default for ClientState {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             font_zoom: 1.0,
             appearance: WindowAppearanceOverrides::default(),
+            show_fps: false,
             selected_session: None,
             selected_tabs: HashMap::new(),
             focused_panes: HashMap::new(),
@@ -397,6 +400,7 @@ impl ClientState {
         self.appearance = source.appearance;
         self.font_zoom = source.font_zoom;
         self.sidebar_width = source.sidebar_width;
+        self.show_fps = source.show_fps;
         self.selected_session = None;
         self.selected_tabs.clear();
         self.focused_panes.clear();
@@ -421,9 +425,9 @@ impl ClientState {
         let mut changed = false;
         match self.version {
             CLIENT_STATE_VERSION => {}
-            // Version 1 stored a materialized theme copied from configuration.
-            // Ignore that legacy field so global TOML remains authoritative.
-            1 => {
+            // Versions 1 and 2 predate the optional window-level FPS overlay.
+            // Version 1 also stored a materialized theme copied from configuration.
+            1 | 2 => {
                 self.version = CLIENT_STATE_VERSION;
                 changed = true;
             }

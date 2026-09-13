@@ -42,7 +42,6 @@ use objc2::{class, msg_send};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
-use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write as _;
@@ -54,12 +53,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-#[cfg(windows)]
-use windows::Win32::System::ProcessStatus::{
-    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
-};
-#[cfg(windows)]
-use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, VK_ADD, VK_DECIMAL, VK_DIVIDE, VK_MULTIPLY, VK_NUMPAD0,
@@ -92,6 +85,9 @@ const TITLEBAR_BRAND_WIDTH: f32 = 158.0;
 const UI_FONT: &str = "Segoe UI";
 #[cfg(target_os = "macos")]
 const UI_FONT: &str = ".SystemUIFont";
+const UI_BODY_TEXT_SIZE: f32 = 14.0;
+const UI_SMALL_TEXT_SIZE: f32 = 13.0;
+const UI_MICRO_TEXT_SIZE: f32 = 12.0;
 const TAB_DRAG_THRESHOLD: f32 = 4.0;
 const TERMINAL_PADDING: f32 = 8.0;
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
@@ -462,6 +458,7 @@ enum UiEvent {
         tab_id: u64,
         message: ServerMessage,
     },
+    PerformanceSample(Result<workspace::performance::PerformanceSample, String>),
     TabDisconnected {
         tab_id: u64,
         error: String,
@@ -634,6 +631,38 @@ enum SettingsScope {
     Global,
     Window,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsSection {
+    #[default]
+    Appearance,
+    Interface,
+    Terminal,
+    Keyboard,
+    Performance,
+    Advanced,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 6] = [
+        Self::Appearance,
+        Self::Interface,
+        Self::Terminal,
+        Self::Keyboard,
+        Self::Performance,
+        Self::Advanced,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Interface => "Interface",
+            Self::Terminal => "Terminal",
+            Self::Keyboard => "Keyboard",
+            Self::Performance => "Performance",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
 
 struct CompiApp {
     started_at: Instant,
@@ -684,9 +713,17 @@ struct CompiApp {
     settings_scope: SettingsScope,
     daemon_restarting: bool,
     zoom: f32,
+    overlay_return: Option<Overlay>,
     overlay: Option<Overlay>,
     overlay_index: usize,
     overlay_scroll: ScrollHandle,
+    overlay_focus: usize,
+    overlay_generation: u64,
+    overlay_closing_since: Option<Instant>,
+    settings_section: SettingsSection,
+    performance_enabled: Arc<AtomicBool>,
+    performance: workspace::performance::PerformanceMonitor,
+    performance_notice: Option<String>,
     overlay_revision: Option<u64>,
     pane_zoom: PaneZoomState,
     layout: Option<WorkspaceLayout>,
@@ -1130,11 +1167,16 @@ impl Render for HeaderTooltip {
             .border_1()
             .border_color(color(self.colors.border))
             .bg(color(self.colors.surface))
-            .text_size(px(11.0))
-            .text_color(color(self.colors.foreground))
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color(modal_text_color(self.colors.foreground, self.colors)))
             .child(self.title.clone())
             .when_some(self.reason.clone(), |tooltip, reason| {
-                tooltip.child(div().text_color(color(self.colors.muted)).child(reason))
+                tooltip.child(
+                    div()
+                        .text_color(color(modal_text_color(self.colors.muted, self.colors)))
+                        .child(reason),
+                )
             })
     }
 }
@@ -1582,7 +1624,7 @@ impl PaintModel {
 }
 
 fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Window) {
-    let paint_started_at = performance_metrics().map(|_| Instant::now());
+    let paint_started_at = Instant::now();
     let visible = &model.visible_rows;
     let base = model.base_row;
     let typography = &model.typography;
@@ -1616,9 +1658,7 @@ fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Windo
         }
         paint_images(bounds, model, base, true, typography, window);
     });
-    if let Some(started_at) = paint_started_at {
-        record_paint_metrics(started_at);
-    }
+    record_paint_metrics(paint_started_at);
 }
 
 fn paint_row_backgrounds(
@@ -1883,7 +1923,7 @@ fn shape_row(
         terminal_font.weight = if style.attributes.bold {
             FontWeight::BOLD
         } else {
-            FontWeight::NORMAL
+            FontWeight::MEDIUM
         };
         terminal_font.style = if style.attributes.italic {
             FontStyle::Italic
@@ -2117,6 +2157,87 @@ fn terminal_color(value: Color, foreground: bool, theme: ThemePreset) -> Hsla {
 
 fn color(value: u32) -> Hsla {
     rgb(value).into()
+}
+
+fn ui_text_color(preferred: u32, background: u32) -> u32 {
+    ui_text_color_for(preferred, &[background])
+}
+
+fn modal_text_color(preferred: u32, colors: &ThemeColors) -> u32 {
+    ui_text_color_for(
+        preferred,
+        &[
+            colors.background,
+            colors.surface,
+            colors.surface_hover,
+            colors.selection,
+        ],
+    )
+}
+
+fn ui_text_color_for(preferred: u32, backgrounds: &[u32]) -> u32 {
+    if backgrounds
+        .iter()
+        .all(|background| contrast_ratio(preferred, *background) >= 4.5)
+    {
+        return preferred;
+    }
+    let black = 0x000000;
+    let white = 0xffffff;
+    let minimum_contrast = |candidate| {
+        backgrounds
+            .iter()
+            .map(|background| contrast_ratio(candidate, *background))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let target = if minimum_contrast(black) >= minimum_contrast(white) {
+        black
+    } else {
+        white
+    };
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..12 {
+        let middle = (low + high) / 2.0;
+        if minimum_contrast(blend_rgb(preferred, target, middle)) >= 4.5 {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    blend_rgb(preferred, target, high)
+}
+
+fn blend_rgb(from: u32, to: u32, amount: f32) -> u32 {
+    let channel = |shift: u32| {
+        let from = ((from >> shift) & 0xff_u32) as f32;
+        let to = ((to >> shift) & 0xff_u32) as f32;
+        (from + (to - from) * amount).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
+fn contrast_ratio(first: u32, second: u32) -> f32 {
+    let first = relative_luminance(first);
+    let second = relative_luminance(second);
+    let (lighter, darker) = if first >= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn relative_luminance(value: u32) -> f32 {
+    let channel = |shift: u32| {
+        let value = ((value >> shift) & 0xff_u32) as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
 }
 #[cfg(windows)]
 fn active_keypad_key() -> Option<KeypadKey> {
@@ -2441,95 +2562,145 @@ fn log_startup_metric(name: &str, elapsed: Duration) {
     perf::log_startup_metric(name, elapsed);
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
+struct RenderPerformance {
+    updates_per_second: f32,
+    frame_p50_us: u64,
+    frame_p95_us: u64,
+    paint_p50_us: u64,
+    paint_p95_us: u64,
+}
+
 struct PaintMetrics {
     last_frame: Option<Instant>,
-    frame_intervals_us: Vec<u64>,
-    paint_times_us: Vec<u64>,
+    frame_intervals_us: VecDeque<u64>,
+    paint_times_us: VecDeque<u64>,
+    recent_frames: VecDeque<Instant>,
+    frames_since_log: usize,
+    paints_since_log: usize,
 }
 
-static PERFORMANCE_METRICS: LazyLock<Option<Mutex<PaintMetrics>>> = LazyLock::new(|| {
-    env::var_os("COMPI_PERF_LOG")
-        .is_some()
-        .then(|| Mutex::new(PaintMetrics::default()))
-});
-
-fn performance_metrics() -> Option<&'static Mutex<PaintMetrics>> {
-    PERFORMANCE_METRICS.as_ref()
+impl Default for PaintMetrics {
+    fn default() -> Self {
+        Self {
+            last_frame: None,
+            frame_intervals_us: VecDeque::with_capacity(240),
+            paint_times_us: VecDeque::with_capacity(240),
+            recent_frames: VecDeque::with_capacity(240),
+            frames_since_log: 0,
+            paints_since_log: 0,
+        }
+    }
 }
-fn record_paint_metrics(started_at: Instant) {
+
+static PERFORMANCE_METRICS: LazyLock<Mutex<PaintMetrics>> =
+    LazyLock::new(|| Mutex::new(PaintMetrics::default()));
+
+fn push_bounded<T>(values: &mut VecDeque<T>, value: T, limit: usize) {
+    if values.len() == limit {
+        values.pop_front();
+    }
+    values.push_back(value);
+}
+
+fn record_frame_metrics() {
     let finished_at = Instant::now();
-    let Some(metrics) = performance_metrics() else {
-        return;
-    };
-    let Ok(mut metrics) = metrics.lock() else {
+    let Ok(mut metrics) = PERFORMANCE_METRICS.lock() else {
         return;
     };
     if let Some(last_frame) = metrics.last_frame {
         let interval = finished_at.saturating_duration_since(last_frame);
         if interval <= Duration::from_millis(100) {
-            metrics.frame_intervals_us.push(interval.as_micros() as u64);
+            push_bounded(
+                &mut metrics.frame_intervals_us,
+                interval.as_micros() as u64,
+                240,
+            );
         }
     }
     metrics.last_frame = Some(finished_at);
-    metrics.paint_times_us.push(
+    push_bounded(&mut metrics.recent_frames, finished_at, 240);
+    while metrics
+        .recent_frames
+        .front()
+        .is_some_and(|frame| finished_at.saturating_duration_since(*frame) > Duration::from_secs(1))
+    {
+        metrics.recent_frames.pop_front();
+    }
+    metrics.frames_since_log = metrics.frames_since_log.saturating_add(1);
+}
+
+fn record_paint_metrics(started_at: Instant) {
+    let finished_at = Instant::now();
+    let Ok(mut metrics) = PERFORMANCE_METRICS.lock() else {
+        return;
+    };
+    push_bounded(
+        &mut metrics.paint_times_us,
         finished_at
             .saturating_duration_since(started_at)
             .as_micros() as u64,
+        240,
     );
-    if metrics.paint_times_us.len() < 240 || metrics.frame_intervals_us.len() < 120 {
+    metrics.paints_since_log = metrics.paints_since_log.saturating_add(1);
+    if !perf::enabled() || metrics.frames_since_log < 120 || metrics.paints_since_log < 240 {
         return;
     }
-
-    metrics.frame_intervals_us.sort_unstable();
-    metrics.paint_times_us.sort_unstable();
-    let frame_p50 = percentile(&metrics.frame_intervals_us, 50);
-    let frame_p95 = percentile(&metrics.frame_intervals_us, 95);
-    let paint_p50 = percentile(&metrics.paint_times_us, 50);
-    let paint_p95 = percentile(&metrics.paint_times_us, 95);
+    let snapshot = render_performance_from(&metrics);
     #[cfg(windows)]
-    let (private_bytes, handles) = current_process_metrics();
+    {
+        let process = perf::process_metrics();
+        log_performance_sample(
+            snapshot.frame_p50_us,
+            snapshot.frame_p95_us,
+            snapshot.paint_p50_us,
+            snapshot.paint_p95_us,
+            process.private_bytes.unwrap_or_default() as usize,
+            process.handles.unwrap_or_default() as u32,
+        );
+    }
+    #[cfg(target_os = "macos")]
     log_performance_sample(
-        frame_p50,
-        frame_p95,
-        paint_p50,
-        paint_p95,
-        #[cfg(windows)]
-        private_bytes,
-        #[cfg(windows)]
-        handles,
+        snapshot.frame_p50_us,
+        snapshot.frame_p95_us,
+        snapshot.paint_p50_us,
+        snapshot.paint_p95_us,
     );
-    metrics.frame_intervals_us.clear();
-    metrics.paint_times_us.clear();
+    metrics.frames_since_log = 0;
+    metrics.paints_since_log = 0;
 }
 
-fn percentile(sorted: &[u64], percentile: usize) -> u64 {
-    sorted[(sorted.len().saturating_sub(1) * percentile) / 100]
+fn render_performance_snapshot() -> RenderPerformance {
+    let Ok(metrics) = PERFORMANCE_METRICS.lock() else {
+        return RenderPerformance::default();
+    };
+    render_performance_from(&metrics)
 }
 
-#[cfg(windows)]
-fn current_process_metrics() -> (usize, u32) {
-    let process = unsafe { GetCurrentProcess() };
-    let mut memory = PROCESS_MEMORY_COUNTERS_EX {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        ..Default::default()
-    };
-    let memory_result = unsafe {
-        GetProcessMemoryInfo(
-            process,
-            &mut memory as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
-            size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        )
-    };
-    let mut handles = 0;
-    let handle_result = unsafe { GetProcessHandleCount(process, &mut handles) };
-    let private_bytes = if memory_result.is_ok() {
-        memory.PrivateUsage
-    } else {
-        0
-    };
-    let handles = if handle_result.is_ok() { handles } else { 0 };
-    (private_bytes, handles)
+fn render_performance_from(metrics: &PaintMetrics) -> RenderPerformance {
+    let mut frames: Vec<_> = metrics.frame_intervals_us.iter().copied().collect();
+    let mut paints: Vec<_> = metrics.paint_times_us.iter().copied().collect();
+    frames.sort_unstable();
+    paints.sort_unstable();
+    let now = Instant::now();
+    RenderPerformance {
+        updates_per_second: metrics
+            .recent_frames
+            .iter()
+            .filter(|frame| now.saturating_duration_since(**frame) <= Duration::from_secs(1))
+            .count() as f32,
+        frame_p50_us: percentile_or_zero(&frames, 50),
+        frame_p95_us: percentile_or_zero(&frames, 95),
+        paint_p50_us: percentile_or_zero(&paints, 50),
+        paint_p95_us: percentile_or_zero(&paints, 95),
+    }
+}
+
+fn percentile_or_zero(sorted: &[u64], percentile: usize) -> u64 {
+    sorted
+        .get((sorted.len().saturating_sub(1) * percentile) / 100)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn log_performance_sample(
@@ -2576,6 +2747,42 @@ mod tests {
 
         assert!(!drag_threshold_crossed(origin, point(px(12.0), px(12.0))));
         assert!(drag_threshold_crossed(origin, point(px(14.0), px(10.0))));
+    }
+
+    #[test]
+    fn modal_text_meets_wcag_aa_across_every_theme() {
+        for theme in ThemePreset::ALL {
+            let colors = theme.colors();
+            for preferred in [colors.foreground, colors.muted, colors.error] {
+                let adjusted = modal_text_color(preferred, colors);
+                assert!(
+                    contrast_ratio(adjusted, colors.surface) >= 4.5,
+                    "{} surface contrast",
+                    theme.id()
+                );
+                assert!(
+                    contrast_ratio(adjusted, colors.surface_hover) >= 4.5,
+                    "{} hover contrast",
+                    theme.id()
+                );
+                assert!(
+                    contrast_ratio(adjusted, colors.background) >= 4.5,
+                    "{} background contrast",
+                    theme.id()
+                );
+                assert!(
+                    contrast_ratio(adjusted, colors.selection) >= 4.5,
+                    "{} selection contrast",
+                    theme.id()
+                );
+            }
+            let accent_text = ui_text_color(colors.background, colors.accent);
+            assert!(
+                contrast_ratio(accent_text, colors.accent) >= 4.5,
+                "{} accent contrast",
+                theme.id()
+            );
+        }
     }
 
     #[test]
