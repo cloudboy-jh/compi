@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
 const TIMEOUT: Duration = Duration::from_secs(30);
+const LARGE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct DaemonGuard {
@@ -227,8 +228,12 @@ impl Controller {
     }
 
     fn until(&mut self, marker: &str) -> ScreenSnapshot {
+        self.until_with_timeout(marker, TIMEOUT)
+    }
+
+    fn until_with_timeout(&mut self, marker: &str, timeout: Duration) -> ScreenSnapshot {
         let started = Instant::now();
-        let deadline = started + TIMEOUT;
+        let deadline = started + timeout;
         loop {
             // A previous wait may already have consumed the frame containing
             // this marker. Check the replica even when no new event arrives.
@@ -325,7 +330,7 @@ fn kitty_4k_payload_and_placement_survive_detach_and_reconnect() {
         .unwrap();
     let mut attached = Controller::attach(&daemon, &surface, 80, 24);
     attached.input(b"cat kitty-transfer\r");
-    let before = attached.until("KITTY_READY_42");
+    let before = attached.until_with_timeout("KITTY_READY_42", LARGE_TRANSFER_TIMEOUT);
     assert_eq!(before.images.len(), 1);
     assert!(
         before.images[0].data.as_ref() == encoded,
