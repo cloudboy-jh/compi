@@ -291,8 +291,45 @@ impl TerminalState {
 
     pub fn advance(&mut self, bytes: &[u8]) -> (Option<Delta>, Vec<Vec<u8>>) {
         let before = self.change_baseline();
-        for &byte in bytes {
-            self.advance_byte(byte);
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if matches!(&self.input_state, InputState::Normal) {
+                let run_length = bytes[offset..]
+                    .iter()
+                    .position(|byte| *byte == 0x1b)
+                    .unwrap_or(bytes.len() - offset);
+                if run_length > 0 {
+                    self.feed_vte(&bytes[offset..offset + run_length]);
+                    offset += run_length;
+                    continue;
+                }
+            } else if matches!(&self.input_state, InputState::Apc(_)) {
+                let run_length = bytes[offset..]
+                    .iter()
+                    .position(|byte| matches!(*byte, 0x1b | 0x9c))
+                    .unwrap_or(bytes.len() - offset);
+                if run_length > 0 {
+                    let InputState::Apc(mut payload) =
+                        std::mem::replace(&mut self.input_state, InputState::Normal)
+                    else {
+                        unreachable!("checked APC input state");
+                    };
+                    let remaining_capacity = MAX_APC_BYTES.saturating_sub(payload.len());
+                    if run_length <= remaining_capacity {
+                        payload.extend_from_slice(&bytes[offset..offset + run_length]);
+                        self.input_state = InputState::Apc(payload);
+                        offset += run_length;
+                    } else {
+                        payload.extend_from_slice(&bytes[offset..offset + remaining_capacity]);
+                        self.reject_oversized_apc(&payload);
+                        self.input_state = InputState::ApcDiscard;
+                        offset += remaining_capacity + 1;
+                    }
+                    continue;
+                }
+            }
+            self.advance_byte(bytes[offset]);
+            offset += 1;
         }
         self.finish_change(before)
     }
