@@ -6,6 +6,21 @@ The Phase 4 workspace client and the image/theme slice are implemented. The nati
 
 Ordered. Finish each item before starting the next. Everything lands on main in logical commits.
 
+### Latest handoff
+
+- Completed and pushed to `main`: [`5630770`](https://github.com/cloudboy-jh/compi/commit/5630770) bundles the pinned Windows ConPTY runtime; [`94614ea`](https://github.com/cloudboy-jh/compi/commit/94614ea) delivers the theme catalog, selected eye icon, native image workflows, graphics retention, and supporting documentation.
+- Verification is complete for the recorded Windows/Linux slice: 123 Windows tests, 99 native Linux tests, warning-denied Clippy, dependency boundaries, native UI smoke, MSI validation, and extracted portable launch/reconnect. Do not repeat these checks just to reconfirm the handoff; rerun relevant checks when implementation changes.
+- Start the next session with SSH transport, not another icon/theme redesign or packaging pass. Prove the smallest real local-to-remote attach/reconnect path first, then cover host-key/authentication failures, dropped connections, process-lifetime preservation, and exclusive control.
+- Keep remote image uploads, image-aware reflow, native Mac image/clipboard/UI qualification, and sustained resource/display measurements explicit follow-ups rather than silently folding them into the initial SSH implementation.
+
+Run the latest rebuilt Windows app from the repository root:
+
+```powershell
+.\target\installer\product\release\compi.exe --instance compi-v10
+```
+
+This uses an isolated instance without stopping older work. Keep the sibling daemon, `conpty.dll`, and `OpenConsole.exe` together. Existing older GUI/daemon processes require an intentional upgrade/restart; no in-place process migration is promised.
+
 ### Completed blockers — 2026-09-12
 
 The [main-branch Core CI run at d7552028](https://github.com/cloudboy-jh/compi/actions/runs/34668270744) passed Ubuntu, macOS, and Windows core jobs plus the native Mac client build. This supersedes the earlier 20-failure status; the detailed fixes and local evidence are retained under **Core CI reliability**.
@@ -38,9 +53,9 @@ The [main-branch Core CI run at d7552028](https://github.com/cloudboy-jh/compi/a
 - Wire protocol is now 10; GUI window-forwarding protocol is 2. Older clients/daemons must be closed/restarted deliberately after accounting for running work. The old v7 golden fixtures remain unchanged.
 - Final verification: 123 Windows tests and 99 native Linux tests passed, including real 4K image reconnect and unchanged v7 fixtures. Workspace formatting, warning-denied Clippy and production dependency boundaries passed. The rebuilt Windows MSI validated and the extracted portable package passed native launch/sibling-daemon/reconnect smoke with the pinned runtime. Current Mac UI/clipboard verification and hosted CI were not run or awaited for this slice.
 
-### Phase 7 — remote SSH transport
+### Next: Phase 7 — remote SSH transport (not implemented)
 
-The server serves existing framing on stdin/stdout under `--server-stdio`. The client spawns `ssh -T` in batch mode under `--connect [user@]host[:port]` and uses the child's stdio as the transport. No network listener, no stored credentials; sshd authenticates. Local peer identity checks remain required for local endpoints and are never satisfied by a remote peer. Instance names and all path values resolve remotely. The existing one-controller-per-surface rule, snapshot resync, and sequence-gap handling apply unchanged. See the specification's "Remote SSH transport" section.
+Implement server framing on stdin/stdout under `--server-stdio` and a client-spawned `ssh -T` connection in batch mode under `--connect [user@]host[:port]`. No network listener, no stored credentials; sshd authenticates. Local peer identity checks remain required for local endpoints and are never satisfied by a remote peer. Instance names and all path values resolve remotely. The existing one-controller-per-surface rule, snapshot resync, and sequence-gap handling apply unchanged. See the specification's "Remote SSH transport" section.
 
 ### Phase 5 and native Mac qualification
 
