@@ -1,16 +1,16 @@
 COMPI BUNDLED THEME ATTRIBUTION
 
 Dark Glass and Warm Carbon are Compi's existing original palettes. Warm Carbon
-now uses amber focus, cursor and selection colors. No Superlogical originals
-are included.
+uses amber focus, cursor and selection colors.
 
 The following upstream palettes and terminal mappings were adapted into
 Compi's whole-application semantic roles. Chrome layers, focus accents, muted
-text and selection backgrounds are Compi adaptations, not claims of exact
-upstream UI reproduction. Original terminal ANSI values are retained for
-Catppuccin, Tokyo Night and Dracula. Solarized follows the upstream Xresources
-dark/light base remapping. Nord's ANSI mapping uses its named base palette.
-Retrieved 2026-09-12. All palette data is bundled; builds do not use the network.
+text, selection backgrounds and newly constructed ANSI tables are Compi
+adaptations, not claims of exact upstream UI reproduction. Original terminal
+ANSI values are retained for Catppuccin, Tokyo Night and Dracula. Solarized
+follows the upstream Xresources dark/light base remapping. Nord's ANSI mapping
+uses its named base palette. Retrieved 2026-09-12. All palette data is bundled;
+builds do not use the network.
 
 CATPPUCCIN (Latte, Frappe, Macchiato, Mocha)
 Copyright (c) 2021 Catppuccin
@@ -38,7 +38,31 @@ Palette and terminal mapping: https://github.com/dracula/kitty/blob/master/dracu
 License: https://github.com/dracula/kitty/blob/master/LICENSE
 MIT License
 
-The MIT license terms below apply separately to each of the four projects and
+OPENCODE THEME ASSETS
+Aura, Ayu, Everforest, Flexoki, GitHub, Gruvbox, Kanagawa, Material, Matrix,
+One Dark, Vercel and Cursor source palettes
+Copyright (c) 2025 opencode
+Source revision: 95daf90670b7c039c436c85537da5fbfe2205b41
+Source directory:
+https://github.com/anomalyco/opencode/tree/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets
+License:
+https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/LICENSE
+MIT License
+
+OH MY PI THEME ASSETS
+Titanium, Obsidian, Poimandres, Mahogany, Alabaster, Honeycomb, Quartz and
+Eucalyptus source palettes
+Copyright (c) 2025 Mario Zechner
+Copyright (c) 2025-2026 Can Bölük
+Copyright (c) 2026 Stencil Labs, Inc.
+Source revision: 8fad7f10066247d394a962a32302d3d0b5e7efb9
+Source directory:
+https://github.com/can1357/oh-my-pi/tree/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults
+License:
+https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/LICENSE
+MIT License
+
+The MIT license terms below apply separately to each of the six projects and
 their copyright notices above:
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

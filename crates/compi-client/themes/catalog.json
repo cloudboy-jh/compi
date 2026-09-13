@@ -180,6 +180,426 @@
         "selection": "#44475a", "cursor": "#f8f8f2",
         "ansi": ["#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2", "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff"]
       }
+    },
+    {
+      "variant": "Aura",
+      "id": "aura",
+      "name": "Aura",
+      "family": "Aura",
+      "description": "Violet neon on near-black chrome.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/aura.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#0f0f0f", "surface": "#15141b", "surface_hover": "#15141b", "border": "#2d2d2d",
+        "foreground": "#edecee", "muted": "#6d6d6d", "accent": "#a277ff", "error": "#ff6767",
+        "selection": "#15141b", "cursor": "#a277ff",
+        "ansi": ["#4c4c4c", "#ff6767", "#61ffca", "#ffca85", "#a277ff", "#f694ff", "#4bdddd", "#edecee", "#908f90", "#ff3e3e", "#38ffbc", "#ffb85c", "#864eff", "#f36bff", "#6cefef", "#f3f3f4"]
+      }
+    },
+    {
+      "variant": "AyuDark",
+      "id": "ayu-dark",
+      "name": "Ayu Dark",
+      "family": "Ayu",
+      "description": "Ink-black warmth with amber focus.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/ayu.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#0b0e14", "surface": "#0f131a", "surface_hover": "#0d1017", "border": "#6c7380",
+        "foreground": "#bfbdb6", "muted": "#6f7480", "accent": "#59c2ff", "error": "#d95757",
+        "selection": "#0d1017", "cursor": "#59c2ff",
+        "ansi": ["#495265", "#d95757", "#7fd962", "#e6b673", "#59c2ff", "#d2a6ff", "#39bae6", "#c6c4be", "#7e828a", "#ec7777", "#9cec82", "#eca644", "#30b3ff", "#bd7dff", "#5ccff6", "#dad9d5"]
+      }
+    },
+    {
+      "variant": "EverforestDark",
+      "id": "everforest-dark",
+      "name": "Everforest Dark",
+      "family": "Everforest",
+      "description": "Woodland green with calm, earthy contrast.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/everforest.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#2d353b", "surface": "#333c43", "surface_hover": "#343f44", "border": "#859289",
+        "foreground": "#d3c6aa", "muted": "#7a8478", "accent": "#a7c080", "error": "#e67e80",
+        "selection": "#343f44", "cursor": "#a7c080",
+        "ansi": ["#627380", "#e67e80", "#a7c080", "#e69875", "#4b7ddd", "#7fbbb3", "#83c092", "#ccc5b8", "#8f9598", "#eb5053", "#97c057", "#ec7a46", "#6c99ef", "#98d5cd", "#5ac073", "#ded9d1"]
+      }
+    },
+    {
+      "variant": "EverforestLight",
+      "id": "everforest-light",
+      "name": "Everforest Light",
+      "family": "Everforest",
+      "description": "Warm paper with moss and cyan accents.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/everforest.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fdf6e3", "surface": "#efebd4", "surface_hover": "#f4f0d9", "border": "#939f91",
+        "foreground": "#5c6a72", "muted": "#778277", "accent": "#728500", "error": "#f85552",
+        "selection": "#f4f0d9", "cursor": "#728500",
+        "ansi": ["#5c6a72", "#f85552", "#8da101", "#f57d26", "#2d549f", "#3a94c5", "#35a77c", "#efebd4", "#9aa09b", "#ff2622", "#bad500", "#ff994f", "#2964d6", "#55addd", "#3bd49a", "#f5f2e3"]
+      }
+    },
+    {
+      "variant": "FlexokiDark",
+      "id": "flexoki-dark",
+      "name": "Flexoki Dark",
+      "family": "Flexoki",
+      "description": "Inky black with tactile print-inspired color.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/flexoki.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#100f0f", "surface": "#1c1b1a", "surface_hover": "#282726", "border": "#575653",
+        "foreground": "#cecdc3", "muted": "#6f6e69", "accent": "#da702c", "error": "#d14d41",
+        "selection": "#282726", "cursor": "#da702c",
+        "ansi": ["#5a5454", "#d14d41", "#879a39", "#da702c", "#4b7ddd", "#4385be", "#3aa99f", "#cecdc3", "#8b8783", "#e66a5f", "#afcb3b", "#ed8b4c", "#6c99ef", "#5d9ed7", "#44d2c5", "#dfded8"]
+      }
+    },
+    {
+      "variant": "FlexokiLight",
+      "id": "flexoki-light",
+      "name": "Flexoki Light",
+      "family": "Flexoki",
+      "description": "Cream paper with rich editorial color.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/flexoki.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fffcf0", "surface": "#f2f0e5", "surface_hover": "#e6e4d9", "border": "#b7b5ac",
+        "foreground": "#100f0f", "muted": "#6f6e69", "accent": "#205ea6", "error": "#af3029",
+        "selection": "#e6e4d9", "cursor": "#205ea6",
+        "ansi": ["#100f0f", "#af3029", "#66800b", "#bc5215", "#205ea6", "#5e409d", "#24837b", "#f2f0e5", "#6f6e69", "#df352c", "#92ba04", "#f5630f", "#1975e0", "#7148c8", "#22b8ab", "#f7f5ee"]
+      }
+    },
+    {
+      "variant": "GitHubDark",
+      "id": "github-dark",
+      "name": "GitHub Dark",
+      "family": "GitHub",
+      "description": "GitHub charcoal with clear blue focus.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/github.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#0d1117", "surface": "#010409", "surface_hover": "#161b22", "border": "#30363d",
+        "foreground": "#c9d1d9", "muted": "#8b949e", "accent": "#58a6ff", "error": "#f85149",
+        "selection": "#161b22", "cursor": "#58a6ff",
+        "ansi": ["#434d5c", "#f85149", "#3fb950", "#e3b341", "#58a6ff", "#bc8cff", "#d29922", "#cad1d8", "#7c8490", "#ff2419", "#55d667", "#f4c963", "#2f90ff", "#a463ff", "#eeb339", "#dde1e6"]
+      }
+    },
+    {
+      "variant": "GitHubLight",
+      "id": "github-light",
+      "name": "GitHub Light",
+      "family": "GitHub",
+      "description": "Crisp white with familiar GitHub blue.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/github.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#ffffff", "surface": "#f6f8fa", "surface_hover": "#f0f3f6", "border": "#d0d7de",
+        "foreground": "#24292f", "muted": "#57606a", "accent": "#0969da", "error": "#cf222e",
+        "selection": "#f0f3f6", "cursor": "#0969da",
+        "ansi": ["#24292f", "#cf222e", "#1a7f37", "#9a6700", "#0969da", "#8250df", "#bc4c00", "#f6f8fa", "#7c8084", "#ed3743", "#16b644", "#cd8900", "#1782ff", "#9e72f0", "#ef6100", "#f9fafc"]
+      }
+    },
+    {
+      "variant": "GruvboxDark",
+      "id": "gruvbox-dark",
+      "name": "Gruvbox Dark",
+      "family": "Gruvbox",
+      "description": "Retro dark brown with saturated earth tones.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/gruvbox.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#282828", "surface": "#3c3836", "surface_hover": "#504945", "border": "#665c54",
+        "foreground": "#ebdbb2", "muted": "#928374", "accent": "#83a598", "error": "#fb4934",
+        "selection": "#504945", "cursor": "#83a598",
+        "ansi": ["#656565", "#fb4934", "#b8bb26", "#fe8019", "#83a598", "#d3869b", "#fabd2f", "#d6d2c7", "#94938e", "#ff7363", "#e2e62e", "#ff9c4b", "#97c4b3", "#d45c7d", "#ffce5d", "#e4e2db"]
+      }
+    },
+    {
+      "variant": "GruvboxLight",
+      "id": "gruvbox-light",
+      "name": "Gruvbox Light",
+      "family": "Gruvbox",
+      "description": "Retro cream with grounded earth tones.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/gruvbox.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fbf1c7", "surface": "#ebdbb2", "surface_hover": "#d5c4a1", "border": "#bdae93",
+        "foreground": "#3c3836", "muted": "#7c6f64", "accent": "#076678", "error": "#9d0006",
+        "selection": "#d5c4a1", "cursor": "#076678",
+        "ansi": ["#3c3836", "#9d0006", "#79740e", "#af3a03", "#076678", "#8f3f71", "#b57614", "#ebdbb2", "#867c6a", "#d00008", "#b2aa08", "#e54900", "#0096b2", "#c14091", "#f2970a", "#f2e8cd"]
+      }
+    },
+    {
+      "variant": "KanagawaWave",
+      "id": "kanagawa-wave",
+      "name": "Kanagawa Wave",
+      "family": "Kanagawa",
+      "description": "Sumi ink with wave blue and sakura focus.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/kanagawa.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#1f1f28", "surface": "#2a2a37", "surface_hover": "#363646", "border": "#54546d",
+        "foreground": "#dcd7ba", "muted": "#727169", "accent": "#7e9cd8", "error": "#e82424",
+        "selection": "#363646", "cursor": "#7e9cd8",
+        "ansi": ["#54546d", "#e82424", "#98bb6c", "#d7a657", "#7e9cd8", "#957fb8", "#76946a", "#d3d1c3", "#898891", "#f84747", "#b2d585", "#eabe77", "#5280db", "#ae97d3", "#8cb67b", "#e2e1d8"]
+      }
+    },
+    {
+      "variant": "KanagawaLotus",
+      "id": "kanagawa-lotus",
+      "name": "Kanagawa Lotus",
+      "family": "Kanagawa",
+      "description": "Lotus paper with indigo and rose accents.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/kanagawa.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#f2e9de", "surface": "#eae4d7", "surface_hover": "#e3dcd2", "border": "#d4cbbf",
+        "foreground": "#54433a", "muted": "#726a62", "accent": "#2d4f67", "error": "#e82424",
+        "selection": "#e3dcd2", "cursor": "#2d4f67",
+        "ansi": ["#54433a", "#e82424", "#98bb6c", "#d7a657", "#2d4f67", "#957fb8", "#76946a", "#eae4d7", "#93877c", "#f84747", "#b2d585", "#eabe77", "#316c96", "#ae97d3", "#8cb67b", "#f1ede5"]
+      }
+    },
+    {
+      "variant": "MaterialDark",
+      "id": "material-dark",
+      "name": "Material Dark",
+      "family": "Material",
+      "description": "Cool slate with vivid Material syntax color.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/material.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#263238", "surface": "#1e272c", "surface_hover": "#37474f", "border": "#37474f",
+        "foreground": "#eeffff", "muted": "#78909c", "accent": "#82aaff", "error": "#f07178",
+        "selection": "#37474f", "cursor": "#82aaff",
+        "ansi": ["#526772", "#f07178", "#c3e88d", "#ffcb6b", "#82aaff", "#c792ea", "#4bdddd", "#f5f8f8", "#96a4aa", "#f8404a", "#b3ec60", "#ffbd42", "#598eff", "#b866ee", "#6cefef", "#f8fafa"]
+      }
+    },
+    {
+      "variant": "MaterialLight",
+      "id": "material-light",
+      "name": "Material Light",
+      "family": "Material",
+      "description": "Clean gray daylight with focused blue color.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/material.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fafafa", "surface": "#f5f5f5", "surface_hover": "#e7e7e8", "border": "#e0e0e0",
+        "foreground": "#263238", "muted": "#687c86", "accent": "#6182b8", "error": "#e53935",
+        "selection": "#e7e7e8", "cursor": "#6182b8",
+        "ansi": ["#263238", "#e53935", "#91b859", "#ffb300", "#6182b8", "#7c4dff", "#f4511e", "#f5f5f5", "#7d8487", "#f55b58", "#abd272", "#ffc233", "#7a9bd2", "#5e24ff", "#ff7246", "#f8f8f8"]
+      }
+    },
+    {
+      "variant": "Matrix",
+      "id": "matrix",
+      "name": "Matrix",
+      "family": "Matrix",
+      "description": "Deep black with phosphor-green focus.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/matrix.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#0a0e0a", "surface": "#0e130d", "surface_hover": "#141c12", "border": "#1e2a1b",
+        "foreground": "#62ff94", "muted": "#8ca391", "accent": "#2eff6a", "error": "#ff4b4b",
+        "selection": "#141c12", "cursor": "#2eff6a",
+        "ansi": ["#3d553d", "#ff4b4b", "#62ff94", "#e6ff57", "#2eff6a", "#00efff", "#30b3ff", "#b8ccbe", "#718773", "#ff2222", "#39ff78", "#e0ff2e", "#61ff8e", "#33f2ff", "#63c6ff", "#d1ded5"]
+      }
+    },
+    {
+      "variant": "OneDark",
+      "id": "one-dark",
+      "name": "One Dark",
+      "family": "One",
+      "description": "Atom-inspired charcoal with balanced syntax color.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/one-dark.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#282c34", "surface": "#21252b", "surface_hover": "#353b45", "border": "#393f4a",
+        "foreground": "#abb2bf", "muted": "#7f848e", "accent": "#61afef", "error": "#e06c75",
+        "selection": "#353b45", "cursor": "#61afef",
+        "ansi": ["#5d6779", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#d19a66", "#babfca", "#848c9b", "#e63d4a", "#b2db94", "#eab34d", "#2f9ef8", "#bf4be1", "#e6b484", "#d2d5dd"]
+      }
+    },
+    {
+      "variant": "VercelDark",
+      "id": "vercel-dark",
+      "name": "Vercel Dark",
+      "family": "Vercel",
+      "description": "Hard monochrome with electric-blue focus.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/vercel.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#000000", "surface": "#1a1a1a", "surface_hover": "#292929", "border": "#1f1f1f",
+        "foreground": "#ededed", "muted": "#878787", "accent": "#0070f3", "error": "#e5484d",
+        "selection": "#292929", "cursor": "#0070f3",
+        "ansi": ["#474747", "#e5484d", "#46a758", "#ffb224", "#0070f3", "#52a8ff", "#4bdddd", "#ededed", "#8d8d8d", "#f56b70", "#55cb6b", "#ffc457", "#278bff", "#2993ff", "#6cefef", "#f3f3f3"]
+      }
+    },
+    {
+      "variant": "VercelLight",
+      "id": "vercel-light",
+      "name": "Vercel Light",
+      "family": "Vercel",
+      "description": "Sharp white and black with electric-blue focus.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/vercel.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#ffffff", "surface": "#fafafa", "surface_hover": "#eaeaea", "border": "#eaeaea",
+        "foreground": "#171717", "muted": "#666666", "accent": "#0070f3", "error": "#dc3545",
+        "selection": "#eaeaea", "cursor": "#0070f3",
+        "ansi": ["#171717", "#dc3545", "#388e3c", "#ff9500", "#0070f3", "#0062d1", "#2d9f9f", "#fafafa", "#767676", "#ef5564", "#37c23e", "#ffaa33", "#278bff", "#057aff", "#29d6d6", "#fcfcfc"]
+      }
+    },
+    {
+      "variant": "CursorDark",
+      "id": "cursor-dark",
+      "name": "Cursor Dark",
+      "family": "Cursor",
+      "description": "Restrained charcoal with cool cyan detail.",
+      "mode": "dark",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/cursor.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#181818", "surface": "#141414", "surface_hover": "#262626", "border": "#272727",
+        "foreground": "#e4e4e4", "muted": "#656565", "accent": "#88c0d0", "error": "#e34671",
+        "selection": "#262626", "cursor": "#88c0d0",
+        "ansi": ["#555555", "#e34671", "#3fa266", "#f1b467", "#88c0d0", "#81a1c1", "#4bdddd", "#e4e4e4", "#919191", "#f3698f", "#48cc7c", "#faa335", "#5eb7d1", "#588dc1", "#6cefef", "#ededed"]
+      }
+    },
+    {
+      "variant": "CursorLight",
+      "id": "cursor-light",
+      "name": "Cursor Light",
+      "family": "Cursor",
+      "description": "Soft white with restrained teal detail.",
+      "mode": "light",
+      "source": "https://github.com/anomalyco/opencode/blob/95daf90670b7c039c436c85537da5fbfe2205b41/packages/tui/src/theme/assets/cursor.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fcfcfc", "surface": "#f3f3f3", "surface_hover": "#ededed", "border": "#ebebeb",
+        "foreground": "#141414", "muted": "#5f5f5f", "accent": "#628c96", "error": "#cf2d56",
+        "selection": "#ededed", "cursor": "#628c96",
+        "ansi": ["#141414", "#cf2d56", "#1f8a65", "#db704b", "#6f9ba6", "#3c7cab", "#2d9f9f", "#f3f3f3", "#727272", "#e64971", "#1bc188", "#ed8d6c", "#84b7c4", "#4997d1", "#29d6d6", "#f7f7f7"]
+      }
+    },
+    {
+      "variant": "Titanium",
+      "id": "titanium",
+      "name": "Titanium",
+      "family": "OMP Originals",
+      "description": "Brushed blue-black metal with electric-blue focus.",
+      "mode": "dark",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/titanium.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#151820", "surface": "#0f1216", "surface_hover": "#2a3038", "border": "#2a3038",
+        "foreground": "#e8ecf4", "muted": "#9ca3b0", "accent": "#00b4ff", "error": "#ff4757",
+        "selection": "#17465a", "cursor": "#00b4ff",
+        "ansi": ["#4a5166", "#ff4757", "#00ff88", "#ffb347", "#00b4ff", "#d4c090", "#4bdddd", "#ebedf1", "#8e93a0", "#ff1e32", "#33ffa0", "#ffa21e", "#33c3ff", "#d4b467", "#6cefef", "#f2f3f6"]
+      }
+    },
+    {
+      "variant": "Obsidian",
+      "id": "obsidian",
+      "name": "Obsidian",
+      "family": "OMP Originals",
+      "description": "Volcanic black glass with vivid violet focus.",
+      "mode": "dark",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/obsidian.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#0c0b0a", "surface": "#1a1816", "surface_hover": "#2b2825", "border": "#1a1816",
+        "foreground": "#e8e8ec", "muted": "#8a857f", "accent": "#9d7aff", "error": "#ff5570",
+        "selection": "#1a1816", "cursor": "#9d7aff",
+        "ansi": ["#5a524b", "#ff5570", "#52e8a0", "#ffc942", "#5cd9ff", "#9d7aff", "#4bdddd", "#e8e8ec", "#96918f", "#ff2c4e", "#76f7b9", "#ffbd19", "#33cfff", "#7f51ff", "#6cefef", "#f0f0f3"]
+      }
+    },
+    {
+      "variant": "Poimandres",
+      "id": "poimandres",
+      "name": "Poimandres",
+      "family": "Poimandres",
+      "description": "Cool midnight with mint and cyan signals.",
+      "mode": "dark",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/dark-poimandres.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#1b1e28", "surface": "#303340", "surface_hover": "#303340", "border": "#506477",
+        "foreground": "#a6accd", "muted": "#767c9d", "accent": "#00ced1", "error": "#d0679d",
+        "selection": "#272c3c", "cursor": "#00ced1",
+        "ansi": ["#50576e", "#d0679d", "#00ced1", "#fffac2", "#7ac6b6", "#dd4bc5", "#767c9d", "#b8bbcc", "#7c8195", "#e585b6", "#05fbff", "#fff799", "#50c8ae", "#ef6cd9", "#8991bd", "#d1d3de"]
+      }
+    },
+    {
+      "variant": "Mahogany",
+      "id": "mahogany",
+      "name": "Mahogany",
+      "family": "OMP Originals",
+      "description": "Dark wood with brass and burgundy accents.",
+      "mode": "dark",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/mahogany.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#181210", "surface": "#1f1914", "surface_hover": "#2a221d", "border": "#3a302a",
+        "foreground": "#ece4d8", "muted": "#b8b0a6", "accent": "#c4a050", "error": "#b24d5c",
+        "selection": "#2a221d", "cursor": "#c4a050",
+        "ansi": ["#5e4b44", "#9d4451", "#6a7c5d", "#d4a574", "#b5826f", "#dd4bc5", "#c4a050", "#e7e3dd", "#988b84", "#c64e5f", "#81a666", "#d89147", "#d09b87", "#ef6cd9", "#dcb96b", "#efede9"]
+      }
+    },
+    {
+      "variant": "Alabaster",
+      "id": "alabaster",
+      "name": "Alabaster",
+      "family": "OMP Originals",
+      "description": "Clean mineral white with restrained cool accents.",
+      "mode": "light",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/alabaster.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fdfcfb", "surface": "#ffffff", "surface_hover": "#faf9f8", "border": "#e8e8ec",
+        "foreground": "#1a1c20", "muted": "#6a7080", "accent": "#505860", "error": "#704040",
+        "selection": "#f0eff0", "cursor": "#505860",
+        "ansi": ["#1a1c20", "#704040", "#405840", "#806850", "#505860", "#9f2d8d", "#2d9f9f", "#909098", "#4c4d52", "#9e4545", "#498249", "#ae8255", "#5a7189", "#d629bb", "#29d6d6", "#b7b7bc"]
+      }
+    },
+    {
+      "variant": "Honeycomb",
+      "id": "honeycomb",
+      "name": "Honeycomb",
+      "family": "OMP Originals",
+      "description": "Warm cream with honeyed amber structure.",
+      "mode": "light",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/light-honeycomb.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fffde7", "surface": "#fff3e0", "surface_hover": "#f9fbe7", "border": "#f57f17",
+        "foreground": "#5d4037", "muted": "#5d4037", "accent": "#9a6500", "error": "#d32f2f",
+        "selection": "#fff8e1", "cursor": "#9a6500",
+        "ansi": ["#5d4037", "#d32f2f", "#388e3c", "#ffb300", "#e65100", "#9f2d8d", "#2d9f9f", "#8d6e63", "#715349", "#e84d4d", "#37c23e", "#ffc233", "#ff6b1a", "#d629bb", "#29d6d6", "#b5a19a"]
+      }
+    },
+    {
+      "variant": "Quartz",
+      "id": "quartz",
+      "name": "Quartz",
+      "family": "OMP Originals",
+      "description": "Pale mineral rose with lavender structure.",
+      "mode": "light",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/quartz.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#fbf7f9", "surface": "#ffffff", "surface_hover": "#faf5f7", "border": "#8070a0",
+        "foreground": "#3a2830", "muted": "#9e6b7b", "accent": "#c07088", "error": "#b85860",
+        "selection": "#f0e0e8", "cursor": "#c07088",
+        "ansi": ["#3a2830", "#b85860", "#88a088", "#c09870", "#8070a0", "#9f2d8d", "#c07088", "#a898b0", "#685766", "#d27179", "#9bc09b", "#d9b28a", "#9783c0", "#d629bb", "#d98aa2", "#c6bccc"]
+      }
+    },
+    {
+      "variant": "Eucalyptus",
+      "id": "eucalyptus",
+      "name": "Eucalyptus",
+      "family": "OMP Originals",
+      "description": "Fresh pale teal with grounded green detail.",
+      "mode": "light",
+      "source": "https://github.com/can1357/oh-my-pi/blob/8fad7f10066247d394a962a32302d3d0b5e7efb9/packages/coding-agent/src/modes/theme/defaults/light-eucalyptus.json; whole-app roles and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#e0f7fa", "surface": "#e6f5f3", "surface_hover": "#e8f5e9", "border": "#00796b",
+        "foreground": "#37474f", "muted": "#37474f", "accent": "#00897b", "error": "#c62828",
+        "selection": "#e0f2f1", "cursor": "#00897b",
+        "ansi": ["#37474f", "#c62828", "#2e7d32", "#f9a825", "#006064", "#00897b", "#2d9f9f", "#607d8b", "#485e68", "#e73a3a", "#2eb035", "#ffbd52", "#009197", "#00bca9", "#29d6d6", "#98aab4"]
+      }
     }
   ]
 }
