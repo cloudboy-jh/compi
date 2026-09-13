@@ -259,7 +259,7 @@ pub fn process_metrics() -> ProcessMetrics {
         cpu_time_ns: Some(task.pti_total_user.saturating_add(task.pti_total_system)),
         resident_bytes: Some(task.pti_resident_size),
         virtual_bytes: Some(task.pti_virtual_size),
-        threads: Some(u64::from(task.pti_threadnum)),
+        threads: u64::try_from(task.pti_threadnum).ok(),
         file_descriptors: (fd_bytes >= 0).then_some((fd_bytes / libc::PROC_PIDLISTFD_SIZE) as u64),
         ..Default::default()
     }
