@@ -5,7 +5,7 @@ This file records completed implementation and dated verification evidence. Unfi
 ## Latest completed handoff
 
 - The Windows UI, terminal resize, resource observability, and current-FPS work described below is complete in the current source checkpoint.
-- Final Windows verification passed formatting, warning-denied workspace/all-target Clippy, and 128 tests across 10 suites. Native 144-DPI captures verified responsive flat modals, stable one-prompt resizing, and a 144 FPS idle / 142 FPS sustained-output overlay.
+- Final Windows verification passed formatting, warning-denied workspace/all-target Clippy, and 128 tests across 12 suites. Native 144-DPI captures verified responsive flat modals, stable one-prompt resizing, and a 144 FPS idle / 142 FPS sustained-output overlay.
 
 ### Windows UI, resize, observability, and current FPS — 2026-09-13
 
