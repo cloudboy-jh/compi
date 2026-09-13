@@ -59,30 +59,38 @@ impl PipeReader {
         if let Some(frame) = self.take_frame()? {
             return Ok(Some(frame));
         }
-
-        let mut available = 0_u32;
-        unsafe {
-            PeekNamedPipe(
-                HANDLE(file.as_raw_handle()),
-                None,
-                0,
-                None,
-                Some(&mut available),
-                None,
-            )?;
+        let mut chunk = [0_u8; 32 * 1024];
+        // Drain up to 1 MiB already available per poll, without blocking or
+        // making large image frames pay the caller's sleep after every 32 KiB.
+        for _ in 0..32 {
+            let mut available = 0_u32;
+            unsafe {
+                PeekNamedPipe(
+                    HANDLE(file.as_raw_handle()),
+                    None,
+                    0,
+                    None,
+                    Some(&mut available),
+                    None,
+                )?;
+            }
+            if available == 0 {
+                return Ok(None);
+            }
+            let length = (available as usize).min(chunk.len());
+            let mut reader = file;
+            let read = reader.read(&mut chunk[..length])?;
+            if read == 0 {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "named pipe closed").into(),
+                );
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+            if let Some(frame) = self.take_frame()? {
+                return Ok(Some(frame));
+            }
         }
-        if available == 0 {
-            return Ok(None);
-        }
-
-        let mut chunk = vec![0_u8; (available as usize).min(32 * 1024)];
-        let mut reader = file;
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "named pipe closed").into());
-        }
-        self.buffer.extend_from_slice(&chunk[..read]);
-        self.take_frame()
+        Ok(None)
     }
 
     #[cfg(unix)]
@@ -92,31 +100,36 @@ impl PipeReader {
             return Ok(Some(frame));
         }
         let mut chunk = [0_u8; 32 * 1024];
-        let count = unsafe {
-            libc::recv(
-                file.as_raw_fd(),
-                chunk.as_mut_ptr().cast(),
-                chunk.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
-                return Ok(None);
+        for _ in 0..32 {
+            let count = unsafe {
+                libc::recv(
+                    file.as_raw_fd(),
+                    chunk.as_mut_ptr().cast(),
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                match error.kind() {
+                    io::ErrorKind::WouldBlock => return Ok(None),
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return Err(error.into()),
+                }
             }
-            return Err(error.into());
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "local connection closed",
+                )
+                .into());
+            }
+            self.buffer.extend_from_slice(&chunk[..count as usize]);
+            if let Some(frame) = self.take_frame()? {
+                return Ok(Some(frame));
+            }
         }
-        if count == 0 {
-            return Err(
-                io::Error::new(io::ErrorKind::UnexpectedEof, "local connection closed").into(),
-            );
-        }
-        self.buffer.extend_from_slice(&chunk[..count as usize]);
-        self.take_frame()
+        Ok(None)
     }
 
     fn take_frame(&mut self) -> Result<Option<Frame>> {
@@ -124,17 +137,22 @@ impl PipeReader {
             return Ok(None);
         }
         let length = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
-        if length > frame::MAX_PAYLOAD {
+        if length > frame::payload_limit(self.buffer[4]) {
             return Err(format!("frame payload is too large: {length} bytes").into());
         }
         let frame_length = 5 + length;
         if self.buffer.len() < frame_length {
+            if self.buffer.capacity() < frame_length {
+                self.buffer
+                    .try_reserve_exact(frame_length - self.buffer.len())?;
+            }
             return Ok(None);
         }
 
         let kind = self.buffer[4];
-        let payload = self.buffer[5..frame_length].to_vec();
-        self.buffer.drain(..frame_length);
+        let remainder = self.buffer.split_off(frame_length);
+        let mut payload = std::mem::replace(&mut self.buffer, remainder);
+        payload.drain(..5);
         Ok(Some(Frame { kind, payload }))
     }
 }

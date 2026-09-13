@@ -45,6 +45,9 @@ pub struct DaemonClient {
     connection: File,
     next_request_id: u64,
     pending_screen: VecDeque<crate::ScreenMessage>,
+    pending_screen_sizes: VecDeque<usize>,
+    pending_screen_bytes: usize,
+    last_screen_bytes: usize,
     poll_reader: pipe::PipeReader,
     target: Option<TerminalTarget>,
     workspace: Option<WorkspaceSnapshot>,
@@ -129,7 +132,7 @@ impl DaemonClient {
                         message => return Err(unexpected_response(message)),
                     },
                     Some(ServerEvent::Control { .. }) => {}
-                    Some(ServerEvent::Screen(message)) => self.pending_screen.push_back(message),
+                    Some(ServerEvent::Screen(message)) => self.queue_screen(message),
                     None => return Err("daemon disconnected before responding".into()),
                 }
             }
@@ -296,7 +299,7 @@ impl DaemonClient {
                     return Ok(message);
                 }
                 Some(ServerEvent::Control { .. }) => {}
-                Some(ServerEvent::Screen(message)) => self.pending_screen.push_back(message),
+                Some(ServerEvent::Screen(message)) => self.queue_screen(message),
                 None => return Err("daemon disconnected before responding".into()),
             }
         }
@@ -331,7 +334,28 @@ impl DaemonClient {
     }
 
     pub fn take_pending_screen(&mut self) -> Option<crate::ScreenMessage> {
+        if let Some(bytes) = self.pending_screen_sizes.pop_front() {
+            self.pending_screen_bytes -= bytes;
+        }
         self.pending_screen.pop_front()
+    }
+
+    fn queue_screen(&mut self, message: crate::ScreenMessage) {
+        if self.pending_screen.len() >= 32
+            || self
+                .pending_screen_bytes
+                .saturating_add(self.last_screen_bytes)
+                > frame::MAX_SCREEN_PAYLOAD
+        {
+            // Keep the newest event. A discarded baseline/delta is observable as
+            // a sequence gap, recovered through the existing snapshot protocol.
+            self.pending_screen.clear();
+            self.pending_screen_sizes.clear();
+            self.pending_screen_bytes = 0;
+        }
+        self.pending_screen.push_back(message);
+        self.pending_screen_sizes.push_back(self.last_screen_bytes);
+        self.pending_screen_bytes += self.last_screen_bytes;
     }
 
     pub fn into_parts(
@@ -357,6 +381,9 @@ impl DaemonClient {
             connection,
             next_request_id,
             pending_screen: VecDeque::new(),
+            pending_screen_sizes: VecDeque::new(),
+            pending_screen_bytes: 0,
+            last_screen_bytes: 0,
             poll_reader: pipe::PipeReader::default(),
             target: None,
             workspace: None,
@@ -373,13 +400,16 @@ impl DaemonClient {
             connection,
             next_request_id,
             pending_screen: VecDeque::new(),
+            pending_screen_sizes: VecDeque::new(),
+            pending_screen_bytes: 0,
+            last_screen_bytes: 0,
             poll_reader: pipe::PipeReader::default(),
             target: Some(target),
             workspace,
         }
     }
 
-    fn decode_event(&self, message: frame::Frame) -> Result<Option<ServerEvent>> {
+    fn decode_event(&mut self, message: frame::Frame) -> Result<Option<ServerEvent>> {
         match message.kind {
             CONTROL_FRAME => {
                 let control = decode_server(&message.payload)?;
@@ -389,6 +419,7 @@ impl DaemonClient {
                 }))
             }
             SCREEN_FRAME => {
+                self.last_screen_bytes = message.payload.len();
                 let terminal = decode_terminal_frame(&message.payload)?;
                 if self
                     .target

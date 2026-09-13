@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -107,7 +108,7 @@ pub struct KittyImage {
     pub format: u16,
     pub width: u32,
     pub height: u32,
-    pub data: String,
+    pub data: Arc<str>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,8 +178,11 @@ pub fn encode_screen(message: &ScreenMessage) -> Result<Vec<u8>, bincode::error:
 }
 
 pub fn decode_screen(payload: &[u8]) -> Result<ScreenMessage, bincode::error::DecodeError> {
-    bincode::serde::decode_from_slice(payload, bincode::config::standard())
-        .map(|(message, _)| message)
+    bincode::serde::decode_from_slice(
+        payload,
+        bincode::config::standard().with_limit::<{ crate::frame::MAX_SCREEN_PAYLOAD }>(),
+    )
+    .map(|(message, _)| message)
 }
 
 pub fn encode_terminal_frame(
@@ -188,5 +192,9 @@ pub fn encode_terminal_frame(
 }
 
 pub fn decode_terminal_frame(payload: &[u8]) -> Result<TerminalFrame, bincode::error::DecodeError> {
-    bincode::serde::decode_from_slice(payload, bincode::config::standard()).map(|(frame, _)| frame)
+    bincode::serde::decode_from_slice(
+        payload,
+        bincode::config::standard().with_limit::<{ crate::frame::MAX_SCREEN_PAYLOAD }>(),
+    )
+    .map(|(frame, _)| frame)
 }

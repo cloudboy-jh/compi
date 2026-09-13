@@ -24,11 +24,18 @@ pub use client::{DaemonClient, DaemonError, ServerEvent};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+// Version 10 admits screen frames larger than the version 9 reader's 16-MiB cap.
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_MUTATION_RECEIPTS: usize = 1_024;
+
+/// Authoritative graphics storage, measured as retained base64 bytes.
+pub const DEFAULT_GRAPHICS_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_GRAPHICS_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum RGBA allocation for one decoded image.
+pub const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -257,7 +264,7 @@ impl Default for LaunchContext {
             profile: LaunchProfile::default(),
             env: std::collections::BTreeMap::new(),
             scrollback_lines: 10_000,
-            graphics_bytes: 4 * 1024 * 1024,
+            graphics_bytes: DEFAULT_GRAPHICS_BYTES,
         }
     }
 }

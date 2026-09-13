@@ -449,6 +449,16 @@ Do not rewrite the engine at the same time as the workspace and platform migrati
 
 Escape sequences are untrusted process output. Hyperlink opening validates schemes and requires user interaction. OSC 52 obeys user policy, never exposes clipboard reads, and is routed only to an appropriate controlling client. Replayed snapshots must not replay clipboard or bell side effects.
 
+### Graphics retention and transport
+
+- Each surface admits at most 64 MiB of retained base64 image data and pending-transfer reservations. Individual decoded images and each visible pane's decoded cache are bounded to 64 MiB. A raw 3840×2160 RGBA image is 31.64 MiB and occupies 42.19 MiB as retained base64.
+- Capacity pressure may reclaim unreferenced images, never pixels referenced by retained placements. Rejected transfers return Kitty errors without replacing previously committed pixels or placements. Immutable payloads are shared between snapshots; placement-only updates do not retransmit image pixels.
+- Decoded images are requested only for visible placements. Offscreen cache entries and their native sprite-atlas textures are released independently of authoritative image retention. Saturated decode queues retry without requiring reconnection.
+- Protocol 10 permits bounded screen frames up to 128 MiB while retaining the 1 MiB control-frame limit. Writer budgets include in-flight data; queued recovery and client pending-screen backlogs remain bounded. Polling drains at most 1 MiB of available data per call instead of throttling a large frame at one 32 KiB read per polling interval.
+- Main-screen image anchors follow scrolling into retained history; expired history anchors are removed. Resize preserves pixel data and grid coordinates/extents while text reflows. Image-aware logical-line reanchoring is not implemented; this is not a claim of full graphics reflow or Kitty/sixel parity.
+- These are per-surface, per-cache and per-connection bounds, not a daemon-wide memory ceiling. Many retained surfaces, transfer buffers, frame serialization and GPU allocations require separate resource qualification.
+
+
 ### Native rendering
 
 - GPUI renders terminal cells from client replicas, never by independently parsing PTY output.
@@ -539,6 +549,15 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 - Bracketed paste is honored. Pasting never implicitly executes an extra newline beyond the clipboard contents.
 - IME and composed text follow native input paths.
 
+### Image input and inspection
+
+- Image paste and file drop are input operations, separate from applications emitting Kitty graphics. PNG, JPEG, WebP, GIF first-frame and BMP input is validated and decoded on bounded background workers.
+- Windows/WSL resolves readable file paths through the selected distribution; macOS uses native paths. The terminal receives one properly quoted path, with no automatic execution/newline. Prepared input is rejected if its target surface, process lifetime or server generation changed.
+- Clipboard originals are stored privately under `clipboard-images` using content-addressed names. The managed store admits at most 512 MiB/4096 files; it does not delete files when a preview or window closes. Standard Windows DIB/DIBV5 bitmap clipboard formats are supported alongside encoded image formats.
+- A compact, dismissible thumbnail shows filename, dimensions and size outside the terminal grid. Inspection loads the full image on demand and supports fit, zoom, pan, copy and a native Save dialog. Dismissing a preview never edits the shell line or deletes its source file.
+- Input files are bounded to 64 MiB encoded data, 8192 pixels per side and the decoded-memory limit. Remote uploads and application-specific attachment protocols are not implemented in this local-input slice.
+
+
 ## Configuration and appearance
 
 Use a versioned TOML configuration with documented defaults. An **Open configuration file** command, compact **Quick Appearance**, and a comprehensive in-window **Settings** panel are baseline. Settings edits appearance directly; launch profiles, fonts, limits, and advanced keybindings remain inspectable/editable through TOML.
@@ -547,15 +566,17 @@ Configuration includes profiles, shell/login behavior, starting directory, envir
 
 Invalid configuration must produce a useful diagnostic and a safe recovery path. Apply independent valid settings where possible; never silently launch an unintended executable. Configuration and client state are separate files.
 
-The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindings`, `shell`, `environment`, `profiles.NAME`, `limits`, and `clipboard` tables, with `default_profile` selecting a named profile. `appearance.theme` accepts `dark-glass` or `warm-carbon`; `appearance.terminal_opacity` accepts 0.1–1.0; `appearance.background_effect` accepts `clear` or `blurred`. `layout.sidebar_width` is 200–600 logical pixels. `limits.scrollback_lines` is 0–100,000 alongside the fixed 1 MiB history byte bound; `limits.graphics_bytes` is 0–4 MiB so inline graphics remain within the current transport envelope. `clipboard.policy` controls OSC 52 (`allow`/`deny`), not explicit user Copy/Paste. Explicit program argv is literal; use `login` deliberately for shell profiles.
+The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindings`, `shell`, `environment`, `profiles.NAME`, `limits`, and `clipboard` tables, with `default_profile` selecting a named profile. `appearance.theme` accepts stable IDs from the bundled theme catalog; `appearance.favorites` is an optional list of those IDs. `appearance.terminal_opacity` accepts 0.1–1.0; `appearance.background_effect` accepts `clear` or `blurred`. `layout.sidebar_width` is 200–600 logical pixels. `limits.scrollback_lines` is 0–100,000 alongside the fixed 1 MiB history byte bound; `limits.graphics_bytes` is 0–64 MiB of retained image data/reservations per surface. `clipboard.policy` controls OSC 52 (`allow`/`deny`), not explicit user Copy/Paste. Explicit program argv is literal; use `login` deliberately for shell profiles.
 
 ### Theme presets and access
 
 - The first-run theme is **Dark Glass**: neutral-dark application surfaces, restrained glass in titlebar/tab chrome and the optional sidebar, and an acid-green accent. Its identity remains visible with the sidebar closed. Warm Carbon is an optional whole-app preset.
 - Each preset supplies coordinated chrome, terminal palette, text, borders, focus, selection, cursor, and ANSI colors. Terminal opacity and clear/blurred background effect are orthogonal appearance settings.
 - The baseline offers whole-app presets, not independent terminal-palette or accent overrides, custom theme files, or automatic system light/dark switching.
-- **Quick Appearance** exposes the two preset previews, background effect, and one continuous 10–100% **Terminal opacity** slider. That same value controls the terminal canvas and window-header/tab backgrounds; there is no separate header setting. **Settings** exposes the same controls plus explicit **Global defaults** and **This window** scopes, interface state, terminal summary, keyboard/configuration access, and daemon controls.
-- Appearance changes apply immediately and persist to the selected scope. Global changes atomically update only the TOML appearance table and clear the current window's overrides; window changes write only explicitly changed appearance fields to private JSON. **Use global defaults** clears those fields.
+- **Quick Appearance** exposes the current theme, access to the searchable catalog, background effect, and one continuous 10–100% **Terminal opacity** slider. That same value controls terminal canvas and window-header/tab backgrounds; there is no separate header setting. **Settings** retains **Global defaults** and **This window** scopes plus interface, terminal, keyboard/configuration, and daemon controls.
+- The bundled catalog contains 12 complete whole-app themes, generated from validated data at build time. Dark/light filters, favorites, and miniature terminal/header previews support browsing. Imported palettes retain their licenses and attribution, accessible from the catalog.
+- Theme selection previews the current window without saving; cancel restores the accepted theme. **Apply globally** updates the shared configuration and open windows following those defaults, without clearing other windows' explicit overrides or changing opacity/background preferences. Window-scoped application saves only its theme override. Favorites persist independently in the global configuration.
+- Other appearance edits apply to the selected scope through atomic, comment-preserving TOML or private window JSON. **Use global defaults** clears the current window's appearance overrides. CLI overrides remain invocation-local.
 - Appearance changes never restart a process, detach a surface, reset terminal contents, or make a CLI override durable. Explicit terminal cell backgrounds and foreground text remain opaque.
 
 ### Glass and readability
@@ -566,9 +587,9 @@ The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindin
 
 ### Brand
 
-Compi keeps its acid-lime dinosaur-eye mark with the black `/` pupil. Acid green (`#DFFB35`) is the default theme accent. The mark establishes product identity without forcing warm chrome or a single terminal ANSI palette across all presets.
+The in-terminal brand mark uses the selected rounded iris and pixel-derived, hooked swoop from the desktop icon. It is a filled vector with a pupil cutout, not a font glyph or a scaled desktop bitmap. The iris inherits the active theme accent, including during theme preview, and remains opaque while header backgrounds fade. Acid green (`#DFFB35`) remains the Dark Glass default; other themes supply their own accents. The desktop artwork is unchanged.
 
-The optional **Carbon** preset retains these warm color tokens; they are not the default Dark Glass palette:
+The optional **Warm Carbon** preset uses these warm color tokens; they are not the default Dark Glass palette:
 
 | Role | Color |
 |---|---|
@@ -578,8 +599,8 @@ The optional **Carbon** preset retains these warm color tokens; they are not the
 | Border | `#403C31` |
 | UI text | `#F4F1E8` |
 | Muted text | `#AAA394` |
-| Accent | `#DFFB35` |
-| Initial terminal canvas | `#1A1916` |
+| Accent | `#E5C07B` |
+| Initial terminal canvas | `#171613` |
 
 Default typography is IBM Plex Sans for chrome and IBM Plex Mono for the terminal, with appropriate native fallbacks. Users can configure terminal typography independently of application chrome; colors are selected together through a whole-app preset.
 
@@ -588,6 +609,8 @@ Use restrained spacing, readable labels, real icons, horizontal peer actions, vi
 ## Startup, storage, and distribution
 
 - A source checkout on Mac or Windows must build and run without an installer or registration step.
+- Windows requires the pinned Microsoft ConPTY/OpenConsole runtime pair beside the daemon. Source preparation is documented in README and automated in Windows packaging/CI. The stock runtime is not a fallback: native tracing showed it discarding Kitty APC output. Creation, resize and close use matching runtime APIs while preserving suspended-before-job-before-resume process ownership.
+- Client/daemon protocol 10 and GUI launch handoff version 2 reject older incompatible binaries. Upgrades must not silently terminate existing work; close older clients and deliberately restart an older daemon only after accounting for its live processes.
 - The client discovers the current user's server and starts it when absent, using race-safe startup and a bounded readiness handshake.
 - Auto-started server lifetime is independent of the launching client.
 - Existing platform supervision may be reused, but registration is optional for development and never required by domain logic.

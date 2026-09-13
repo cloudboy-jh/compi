@@ -14,7 +14,7 @@ use compi_protocol::{
     LayoutNode, MutationId, MutationRequest, PaneId, SessionId, SplitAxis, TabId,
     WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
-use sha2::{Digest, Sha256};
+mod brand;
 mod workspace;
 use crate::typography::TerminalTypography;
 use crate::viewport::{
@@ -201,9 +201,15 @@ struct SurfaceView {
     scroll_offset: usize,
     selection: Option<Selection>,
     selecting: bool,
-    image_cache: HashMap<u32, ([u8; 32], Arc<RenderImage>)>,
-    image_pending: HashMap<u32, [u8; 32]>,
-    image_rejected: HashMap<u32, [u8; 32]>,
+    image_cache: HashMap<u32, (u64, Arc<RenderImage>)>,
+    image_pending: HashMap<u32, u64>,
+    image_rejected: HashMap<u32, u64>,
+    image_sources: HashMap<u32, (KittyImage, u64)>,
+    visible_images: HashSet<u32>,
+    image_capacity_rejected: HashSet<u32>,
+    image_viewport: Option<(usize, i16, i16, u32, u32, bool)>,
+    images_dirty: bool,
+    image_retry: bool,
     image_cache_bytes: usize,
     image_error: Option<String>,
     row_render_cache: Arc<Mutex<RowRenderCache>>,
@@ -236,58 +242,151 @@ impl SurfaceView {
         }
     }
 
-    fn refresh_images(&mut self, tab_id: u64, sender: UiEventSender) {
+    fn refresh_images(&mut self, cell_width: f32, cell_height: f32, sender: UiEventSender) {
         let Some(snapshot) = self.mirror.snapshot() else {
             return;
         };
-        let active_ids: HashSet<u32> = snapshot.images.iter().map(|image| image.id).collect();
-        self.image_cache.retain(|id, _| active_ids.contains(id));
-        self.image_pending.retain(|id, _| active_ids.contains(id));
-        self.image_rejected.retain(|id, _| active_ids.contains(id));
+        let viewport = (
+            self.scroll_offset,
+            self.cols,
+            self.rows,
+            cell_width.to_bits(),
+            cell_height.to_bits(),
+            snapshot.modes.alternate_screen,
+        );
+        if !self.images_dirty && !self.image_retry && self.image_viewport == Some(viewport) {
+            return;
+        }
+        self.images_dirty = false;
+        self.image_retry = false;
+        self.image_viewport = Some(viewport);
+        let active_ids: HashSet<_> = snapshot.images.iter().map(|image| image.id).collect();
+        self.image_sources.retain(|id, _| active_ids.contains(id));
+        for image in &snapshot.images {
+            let unchanged = self.image_sources.get(&image.id).is_some_and(|(old, _)| {
+                old.format == image.format
+                    && old.width == image.width
+                    && old.height == image.height
+                    && Arc::ptr_eq(&old.data, &image.data)
+            });
+            if !unchanged {
+                let generation = NEXT_IMAGE_DECODE.fetch_add(1, Ordering::Relaxed);
+                self.image_sources
+                    .insert(image.id, (image.clone(), generation));
+                self.image_rejected.remove(&image.id);
+                self.image_capacity_rejected.remove(&image.id);
+            }
+        }
+        let base = snapshot.scrollback.len().saturating_sub(self.scroll_offset) as i64;
+        let visible: HashSet<_> = snapshot
+            .placements
+            .iter()
+            .filter_map(|placement| {
+                if placement.alternate_screen != snapshot.modes.alternate_screen {
+                    return None;
+                }
+                let (source, _) = self.image_sources.get(&placement.image_id)?;
+                let row = i64::from(placement.row)
+                    + if placement.alternate_screen {
+                        0
+                    } else {
+                        snapshot.scrollback.len() as i64
+                    }
+                    - base;
+                let rows = placement.rows.map_or_else(
+                    || {
+                        (source.height as f32 / cell_height.max(1.0))
+                            .ceil()
+                            .max(1.0) as i64
+                    },
+                    i64::from,
+                );
+                let cols = placement.cols.map_or_else(
+                    || (source.width as f32 / cell_width.max(1.0)).ceil().max(1.0) as i64,
+                    i64::from,
+                );
+                (row < i64::from(snapshot.rows)
+                    && row + rows > 0
+                    && i64::from(placement.col) < i64::from(snapshot.cols)
+                    && i64::from(placement.col) + cols > 0)
+                    .then_some(placement.image_id)
+            })
+            .collect();
+        let visibility_changed = visible != self.visible_images;
+        self.visible_images = visible;
+        let current = |id: &u32, generation: u64| {
+            self.visible_images.contains(id)
+                && self
+                    .image_sources
+                    .get(id)
+                    .is_some_and(|(_, expected)| *expected == generation)
+        };
+        self.image_cache
+            .retain(|id, (generation, _)| current(id, *generation));
+        self.image_pending
+            .retain(|id, generation| current(id, *generation));
+        self.image_rejected
+            .retain(|id, generation| current(id, *generation));
+        let previous_bytes = self.image_cache_bytes;
         self.image_cache_bytes = self
             .image_cache
             .values()
             .map(|(_, image)| decoded_image_bytes(image))
             .sum();
-        if self.image_rejected.is_empty() {
+        if visibility_changed || self.image_cache_bytes < previous_bytes {
+            self.image_capacity_rejected.clear();
+        }
+        self.image_capacity_rejected
+            .retain(|id| self.visible_images.contains(id));
+        if self.image_rejected.is_empty() && self.image_capacity_rejected.is_empty() {
             self.image_error = None;
         }
+        let mut reserved: usize = self
+            .image_pending
+            .keys()
+            .filter_map(|id| self.image_sources.get(id))
+            .map(|(image, _)| image.width as usize * image.height as usize * 4)
+            .sum();
         for image in &snapshot.images {
-            let mut hash = Sha256::new();
-            hash.update(image.format.to_le_bytes());
-            hash.update(image.width.to_le_bytes());
-            hash.update(image.height.to_le_bytes());
-            hash.update(image.data.as_bytes());
-            let fingerprint: [u8; 32] = hash.finalize().into();
+            if !self.visible_images.contains(&image.id) {
+                continue;
+            }
+            let generation = self.image_sources[&image.id].1;
             if self
                 .image_cache
                 .get(&image.id)
-                .is_some_and(|(cached, _)| *cached == fingerprint)
-                || self.image_pending.get(&image.id) == Some(&fingerprint)
-                || self.image_rejected.get(&image.id) == Some(&fingerprint)
+                .is_some_and(|(cached, _)| *cached == generation)
+                || self.image_pending.get(&image.id) == Some(&generation)
+                || self.image_rejected.get(&image.id) == Some(&generation)
+                || self.image_capacity_rejected.contains(&image.id)
             {
                 continue;
             }
-            if let Some((_, previous)) = self.image_cache.remove(&image.id) {
-                self.image_cache_bytes = self
-                    .image_cache_bytes
-                    .saturating_sub(decoded_image_bytes(&previous));
+            let expected = (image.width as usize)
+                .checked_mul(image.height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .unwrap_or(usize::MAX);
+            if self
+                .image_cache_bytes
+                .saturating_add(reserved)
+                .saturating_add(expected)
+                > SURFACE_IMAGE_CACHE_LIMIT
+            {
+                self.image_capacity_rejected.insert(image.id);
+                self.image_error = Some("Visible images exceed this pane's 64 MiB decoded cache. Scroll to release offscreen previews; original image data is retained.".into());
+                continue;
             }
-            self.image_pending.remove(&image.id);
-            self.image_rejected.remove(&image.id);
             let job = ImageDecodeJob {
-                tab_id,
+                tab_id: self.id,
                 image: image.clone(),
-                fingerprint,
+                generation,
                 sender: sender.clone(),
             };
             if IMAGE_DECODERS.try_send(job).is_ok() {
-                self.image_pending.insert(image.id, fingerprint);
+                self.image_pending.insert(image.id, generation);
+                reserved += expected;
             } else {
-                self.image_rejected.insert(image.id, fingerprint);
-                self.image_error = Some(
-                    "Image decoding queue is full. Reconnect to retry unchanged images.".into(),
-                );
+                self.image_retry = true;
             }
         }
     }
@@ -301,6 +400,12 @@ impl SurfaceView {
         self.image_cache.clear();
         self.image_pending.clear();
         self.image_rejected.clear();
+        self.image_sources.clear();
+        self.visible_images.clear();
+        self.image_capacity_rejected.clear();
+        self.image_viewport = None;
+        self.images_dirty = true;
+        self.image_retry = false;
         self.image_cache_bytes = 0;
         self.image_error = None;
         if let Ok(mut cache) = self.row_render_cache.lock() {
@@ -317,6 +422,22 @@ impl SurfaceView {
 }
 enum UiEvent {
     StateSaveFinished,
+    AppearanceReloaded {
+        appearance: AppearanceSettings,
+        favorites: Vec<ThemePreset>,
+        diagnostics: Vec<String>,
+    },
+    ImagePrepared {
+        request: u64,
+        origin: workspace::media::InputOrigin,
+        result: Result<crate::image_input::PreparedImage, String>,
+    },
+    ImageInspectorLoaded {
+        request: u64,
+        result: Result<Arc<RenderImage>, String>,
+    },
+    ImageClipboardReady(Result<gpui::Image, String>),
+    ImageOperationFinished(Result<String, String>),
     SurfacesLoaded(Result<compi_protocol::WorkspaceSnapshot, String>),
     DaemonRestarted(Result<compi_protocol::WorkspaceSnapshot, String>),
     MutationFinished {
@@ -334,7 +455,7 @@ enum UiEvent {
     KittyImageDecoded {
         tab_id: u64,
         image_id: u32,
-        data: [u8; 32],
+        generation: u64,
         result: Result<Arc<RenderImage>, String>,
     },
     TabControl {
@@ -373,11 +494,12 @@ static EVENT_ROUTES: LazyLock<Mutex<HashMap<u64, async_channel::Sender<UiEvent>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const SURFACE_IMAGE_CACHE_LIMIT: usize = 64 * 1024 * 1024;
+static NEXT_IMAGE_DECODE: AtomicU64 = AtomicU64::new(1);
 
 struct ImageDecodeJob {
     tab_id: u64,
     image: KittyImage,
-    fingerprint: [u8; 32],
+    generation: u64,
     sender: UiEventSender,
 }
 
@@ -401,7 +523,7 @@ static IMAGE_DECODERS: LazyLock<mpsc::SyncSender<ImageDecodeJob>> = LazyLock::ne
                 let _ = job.sender.send(UiEvent::KittyImageDecoded {
                     tab_id: job.tab_id,
                     image_id: job.image.id,
-                    data: job.fingerprint,
+                    generation: job.generation,
                     result,
                 });
             }
@@ -547,6 +669,14 @@ struct CompiApp {
     defaults: ClientState,
     config: LoadedConfig,
     theme: ThemePreset,
+    theme_catalog: Option<workspace::catalog::CatalogState>,
+    pending_appearance_reload: Option<(AppearanceSettings, Vec<ThemePreset>)>,
+    pending_image_inputs: HashSet<u64>,
+    image_previews: VecDeque<workspace::media::ImagePreview>,
+    image_inspector: Option<workspace::media::InspectorState>,
+    image_notice: Option<String>,
+    rendered_images: HashMap<usize, Arc<RenderImage>>,
+    rendered_image_ids: HashSet<usize>,
     terminal_opacity: f32,
     opacity_drag_origin: Option<f32>,
     background_effect: BackgroundEffect,
@@ -684,9 +814,53 @@ impl CompiApp {
     }
 
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let clipboard = cx.read_from_clipboard();
+        #[cfg(windows)]
+        if !clipboard.as_ref().is_some_and(|item| {
+            item.entries()
+                .iter()
+                .any(|entry| matches!(entry, gpui::ClipboardEntry::Image(_)))
+        }) {
+            match crate::image_input::clipboard_bitmap() {
+                Ok(Some(bytes)) => {
+                    if let Some(view_id) = self.focused_view {
+                        self.prepare_image_input(
+                            crate::image_input::ImageInput::Clipboard(bytes),
+                            view_id,
+                            cx,
+                        );
+                    }
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.global_error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let Some(item) = clipboard else { return };
+        if item
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, gpui::ClipboardEntry::Image(_)))
+        {
+            let Some(view_id) = self.focused_view else {
+                return;
+            };
+            for entry in item.into_entries() {
+                if let gpui::ClipboardEntry::Image(image) = entry {
+                    self.prepare_image_input(
+                        crate::image_input::ImageInput::Clipboard(image.bytes),
+                        view_id,
+                        cx,
+                    );
+                }
+            }
             return;
-        };
+        }
+        let Some(text) = item.text() else { return };
         let Some(tab) = self.focused_view_mut() else {
             return;
         };
@@ -989,11 +1163,8 @@ fn chrome_icon(icon: ChromeIcon, tint: Hsla) -> impl IntoElement {
             let mut path = PathBuilder::stroke(px(1.25));
             match icon {
                 ChromeIcon::Mark => {
-                    path.move_to(point(x(2.0), y(8.0)));
-                    path.line_to(point(x(8.0), y(3.0)));
-                    path.line_to(point(x(14.0), y(8.0)));
-                    path.line_to(point(x(8.0), y(13.0)));
-                    path.line_to(point(x(2.0), y(8.0)));
+                    brand::paint(bounds, tint, window);
+                    return;
                 }
                 ChromeIcon::Sidebar => {
                     path.move_to(point(x(2.5), y(3.0)));
@@ -1099,7 +1270,11 @@ fn chrome_icon(icon: ChromeIcon, tint: Hsla) -> impl IntoElement {
             }
         },
     )
-    .size(px(16.0))
+    .size(px(if matches!(icon, ChromeIcon::Mark) {
+        20.0
+    } else {
+        16.0
+    }))
 }
 
 fn window_control(
@@ -1868,28 +2043,24 @@ fn paint_images(
         let Some(image) = model.images.get(&placement.image_id).cloned() else {
             continue;
         };
-        let absolute_row = if placement.alternate_screen {
-            if placement.row < 0 {
-                continue;
-            }
-            placement.row as usize
-        } else {
-            let row = model.scrollback_len as i64 + i64::from(placement.row);
-            if row < 0 {
-                continue;
-            }
-            row as usize
-        };
-        if absolute_row < base {
-            continue;
-        }
-        let visible_row = absolute_row - base;
+        let absolute_row = i64::from(placement.row)
+            + if placement.alternate_screen {
+                0
+            } else {
+                model.scrollback_len as i64
+            };
+        let visible_row = absolute_row - base as i64;
         let rows = placement.rows.unwrap_or_else(|| {
             ((image.size(0).height.0 as f32 / typography.cell_height).ceil() as u16).max(1)
         });
         let cols = placement.cols.unwrap_or_else(|| {
             ((image.size(0).width.0 as f32 / typography.cell_width).ceil() as u16).max(1)
         });
+        if visible_row + i64::from(rows) <= 0
+            || visible_row as f32 * typography.cell_height >= f32::from(bounds.size.height)
+        {
+            continue;
+        }
         let image_bounds = Bounds::new(
             point(
                 bounds.left() + px(f32::from(placement.col) * typography.cell_width),
@@ -2053,7 +2224,7 @@ fn decode_kitty_image(image: &KittyImage) -> Result<Arc<RenderImage>, String> {
         .filter(|bytes| *bytes <= MAX_IMAGE_BYTES)
         .ok_or("Image dimensions exceed the 64 MiB decoded image limit")?;
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&image.data)
+        .decode(image.data.as_bytes())
         .map_err(|error| error.to_string())?;
     let mut buffer = match image.format {
         32 => RgbaImage::from_raw(image.width, image.height, bytes)
@@ -2439,7 +2610,9 @@ mod tests {
             format: 32,
             width: 1,
             height: 1,
-            data: base64::engine::general_purpose::STANDARD.encode([1, 2, 3, 4]),
+            data: base64::engine::general_purpose::STANDARD
+                .encode([1, 2, 3, 4])
+                .into(),
         };
         let decoded = decode_kitty_image(&image).unwrap();
         assert_eq!(decoded.as_bytes(0), Some([3, 2, 1, 4].as_slice()));

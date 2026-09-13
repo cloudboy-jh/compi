@@ -1,5 +1,8 @@
 use super::*;
 use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle};
+use sha2::{Digest, Sha256};
+pub(super) mod catalog;
+pub(super) mod media;
 
 #[derive(Clone)]
 pub(super) struct TransferSeed {
@@ -25,6 +28,8 @@ pub(super) enum Overlay {
     PaneActions,
     QuickAppearance,
     Settings,
+    ThemeCatalog,
+    ImageInspector,
     Text {
         purpose: TextPurpose,
         title: &'static str,
@@ -254,6 +259,14 @@ impl CompiApp {
             defaults,
             glass: terminal_opacity < 1.0,
             theme,
+            theme_catalog: None,
+            pending_appearance_reload: None,
+            pending_image_inputs: HashSet::new(),
+            image_previews: VecDeque::new(),
+            image_inspector: None,
+            image_notice: None,
+            rendered_images: HashMap::new(),
+            rendered_image_ids: HashSet::new(),
             terminal_opacity,
             opacity_drag_origin: None,
             background_effect,
@@ -346,8 +359,12 @@ impl CompiApp {
         // A control-only subscription keeps hidden work and empty windows authoritative.
         let sender = this.event_tx.clone();
         let instance = this.instance.clone();
+        let appearance_path = this.config.path.clone();
         let alive = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
+            let mut appearance_stamp = fs::metadata(&appearance_path)
+                .ok()
+                .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
@@ -357,13 +374,31 @@ impl CompiApp {
                 }
                 let sender = sender.clone();
                 let instance = instance.clone();
-                cx.background_executor()
+                let appearance_path = appearance_path.clone();
+                let previous_stamp = appearance_stamp;
+                appearance_stamp = cx
+                    .background_executor()
                     .spawn(async move {
                         let result =
                             DaemonClient::connect(instance.as_deref(), Duration::from_secs(2))
                                 .and_then(|mut client| client.workspace())
                                 .map_err(|error| error.to_string());
                         sender.send(UiEvent::SurfacesLoaded(result));
+                        let stamp = fs::metadata(&appearance_path)
+                            .ok()
+                            .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+                        if stamp.is_some() && stamp != previous_stamp {
+                            let loaded = crate::config::load(
+                                Some(&appearance_path),
+                                crate::config::FontOverrides::default(),
+                            );
+                            sender.send(UiEvent::AppearanceReloaded {
+                                appearance: loaded.configured_appearance,
+                                favorites: loaded.theme_favorites,
+                                diagnostics: loaded.diagnostics,
+                            });
+                        }
+                        stamp
                     })
                     .await;
             }
@@ -435,7 +470,12 @@ impl CompiApp {
         }
     }
 
-    fn apply_scoped_appearance(&mut self, appearance: AppearanceSettings, window: &mut Window) {
+    fn apply_scoped_appearance(
+        &mut self,
+        appearance: AppearanceSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let previous = self.appearance();
         match self.settings_scope {
             SettingsScope::Global => {
@@ -469,6 +509,9 @@ impl CompiApp {
         }
         self.apply_window_background(window);
         self.save_state();
+        if self.settings_scope == SettingsScope::Global {
+            self.broadcast_global_appearance(window, cx);
+        }
     }
 
     fn reset_window_appearance(&mut self, window: &mut Window) {
@@ -881,6 +924,37 @@ impl CompiApp {
         }
         match event {
             UiEvent::StateSaveFinished => {}
+            UiEvent::AppearanceReloaded {
+                appearance,
+                favorites,
+                diagnostics,
+            } => {
+                self.pending_appearance_reload = Some((appearance, favorites));
+                self.config_diagnostics = diagnostics;
+                self.global_warning =
+                    diagnostic_warning(&self.config_diagnostics, &self.typography.diagnostics);
+            }
+            UiEvent::ImagePrepared {
+                request,
+                origin,
+                result,
+            } => self.accept_prepared_image(request, origin, result),
+            UiEvent::ImageInspectorLoaded { request, result } => {
+                self.accept_inspector_image(request, result)
+            }
+            UiEvent::ImageClipboardReady(result) => match result {
+                Ok(image) => {
+                    cx.write_to_clipboard(gpui::ClipboardEntry::Image(image).into());
+                    self.image_notice = Some("Image copied".into());
+                }
+                Err(error) => self.image_notice = Some(error),
+            },
+            UiEvent::ImageOperationFinished(result) => {
+                self.image_notice = Some(match result {
+                    Ok(message) => message,
+                    Err(error) => error,
+                })
+            }
             UiEvent::SurfacesLoaded(Ok(workspace)) => self.accept_workspace(workspace),
             UiEvent::DaemonRestarted(result) => {
                 self.daemon_restarting = false;
@@ -969,13 +1043,14 @@ impl CompiApp {
                 };
                 let images_changed = match &message {
                     ScreenMessage::Snapshot { .. } => true,
-                    ScreenMessage::Delta { delta } => delta.images.is_some(),
+                    ScreenMessage::Delta { delta } => {
+                        delta.images.is_some() || delta.placements.is_some()
+                    }
                 };
                 let latency = match &message {
                     ScreenMessage::Delta { delta } => delta.latency_ids.clone(),
                     _ => Vec::new(),
                 };
-                let sender = self.event_tx.clone();
                 let status = self
                     .surface_views
                     .iter()
@@ -1066,9 +1141,7 @@ impl CompiApp {
                         _ if matches!(view.state, ConnectionState::Exited(_)) => view.state,
                         _ => ConnectionState::Attached,
                     };
-                    if images_changed {
-                        view.refresh_images(tab_id, sender);
-                    }
+                    view.images_dirty |= images_changed;
                 }
                 if self.focused_view == Some(tab_id)
                     && matches!(
@@ -1088,13 +1161,14 @@ impl CompiApp {
             UiEvent::KittyImageDecoded {
                 tab_id,
                 image_id,
-                data,
+                generation,
                 result,
             } => {
                 if let Some(view) = self.surface_view_mut(tab_id)
-                    && view.image_pending.get(&image_id) == Some(&data)
+                    && view.image_pending.get(&image_id) == Some(&generation)
                 {
                     view.image_pending.remove(&image_id);
+                    view.images_dirty = true;
                     match result {
                         Ok(image) => {
                             let bytes = decoded_image_bytes(&image);
@@ -1103,18 +1177,18 @@ impl CompiApp {
                                 .checked_add(bytes)
                                 .is_none_or(|total| total > SURFACE_IMAGE_CACHE_LIMIT)
                             {
-                                view.image_rejected.insert(image_id, data);
-                                view.image_error = Some("This pane reached its 64 MiB decoded image cache limit. Remove images or reconnect to retry.".into());
+                                view.image_capacity_rejected.insert(image_id);
+                                view.image_error = Some("Visible images exceed this pane's 64 MiB decoded cache. Original image data is retained.".into());
                             } else {
                                 view.image_cache_bytes += bytes;
-                                view.image_cache.insert(image_id, (data, image));
+                                view.image_cache.insert(image_id, (generation, image));
                                 if view.image_rejected.is_empty() {
                                     view.image_error = None;
                                 }
                             }
                         }
                         Err(error) => {
-                            view.image_rejected.insert(image_id, data);
+                            view.image_rejected.insert(image_id, generation);
                             view.image_error = Some(format!("Image {image_id}: {error}"));
                         }
                     }
@@ -1217,6 +1291,12 @@ impl CompiApp {
                     image_cache: HashMap::new(),
                     image_pending: HashMap::new(),
                     image_rejected: HashMap::new(),
+                    image_sources: HashMap::new(),
+                    visible_images: HashSet::new(),
+                    image_capacity_rejected: HashSet::new(),
+                    image_viewport: None,
+                    images_dirty: true,
+                    image_retry: false,
                     image_cache_bytes: 0,
                     image_error: None,
                     row_render_cache: Arc::new(Mutex::new(RowRenderCache::default())),
@@ -1655,6 +1735,8 @@ impl CompiApp {
     }
 
     fn dismiss_overlay(&mut self) {
+        self.cancel_catalog_preview();
+        self.image_inspector = None;
         self.overlay = None;
         self.ime_text.clear();
         self.ime_marked_range = None;
@@ -1682,6 +1764,9 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let key = &event.keystroke;
+        if self.inspector_key(key, window, cx) {
+            return true;
+        }
         if key.key == "escape" && self.dragging_tab.is_some() {
             self.dragging_tab = None;
             self.tab_drag_origin = None;
@@ -1697,6 +1782,16 @@ impl CompiApp {
             return true;
         }
         if self.overlay.is_some() {
+            if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
+                match key.key.as_str() {
+                    "up" | "down" => {
+                        self.move_catalog_selection(key.key == "up");
+                        cx.notify();
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             match key.key.as_str() {
                 "escape" => {
                     self.dismiss_overlay();
@@ -2179,6 +2274,7 @@ impl CompiApp {
                 self.open_overlay(Overlay::QuickAppearance, "");
             }
             Command::OpenSettings => self.open_overlay(Overlay::Settings, ""),
+            Command::OpenThemeCatalog => self.open_theme_catalog(SettingsScope::Global),
             Command::OpenConfiguration => {
                 let path = self.config.path.clone();
                 if !path.as_os_str().is_empty() {
@@ -2282,7 +2378,10 @@ impl CompiApp {
             return;
         };
         match overlay {
-            Overlay::QuickAppearance | Overlay::Settings => self.dismiss_overlay(),
+            Overlay::ThemeCatalog => self.apply_catalog_theme(window, cx),
+            Overlay::QuickAppearance | Overlay::Settings | Overlay::ImageInspector => {
+                self.dismiss_overlay()
+            }
             Overlay::Text { purpose, .. } => {
                 let label = self.ime_text.trim().to_owned();
                 if label.is_empty() {
@@ -2531,7 +2630,7 @@ impl CompiApp {
                     });
                 }
             }
-            Some(Overlay::QuickAppearance | Overlay::Settings) => {}
+            Some(Overlay::QuickAppearance | Overlay::Settings | Overlay::ThemeCatalog) => {}
             Some(Overlay::Palette) => {
                 let context = self.command_context(cx);
                 for spec in commands::REGISTRY
@@ -2623,6 +2722,9 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some((appearance, favorites)) = self.pending_appearance_reload.take() {
+            self.sync_global_appearance(appearance, favorites, window);
+        }
         if self.refresh_typography(window) {
             self.rebuild_layout(window, true);
         }
@@ -2630,6 +2732,52 @@ impl CompiApp {
             let view_id = cx.entity_id();
             window.on_next_frame(move |_, cx| cx.notify(view_id));
         }
+        for view in &mut self.surface_views {
+            if !view.stop.load(Ordering::Acquire) {
+                view.refresh_images(
+                    self.typography.cell_width,
+                    self.typography.cell_height,
+                    self.event_tx.clone(),
+                );
+            }
+        }
+        if self.surface_views.iter().any(|view| view.image_retry) {
+            let view_id = cx.entity_id();
+            window.on_next_frame(move |_, cx| cx.notify(view_id));
+        }
+        // Release sprite-atlas entries as application caches release offscreen
+        // graphics, removed previews, and closed inspections.
+        self.rendered_image_ids.clear();
+        let images = self
+            .surface_views
+            .iter()
+            .filter(|view| !view.stop.load(Ordering::Acquire))
+            .flat_map(|view| view.image_cache.values().map(|(_, image)| image))
+            .chain(
+                self.image_previews
+                    .iter()
+                    .map(|preview| &preview.image.thumbnail),
+            )
+            .chain(
+                self.image_inspector
+                    .iter()
+                    .filter_map(|inspector| inspector.image.as_ref()),
+            );
+        for image in images {
+            let id = Arc::as_ptr(image) as usize;
+            self.rendered_image_ids.insert(id);
+            self.rendered_images
+                .entry(id)
+                .or_insert_with(|| image.clone());
+        }
+        self.rendered_images.retain(|id, image| {
+            if self.rendered_image_ids.contains(id) {
+                true
+            } else {
+                let _ = window.drop_image(image.clone());
+                false
+            }
+        });
         let colors = self.colors();
         let title = self
             .selected_tab()
@@ -2720,6 +2868,9 @@ impl CompiApp {
                     )
                 },
             )
+            .when(self.overlay.is_none(), |root| {
+                root.child(self.render_image_previews(cx))
+            })
             .when(self.overlay.is_some(), |root| {
                 root.child(self.render_overlay(cx))
             })
@@ -3358,6 +3509,7 @@ impl CompiApp {
                 .iter()
                 .find(|view| view.pane_id == pane_id);
             let focused = view.is_some_and(|view| Some(view.id) == self.focused_view);
+            let drop_view_id = view.map(|view| view.id);
             let paint = view.and_then(|view| {
                 PaintModel::from_tab(
                     view,
@@ -3416,6 +3568,14 @@ impl CompiApp {
                 .bg(color(colors.background).opacity(self.terminal_opacity))
                 .flex()
                 .flex_col()
+                .on_drop(
+                    cx.listener(move |this, paths: &gpui::ExternalPaths, _, cx| {
+                        if let Some(view_id) = drop_view_id {
+                            this.drop_image_files(paths, view_id, cx);
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, _, cx| {
@@ -3805,80 +3965,6 @@ impl CompiApp {
                 }))
                 .child(label)
         });
-        let themes = ThemePreset::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, theme)| {
-                let selected = appearance.theme == theme;
-                let palette = theme.colors();
-                let swatches = [
-                    palette.background,
-                    palette.surface,
-                    palette.accent,
-                    palette.foreground,
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(swatch, value)| {
-                    div()
-                        .id(("theme-swatch", index * 4 + swatch))
-                        .flex_1()
-                        .h(px(8.0))
-                        .bg(color(value))
-                });
-                div()
-                    .id(("theme-card", index))
-                    .flex_1()
-                    .min_w_0()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(color(if selected {
-                        colors.accent
-                    } else {
-                        colors.border
-                    }))
-                    .bg(color(if selected {
-                        colors.surface_hover
-                    } else {
-                        colors.background
-                    }))
-                    .when(!theme_locked, |card| {
-                        card.cursor_pointer()
-                            .hover(move |style| style.bg(color(colors.surface_hover)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let mut next = this.scoped_appearance();
-                                next.theme = theme;
-                                this.apply_scoped_appearance(next, window);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }))
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .child(theme.label())
-                            .child(if selected { "Selected" } else { "" }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(color(colors.muted))
-                            .child(theme.description()),
-                    )
-                    .child(
-                        div()
-                            .h(px(8.0))
-                            .rounded_sm()
-                            .overflow_hidden()
-                            .flex()
-                            .children(swatches),
-                    )
-            });
         let effects = BackgroundEffect::ALL
             .into_iter()
             .enumerate()
@@ -3901,7 +3987,7 @@ impl CompiApp {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let mut next = this.scoped_appearance();
                         next.background_effect = effect;
-                        this.apply_scoped_appearance(next, window);
+                        this.apply_scoped_appearance(next, window, cx);
                         cx.stop_propagation();
                         cx.notify();
                     }))
@@ -3980,7 +4066,7 @@ impl CompiApp {
                     )
                     .child(div().flex().gap_1().children(scopes)),
             )
-            .child(div().flex().gap_2().children(themes))
+            .child(self.render_theme_catalog_entry(appearance.theme, cx))
             .when(theme_locked, |section| {
                 section.child(
                     div()
@@ -4321,6 +4407,12 @@ impl CompiApp {
     }
 
     fn render_overlay(&self, cx: &Context<Self>) -> AnyElement {
+        if matches!(self.overlay, Some(Overlay::ImageInspector)) {
+            return self.render_image_inspector(cx);
+        }
+        if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
+            return self.render_theme_catalog(cx);
+        }
         if matches!(self.overlay, Some(Overlay::PaneActions)) {
             return self.render_pane_actions_menu(cx);
         }
@@ -4649,7 +4741,7 @@ impl CompiApp {
             self.terminal_opacity = origin;
             let mut next = self.scoped_appearance();
             next.terminal_opacity = opacity;
-            self.apply_scoped_appearance(next, window);
+            self.apply_scoped_appearance(next, window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -5001,6 +5093,11 @@ impl CompiApp {
     fn render_editor(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
         let text = self.ime_text.clone();
+        let placeholder = if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
+            "Search themes by name or family…"
+        } else {
+            "Type to search or enter a name…"
+        };
         let selection = self.ime_selected_range.clone();
         let marked = self.ime_marked_range.clone();
         let input = cx.entity();
@@ -5024,7 +5121,7 @@ impl CompiApp {
                             cx,
                         );
                         let displayed: SharedString = if text.is_empty() {
-                            "Type to search or enter a name…".into()
+                            placeholder.into()
                         } else {
                             text.clone().into()
                         };

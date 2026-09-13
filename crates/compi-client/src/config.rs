@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use compi_protocol::LaunchContext;
+use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES};
 use serde::{Deserialize, Serialize};
 
 use crate::theme::{BackgroundEffect, ThemePreset};
@@ -110,6 +110,8 @@ pub struct LoadedConfig {
     pub configured_font: FontSettings,
     pub appearance: AppearanceSettings,
     pub configured_appearance: AppearanceSettings,
+    #[serde(default)]
+    pub theme_favorites: Vec<ThemePreset>,
     pub sidebar_width: f32,
     pub configured_sidebar_width: f32,
     pub keybindings: HashMap<String, String>,
@@ -129,6 +131,7 @@ impl Default for LoadedConfig {
             configured_font: FontSettings::default(),
             appearance: AppearanceSettings::default(),
             configured_appearance: AppearanceSettings::default(),
+            theme_favorites: Vec::new(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             configured_sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             keybindings: HashMap::new(),
@@ -154,7 +157,7 @@ impl LoadedConfig {
                 self.appearance.theme = theme;
                 self.provenance.theme = ValueSource::CommandLine;
             } else {
-                invalid(self, "--theme", "dark-glass or warm-carbon", "CLI");
+                invalid(self, "--theme", "a bundled theme ID", "CLI");
             }
         }
         if let Some(width) = sidebar_width {
@@ -188,6 +191,25 @@ impl LoadedConfig {
         Ok(())
     }
 
+    /// Persist global favorites in display order without changing appearance.
+    pub fn save_theme_favorites(&mut self, favorites: &[ThemePreset]) -> Result<(), String> {
+        let mut unique = Vec::with_capacity(favorites.len());
+        for &theme in favorites {
+            if !unique.contains(&theme) {
+                unique.push(theme);
+            }
+        }
+        update_appearance(&self.path, |table| {
+            let favorites = unique
+                .iter()
+                .map(|theme| theme.id())
+                .collect::<toml_edit::Array>();
+            set_appearance_value(table, "favorites", toml_edit::Value::Array(favorites));
+        })?;
+        self.theme_favorites = unique;
+        Ok(())
+    }
+
     /// Check a same-user forwarded configuration before it reaches native UI or
     /// launch code. A stored launch error is a valid, inspectable configuration;
     /// callers must separately require `launch.as_ref()` when creating work.
@@ -218,7 +240,7 @@ impl LoadedConfig {
                 .map_err(|error| format!("Invalid shortcut for {id}: {error}"))?;
         }
         if let Ok(launch) = &self.launch {
-            if launch.scrollback_lines > 100_000 || launch.graphics_bytes > 4 * 1024 * 1024 {
+            if launch.scrollback_lines > 100_000 || launch.graphics_bytes > MAX_GRAPHICS_BYTES {
                 return Err("Forwarded configuration exceeds terminal resource limits".to_owned());
             }
             for value in [
@@ -289,7 +311,32 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
                 invalid(
                     loaded,
                     "appearance.theme",
-                    "dark-glass or warm-carbon",
+                    "a bundled theme ID",
+                    "configuration",
+                );
+            }
+        }
+        if let Some(value) = appearance.get("favorites") {
+            if let Some(favorites) = value.as_array() {
+                for (index, value) in favorites.iter().enumerate() {
+                    if let Some(theme) = value.as_str().and_then(ThemePreset::parse) {
+                        if !loaded.theme_favorites.contains(&theme) {
+                            loaded.theme_favorites.push(theme);
+                        }
+                    } else {
+                        invalid(
+                            loaded,
+                            &format!("appearance.favorites[{index}]"),
+                            "a bundled theme ID",
+                            "configuration",
+                        );
+                    }
+                }
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.favorites",
+                    "an array of bundled theme IDs",
                     "configuration",
                 );
             }
@@ -508,7 +555,7 @@ fn apply_launch(document: &toml::Table, loaded: &mut LoadedConfig) {
             ("scrollback_lines", 100_000, &mut launch.scrollback_lines),
             (
                 "graphics_bytes",
-                4 * 1024 * 1024,
+                MAX_GRAPHICS_BYTES as i64,
                 &mut launch.graphics_bytes,
             ),
         ] {
@@ -578,11 +625,34 @@ pub fn load(path: Option<&Path>, overrides: FontOverrides) -> LoadedConfig {
 }
 
 fn save_appearance(path: &Path, appearance: AppearanceSettings) -> Result<(), String> {
-    if path.as_os_str().is_empty() {
-        return Err("No configuration path could be resolved; see Diagnostics".to_owned());
-    }
     if !valid_terminal_opacity(f64::from(appearance.terminal_opacity)) {
         return Err("Terminal opacity must be between 0.1 and 1.0".to_owned());
+    }
+    update_appearance(path, |table| {
+        set_appearance_value(table, "theme", appearance.theme.id().into());
+        let opacity = (f64::from(appearance.terminal_opacity) * 1_000_000.0).round() / 1_000_000.0;
+        set_appearance_value(table, "terminal_opacity", opacity.into());
+        set_appearance_value(
+            table,
+            "background_effect",
+            appearance.background_effect.id().into(),
+        );
+    })
+}
+
+fn set_appearance_value(table: &mut toml_edit::Table, key: &str, mut value: toml_edit::Value) {
+    if let Some(previous) = table.get(key).and_then(toml_edit::Item::as_value) {
+        *value.decor_mut() = previous.decor().clone();
+    }
+    table[key] = toml_edit::Item::Value(value);
+}
+
+fn update_appearance(
+    path: &Path,
+    update: impl FnOnce(&mut toml_edit::Table),
+) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("No configuration path could be resolved; see Diagnostics".to_owned());
     }
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
@@ -620,10 +690,7 @@ fn save_appearance(path: &Path, appearance: AppearanceSettings) -> Result<(), St
     let table = document["appearance"]
         .as_table_mut()
         .expect("appearance was created or validated as a table");
-    table["theme"] = toml_edit::value(appearance.theme.id());
-    let opacity = (f64::from(appearance.terminal_opacity) * 1_000_000.0).round() / 1_000_000.0;
-    table["terminal_opacity"] = toml_edit::value(opacity);
-    table["background_effect"] = toml_edit::value(appearance.background_effect.id());
+    update(table);
 
     if let Some(parent) = path
         .parent()
@@ -1046,7 +1113,7 @@ mod tests {
         let path = root.join("config.toml");
         fs::write(
             &path,
-            "# retained comment\nversion = 1\n[appearance]\ntheme = 'warm-carbon'\n[future]\nanswer = 42\n",
+            "# retained comment\nversion = 1\n[appearance]\ntheme = 'warm-carbon' # theme comment\nfavorites = ['nord'] # favorites comment\n[future]\nanswer = 42\n",
         )
         .unwrap();
         let mut loaded = load(Some(&path), FontOverrides::default());
@@ -1060,19 +1127,76 @@ mod tests {
             .unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("# retained comment"));
-        assert!(saved.contains("[future]"));
-        assert!(saved.contains("answer = 42"));
-        assert!(saved.lines().any(|line| line == "terminal_opacity = 0.72"));
-        assert!(saved.contains("background_effect = \"clear\""));
+        assert!(saved.contains("# theme comment"));
+        assert!(saved.contains("# favorites comment"));
+        let document = saved.parse::<toml::Table>().unwrap();
+        assert_eq!(document["future"]["answer"].as_integer(), Some(42));
         assert_eq!(loaded.appearance.theme, ThemePreset::DarkGlass);
         assert_eq!(loaded.configured_appearance.theme, ThemePreset::WarmCarbon);
         let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.theme_favorites, [ThemePreset::Nord]);
         assert_eq!(reloaded.appearance.terminal_opacity, 0.72);
         assert_eq!(
             reloaded.appearance.background_effect,
             BackgroundEffect::Clear
         );
+        loaded
+            .save_theme_favorites(&[
+                ThemePreset::CatppuccinLatte,
+                ThemePreset::Nord,
+                ThemePreset::CatppuccinLatte,
+            ])
+            .unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(
+            reloaded.theme_favorites,
+            [ThemePreset::CatppuccinLatte, ThemePreset::Nord]
+        );
+        assert_eq!(reloaded.theme_favorites, loaded.theme_favorites);
+        assert_eq!(reloaded.appearance.theme, ThemePreset::WarmCarbon);
+        assert_eq!(reloaded.appearance.terminal_opacity, 0.72);
+        assert_eq!(
+            reloaded.appearance.background_effect,
+            BackgroundEffect::Clear
+        );
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# favorites comment"));
+        assert_eq!(
+            saved.parse::<toml::Table>().unwrap()["future"]["answer"].as_integer(),
+            Some(42)
+        );
+        loaded.save_theme_favorites(&[]).unwrap();
+        assert!(
+            load(Some(&path), FontOverrides::default())
+                .theme_favorites
+                .is_empty()
+        );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn favorites_keep_valid_entries_in_order_when_siblings_are_invalid() {
+        let loaded = parse(
+            "version = 1\n[appearance]\nfavorites = ['nord', 'unknown', 'catppuccin-latte', 7, 'nord']",
+            FontOverrides::default(),
+        );
+        assert_eq!(
+            loaded.theme_favorites,
+            [ThemePreset::Nord, ThemePreset::CatppuccinLatte]
+        );
+        assert_eq!(loaded.diagnostics.len(), 2);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("appearance.favorites[1]"))
+        );
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("appearance.favorites[3]"))
+        );
     }
 
     #[test]

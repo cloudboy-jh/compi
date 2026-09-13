@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "support/kitty.rs"]
+mod kitty;
+
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::{
     ClientMessage, DaemonClient, PROTOCOL_VERSION, ScreenSnapshot, ServerEvent, ServerMessage,
@@ -306,6 +309,49 @@ fn wait_status(client: &mut DaemonClient, id: &SurfaceId, expected: SurfaceStatu
         );
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+#[test]
+fn kitty_4k_payload_and_placement_survive_detach_and_reconnect() {
+    let mut daemon = DaemonGuard::start();
+    let encoded = kitty::write_4k_transfer(&daemon.directory.join("kitty-transfer"));
+    let mut control = daemon.client();
+    let surface = control
+        .create_surface(
+            80,
+            24,
+            Some(daemon.directory.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+    let mut attached = Controller::attach(&daemon, &surface, 80, 24);
+    attached.input(b"cat kitty-transfer\r");
+    let before = attached.until("KITTY_READY_42");
+    assert_eq!(before.images.len(), 1);
+    assert!(
+        before.images[0].data.as_ref() == encoded,
+        "transmitted 4K payload changed"
+    );
+    assert_eq!(
+        (before.images[0].width, before.images[0].height),
+        (3840, 2160)
+    );
+    assert_eq!(before.placements.len(), 1);
+    assert_eq!(before.placements[0].image_id, 42);
+    assert_eq!(before.placements[0].placement_id, Some(7));
+    attached.client.request(ClientMessage::Detach).unwrap();
+    drop(attached);
+    let mut reattached = Controller::attach(&daemon, &surface, 80, 24);
+    let after = reattached.until("KITTY_READY_42");
+    assert!(
+        after.images == before.images,
+        "reattach changed image payload or identity"
+    );
+    assert_eq!(after.placements, before.placements);
+    assert_eq!(
+        control.list_surfaces().unwrap()[0].process_lifetime_id,
+        surface.process_lifetime_id
+    );
+    daemon.shutdown();
 }
 
 #[test]

@@ -4,6 +4,15 @@
 use std::io::{self, Read, Write};
 
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+pub const MAX_SCREEN_PAYLOAD: usize = 128 * 1024 * 1024;
+
+pub const fn payload_limit(kind: u8) -> usize {
+    match kind {
+        crate::SCREEN_FRAME => MAX_SCREEN_PAYLOAD,
+        crate::CONTROL_FRAME => crate::MAX_CONTROL_PAYLOAD,
+        _ => MAX_PAYLOAD,
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Frame {
@@ -21,7 +30,7 @@ pub fn read<R: Read>(reader: &mut R) -> io::Result<Option<Frame>> {
     reader.read_exact(&mut header[1..])?;
 
     let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-    if length > MAX_PAYLOAD {
+    if length > payload_limit(header[4]) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("frame payload is too large: {length} bytes"),
@@ -39,7 +48,7 @@ pub fn read<R: Read>(reader: &mut R) -> io::Result<Option<Frame>> {
 pub fn write<W: Write>(writer: &mut W, kind: u8, payload: &[u8]) -> io::Result<()> {
     let length = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload exceeds u32"))?;
-    if payload.len() > MAX_PAYLOAD {
+    if payload.len() > payload_limit(kind) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "frame payload exceeds the protocol limit",
@@ -102,6 +111,20 @@ mod tests {
         };
 
         assert_eq!(read(&mut reader).unwrap().unwrap().payload, payload);
+    }
+    #[test]
+    fn rejects_kind_specific_capacity_before_reading_a_body() {
+        for (kind, limit) in [
+            (crate::CONTROL_FRAME, crate::MAX_CONTROL_PAYLOAD),
+            (crate::SCREEN_FRAME, MAX_SCREEN_PAYLOAD),
+        ] {
+            let mut header = ((limit + 1) as u32).to_le_bytes().to_vec();
+            header.push(kind);
+            assert_eq!(
+                read(&mut Cursor::new(header)).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]

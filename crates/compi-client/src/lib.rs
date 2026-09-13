@@ -7,6 +7,8 @@ pub mod config;
 pub mod console;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod gui;
+#[cfg(any(windows, target_os = "macos"))]
+pub mod image_input;
 pub mod input;
 pub mod layout;
 pub mod probe;

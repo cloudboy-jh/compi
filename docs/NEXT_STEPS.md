@@ -1,6 +1,50 @@
 # Compi next steps
 
-The Phase 4 workspace client is implemented on top of Phases 0–3. Native Windows/WSL workspace qualification passed, and the current Windows terminal interaction pass is complete. Focused UI/UX refinement is next; native Mac workspace qualification, Linux native CI, performance/resource measurement, and remaining physical-input/display gates are still open. Earlier platform evidence and its limits are retained below.
+The Phase 4 workspace client and the image/theme slice are implemented. The native Windows client now has a 12-theme catalog, the selected theme-colored rounded-eye mark, image paste/drop, and a full-image inspector. Graphics retention and real 4K detach/reattach have been exercised on Windows/WSL and Linux; Windows uses a pinned Microsoft ConPTY runtime because the stock runtime discarded graphics. Remote SSH transport is the next implementation phase. Native Mac UI/input qualification, resource measurement, and remaining physical-input/display gates stay open; earlier hosted results below remain dated evidence, not claims about unrun current CI.
+
+## Current work: SSH, then shared qualification
+
+Ordered. Finish each item before starting the next. Everything lands on main in logical commits.
+
+### Completed blockers — 2026-09-12
+
+The [main-branch Core CI run at d7552028](https://github.com/cloudboy-jh/compi/actions/runs/34668270744) passed Ubuntu, macOS, and Windows core jobs plus the native Mac client build. This supersedes the earlier 20-failure status; the detailed fixes and local evidence are retained under **Core CI reliability**.
+
+1. **MIT license — complete.** LICENSE, workspace `license = "MIT"`, and the README License section are present.
+2. **Daemon integration reliability — complete.** Both suites serialize daemon lifetimes and use bounded state polling; built-in terminal controls replaced `top`/`tput` dependencies.
+3. **Unix runtime failures — complete.** Retained-grid exit semantics, buffered reads, soft-wrapped markers, and fixture ordering are corrected; both hosted Unix jobs passed.
+4. **Dependency boundary diagnostics — complete.** Explicit UTF-8 metadata decoding and readable resolution/launch errors distinguish exit 2 from real boundary violations (exit 1).
+5. **Lint gap — complete.** Core CI checks workspace formatting and warning-denied workspace/all-target Clippy.
+6. **Gate — complete.** The final tracing-enabled Windows batch passed 25 consecutive runs after all corrections; the subsequent hosted run passed every core job.
+
+### Distribution — Phase 6, reduced scope
+
+- `.github/workflows/release.yml` replaces the signing-required Windows-only workflow. Windows and ARM64 macOS package jobs must both pass before one tag-triggered draft release is assembled. Manual dispatch builds downloadable Actions artifacts without creating a tag or release.
+- Windows signing secrets are optional as a pair; partial configuration fails explicitly. `-RequireSigning` remains available for deliberately signed builds. All three installer Cargo builds are locked; the isolated bootstrapper lockfile and obsolete theme imports were corrected after the real package build exposed them.
+- `tools/build-macos.sh` builds a macOS 14+ ARM64 `Compi.app` with sibling client/daemon executables, native icon, license, ad-hoc signature, app ZIP, DMG, and checksums. Ad-hoc signing is not Developer ID signing or notarization.
+- Local Windows qualification built and WiX-validated the unsigned installer and portable ZIP, verified checksums/license contents, visually exercised the real installer Ready surface without installing into the live account, and launched the extracted portable client twice with unchanged daemon/surface/process identities. Installer library tests passed 4/4; the known per-user MSI ICE91 warnings and upstream `proc-macro-error2` notice remain visible.
+- [Release run 34711439577](https://github.com/cloudboy-jh/compi/actions/runs/34711439577), source commit `21a3af9`, passed the ARM64 Mac build and copied-DMG-bundle LaunchServices/reconnect smoke. Downloaded Mac artifacts matched their checksums and retained executable permissions and the license. The hosted Windows installer lifecycle result was not observed to completion before the local watcher was stopped at the user's direction; consult that run rather than treating this note as current CI status.
+- README documents draft-release visibility, unsigned Windows warnings, and macOS Gatekeeper approval. No release tag or public release was created during this session. Physical-input, IME, display pacing, signing/notarization, and full native Mac workspace qualification remain separate gates.
+
+### Completed: image input, themes, and graphics
+
+- The native header uses the selected rounded iris with the desktop icon's pixel-derived hooked swoop. Its accent follows theme selection and preview; the desktop artwork is unchanged.
+- The bundled catalog contains 12 whole-app themes: Dark Glass, Warm Carbon, four Catppuccin variants, Tokyo Night/Day, Solarized Dark/Light, Nord, and Dracula. Build-time validated data generates the constant palette API. Native browsing includes search, dark/light/favorite filters, miniature terminal/header previews, and bundled license text. Preview/cancel, favorite persistence, global propagation to existing windows, and preservation of explicit window overrides were exercised in the Windows client. Theme changes preserve terminal/header opacity.
+- PNG and native Windows DIB bitmap clipboard images, plus actual OLE file drops, produced readable WSL paths and compact previews without automatic execution. The native inspector rendered the full 3840×2160 image, zoomed/panned, copied matching pixels, and saved the original bytes through the native Save dialog. An apostrophe/space-containing filename was quoted correctly. Managed image files survived window closure; thumbnail dismissal does not delete them.
+- Source image storage/reservations default to 64 MiB per surface; decoded caches admit 64 MiB per pane. Offscreen decoded assets and sprite-atlas entries are released without deleting referenced authoritative pixels. Transfers, decoder queues, frame queues, and cache admission remain bounded; rejection preserves existing images and produces Kitty errors. This is not a daemon-wide memory cap.
+- The first real Windows graphics test exposed stock ConPTY dropping every Kitty APC sequence: the bounded raw PTY trace contained 439 bytes and the completion marker, but zero image sequences. The approved scope expansion bundles official Microsoft ConPTY/OpenConsole 1.24.260710001 with SHA-256-pinned preparation, Microsoft signature verification, and license text. Source builds, Windows CI, MSI and portable packaging use the matching pair without an unsupported system fallback.
+- The real 4K RGBA fixture transmits 31.64 MiB of pixels / 42.19 MiB of base64, then compares image bytes and placement after a new attachment. It passes on Windows with the pinned runtime and on native Linux under WSL. Large-frame polling was corrected to drain up to 1 MiB per call, avoiding artificial 32 KiB-per-poll throttling and the resulting Linux timeout.
+- Resize preserves image bytes and grid coordinates/extents while text reflows independently. Main-screen scrollback anchors now continue moving below row -1; expiry/clear releases expired placements. Image-aware logical-line reanchoring, sixel, full Kitty parity, remote uploads, and native Mac image-input/visual qualification are not claimed.
+- Wire protocol is now 10; GUI window-forwarding protocol is 2. Older clients/daemons must be closed/restarted deliberately after accounting for running work. The old v7 golden fixtures remain unchanged.
+- Final verification: 123 Windows tests and 99 native Linux tests passed, including real 4K image reconnect and unchanged v7 fixtures. Workspace formatting, warning-denied Clippy and production dependency boundaries passed. The rebuilt Windows MSI validated and the extracted portable package passed native launch/sibling-daemon/reconnect smoke with the pinned runtime. Current Mac UI/clipboard verification and hosted CI were not run or awaited for this slice.
+
+### Phase 7 — remote SSH transport
+
+The server serves existing framing on stdin/stdout under `--server-stdio`. The client spawns `ssh -T` in batch mode under `--connect [user@]host[:port]` and uses the child's stdio as the transport. No network listener, no stored credentials; sshd authenticates. Local peer identity checks remain required for local endpoints and are never satisfied by a remote peer. Instance names and all path values resolve remotely. The existing one-controller-per-surface rule, snapshot resync, and sequence-gap handling apply unchanged. See the specification's "Remote SSH transport" section.
+
+### Phase 5 and native Mac qualification
+
+Run the existing measurement harness (`tools/measure-release.ps1`, `tools/soak-release.ps1`) and complete item 6, the native Mac pass, on the available Mac. Qualify the bundled application rather than a bare `cargo run`, so the result survives later packaging changes.
 
 ## Completed: Phase 0 — implementation contracts
 
@@ -23,7 +67,7 @@ The code changes in [Phase 1](Spec.md#1-extract-the-neutral-foundation) are impl
 - Extracted pure input/mouse/paste/focus encoding, selection, viewport lookup, hyperlink policy, and shared theme constants into the client without compatibility shims.
 - Kept engine-to-wire conversion at the daemon boundary without additional grid copies. The daemon's production dependencies contain no GPUI, client application, or installer package.
 - Moved installer UI into its existing isolated `installer/bootstrapper` package. Preserved its locked registry versions while updating local package dependencies.
-- Added [three-host neutral CI](../.github/workflows/core-ci.yml), including v7 fixtures, replica recovery, resolved dependency-boundary checks, and a native Windows daemon build without graphics setup. The unreliable standalone hosted Windows product/installer workflow was removed; native Windows product verification remains in [the acceptance recipes](testcmds.md), while signed distribution remains tag-triggered in `windows-release.yml`.
+- Added [three-host neutral CI](../.github/workflows/core-ci.yml), including v7 fixtures, replica recovery, resolved dependency-boundary checks, and a native Windows daemon build without graphics setup. The unreliable standalone hosted Windows product/installer workflow was removed; native Windows product verification remains in [the acceptance recipes](testcmds.md). The former signing-required tag workflow is now superseded by the cross-platform [release workflow](../.github/workflows/release.yml).
 
 ### Verification from this pass
 
@@ -212,6 +256,13 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - At 144 DPI, the fixed logical viewport filled the complete area below the header with no false workspace overflow bars and kept all custom Windows controls reachable. Vim occupied the full alternate screen, accepted input, restored the main shell screen on exit, and showed no history scrollbar. Composed captures verified both unblurred clear and softened blurred terminal backgrounds at 70% while terminal foreground text stayed opaque.
 - Focused `compi-client` regressions passed 49 tests; the final isolated all-target workspace run passed 110 tests across 10 suites. Formatting and warning-denied workspace Clippy passed; Cargo still reports the upstream `proc-macro-error2` future-compatibility notice. Synthetic Win32 input and composed desktop captures verify the native event/render path, not physical-keyboard, IME, or sustained display-pacing qualification.
 
+### Unified terminal and header opacity — 2026-09-12
+
+- The existing **Terminal opacity** slider controls terminal and window-header/tab backgrounds together. No separate header setting, override, or slider was introduced. Text, icons, window controls, and explicit terminal cell backgrounds remain opaque.
+- Removed percentage quantization from pointer mapping and avoid reapplying native material on every drag pixel. The appearance overlay leaves the header unobscured for live preview; only releasing the slider persists the selected scope.
+- Native Windows verification exercised the single slider on the release client: both backgrounds faded during the drag, the isolated TOML stayed unchanged during preview, and release saved the fractional `terminal_opacity = 0.400822` value. Composed desktop captures confirmed transparent backgrounds and opaque text/controls. The updated slider regression passed; [Core CI run 34711433745](https://github.com/cloudboy-jh/compi/actions/runs/34711433745) then passed all three native core jobs and the Mac client build at final source commit `21a3af9`.
+- The behavior and two focused specification updates landed in `6fe9438`; unrelated pre-existing specification edits remain outside that commit. This does not qualify physical keys, IME, or sustained frame pacing.
+
 ### Core CI reliability — 2026-09-11
 
 - Reproduced the Unix natural-exit panic in WSL2 Ubuntu: the old test expected reattachment to fail, contradicting the retained read-only grid contract and native client. The regression now verifies final output, exit code, unchanged process lifetime, read-only resize/reconnect, and rejected process input. CI's other Unix timeout came from checking markers only on new events, even when the retained replica already contained the requested text; waits now inspect the current replica first.
@@ -225,18 +276,20 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - Final local verification was restarted after all corrections with terminal tracing enabled to match CI: the exact locked three-crate test command passed 25 consecutive times on Windows 11/WSL2, 110 tests per run with zero failures or ignored tests. Native Linux execution inside WSL2 passed 90 tests, including all six Unix daemon scenarios, the buffered-read regression, v7 byte fixtures, and terminal compatibility. Workspace formatting and warning-denied Clippy passed; Windows still reports the upstream `proc-macro-error2` future-compatibility notice.
 - Boundary checks passed for Windows, Linux, and macOS targets. A deliberately unavailable Rust toolchain produced readable exit 2 without a traceback; a temporary real Cargo graph verified that dev-only graphics remain allowed and a production PTY violation still exits 1.
 - Core CI now checks formatting, lints the whole workspace, and provisions a required default Ubuntu WSL2 distribution before Windows product tests. Hosted results are tracked by the README's main-branch badge; local results alone are not hosted-CI evidence. No new graphical client qualification, performance budget, installer/signing result, or physical-input/display claim is made here. Linux's graphical client remains unqualified.
+- Hosted gate closed on 2026-09-12: [run 34668270744](https://github.com/cloudboy-jh/compi/actions/runs/34668270744), commit `d7552028`, passed all three core jobs and `mac-client`. This is native hosted build/test evidence, not bundled-app or physical-input qualification.
+- The distribution/unified-opacity source at `21a3af9` also passed every job in [Core CI run 34711433745](https://github.com/cloudboy-jh/compi/actions/runs/34711433745). The ARM64 Mac release job additionally passed native copied-DMG-bundle launch and same-process reconnect; this is artifact lifecycle evidence, not the full workspace/physical-input matrix.
 
 ### Remaining qualification
 
 1. Complete a focused UI/UX refinement pass without changing the workspace model, persistence/protocol contracts, or established navigation.
-2. Build and exercise the full workspace client on a native Mac. No Mac SDK/runtime or configured SSH host was available here.
+2. Complete the full native Mac workspace matrix. The hosted ARM64 release job now qualifies copied-DMG-bundle launch and reconnect; physical keyboard/display access remains unavailable locally.
 3. Keep native Linux core CI passing; WSL2 Linux runtime suites now pass locally, but neither cross-compilation nor headless tests qualify the Linux graphical client.
 4. Retain physical keys, dead keys/IME, exact user font/glyph selection, mixed displays/DPI, native controls, and sustained pacing/resource qualification as explicit gates.
 5. Continue Phase 5 daily-use/soak measurements and dogfood artifacts. Packaging/signing remains Phase 6.
 
 ## Current implementation: native refinement status
 
-**Status:** typography and glyph integration are implemented, and the current Windows terminal interaction pass is complete. Focused UI/UX refinement is next, followed by performance/resource measurement, native Mac workspace qualification, and the remaining physical-input/display matrix. The terminal derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. Ghostty-like terminal tabs and the secondary Superterminal-style sidebar are implemented.
+**Status:** typography and glyph integration are implemented, and the current Windows terminal interaction pass is complete. The focused UI/UX, performance/resource, native Mac workspace, and physical-input/display work below remains open; the ordered **Current work** section takes scheduling precedence. The terminal derives cell advance, line height, and baseline from the resolved primary font; uses one geometry source for painting, PTY sizing, cursor, selection, hit-testing, images, and IME; invalidates shaped rows on display-scale changes; and rebases shaped fallback glyphs to logical terminal cells. Versioned native configuration and CLI overrides are wired through startup. Ghostty-like terminal tabs and the secondary Superterminal-style sidebar are implemented.
 
 ### Completed — 2026-09-07
 
@@ -247,7 +300,7 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - Kept the bounded row-shaping cache and invalidated it when display scale changes. Native UI chrome continues to use the system font.
 - Verified the Mac build, all 54 workspace tests, warning-free workspace Clippy, diff hygiene, first terminal frame, and an AppKit event-loop smoke. Pixel-level comparison and physical-input qualification remain blocked by unavailable screen-capture/accessibility permissions.
 
-**Next:** complete the focused UI/UX refinement pass on the existing workspace model; then measure interaction latency, frame pacing, and resource behavior under sustained terminal output; qualify the complete workspace client on Mac; and continue Phase 5 dogfooding while retaining physical-key, IME, font, and mixed-display checks as explicit gates.
+**Refinement sequence when resumed:** complete the focused UI/UX refinement pass on the existing workspace model; then measure interaction latency, frame pacing, and resource behavior under sustained terminal output; qualify the complete workspace client on Mac; and continue Phase 5 dogfooding while retaining physical-key, IME, font, and mixed-display checks as explicit gates.
 
 ### 1. Establish the typography and glyph baseline — implementation complete, visual selection pending
 
@@ -310,6 +363,7 @@ Continue in the [specification's migration and build order](Spec.md#migration-an
 - **Phase 4: implementation complete, Mac qualification pending:** primary terminal tabs, secondary hidden workspace sidebar, nested splits/overflow, remembered windows, tab tear-off/transfer, palette, configuration, and whole-app themes.
 - **Phase 5:** qualify shared daily use and produce Mac/Windows dogfood artifacts with attributable resource measurements.
 - **Phase 6:** qualify distribution and extend process discovery/headless use.
+- **Phase 7: not started:** remote SSH transport. Serve existing framing on stdio, connect over an ssh channel, no network listener, sshd authenticates.
 
 Do not combine engine replacement, PTY migration, workspace migration, and UI redesign into one rewrite. Windows signing and installer qualification do not block the cross-platform foundation.
 

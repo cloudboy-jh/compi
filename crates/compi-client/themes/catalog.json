@@ -1,0 +1,185 @@
+{
+  "default": "dark-glass",
+  "themes": [
+    {
+      "variant": "DarkGlass",
+      "id": "dark-glass",
+      "name": "Dark Glass",
+      "family": "Compi",
+      "description": "Neutral charcoal with crisp lime focus.",
+      "mode": "dark",
+      "source": "Compi original palette",
+      "colors": {
+        "background": "#151719", "surface": "#202326", "surface_hover": "#2b2f33", "border": "#42474c",
+        "foreground": "#ecefee", "muted": "#a5aeaf", "accent": "#dffb35", "error": "#f17c85",
+        "selection": "#3e492d", "cursor": "#dffb35",
+        "ansi": ["#24282b", "#f17c85", "#a5ce82", "#e8c985", "#80b9ee", "#c89de8", "#7dcbd0", "#d7dfdc", "#788287", "#ff98a0", "#bce49b", "#f3dfa2", "#a4d0fa", "#dbb5f5", "#9edfe1", "#f1f4f2"]
+      }
+    },
+    {
+      "variant": "WarmCarbon",
+      "id": "warm-carbon",
+      "name": "Warm Carbon",
+      "family": "Compi",
+      "description": "Warm charcoal and amber for long sessions.",
+      "mode": "dark",
+      "source": "Compi original palette; amber accent and selection adapted for Warm Carbon",
+      "colors": {
+        "background": "#171613", "surface": "#211f1a", "surface_hover": "#2b2922", "border": "#403c31",
+        "foreground": "#f4f1e8", "muted": "#aaa394", "accent": "#e5c07b", "error": "#e06c75",
+        "selection": "#4b402b", "cursor": "#e5c07b",
+        "ansi": ["#1d1b18", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#d8d2c7", "#827a73", "#ff7a85", "#b4d88a", "#ffd68a", "#84c4ff", "#dd91e8", "#78dce8", "#f5f0e8"]
+      }
+    },
+    {
+      "variant": "CatppuccinLatte",
+      "id": "catppuccin-latte",
+      "name": "Catppuccin Latte",
+      "family": "Catppuccin",
+      "description": "Light cream with mauve focus and soft pastels.",
+      "mode": "light",
+      "source": "https://github.com/catppuccin/palette; https://github.com/catppuccin/kitty/blob/main/themes/latte.conf; chrome and selection adapted by Compi",
+      "colors": {
+        "background": "#eff1f5", "surface": "#e6e9ef", "surface_hover": "#ccd0da", "border": "#9ca0b0",
+        "foreground": "#4c4f69", "muted": "#6c6f85", "accent": "#8839ef", "error": "#d20f39",
+        "selection": "#ccd0da", "cursor": "#dc8a78",
+        "ansi": ["#5c5f77", "#d20f39", "#40a02b", "#df8e1d", "#1e66f5", "#ea76cb", "#179299", "#acb0be", "#6c6f85", "#d20f39", "#40a02b", "#df8e1d", "#1e66f5", "#ea76cb", "#179299", "#bcc0cc"]
+      }
+    },
+    {
+      "variant": "CatppuccinFrappe",
+      "id": "catppuccin-frappe",
+      "name": "Catppuccin Frappé",
+      "family": "Catppuccin",
+      "description": "Gentle slate with mauve focus and muted pastels.",
+      "mode": "dark",
+      "source": "https://github.com/catppuccin/palette; https://github.com/catppuccin/kitty/blob/main/themes/frappe.conf; chrome and selection adapted by Compi",
+      "colors": {
+        "background": "#303446", "surface": "#292c3c", "surface_hover": "#414559", "border": "#626880",
+        "foreground": "#c6d0f5", "muted": "#a5adce", "accent": "#ca9ee6", "error": "#e78284",
+        "selection": "#51576d", "cursor": "#f2d5cf",
+        "ansi": ["#51576d", "#e78284", "#a6d189", "#e5c890", "#8caaee", "#f4b8e4", "#81c8be", "#b5bfe2", "#626880", "#e78284", "#a6d189", "#e5c890", "#8caaee", "#f4b8e4", "#81c8be", "#a5adce"]
+      }
+    },
+    {
+      "variant": "CatppuccinMacchiato",
+      "id": "catppuccin-macchiato",
+      "name": "Catppuccin Macchiato",
+      "family": "Catppuccin",
+      "description": "Deep blue-gray with lilac focus and mellow pastels.",
+      "mode": "dark",
+      "source": "https://github.com/catppuccin/palette; https://github.com/catppuccin/kitty/blob/main/themes/macchiato.conf; chrome and selection adapted by Compi",
+      "colors": {
+        "background": "#24273a", "surface": "#1e2030", "surface_hover": "#363a4f", "border": "#5b6078",
+        "foreground": "#cad3f5", "muted": "#a5adcb", "accent": "#c6a0f6", "error": "#ed8796",
+        "selection": "#494d64", "cursor": "#f4dbd6",
+        "ansi": ["#494d64", "#ed8796", "#a6da95", "#eed49f", "#8aadf4", "#f5bde6", "#8bd5ca", "#b8c0e0", "#5b6078", "#ed8796", "#a6da95", "#eed49f", "#8aadf4", "#f5bde6", "#8bd5ca", "#a5adcb"]
+      }
+    },
+    {
+      "variant": "CatppuccinMocha",
+      "id": "catppuccin-mocha",
+      "name": "Catppuccin Mocha",
+      "family": "Catppuccin",
+      "description": "Rich midnight with lavender focus and bright pastels.",
+      "mode": "dark",
+      "source": "https://github.com/catppuccin/palette; https://github.com/catppuccin/kitty/blob/main/themes/mocha.conf; chrome and selection adapted by Compi",
+      "colors": {
+        "background": "#1e1e2e", "surface": "#181825", "surface_hover": "#313244", "border": "#585b70",
+        "foreground": "#cdd6f4", "muted": "#a6adc8", "accent": "#cba6f7", "error": "#f38ba8",
+        "selection": "#45475a", "cursor": "#f5e0dc",
+        "ansi": ["#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de", "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8"]
+      }
+    },
+    {
+      "variant": "TokyoNight",
+      "id": "tokyo-night",
+      "name": "Tokyo Night",
+      "family": "Tokyo Night",
+      "description": "Inky blue with electric blue focus and neon color.",
+      "mode": "dark",
+      "source": "https://github.com/folke/tokyonight.nvim/blob/main/extras/kitty/tokyonight_night.conf; chrome adapted by Compi",
+      "colors": {
+        "background": "#1a1b26", "surface": "#16161e", "surface_hover": "#292e42", "border": "#414868",
+        "foreground": "#c0caf5", "muted": "#9aa5ce", "accent": "#7aa2f7", "error": "#f7768e",
+        "selection": "#283457", "cursor": "#c0caf5",
+        "ansi": ["#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6", "#414868", "#ff899d", "#9fe044", "#faba4a", "#8db0ff", "#c7a9ff", "#a4daff", "#c0caf5"]
+      }
+    },
+    {
+      "variant": "TokyoNightDay",
+      "id": "tokyo-night-day",
+      "name": "Tokyo Night Day",
+      "family": "Tokyo Night",
+      "description": "Cool daylight with clear blue focus and vivid color.",
+      "mode": "light",
+      "source": "https://github.com/folke/tokyonight.nvim/blob/main/extras/kitty/tokyonight_day.conf; chrome adapted by Compi",
+      "colors": {
+        "background": "#e1e2e7", "surface": "#d0d5e3", "surface_hover": "#c4c8da", "border": "#8990b3",
+        "foreground": "#3760bf", "muted": "#6172b0", "accent": "#2e7de9", "error": "#c64343",
+        "selection": "#b7c1e3", "cursor": "#3760bf",
+        "ansi": ["#b4b5b9", "#f52a65", "#587539", "#8c6c3e", "#2e7de9", "#9854f1", "#007197", "#6172b0", "#a1a6c5", "#ff4774", "#5c8524", "#a27629", "#358aff", "#a463ff", "#007ea8", "#3760bf"]
+      }
+    },
+    {
+      "variant": "SolarizedDark",
+      "id": "solarized-dark",
+      "name": "Solarized Dark",
+      "family": "Solarized",
+      "description": "Deep teal with balanced blue focus and earth tones.",
+      "mode": "dark",
+      "source": "https://github.com/altercation/solarized/blob/master/xresources/solarized; chrome and selection adapted by Compi",
+      "colors": {
+        "background": "#002b36", "surface": "#073642", "surface_hover": "#164550", "border": "#586e75",
+        "foreground": "#839496", "muted": "#93a1a1", "accent": "#268bd2", "error": "#dc322f",
+        "selection": "#164550", "cursor": "#93a1a1",
+        "ansi": ["#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5", "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3"]
+      }
+    },
+    {
+      "variant": "SolarizedLight",
+      "id": "solarized-light",
+      "name": "Solarized Light",
+      "family": "Solarized",
+      "description": "Warm paper with balanced blue focus and earth tones.",
+      "mode": "light",
+      "source": "https://github.com/altercation/solarized/blob/master/xresources/solarized; light base mapping, chrome and selection adapted by Compi",
+      "colors": {
+        "background": "#fdf6e3", "surface": "#eee8d5", "surface_hover": "#e4decb", "border": "#93a1a1",
+        "foreground": "#657b83", "muted": "#586e75", "accent": "#268bd2", "error": "#dc322f",
+        "selection": "#e4decb", "cursor": "#586e75",
+        "ansi": ["#eee8d5", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#073642", "#fdf6e3", "#cb4b16", "#93a1a1", "#839496", "#657b83", "#6c71c4", "#586e75", "#002b36"]
+      }
+    },
+    {
+      "variant": "Nord",
+      "id": "nord",
+      "name": "Nord",
+      "family": "Nord",
+      "description": "Arctic blue-gray with frost focus and quiet color.",
+      "mode": "dark",
+      "source": "https://github.com/nordtheme/nord/blob/develop/src/nord.css; semantic chrome and ANSI mapping adapted by Compi",
+      "colors": {
+        "background": "#2e3440", "surface": "#3b4252", "surface_hover": "#434c5e", "border": "#4c566a",
+        "foreground": "#d8dee9", "muted": "#a5b1c2", "accent": "#88c0d0", "error": "#bf616a",
+        "selection": "#434c5e", "cursor": "#d8dee9",
+        "ansi": ["#3b4252", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0", "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#8fbcbb", "#eceff4"]
+      }
+    },
+    {
+      "variant": "Dracula",
+      "id": "dracula",
+      "name": "Dracula",
+      "family": "Dracula",
+      "description": "Dark violet with purple focus and vivid accents.",
+      "mode": "dark",
+      "source": "https://github.com/dracula/kitty/blob/master/dracula.conf; semantic chrome adapted by Compi",
+      "colors": {
+        "background": "#282a36", "surface": "#21222c", "surface_hover": "#343746", "border": "#6272a4",
+        "foreground": "#f8f8f2", "muted": "#a0abce", "accent": "#bd93f9", "error": "#ff5555",
+        "selection": "#44475a", "cursor": "#f8f8f2",
+        "ansi": ["#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2", "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff"]
+      }
+    }
+  ]
+}

@@ -2,8 +2,9 @@ pub mod trace;
 
 use base64::Engine;
 use compi_protocol::{
-    Cell, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode, Row, RowUpdate,
-    TerminalModes, TextAttributes,
+    Cell, Color, CursorShape, CursorState, DEFAULT_GRAPHICS_BYTES, KittyImage, KittyPlacement,
+    MAX_DECODED_IMAGE_BYTES, MAX_GRAPHICS_BYTES, MouseMode, Row, RowUpdate, TerminalModes,
+    TextAttributes,
 };
 use flate2::read::ZlibDecoder;
 use smol_str::SmolStr;
@@ -15,7 +16,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vte::{Params, Parser, Perform};
 
 pub const MAX_SCROLLBACK_BYTES: usize = 1024 * 1024;
-pub const MAX_GRAPHICS_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GRAPHICS_TRANSFERS: usize = 64;
+const MAX_GRAPHICS_IMAGES: usize = 1024;
+const MAX_GRAPHICS_PLACEMENTS: usize = 4096;
 const MAX_APC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OSC8_URI_BYTES: usize = 2048;
 const MAX_UNSUPPORTED_SIGNATURES: usize = 128;
@@ -98,6 +101,8 @@ struct KittyTransfer {
     height: u32,
     compressed: bool,
     bytes: Vec<u8>,
+    reserved_bytes: usize,
+    quiet: u8,
     placement: Option<KittyPlacement>,
 }
 
@@ -158,6 +163,7 @@ struct ChangeBaseline {
     row_hashes: Vec<u64>,
     scrollback_generation: u64,
     graphics_generation: u64,
+    image_generation: u64,
     cursor: CursorState,
     modes: TerminalModes,
     title: String,
@@ -183,6 +189,7 @@ pub struct TerminalState {
     sequence: u64,
     scrollback_generation: u64,
     graphics_generation: u64,
+    image_generation: u64,
     replies: Vec<Vec<u8>>,
     clipboard_writes: Vec<String>,
     images: HashMap<u32, KittyImage>,
@@ -226,24 +233,26 @@ impl TerminalState {
             images: HashMap::new(),
             scrollback_generation: 0,
             graphics_generation: 0,
+            image_generation: 0,
             placements: Vec::new(),
             transfers: HashMap::new(),
             next_image_id: 1,
             active_transfer: None,
             diagnostics: UnsupportedDiagnostics::default(),
-            graphics_byte_limit: MAX_GRAPHICS_BYTES,
+            graphics_byte_limit: DEFAULT_GRAPHICS_BYTES,
         }
     }
 
     pub fn set_resource_limits(&mut self, scrollback_lines: usize, graphics_bytes: usize) {
         self.main.scrollback_line_limit = scrollback_lines;
         self.alternate.scrollback_line_limit = scrollback_lines;
-        self.graphics_byte_limit = graphics_bytes;
+        self.graphics_byte_limit = graphics_bytes.min(MAX_GRAPHICS_BYTES);
     }
 
     pub fn clear_scrollback(&mut self) {
         self.main.scrollback.clear();
         self.main.scrollback_bytes = 0;
+        self.prune_history_placements();
         self.scrollback_generation = self.scrollback_generation.saturating_add(1);
         self.sequence = self.sequence.saturating_add(1);
     }
@@ -301,6 +310,8 @@ impl TerminalState {
                 usize::from(self.cursor.col),
             )
         });
+        // Text reflows; Kitty placements retain their grid coordinates and
+        // extents. Image-aware logical-line reanchoring is not implemented.
         let reflowed_cursor = reflow_main_buffer(&mut self.main, cols, rows, cursor_in_main);
         resize_buffer_cells(&mut self.alternate, cols, rows);
         self.scrollback_generation = self.scrollback_generation.saturating_add(1);
@@ -327,6 +338,7 @@ impl TerminalState {
             row_hashes: self.buffer().rows.iter().map(row_hash).collect(),
             scrollback_generation: self.scrollback_generation,
             graphics_generation: self.graphics_generation,
+            image_generation: self.image_generation,
             cursor: self.cursor,
             modes: self.modes.clone(),
             title: self.title.clone(),
@@ -369,12 +381,22 @@ impl TerminalState {
                 row: row.clone(),
             })
             .collect();
-        let (images, placements) = if graphics_changed {
-            let snapshot = self.snapshot();
-            (Some(snapshot.images), Some(snapshot.placements))
-        } else {
-            (None, None)
-        };
+        let images = (before.image_generation != self.image_generation).then(|| {
+            let mut images: Vec<_> = self.images.values().cloned().collect();
+            images.sort_by_key(|image| image.id);
+            images
+        });
+        let placements = graphics_changed.then(|| {
+            let mut placements = self.placements.clone();
+            placements.sort_by_key(|placement| {
+                (
+                    placement.z_index,
+                    placement.image_id,
+                    placement.placement_id.unwrap_or(0),
+                )
+            });
+            placements
+        });
         let delta = Delta {
             sequence: self.sequence,
             cols: self.cols() as u16,
@@ -408,8 +430,8 @@ impl TerminalState {
                 payload.push(byte);
                 self.input_state = InputState::Apc(payload);
             }
-            InputState::Apc(_) => {
-                self.diagnostics.record("APC:oversized");
+            InputState::Apc(payload) => {
+                self.reject_oversized_apc(&payload);
                 self.input_state = InputState::ApcDiscard;
             }
             InputState::ApcEscape(payload) if byte == b'\\' => self.dispatch_apc(&payload),
@@ -418,8 +440,8 @@ impl TerminalState {
                 payload.push(byte);
                 self.input_state = InputState::Apc(payload);
             }
-            InputState::ApcEscape(_) => {
-                self.diagnostics.record("APC:oversized");
+            InputState::ApcEscape(payload) => {
+                self.reject_oversized_apc(&payload);
                 self.input_state = InputState::ApcDiscard;
             }
             InputState::ApcDiscard if byte == 0x1b => {
@@ -430,6 +452,31 @@ impl TerminalState {
             InputState::ApcDiscardEscape if byte == b'\\' => {}
             InputState::ApcDiscardEscape => self.input_state = InputState::ApcDiscard,
         }
+    }
+
+    fn reject_oversized_apc(&mut self, payload: &[u8]) {
+        self.diagnostics.record("APC:oversized");
+        let Some(control) = payload
+            .strip_prefix(b"G")
+            .and_then(|payload| payload.split(|byte| *byte == b';').next())
+            .and_then(|control| std::str::from_utf8(control).ok())
+        else {
+            return;
+        };
+        let id = control
+            .split(',')
+            .find_map(|item| item.strip_prefix("i=")?.parse().ok())
+            .or(self.active_transfer)
+            .unwrap_or(0);
+        let transfer = self.transfers.remove(&id);
+        let quiet = control
+            .split(',')
+            .find_map(|item| item.strip_prefix("q=")?.parse().ok())
+            .unwrap_or_else(|| transfer.as_ref().map_or(0, |transfer| transfer.quiet));
+        if self.active_transfer == Some(id) {
+            self.active_transfer = None;
+        }
+        self.graphics_error(id, quiet, "E2BIG:APC chunk exceeds limit");
     }
 
     fn feed_vte(&mut self, bytes: &[u8]) {
@@ -624,7 +671,7 @@ impl TerminalState {
             let mut moved_placement = false;
             for placement in &mut self.placements {
                 if placement.alternate_screen == active_alt
-                    && placement.row >= top as i32
+                    && (placement.row >= top as i32 || (!active_alt && top == 0))
                     && placement.row < bottom as i32
                 {
                     placement.row -= 1;
@@ -635,9 +682,23 @@ impl TerminalState {
                 self.graphics_generation = self.graphics_generation.saturating_add(1);
             }
         }
+        self.prune_history_placements();
+    }
+
+    fn prune_history_placements(&mut self) {
         let min_row = -(self.main.scrollback.len() as i32);
-        self.placements
-            .retain(|placement| placement.alternate_screen || placement.row >= min_row);
+        let before = self.placements.len();
+        self.placements.retain(|placement| {
+            placement.row
+                >= if placement.alternate_screen {
+                    0
+                } else {
+                    min_row
+                }
+        });
+        if self.placements.len() != before {
+            self.graphics_generation = self.graphics_generation.saturating_add(1);
+        }
     }
 
     fn scroll_down(&mut self, count: usize) {
@@ -686,6 +747,7 @@ impl TerminalState {
                 if mode == 3 {
                     self.main.scrollback.clear();
                     self.main.scrollback_bytes = 0;
+                    self.prune_history_placements();
                     self.scrollback_generation = self.scrollback_generation.saturating_add(1);
                 }
             }
@@ -940,9 +1002,13 @@ impl TerminalState {
                     .flatten()
             })
             .unwrap_or_else(|| {
-                let id = self.next_image_id;
-                self.next_image_id = self.next_image_id.saturating_add(1);
-                id
+                loop {
+                    let id = self.next_image_id;
+                    self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+                    if !self.images.contains_key(&id) && !self.transfers.contains_key(&id) {
+                        break id;
+                    }
+                }
             });
         if action == "q" {
             self.replies
@@ -950,25 +1016,12 @@ impl TerminalState {
             return;
         }
         if matches!(action, "t" | "T") {
-            let retained_bytes = self
-                .images
-                .values()
-                .map(|image| decoded_base64_size(image.data.as_bytes()))
-                .chain(self.transfers.values().map(|transfer| transfer.bytes.len()))
-                .fold(0usize, usize::saturating_add);
-            let decoded_bound = decoded_base64_size(encoded);
-            if self.graphics_byte_limit == 0
-                || retained_bytes.saturating_add(decoded_bound) > self.graphics_byte_limit
-                || (!self.transfers.contains_key(&id) && self.transfers.len() >= 64)
-            {
+            // Explicit initial metadata restarts an abandoned transfer, but never
+            // removes the previously committed image with the same ID.
+            if values.contains_key("f") || values.contains_key("s") || values.contains_key("v") {
                 self.transfers.remove(&id);
-                if self.active_transfer == Some(id) {
-                    self.active_transfer = None;
-                }
-                return;
             }
-            let placement = (action == "T").then(|| self.kitty_placement(id, &values));
-            let transfer = self.transfers.entry(id).or_default();
+            let mut transfer = self.transfers.remove(&id).unwrap_or_default();
             transfer.format = values
                 .get("f")
                 .and_then(|value| value.parse().ok())
@@ -986,61 +1039,211 @@ impl TerminalState {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(transfer.height);
             transfer.compressed |= values.get("o") == Some(&"z");
-            transfer.placement = transfer.placement.or(placement);
-            match base64::engine::general_purpose::STANDARD.decode(encoded) {
-                Ok(bytes) => transfer.bytes.extend(bytes),
-                Err(error) => {
-                    eprintln!("compi-daemon: invalid Kitty image payload: {error}");
-                    self.transfers.remove(&id);
-                    if self.active_transfer == Some(id) {
-                        self.active_transfer = None;
-                    }
-                    return;
+            transfer.quiet = values
+                .get("q")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(transfer.quiet);
+            if transfer.placement.is_none() && action == "T" {
+                transfer.placement = Some(self.kitty_placement(id, &values));
+            }
+            let result = self.append_transfer(id, &mut transfer, encoded, &values);
+            if let Err(error) = result {
+                if self.active_transfer == Some(id) {
+                    self.active_transfer = None;
                 }
+                self.graphics_error(id, transfer.quiet, error);
+                return;
             }
             if values.get("m") == Some(&"1") {
+                self.transfers.insert(id, transfer);
                 self.active_transfer = Some(id);
             } else {
                 if self.active_transfer == Some(id) {
                     self.active_transfer = None;
                 }
-                if !self.finish_transfer(id) {
-                    return;
+                let quiet = transfer.quiet;
+                if let Err(error) = self.finish_transfer(id, transfer) {
+                    self.graphics_error(id, quiet, error);
+                }
+            }
+        } else if action == "p" {
+            let quiet = values
+                .get("q")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            if !self.images.contains_key(&id) {
+                self.graphics_error(id, quiet, "ENOENT:unknown image");
+            } else {
+                let placement = self.kitty_placement(id, &values);
+                if self.has_placement_capacity(&placement) {
+                    self.push_placement(placement);
+                } else {
+                    self.graphics_error(id, quiet, "ENOSPC:placement limit exceeded");
                 }
             }
         }
-        if action == "p" {
-            self.place_image(id, &values);
+    }
+
+    fn graphics_error(&mut self, id: u32, quiet: u8, error: &str) {
+        if quiet < 2 {
+            self.replies
+                .push(format!("\x1b_Gi={id};{error}\x1b\\").into_bytes());
         }
     }
 
-    fn finish_transfer(&mut self, id: u32) -> bool {
-        let Some(mut transfer) = self.transfers.remove(&id) else {
-            return self.images.contains_key(&id);
-        };
-        let current_bytes = self
-            .images
+    fn graphics_bytes(&self) -> usize {
+        self.images
             .values()
-            .map(|image| decoded_base64_size(image.data.as_bytes()))
-            .chain(self.transfers.values().map(|pending| pending.bytes.len()))
-            .fold(0usize, usize::saturating_add);
-        let available = self.graphics_byte_limit.saturating_sub(current_bytes);
+            .map(|image| image.data.len())
+            .chain(
+                self.transfers
+                    .values()
+                    .map(|transfer| transfer.reserved_bytes),
+            )
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn reclaim_unreferenced_images(&mut self, preserve_id: u32) {
+        let before = self.images.len();
+        self.images.retain(|id, _| {
+            *id == preserve_id
+                || self
+                    .placements
+                    .iter()
+                    .any(|placement| placement.image_id == *id)
+        });
+        if self.images.len() != before {
+            self.graphics_generation = self.graphics_generation.saturating_add(1);
+            self.image_generation = self.image_generation.saturating_add(1);
+        }
+    }
+
+    fn append_transfer(
+        &mut self,
+        id: u32,
+        transfer: &mut KittyTransfer,
+        encoded: &[u8],
+        values: &HashMap<&str, &str>,
+    ) -> Result<(), &'static str> {
+        if values.get("t").is_some_and(|medium| *medium != "d") {
+            return Err("ENOTSUP:only direct transmission is supported");
+        }
+        if values
+            .get("o")
+            .is_some_and(|compression| *compression != "z")
+        {
+            return Err("ENOTSUP:unsupported compression");
+        }
+        let expected = match transfer.format {
+            24 | 32 => {
+                let rgba = decoded_image_size(transfer.width, transfer.height)?;
+                Some(rgba / 4 * usize::from(transfer.format / 8))
+            }
+            100 => None,
+            _ => return Err("ENOTSUP:unsupported image format"),
+        };
+        let pending = transfer
+            .bytes
+            .len()
+            .saturating_add(decoded_base64_size(encoded));
+        // Raw image dimensions reserve the entire final image before decoding the
+        // first chunk, so later transfers cannot steal its completion capacity.
+        let reservation = base64_size(pending.max(expected.unwrap_or(0)));
+        if self.graphics_bytes().saturating_add(reservation) > self.graphics_byte_limit
+            || self.images.len() >= MAX_GRAPHICS_IMAGES
+        {
+            self.reclaim_unreferenced_images(id);
+        }
+        if self.graphics_byte_limit == 0
+            || self.graphics_bytes().saturating_add(reservation) > self.graphics_byte_limit
+            || self.transfers.len() >= MAX_GRAPHICS_TRANSFERS
+            || (!self.images.contains_key(&id)
+                && self.images.len() + self.transfers.len() >= MAX_GRAPHICS_IMAGES)
+            || transfer
+                .placement
+                .as_ref()
+                .is_some_and(|placement| !self.has_placement_capacity(placement))
+        {
+            return Err("ENOSPC:graphics limit exceeded");
+        }
+        if !transfer.compressed && expected.is_some_and(|length| pending > length) {
+            return Err("EINVAL:raw image byte count exceeds dimensions");
+        }
+        transfer.reserved_bytes = reservation;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| "EINVAL:invalid base64 image payload")?;
+        let capacity = if transfer.compressed {
+            pending
+        } else {
+            expected.unwrap_or(pending)
+        };
+        transfer
+            .bytes
+            .try_reserve_exact(capacity.saturating_sub(transfer.bytes.len()))
+            .map_err(|_| "ENOMEM:unable to allocate image transfer")?;
+        transfer.bytes.extend_from_slice(&decoded);
+        Ok(())
+    }
+
+    fn finish_transfer(
+        &mut self,
+        id: u32,
+        mut transfer: KittyTransfer,
+    ) -> Result<(), &'static str> {
+        let available = self
+            .graphics_byte_limit
+            .saturating_sub(self.graphics_bytes());
+        let raw_limit = available / 4 * 3;
         if transfer.compressed {
+            let expected = match transfer.format {
+                24 | 32 => {
+                    decoded_image_size(transfer.width, transfer.height)? / 4
+                        * usize::from(transfer.format / 8)
+                }
+                _ => raw_limit.min(MAX_DECODED_IMAGE_BYTES),
+            };
+            if base64_size(expected) > available {
+                return Err("ENOSPC:graphics limit exceeded");
+            }
             let mut decoded = Vec::new();
-            if let Err(error) = ZlibDecoder::new(&transfer.bytes[..])
-                .take(available.saturating_add(1) as u64)
+            ZlibDecoder::new(&transfer.bytes[..])
+                .take(expected.saturating_add(1) as u64)
                 .read_to_end(&mut decoded)
-            {
-                eprintln!("compi-daemon: invalid compressed Kitty image: {error}");
-                return false;
+                .map_err(|_| "EINVAL:invalid compressed image")?;
+            if decoded.len() > expected {
+                return Err("ENOSPC:decompressed image exceeds limit");
             }
             transfer.bytes = decoded;
         }
-        if current_bytes.saturating_add(transfer.bytes.len()) > self.graphics_byte_limit {
-            eprintln!("compi-daemon: Kitty graphics memory limit exceeded");
-            return false;
+        if transfer.format == 100 {
+            // Validate PNG dimensions before any client image decoder is invoked.
+            if transfer.bytes.len() < 24
+                || &transfer.bytes[..8] != b"\x89PNG\r\n\x1a\n"
+                || &transfer.bytes[12..16] != b"IHDR"
+            {
+                return Err("EINVAL:invalid PNG header");
+            }
+            transfer.width = u32::from_be_bytes(transfer.bytes[16..20].try_into().unwrap());
+            transfer.height = u32::from_be_bytes(transfer.bytes[20..24].try_into().unwrap());
+            decoded_image_size(transfer.width, transfer.height)?;
+        } else {
+            let expected = decoded_image_size(transfer.width, transfer.height)? / 4
+                * usize::from(transfer.format / 8);
+            if transfer.bytes.len() != expected {
+                return Err("EINVAL:raw image byte count does not match dimensions");
+            }
+        }
+        if base64_size(transfer.bytes.len()) > available {
+            return Err("ENOSPC:graphics limit exceeded");
         }
         let placement = transfer.placement;
+        if placement
+            .as_ref()
+            .is_some_and(|placement| !self.has_placement_capacity(placement))
+        {
+            return Err("ENOSPC:placement limit exceeded");
+        }
         self.images.insert(
             id,
             KittyImage {
@@ -1048,23 +1251,32 @@ impl TerminalState {
                 format: transfer.format,
                 width: transfer.width,
                 height: transfer.height,
-                data: base64::engine::general_purpose::STANDARD.encode(&transfer.bytes),
+                data: base64::engine::general_purpose::STANDARD
+                    .encode(&transfer.bytes)
+                    .into(),
             },
         );
         self.graphics_generation = self.graphics_generation.saturating_add(1);
+        self.image_generation = self.image_generation.saturating_add(1);
         if let Some(placement) = placement {
             self.push_placement(placement);
         }
-        true
+        Ok(())
     }
 
-    fn place_image(&mut self, id: u32, values: &HashMap<&str, &str>) {
-        if !self.images.contains_key(&id) {
-            eprintln!("compi-daemon: Kitty placement references unknown image {id}");
-            return;
-        }
-        let placement = self.kitty_placement(id, values);
-        self.push_placement(placement);
+    fn has_placement_capacity(&self, placement: &KittyPlacement) -> bool {
+        self.placements.len()
+            + self
+                .transfers
+                .values()
+                .filter(|transfer| transfer.placement.is_some())
+                .count()
+            < MAX_GRAPHICS_PLACEMENTS
+            || placement.placement_id.is_some_and(|id| {
+                self.placements.iter().any(|existing| {
+                    existing.image_id == placement.image_id && existing.placement_id == Some(id)
+                })
+            })
     }
 
     fn kitty_placement(&self, id: u32, values: &HashMap<&str, &str>) -> KittyPlacement {
@@ -1126,6 +1338,9 @@ impl TerminalState {
             mode => self
                 .diagnostics
                 .record(format!("Kitty-delete:{}", mode.to_ascii_lowercase())),
+        }
+        if before.0 != self.images.len() {
+            self.image_generation = self.image_generation.saturating_add(1);
         }
         if before
             != (
@@ -1549,6 +1764,20 @@ fn repair_wide_cells(row: &mut Row) {
     }
 }
 
+fn base64_size(bytes: usize) -> usize {
+    bytes.saturating_add(2) / 3 * 4
+}
+
+fn decoded_image_size(width: u32, height: u32) -> Result<usize, &'static str> {
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    match bytes {
+        Some(bytes) if bytes > 0 && bytes <= MAX_DECODED_IMAGE_BYTES => Ok(bytes),
+        _ => Err("E2BIG:decoded image dimensions exceed limit"),
+    }
+}
+
 fn decoded_base64_size(encoded: &[u8]) -> usize {
     let padding = encoded
         .iter()
@@ -1808,7 +2037,7 @@ mod tests {
         assert!(terminal.snapshot().images.is_empty());
         terminal.advance(b"\x1b_Gm=0;AwQ=\x1b\\");
         let snapshot = terminal.snapshot();
-        assert_eq!(snapshot.images[0].data, "AQIDBA==");
+        assert_eq!(&*snapshot.images[0].data, "AQIDBA==");
         assert_eq!(
             (snapshot.images[0].width, snapshot.images[0].height),
             (1, 1)
@@ -1823,7 +2052,7 @@ mod tests {
             .into_iter()
             .find(|image| image.id == 9)
             .unwrap();
-        assert_eq!(compressed.data, "AQIDBA==");
+        assert_eq!(&*compressed.data, "AQIDBA==");
     }
 
     #[test]
@@ -1855,22 +2084,24 @@ mod tests {
     }
 
     #[test]
-    fn configured_graphics_limit_counts_decoded_chunk_bytes() {
+    fn cap_rejection_preserves_existing_image_and_placement() {
         let mut terminal = TerminalState::new(10, 2);
-        terminal.set_resource_limits(10, 4);
+        terminal.set_resource_limits(10, 8);
         terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=8,m=1;AQI=\x1b\\");
         terminal.advance(b"\x1b_Gm=0;AwQ=\x1b\\");
-        assert_eq!(terminal.snapshot().images[0].data, "AQIDBA==");
-        terminal.advance(b"\x1b_Ga=t,f=32,s=1,v=1,i=9;AQIDBA==\x1b\\");
-        assert_eq!(
-            terminal
-                .snapshot()
-                .images
-                .iter()
-                .map(|image| image.id)
-                .collect::<Vec<_>>(),
-            [8]
-        );
+        let before = terminal.snapshot();
+        assert_eq!(&*before.images[0].data, "AQIDBA==");
+        for command in [
+            b"\x1b_Ga=T,f=32,s=1,v=1,i=9;AQIDBA==\x1b\\".as_slice(),
+            b"\x1b_Ga=T,f=32,s=1,v=1,i=8;BQYHCA==\x1b\\".as_slice(),
+        ] {
+            let (_, replies) = terminal.advance(command);
+            assert_eq!(replies.len(), 1);
+            assert!(String::from_utf8_lossy(&replies[0]).contains(";ENOSPC:"));
+            let after = terminal.snapshot();
+            assert_eq!(after.images, before.images);
+            assert_eq!(after.placements, before.placements);
+        }
     }
 
     #[test]
@@ -1884,9 +2115,11 @@ mod tests {
         let compressed =
             base64::engine::general_purpose::STANDARD.encode(compressed.finish().unwrap());
         let mut terminal = TerminalState::new(10, 2);
-        terminal.set_resource_limits(10, 1024);
+        terminal.set_resource_limits(10, 1200);
         terminal.advance(format!("\x1b_Ga=t,f=32,s=200,v=1,i=1,m=1;{encoded}\x1b\\").as_bytes());
-        terminal.advance(format!("\x1b_Ga=t,f=32,s=200,v=1,i=2,o=z;{compressed}\x1b\\").as_bytes());
+        let (_, replies) = terminal
+            .advance(format!("\x1b_Ga=t,f=32,s=200,v=1,i=2,o=z;{compressed}\x1b\\").as_bytes());
+        assert!(String::from_utf8_lossy(&replies[0]).starts_with("\x1b_Gi=2;ENOSPC:"));
         assert!(terminal.snapshot().images.is_empty());
         terminal.advance(b"\x1b_Gi=1,m=0;\x1b\\");
         assert_eq!(
@@ -1898,5 +2131,68 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1]
         );
+        assert_eq!(terminal.snapshot().images[0].data.as_ref(), encoded);
+    }
+
+    #[test]
+    fn generated_image_id_never_overwrites_an_explicit_image() {
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AQIDBA==\x1b\\");
+        let original = terminal.snapshot().images[0].clone();
+        terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1;BQYHCA==\x1b\\");
+        let snapshot = terminal.snapshot();
+        assert_eq!(snapshot.images[0], original);
+        assert_eq!(snapshot.images[1].id, 2);
+        assert_eq!(
+            snapshot
+                .placements
+                .iter()
+                .map(|placement| placement.image_id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn transfer_and_placement_counts_reject_without_stealing_reservations() {
+        let mut terminal = TerminalState::new(10, 2);
+        for id in 1..=MAX_GRAPHICS_TRANSFERS {
+            terminal.advance(format!("\x1b_Ga=t,f=32,s=1,v=1,i={id},m=1;AQI=\x1b\\").as_bytes());
+        }
+        let (_, replies) = terminal.advance(b"\x1b_Ga=t,f=32,s=1,v=1,i=100,m=1;AQI=\x1b\\");
+        assert!(String::from_utf8_lossy(&replies[0]).contains(";ENOSPC:"));
+        for id in 1..=MAX_GRAPHICS_TRANSFERS {
+            terminal.advance(format!("\x1b_Gi={id},m=0;AwQ=\x1b\\").as_bytes());
+        }
+        assert_eq!(terminal.snapshot().images.len(), MAX_GRAPHICS_TRANSFERS);
+        for _ in 0..MAX_GRAPHICS_PLACEMENTS {
+            terminal.advance(b"\x1b_Ga=p,i=1\x1b\\");
+        }
+        let before = terminal.snapshot();
+        let (_, replies) = terminal.advance(b"\x1b_Ga=p,i=1\x1b\\");
+        assert!(String::from_utf8_lossy(&replies[0]).contains(";ENOSPC:"));
+        assert_eq!(terminal.snapshot().placements, before.placements);
+        assert_eq!(terminal.snapshot().images, before.images);
+    }
+
+    #[test]
+    fn decompression_overflow_preserves_committed_pixels_and_releases_transfer() {
+        use std::io::Write;
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.set_resource_limits(10, 128);
+        terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=1;AQIDBA==\x1b\\");
+        let before = terminal.snapshot();
+        let mut compressed =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        compressed.write_all(&[0; 4096]).unwrap();
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(compressed.finish().unwrap());
+        let (_, replies) =
+            terminal.advance(format!("\x1b_Ga=T,f=32,s=1,v=1,i=2,o=z;{encoded}\x1b\\").as_bytes());
+        assert!(String::from_utf8_lossy(&replies[0]).starts_with("\x1b_Gi=2;ENOSPC:"));
+        assert_eq!(terminal.snapshot().images, before.images);
+        assert_eq!(terminal.snapshot().placements, before.placements);
+        terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=2;BQYHCA==\x1b\\");
+        assert_eq!(terminal.snapshot().images[1].data.as_ref(), "BQYHCA==");
     }
 }

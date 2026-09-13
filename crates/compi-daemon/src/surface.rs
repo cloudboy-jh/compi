@@ -36,6 +36,11 @@ use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_T
 const TRANSPORT_CHUNK: usize = 32 * 1024;
 const CLIENT_QUEUE_FRAMES: usize = 256;
 const CLIENT_SCREEN_QUEUE_FRAMES: usize = 32;
+// Include the frame currently being written. Reserve a separate full-size
+// snapshot slot for gap recovery and control capacity beyond screen traffic.
+const CLIENT_SCREEN_QUEUE_BYTES: usize = frame::MAX_SCREEN_PAYLOAD;
+const CLIENT_RECOVERY_QUEUE_BYTES: usize = 2 * frame::MAX_SCREEN_PAYLOAD;
+const CLIENT_QUEUE_BYTES: usize = CLIENT_RECOVERY_QUEUE_BYTES + frame::MAX_PAYLOAD;
 const MAX_PENDING_LATENCY_IDS: usize = 4_096;
 static NEXT_ATTACHMENT: AtomicU64 = AtomicU64::new(1);
 
@@ -98,6 +103,8 @@ pub struct ConnectionSink {
     sender: SyncSender<Outgoing>,
     alive: Arc<AtomicBool>,
     queued_frames: Arc<AtomicUsize>,
+    queued_bytes: Arc<AtomicUsize>,
+    needs_snapshot: Arc<AtomicBool>,
     #[cfg(windows)]
     writer_thread: Arc<OwnedHandle>,
 }
@@ -585,6 +592,7 @@ impl Surface {
                     }
                 }
             }
+            self.recover_screen(false);
 
             match pty.wait(50) {
                 Ok(Some(code)) => break 'running code,
@@ -617,6 +625,7 @@ impl Surface {
             failure = None;
         }
         let _ = output_thread.join();
+        self.recover_screen(true);
         if let Ok(mut input) = self.input.lock() {
             input.take();
         }
@@ -670,6 +679,29 @@ impl Surface {
                     exit_code,
                 },
             });
+        }
+    }
+
+    fn recover_screen(&self, final_screen: bool) {
+        let Ok(state) = self.state.lock() else { return };
+        let Some((sink, _)) = state.client.as_ref().filter(|_| state.client_ready) else {
+            return;
+        };
+        if !sink.needs_snapshot.load(Ordering::Acquire)
+            || (!final_screen && sink.queued_frames.load(Ordering::Acquire) != 0)
+        {
+            return;
+        }
+        if sink
+            .send_screen_recovery(&TerminalFrame {
+                identity: self.identity.clone(),
+                message: ScreenMessage::Snapshot {
+                    snapshot: crate::screen::snapshot(state.terminal.snapshot()),
+                },
+            })
+            .is_ok()
+        {
+            sink.needs_snapshot.store(false, Ordering::Release);
         }
     }
 
@@ -1166,6 +1198,8 @@ impl ConnectionSink {
         let writer_alive = alive.clone();
         let queued_frames = Arc::new(AtomicUsize::new(0));
         let writer_queued_frames = queued_frames.clone();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let writer_queued_bytes = queued_bytes.clone();
         thread::spawn(move || {
             #[cfg(windows)]
             {
@@ -1181,7 +1215,6 @@ impl ConnectionSink {
 
             let result = (|| -> Result<()> {
                 while let Ok(message) = receiver.recv() {
-                    writer_queued_frames.fetch_sub(1, Ordering::AcqRel);
                     let mut writer = &*writer_connection;
                     let write_result = frame::write(&mut writer, message.kind, &message.payload)
                         .map_err(Into::into)
@@ -1195,6 +1228,8 @@ impl ConnectionSink {
                                 Ok(())
                             }
                         });
+                    writer_queued_frames.fetch_sub(1, Ordering::AcqRel);
+                    writer_queued_bytes.fetch_sub(message.payload.len(), Ordering::AcqRel);
                     if let Some(acknowledgement) = message.acknowledgement {
                         let _ = acknowledgement.send(
                             write_result
@@ -1223,6 +1258,8 @@ impl ConnectionSink {
             sender,
             alive,
             queued_frames,
+            queued_bytes,
+            needs_snapshot: Arc::new(AtomicBool::new(false)),
             #[cfg(windows)]
             writer_thread: Arc::new(writer_thread),
         })
@@ -1234,17 +1271,22 @@ impl ConnectionSink {
 
     pub fn send_control(&self, message: &ServerControl) -> Result<()> {
         let payload = encode_server(message)?;
-        self.send(CONTROL_FRAME, &payload)
+        self.send(CONTROL_FRAME, payload)
     }
 
     pub fn send_control_sync(&self, message: &ServerControl) -> Result<()> {
         let payload = encode_server(message)?;
         let (sender, receiver) = sync_channel(0);
-        self.enqueue(Outgoing {
-            kind: CONTROL_FRAME,
-            payload,
-            acknowledgement: Some(sender),
-        })?;
+        self.enqueue(
+            Outgoing {
+                kind: CONTROL_FRAME,
+                payload,
+                acknowledgement: Some(sender),
+            },
+            CLIENT_QUEUE_BYTES,
+        )?
+        .then_some(())
+        .ok_or("client output queue is full")?;
         receiver
             .recv_timeout(Duration::from_secs(2))
             .map_err(|_| "timed out writing control response")?
@@ -1252,16 +1294,40 @@ impl ConnectionSink {
     }
 
     pub fn send_screen(&self, message: &TerminalFrame) -> Result<bool> {
-        if self.queued_frames.load(Ordering::Acquire) >= CLIENT_SCREEN_QUEUE_FRAMES {
+        if self.needs_snapshot.load(Ordering::Acquire)
+            || self.queued_frames.load(Ordering::Acquire) >= CLIENT_SCREEN_QUEUE_FRAMES
+            || self.queued_bytes.load(Ordering::Acquire) >= CLIENT_SCREEN_QUEUE_BYTES
+        {
+            self.needs_snapshot.store(true, Ordering::Release);
             return Ok(false);
         }
         let payload = encode_terminal_frame(message)?;
-        self.send(SCREEN_FRAME, &payload).map(|_| true)
+        let sent = self.enqueue(
+            Outgoing {
+                kind: SCREEN_FRAME,
+                payload,
+                acknowledgement: None,
+            },
+            CLIENT_SCREEN_QUEUE_BYTES,
+        )?;
+        if !sent {
+            self.needs_snapshot.store(true, Ordering::Release);
+        }
+        Ok(sent)
     }
 
     fn send_screen_recovery(&self, message: &TerminalFrame) -> Result<()> {
         let payload = encode_terminal_frame(message)?;
-        self.send(SCREEN_FRAME, &payload)
+        self.enqueue(
+            Outgoing {
+                kind: SCREEN_FRAME,
+                payload,
+                acknowledgement: None,
+            },
+            CLIENT_RECOVERY_QUEUE_BYTES,
+        )?
+        .then_some(())
+        .ok_or_else(|| "client snapshot queue is full".into())
     }
 
     pub fn is_alive(&self) -> bool {
@@ -1275,28 +1341,49 @@ impl ConnectionSink {
         pipe::disconnect(&self.connection);
     }
 
-    fn send(&self, kind: u8, payload: &[u8]) -> Result<()> {
-        self.enqueue(Outgoing {
-            kind,
-            payload: payload.to_vec(),
-            acknowledgement: None,
-        })
+    fn send(&self, kind: u8, payload: Vec<u8>) -> Result<()> {
+        self.enqueue(
+            Outgoing {
+                kind,
+                payload,
+                acknowledgement: None,
+            },
+            CLIENT_QUEUE_BYTES,
+        )?
+        .then_some(())
+        .ok_or_else(|| "client output queue is full".into())
     }
 
-    fn enqueue(&self, outgoing: Outgoing) -> Result<()> {
+    fn enqueue(&self, outgoing: Outgoing, byte_limit: usize) -> Result<bool> {
         if !self.is_alive() {
             return Err("client connection is closed".into());
         }
+        let bytes = outgoing.payload.len();
+        if bytes > frame::payload_limit(outgoing.kind) {
+            return Err("frame payload exceeds the protocol limit".into());
+        }
+        if self
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued
+                    .checked_add(bytes)
+                    .filter(|total| *total <= byte_limit)
+            })
+            .is_err()
+        {
+            return Ok(false);
+        }
         self.queued_frames.fetch_add(1, Ordering::AcqRel);
         match self.sender.try_send(outgoing) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(TrySendError::Full(_)) => {
                 self.queued_frames.fetch_sub(1, Ordering::AcqRel);
-                self.disconnect();
-                Err("client output queue is full".into())
+                self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                Ok(false)
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.queued_frames.fetch_sub(1, Ordering::AcqRel);
+                self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                 self.alive.store(false, Ordering::Release);
                 Err("client writer stopped".into())
             }

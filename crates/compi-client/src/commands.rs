@@ -103,6 +103,7 @@ registry! {
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
     ZoomReset, "zoom_reset", "Reset font size", Some("cmd-0"), Some("ctrl-0");
     OpenQuickAppearance, "open_quick_appearance", "Open Quick Appearance", None, None;
+    OpenThemeCatalog, "open_theme_catalog", "Browse theme catalog", None, None;
     OpenSettings, "open_settings", "Open Settings", Some("cmd-,"), Some("ctrl-,");
     OpenConfiguration, "open_configuration", "Open configuration file", None, None;
     ResetClientLayout, "reset_client_layout", "Reset client layout", None, None;
@@ -215,7 +216,7 @@ impl Command {
             SplitRight | SplitDown | TogglePaneZoom | FocusLeft | FocusRight | FocusUp
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | RemovePane => CommandCategory::Panes,
-            OpenQuickAppearance | OpenSettings => CommandCategory::Appearance,
+            OpenQuickAppearance | OpenSettings | OpenThemeCatalog => CommandCategory::Appearance,
             OpenPalette | ToggleSidebar | ResetSidebarWidth | OpenConfiguration
             | ResetClientLayout | Reconnect | RestartDaemon | OpenDiagnostics | Quit => {
                 CommandCategory::Application
@@ -228,6 +229,7 @@ impl Command {
         match self {
             OpenPalette => "commands actions",
             OpenQuickAppearance => "theme opacity transparency clear blur",
+            OpenThemeCatalog => "themes catalog colors schemes light dark favorites",
             OpenSettings => "preferences configuration appearance terminal keyboard daemon",
             OpenConfiguration => "toml edit file",
             RestartDaemon => "server reboot",
@@ -256,6 +258,7 @@ impl Command {
                 | ZoomOut
                 | ZoomReset
                 | OpenQuickAppearance
+                | OpenThemeCatalog
                 | OpenSettings
                 | OpenConfiguration
                 | ResetClientLayout

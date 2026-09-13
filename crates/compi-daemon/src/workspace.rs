@@ -1121,7 +1121,9 @@ fn validate_split_geometry(
 }
 
 fn validate_launch_context(context: &compi_protocol::LaunchContext) -> Result<(), String> {
-    if context.scrollback_lines > 100_000 || context.graphics_bytes > 4 * 1024 * 1024 {
+    if context.scrollback_lines > 100_000
+        || context.graphics_bytes > compi_protocol::MAX_GRAPHICS_BYTES
+    {
         return Err("launch resource limits exceed supported bounds".into());
     }
     let profile = &context.profile;
