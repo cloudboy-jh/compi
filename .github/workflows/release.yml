@@ -35,6 +35,9 @@ jobs:
           distribution: Ubuntu-24.04
           set-as-default: 'true'
           wsl-version: '2'
+      - name: Prepare pinned Microsoft ConPTY runtime
+        shell: pwsh
+        run: .\tools\prepare-conpty.ps1
       - name: Verify source and runtime prerequisites
         shell: pwsh
         run: |

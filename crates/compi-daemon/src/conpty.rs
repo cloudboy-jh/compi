@@ -1,19 +1,24 @@
 use crate::Result;
 use crate::launch::LaunchDescription;
-use std::ffi::{OsStr, c_void};
-use std::fs::File;
+use std::ffi::{CStr, OsStr, c_void};
+use std::fs::{File, OpenOptions};
 use std::iter::once;
 use std::mem::{size_of, size_of_val};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+use windows::Win32::Foundation::{
+    FreeLibrary, HANDLE, HMODULE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows::Win32::System::Console::{COORD, HPCON};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
+};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
@@ -23,10 +28,130 @@ use windows::Win32::System::Threading::{
     ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{HRESULT, PCSTR, PCWSTR, PWSTR};
+
+type CreatePseudoConsole =
+    unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
+type ResizePseudoConsole = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
+type ClosePseudoConsole = unsafe extern "system" fn(HPCON);
+
+struct ConptyModule(HMODULE);
+
+// A LoadLibrary reference is process-wide, has no thread affinity, and is
+// released only after its owner's last console has closed.
+unsafe impl Send for ConptyModule {}
+unsafe impl Sync for ConptyModule {}
+
+impl Drop for ConptyModule {
+    fn drop(&mut self) {
+        let _ = unsafe { FreeLibrary(self.0) };
+    }
+}
+
+struct ConptyRuntime {
+    _module: ConptyModule,
+    // Keep the required sibling present while conpty.dll selects/spawns it.
+    // Without this file, the upstream DLL can fall back to system conhost.
+    _host: File,
+    create: CreatePseudoConsole,
+    resize: ResizePseudoConsole,
+    close: ClosePseudoConsole,
+}
+
+fn runtime_error(detail: impl std::fmt::Display) -> crate::Error {
+    format!(
+        "bundled Microsoft.Windows.Console.ConPTY 1.24.260710001 is unavailable or incompatible: \
+         {detail}. Reinstall Compi with conpty.dll and OpenConsole.exe beside compi-daemon.exe; \
+         for a source build, run tools\\prepare-conpty.ps1 for your architecture, then rebuild. \
+         The Windows system ConPTY runtime is not supported."
+    )
+    .into()
+}
+
+impl ConptyRuntime {
+    fn load() -> Result<Self> {
+        let executable = std::env::current_exe().map_err(runtime_error)?;
+        let directory = executable
+            .parent()
+            .ok_or_else(|| runtime_error("the daemon executable has no parent directory"))?;
+        let host_path = directory.join("OpenConsole.exe");
+        let host = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&host_path)
+            .map_err(|error| runtime_error(format!("{}: {error}", host_path.display())))?;
+        let dll_path = directory.join("conpty.dll");
+        let dll_wide: Vec<u16> = dll_path.as_os_str().encode_wide().chain(once(0)).collect();
+        let module = ConptyModule(
+            unsafe {
+                LoadLibraryExW(
+                    PCWSTR(dll_wide.as_ptr()),
+                    None,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            }
+            .map_err(|error| runtime_error(format!("{}: {error}", dll_path.display())))?,
+        );
+        let symbol = |name: &CStr| {
+            unsafe { GetProcAddress(module.0, PCSTR(name.as_ptr().cast())) }.ok_or_else(|| {
+                runtime_error(format!(
+                    "{} does not export {}",
+                    dll_path.display(),
+                    name.to_string_lossy()
+                ))
+            })
+        };
+        // Signatures are the WINAPI declarations in the pinned package's inc/conpty.h.
+        let create = unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, CreatePseudoConsole>(
+                symbol(c"ConptyCreatePseudoConsole")?,
+            )
+        };
+        let resize = unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, ResizePseudoConsole>(
+                symbol(c"ConptyResizePseudoConsole")?,
+            )
+        };
+        let close = unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, ClosePseudoConsole>(symbol(
+                c"ConptyClosePseudoConsole",
+            )?)
+        };
+        Ok(Self {
+            _module: module,
+            _host: host,
+            create,
+            resize,
+            close,
+        })
+    }
+
+    fn create(self, size: COORD, input: HANDLE, output: HANDLE) -> Result<Pseudoconsole> {
+        let mut handle = HPCON::default();
+        unsafe { (self.create)(size, input, output, 0, &mut handle) }
+            .ok()
+            .map_err(runtime_error)?;
+        Ok(Pseudoconsole {
+            handle,
+            runtime: self,
+        })
+    }
+}
+
+struct Pseudoconsole {
+    handle: HPCON,
+    runtime: ConptyRuntime,
+}
+
+impl Drop for Pseudoconsole {
+    fn drop(&mut self) {
+        // The runtime (and its module reference) drops only after this call.
+        unsafe { (self.runtime.close)(self.handle) };
+    }
+}
 
 pub struct ConptySession {
-    hpc: Option<HPCON>,
+    hpc: Option<Pseudoconsole>,
     process: OwnedHandle,
     job: OwnedHandle,
     input: Option<File>,
@@ -39,35 +164,28 @@ impl ConptySession {
             return Err("terminal dimensions must be positive".into());
         }
         let _ = launch.command()?;
+        let runtime = ConptyRuntime::load()?;
 
         unsafe {
             let (pty_input, host_input) = anonymous_pipe()?;
             let (host_output, pty_output) = anonymous_pipe()?;
 
-            let hpc = CreatePseudoConsole(
+            let hpc = runtime.create(
                 COORD { X: cols, Y: rows },
                 raw_handle(&pty_input),
                 raw_handle(&pty_output),
-                0,
             )?;
 
-            let process_result = create_process(hpc, launch);
+            let process_result = create_process(hpc.handle, launch);
             drop(pty_input);
             drop(pty_output);
 
-            let (process, thread) = match process_result {
-                Ok(handles) => handles,
-                Err(error) => {
-                    ClosePseudoConsole(hpc);
-                    return Err(error);
-                }
-            };
+            let (process, thread) = process_result?;
 
             let job = match create_kill_on_close_job(&process) {
                 Ok(job) => job,
                 Err(error) => {
                     terminate_and_wait(&process);
-                    ClosePseudoConsole(hpc);
                     return Err(error);
                 }
             };
@@ -76,7 +194,6 @@ impl ConptySession {
                 let error = windows::core::Error::from_thread();
                 let _ = TerminateJobObject(HANDLE(job.as_raw_handle()), 1);
                 let _ = WaitForSingleObject(HANDLE(process.as_raw_handle()), 5_000);
-                ClosePseudoConsole(hpc);
                 return Err(error.into());
             }
             drop(thread);
@@ -101,11 +218,11 @@ impl ConptySession {
     }
 
     pub fn resize_owned(&self, cols: i16, rows: i16) -> Result<()> {
-        let hpc = self.hpc.ok_or("ConPTY is closed")?;
+        let hpc = self.hpc.as_ref().ok_or("ConPTY is closed")?;
         if cols <= 0 || rows <= 0 {
             return Err("terminal dimensions must be positive".into());
         }
-        unsafe { ResizePseudoConsole(hpc, COORD { X: cols, Y: rows })? };
+        unsafe { (hpc.runtime.resize)(hpc.handle, COORD { X: cols, Y: rows }).ok()? };
         Ok(())
     }
 
@@ -130,9 +247,7 @@ impl ConptySession {
     }
 
     pub fn close_pseudoconsole(&mut self) {
-        if let Some(hpc) = self.hpc.take() {
-            unsafe { ClosePseudoConsole(hpc) };
-        }
+        drop(self.hpc.take());
     }
 }
 

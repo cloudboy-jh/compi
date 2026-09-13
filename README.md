@@ -44,20 +44,30 @@ The workspace client is implemented and verified on Windows/WSL. Native macOS wo
 The **Release** workflow builds Windows x64 and Apple Silicon macOS 14+ artifacts:
 
 - `Compi-<version>-Setup.exe`: per-user Windows installer, including repair and uninstall.
-- `Compi-<version>-Windows-x64.zip`: portable Windows client and sibling daemon; extract both together. WSL2 is required for either Windows package.
+- `Compi-<version>-Windows-x64.zip`: portable Windows client, sibling daemon, and bundled ConPTY runtime/license; extract the entire archive together. WSL2 is required for either Windows package.
 - `Compi-<version>-macOS-arm64.dmg`: open the disk image and drag `Compi.app` into Applications.
 - `Compi-<version>-macOS-arm64.app.zip`: alternative Mac app archive. Move the entire extracted bundle, not just its executable.
 - `SHA256SUMS.txt`: checksums for the release assets.
 
+Both Windows packages include Microsoft's matching `conpty.dll` and `OpenConsole.exe` from pinned [`Microsoft.Windows.Console.ConPTY` 1.24.260710001](https://www.nuget.org/packages/Microsoft.Windows.Console.ConPTY/1.24.260710001), plus `ConPTY-LICENSE.txt` (MIT), beside `compi-daemon.exe`. Keep these files together: the daemon does not search PATH/current-directory or fall back to the Windows system ConPTY, which can strip Kitty graphics. Microsoft's binaries retain their original Microsoft signatures; optional Compi signing does not re-sign them.
+
 A `v<workspace-version>` tag builds both platforms and creates one **draft** GitHub release only after both packaging checks pass. Drafts are not public downloads until published. Running the workflow manually produces downloadable Actions artifacts without creating a release; those contain platform-specific checksum manifests.
 
-Windows artifacts are unsigned unless both signing secrets are configured. SmartScreen may warn; for an artifact you trust, **More info → Run anyway** may be available unless device policy forbids it. Mac artifacts are ad-hoc signed for integrity, but have no Developer ID signature or notarization. If Gatekeeper blocks an artifact you trust, attempt to open it, then use **System Settings → Privacy & Security → Open Anyway**; older macOS versions also offer right-click → Open. Do not disable platform security globally.
+Compi's Windows executables are unsigned unless both signing secrets are configured; the bundled Microsoft runtime is always Microsoft-signed. SmartScreen may warn; for an artifact you trust, **More info → Run anyway** may be available unless device policy forbids it. Mac artifacts are ad-hoc signed for integrity, but have no Developer ID signature or notarization. If Gatekeeper blocks an artifact you trust, attempt to open it, then use **System Settings → Privacy & Security → Open Anyway**; older macOS versions also offer right-click → Open. Do not disable platform security globally.
 
 Build locally with `pwsh -File tools/build-installer.ps1` on Windows or `bash tools/build-macos.sh` on an ARM64 Mac. Both accept an optional expected version tag (`-ExpectedTag` / `--expected-tag`). Windows signing remains available through `-SigningCertificateThumbprint`, with `-RequireSigning` for builds that must not be unsigned.
 
 ## Run from source
 
 Requires Rust and the platform build tools. Windows also requires WSL2; macOS requires Xcode with the Metal compiler available through `xcrun`.
+
+On Windows, prepare the pinned Microsoft runtime **before building or testing** (requires PowerShell 7 and HTTPS access to NuGet for the first download):
+
+```powershell
+pwsh -File tools/prepare-conpty.ps1
+```
+
+Preparation checks the pinned archive SHA256 and Microsoft Authenticode signatures, reuses only verified cached content, and stages `conpty.dll`, `OpenConsole.exe`, and `ConPTY-LICENSE.txt` in `target/conpty-runtime/x64`. The archive cache is `target/conpty-runtime/cache/`; the version, digest, package-signature provenance, and upstream license notice are recorded in `tools/prepare-conpty.ps1`. `-Architecture arm64` prepares the upstream ARM64 pair for a native ARM64 build; distributed Windows artifacts remain x64. Cargo copies the staged files beside the daemon and test executables, including custom target directories/profiles and explicit target triples. Compilation without preparation is allowed, but Windows terminal startup fails clearly if the bundled runtime is absent. The Windows installer build and both Windows CI workflows run preparation automatically.
 
 Build the client and server:
 

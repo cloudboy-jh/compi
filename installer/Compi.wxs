@@ -22,6 +22,9 @@
             <File Id="CompiExe" Source="$(var.BinDir)\compi.exe" />
             <File Id="DaemonExe" Source="$(var.BinDir)\compi-daemon.exe" />
             <File Id="MaintenanceExe" Name="Compi-Setup.exe" Source="$(var.MaintenanceExe)" />
+            <File Id="ConptyDll" Source="$(var.BinDir)\conpty.dll" />
+            <File Id="OpenConsoleExe" Source="$(var.BinDir)\OpenConsole.exe" />
+            <File Id="ConptyLicense" Source="$(var.BinDir)\ConPTY-LICENSE.txt" />
             <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
             <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
             <RegistryValue

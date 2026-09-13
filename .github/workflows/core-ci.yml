@@ -51,6 +51,10 @@ jobs:
         run: |
           wsl.exe --exec /bin/bash -lc true
           if ($LASTEXITCODE -ne 0) { throw 'A working default WSL2 distribution is required for Windows daemon tests' }
+      - name: Prepare pinned Microsoft ConPTY runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\tools\prepare-conpty.ps1
       - name: Run all product crate tests
         env:
           COMPI_TERMINAL_TRACE_DIR: ${{ runner.temp }}/compi-terminal-traces

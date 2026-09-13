@@ -92,10 +92,17 @@ try {
     & dotnet tool restore
     if ($LASTEXITCODE -ne 0) { throw 'Failed to restore the pinned WiX tool' }
 
+    & (Join-Path $PSScriptRoot 'prepare-conpty.ps1') -Architecture x64
+
     & cargo build --locked --release -p compi-client -p compi-daemon --bins --target-dir $productTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi product binaries' }
     Assert-FileVersion (Join-Path $productBin 'compi.exe')
     Assert-FileVersion (Join-Path $productBin 'compi-daemon.exe')
+    foreach ($runtimeFile in @('conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $productBin $runtimeFile) -PathType Leaf)) {
+            throw "Missing bundled runtime '$runtimeFile' in '$productBin'. Rerun tools/prepare-conpty.ps1 and rebuild the daemon before packaging."
+        }
+    }
     Invoke-SignArtifact (Join-Path $productBin 'compi.exe')
     Invoke-SignArtifact (Join-Path $productBin 'compi-daemon.exe')
     & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $maintenanceTarget
@@ -130,6 +137,9 @@ try {
     Compress-Archive -Path @(
         (Join-Path $productBin 'compi.exe'),
         (Join-Path $productBin 'compi-daemon.exe'),
+        (Join-Path $productBin 'conpty.dll'),
+        (Join-Path $productBin 'OpenConsole.exe'),
+        (Join-Path $productBin 'ConPTY-LICENSE.txt'),
         (Join-Path $projectRoot 'LICENSE')
     ) -DestinationPath $portableDestination
 
