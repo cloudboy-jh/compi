@@ -29,13 +29,14 @@ pub enum ImageTarget {
     Wsl {
         distribution: Option<String>,
     },
+    Remote,
 }
 
 pub struct PreparedImage {
     /// Native, accessible original path, also used by inspector copy/save.
     pub path: PathBuf,
-    /// One quoted POSIX shell argument; never includes an execution/newline suffix.
-    pub quoted_path: String,
+    /// One quoted POSIX shell argument after local path mapping or remote upload.
+    pub quoted_path: Option<String>,
     pub name: String,
     pub width: u32,
     pub height: u32,
@@ -77,7 +78,10 @@ pub fn prepare(input: ImageInput, target: ImageTarget) -> Result<PreparedImage, 
             persist(&root, &bytes, format)?
         }
     };
-    let quoted_path = quote_posix(&target_path(&path, &target)?)?;
+    let quoted_path = match target {
+        ImageTarget::Remote => None,
+        _ => Some(quote_posix(&target_path(&path, &target)?)?),
+    };
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -98,6 +102,17 @@ pub fn load_full_image(path: &Path) -> Result<Arc<RenderImage>, String> {
     let bytes = read_encoded(path)?;
     let (decoded, _) = decode(&bytes)?;
     Ok(render_image(decoded.into_rgba8()))
+}
+
+pub fn read_upload(path: &Path) -> Result<Vec<u8>, String> {
+    read_encoded(path)
+}
+
+pub fn quote_remote_path(path: &str) -> Result<String, String> {
+    if !path.starts_with('/') {
+        return Err("Remote image uploads require a POSIX daemon host".into());
+    }
+    quote_posix(path)
 }
 
 pub fn clipboard_image(path: &Path) -> Result<gpui::Image, String> {
@@ -368,6 +383,7 @@ fn validate_target(target: &ImageTarget) -> Result<(), String> {
             #[cfg(not(windows))]
             return Err("WSL image targets are only available on Windows".into());
         }
+        ImageTarget::Remote => {}
     }
     Ok(())
 }
@@ -430,6 +446,7 @@ fn target_path(path: &Path, target: &ImageTarget) -> Result<String, String> {
                 Err("WSL image targets are only available on Windows".into())
             }
         }
+        ImageTarget::Remote => Err("remote image path is assigned after upload".into()),
     }
 }
 
@@ -793,6 +810,34 @@ mod tests {
         ] {
             assert!(quote_posix(path).is_err());
         }
+    }
+
+    #[test]
+    fn remote_preparation_keeps_local_original_until_upload_assigns_a_path() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-remote-image-test-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("pixel.png");
+        let mut encoded = Cursor::new(Vec::new());
+        RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        fs::write(&path, &bytes).unwrap();
+
+        let prepared = prepare(ImageInput::File(path.clone()), ImageTarget::Remote).unwrap();
+        assert_eq!(prepared.path, path);
+        assert_eq!(prepared.quoted_path, None);
+        assert_eq!(read_upload(&prepared.path).unwrap(), bytes);
+        assert_eq!(
+            quote_remote_path("/home/user/a 'quote'.png").unwrap(),
+            "'/home/user/a '\\''quote'\\''.png'"
+        );
+        assert!(quote_remote_path(r"C:\image.png").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

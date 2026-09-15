@@ -54,7 +54,6 @@ impl PipeReader {
         result.map_err(Into::into)
     }
 
-    #[cfg(windows)]
     pub fn poll(&mut self, file: &File) -> Result<Option<Frame>> {
         if let Some(frame) = self.take_frame()? {
             return Ok(Some(frame));
@@ -63,68 +62,10 @@ impl PipeReader {
         // Drain up to 1 MiB already available per poll, without blocking or
         // making large image frames pay the caller's sleep after every 32 KiB.
         for _ in 0..32 {
-            let mut available = 0_u32;
-            unsafe {
-                PeekNamedPipe(
-                    HANDLE(file.as_raw_handle()),
-                    None,
-                    0,
-                    None,
-                    Some(&mut available),
-                    None,
-                )?;
-            }
-            if available == 0 {
+            let Some(read) = read_available(file, &mut chunk)? else {
                 return Ok(None);
-            }
-            let length = (available as usize).min(chunk.len());
-            let mut reader = file;
-            let read = reader.read(&mut chunk[..length])?;
-            if read == 0 {
-                return Err(
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "named pipe closed").into(),
-                );
-            }
-            self.buffer.extend_from_slice(&chunk[..read]);
-            if let Some(frame) = self.take_frame()? {
-                return Ok(Some(frame));
-            }
-        }
-        Ok(None)
-    }
-
-    #[cfg(unix)]
-    pub fn poll(&mut self, file: &File) -> Result<Option<Frame>> {
-        use std::os::fd::AsRawFd;
-        if let Some(frame) = self.take_frame()? {
-            return Ok(Some(frame));
-        }
-        let mut chunk = [0_u8; 32 * 1024];
-        for _ in 0..32 {
-            let count = unsafe {
-                libc::recv(
-                    file.as_raw_fd(),
-                    chunk.as_mut_ptr().cast(),
-                    chunk.len(),
-                    libc::MSG_DONTWAIT,
-                )
             };
-            if count < 0 {
-                let error = io::Error::last_os_error();
-                match error.kind() {
-                    io::ErrorKind::WouldBlock => return Ok(None),
-                    io::ErrorKind::Interrupted => continue,
-                    _ => return Err(error.into()),
-                }
-            }
-            if count == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "local connection closed",
-                )
-                .into());
-            }
-            self.buffer.extend_from_slice(&chunk[..count as usize]);
+            self.buffer.extend_from_slice(&chunk[..read]);
             if let Some(frame) = self.take_frame()? {
                 return Ok(Some(frame));
             }
@@ -154,6 +95,60 @@ impl PipeReader {
         let mut payload = std::mem::replace(&mut self.buffer, remainder);
         payload.drain(..5);
         Ok(Some(Frame { kind, payload }))
+    }
+}
+
+#[cfg(windows)]
+pub fn read_available(file: &File, buffer: &mut [u8]) -> Result<Option<usize>> {
+    let mut available = 0_u32;
+    unsafe {
+        PeekNamedPipe(
+            HANDLE(file.as_raw_handle()),
+            None,
+            0,
+            None,
+            Some(&mut available),
+            None,
+        )?;
+    }
+    if available == 0 {
+        return Ok(None);
+    }
+    let length = (available as usize).min(buffer.len());
+    let mut reader = file;
+    let read = reader.read(&mut buffer[..length])?;
+    if read == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "named pipe closed").into());
+    }
+    Ok(Some(read))
+}
+
+#[cfg(unix)]
+pub fn read_available(file: &File, buffer: &mut [u8]) -> Result<Option<usize>> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let count = unsafe {
+            libc::recv(
+                file.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if count > 0 {
+            return Ok(Some(count as usize));
+        }
+        if count == 0 {
+            return Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "local connection closed").into(),
+            );
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::WouldBlock => return Ok(None),
+            io::ErrorKind::Interrupted => {}
+            _ => return Err(error.into()),
+        }
     }
 }
 

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[cfg(any(windows, target_os = "macos", test))]
 struct Arguments {
     instance: Option<String>,
+    connect: Option<String>,
     working_directory: Option<String>,
     config: Option<PathBuf>,
     font: FontOverrides,
@@ -20,6 +21,7 @@ struct Arguments {
 fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, String> {
     let mut args = args.into_iter();
     let mut instance = None;
+    let mut connect = None;
     let mut working_directory = None;
     let mut config = None;
     let mut family = None;
@@ -30,6 +32,7 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
     while let Some(argument) = args.next() {
         let setting = match argument.as_str() {
             "--instance" => &mut instance,
+            "--connect" => &mut connect,
             "--working-directory" => &mut working_directory,
             "--config" => &mut config,
             "--font-family" => &mut family,
@@ -72,6 +75,7 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
     let sidebar_width = numeric_override(sidebar_width, "--sidebar-width");
     Ok(Arguments {
         instance,
+        connect,
         working_directory,
         config: config.map(PathBuf::from),
         font,
@@ -87,21 +91,32 @@ fn main() {
         Ok(args) => args,
         Err(error) => {
             eprintln!(
-                "{error}\nUsage: compi [--instance NAME] [--working-directory PATH | PATH] [--config PATH] [--font-family FAMILY] [--font-size SIZE] [--line-height MULTIPLIER] [--theme NAME] [--sidebar-width WIDTH]"
+                "{error}\nUsage: compi [--instance NAME] [--connect [USER@]HOST[:PORT]] [--working-directory PATH | PATH] [--config PATH] [--font-family FAMILY] [--font-size SIZE] [--line-height MULTIPLIER] [--theme NAME] [--sidebar-width WIDTH]"
             );
             std::process::exit(2);
         }
     };
+    let target = match compi_client::connection::ConnectionTarget::from_options(
+        args.instance.clone(),
+        args.connect.clone(),
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("Could not configure Compi connection: {error}");
+            std::process::exit(2);
+        }
+    };
+    let host_instance = target.state_instance();
     let mut config = compi_client::config::load(args.config.as_deref(), args.font);
     config.apply_presentation_overrides(args.theme.as_deref(), args.sidebar_width);
     config.diagnostics.extend(args.diagnostics);
     let request = compi_client::window_host::LaunchRequest::new(args.working_directory, config);
-    match compi_client::window_host::acquire(args.instance.as_deref(), request) {
+    match compi_client::window_host::acquire(host_instance.as_deref(), request) {
         Ok(compi_client::window_host::HostAcquisition::Forwarded) => {}
         Ok(compi_client::window_host::HostAcquisition::Host(mut host, request)) => {
             let receiver = host.take_receiver();
             compi_client::gui::run(
-                args.instance,
+                target,
                 request.initial_working_directory,
                 request.config,
                 Some(receiver),
@@ -133,6 +148,8 @@ mod tests {
             [
                 "--instance",
                 "work",
+                "--connect",
+                "dev@example.com:2222",
                 "--config",
                 "chosen.toml",
                 "--font-size",
@@ -151,6 +168,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.instance.as_deref(), Some("work"));
+        assert_eq!(args.connect.as_deref(), Some("dev@example.com:2222"));
         assert_eq!(
             args.working_directory.as_deref(),
             Some("/project with spaces")

@@ -19,13 +19,13 @@ pub use screen::{
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub use client::{DaemonClient, DaemonError, ServerEvent};
+pub use client::{ClientIo, DaemonClient, DaemonError, ServerEvent};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Version 11 adds opt-in runtime resource metrics for the native client.
-pub const PROTOCOL_VERSION: u32 = 11;
+// Version 12 adds bounded, chunked image uploads for remote terminals.
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -36,6 +36,8 @@ pub const DEFAULT_GRAPHICS_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_GRAPHICS_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum RGBA allocation for one decoded image.
 pub const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_IMAGE_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const IMAGE_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -88,6 +90,7 @@ opaque_id!(SurfaceId);
 opaque_id!(ProcessLifetimeId);
 opaque_id!(MutationId);
 opaque_id!(AttachmentId);
+opaque_id!(UploadId);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TerminalIdentity {
@@ -143,6 +146,19 @@ pub enum ClientMessage {
     },
     RequestSnapshot,
     ClearScrollback,
+    BeginImageUpload {
+        name: String,
+        byte_len: u64,
+        sha256: [u8; 32],
+    },
+    UploadImageChunk {
+        upload_id: UploadId,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    FinishImageUpload {
+        upload_id: UploadId,
+    },
     ShutdownDaemon,
 }
 
@@ -191,6 +207,16 @@ pub enum ServerMessage {
     },
     SnapshotReady {
         sequence: u64,
+    },
+    ImageUploadStarted {
+        upload_id: UploadId,
+    },
+    ImageUploadProgress {
+        upload_id: UploadId,
+        next_offset: u64,
+    },
+    ImageUploaded {
+        path: String,
     },
     DaemonStopping,
     SurfaceExited {

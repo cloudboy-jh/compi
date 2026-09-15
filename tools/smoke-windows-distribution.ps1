@@ -1,10 +1,14 @@
 [CmdletBinding()]
-param([switch]$Install)
+param([switch]$Install, [string]$DistributionDirectory)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$distribution = Join-Path $projectRoot 'target\distribution'
+$distribution = if ($DistributionDirectory) {
+    (Resolve-Path $DistributionDirectory).Path
+} else {
+    Join-Path $projectRoot 'target\distribution'
+}
 $evidence = Join-Path $projectRoot 'target\distribution-smoke'
 $installedDirectory = Join-Path $env:LOCALAPPDATA 'Programs\Compi'
 $registration = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi'

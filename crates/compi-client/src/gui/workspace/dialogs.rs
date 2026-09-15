@@ -589,6 +589,7 @@ impl CompiApp {
                 div()
                     .w(px(panel_width))
                     .h(px(panel_height))
+                    .min_h_0()
                     .mt_2()
                     .flex()
                     .flex_col()

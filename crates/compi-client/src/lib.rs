@@ -3,6 +3,7 @@
 pub mod client_state;
 pub mod commands;
 pub mod config;
+pub mod connection;
 #[cfg(windows)]
 pub mod console;
 #[cfg(any(windows, target_os = "macos"))]

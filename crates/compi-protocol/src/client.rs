@@ -1,15 +1,21 @@
 use crate::Result;
 use crate::frame;
 use crate::{
-    CONTROL_FRAME, ClientControl, ClientMessage, ErrorCode, MutationId, MutationReceipt,
-    MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, ServerMessage, SurfaceId,
-    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
-    decode_server, decode_terminal_frame, encode_client,
+    CONTROL_FRAME, ClientControl, ClientMessage, ErrorCode, IMAGE_UPLOAD_CHUNK_BYTES,
+    MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION,
+    RuntimeMetrics, SCREEN_FRAME, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus,
+    TerminalTarget, WorkspaceMutation, WorkspaceSnapshot, decode_server, decode_terminal_frame,
+    encode_client,
 };
 use crate::{identity, pipe};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::File;
+use std::io::Read;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_MUTATION: AtomicU64 = AtomicU64::new(1);
@@ -41,8 +47,120 @@ pub enum ServerEvent {
     Screen(crate::ScreenMessage),
 }
 
+pub struct ClientIo {
+    reader: File,
+    writer: Option<File>,
+    child: Option<Child>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_thread: Option<JoinHandle<()>>,
+}
+
+impl ClientIo {
+    fn local(connection: File) -> Self {
+        Self {
+            reader: connection,
+            writer: None,
+            child: None,
+            stderr: Arc::new(Mutex::new(Vec::new())),
+            stderr_thread: None,
+        }
+    }
+
+    fn command(mut child: Child) -> Result<Self> {
+        let stdin = child.stdin.take().ok_or("transport stdin was not piped")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("transport stdout was not piped")?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or("transport stderr was not piped")?;
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let stderr_thread = Some(capture_stderr(stderr, diagnostics.clone()));
+        Ok(Self {
+            reader: child_stdout_file(stdout),
+            writer: Some(child_stdin_file(stdin)),
+            child: Some(child),
+            stderr: diagnostics,
+            stderr_thread,
+        })
+    }
+
+    pub fn reader(&self) -> &File {
+        &self.reader
+    }
+
+    pub fn writer(&self) -> &File {
+        self.writer.as_ref().unwrap_or(&self.reader)
+    }
+
+    fn finish_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn diagnostics(&mut self) -> String {
+        self.finish_child();
+        self.stderr
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for ClientIo {
+    fn drop(&mut self) {
+        self.finish_child();
+    }
+}
+
+fn capture_stderr(mut stderr: ChildStderr, diagnostics: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        while let Ok(count) = stderr.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            if let Ok(mut stored) = diagnostics.lock() {
+                let remaining = (64 * 1024_usize).saturating_sub(stored.len());
+                stored.extend_from_slice(&chunk[..count.min(remaining)]);
+            }
+        }
+    })
+}
+
+#[cfg(unix)]
+fn child_stdout_file(stdout: ChildStdout) -> File {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    unsafe { File::from_raw_fd(stdout.into_raw_fd()) }
+}
+
+#[cfg(unix)]
+fn child_stdin_file(stdin: ChildStdin) -> File {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    unsafe { File::from_raw_fd(stdin.into_raw_fd()) }
+}
+
+#[cfg(windows)]
+fn child_stdout_file(stdout: ChildStdout) -> File {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+    unsafe { File::from_raw_handle(stdout.into_raw_handle()) }
+}
+
+#[cfg(windows)]
+fn child_stdin_file(stdin: ChildStdin) -> File {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+    unsafe { File::from_raw_handle(stdin.into_raw_handle()) }
+}
+
 pub struct DaemonClient {
-    connection: File,
+    connection: ClientIo,
     next_request_id: u64,
     pending_screen: VecDeque<crate::ScreenMessage>,
     pending_screen_sizes: VecDeque<usize>,
@@ -61,17 +179,40 @@ impl DaemonClient {
 
     pub fn connect_to(pipe_name: &str, timeout: Duration) -> Result<Self> {
         let connection = pipe::connect(pipe_name, timeout)?;
-        let mut client = Self::from_parts(connection, 1);
-        match client.request(ClientMessage::Hello {
+        Self::handshake(Self::from_parts(connection, 1))
+    }
+
+    pub fn connect_command(command: &mut Command) -> Result<Self> {
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let connection = ClientIo::command(child)?;
+        Self::handshake(Self::from_io(connection, 1))
+    }
+
+    fn handshake(mut client: Self) -> Result<Self> {
+        let result: std::result::Result<(), String> = match client.request(ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
-        })? {
-            ServerMessage::Hello { protocol_version } if protocol_version == PROTOCOL_VERSION => {
-                Ok(client)
+        }) {
+            Ok(ServerMessage::Hello { protocol_version })
+                if protocol_version == PROTOCOL_VERSION =>
+            {
+                return Ok(client);
             }
-            ServerMessage::Error { code, message, .. } => {
-                Err(format!("daemon rejected protocol ({code:?}): {message}").into())
+            Ok(ServerMessage::Error { code, message, .. }) => {
+                Err(format!("daemon rejected protocol ({code:?}): {message}"))
             }
-            message => Err(format!("unexpected daemon hello response: {message:?}").into()),
+            Ok(message) => Err(format!("unexpected daemon hello response: {message:?}")),
+            Err(error) => Err(error.to_string()),
+        };
+        let diagnostics = client.connection.diagnostics();
+        let error = result.unwrap_err();
+        if diagnostics.is_empty() {
+            Err(error.into())
+        } else {
+            Err(format!("{error}: {diagnostics}").into())
         }
     }
 
@@ -84,6 +225,46 @@ impl DaemonClient {
     pub fn runtime_metrics(&mut self) -> Result<RuntimeMetrics> {
         match self.request(ClientMessage::GetRuntimeMetrics)? {
             ServerMessage::RuntimeMetrics { metrics } => Ok(metrics),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    pub fn upload_image(&mut self, name: &str, bytes: &[u8]) -> Result<String> {
+        if bytes.is_empty() || bytes.len() > MAX_IMAGE_UPLOAD_BYTES {
+            return Err(format!(
+                "image upload must contain 1 through {MAX_IMAGE_UPLOAD_BYTES} bytes"
+            )
+            .into());
+        }
+        let byte_len = u64::try_from(bytes.len())?;
+        let sha256: [u8; 32] = Sha256::digest(bytes).into();
+        let upload_id = match self.request(ClientMessage::BeginImageUpload {
+            name: name.to_owned(),
+            byte_len,
+            sha256,
+        })? {
+            ServerMessage::ImageUploadStarted { upload_id } => upload_id,
+            message => return Err(unexpected_response(message)),
+        };
+        let mut next_offset = 0_u64;
+        for chunk in bytes.chunks(IMAGE_UPLOAD_CHUNK_BYTES) {
+            let expected = next_offset + u64::try_from(chunk.len())?;
+            match self.request(ClientMessage::UploadImageChunk {
+                upload_id: upload_id.clone(),
+                offset: next_offset,
+                data: chunk.to_vec(),
+            })? {
+                ServerMessage::ImageUploadProgress {
+                    upload_id: acknowledged,
+                    next_offset: actual,
+                } if acknowledged == upload_id && actual == expected => {
+                    next_offset = actual;
+                }
+                message => return Err(unexpected_response(message)),
+            }
+        }
+        match self.request(ClientMessage::FinishImageUpload { upload_id })? {
+            ServerMessage::ImageUploaded { path } => Ok(path),
             message => Err(unexpected_response(message)),
         }
     }
@@ -278,7 +459,7 @@ impl DaemonClient {
             target,
             message,
         })?;
-        frame::write(&mut self.connection, CONTROL_FRAME, &payload)?;
+        frame::write(&mut self.connection.writer(), CONTROL_FRAME, &payload)?;
         Ok(request_id)
     }
 
@@ -313,7 +494,7 @@ impl DaemonClient {
 
     pub fn read_event(&mut self) -> Result<Option<ServerEvent>> {
         loop {
-            let Some(frame) = self.poll_reader.read(&self.connection)? else {
+            let Some(frame) = self.poll_reader.read(self.connection.reader())? else {
                 return Ok(None);
             };
             if let Some(event) = self.decode_event(frame)? {
@@ -327,7 +508,7 @@ impl DaemonClient {
 
     pub fn poll_event(&mut self) -> Result<Option<ServerEvent>> {
         loop {
-            let Some(frame) = self.poll_reader.poll(&self.connection)? else {
+            let Some(frame) = self.poll_reader.poll(self.connection.reader())? else {
                 return Ok(None);
             };
             if let Some(event) = self.decode_event(frame)? {
@@ -367,7 +548,7 @@ impl DaemonClient {
     pub fn into_parts(
         self,
     ) -> (
-        File,
+        ClientIo,
         u64,
         VecDeque<crate::ScreenMessage>,
         Option<TerminalTarget>,
@@ -383,6 +564,10 @@ impl DaemonClient {
     }
 
     pub fn from_parts(connection: File, next_request_id: u64) -> Self {
+        Self::from_io(ClientIo::local(connection), next_request_id)
+    }
+
+    fn from_io(connection: ClientIo, next_request_id: u64) -> Self {
         Self {
             connection,
             next_request_id,
@@ -397,7 +582,7 @@ impl DaemonClient {
     }
 
     pub fn from_attached_parts(
-        connection: File,
+        connection: ClientIo,
         next_request_id: u64,
         target: TerminalTarget,
         workspace: Option<WorkspaceSnapshot>,

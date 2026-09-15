@@ -3,11 +3,10 @@ use crate::{DaemonClient, MirrorApply, ScreenMirror};
 use compi_protocol::frame;
 use compi_protocol::pipe;
 use compi_protocol::{
-    CONTROL_FRAME, ClientControl, ClientMessage, SCREEN_FRAME, ServerMessage, SurfaceInfo,
-    TerminalTarget, decode_server, decode_terminal_frame, encode_client,
+    CONTROL_FRAME, ClientControl, ClientIo, ClientMessage, SCREEN_FRAME, ServerMessage,
+    SurfaceInfo, TerminalTarget, decode_server, decode_terminal_frame, encode_client,
 };
 use compi_protocol::{Color, ScreenSnapshot, TextAttributes};
-use std::fs::File;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,7 +77,7 @@ pub fn attach(mut client: DaemonClient, surface: SurfaceInfo) -> Result<()> {
 
     let mut reader = pipe::PipeReader::default();
     loop {
-        let message = match reader.poll(&pipe)? {
+        let message = match reader.poll(pipe.reader())? {
             Some(message) => message,
             None => {
                 thread::sleep(Duration::from_millis(5));
@@ -225,7 +224,7 @@ fn color_code(color: Color, foreground: bool) -> String {
 }
 
 fn spawn_input_pump(
-    pipe: Arc<File>,
+    pipe: Arc<ClientIo>,
     write_lock: Arc<Mutex<()>>,
     request_ids: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
@@ -292,7 +291,7 @@ fn spawn_input_pump(
 }
 
 fn spawn_resize_pump(
-    pipe: Arc<File>,
+    pipe: Arc<ClientIo>,
     write_lock: Arc<Mutex<()>>,
     request_ids: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
@@ -325,7 +324,7 @@ fn spawn_resize_pump(
 }
 
 fn send(
-    pipe: &File,
+    pipe: &ClientIo,
     lock: &Mutex<()>,
     request_ids: &AtomicU64,
     target: &TerminalTarget,
@@ -338,7 +337,7 @@ fn send(
         message,
     })?;
     let _guard = lock.lock().map_err(|_| "pipe writer lock was poisoned")?;
-    frame::write(&mut &*pipe, CONTROL_FRAME, &payload)?;
+    frame::write(&mut pipe.writer(), CONTROL_FRAME, &payload)?;
     Ok(request_id)
 }
 

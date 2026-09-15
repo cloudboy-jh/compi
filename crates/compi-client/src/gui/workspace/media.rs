@@ -63,6 +63,7 @@ enum MediaJob {
         origin: InputOrigin,
         input: ImageInput,
         target: ImageTarget,
+        connection_target: ConnectionTarget,
         sender: UiEventSender,
     },
     Inspect {
@@ -101,9 +102,23 @@ static MEDIA_WORKERS: LazyLock<mpsc::SyncSender<MediaJob>> = LazyLock::new(|| {
                         origin,
                         input,
                         target,
+                        connection_target,
                         sender,
                     } => {
-                        let result = image_input::prepare(input, target);
+                        let result = image_input::prepare(input, target).and_then(|mut image| {
+                            if image.quoted_path.is_none() {
+                                let bytes = image_input::read_upload(&image.path)?;
+                                let mut client = connection_target.connect().map_err(|error| {
+                                    format!("Cannot connect for image upload: {error}")
+                                })?;
+                                let remote_path = client
+                                    .upload_image(&image.name, &bytes)
+                                    .map_err(|error| format!("Cannot upload image: {error}"))?;
+                                image.quoted_path =
+                                    Some(image_input::quote_remote_path(&remote_path)?);
+                            }
+                            Ok(image)
+                        });
                         sender.send(UiEvent::ImagePrepared {
                             request,
                             origin,
@@ -182,28 +197,35 @@ impl CompiApp {
             server_id: workspace.server_id.clone(),
             generation: workspace.server_generation.clone(),
         };
-        #[cfg(windows)]
-        let target = {
-            let surface = workspace.surface(&view.surface_id);
-            let distribution = surface
-                .and_then(|surface| surface.working_directory.as_ref())
-                .map(|cwd| cwd.distribution.clone())
-                .filter(|name| !name.is_empty())
-                .or_else(|| {
-                    surface
-                        .and_then(|surface| surface.launch.profile.as_ref())
-                        .and_then(|profile| profile.distribution.clone())
-                });
-            ImageTarget::Wsl { distribution }
+        let target = if self.target.is_remote() {
+            ImageTarget::Remote
+        } else {
+            #[cfg(windows)]
+            {
+                let surface = workspace.surface(&view.surface_id);
+                let distribution = surface
+                    .and_then(|surface| surface.working_directory.as_ref())
+                    .map(|cwd| cwd.distribution.clone())
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| {
+                        surface
+                            .and_then(|surface| surface.launch.profile.as_ref())
+                            .and_then(|profile| profile.distribution.clone())
+                    });
+                ImageTarget::Wsl { distribution }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                ImageTarget::Native
+            }
         };
-        #[cfg(target_os = "macos")]
-        let target = ImageTarget::Native;
         let request = NEXT_IMAGE_REQUEST.fetch_add(1, Ordering::Relaxed);
         let job = MediaJob::Prepare {
             request,
             origin,
             input,
             target,
+            connection_target: self.target.clone(),
             sender: self.event_tx.clone(),
         };
         if MEDIA_WORKERS.try_send(job).is_err() {
@@ -276,7 +298,11 @@ impl CompiApp {
             .mirror
             .snapshot()
             .is_some_and(|snapshot| snapshot.modes.bracketed_paste);
-        let input = format!("{} ", image.quoted_path);
+        let Some(quoted_path) = image.quoted_path.as_deref() else {
+            self.global_error = Some("Remote image upload did not return a shell path".into());
+            return;
+        };
+        let input = format!("{quoted_path} ");
         view.send(ClientMessage::Input {
             data: crate::input::encode_paste(&input, bracketed),
             latency_id: None,

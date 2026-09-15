@@ -6,7 +6,14 @@ param(
     [ValidateRange(5, 300)]
     [int]$SampleSeconds = 30,
     [ValidateRange(1, 8)]
-    [int]$LoadSessions = 3
+    [int]$LoadSessions = 3,
+    [string]$FontFamily = 'Cascadia Mono',
+    [ValidateRange(6, 72)]
+    [double]$FontSize = 14,
+    [ValidateRange(0.8, 3.0)]
+    [double]$LineHeight = 1.35,
+    [string]$Theme = 'dark-glass',
+    [switch]$ConfirmPhysicalDisplay
 )
 
 Set-StrictMode -Version Latest
@@ -27,6 +34,7 @@ $instance = 'soak{0:MMddHHmmss}{1}' -f (Get-Date), $PID
 $outputDirectory = Join-Path $env:LOCALAPPDATA 'Compi\measurements'
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 $outputPath = Join-Path $outputDirectory ("{0}-soak.csv" -f $instance)
+$contextPath = Join-Path $outputDirectory ("{0}-soak-environment.json" -f $instance)
 $processes = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $results = [System.Collections.Generic.List[object]]::new()
 $daemon = $null
@@ -78,28 +86,115 @@ function Add-ResourceSample {
     })
 }
 
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()] [string]$Argument)
+
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    if ($Argument.Contains('"')) {
+        throw 'Soak process arguments cannot contain quotes'
+    }
+    return '"' + $Argument + '"'
+}
+
+function Get-Sha256 {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '')
+    }
+    finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Start-SoakClient {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $clientPath
+    $startInfo.UseShellExecute = $false
+    $arguments = @(
+        '--instance', $instance,
+        '--font-family', $FontFamily,
+        '--font-size', ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $FontSize)),
+        '--line-height', ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $LineHeight)),
+        '--theme', $Theme
+    )
+    $startInfo.Arguments = (($arguments | ForEach-Object {
+        ConvertTo-NativeArgument -Argument $_
+    }) -join ' ')
+    $process = [Diagnostics.Process]::Start($startInfo)
+    $script:processes.Add($process)
+    return $process
+}
+
+function Get-ReceiptId {
+    param(
+        [Parameter(Mandatory)] [string]$Receipt,
+        [Parameter(Mandatory)] [string]$Field
+    )
+
+    if ($Receipt -notmatch "(?:^|\s)$([regex]::Escape($Field))=([^\s]+)") {
+        throw "Probe receipt did not contain ${Field}: $Receipt"
+    }
+    return $Matches[1].Split(',')[0]
+}
+
+function Wait-SessionRemoved {
+    param([Parameter(Mandatory)] [string]$SessionId)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $workspace = (& $probePath --instance $instance workspace | Out-String | ConvertFrom-Json)
+        if ($LASTEXITCODE -eq 0 -and $workspace.sessions.id -notcontains $SessionId) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Lifecycle-cycle session $SessionId was not removed"
+}
+
 try {
     $daemon = Start-Process -FilePath $daemonPath -ArgumentList @('--instance', $instance) -PassThru -WindowStyle Hidden
     $processes.Add($daemon)
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     do {
-        & $probePath --instance $instance list *> $null
+        & $probePath --instance $instance workspace *> $null
         if ($LASTEXITCODE -eq 0) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($LASTEXITCODE -ne 0) { throw 'Soak daemon did not become ready' }
 
     $durationSeconds = $Minutes * 60 + 30
-    $loads = for ($index = 0; $index -lt $LoadSessions; $index++) {
+    $loads = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+    for ($index = 0; $index -lt $LoadSessions; $index++) {
         $process = Start-Process -FilePath $probePath -ArgumentList @(
             '--instance', $instance, 'soak', $durationSeconds
         ) -PassThru -WindowStyle Hidden
         $processes.Add($process)
-        $process
+        $loads.Add($process)
+
+        $expectedSurfaces = $index + 1
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            if ($process.HasExited) {
+                throw "Sustained-output workload $($process.Id) exited with code $($process.ExitCode) during startup"
+            }
+            $workspace = (& $probePath --instance $instance workspace | Out-String | ConvertFrom-Json)
+            if ($LASTEXITCODE -eq 0 -and @($workspace.surfaces).Count -ge $expectedSurfaces) {
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (@($workspace.surfaces).Count -lt $expectedSurfaces) {
+            throw "Sustained-output workload $($process.Id) did not create a surface"
+        }
     }
     Start-Sleep -Seconds 2
-    $client = Start-Process -FilePath $clientPath -ArgumentList @('--instance', $instance) -PassThru -WindowStyle Minimized
-    $processes.Add($client)
+    $client = Start-SoakClient
     Start-Sleep -Seconds 6
 
     $started = [DateTime]::UtcNow
@@ -112,12 +207,16 @@ try {
             Add-ResourceSample -Process $load -Kind 'load' -Ordinal $sample
         }
 
-        $cycleSession = (& $probePath --instance $instance create).Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $cycleSession) {
+        $sessionReceipt = (& $probePath --instance $instance session create "Soak cycle $sample").Trim()
+        if ($LASTEXITCODE -ne 0) {
             throw 'Could not create the lifecycle-cycle session'
         }
-        & $probePath --instance $instance kill $cycleSession *> $null
-        if ($LASTEXITCODE -ne 0) { throw 'Could not kill the lifecycle-cycle session' }
+        $cycleSession = Get-ReceiptId -Receipt $sessionReceipt -Field 'sessions'
+        & $probePath --instance $instance tab create $cycleSession "Soak cycle $sample" *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not create the lifecycle-cycle tab' }
+        & $probePath --instance $instance session remove $cycleSession *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not remove the lifecycle-cycle session' }
+        Wait-SessionRemoved -SessionId $cycleSession
 
         $sample++
         Start-Sleep -Seconds $SampleSeconds
@@ -140,6 +239,34 @@ try {
         }
     }
     $results | Export-Csv -Path $outputPath -NoTypeInformation -Encoding utf8
+    $qualified = $ConfirmPhysicalDisplay.IsPresent -and $Minutes -ge 30
+    $context = [ordered]@{
+        run_id = $instance
+        qualified_physical_display_run = $qualified
+        physical_display_confirmed_by_operator = $ConfirmPhysicalDisplay.IsPresent
+        minutes = $Minutes
+        sample_seconds = $SampleSeconds
+        load_sessions = $LoadSessions
+        binary_directory = (Resolve-Path $BinaryDirectory).Path
+        build_profile = Split-Path -Leaf (Resolve-Path $BinaryDirectory).Path
+        font_family = $FontFamily
+        font_size = $FontSize
+        line_height = $LineHeight
+        theme = $Theme
+        windows = [Environment]::OSVersion.VersionString
+        cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name)
+        video = @(Get-CimInstance Win32_VideoController | Select-Object Name, CurrentHorizontalResolution, CurrentVerticalResolution, CurrentRefreshRate)
+        commit = (& git rev-parse HEAD 2>$null)
+        rustc = (& rustc --version 2>$null)
+        binaries = [ordered]@{
+            client_sha256 = Get-Sha256 -Path $clientPath
+            daemon_sha256 = Get-Sha256 -Path $daemonPath
+            probe_sha256 = Get-Sha256 -Path $probePath
+        }
+    }
+    $context | ConvertTo-Json -Depth 5 | Set-Content -Path $contextPath -Encoding utf8
+    Write-Host "Environment JSON: $contextPath"
+    Write-Host "Qualified physical-display run: $qualified"
     Write-Host "Soak passed: $outputPath"
 }
 finally {

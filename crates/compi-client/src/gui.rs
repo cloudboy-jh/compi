@@ -3,11 +3,11 @@ use crate::client_state::{
 };
 use crate::commands::{self, Command};
 use crate::config::{AppearanceSettings, FontSettings, LoadedConfig};
+use crate::connection::ConnectionTarget;
 use crate::input::{
     self, Key, KeypadKey, Modifiers, encode_keystroke, encode_mouse, utf16_byte_index,
 };
 use crate::layout::{self, LayoutMetrics, WorkspaceLayout};
-use crate::probe;
 use crate::selection::{GridPoint, Selection, line_selection, selected_text, word_selection};
 use crate::theme::{BackgroundEffect, ThemeColors, ThemePreset};
 use compi_protocol::{
@@ -26,7 +26,7 @@ use base64::Engine as _;
 use compi_protocol::perf;
 use compi_protocol::{
     Cell, ClientMessage, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode,
-    Row, ScreenMessage, ServerMessage, SurfaceId, SurfaceStatus,
+    Row, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus,
 };
 use gpui::{
     App, Application, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
@@ -94,24 +94,25 @@ const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
 const UI_EVENT_YIELD: Duration = Duration::from_micros(8_333);
 
 pub fn run(
-    instance: Option<String>,
+    target: ConnectionTarget,
     initial_working_directory: Option<String>,
     config: LoadedConfig,
     launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
 ) {
+    let empty_measurement = perf::empty_window_enabled();
     Application::new().run(move |cx: &mut App| {
-        if let Err(error) = open_compi_window(
-            instance.clone(),
-            initial_working_directory,
-            config,
-            None,
-            cx,
-        ) {
+        let opened = if empty_measurement {
+            open_empty_measurement_window(cx)
+        } else {
+            open_compi_window(target.clone(), initial_working_directory, config, None, cx)
+                .map(|_| ())
+        };
+        if let Err(error) = opened {
             eprintln!("Could not open Compi: {error}");
             cx.quit();
             return;
         }
-        if let Some(requests) = launch_requests {
+        if !empty_measurement && let Some(requests) = launch_requests {
             cx.spawn(async move |cx| {
                 loop {
                     cx.background_executor()
@@ -123,10 +124,10 @@ pub fn run(
                             Err(TryRecvError::Empty) => break,
                             Err(TryRecvError::Disconnected) => return,
                         };
-                        let instance = instance.clone();
+                        let target = target.clone();
                         let _ = cx.update(|cx| {
                             if let Err(error) = open_compi_window(
-                                instance,
+                                target,
                                 request.initial_working_directory,
                                 request.config,
                                 None,
@@ -147,6 +148,37 @@ pub fn run(
         })
         .detach();
     });
+}
+
+struct EmptyMeasurementWindow;
+
+impl Render for EmptyMeasurementWindow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().bg(rgb(0x11100f))
+    }
+}
+
+fn open_empty_measurement_window(cx: &mut App) -> crate::Result<()> {
+    let started_at = Instant::now();
+    let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+    let window = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            focus: true,
+            ..Default::default()
+        },
+        |_, cx| cx.new(|_| EmptyMeasurementWindow),
+    )?;
+    window.update(cx, |_, window, _| {
+        window.on_next_frame(move |_, _| {
+            log_startup_metric("first_window_frame_ms", started_at.elapsed());
+        });
+    })?;
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(6));
+        perf::log_resource_sample("client", "empty_window", 0);
+    });
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -666,9 +698,13 @@ impl SettingsSection {
 
 struct CompiApp {
     started_at: Instant,
-    instance: Option<String>,
+    target: ConnectionTarget,
     initial_working_directory: Option<String>,
     first_snapshot_logged: bool,
+    ready_probe_marker: Option<String>,
+    ready_probe_sent_at: Option<Instant>,
+    ready_probe_render_pending: bool,
+    ready_probe_logged: bool,
     pending_present_latency_ids: Vec<u64>,
     window_title: String,
     focus_handle: FocusHandle,
@@ -734,6 +770,7 @@ struct CompiApp {
     zoom_layout: Option<WorkspaceLayout>,
     mutation_pending: bool,
     global_error: Option<String>,
+    connection_error: Option<String>,
     font_settings: FontSettings,
     typography: Arc<TerminalTypography>,
     typography_scale: f32,
@@ -2406,7 +2443,7 @@ fn spawn_tab_worker(
     cols: i16,
     rows: i16,
     sender: UiEventSender,
-    instance: Option<String>,
+    connection_target: ConnectionTarget,
     lifecycle: WorkerLifecycle,
 ) {
     let WorkerLifecycle {
@@ -2433,7 +2470,7 @@ fn spawn_tab_worker(
             rows,
             stop.clone(),
             &sender,
-            instance.as_deref(),
+            &connection_target,
         );
         closed.store(true, Ordering::Release);
         if stop.load(Ordering::Acquire) {
@@ -2454,9 +2491,9 @@ fn run_tab_connection(
     rows: i16,
     stop: Arc<AtomicBool>,
     sender: &UiEventSender,
-    instance: Option<&str>,
+    connection_target: &ConnectionTarget,
 ) -> crate::Result<()> {
-    let mut client = probe::connect_or_start(instance)?;
+    let mut client = connection_target.connect()?;
     let workspace = client.workspace()?;
     let Some(surface) = workspace.surface(surface_id).cloned() else {
         stop.store(true, Ordering::Release);
@@ -2556,6 +2593,22 @@ fn short_surface_id(id: &SurfaceId) -> String {
         .chars()
         .take(8)
         .collect()
+}
+
+fn snapshot_contains_marker(snapshot: Option<&ScreenSnapshot>, marker: &str) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot
+            .scrollback
+            .iter()
+            .chain(&snapshot.cells)
+            .any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains(marker)
+            })
+    })
 }
 
 fn log_startup_metric(name: &str, elapsed: Duration) {

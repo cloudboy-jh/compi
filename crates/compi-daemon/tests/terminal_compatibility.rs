@@ -9,8 +9,16 @@ fn expected_screen(fixture: &Value) -> ScreenMessage {
     serde_json::from_value(fixture["value"].clone()).unwrap()
 }
 
+fn without_placements(mut message: ScreenMessage) -> ScreenMessage {
+    match &mut message {
+        ScreenMessage::Snapshot { snapshot } => snapshot.placements.clear(),
+        ScreenMessage::Delta { delta } => delta.placements = None,
+    }
+    message
+}
+
 #[test]
-fn extracted_engine_and_replica_match_pre_extraction_replay() {
+fn extracted_engine_and_replica_match_pre_extraction_replay_except_graphics_reflow() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../compi-protocol/tests/fixtures/terminal-v7.json"
     ))
@@ -25,8 +33,10 @@ fn extracted_engine_and_replica_match_pre_extraction_replay() {
     assert_eq!(initial, expected_screen(&fixture["initial"]));
     let mut replica = ScreenMirror::default();
     assert_eq!(replica.apply(initial), MirrorApply::Applied);
+    let mut graphics_reflowed = false;
 
     for event in fixture["events"].as_array().unwrap() {
+        graphics_reflowed |= event.get("resize").is_some();
         let (delta, replies) = if let Some(output) = event.get("output") {
             terminal.advance(&STANDARD.decode(output.as_str().unwrap()).unwrap())
         } else {
@@ -46,17 +56,30 @@ fn extracted_engine_and_replica_match_pre_extraction_replay() {
             delta: screen::delta(delta),
         });
         let expected_delta = (!event["delta"].is_null()).then(|| expected_screen(&event["delta"]));
-        assert_eq!(message, expected_delta);
+        if graphics_reflowed {
+            assert_eq!(
+                message.clone().map(without_placements),
+                expected_delta.map(without_placements)
+            );
+        } else {
+            assert_eq!(message, expected_delta);
+        }
         if let Some(message) = message {
             assert_eq!(replica.apply(message), MirrorApply::Applied);
         }
         let snapshot = screen::snapshot(terminal.snapshot());
-        assert_eq!(
-            ScreenMessage::Snapshot {
-                snapshot: snapshot.clone(),
-            },
-            expected_screen(&event["snapshot"])
-        );
+        let actual_snapshot = ScreenMessage::Snapshot {
+            snapshot: snapshot.clone(),
+        };
+        let expected_snapshot = expected_screen(&event["snapshot"]);
+        if graphics_reflowed {
+            assert_eq!(
+                without_placements(actual_snapshot),
+                without_placements(expected_snapshot)
+            );
+        } else {
+            assert_eq!(actual_snapshot, expected_snapshot);
+        }
         assert_eq!(replica.snapshot(), Some(&snapshot));
     }
 }
@@ -156,7 +179,7 @@ fn image_anchor_tracks_retained_history_without_retransmitting_pixels() {
 }
 
 #[test]
-fn resize_reflows_text_but_preserves_image_grid_anchor_and_payload() {
+fn resize_reflows_text_and_logical_image_anchor_without_retransmitting_payload() {
     let mut terminal = TerminalState::new(10, 3);
     terminal.advance(b"abcdefghijK\x1b_Ga=T,f=32,s=1,v=1,i=1,p=7;AQIDBA==\x1b\\");
     let initial = screen::snapshot(terminal.snapshot());
@@ -173,7 +196,7 @@ fn resize_reflows_text_but_preserves_image_grid_anchor_and_payload() {
     );
     let resized = screen::snapshot(terminal.snapshot());
     assert_eq!(resized.images, initial.images);
-    assert_eq!(resized.placements, initial.placements);
+    assert_eq!(resized.placements[0].row, 2);
     assert!(resized.scrollback.is_empty());
     assert_eq!(
         resized.cells[0]
@@ -185,8 +208,8 @@ fn resize_reflows_text_but_preserves_image_grid_anchor_and_payload() {
     );
     assert_eq!(replica.snapshot(), Some(&resized));
     terminal.clear_scrollback();
-    // Clearing history does not remove a still-live grid anchor.
-    assert_eq!(terminal.snapshot().placements, initial.placements);
+    // Clearing history does not remove the placement while its reflowed anchor remains on-screen.
+    assert_eq!(terminal.snapshot().placements, resized.placements);
 }
 
 #[test]

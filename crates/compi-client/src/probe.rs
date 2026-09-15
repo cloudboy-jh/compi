@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::connection::ConnectionTarget;
 #[cfg(windows)]
 use crate::console;
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
@@ -20,27 +21,37 @@ use windows::Win32::System::Threading::{
 
 pub fn run() -> Result<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
-    let instance = if args.first().is_some_and(|arg| arg == "--instance") {
-        if args.len() < 2 {
-            return Err("--instance requires a name".into());
+    let mut instance = None;
+    let mut connect = None;
+    loop {
+        let destination = match args.first().map(String::as_str) {
+            Some("--instance") => &mut instance,
+            Some("--connect") => &mut connect,
+            _ => break,
+        };
+        let option = args.remove(0);
+        if destination.is_some() {
+            return Err(format!("{option} may be provided only once").into());
         }
-        let instance = args.remove(1);
-        args.remove(0);
-        Some(instance)
-    } else {
-        None
-    };
-    let instance = instance.as_deref();
+        if args.is_empty() || args[0].is_empty() || args[0].starts_with("--") {
+            return Err(format!("{option} requires a value").into());
+        }
+        *destination = Some(args.remove(0));
+    }
+    let target = ConnectionTarget::from_options(instance, connect)?;
 
     match args.first().map(String::as_str) {
-        None => start(instance, None),
-        Some("start") => start(instance, optional_tail(&args, 1)?),
-        Some("daemon-start") => start_daemon(instance),
-        Some("workspace") => workspace(instance),
-        Some("session") => session_command(instance, &args[1..]),
-        Some("tab") => tab_command(instance, &args[1..]),
-        Some("pane") => pane_command(instance, &args[1..]),
-        Some("surface") => surface_command(instance, &args[1..]),
+        None => start(&target, None),
+        Some("start") => start(&target, optional_tail(&args, 1)?),
+        Some("daemon-start") => {
+            drop(target.connect()?);
+            Ok(())
+        }
+        Some("workspace") => workspace(&target),
+        Some("session") => session_command(&target, &args[1..]),
+        Some("tab") => tab_command(&target, &args[1..]),
+        Some("pane") => pane_command(&target, &args[1..]),
+        Some("surface") => surface_command(&target, &args[1..]),
         Some("soak") => {
             if args.len() != 2 {
                 return Err("soak requires exactly one duration in seconds".into());
@@ -51,9 +62,9 @@ pub fn run() -> Result<()> {
             if seconds == 0 {
                 return Err("soak duration must be a positive integer".into());
             }
-            soak(instance, Duration::from_secs(seconds))
+            soak(&target, Duration::from_secs(seconds))
         }
-        Some("shutdown") => shutdown(instance),
+        Some("shutdown") => shutdown(&target),
         Some("check-system") | Some("--check-system") => check_system(),
         Some("help") | Some("--help") | Some("-h") => {
             usage();
@@ -66,28 +77,28 @@ pub fn run() -> Result<()> {
 fn usage() {
     println!(
         "compi-probe - workspace protocol diagnostic client\n\n\
-         Usage:\n  compi-probe start [working-directory]\n  \
-         compi-probe workspace\n  \
-         compi-probe session create <label>\n  \
-         compi-probe session rename <session-id> <label>\n  \
-         compi-probe session remove <session-id>\n  \
-         compi-probe tab create <session-id> <label> [working-directory]\n  \
-         compi-probe tab rename <tab-id> <label>\n  \
-         compi-probe tab move <session-id> <tab-id> <index>\n  \
-         compi-probe tab remove <tab-id>\n  \
-         compi-probe pane split-right|split-down <pane-id> [working-directory]\n  \
-         compi-probe pane remove <pane-id>\n  \
-         compi-probe surface attach|inspect|end|restart <surface-id>\n  \
-         compi-probe soak <seconds>\n  \
-         compi-probe shutdown\n  \
+         Usage:\n  compi-probe [--instance NAME] [--connect [USER@]HOST[:PORT]] start [working-directory]\n  \
+         compi-probe [connection options] workspace\n  \
+         compi-probe [connection options] session create <label>\n  \
+         compi-probe [connection options] session rename <session-id> <label>\n  \
+         compi-probe [connection options] session remove <session-id>\n  \
+         compi-probe [connection options] tab create <session-id> <label> [working-directory]\n  \
+         compi-probe [connection options] tab rename <tab-id> <label>\n  \
+         compi-probe [connection options] tab move <session-id> <tab-id> <index>\n  \
+         compi-probe [connection options] tab remove <tab-id>\n  \
+         compi-probe [connection options] pane split-right|split-down <pane-id> [working-directory]\n  \
+         compi-probe [connection options] pane remove <pane-id>\n  \
+         compi-probe [connection options] surface attach|inspect|end|restart <surface-id>\n  \
+         compi-probe [connection options] soak <seconds>\n  \
+         compi-probe [connection options] shutdown\n  \
          compi-probe check-system\n\n\
-         Add `--instance <name>` before the command for an isolated daemon.\n\
+         Connection options select an isolated instance, an SSH host, or both.\n\
          Press Ctrl+] to detach without stopping the shell."
     );
 }
 
-fn start(instance: Option<&str>, working_directory: Option<String>) -> Result<()> {
-    let mut client = connect_or_start(instance)?;
+fn start(target: &ConnectionTarget, working_directory: Option<String>) -> Result<()> {
+    let mut client = target.connect()?;
     let (cols, rows) = console::dimensions();
     let surface = client.create_surface(cols, rows, working_directory)?;
     if surface.status != SurfaceStatus::Running {
@@ -99,15 +110,15 @@ fn start(instance: Option<&str>, working_directory: Option<String>) -> Result<()
     console::attach(client, surface)
 }
 
-fn workspace(instance: Option<&str>) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+fn workspace(target: &ConnectionTarget) -> Result<()> {
+    let mut client = target.connect()?;
     let workspace = client.workspace()?;
     println!("{}", serde_json::to_string_pretty(&workspace)?);
     Ok(())
 }
 
-fn session_command(instance: Option<&str>, args: &[String]) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+fn session_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
+    let mut client = target.connect()?;
     let operation = match args.first().map(String::as_str) {
         Some("create") if args.len() == 2 => WorkspaceMutation::CreateSession {
             label: args[1].clone(),
@@ -124,8 +135,8 @@ fn session_command(instance: Option<&str>, args: &[String]) -> Result<()> {
     print_receipt(client.mutate(operation)?)
 }
 
-fn tab_command(instance: Option<&str>, args: &[String]) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+fn tab_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
+    let mut client = target.connect()?;
     let (cols, rows) = console::dimensions();
     let operation = match args.first().map(String::as_str) {
         Some("create") if matches!(args.len(), 3 | 4) => WorkspaceMutation::CreateTab {
@@ -154,8 +165,8 @@ fn tab_command(instance: Option<&str>, args: &[String]) -> Result<()> {
     print_receipt(client.mutate(operation)?)
 }
 
-fn pane_command(instance: Option<&str>, args: &[String]) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
+    let mut client = target.connect()?;
     let (cols, rows) = console::dimensions();
     let workspace = client.workspace()?;
     let operation = match args.first().map(String::as_str) {
@@ -239,25 +250,25 @@ fn pane_command(instance: Option<&str>, args: &[String]) -> Result<()> {
     })?)
 }
 
-fn surface_command(instance: Option<&str>, args: &[String]) -> Result<()> {
+fn surface_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
     if args.len() != 2 {
         return Err("surface command requires an action and surface ID".into());
     }
     let surface_id = SurfaceId::new(args[1].clone());
     match args[0].as_str() {
         "attach" => {
-            let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+            let mut client = target.connect()?;
             let surface = find_surface(&mut client, &surface_id)?;
             console::attach(client, surface)
         }
-        "inspect" => inspect(instance, surface_id),
+        "inspect" => inspect(target, surface_id),
         "end" => {
-            let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+            let mut client = target.connect()?;
             let surface = find_surface(&mut client, &surface_id)?;
             print_receipt(client.end_surface(&surface)?)
         }
         "restart" => {
-            let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+            let mut client = target.connect()?;
             let surface = find_surface(&mut client, &surface_id)?;
             let (cols, rows) = console::dimensions();
             let receipt = client.mutate(WorkspaceMutation::RestartSurface {
@@ -288,23 +299,42 @@ fn find_surface(client: &mut DaemonClient, id: &SurfaceId) -> Result<SurfaceInfo
 }
 
 fn print_receipt(receipt: compi_protocol::MutationReceipt) -> Result<()> {
+    let ids = |values: &[String]| values.join(",");
+    let sessions = receipt
+        .affected_sessions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let tabs = receipt
+        .affected_tabs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let panes = receipt
+        .affected_panes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let surfaces = receipt
+        .affected_surfaces
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     println!(
-        "mutation={} revision={} state={} surfaces={}",
+        "mutation={} revision={} state={} sessions={} tabs={} panes={} surfaces={}",
         receipt.mutation_id,
         receipt.revision,
         receipt.operation_state,
-        receipt
-            .affected_surfaces
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
+        ids(&sessions),
+        ids(&tabs),
+        ids(&panes),
+        ids(&surfaces),
     );
     Ok(())
 }
 
-fn inspect(instance: Option<&str>, surface_id: SurfaceId) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+fn inspect(target: &ConnectionTarget, surface_id: SurfaceId) -> Result<()> {
+    let mut client = target.connect()?;
     let surface = find_surface(&mut client, &surface_id)?;
     client.attach_surface(&surface, surface.cols, surface.rows)?;
     loop {
@@ -329,8 +359,8 @@ fn inspect(instance: Option<&str>, surface_id: SurfaceId) -> Result<()> {
     }
 }
 
-fn soak(instance: Option<&str>, duration: Duration) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+fn soak(target: &ConnectionTarget, duration: Duration) -> Result<()> {
+    let mut client = target.connect()?;
     let surface = client.create_surface(100, 30, None)?;
     client.attach_surface(&surface, 100, 30)?;
     client.request(ClientMessage::Input {
@@ -402,8 +432,8 @@ fn soak(instance: Option<&str>, duration: Duration) -> Result<()> {
     }
 }
 
-fn shutdown(instance: Option<&str>) -> Result<()> {
-    let mut client = DaemonClient::connect(instance, Duration::from_secs(2))?;
+fn shutdown(target: &ConnectionTarget) -> Result<()> {
+    let mut client = target.connect()?;
     client.shutdown_daemon()?;
     println!("daemon stopping");
     Ok(())

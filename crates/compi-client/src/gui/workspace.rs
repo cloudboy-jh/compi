@@ -68,20 +68,26 @@ pub(super) struct DividerDrag {
 }
 
 pub(super) fn open_compi_window(
-    instance: Option<String>,
+    target: ConnectionTarget,
     initial_working_directory: Option<String>,
     config: LoadedConfig,
     transferred_seed: Option<TransferSeed>,
     cx: &mut App,
 ) -> crate::Result<WindowHandle<CompiApp>> {
     let started_at = Instant::now();
-    let snapshot =
-        probe::connect_or_start(instance.as_deref()).and_then(|mut client| client.workspace())?;
+    let mut client = target.connect()?;
+    let mut snapshot = client.workspace()?;
+    let target_sessions = perf::target_session_count();
+    while snapshot.surfaces.len() < target_sessions {
+        client.create_surface(DEFAULT_COLS, DEFAULT_ROWS, None)?;
+        snapshot = client.workspace()?;
+    }
     let defaults = ClientState {
         sidebar_width: config.configured_sidebar_width,
         ..ClientState::default()
     };
-    let mut slot = StateSlot::claim(instance.as_deref(), &snapshot.server_id, &defaults)?;
+    let state_instance = target.state_instance();
+    let mut slot = StateSlot::claim(state_instance.as_deref(), &snapshot.server_id, &defaults)?;
     slot.state.reconcile(None, &snapshot);
     if let Some(seed) = &transferred_seed
         && !slot
@@ -132,7 +138,7 @@ pub(super) fn open_compi_window(
             cx.new(|cx| {
                 CompiApp::new(
                     started_at,
-                    instance,
+                    target,
                     initial_working_directory,
                     config,
                     defaults,
@@ -149,6 +155,14 @@ pub(super) fn open_compi_window(
         window.focus(&view.focus_handle);
         cx.activate(true);
     })?;
+    if perf::enabled() {
+        let first_frame_started_at = started_at;
+        window.update(cx, |_, window, _| {
+            window.on_next_frame(move |_, _| {
+                log_startup_metric("first_window_frame_ms", first_frame_started_at.elapsed());
+            });
+        })?;
+    }
     Ok(window)
 }
 
@@ -175,7 +189,7 @@ impl CompiApp {
     #[allow(clippy::too_many_arguments)]
     fn new(
         started_at: Instant,
-        instance: Option<String>,
+        target: ConnectionTarget,
         initial_working_directory: Option<String>,
         config: LoadedConfig,
         defaults: ClientState,
@@ -238,9 +252,14 @@ impl CompiApp {
         let performance_enabled = Arc::new(AtomicBool::new(state.show_fps));
         let mut this = Self {
             started_at,
-            instance,
+            target,
             initial_working_directory,
             first_snapshot_logged: false,
+            ready_probe_marker: perf::ready_probe_enabled()
+                .then(|| format!("COMPI_READY_{}", std::process::id())),
+            ready_probe_sent_at: None,
+            ready_probe_render_pending: false,
+            ready_probe_logged: false,
             pending_present_latency_ids: Vec::new(),
             window_title: "Compi".into(),
             focus_handle: cx.focus_handle(),
@@ -305,6 +324,7 @@ impl CompiApp {
             zoom_layout: None,
             mutation_pending: false,
             global_error: None,
+            connection_error: None,
             font_settings: config.font.clone(),
             typography,
             typography_scale: window.scale_factor(),
@@ -375,9 +395,30 @@ impl CompiApp {
             }
         })
         .detach();
+        if perf::enabled() {
+            let metrics_view = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(6)).await;
+                    if metrics_view
+                        .update(cx, |this, _| {
+                            let sessions = this
+                                .workspace
+                                .as_ref()
+                                .map_or(0, |workspace| workspace.surfaces.len());
+                            perf::log_resource_sample("client", "terminal", sessions);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         // A control-only subscription keeps hidden work and empty windows authoritative.
         let sender = this.event_tx.clone();
-        let instance = this.instance.clone();
+        let target = this.target.clone();
         let appearance_path = this.config.path.clone();
         let performance_enabled = this.performance_enabled.clone();
         let alive = cx.entity().downgrade();
@@ -393,14 +434,14 @@ impl CompiApp {
                     break;
                 }
                 let sender = sender.clone();
-                let instance = instance.clone();
+                let target = target.clone();
                 let appearance_path = appearance_path.clone();
                 let previous_stamp = appearance_stamp;
                 let collect_performance = performance_enabled.load(Ordering::Acquire);
                 appearance_stamp = cx
                     .background_executor()
                     .spawn(async move {
-                        match DaemonClient::connect(instance.as_deref(), Duration::from_secs(2)) {
+                        match target.connect() {
                             Ok(mut client) => {
                                 sender.send(UiEvent::SurfacesLoaded(
                                     client.workspace().map_err(|error| error.to_string()),
@@ -681,9 +722,10 @@ impl CompiApp {
         }
         self.loading_surfaces = true;
         let sender = self.event_tx.clone();
-        let instance = self.instance.clone();
+        let target = self.target.clone();
         thread::spawn(move || {
-            let result = probe::connect_or_start(instance.as_deref())
+            let result = target
+                .connect()
                 .and_then(|mut client| client.workspace())
                 .map_err(|error| error.to_string());
             sender.send(UiEvent::SurfacesLoaded(result));
@@ -704,9 +746,10 @@ impl CompiApp {
             }
         }
         let sender = self.event_tx.clone();
-        let instance = self.instance.clone();
+        let target = self.target.clone();
         thread::spawn(move || {
-            let result = probe::restart_daemon(instance.as_deref())
+            let result = target
+                .restart_daemon()
                 .and_then(|mut client| client.workspace())
                 .map_err(|error| error.to_string());
             sender.send(UiEvent::DaemonRestarted(result));
@@ -786,11 +829,10 @@ impl CompiApp {
         };
         self.mutation_pending = true;
         let sender = self.event_tx.clone();
-        let instance = self.instance.clone();
+        let target = self.target.clone();
         thread::spawn(move || {
             let result = (|| -> crate::Result<_> {
-                let mut client =
-                    DaemonClient::connect(instance.as_deref(), Duration::from_secs(2))?;
+                let mut client = target.connect()?;
                 let receipt = if let Some((tab_id, tree)) = layout_guard {
                     Self::commit_divider(&mut client, mutation, &tab_id, &tree)?
                 } else {
@@ -1000,17 +1042,21 @@ impl CompiApp {
                     Err(error) => error,
                 })
             }
-            UiEvent::SurfacesLoaded(Ok(workspace)) => self.accept_workspace(workspace),
+            UiEvent::SurfacesLoaded(Ok(workspace)) => {
+                self.connection_error = None;
+                self.accept_workspace(workspace);
+            }
             UiEvent::DaemonRestarted(result) => {
                 self.daemon_restarting = false;
                 self.loading_surfaces = false;
                 match result {
                     Ok(workspace) => {
                         self.global_error = None;
+                        self.connection_error = None;
                         self.accept_workspace(workspace);
                     }
                     Err(error) => {
-                        self.global_error = Some(format!(
+                        self.connection_error = Some(format!(
                             "Daemon restart failed: {error}. Use Reconnect to retry."
                         ));
                     }
@@ -1018,7 +1064,8 @@ impl CompiApp {
             }
             UiEvent::SurfacesLoaded(Err(error)) => {
                 self.loading_surfaces = false;
-                self.global_error = Some(format!("Disconnected: {error}. Use Reconnect to retry."));
+                self.connection_error =
+                    Some(format!("Disconnected: {error}. Use Reconnect to retry."));
             }
             UiEvent::MutationFinished {
                 result,
@@ -1061,6 +1108,13 @@ impl CompiApp {
                     .find(|view| view.id == tab_id)
                     .and_then(|view| self.workspace.as_ref()?.surface(&view.surface_id))
                     .map(|surface| (surface.status, surface.exit_code));
+                let ready_probe = self
+                    .ready_probe_marker
+                    .clone()
+                    .filter(|_| self.ready_probe_sent_at.is_none());
+                if ready_probe.is_some() {
+                    self.ready_probe_sent_at = Some(Instant::now());
+                }
                 if let Some(view) = self.surface_view_mut(tab_id) {
                     if view.stop.load(Ordering::Acquire) {
                         transport.close();
@@ -1079,6 +1133,12 @@ impl CompiApp {
                         cols: view.cols,
                         rows: view.rows,
                     });
+                    if let Some(marker) = ready_probe {
+                        view.send(ClientMessage::Input {
+                            data: format!("printf '%s\\n' '{marker}'\n").into_bytes(),
+                            latency_id: None,
+                        });
+                    }
                 }
             }
             UiEvent::TabScreen { tab_id, message } => {
@@ -1126,6 +1186,8 @@ impl CompiApp {
                             .remove(id.as_str())
                             .map(|saved| (saved, identity))
                     });
+                let ready_probe_marker = self.ready_probe_marker.clone();
+                let mut ready_probe_observed = false;
                 if let Some(view) = self.surface_view_mut(tab_id) {
                     if let ScreenMessage::Delta { delta } = &message
                         && let Some(old) = view.mirror.snapshot()
@@ -1187,7 +1249,11 @@ impl CompiApp {
                         _ => ConnectionState::Attached,
                     };
                     view.images_dirty |= images_changed;
+                    ready_probe_observed = ready_probe_marker.as_deref().is_some_and(|marker| {
+                        snapshot_contains_marker(view.mirror.snapshot(), marker)
+                    });
                 }
+                self.ready_probe_render_pending |= ready_probe_observed;
                 if self.focused_view == Some(tab_id)
                     && matches!(
                         self.config.clipboard_policy,
@@ -1390,7 +1456,7 @@ impl CompiApp {
                     view.cols,
                     view.rows,
                     self.event_tx.clone(),
-                    self.instance.clone(),
+                    self.target.clone(),
                     WorkerLifecycle {
                         stop: view.stop.clone(),
                         previous_closed,
@@ -1870,13 +1936,22 @@ impl CompiApp {
                     self.activate_overlay(window, cx);
                 }
                 "up" | "down" => {
-                    let count = self.overlay_choices(cx).len().max(1);
+                    let choices = self.overlay_choices(cx);
+                    let count = choices.len().max(1);
                     self.overlay_index = if key.key == "up" {
                         (self.overlay_index + count - 1) % count
                     } else {
                         (self.overlay_index + 1) % count
                     };
-                    self.overlay_scroll.scroll_to_item(self.overlay_index);
+                    if choices
+                        .get(self.overlay_index)
+                        .is_some_and(|choice| choice.reason.is_some())
+                    {
+                        self.overlay_scroll
+                            .scroll_to_top_of_item(self.overlay_index);
+                    } else {
+                        self.overlay_scroll.scroll_to_item(self.overlay_index);
+                    }
                 }
                 "backspace" | "delete"
                     if !matches!(
@@ -2140,7 +2215,7 @@ impl CompiApp {
             }
             Command::NewWindow => {
                 if let Err(error) =
-                    open_compi_window(self.instance.clone(), None, self.config.clone(), None, cx)
+                    open_compi_window(self.target.clone(), None, self.config.clone(), None, cx)
                 {
                     self.global_error = Some(error.to_string());
                 }
@@ -2767,7 +2842,7 @@ impl CompiApp {
                     if let Some(typed) = handle.downcast::<CompiApp>()
                         && let Ok(other) = typed.read(cx)
                         && !std::ptr::eq(other, self)
-                        && other.instance == self.instance
+                        && other.target == self.target
                     {
                         let title = other.window_title.clone();
                         if title.to_lowercase().contains(&query) {
@@ -2874,6 +2949,18 @@ impl CompiApp {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        if self.ready_probe_render_pending && !self.ready_probe_logged {
+            self.ready_probe_render_pending = false;
+            self.ready_probe_logged = true;
+            let started_at = self.started_at;
+            let sent_at = self.ready_probe_sent_at;
+            window.on_next_frame(move |_, _| {
+                perf::log_startup_metric("ready_for_input_ms", started_at.elapsed());
+                if let Some(sent_at) = sent_at {
+                    perf::log_startup_metric("input_to_render_ms", sent_at.elapsed());
+                }
+            });
+        }
         if !self.pending_present_latency_ids.is_empty() {
             let ids = std::mem::take(&mut self.pending_present_latency_ids);
             window.on_next_frame(move |_, _| {
@@ -2882,6 +2969,22 @@ impl CompiApp {
                 }
             });
         }
+        let notice = self
+            .global_error
+            .clone()
+            .map(|error| (error, false, true))
+            .or_else(|| {
+                self.connection_error
+                    .clone()
+                    .map(|error| (error, true, true))
+            })
+            .or_else(|| {
+                self.state_save_error
+                    .lock()
+                    .ok()?
+                    .as_ref()
+                    .map(|error| (format!("Window state is unsaved: {error}"), false, false))
+            });
         let root = div()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
@@ -2913,49 +3016,57 @@ impl CompiApp {
                     .when(self.sidebar_open, |row| row.child(self.render_sidebar(cx)))
                     .child(self.render_panes(cx)),
             )
-            .when_some(
-                self.global_error.clone().or_else(|| {
-                    self.state_save_error
-                        .lock()
-                        .ok()?
-                        .as_ref()
-                        .map(|error| format!("Window state is unsaved: {error}"))
-                }),
-                |root, error| {
-                    root.child(
-                        div()
-                            .absolute()
-                            .bottom_2()
-                            .left_2()
-                            .right_2()
-                            .px_3()
-                            .py_2()
-                            .bg(color(colors.surface))
-                            .border_1()
-                            .border_color(color(colors.error))
-                            .text_color(color(colors.error))
-                            .flex()
-                            .gap_3()
-                            .child(div().flex_1().child(error))
-                            .child(self.command_button(
-                                "error-reconnect",
-                                "Reconnect",
-                                Command::Reconnect,
-                                cx,
-                            ))
-                            .child(
+            .when_some(notice, |root, (error, can_reconnect, dismissible)| {
+                root.child(
+                    div()
+                        .mx_2()
+                        .mb_2()
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .bg(color(colors.surface))
+                        .border_1()
+                        .border_color(color(colors.error))
+                        .text_color(color(colors.error))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().min_w_0().child(error))
+                        .when(can_reconnect || dismissible, |banner| {
+                            banner.child(
                                 div()
-                                    .id("dismiss-error")
-                                    .cursor_pointer()
-                                    .child("Dismiss")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.global_error = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                },
-            )
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap_3()
+                                    .when(can_reconnect, |actions| {
+                                        actions.child(self.command_button(
+                                            "error-reconnect",
+                                            "Reconnect",
+                                            Command::Reconnect,
+                                            cx,
+                                        ))
+                                    })
+                                    .when(dismissible, |actions| {
+                                        actions.child(
+                                            div()
+                                                .id("dismiss-error")
+                                                .cursor_pointer()
+                                                .child("Dismiss")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if can_reconnect {
+                                                        this.connection_error = None;
+                                                    } else {
+                                                        this.global_error = None;
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    }),
+                            )
+                        }),
+                )
+            })
             .when(self.overlay.is_none(), |root| {
                 root.child(self.render_image_previews(cx))
             })
@@ -3581,13 +3692,57 @@ impl CompiApp {
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
         let Some(layout) = self.visible_layout() else {
-            return div().flex_1().size_full().flex().flex_col().items_center().justify_center().gap_3().bg(color(colors.background).opacity(self.terminal_opacity))
-                .child(div().text_size(px(18.0)).child("Your work stays here"))
-                .child(div().text_color(color(colors.muted)).child("Create a terminal tab or restore hidden work. Hiding a tab keeps its processes running."))
-                .child(div().flex().gap_2()
-                    .child(self.command_button("empty-new-terminal", "New terminal tab", Command::NewTab, cx))
-                    .child(self.command_button("empty-new-workspace", "New workspace", Command::CreateWorkspace, cx))
-                    .child(self.command_button("empty-restore", "Restore hidden tab", Command::RestoreHiddenTab, cx)))
+            return div()
+                .flex_1()
+                .size_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(color(colors.background).opacity(self.terminal_opacity))
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(680.0))
+                        .px_4()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .text_center()
+                        .child(div().text_size(px(18.0)).child("Your work stays here"))
+                        .child(
+                            div()
+                                .w_full()
+                                .text_color(color(colors.muted))
+                                .child("Create a terminal tab or restore hidden work. Hiding a tab keeps its processes running."),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .justify_center()
+                                .gap_2()
+                                .child(self.command_button(
+                                    "empty-new-terminal",
+                                    "New terminal tab",
+                                    Command::NewTab,
+                                    cx,
+                                ))
+                                .child(self.command_button(
+                                    "empty-new-workspace",
+                                    "New workspace",
+                                    Command::CreateWorkspace,
+                                    cx,
+                                ))
+                                .child(self.command_button(
+                                    "empty-restore",
+                                    "Restore hidden tab",
+                                    Command::RestoreHiddenTab,
+                                    cx,
+                                )),
+                        ),
+                )
                 .into_any_element();
         };
         let panes = layout.panes.iter().enumerate().map(|(index, geometry)| {
@@ -3676,6 +3831,66 @@ impl CompiApp {
                         cx.notify();
                     }),
                 )
+                .when(!matches!(status, "Running"), |pane| {
+                    pane.child(
+                        div()
+                            .flex_none()
+                            .min_h(px(36.0))
+                            .px_2()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_end()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(color(colors.border))
+                            .bg(color(colors.surface))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(if matches!(status, "Failed" | "Lost") {
+                                        colors.error
+                                    } else {
+                                        colors.muted
+                                    }))
+                                    .child(status),
+                            )
+                            .when(status == "Unavailable", |actions| {
+                                actions.child(self.pane_command_button(
+                                    ("retry-pane", index),
+                                    "Retry attachment",
+                                    Command::Reconnect,
+                                    &pane_id,
+                                    cx,
+                                ))
+                            })
+                            .when(matches!(status, "Exited" | "Failed" | "Lost"), |actions| {
+                                actions.child(self.pane_command_button(
+                                    ("restart-pane", index),
+                                    "Restart surface",
+                                    Command::RestartSurface,
+                                    &pane_id,
+                                    cx,
+                                ))
+                            }),
+                    )
+                })
+                .when_some(error, |pane, error| {
+                    pane.child(
+                        div()
+                            .flex_none()
+                            .px_2()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(color(colors.border))
+                            .bg(color(colors.surface))
+                            .text_color(color(colors.error))
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .child(error),
+                    )
+                })
                 .child(
                     div()
                         .flex_1()
@@ -3737,53 +3952,7 @@ impl CompiApp {
                                 },
                             )
                             .size_full(),
-                        )
-                        .when_some(error, |pane, error| {
-                            pane.child(
-                                div()
-                                    .absolute()
-                                    .left_2()
-                                    .right_2()
-                                    .bottom_2()
-                                    .p_2()
-                                    .bg(color(colors.surface))
-                                    .text_color(color(colors.error))
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .child(error),
-                            )
-                        })
-                        .when(!matches!(status, "Running"), |pane| {
-                            pane.child(
-                                div()
-                                    .absolute()
-                                    .top_2()
-                                    .right_2()
-                                    .flex()
-                                    .gap_1()
-                                    .bg(color(colors.surface))
-                                    .when(status == "Unavailable", |actions| {
-                                        actions.child(self.pane_command_button(
-                                            ("retry-pane", index),
-                                            "Retry attachment",
-                                            Command::Reconnect,
-                                            &pane_id,
-                                            cx,
-                                        ))
-                                    })
-                                    .when(
-                                        matches!(status, "Exited" | "Failed" | "Lost"),
-                                        |actions| {
-                                            actions.child(self.pane_command_button(
-                                                ("restart-pane", index),
-                                                "Restart surface",
-                                                Command::RestartSurface,
-                                                &pane_id,
-                                                cx,
-                                            ))
-                                        },
-                                    ),
-                            )
-                        }),
+                        ),
                 )
                 .when_some(terminal_scroll, |pane, (position, length)| {
                     pane.child(
@@ -4148,7 +4317,7 @@ impl CompiApp {
                     if let Some(typed) = handle.downcast::<CompiApp>() {
                         let matches = typed
                             .update(cx, |other, target, _| {
-                                other.instance == self.instance && target.bounds().contains(&global)
+                                other.target == self.target && target.bounds().contains(&global)
                             })
                             .unwrap_or(false);
                         if matches {
@@ -4212,7 +4381,7 @@ impl CompiApp {
                 display_sidebar_width: self.sidebar_width,
                 display_zoom: self.zoom,
             };
-            match open_compi_window(self.instance.clone(), None, config, Some(seed), cx) {
+            match open_compi_window(self.target.clone(), None, config, Some(seed), cx) {
                 Ok(target) => target,
                 Err(error) => {
                     self.global_error = Some(format!(
@@ -4226,7 +4395,7 @@ impl CompiApp {
             return;
         }
         let ready = target.update(cx, |other, _, _| {
-            other.instance == self.instance
+            other.target == self.target
                 && !other.mutation_pending
                 && other.workspace.as_ref().is_some_and(|snapshot| {
                     snapshot.server_id == workspace.server_id

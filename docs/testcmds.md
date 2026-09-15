@@ -52,9 +52,22 @@ An explicit `--working-directory /absolute/project/path` requests new work. Omit
 
 CI is configured to run the Unix integration suite natively on Mac/Linux. Windows/WSL tests still require a qualified Windows host. The Windows immediate-descendant ownership regression is part of `cargo test --locked -p compi-daemon --lib`; compiling it on another host does not qualify the retained ConPTY backend.
 
+## SSH and headless checks
+
+Install the matching `compi-daemon` on an SSH host, then exercise discovery and lifecycle without GPUI:
+
+```sh
+compi-probe --connect user@host:22 --instance qualification workspace
+compi-probe --connect user@host:22 --instance qualification start
+compi-probe --connect user@host:22 --instance qualification surface inspect <surface-id>
+```
+
+Closing or detaching the probe must leave the remote surface running. A later `workspace` or `surface attach` must report the same server, surface, and process-lifetime IDs. Use `surface end` for one process and `shutdown` only for a disposable instance. Unknown host keys, authentication failures, missing remote binaries, and dropped relays must fail visibly; Compi does not bypass OpenSSH policy or fall back to a local daemon.
+
+
 ## Phase 4 native workspace checks
 
-Use matching v9 client/daemon binaries and an isolated instance. Do not stop an older daemon that owns valuable work merely to try the new client.
+Use matching protocol 12 client/daemon binaries and an isolated instance. Do not stop an older daemon that owns valuable work merely to try the new client.
 
 ```powershell
 cargo test --locked --workspace --all-targets --release
@@ -121,7 +134,7 @@ Use `.\target\release\examples\compi-probe.exe --instance acceptance ...` only i
 
 ```powershell
 cargo build --release --example compi-probe
-.\target\release\examples\compi-probe.exe --instance acceptance create
+.\target\release\examples\compi-probe.exe --instance acceptance workspace
 ```
 
 Run these commands inside an attached 100x30 Compi terminal. Capture pass/fail, elapsed time, peak private bytes, peak working set, peak handles, and any visible corruption.

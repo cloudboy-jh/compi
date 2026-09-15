@@ -5,6 +5,12 @@ param(
     [string[]]$Mode = @('warm', 'cold', 'empty'),
     [ValidateRange(1, 100)]
     [int]$Samples = 10,
+    [string]$FontFamily = 'Cascadia Mono',
+    [ValidateRange(6, 72)]
+    [double]$FontSize = 14,
+    [ValidateRange(0.8, 3.0)]
+    [double]$LineHeight = 1.35,
+    [string]$Theme = 'dark-glass',
     [switch]$ConfirmPhysicalDisplay
 )
 if (-not $BinaryDirectory) {
@@ -32,6 +38,32 @@ $startupLog = Join-Path $compiData 'client-startup.log'
 $results = [System.Collections.Generic.List[object]]::new()
 $startedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()] [string]$Argument)
+
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    if ($Argument.Contains('"')) {
+        throw 'Measurement process arguments cannot contain quotes'
+    }
+    return '"' + $Argument + '"'
+}
+
+function Get-Sha256 {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '')
+    }
+    finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Start-WithEnvironment {
     param(
         [Parameter(Mandatory)] [string]$FilePath,
@@ -39,25 +71,18 @@ function Start-WithEnvironment {
         [Parameter(Mandatory)] [hashtable]$Environment
     )
 
-    $prior = @{}
-    try {
-        foreach ($entry in $Environment.GetEnumerator()) {
-            $prior[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
-            [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
-        }
-        $startParameters = @{ FilePath = $FilePath; PassThru = $true }
-        if ($ArgumentList) {
-            $startParameters.ArgumentList = $ArgumentList
-        }
-        $process = Start-Process @startParameters
-        $script:startedProcesses.Add($process)
-        return $process
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.Arguments = (($ArgumentList | ForEach-Object {
+        ConvertTo-NativeArgument -Argument $_
+    }) -join ' ')
+    foreach ($entry in $Environment.GetEnumerator()) {
+        $startInfo.EnvironmentVariables[$entry.Key] = [string]$entry.Value
     }
-    finally {
-        foreach ($entry in $prior.GetEnumerator()) {
-            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
-        }
-    }
+    $process = [Diagnostics.Process]::Start($startInfo)
+    $script:startedProcesses.Add($process)
+    return $process
 }
 
 function Wait-StartupMetric {
@@ -120,7 +145,7 @@ function Wait-Daemon {
         $priorErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            & $probePath --instance $Instance list *> $null
+            & $probePath --instance $Instance workspace *> $null
             $exitCode = $LASTEXITCODE
         }
         finally {
@@ -206,8 +231,12 @@ function Add-ProcessMeasurement {
         ready_for_input_ms = $ReadyForInputMs
         input_to_render_ms = $InputToRenderMs
         private_bytes = $Process.PrivateMemorySize64
+        resident_bytes = $null
+        virtual_bytes = $null
         working_set_bytes = $Process.WorkingSet64
         handles = $Process.HandleCount
+        file_descriptors = $null
+        threads = $null
         gpu_dedicated_bytes = $gpu[0]
         gpu_shared_bytes = $gpu[1]
         resource_log = $ResourceLine
@@ -246,7 +275,13 @@ function Invoke-ClientSample {
     else {
         $environment.COMPI_PERF_READY_PROBE = '1'
     }
-    $arguments = if ($Instance) { @('--instance', $Instance) } else { @() }
+    $arguments = @(
+        '--instance', $Instance,
+        '--font-family', $FontFamily,
+        '--font-size', ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $FontSize)),
+        '--line-height', ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $LineHeight)),
+        '--theme', $Theme
+    )
     $client = Start-WithEnvironment -FilePath $clientPath -ArgumentList $arguments -Environment $environment
     try {
         $firstWindow = Wait-StartupMetric -Sample $Sample -Metric 'first_window_frame_ms'
@@ -275,7 +310,8 @@ try {
     if ($Mode -contains 'empty') {
         for ($index = 1; $index -le $Samples; $index++) {
             $sample = '{0}-empty-{1:D2}' -f $runId, $index
-            Invoke-ClientSample -Startup 'empty' -Sample $sample -EmptyWindow
+            $instance = '{0}-e{1:D2}' -f $instanceBase, $index
+            Invoke-ClientSample -Startup 'empty' -Sample $sample -Instance $instance -EmptyWindow
         }
     }
 
@@ -379,11 +415,23 @@ $environmentRecord = [ordered]@{
     physical_display_confirmed_by_operator = $ConfirmPhysicalDisplay.IsPresent
     samples_per_mode = $Samples
     modes = $Mode
+    binary_directory = (Resolve-Path $BinaryDirectory).Path
+    build_profile = Split-Path -Leaf (Resolve-Path $BinaryDirectory).Path
+    font_family = $FontFamily
+    font_size = $FontSize
+    line_height = $LineHeight
+    theme = $Theme
     windows = [Environment]::OSVersion.VersionString
     cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name)
     video = @(Get-CimInstance Win32_VideoController | Select-Object Name, CurrentHorizontalResolution, CurrentVerticalResolution, CurrentRefreshRate)
     wsl = Get-WslRecord
     commit = (& git rev-parse HEAD 2>$null)
+    rustc = (& rustc --version 2>$null)
+    binaries = [ordered]@{
+        client_sha256 = Get-Sha256 -Path $clientPath
+        daemon_sha256 = Get-Sha256 -Path $daemonPath
+        probe_sha256 = Get-Sha256 -Path $probePath
+    }
 }
 
 $csvPath = Join-Path $measurementDirectory "$runId.csv"

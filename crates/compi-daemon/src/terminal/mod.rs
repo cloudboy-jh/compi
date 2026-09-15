@@ -341,15 +341,60 @@ impl TerminalState {
             return None;
         }
         let before = self.change_baseline();
+        let old_scrollback = self.main.scrollback.len();
         let cursor_in_main = (!self.active_alternate).then(|| {
             (
-                self.main.scrollback.len() + usize::from(self.cursor.row),
+                old_scrollback + usize::from(self.cursor.row),
                 usize::from(self.cursor.col),
             )
         });
-        // Text reflows; Kitty placements retain their grid coordinates and
-        // extents. Image-aware logical-line reanchoring is not implemented.
-        let reflowed_cursor = reflow_main_buffer(&mut self.main, cols, rows, cursor_in_main);
+        let source_rows = old_scrollback + self.main.rows.len();
+        let placement_anchors: Vec<_> = self
+            .placements
+            .iter()
+            .enumerate()
+            .filter(|(_, placement)| !placement.alternate_screen)
+            .filter_map(|(index, placement)| {
+                let row = i64::try_from(old_scrollback).ok()? + i64::from(placement.row);
+                (row >= 0 && usize::try_from(row).ok()? < source_rows).then_some((
+                    index,
+                    (usize::try_from(row).unwrap(), usize::from(placement.col)),
+                ))
+            })
+            .collect();
+        let anchors: Vec<_> = placement_anchors
+            .iter()
+            .map(|(_, anchor)| *anchor)
+            .collect();
+        let (reflowed_cursor, mapped_anchors) =
+            reflow_main_buffer(&mut self.main, cols, rows, cursor_in_main, &anchors);
+        let mut keep = vec![true; self.placements.len()];
+        let mut graphics_changed = false;
+        for ((index, _), mapped) in placement_anchors.into_iter().zip(mapped_anchors) {
+            match mapped {
+                Some((row, col)) => {
+                    let placement = &mut self.placements[index];
+                    if placement.row != row || placement.col != col {
+                        placement.row = row;
+                        placement.col = col;
+                        graphics_changed = true;
+                    }
+                }
+                None => {
+                    keep[index] = false;
+                    graphics_changed = true;
+                }
+            }
+        }
+        if graphics_changed {
+            let mut index = 0;
+            self.placements.retain(|_| {
+                let retain = keep[index];
+                index += 1;
+                retain
+            });
+            self.graphics_generation = self.graphics_generation.saturating_add(1);
+        }
         resize_buffer_cells(&mut self.alternate, cols, rows);
         self.scrollback_generation = self.scrollback_generation.saturating_add(1);
         if let Some((row, col)) = reflowed_cursor {
@@ -1027,6 +1072,24 @@ impl TerminalState {
             .filter_map(|item| item.split_once('='))
             .collect();
         let action = values.get("a").copied().unwrap_or("t");
+        if let Some(key) = values.keys().find(|key| {
+            !matches!(
+                **key,
+                "a" | "i" | "f" | "s" | "v" | "o" | "q" | "m" | "t" | "p" | "r" | "c" | "z" | "d"
+            )
+        }) {
+            let id = values
+                .get("i")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let quiet = values
+                .get("q")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            self.diagnostics.record(format!("Kitty:{key}"));
+            self.graphics_error(id, quiet, "ENOTSUP:unsupported control key");
+            return;
+        }
         if action == "d" {
             self.delete_graphics(&values);
             return;
@@ -1118,6 +1181,12 @@ impl TerminalState {
                     self.graphics_error(id, quiet, "ENOSPC:placement limit exceeded");
                 }
             }
+        } else {
+            let quiet = values
+                .get("q")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            self.graphics_error(id, quiet, "ENOTSUP:unsupported action");
         }
     }
 
@@ -1667,29 +1736,43 @@ fn row_hash(row: &Row) -> u64 {
     hasher.finish()
 }
 
+type ReflowResult = (Option<(usize, usize)>, Vec<Option<(i32, u16)>>);
+type LogicalLine = (Vec<Cell>, Option<usize>, Vec<(usize, usize)>);
+
 fn reflow_main_buffer(
     buffer: &mut Buffer,
     cols: usize,
     rows: usize,
     cursor: Option<(usize, usize)>,
-) -> Option<(usize, usize)> {
+    anchors: &[(usize, usize)],
+) -> ReflowResult {
     let mut source: Vec<Row> = buffer
         .scrollback
         .drain(..)
         .chain(buffer.rows.drain(..))
         .collect();
-    if let Some((cursor_row, _)) = cursor {
+    if cursor.is_some() || !anchors.is_empty() {
         let blank = Cell::default();
-        let last_used_row = source
+        let last_content_row = source
             .iter()
-            .rposition(|row| row.wrapped || row.cells.iter().any(|cell| cell != &blank))
-            .unwrap_or(cursor_row)
-            .max(cursor_row);
+            .rposition(|row| row.wrapped || row.cells.iter().any(|cell| cell != &blank));
+        let last_cursor_row = cursor.map(|(row, _)| row);
+        let last_anchor_row = anchors.iter().map(|(row, _)| *row).max();
+        let last_used_row = [last_content_row, last_cursor_row, last_anchor_row]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0);
         source.truncate(last_used_row.saturating_add(1).min(source.len()));
     }
-    let mut logical_lines: Vec<(Vec<Cell>, Option<usize>)> = Vec::new();
+    let mut anchors_by_row = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+    for (index, (row, col)) in anchors.iter().copied().enumerate() {
+        anchors_by_row.entry(row).or_default().push((index, col));
+    }
+    let mut logical_lines: Vec<LogicalLine> = Vec::new();
     let mut line_cells = Vec::new();
     let mut line_cursor = None;
+    let mut line_anchors = Vec::new();
     for (row_index, row) in source.into_iter().enumerate() {
         if let Some((cursor_row, cursor_col)) = cursor
             && cursor_row == row_index
@@ -1697,24 +1780,40 @@ fn reflow_main_buffer(
             line_cursor =
                 Some(line_cells.len() + cursor_col.min(row.cells.len().saturating_sub(1)));
         }
+        if let Some(row_anchors) = anchors_by_row.remove(&row_index) {
+            for (index, col) in row_anchors {
+                line_anchors.push((
+                    index,
+                    line_cells.len() + col.min(row.cells.len().saturating_sub(1)),
+                ));
+            }
+        }
         line_cells.extend(row.cells);
         if !row.wrapped {
-            trim_reflow_line(&mut line_cells, line_cursor);
-            logical_lines.push((std::mem::take(&mut line_cells), line_cursor.take()));
+            trim_reflow_line(&mut line_cells, line_cursor, &line_anchors);
+            line_anchors.sort_by_key(|(_, offset)| *offset);
+            logical_lines.push((
+                std::mem::take(&mut line_cells),
+                line_cursor.take(),
+                std::mem::take(&mut line_anchors),
+            ));
         }
     }
     if !line_cells.is_empty() || logical_lines.is_empty() {
-        trim_reflow_line(&mut line_cells, line_cursor);
-        logical_lines.push((line_cells, line_cursor));
+        trim_reflow_line(&mut line_cells, line_cursor, &line_anchors);
+        line_anchors.sort_by_key(|(_, offset)| *offset);
+        logical_lines.push((line_cells, line_cursor, line_anchors));
     }
 
     let mut physical_rows = Vec::new();
     let mut mapped_cursor = None;
-    for (cells, cursor_offset) in logical_lines {
+    let mut mapped_anchors = vec![None; anchors.len()];
+    for (cells, cursor_offset, line_anchors) in logical_lines {
         let line_start = physical_rows.len();
         let mut row = Row::blank(cols);
         let mut col = 0;
         let mut source_col = 0;
+        let mut next_anchor = 0;
         while source_col < cells.len() {
             let cell = &cells[source_col];
             let width = usize::from(cell.width.max(1));
@@ -1731,6 +1830,15 @@ fn reflow_main_buffer(
                     physical_rows.len(),
                     col + cursor_offset.unwrap().saturating_sub(source_col),
                 ));
+            }
+            while let Some((index, offset)) = line_anchors.get(next_anchor).copied()
+                && offset < source_col.saturating_add(width)
+            {
+                if offset >= source_col {
+                    mapped_anchors[index] =
+                        Some((physical_rows.len(), col + offset.saturating_sub(source_col)));
+                }
+                next_anchor += 1;
             }
             if cell.width == 0 {
                 source_col += 1;
@@ -1754,6 +1862,13 @@ fn reflow_main_buffer(
         if cursor_offset == Some(cells.len()) {
             mapped_cursor = Some((physical_rows.len(), col.min(cols.saturating_sub(1))));
         }
+        while let Some((index, offset)) = line_anchors.get(next_anchor).copied() {
+            if offset == cells.len() {
+                mapped_anchors[index] =
+                    Some((physical_rows.len(), col.min(cols.saturating_sub(1))));
+            }
+            next_anchor += 1;
+        }
         physical_rows.push(row);
         if mapped_cursor.is_none() && cursor_offset.is_some() {
             mapped_cursor = Some((line_start, 0));
@@ -1768,19 +1883,43 @@ fn reflow_main_buffer(
     buffer.scrollback = physical_rows.into();
     buffer.rows = viewport;
     buffer.scrollback_bytes = buffer.scrollback.iter().map(row_memory).sum();
+    let mut removed_rows = 0;
     while buffer.scrollback_bytes > MAX_SCROLLBACK_BYTES
         || buffer.scrollback.len() > buffer.scrollback_line_limit
     {
         let Some(removed) = buffer.scrollback.pop_front() else {
             break;
         };
+        removed_rows += 1;
         buffer.scrollback_bytes = buffer.scrollback_bytes.saturating_sub(row_memory(&removed));
     }
-    mapped_cursor.map(|(row, col)| (row.saturating_sub(viewport_start), col))
+    let mapped_anchors = mapped_anchors
+        .into_iter()
+        .map(|mapped| {
+            let (row, col) = mapped?;
+            if row < removed_rows {
+                return None;
+            }
+            let relative = i64::try_from(row).ok()? - i64::try_from(viewport_start).ok()?;
+            Some((
+                i32::try_from(relative).ok()?,
+                u16::try_from(col.min(cols.saturating_sub(1))).ok()?,
+            ))
+        })
+        .collect();
+    (
+        mapped_cursor.map(|(row, col)| (row.saturating_sub(viewport_start), col)),
+        mapped_anchors,
+    )
 }
 
-fn trim_reflow_line(cells: &mut Vec<Cell>, cursor: Option<usize>) {
-    let minimum = cursor.map_or(0, |offset| offset.saturating_add(1));
+fn trim_reflow_line(cells: &mut Vec<Cell>, cursor: Option<usize>, anchors: &[(usize, usize)]) {
+    let minimum = cursor
+        .into_iter()
+        .chain(anchors.iter().map(|(_, offset)| *offset))
+        .map(|offset| offset.saturating_add(1))
+        .max()
+        .unwrap_or(0);
     while cells.len() > minimum && cells.last().is_some_and(|cell| cell == &Cell::default()) {
         cells.pop();
     }
@@ -1989,6 +2128,38 @@ mod tests {
     }
 
     #[test]
+    fn reanchors_kitty_placements_to_logical_text_during_reflow() {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.advance(b"abcdef");
+        terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=7,p=9;AQIDBA==\x1b\\");
+        assert_eq!(
+            (
+                terminal.snapshot().placements[0].row,
+                terminal.snapshot().placements[0].col
+            ),
+            (0, 6)
+        );
+
+        terminal.resize(4, 3);
+        assert_eq!(
+            (
+                terminal.snapshot().placements[0].row,
+                terminal.snapshot().placements[0].col
+            ),
+            (1, 2)
+        );
+
+        terminal.resize(10, 3);
+        assert_eq!(
+            (
+                terminal.snapshot().placements[0].row,
+                terminal.snapshot().placements[0].col
+            ),
+            (0, 6)
+        );
+    }
+
+    #[test]
     fn height_resizes_do_not_turn_unused_rows_into_scrollback() {
         let mut terminal = TerminalState::new(20, 24);
         terminal.advance(b"prompt");
@@ -2059,6 +2230,24 @@ mod tests {
         terminal.advance(b"\x1b_Ga=d,d=i,i=7\x1b\\");
         assert!(terminal.snapshot().images.is_empty());
         assert!(terminal.snapshot().placements.is_empty());
+    }
+
+    #[test]
+    fn rejects_unimplemented_kitty_controls_instead_of_claiming_support() {
+        let mut terminal = TerminalState::new(10, 2);
+        let (_, replies) = terminal.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=7,X=1;AQIDBA==\x1b\\");
+        assert!(terminal.snapshot().images.is_empty());
+        assert_eq!(replies.len(), 1);
+        assert!(String::from_utf8_lossy(&replies[0]).contains("ENOTSUP"));
+        assert_eq!(terminal.diagnostics.counts.get("Kitty:X"), Some(&1));
+    }
+
+    #[test]
+    fn records_sixel_as_an_unsupported_streaming_dcs() {
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.advance(b"\x1bPq~\x1b\\");
+        assert_eq!(terminal.diagnostics.counts.get("DCS:q"), Some(&1));
+        assert!(terminal.snapshot().images.is_empty());
     }
 
     #[test]

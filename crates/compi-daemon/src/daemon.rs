@@ -7,29 +7,426 @@ use compi_protocol::identity::PipeSecurity;
 use compi_protocol::identity::{self, InstanceNames};
 use compi_protocol::pipe;
 use compi_protocol::{
-    CONTROL_FRAME, ClientMessage, ErrorCode, PROTOCOL_VERSION, RuntimeMetrics, ServerControl,
-    ServerMessage, SurfaceId, SurfaceStatus, TerminalTarget, decode_client,
+    CONTROL_FRAME, ClientMessage, ErrorCode, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES,
+    PROTOCOL_VERSION, RuntimeMetrics, ServerControl, ServerMessage, SurfaceId, SurfaceStatus,
+    TerminalTarget, UploadId, decode_client,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(windows)]
 use std::ffi::OsStr;
-use std::fs::File;
-#[cfg(windows)]
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::iter::once;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 #[cfg(windows)]
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+use windows::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
+    SetHandleInformation,
+};
 #[cfg(windows)]
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
+use windows::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, CreateMutexW, DETACHED_PROCESS, ReleaseMutex,
+};
 #[cfg(windows)]
 use windows::core::PCWSTR;
+
+const MAX_CONNECTION_UPLOADS: usize = 4;
+const REMOTE_IMAGE_STORE_BYTES: u64 = 512 * 1024 * 1024;
+const REMOTE_IMAGE_STORE_FILES: usize = 4096;
+static NEXT_UPLOAD: AtomicU64 = AtomicU64::new(1);
+static UPLOAD_STORE_LOCK: Mutex<()> = Mutex::new(());
+
+struct ImageUpload {
+    temporary: PathBuf,
+    file: Option<File>,
+    extension: String,
+    expected_bytes: u64,
+    expected_sha256: [u8; 32],
+    written: u64,
+    hasher: Sha256,
+}
+
+impl Drop for ImageUpload {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        let _ = std::fs::remove_file(&self.temporary);
+    }
+}
+
+pub fn relay_stdio(instance: Option<&str>) -> Result<()> {
+    #[cfg(windows)]
+    prevent_stdio_inheritance()?;
+    ensure_daemon(instance)?;
+    let names = identity::instance_names(instance)?;
+    let connection = Arc::new(pipe::connect(&names.pipe, Duration::from_secs(2))?);
+    let writer = connection.clone();
+    let (finished_tx, finished_rx) = mpsc::channel();
+
+    let input_finished = finished_tx.clone();
+    thread::spawn(move || {
+        let result = io::copy(&mut io::stdin().lock(), &mut &*writer).map(|_| ());
+        let _ = input_finished.send(result);
+    });
+    thread::spawn(move || {
+        let mut output = io::stdout().lock();
+        let mut buffer = [0_u8; 32 * 1024];
+        let result = loop {
+            match pipe::read_available(&connection, &mut buffer) {
+                Ok(Some(count)) => {
+                    if let Err(error) = output
+                        .write_all(&buffer[..count])
+                        .and_then(|()| output.flush())
+                    {
+                        break Err(error);
+                    }
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(2)),
+                Err(error) => {
+                    let kind = error
+                        .downcast_ref::<io::Error>()
+                        .map_or(io::ErrorKind::Other, io::Error::kind);
+                    break Err(io::Error::new(kind, error.to_string()));
+                }
+            }
+        };
+        let _ = finished_tx.send(result);
+    });
+
+    match finished_rx.recv()? {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn prevent_stdio_inheritance() -> Result<()> {
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(stream)? };
+        unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_daemon(instance: Option<&str>) -> Result<()> {
+    if compi_protocol::DaemonClient::connect(instance, Duration::from_millis(100)).is_ok() {
+        return Ok(());
+    }
+
+    let directory = compi_protocol::paths::data_dir()?;
+    std::fs::create_dir_all(&directory)?;
+    let suffix = instance.map(|name| format!("-{name}")).unwrap_or_default();
+    let log_path = directory.join(format!("daemon{suffix}.log"));
+    let log = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&log_path)?;
+    let log_error = log.try_clone()?;
+    let mut command = Command::new(std::env::current_exe()?);
+    if let Some(instance) = instance {
+        command.arg("--instance").arg(instance);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_error));
+    #[cfg(windows)]
+    command.creation_flags(DETACHED_PROCESS.0 | CREATE_NEW_PROCESS_GROUP.0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if compi_protocol::DaemonClient::connect(instance, Duration::from_millis(100)).is_ok() {
+            #[cfg(unix)]
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            #[cfg(windows)]
+            drop(child);
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "daemon exited with {status}; inspect {}",
+                log_path.display()
+            )
+            .into());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("daemon did not start; inspect {}", log_path.display()).into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn begin_image_upload(
+    name: &str,
+    expected_bytes: u64,
+    expected_sha256: [u8; 32],
+) -> Result<(UploadId, ImageUpload)> {
+    if expected_bytes == 0 || expected_bytes > MAX_IMAGE_UPLOAD_BYTES as u64 {
+        return Err(
+            format!("image upload must contain 1 through {MAX_IMAGE_UPLOAD_BYTES} bytes").into(),
+        );
+    }
+    let extension = upload_extension(name)?;
+    let root = upload_directory()?;
+    for _ in 0..16 {
+        let nonce = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
+        let upload_id = UploadId::new(format!("upload-{:x}-{nonce:x}", std::process::id()));
+        let temporary = root.join(format!(".{}.part", upload_id.as_str()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => {
+                return Ok((
+                    upload_id,
+                    ImageUpload {
+                        temporary,
+                        file: Some(file),
+                        extension,
+                        expected_bytes,
+                        expected_sha256,
+                        written: 0,
+                        hasher: Sha256::new(),
+                    },
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("could not allocate a unique image upload".into())
+}
+
+fn append_image_upload(upload: &mut ImageUpload, offset: u64, data: &[u8]) -> Result<u64> {
+    if data.is_empty() || data.len() > IMAGE_UPLOAD_CHUNK_BYTES {
+        return Err(format!(
+            "image upload chunks must contain 1 through {IMAGE_UPLOAD_CHUNK_BYTES} bytes"
+        )
+        .into());
+    }
+    if offset != upload.written {
+        return Err(format!(
+            "image upload offset mismatch: expected {}, got {offset}",
+            upload.written
+        )
+        .into());
+    }
+    let next = upload
+        .written
+        .checked_add(u64::try_from(data.len())?)
+        .filter(|next| *next <= upload.expected_bytes)
+        .ok_or("image upload exceeds its declared length")?;
+    upload
+        .file
+        .as_mut()
+        .ok_or("image upload is already finished")?
+        .write_all(data)?;
+    upload.hasher.update(data);
+    upload.written = next;
+    Ok(next)
+}
+
+fn finish_image_upload(mut upload: ImageUpload) -> Result<String> {
+    if upload.written != upload.expected_bytes {
+        return Err(format!(
+            "image upload is incomplete: expected {} bytes, received {}",
+            upload.expected_bytes, upload.written
+        )
+        .into());
+    }
+    upload
+        .file
+        .as_mut()
+        .ok_or("image upload is already finished")?
+        .sync_all()?;
+    upload.file.take();
+    let actual: [u8; 32] = std::mem::take(&mut upload.hasher).finalize().into();
+    if actual != upload.expected_sha256 {
+        return Err("image upload checksum does not match".into());
+    }
+    let root = upload
+        .temporary
+        .parent()
+        .ok_or("image upload has no storage directory")?;
+    let destination = root.join(format!("{}.{}", digest_hex(&actual), upload.extension));
+    let _store = UPLOAD_STORE_LOCK
+        .lock()
+        .map_err(|_| "remote image storage lock was poisoned")?;
+    match std::fs::symlink_metadata(&destination) {
+        Ok(_) => verify_image_file(&destination, upload.expected_bytes, &actual)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            ensure_upload_capacity(root, upload.expected_bytes)?;
+            match std::fs::hard_link(&upload.temporary, &destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    verify_image_file(&destination, upload.expected_bytes, &actual)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    File::open(root)?.sync_all()?;
+    destination
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "remote image path is not valid UTF-8".into())
+}
+
+fn upload_directory() -> Result<PathBuf> {
+    let data = compi_protocol::paths::data_dir()?;
+    std::fs::create_dir_all(&data)?;
+    let root = data.join("uploaded-images");
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err("remote image storage is not a directory".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir(&root)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&root)?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(
+                "remote image storage must be owned by the daemon user with mode 0700".into(),
+            );
+        }
+    }
+    Ok(root)
+}
+
+fn ensure_upload_capacity(root: &Path, incoming: u64) -> Result<()> {
+    let mut used = 0_u64;
+    let mut files = 0_usize;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() {
+            return Err("remote image storage contains an unexpected entry".into());
+        }
+        files = files.saturating_add(1);
+        used = used.saturating_add(metadata.len());
+    }
+    if files >= REMOTE_IMAGE_STORE_FILES || used.saturating_add(incoming) > REMOTE_IMAGE_STORE_BYTES
+    {
+        return Err(format!(
+            "remote image storage is full ({REMOTE_IMAGE_STORE_BYTES} bytes or {REMOTE_IMAGE_STORE_FILES} files)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn upload_extension(name: &str) -> Result<String> {
+    if name.is_empty()
+        || name.len() > 255
+        || name.chars().any(char::is_control)
+        || name.contains(['/', '\\'])
+    {
+        return Err("image upload name must be a plain file name of at most 255 bytes".into());
+    }
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or("image upload name requires a supported extension")?;
+    if !matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+    ) {
+        return Err("supported image upload formats are PNG, JPEG, WebP, GIF and BMP".into());
+    }
+    Ok(extension)
+}
+
+fn verify_image_file(path: &Path, expected_bytes: u64, expected_sha256: &[u8; 32]) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() != expected_bytes {
+        return Err("existing remote image does not match the uploaded content".into());
+    }
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual: [u8; 32] = hasher.finalize().into();
+    if &actual != expected_sha256 {
+        return Err("existing remote image checksum does not match".into());
+    }
+    Ok(())
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
 
 pub fn run(instance: Option<&str>) -> Result<()> {
     let started_at = Instant::now();
@@ -234,6 +631,7 @@ fn handle_connection(
 
     let mut attached: Option<Arc<Surface>> = None;
     let mut workspace_events = manager.subscribe();
+    let mut uploads = HashMap::<UploadId, ImageUpload>::new();
     let result = (|| -> Result<()> {
         while !stopping.load(Ordering::Acquire) && sink.is_alive() {
             send_workspace_events(&sink, &mut workspace_events, &manager)?;
@@ -417,6 +815,82 @@ fn handle_connection(
                     };
                     if let Err(error) = surface.clear_scrollback(target, request_id) {
                         send_surface_error(&sink, request_id, &error);
+                    }
+                }
+                ClientMessage::BeginImageUpload {
+                    name,
+                    byte_len,
+                    sha256,
+                } => {
+                    if uploads.len() >= MAX_CONNECTION_UPLOADS {
+                        send_error(
+                            &sink,
+                            Some(request_id),
+                            ErrorCode::Busy,
+                            "too many image uploads are active on this connection",
+                        );
+                        continue;
+                    }
+                    match begin_image_upload(&name, byte_len, sha256) {
+                        Ok((upload_id, upload)) => {
+                            uploads.insert(upload_id.clone(), upload);
+                            sink.send_control(&ServerControl {
+                                request_id: Some(request_id),
+                                message: ServerMessage::ImageUploadStarted { upload_id },
+                            })?;
+                        }
+                        Err(error) => send_error(
+                            &sink,
+                            Some(request_id),
+                            ErrorCode::InvalidRequest,
+                            &error.to_string(),
+                        ),
+                    }
+                }
+                ClientMessage::UploadImageChunk {
+                    upload_id,
+                    offset,
+                    data,
+                } => {
+                    let result = uploads
+                        .get_mut(&upload_id)
+                        .ok_or_else(|| "image upload does not exist".into())
+                        .and_then(|upload| append_image_upload(upload, offset, &data));
+                    match result {
+                        Ok(next_offset) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ImageUploadProgress {
+                                upload_id,
+                                next_offset,
+                            },
+                        })?,
+                        Err(error) => {
+                            uploads.remove(&upload_id);
+                            send_error(
+                                &sink,
+                                Some(request_id),
+                                ErrorCode::InvalidRequest,
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                }
+                ClientMessage::FinishImageUpload { upload_id } => {
+                    let result = uploads
+                        .remove(&upload_id)
+                        .ok_or_else(|| "image upload does not exist".into())
+                        .and_then(finish_image_upload);
+                    match result {
+                        Ok(path) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ImageUploaded { path },
+                        })?,
+                        Err(error) => send_error(
+                            &sink,
+                            Some(request_id),
+                            ErrorCode::InvalidRequest,
+                            &error.to_string(),
+                        ),
                     }
                 }
                 ClientMessage::ShutdownDaemon => {

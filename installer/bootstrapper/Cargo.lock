@@ -803,6 +803,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "smol_str",
  "windows 0.62.2",
 ]

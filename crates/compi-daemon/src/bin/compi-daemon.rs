@@ -14,6 +14,14 @@ fn run() -> compi_daemon::Result<()> {
         [flag, instance] if flag == "--instance" && !instance.is_empty() => {
             compi_daemon::daemon::run(Some(instance))
         }
+        [flag] if flag == "--server-stdio" => compi_daemon::daemon::relay_stdio(None),
+        [flag, instance_flag, instance]
+            if flag == "--server-stdio"
+                && instance_flag == "--instance"
+                && !instance.is_empty() =>
+        {
+            compi_daemon::daemon::relay_stdio(Some(instance))
+        }
         [flag] if flag == "--check-system" => compi_daemon::launch::check_system(),
         [flag] if flag == "--shutdown" => shutdown_daemon(),
         #[cfg(windows)]
@@ -47,10 +55,13 @@ fn run() -> compi_daemon::Result<()> {
         #[cfg(windows)]
         [flag] if flag == "--activate-task" => compi_daemon::supervisor::activate(),
         #[cfg(unix)]
-        _ => Err("usage: compi-daemon [--instance <name> | --check-system | --shutdown]".into()),
+        _ => Err(
+            "usage: compi-daemon [--instance <name> | --server-stdio [--instance <name>] | --check-system | --shutdown]"
+                .into(),
+        ),
         #[cfg(windows)]
         _ => Err(
-            "usage: compi-daemon [--instance <name> | --check-system | --shutdown | --supervise | --install-task | --uninstall-task | --activate-task | --write-task-xml <path> <user-sid> | --remove-task-xml <path>]"
+            "usage: compi-daemon [--instance <name> | --server-stdio [--instance <name>] | --check-system | --shutdown | --supervise | --install-task | --uninstall-task | --activate-task | --write-task-xml <path> <user-sid> | --remove-task-xml <path>]"
                 .into(),
         ),
     }

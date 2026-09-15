@@ -26,9 +26,9 @@ Compi client  ⇄  Compi server  ⇄  shells and PTYs
  native UI        persistent        your work
 ```
 
-### Can the server run anywhere?
+### Can the server run remotely?
 
-Not yet. Compi already has a real client/server architecture, and the server runs headlessly on macOS, Linux, and Windows. Today, however, a Compi client connects to a per-user server on the same machine. Remote transport, discovery, authentication, and tunneling are not currently shipped.
+Yes. `compi --connect [user@]host[:port]` starts an OpenSSH stdio relay to `compi-daemon --server-stdio` on a host where the matching Compi daemon is installed. Compi opens no network listener and stores no SSH credentials; OpenSSH owns authentication, host keys, and tunneling. Automatic discovery, cloud relays, and cross-machine workspace synchronization are not shipped.
 
 ## Platform status
 
@@ -89,6 +89,14 @@ Run on Windows:
 ```
 
 Compi starts its sibling server automatically. Relaunch with the same instance name to reconnect to the existing workspace. Use `--working-directory PATH` when you intentionally want new work to start in a specific directory.
+
+To open the native client against an SSH host:
+
+```sh
+compi --connect dev@example.com:2222
+```
+
+The headless diagnostic client accepts the same `--connect` and optional `--instance` options. For example, `compi-probe --connect dev@example.com workspace` prints the remote hierarchy and lifecycle state, while its session, tab, pane, surface, soak, and shutdown commands operate through the same protocol. The remote host must provide `compi-daemon` on `PATH`.
 
 ## Test
 

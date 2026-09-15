@@ -375,19 +375,21 @@ Profiles resolve into host-specific executable, argv, cwd, and environment data 
 
 ### Transport
 
-Expose a small listener/stream boundary with OS-local implementations:
+Expose a small stream boundary with three transports:
 
 - Unix-domain sockets on macOS/Linux.
 - Current-user-restricted named pipes on native Windows.
+- An SSH stdio relay started as `ssh -T ... compi-daemon --server-stdio`; authentication, host-key policy, and tunneling remain OpenSSH responsibilities.
 
-An existing local-socket library may provide the mechanical plumbing, but security and lifecycle behavior must be verified on each OS. A common API does not establish authorization by itself.
+An existing local-socket library may provide mechanical plumbing, but security and lifecycle behavior must be verified on each OS. A common API does not establish authorization by itself.
 
-- Restrict endpoints to the current user through permissions/ACLs and applicable platform peer checks.
-- Store endpoints in private, platform-appropriate locations.
+- Restrict local endpoints to the current user through permissions/ACLs and applicable platform peer checks.
+- Store local endpoints in private, platform-appropriate locations.
 - Enforce one server per user and instance with race-safe ownership.
 - Recover stale endpoints only after confirming the previous owner is absent.
-- Baseline local operation does not open a network listener.
-- TCP, remote discovery, authentication, and tunneling are separate scope. Loopback is not treated as inherently authenticated.
+- Remote targets use `[user@]host[:port]`, batch mode, a bounded connection timeout, and the remote host's own instance namespace and private storage.
+- Baseline operation opens no Compi network listener, stores no SSH credentials, and never treats a remote relay as a local peer.
+- TCP listeners, automatic remote discovery, cloud relays, and cross-machine workspace synchronization remain separate scope. Loopback is not treated as inherently authenticated.
 
 ### Wire contract
 
@@ -454,9 +456,15 @@ Escape sequences are untrusted process output. Hyperlink opening validates schem
 - Each surface admits at most 64 MiB of retained base64 image data and pending-transfer reservations. Individual decoded images and each visible pane's decoded cache are bounded to 64 MiB. A raw 3840×2160 RGBA image is 31.64 MiB and occupies 42.19 MiB as retained base64.
 - Capacity pressure may reclaim unreferenced images, never pixels referenced by retained placements. Rejected transfers return Kitty errors without replacing previously committed pixels or placements. Immutable payloads are shared between snapshots; placement-only updates do not retransmit image pixels.
 - Decoded images are requested only for visible placements. Offscreen cache entries and their native sprite-atlas textures are released independently of authoritative image retention. Saturated decode queues retry without requiring reconnection.
-- Protocol 11 retains protocol 10's bounded screen frames up to 128 MiB and the 1 MiB control-frame limit, and adds an on-demand daemon runtime-metrics response. Writer budgets include in-flight data; queued recovery and client pending-screen backlogs remain bounded. Polling drains at most 1 MiB of available data per call instead of throttling a large frame at one 32 KiB read per polling interval.
-- Main-screen image anchors follow scrolling into retained history; expired history anchors are removed. Resize preserves pixel data and grid coordinates/extents while text reflows. Image-aware logical-line reanchoring is not implemented; this is not a claim of full graphics reflow or Kitty/sixel parity.
+- Protocol 12 retains protocol 11's bounded screen frames up to 128 MiB, 1 MiB control-frame limit, and on-demand runtime metrics. It adds remote image uploads with a 64 MiB per-image limit, 256 KiB chunks, at most four active uploads per connection, exact offsets, SHA-256 verification, and disconnect cleanup. Uploaded images enter a private, content-addressed store capped at 512 MiB and 4096 files. Writer budgets include in-flight data; queued recovery and client pending-screen backlogs remain bounded. Polling drains at most 1 MiB of available data per call.
+- Main-screen image anchors follow scrolling into retained history and logical-line text through width-changing reflow; expired history anchors are removed. Alternate-screen placements retain grid-relative resize behavior. Reflow preserves image payloads and placement extents.
 - These are per-surface, per-cache and per-connection bounds, not a daemon-wide memory ceiling. Many retained surfaces, transfer buffers, frame serialization and GPU allocations require separate resource qualification.
+
+### Graphics protocol coverage
+
+- Required Kitty support is APC `G` direct transmission for raw RGB (`f=24`), raw RGBA (`f=32`), and PNG (`f=100`), including chunking, zlib compression, transmit/place/query/delete actions, image and placement IDs, row/column extents, z-order, clipping, scrolling, history, reflow, and reattachment.
+- Kitty file, temporary-file, and shared-memory transmission; animation; Unicode placeholders; source rectangles; pixel offsets; virtual placements; and composition are outside the baseline. Unknown controls and actions are rejected with a Kitty `ENOTSUP` response and a rate-limited diagnostic rather than accepted silently.
+- Sixel rendering is deferred because current qualification provides no product requirement for it. Sixel DCS payloads are consumed without rendering and recorded as an unsupported `DCS:q` diagnostic. Adding sixel requires bounded decoding, retention, reflow, rendering, and reconnect coverage equivalent to the required Kitty path.
 
 
 ### Native rendering
@@ -552,10 +560,10 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 ### Image input and inspection
 
 - Image paste and file drop are input operations, separate from applications emitting Kitty graphics. PNG, JPEG, WebP, GIF first-frame and BMP input is validated and decoded on bounded background workers.
-- Windows/WSL resolves readable file paths through the selected distribution; macOS uses native paths. The terminal receives one properly quoted path, with no automatic execution/newline. Prepared input is rejected if its target surface, process lifetime or server generation changed.
-- Clipboard originals are stored privately under `clipboard-images` using content-addressed names. The managed store admits at most 512 MiB/4096 files; it does not delete files when a preview or window closes. Standard Windows DIB/DIBV5 bitmap clipboard formats are supported alongside encoded image formats.
+- Windows/WSL resolves readable local file paths through the selected distribution; macOS uses native paths. For an SSH target, the client uploads the original bytes through the bounded daemon protocol and receives an absolute remote POSIX path. The terminal receives one properly quoted path, with no automatic execution/newline. Prepared input is rejected if its target surface, process lifetime or server generation changed.
+- Local clipboard originals are stored privately under `clipboard-images` using content-addressed names. The local and remote managed stores each admit at most 512 MiB/4096 files; they do not delete files when a preview or window closes. Standard Windows DIB/DIBV5 bitmap clipboard formats are supported alongside encoded image formats.
 - A compact, dismissible thumbnail shows filename, dimensions and size outside the terminal grid. Inspection loads the full image on demand and supports fit, zoom, pan, copy and a native Save dialog. Dismissing a preview never edits the shell line or deletes its source file.
-- Input files are bounded to 64 MiB encoded data, 8192 pixels per side and the decoded-memory limit. Remote uploads and application-specific attachment protocols are not implemented in this local-input slice.
+- Input files and remote uploads are bounded to 64 MiB encoded data, 8192 pixels per side and the decoded-memory limit. Application-specific attachment protocols remain outside the baseline.
 
 
 ## Configuration and appearance
@@ -612,7 +620,7 @@ Use restrained spacing, readable labels, real icons, horizontal peer actions, vi
 
 - A source checkout on Mac or Windows must build and run without an installer or registration step.
 - Windows requires the pinned Microsoft ConPTY/OpenConsole runtime pair beside the daemon. Source preparation is documented in README and automated in Windows packaging/CI. The stock runtime is not a fallback: native tracing showed it discarding Kitty APC output. Creation, resize and close use matching runtime APIs while preserving suspended-before-job-before-resume process ownership.
-- Client/daemon protocol 10 and GUI launch handoff version 2 reject older incompatible binaries. Upgrades must not silently terminate existing work; close older clients and deliberately restart an older daemon only after accounting for its live processes.
+- Client/daemon protocol 12 and GUI launch handoff version 2 reject older incompatible binaries. Upgrades must not silently terminate existing work; close older clients and deliberately restart an older daemon only after accounting for its live processes.
 - The client discovers the current user's server and starts it when absent, using race-safe startup and a bounded readiness handshake.
 - Auto-started server lifetime is independent of the launching client.
 - Existing platform supervision may be reused, but registration is optional for development and never required by domain logic.
@@ -659,6 +667,10 @@ Set numeric release budgets from measured platform baselines and explicitly revi
 ### Headless tools
 
 Retain `compi-probe` as a diagnostic target, backed by the normal protocol. It must inspect workspace structure, list surfaces and lifecycle state, exercise isolated launches, attach to screen state, resize, and request explicit termination without GPUI.
+
+`compi-probe --connect [user@]host[:port]` applies the same workspace, hierarchy, attach, inspect, resize, restart, end, soak, and shutdown commands through the SSH transport. Its `workspace` JSON is the authoritative process-discovery surface: stable hierarchy IDs, surface and lifetime IDs, labels, lifecycle state, attachment state, dimensions, and errors.
+
+Agent-specific discovery remains a narrow future extension, not process inference. Add optional non-secret launch metadata only when a concrete agent consumer defines the required identifier and kind. Keep memory, credentials, steering, provider state, and orchestration outside the process protocol.
 
 Diagnostic traces are opt-in and bounded. They can contain sensitive terminal output, must remain local by default, and must never be silently uploaded. Workspace metadata is not a substitute for a terminal trace.
 
@@ -855,16 +867,17 @@ Done when the owner can work on Compi using Compi on either primary machine. A W
 
 ### 6. Qualify distribution and extend process use
 
-- Finish platform packaging, signing/notarization, upgrade, repair, and clean-machine qualification.
-- Add agent discovery metadata and polished headless workflows using the same launch, workspace, and lifecycle contracts.
+- Finish platform signing/notarization, version-to-version upgrade, and clean-machine qualification.
+- Keep the local and SSH `compi-probe` workflows on the same launch, workspace, and lifecycle contracts.
+- Add optional agent discovery metadata only for a concrete consumer; do not infer agents from commands or process names.
 - Keep process hosting separate from agent memory, credentials, steering, and orchestration.
 
-The launch API is generic from the beginning. An agent is a process in a surface, not a different server architecture.
+The launch API is generic. An agent is a process in a surface, not a different server architecture.
 
 ## Explicitly outside this baseline
 
 - Process resurrection after server death, reboot, or runtime termination.
-- Remote SSH hosts, network listeners, cloud accounts, relays, and cross-machine workspace synchronization.
+- Compi-owned network listeners, automatic remote discovery, cloud accounts/relays, and cross-machine workspace synchronization.
 - Shared multi-user workspaces or simultaneous controlling clients on one surface.
 - Arbitrary dock frameworks, floating tool panels, and non-terminal pane applications.
 - A web client, phone client, plugin runtime, or React/Bun/gpuix migration.
