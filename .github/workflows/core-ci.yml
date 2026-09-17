@@ -26,7 +26,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
-      COMPI_TERMINAL_TRACE_DIR: ${{ runner.temp }}/compi-terminal-traces
+      COMPI_TERMINAL_TRACE_DIR: target/compi-terminal-traces
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -88,7 +88,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: terminal-traces-${{ matrix.os }}
-          path: ${{ runner.temp }}/compi-terminal-traces
+          path: target/compi-terminal-traces
           if-no-files-found: ignore
 
   mac-client:
