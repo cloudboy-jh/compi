@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(windows)]
 use std::iter::once;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;

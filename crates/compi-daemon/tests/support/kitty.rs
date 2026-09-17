@@ -3,12 +3,10 @@ use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write;
 use std::path::Path;
 
-pub fn write_4k_transfer(path: &Path) -> String {
-    // The decoded 3840 × 2160 RGBA image is 33,177,600 bytes and its retained
-    // replica payload is 44,236,800 bytes. Compress the repetitive fixture on
-    // the PTY path so hosted debug builds exercise the large retained frame
-    // without spending their timeout parsing 42 MiB of redundant base64.
-    let pixels = vec![0x5a; 3840 * 2160 * 4];
+pub fn write_transfer(path: &Path, width: u32, height: u32) -> String {
+    // Compress the repetitive fixture on the PTY path so tests exercise the
+    // retained image frame rather than spend their timeout parsing base64.
+    let pixels = vec![0x5a; width as usize * height as usize * 4];
     let expected = STANDARD.encode(&pixels);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&pixels).unwrap();
@@ -21,7 +19,7 @@ pub fn write_4k_transfer(path: &Path) -> String {
         if index == 0 {
             write!(
                 file,
-                "\x1b_Ga=T,f=32,s=3840,v=2160,i=42,p=7,c=8,r=4,z=-1,o=z,m=1;"
+                "\x1b_Ga=T,f=32,s={width},v={height},i=42,p=7,c=8,r=4,z=-1,o=z,m=1;"
             )
             .unwrap();
         } else {

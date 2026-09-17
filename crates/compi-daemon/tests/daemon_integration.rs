@@ -150,7 +150,7 @@ fn kitty_4k_payload_and_placement_survive_detach_and_reconnect() {
     let mut daemon = DaemonGuard::start();
     let directory = std::env::temp_dir().join(format!("compi-kitty-{}", daemon.instance));
     fs::create_dir_all(&directory).unwrap();
-    let encoded = kitty::write_4k_transfer(&directory.join("kitty-transfer"));
+    let encoded = kitty::write_transfer(&directory.join("kitty-transfer"), 3840, 2160);
     let mut control = daemon.client();
     let surface = control
         .create_surface(80, 24, Some(directory.to_string_lossy().into_owned()))

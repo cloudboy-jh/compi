@@ -22,6 +22,12 @@ static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
 const TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Keep the macOS debug fixture above ordinary socket buffers without making
+// every CI run serialize a 44 MiB frame. Linux and Windows retain 4K coverage.
+#[cfg(target_os = "macos")]
+const KITTY_TRANSFER_DIMENSIONS: (u32, u32) = (1024, 768);
+#[cfg(not(target_os = "macos"))]
+const KITTY_TRANSFER_DIMENSIONS: (u32, u32) = (3840, 2160);
 
 struct DaemonGuard {
     child: Child,
@@ -312,9 +318,10 @@ fn wait_status(client: &mut DaemonClient, id: &SurfaceId, expected: SurfaceStatu
 }
 
 #[test]
-fn kitty_4k_payload_and_placement_survive_detach_and_reconnect() {
+fn kitty_payload_and_placement_survive_detach_and_reconnect() {
     let mut daemon = DaemonGuard::start();
-    let encoded = kitty::write_4k_transfer(&daemon.directory.join("kitty-transfer"));
+    let (width, height) = KITTY_TRANSFER_DIMENSIONS;
+    let encoded = kitty::write_transfer(&daemon.directory.join("kitty-transfer"), width, height);
     let mut control = daemon.client();
     let surface = control
         .create_surface(
@@ -329,11 +336,11 @@ fn kitty_4k_payload_and_placement_survive_detach_and_reconnect() {
     assert_eq!(before.images.len(), 1);
     assert!(
         before.images[0].data.as_ref() == encoded,
-        "transmitted 4K payload changed"
+        "transmitted Kitty payload changed"
     );
     assert_eq!(
         (before.images[0].width, before.images[0].height),
-        (3840, 2160)
+        (width, height)
     );
     assert_eq!(before.placements.len(), 1);
     assert_eq!(before.placements[0].image_id, 42);
