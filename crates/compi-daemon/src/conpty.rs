@@ -477,7 +477,9 @@ mod tests {
                 }
             }
         });
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // This deadline detects a hung launcher, not PowerShell startup latency.
+        // Cold hosted Windows runners can take longer than 20 seconds here.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut bytes = Vec::new();
         let descendant = loop {
             bytes.extend(
