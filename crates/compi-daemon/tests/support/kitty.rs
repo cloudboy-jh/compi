@@ -16,14 +16,15 @@ pub fn write_transfer(path: &Path, width: u32, height: u32) -> String {
     let chunks = encoded.as_bytes().chunks(4096);
     let count = chunks.len();
     for (index, chunk) in chunks.enumerate() {
+        let more = u8::from(index + 1 < count);
         if index == 0 {
             write!(
                 file,
-                "\x1b_Ga=T,f=32,s={width},v={height},i=42,p=7,c=8,r=4,z=-1,o=z,m=1;"
+                "\x1b_Ga=T,f=32,s={width},v={height},i=42,p=7,c=8,r=4,z=-1,o=z,m={more};"
             )
             .unwrap();
         } else {
-            write!(file, "\x1b_Gm={};", u8::from(index + 1 < count)).unwrap();
+            write!(file, "\x1b_Gm={more};").unwrap();
         }
         file.write_all(chunk).unwrap();
         file.write_all(b"\x1b\\").unwrap();
