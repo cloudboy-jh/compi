@@ -25,8 +25,6 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    env:
-      COMPI_TERMINAL_TRACE_DIR: target/compi-terminal-traces
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -72,10 +70,14 @@ jobs:
           cargo build --locked -p compi-daemon --bin compi-daemon
           cargo build --locked -p compi-client --example compi-probe
       - name: Run real Unix PTY and persistent daemon regressions
+        env:
+          COMPI_TERMINAL_TRACE_DIR: ${{ runner.temp }}/compi-terminal-traces
         if: runner.os != 'Windows'
         run: cargo test --locked -p compi-daemon --test unix_daemon_integration
       - name: Run Windows daemon regressions
         if: runner.os == 'Windows'
+        env:
+          COMPI_TERMINAL_TRACE_DIR: ${{ runner.temp }}/compi-terminal-traces
         shell: pwsh
         run: |
           cargo test --locked -p compi-daemon --test daemon_integration
@@ -88,7 +90,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: terminal-traces-${{ matrix.os }}
-          path: target/compi-terminal-traces
+          path: ${{ runner.temp }}/compi-terminal-traces
           if-no-files-found: ignore
 
   mac-client:

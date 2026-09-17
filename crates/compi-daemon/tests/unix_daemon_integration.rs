@@ -233,19 +233,39 @@ impl Controller {
     }
 
     fn until(&mut self, marker: &str) -> ScreenSnapshot {
+        self.until_matching(&format!("{marker:?}"), |snapshot| {
+            snapshot_text(snapshot).contains(marker)
+        })
+    }
+
+    fn until_marker_and_image(&mut self, marker: &str, image_id: u32) -> ScreenSnapshot {
+        self.until_matching(
+            &format!("{marker:?} and Kitty image {image_id}"),
+            |snapshot| {
+                snapshot_text(snapshot).contains(marker)
+                    && snapshot.images.iter().any(|image| image.id == image_id)
+            },
+        )
+    }
+
+    fn until_matching(
+        &mut self,
+        description: &str,
+        ready: impl Fn(&ScreenSnapshot) -> bool,
+    ) -> ScreenSnapshot {
         let started = Instant::now();
         let deadline = started + TIMEOUT;
         loop {
-            // A previous wait may already have consumed the frame containing
-            // this marker. Check the replica even when no new event arrives.
+            // A previous wait may already have consumed the frame satisfying
+            // this condition. Check the replica even when no new event arrives.
             if let Some(snapshot) = self.mirror.snapshot()
-                && snapshot_text(snapshot).contains(marker)
+                && ready(snapshot)
             {
                 return snapshot.clone();
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out after {:?} waiting for {marker:?}; last screen: {:?}",
+                "timed out after {:?} waiting for {description}; last screen: {:?}",
                 started.elapsed(),
                 self.mirror.snapshot().map(snapshot_text)
             );
@@ -254,7 +274,7 @@ impl Controller {
             } else {
                 self.client.poll_event().unwrap_or_else(|error| {
                     panic!(
-                        "waiting for {marker:?} failed after {:?}: {error}; last screen: {:?}",
+                        "waiting for {description} failed after {:?}: {error}; last screen: {:?}",
                         started.elapsed(),
                         self.mirror.snapshot().map(snapshot_text)
                     )
@@ -271,7 +291,7 @@ impl Controller {
                     ..
                 }) => {
                     panic!(
-                        "waiting for {marker:?} after {:?}: daemon error {code:?}: {message}",
+                        "waiting for {description} after {:?}: daemon error {code:?}: {message}",
                         started.elapsed()
                     );
                 }
@@ -332,7 +352,7 @@ fn kitty_payload_and_placement_survive_detach_and_reconnect() {
         .unwrap();
     let mut attached = Controller::attach(&daemon, &surface, 80, 24);
     attached.input(b"cat kitty-transfer\r");
-    let before = attached.until("KITTY_READY_42");
+    let before = attached.until_marker_and_image("KITTY_READY_42", 42);
     assert_eq!(before.images.len(), 1);
     assert!(
         before.images[0].data.as_ref() == encoded,
@@ -348,7 +368,7 @@ fn kitty_payload_and_placement_survive_detach_and_reconnect() {
     attached.client.request(ClientMessage::Detach).unwrap();
     drop(attached);
     let mut reattached = Controller::attach(&daemon, &surface, 80, 24);
-    let after = reattached.until("KITTY_READY_42");
+    let after = reattached.until_marker_and_image("KITTY_READY_42", 42);
     assert!(
         after.images == before.images,
         "reattach changed image payload or identity"
