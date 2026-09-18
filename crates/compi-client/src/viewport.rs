@@ -52,6 +52,61 @@ pub fn hyperlink_at(snapshot: Option<&ScreenSnapshot>, point: GridPoint) -> Opti
         .as_deref()
 }
 
+pub fn web_link_at(snapshot: Option<&ScreenSnapshot>, point: GridPoint) -> Option<String> {
+    let snapshot = snapshot?;
+    if let Some(uri) = hyperlink_at(Some(snapshot), point).filter(|uri| is_allowed_hyperlink(uri)) {
+        return Some(uri.to_owned());
+    }
+
+    let row_count = snapshot.scrollback.len() + snapshot.cells.len();
+    if point.row >= row_count {
+        return None;
+    }
+    let mut first_row = point.row;
+    while first_row > 0 && row_at(snapshot, first_row - 1).is_some_and(|row| row.wrapped) {
+        first_row -= 1;
+    }
+    let mut last_row = point.row;
+    while last_row + 1 < row_count && row_at(snapshot, last_row).is_some_and(|row| row.wrapped) {
+        last_row += 1;
+    }
+
+    let mut line = String::new();
+    let mut clicked = None;
+    for row_index in first_row..=last_row {
+        let row = row_at(snapshot, row_index)?;
+        for (col, cell) in row.cells.iter().enumerate() {
+            if cell.width == 0 {
+                continue;
+            }
+            let start = line.len();
+            line.push_str(&cell.text);
+            if row_index == point.row && col == point.col {
+                clicked = Some(start..line.len());
+            }
+        }
+    }
+
+    let clicked = clicked?;
+    let token_start = line[..clicked.start]
+        .rfind(char::is_whitespace)
+        .map_or(0, |index| index + 1);
+    let token_end = line[clicked.end..]
+        .find(char::is_whitespace)
+        .map_or(line.len(), |index| clicked.end + index);
+    let token = &line[token_start..token_end];
+    let lowercase = token.to_ascii_lowercase();
+    let scheme_start = lowercase
+        .find("https://")
+        .or_else(|| lowercase.find("http://"))?;
+    let candidate = token[scheme_start..]
+        .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"']);
+    let link_start = token_start + scheme_start;
+    let link_end = link_start + candidate.len();
+    (clicked.start >= link_start && clicked.start < link_end && is_allowed_hyperlink(candidate))
+        .then(|| candidate.to_owned())
+}
+
 pub fn is_allowed_hyperlink(uri: &str) -> bool {
     if uri
         .chars()
@@ -84,5 +139,51 @@ mod tests {
         assert!(!is_allowed_hyperlink("javascript:alert(1)"));
         assert!(!is_allowed_hyperlink("https:///missing-host"));
         assert!(!is_allowed_hyperlink("https://example.com/\nheader"));
+    }
+
+    fn row(text: &str, wrapped: bool) -> Row {
+        Row {
+            cells: text
+                .chars()
+                .map(|character| compi_protocol::Cell {
+                    text: character.to_string().into(),
+                    ..Default::default()
+                })
+                .collect(),
+            wrapped,
+        }
+    }
+
+    fn snapshot(rows: Vec<Row>) -> ScreenSnapshot {
+        ScreenSnapshot {
+            sequence: 1,
+            cols: rows.first().map_or(0, |row| row.cells.len()) as u16,
+            rows: rows.len() as u16,
+            cells: rows,
+            scrollback: Vec::new(),
+            cursor: Default::default(),
+            modes: Default::default(),
+            title: String::new(),
+            current_directory: None,
+            images: Vec::new(),
+            placements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detects_plain_web_links_across_wrapped_rows() {
+        let snapshot = snapshot(vec![
+            row("Sign in: https://exam", true),
+            row("ple.com/oauth?a=1).", false),
+        ]);
+        assert_eq!(
+            web_link_at(Some(&snapshot), GridPoint { row: 0, col: 12 }).as_deref(),
+            Some("https://example.com/oauth?a=1")
+        );
+        assert_eq!(
+            web_link_at(Some(&snapshot), GridPoint { row: 1, col: 5 }).as_deref(),
+            Some("https://example.com/oauth?a=1")
+        );
+        assert!(web_link_at(Some(&snapshot), GridPoint { row: 0, col: 2 }).is_none());
     }
 }

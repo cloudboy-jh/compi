@@ -19,8 +19,7 @@ mod brand;
 mod workspace;
 use crate::typography::TerminalTypography;
 use crate::viewport::{
-    hyperlink_at, inherited_working_directory, is_allowed_hyperlink, visible_row, visible_rows,
-    visible_to_absolute,
+    inherited_working_directory, visible_row, visible_rows, visible_to_absolute, web_link_at,
 };
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use base64::Engine as _;
@@ -1008,8 +1007,8 @@ impl CompiApp {
             event.button,
             event.modifiers,
             visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
-                .and_then(|point| hyperlink_at(tab.mirror.snapshot(), point))
-                .is_some_and(is_allowed_hyperlink),
+                .and_then(|point| web_link_at(tab.mirror.snapshot(), point))
+                .is_some(),
         );
         if Self::terminal_owns_mouse(mouse_mode, event.modifiers, activates_hyperlink) {
             if let Some(data) = encode_mouse(
@@ -1107,8 +1106,8 @@ impl CompiApp {
             event.button,
             event.modifiers,
             visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
-                .and_then(|point| hyperlink_at(tab.mirror.snapshot(), point))
-                .is_some_and(is_allowed_hyperlink),
+                .and_then(|point| web_link_at(tab.mirror.snapshot(), point))
+                .is_some(),
         );
         if Self::terminal_owns_mouse(mouse_mode, event.modifiers, activates_hyperlink) {
             if let Some(data) = encode_mouse(
@@ -1131,10 +1130,8 @@ impl CompiApp {
             {
                 tab.selection = None;
                 (event.button == MouseButton::Left && event.modifiers.secondary())
-                    .then(|| hyperlink_at(tab.mirror.snapshot(), selection.head))
+                    .then(|| web_link_at(tab.mirror.snapshot(), selection.head))
                     .flatten()
-                    .filter(|uri| is_allowed_hyperlink(uri))
-                    .map(str::to_owned)
             } else {
                 None
             };

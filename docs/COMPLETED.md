@@ -7,6 +7,11 @@ This file records completed implementation and dated verification evidence. Unfi
 - The current source checkpoint completes bounded SSH transport, remote image paste/drop, image-aware logical reflow, explicit graphics protocol coverage, remote headless workflows, and current Windows release packaging.
 - Final focused verification passed 135 protocol/client/daemon tests, current release compilation and WiX validation, portable native launch/reconnect, and the headless local lifecycle. A deterministic SSH process stand-in proved successful multi-connection/reconnect behavior, while actual OpenSSH surfaced its connection-refused failure cleanly. Real-host SSH qualification, physical Windows interactions, native Mac qualification, credentialed signing/notarization, version-to-version upgrade, and a final tag workflow remain in `NEXT_STEPS.md`.
 
+### Plain terminal link activation — 2026-09-17
+
+- Ctrl/Cmd-click now opens validated `http://` and `https://` links printed as ordinary terminal text, including URLs split by terminal wrapping. Explicit OSC 8 links remain supported, non-web schemes remain blocked, and link activation still overrides application mouse reporting.
+- Focused plain-link, hyperlink-routing, and scheme-validation tests passed. The optimized Windows client built and launched from the isolated personal installation; automated physical pointer activation was unavailable in the current harness.
+
 ### Bundled terminal font settings — 2026-09-17
 
 - Added build-time validated System monospace, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono presets beside the independent interface-font catalog. The normal, bold, and italic faces used by the terminal are embedded from the pinned Google Fonts revision with checksums, copyright notices, and SIL Open Font License 1.1 text.
