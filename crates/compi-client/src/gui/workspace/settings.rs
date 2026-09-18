@@ -9,6 +9,8 @@ enum SettingsAction {
     Background(BackgroundEffect),
     Opacity(f32),
     ResetWindowAppearance,
+    UiFont(UiFontPreset),
+    TerminalFont(TerminalFontPreset),
     ResetSidebar,
     ResetLayout,
     Zoom(Command),
@@ -43,8 +45,8 @@ impl CompiApp {
                     6
                 }
             }
-            SettingsSection::Interface => 2,
-            SettingsSection::Terminal => 4,
+            SettingsSection::Interface => UiFontPreset::ALL.len() + 2,
+            SettingsSection::Terminal => TerminalFontPreset::ALL.len() + 4,
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
             SettingsSection::Advanced => 4,
@@ -65,18 +67,26 @@ impl CompiApp {
                 }
                 _ => None,
             },
-            SettingsSection::Interface => match offset {
-                0 => Some(SettingsAction::ResetSidebar),
-                1 => Some(SettingsAction::ResetLayout),
-                _ => None,
-            },
-            SettingsSection::Terminal => match offset {
-                0 => Some(SettingsAction::Zoom(Command::ZoomOut)),
-                1 => Some(SettingsAction::Zoom(Command::ZoomReset)),
-                2 => Some(SettingsAction::Zoom(Command::ZoomIn)),
-                3 => Some(SettingsAction::OpenConfiguration),
-                _ => None,
-            },
+            SettingsSection::Interface => UiFontPreset::ALL
+                .get(offset)
+                .copied()
+                .map(SettingsAction::UiFont)
+                .or_else(|| match offset - UiFontPreset::ALL.len() {
+                    0 => Some(SettingsAction::ResetSidebar),
+                    1 => Some(SettingsAction::ResetLayout),
+                    _ => None,
+                }),
+            SettingsSection::Terminal => TerminalFontPreset::ALL
+                .get(offset)
+                .copied()
+                .map(SettingsAction::TerminalFont)
+                .or_else(|| match offset - TerminalFontPreset::ALL.len() {
+                    0 => Some(SettingsAction::Zoom(Command::ZoomOut)),
+                    1 => Some(SettingsAction::Zoom(Command::ZoomReset)),
+                    2 => Some(SettingsAction::Zoom(Command::ZoomIn)),
+                    3 => Some(SettingsAction::OpenConfiguration),
+                    _ => None,
+                }),
             SettingsSection::Keyboard => match offset {
                 0 => Some(SettingsAction::OpenPalette),
                 1 => Some(SettingsAction::OpenConfiguration),
@@ -214,6 +224,8 @@ impl CompiApp {
             }
             SettingsAction::Opacity(delta) => self.adjust_opacity(delta, window, cx),
             SettingsAction::ResetWindowAppearance => self.reset_window_appearance(window),
+            SettingsAction::UiFont(preset) => self.apply_ui_font(preset, window, cx),
+            SettingsAction::TerminalFont(preset) => self.apply_terminal_font(preset, window, cx),
             SettingsAction::ResetSidebar => self.execute(Command::ResetSidebarWidth, window, cx),
             SettingsAction::ResetLayout => self.execute(Command::ResetClientLayout, window, cx),
             SettingsAction::Zoom(command) => self.execute(command, window, cx),
@@ -240,6 +252,46 @@ impl CompiApp {
             crate::config::MAX_TERMINAL_OPACITY,
         );
         self.apply_scoped_appearance(appearance, window, cx);
+    }
+
+    fn apply_ui_font(&mut self, preset: UiFontPreset, window: &Window, cx: &mut Context<Self>) {
+        if self.config.ui_font == preset {
+            return;
+        }
+        if let Err(error) = self.config.save_ui_font(preset) {
+            self.global_error = Some(error);
+            return;
+        }
+        self.ui_font = crate::font_catalog::resolve_ui_font(preset, window.text_system());
+        self.broadcast_global_appearance(window, cx);
+        cx.notify();
+    }
+
+    fn apply_terminal_font(
+        &mut self,
+        preset: TerminalFontPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .config
+            .configured_font
+            .family
+            .eq_ignore_ascii_case(preset.family())
+        {
+            return;
+        }
+        if let Err(error) = self.config.save_terminal_font(preset) {
+            self.global_error = Some(error);
+            return;
+        }
+        self.font_settings = self.config.font.clone();
+        self.typography_scale = 0.0;
+        if self.refresh_typography(window) {
+            self.rebuild_layout(window, true);
+        }
+        self.broadcast_global_appearance(window, cx);
+        cx.notify();
     }
 
     pub(super) fn rebuild_renderer(&mut self, window: &mut Window) {
@@ -580,14 +632,113 @@ impl CompiApp {
 
     fn render_interface_settings(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
+        let selected_background = blend_rgb(colors.surface, colors.accent, 0.14);
+        let fonts = UiFontPreset::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, preset)| {
+                let active = self.config.ui_font == preset;
+                let focused = self.overlay_focus == self.settings_content_focus(index);
+                let background = if active {
+                    selected_background
+                } else {
+                    colors.surface
+                };
+                div()
+                    .id(("settings-ui-font", index))
+                    .min_h(px(58.0))
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color(if focused {
+                        colors.accent
+                    } else if active {
+                        blend_rgb(colors.border, colors.accent, 0.35)
+                    } else {
+                        colors.border
+                    }))
+                    .bg(color(background))
+                    .font_family(preset.family())
+                    .hover(move |style| {
+                        style
+                            .bg(color(if active {
+                                selected_background
+                            } else {
+                                colors.surface_hover
+                            }))
+                            .cursor_pointer()
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.overlay_focus = this.settings_content_focus(index);
+                        this.apply_ui_font(preset, window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(preset.label()),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.muted, colors)))
+                                    .child(format!("{} · Aa Bb 0123", preset.description())),
+                            ),
+                    )
+                    .when(active, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(color(blend_rgb(background, colors.accent, 0.18)))
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(color(modal_text_color(colors.foreground, colors)))
+                                .child("Selected"),
+                        )
+                    })
+            });
+        let reset_offset = UiFontPreset::ALL.len();
         div()
             .flex()
             .flex_col()
             .gap_5()
             .child(self.settings_heading(
                 "Interface",
-                "Window presentation and workspace navigation settings.",
+                "Choose application typography independently from the terminal grid.",
             ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(self.settings_subheading("Interface font"))
+                    .children(fonts)
+                    .child(
+                        div()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .child("Bundled families are licensed under the SIL Open Font License 1.1."),
+                    ),
+            )
             .child(
                 div()
                     .min_h(px(44.0))
@@ -613,7 +764,7 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-reset-sidebar",
                         "Reset width",
-                        self.overlay_focus == self.settings_content_focus(0),
+                        self.overlay_focus == self.settings_content_focus(reset_offset),
                         false,
                         cx.listener(|this, _, window, cx| {
                             this.execute(Command::ResetSidebarWidth, window, cx);
@@ -628,7 +779,7 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-reset-layout",
                         "Reset client layout",
-                        self.overlay_focus == self.settings_content_focus(1),
+                        self.overlay_focus == self.settings_content_focus(reset_offset + 1),
                         false,
                         cx.listener(|this, _, window, cx| {
                             this.execute(Command::ResetClientLayout, window, cx);
@@ -641,26 +792,137 @@ impl CompiApp {
 
     fn render_terminal_settings(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
+        let selected_background = blend_rgb(colors.surface, colors.accent, 0.14);
+        let fonts = TerminalFontPreset::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, preset)| {
+                let active = self
+                    .config
+                    .configured_font
+                    .family
+                    .eq_ignore_ascii_case(preset.family());
+                let focused = self.overlay_focus == self.settings_content_focus(index);
+                let background = if active {
+                    selected_background
+                } else {
+                    colors.surface
+                };
+                div()
+                    .id(("settings-terminal-font", index))
+                    .min_h(px(58.0))
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color(if focused {
+                        colors.accent
+                    } else if active {
+                        blend_rgb(colors.border, colors.accent, 0.35)
+                    } else {
+                        colors.border
+                    }))
+                    .bg(color(background))
+                    .font_family(preset.family())
+                    .hover(move |style| {
+                        style
+                            .bg(color(if active {
+                                selected_background
+                            } else {
+                                colors.surface_hover
+                            }))
+                            .cursor_pointer()
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.overlay_focus = this.settings_content_focus(index);
+                        this.apply_terminal_font(preset, window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(preset.label()),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.muted, colors)))
+                                    .child(format!(
+                                        "{} · $ cargo test  0O1l {{}} []",
+                                        preset.description()
+                                    )),
+                            ),
+                    )
+                    .when(active, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(color(blend_rgb(background, colors.accent, 0.18)))
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(color(modal_text_color(colors.foreground, colors)))
+                                .child("Selected"),
+                        )
+                    })
+            });
+        let zoom_offset = TerminalFontPreset::ALL.len();
         div()
             .flex()
             .flex_col()
             .gap_5()
             .child(self.settings_heading(
                 "Terminal",
-                "Typography applies to terminal cells. Application chrome continues to use the native system font.",
+                "Choose fixed-cell typography independently from the application interface.",
             ))
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .gap_2()
+                    .child(self.settings_subheading("Terminal font"))
+                    .children(fonts)
+                    .child(
+                        div()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .child(
+                                "Bundled families use the SIL Open Font License 1.1. Custom font.family values remain supported.",
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
                     .gap_1()
+                    .child(self.settings_subheading("Typography"))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
                             .child(self.font_settings.family.clone()),
                     )
                     .child(
-                        div().text_size(px(UI_SMALL_TEXT_SIZE)).text_color(color(modal_text_color(colors.muted, colors)))
+                        div()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, colors)))
                             .child(format!(
                                 "{:.1}px · {:.2} line height · {:.0}% zoom",
                                 self.font_settings.size,
@@ -677,7 +939,7 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-zoom-out",
                         "Zoom out",
-                        self.overlay_focus == self.settings_content_focus(0),
+                        self.overlay_focus == self.settings_content_focus(zoom_offset),
                         false,
                         cx.listener(|this, _, window, cx| {
                             this.execute(Command::ZoomOut, window, cx);
@@ -687,7 +949,7 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-zoom-reset",
                         "Reset zoom",
-                        self.overlay_focus == self.settings_content_focus(1),
+                        self.overlay_focus == self.settings_content_focus(zoom_offset + 1),
                         false,
                         cx.listener(|this, _, window, cx| {
                             this.execute(Command::ZoomReset, window, cx);
@@ -697,7 +959,7 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-zoom-in",
                         "Zoom in",
-                        self.overlay_focus == self.settings_content_focus(2),
+                        self.overlay_focus == self.settings_content_focus(zoom_offset + 2),
                         false,
                         cx.listener(|this, _, window, cx| {
                             this.execute(Command::ZoomIn, window, cx);
@@ -712,7 +974,7 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-terminal-config",
                         "Edit terminal configuration",
-                        self.overlay_focus == self.settings_content_focus(3),
+                        self.overlay_focus == self.settings_content_focus(zoom_offset + 3),
                         false,
                         cx.listener(|this, _, window, cx| {
                             this.execute(Command::OpenConfiguration, window, cx);

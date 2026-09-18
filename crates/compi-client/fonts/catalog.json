@@ -1,0 +1,92 @@
+{
+  "default": "system",
+  "fonts": [
+    {
+      "variant": "System",
+      "id": "system",
+      "name": "System default",
+      "family_windows": "Segoe UI",
+      "family_macos": ".SystemUIFont",
+      "description": "Uses the native interface font for this platform.",
+      "files": []
+    },
+    {
+      "variant": "IbmPlexSans",
+      "id": "ibm-plex-sans",
+      "name": "IBM Plex Sans",
+      "family_windows": "IBM Plex Sans",
+      "family_macos": "IBM Plex Sans",
+      "description": "Technical, precise, and distinctly Compi.",
+      "files": ["fonts/ibm-plex-sans/IBMPlexSans[wdth,wght].ttf"]
+    },
+    {
+      "variant": "Inter",
+      "id": "inter",
+      "name": "Inter",
+      "family_windows": "Inter",
+      "family_macos": "Inter",
+      "description": "Compact and neutral for dense workspace controls.",
+      "files": ["fonts/inter/Inter[opsz,wght].ttf"]
+    },
+    {
+      "variant": "AtkinsonHyperlegibleNext",
+      "id": "atkinson-hyperlegible-next",
+      "name": "Atkinson Hyperlegible Next",
+      "family_windows": "Atkinson Hyperlegible Next",
+      "family_macos": "Atkinson Hyperlegible Next",
+      "description": "Highly distinguishable letterforms for easier reading.",
+      "files": ["fonts/atkinson-hyperlegible-next/AtkinsonHyperlegibleNext[wght].ttf"]
+    }
+  ],
+  "terminal_default": "system-monospace",
+  "terminal_fonts": [
+    {
+      "variant": "SystemMonospace",
+      "id": "system-monospace",
+      "name": "System monospace",
+      "family_windows": "Cascadia Mono",
+      "family_macos": "Menlo",
+      "description": "Uses the native terminal font for this platform.",
+      "files": []
+    },
+    {
+      "variant": "JetBrainsMono",
+      "id": "jetbrains-mono",
+      "name": "JetBrains Mono",
+      "family_windows": "JetBrains Mono",
+      "family_macos": "JetBrains Mono",
+      "description": "Clear coding forms with broad language coverage.",
+      "files": [
+        "fonts/jetbrains-mono/JetBrainsMono[wght].ttf",
+        "fonts/jetbrains-mono/JetBrainsMono-Italic[wght].ttf"
+      ]
+    },
+    {
+      "variant": "IbmPlexMono",
+      "id": "ibm-plex-mono",
+      "name": "IBM Plex Mono",
+      "family_windows": "IBM Plex Mono",
+      "family_macos": "IBM Plex Mono",
+      "description": "Technical character shapes paired with IBM Plex Sans.",
+      "files": [
+        "fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf",
+        "fonts/ibm-plex-mono/IBMPlexMono-Medium.ttf",
+        "fonts/ibm-plex-mono/IBMPlexMono-MediumItalic.ttf",
+        "fonts/ibm-plex-mono/IBMPlexMono-Bold.ttf",
+        "fonts/ibm-plex-mono/IBMPlexMono-BoldItalic.ttf"
+      ]
+    },
+    {
+      "variant": "AtkinsonHyperlegibleMono",
+      "id": "atkinson-hyperlegible-mono",
+      "name": "Atkinson Hyperlegible Mono",
+      "family_windows": "Atkinson Hyperlegible Mono",
+      "family_macos": "Atkinson Hyperlegible Mono",
+      "description": "Distinct glyphs designed for terminal readability.",
+      "files": [
+        "fonts/atkinson-hyperlegible-mono/AtkinsonHyperlegibleMono[wght].ttf",
+        "fonts/atkinson-hyperlegible-mono/AtkinsonHyperlegibleMono-Italic[wght].ttf"
+      ]
+    }
+  ]
+}

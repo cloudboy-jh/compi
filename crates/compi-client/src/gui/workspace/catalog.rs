@@ -219,15 +219,31 @@ impl CompiApp {
         &mut self,
         appearance: AppearanceSettings,
         favorites: Vec<ThemePreset>,
+        ui_font: UiFontPreset,
+        terminal_font_family: String,
         window: &mut Window,
     ) {
+        let terminal_font_changed = self.config.configured_font.family != terminal_font_family;
         if self.config.configured_appearance == appearance
             && self.config.theme_favorites == favorites
+            && self.config.ui_font == ui_font
+            && !terminal_font_changed
         {
             return;
         }
         self.config.configured_appearance = appearance;
         self.config.theme_favorites = favorites;
+        self.config.ui_font = ui_font;
+        self.ui_font = crate::font_catalog::resolve_ui_font(ui_font, window.text_system());
+        if terminal_font_changed {
+            self.config.configured_font.family = terminal_font_family.clone();
+            if self.config.provenance.font_family != crate::config::ValueSource::CommandLine {
+                self.config.font.family = terminal_font_family;
+                self.config.provenance.font_family = crate::config::ValueSource::Configuration;
+                self.font_settings = self.config.font.clone();
+                self.typography_scale = 0.0;
+            }
+        }
         if self.config.provenance.theme != crate::config::ValueSource::CommandLine {
             self.config.appearance.theme = appearance.theme;
             self.config.provenance.theme = crate::config::ValueSource::Configuration;
@@ -256,6 +272,8 @@ impl CompiApp {
     pub(super) fn broadcast_global_appearance(&self, window: &Window, cx: &mut Context<Self>) {
         let current = Window::window_handle(window).window_id();
         let appearance = self.config.configured_appearance;
+        let ui_font = self.config.ui_font;
+        let terminal_font_family = self.config.configured_font.family.clone();
         for handle in cx.windows() {
             if handle.window_id() == current {
                 continue;
@@ -268,6 +286,8 @@ impl CompiApp {
                     other.sync_global_appearance(
                         appearance,
                         self.config.theme_favorites.clone(),
+                        ui_font,
+                        terminal_font_family.clone(),
                         target_window,
                     );
                     target_cx.notify();
@@ -561,8 +581,26 @@ impl CompiApp {
                 .min_h_0()
                 .overflow_y_scroll()
                 .p_3()
+                .flex()
+                .flex_col()
+                .gap_5()
                 .text_size(px(UI_SMALL_TEXT_SIZE))
-                .child(crate::theme::THEME_ATTRIBUTION)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(self.settings_subheading("Theme licenses"))
+                        .child(crate::theme::THEME_ATTRIBUTION),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(self.settings_subheading("Bundled font licenses"))
+                        .child(crate::font_catalog::FONT_ATTRIBUTION),
+                )
                 .into_any_element()
         } else {
             div()

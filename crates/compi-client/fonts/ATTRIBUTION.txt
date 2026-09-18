@@ -1,0 +1,142 @@
+COMPI BUNDLED FONT ATTRIBUTION
+
+The font binaries listed below are embedded unmodified from the Google Fonts
+repository at revision a54f7446f84a1125ef6bf08baa46f3639e8905e0.
+Interface fonts include the normal variable face. Terminal fonts include the
+normal and italic weights needed by Compi. Source: https://github.com/google/fonts
+
+IBM PLEX SANS
+Copyright © 2017 IBM Corp. with Reserved Font Name "Plex"
+Source path: ofl/ibmplexsans/IBMPlexSans[wdth,wght].ttf
+SHA-256: 3b031aa4216174205bd8471f88a49b91f093169e9e87bd5262242bc5967fe2e3
+
+INTER
+Copyright 2020 The Inter Project Authors (https://github.com/rsms/inter)
+Source path: ofl/inter/Inter[opsz,wght].ttf
+SHA-256: 29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc559031
+
+ATKINSON HYPERLEGIBLE NEXT
+Copyright 2020-2024 The Atkinson Hyperlegible Next Project Authors
+(https://github.com/googlefonts/atkinson-hyperlegible-next)
+Source path: ofl/atkinsonhyperlegiblenext/AtkinsonHyperlegibleNext[wght].ttf
+SHA-256: 5a455d1cfa099b601ab70751bb9673e8fe1854dc4500c80e1a220d0d75e31745
+
+JETBRAINS MONO
+Copyright 2020 The JetBrains Mono Project Authors
+(https://github.com/JetBrains/JetBrainsMono)
+Source paths:
+  ofl/jetbrainsmono/JetBrainsMono[wght].ttf
+  SHA-256: 48715a42ec242c21e9f02692891e147d022299a52e48d5e413e1a942193ffeda
+  ofl/jetbrainsmono/JetBrainsMono-Italic[wght].ttf
+  SHA-256: 85ae2a5cd3f56baf1ce1c21a851322c58e3d8fbe8e8ad4a4d090a820dd7fe558
+
+IBM PLEX MONO
+Copyright 2017 IBM Corp. All rights reserved.
+Source paths:
+  ofl/ibmplexmono/IBMPlexMono-Regular.ttf
+  SHA-256: 6a3412f058c7d8dfd9170c41e85ade48e5156ecb89356110ca57a0a27734af46
+  ofl/ibmplexmono/IBMPlexMono-Medium.ttf
+  SHA-256: a9b4c49bb299e05b5f6c481e7fb5e78943d2793249a0c8874ab574a2d1ea6755
+  ofl/ibmplexmono/IBMPlexMono-MediumItalic.ttf
+  SHA-256: de6e0f805a15a2a1538be5d1074741298a07ffcba6fa1f4cd93983ff73155a7d
+  ofl/ibmplexmono/IBMPlexMono-Bold.ttf
+  SHA-256: ac27abd6450a64dd94467580a02fe6235156d5b92f2926ebbc8e7489df64e0be
+  ofl/ibmplexmono/IBMPlexMono-BoldItalic.ttf
+  SHA-256: af4e05a761e98c1adf064c48a6352c9bec1a6ad70982cd2a544149323391f98e
+
+ATKINSON HYPERLEGIBLE MONO
+Copyright 2020-2024 The Atkinson Hyperlegible Mono Project Authors
+(https://github.com/googlefonts/atkinson-hyperlegible-next-mono)
+Source paths:
+  ofl/atkinsonhyperlegiblemono/AtkinsonHyperlegibleMono[wght].ttf
+  SHA-256: 5ce8b1698d1ded7dff2178c1a3ad159470085a58ea239e8b2cb88f4fb4a6f646
+  ofl/atkinsonhyperlegiblemono/AtkinsonHyperlegibleMono-Italic[wght].ttf
+  SHA-256: e18f523877530e4abe229df6a36d394326254da488a7f5abb9b7b5ea8f780cd4
+
+All bundled font families are licensed under the SIL Open Font License,
+Version 1.1, reproduced below.
+
+-----------------------------------------------------------
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+-----------------------------------------------------------
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The
+fonts, including any derivative works, can be bundled, embedded,
+redistributed and/or sold with any software provided that any reserved
+names are not used by derivative works. The fonts and derivatives,
+however, cannot be released under any other type of license. The
+requirement for fonts to remain under this license does not apply
+to any document created using the fonts or their derivatives.
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such. This may
+include source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting -- in part or in whole -- any of the components of the
+Original Version, by changing formats or by porting the Font Software to a
+new environment.
+
+"Author" refers to any designer, engineer, programmer, technical
+writer or other person who contributed to the Font Software.
+
+PERMISSION & CONDITIONS
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Font Software, to use, study, copy, merge, embed, modify,
+redistribute, and sell modified and unmodified copies of the Font
+Software, subject to the following conditions:
+
+1) Neither the Font Software nor any of its individual components,
+in Original or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+redistributed and/or sold with any software, provided that each copy
+contains the above copyright notice and this license. These can be
+included either as stand-alone text files, human-readable headers or
+in the appropriate machine-readable metadata fields within text or
+binary files as long as those fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font
+Name(s) unless explicit written permission is granted by the corresponding
+Copyright Holder. This restriction only applies to the primary font name as
+presented to the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) shall not be
+used to promote, endorse or advertise any Modified Version, except to
+acknowledge the contribution(s) of the Copyright Holder(s) and the
+Author(s) or with their explicit written permission.
+
+5) The Font Software, modified or unmodified, in part or in whole, must be
+distributed entirely under this license, and must not be distributed under
+any other license. The requirement for fonts to remain under this license
+does not apply to any document created using the Font Software.
+
+TERMINATION
+This license becomes null and void if any of the above conditions are not
+met.
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER
+DEALINGS IN THE FONT SOFTWARE.

@@ -98,6 +98,22 @@ compi --connect dev@example.com:2222
 
 The headless diagnostic client accepts the same `--connect` and optional `--instance` options. For example, `compi-probe --connect dev@example.com workspace` prints the remote hierarchy and lifecycle state, while its session, tab, pane, surface, soak, and shutdown commands operate through the same protocol. The remote host must provide `compi-daemon` on `PATH`.
 
+## Appearance and typography
+
+Settings includes 40 bundled whole-application themes, four interface-font choices, and four terminal-font choices. Interface fonts apply globally to Compi's chrome and controls. Terminal fonts apply independently to the fixed-width terminal grid.
+
+The native system fonts remain the defaults. Interface selection uses a stable bundled ID, while terminal selection updates the existing `font.family` setting:
+
+```toml
+[appearance]
+ui_font = "ibm-plex-sans"
+
+[font]
+family = "JetBrains Mono"
+```
+
+Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono. Custom installed families remain supported through `font.family`. Bundled font notices and SIL Open Font License 1.1 text are in [`crates/compi-client/fonts/ATTRIBUTION.txt`](crates/compi-client/fonts/ATTRIBUTION.txt).
+
 ## Test
 
 ```sh

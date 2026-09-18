@@ -214,6 +214,7 @@ impl CompiApp {
                         .unwrap_or(config.configured_appearance.theme)
                 }
             });
+        let ui_font = crate::font_catalog::resolve_ui_font(config.ui_font, window.text_system());
         let terminal_opacity = transferred_seed
             .as_ref()
             .map(|seed| seed.display_terminal_opacity)
@@ -289,6 +290,7 @@ impl CompiApp {
             defaults,
             glass: terminal_opacity < 1.0,
             theme,
+            ui_font,
             theme_catalog: None,
             pending_appearance_reload: None,
             pending_image_inputs: HashSet::new(),
@@ -479,6 +481,8 @@ impl CompiApp {
                             sender.send(UiEvent::AppearanceReloaded {
                                 appearance: loaded.configured_appearance,
                                 favorites: loaded.theme_favorites,
+                                ui_font: loaded.ui_font,
+                                terminal_font_family: loaded.configured_font.family,
                                 diagnostics: loaded.diagnostics,
                             });
                         }
@@ -1012,9 +1016,12 @@ impl CompiApp {
             UiEvent::AppearanceReloaded {
                 appearance,
                 favorites,
+                ui_font,
+                terminal_font_family,
                 diagnostics,
             } => {
-                self.pending_appearance_reload = Some((appearance, favorites));
+                self.pending_appearance_reload =
+                    Some((appearance, favorites, ui_font, terminal_font_family));
                 self.config_diagnostics = diagnostics;
                 self.global_warning =
                     diagnostic_warning(&self.config_diagnostics, &self.typography.diagnostics);
@@ -2884,8 +2891,16 @@ impl CompiApp {
                 window.on_next_frame(move |_, cx| cx.notify(view_id));
             }
         }
-        if let Some((appearance, favorites)) = self.pending_appearance_reload.take() {
-            self.sync_global_appearance(appearance, favorites, window);
+        if let Some((appearance, favorites, ui_font, terminal_font_family)) =
+            self.pending_appearance_reload.take()
+        {
+            self.sync_global_appearance(
+                appearance,
+                favorites,
+                ui_font,
+                terminal_font_family,
+                window,
+            );
         }
         if self.refresh_typography(window) {
             self.rebuild_layout(window, true);
@@ -2992,7 +3007,7 @@ impl CompiApp {
             .relative()
             .flex()
             .flex_col()
-            .font_family(UI_FONT)
+            .font_family(self.ui_font.family())
             .text_size(px(UI_BODY_TEXT_SIZE))
             .font_weight(FontWeight::MEDIUM)
             .text_color(color(colors.foreground))
@@ -4564,6 +4579,7 @@ impl CompiApp {
         };
         let selection = self.ime_selected_range.clone();
         let marked = self.ime_marked_range.clone();
+        let ui_font = self.ui_font.family();
         let input = cx.entity();
         let focus = self.focus_handle.clone();
         let editor_focused = !matches!(
@@ -4599,7 +4615,7 @@ impl CompiApp {
                         };
                         let run = TextRun {
                             len: displayed.len(),
-                            font: gpui::font(UI_FONT),
+                            font: gpui::font(ui_font),
                             color: color(modal_text_color(
                                 if text.is_empty() {
                                     colors.muted

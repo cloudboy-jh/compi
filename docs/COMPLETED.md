@@ -7,6 +7,21 @@ This file records completed implementation and dated verification evidence. Unfi
 - The current source checkpoint completes bounded SSH transport, remote image paste/drop, image-aware logical reflow, explicit graphics protocol coverage, remote headless workflows, and current Windows release packaging.
 - Final focused verification passed 135 protocol/client/daemon tests, current release compilation and WiX validation, portable native launch/reconnect, and the headless local lifecycle. A deterministic SSH process stand-in proved successful multi-connection/reconnect behavior, while actual OpenSSH surfaced its connection-refused failure cleanly. Real-host SSH qualification, physical Windows interactions, native Mac qualification, credentialed signing/notarization, version-to-version upgrade, and a final tag workflow remain in `NEXT_STEPS.md`.
 
+### Bundled terminal font settings — 2026-09-17
+
+- Added build-time validated System monospace, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono presets beside the independent interface-font catalog. The normal, bold, and italic faces used by the terminal are embedded from the pinned Google Fonts revision with checksums, copyright notices, and SIL Open Font License 1.1 text.
+- **Settings → Terminal** now renders keyboard-accessible previews in each candidate family. Selection atomically updates the existing `font.family` key without changing size, line height, fallbacks, interface typography, or terminal processes; custom installed family names and invocation-local CLI overrides remain supported.
+- The selected family synchronizes across windows sharing the configuration, invalidates typography and shaped-row caches, and immediately re-resolves the fixed-cell grid. External configuration reloads follow the same path while proportional, missing, or unloadable families retain the existing diagnostic and native-monospace fallback.
+- Client tests passed 61/61, warning-denied all-target client Clippy passed, workspace diagnostics passed, and the optimized Windows client built at 19,180,544 bytes. An isolated native Windows launch showed all four previews without overlap or missing glyphs, selected JetBrains Mono through keyboard controls, persisted `family = "JetBrains Mono"`, and rendered distinct normal, bold, and italic terminal text on an aligned fixed-cell grid. Native macOS visual qualification remains open.
+
+### Bundled interface font catalog — 2026-09-17
+
+- Added a build-time validated interface-font catalog with System default, IBM Plex Sans, Inter, and Atkinson Hyperlegible Next. The three bundled variable faces are embedded in native clients from a pinned Google Fonts revision with checksums, copyright notices, and the SIL Open Font License 1.1.
+- Interface typography is global and independent from fixed-cell terminal typography. Settings renders each option in its own face, persists stable `appearance.ui_font` IDs through atomic comment-preserving TOML updates, reloads external changes, and synchronizes open windows using the same configuration path.
+- The workspace root and custom text editor now use the selected interface family; terminal cells and terminal previews intentionally retain their monospace paths. Missing or invalid selections diagnose and fall back to the native system font.
+- Client tests passed 61/61, warning-denied all-target client Clippy passed, and the optimized Windows client built at 17,976,832 bytes. An isolated native Windows launch rendered all four previews at 1462×973, showed distinct keyboard focus and selection states, changed to Inter through keyboard controls, persisted `ui_font = "inter"`, and reached rendered terminal input. Native macOS visual qualification remains open.
+
+
 ### SSH transport, remote graphics, and current distribution — 2026-09-15
 
 - Protocol 12 adds a persistent `compi-daemon --server-stdio` relay and client `--connect [user@]host[:port]` target. OpenSSH retains authentication and host-key responsibility; Compi uses batch mode, validates targets, opens no listener, stores no credentials, and keeps remote instances in the remote host's namespace. Relay disconnect does not own daemon lifetime; deterministic relay and SSH-process tests preserve server/workspace identity across reconnect, while a successful real-host SSH run remains unqualified.

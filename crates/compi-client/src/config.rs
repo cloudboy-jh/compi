@@ -17,7 +17,10 @@ use std::{
 use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{BackgroundEffect, ThemePreset};
+use crate::{
+    font_catalog::{TerminalFontPreset, UiFontPreset},
+    theme::{BackgroundEffect, ThemePreset},
+};
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
 pub const MIN_SIDEBAR_WIDTH: f32 = 200.0;
@@ -112,6 +115,8 @@ pub struct LoadedConfig {
     pub configured_appearance: AppearanceSettings,
     #[serde(default)]
     pub theme_favorites: Vec<ThemePreset>,
+    #[serde(default)]
+    pub ui_font: UiFontPreset,
     pub sidebar_width: f32,
     pub configured_sidebar_width: f32,
     pub keybindings: HashMap<String, String>,
@@ -132,6 +137,7 @@ impl Default for LoadedConfig {
             appearance: AppearanceSettings::default(),
             configured_appearance: AppearanceSettings::default(),
             theme_favorites: Vec::new(),
+            ui_font: UiFontPreset::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             configured_sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             keybindings: HashMap::new(),
@@ -204,9 +210,32 @@ impl LoadedConfig {
                 .iter()
                 .map(|theme| theme.id())
                 .collect::<toml_edit::Array>();
-            set_appearance_value(table, "favorites", toml_edit::Value::Array(favorites));
+            set_table_value(table, "favorites", toml_edit::Value::Array(favorites));
         })?;
         self.theme_favorites = unique;
+        Ok(())
+    }
+
+    /// Persist the global application-chrome font without changing terminal typography.
+    pub fn save_ui_font(&mut self, ui_font: UiFontPreset) -> Result<(), String> {
+        update_appearance(&self.path, |table| {
+            set_table_value(table, "ui_font", ui_font.id().into());
+        })?;
+        self.ui_font = ui_font;
+        Ok(())
+    }
+
+    /// Persist a bundled terminal font without changing its size, line height, or fallbacks.
+    pub fn save_terminal_font(&mut self, terminal_font: TerminalFontPreset) -> Result<(), String> {
+        let family = terminal_font.family();
+        update_table(&self.path, "font", |table| {
+            set_table_value(table, "family", family.into());
+        })?;
+        self.configured_font.family = family.to_owned();
+        if self.provenance.font_family != ValueSource::CommandLine {
+            self.font.family = family.to_owned();
+            self.provenance.font_family = ValueSource::Configuration;
+        }
         Ok(())
     }
 
@@ -363,6 +392,18 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
                     loaded,
                     "appearance.background_effect",
                     "clear or blurred",
+                    "configuration",
+                );
+            }
+        }
+        if let Some(value) = appearance.get("ui_font") {
+            if let Some(ui_font) = value.as_str().and_then(UiFontPreset::parse) {
+                loaded.ui_font = ui_font;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.ui_font",
+                    "a bundled UI font ID",
                     "configuration",
                 );
             }
@@ -629,10 +670,10 @@ fn save_appearance(path: &Path, appearance: AppearanceSettings) -> Result<(), St
         return Err("Terminal opacity must be between 0.1 and 1.0".to_owned());
     }
     update_appearance(path, |table| {
-        set_appearance_value(table, "theme", appearance.theme.id().into());
+        set_table_value(table, "theme", appearance.theme.id().into());
         let opacity = (f64::from(appearance.terminal_opacity) * 1_000_000.0).round() / 1_000_000.0;
-        set_appearance_value(table, "terminal_opacity", opacity.into());
-        set_appearance_value(
+        set_table_value(table, "terminal_opacity", opacity.into());
+        set_table_value(
             table,
             "background_effect",
             appearance.background_effect.id().into(),
@@ -640,7 +681,7 @@ fn save_appearance(path: &Path, appearance: AppearanceSettings) -> Result<(), St
     })
 }
 
-fn set_appearance_value(table: &mut toml_edit::Table, key: &str, mut value: toml_edit::Value) {
+fn set_table_value(table: &mut toml_edit::Table, key: &str, mut value: toml_edit::Value) {
     if let Some(previous) = table.get(key).and_then(toml_edit::Item::as_value) {
         *value.decor_mut() = previous.decor().clone();
     }
@@ -649,6 +690,14 @@ fn set_appearance_value(table: &mut toml_edit::Table, key: &str, mut value: toml
 
 fn update_appearance(
     path: &Path,
+    update: impl FnOnce(&mut toml_edit::Table),
+) -> Result<(), String> {
+    update_table(path, "appearance", update)
+}
+
+fn update_table(
+    path: &Path,
+    table_name: &str,
     update: impl FnOnce(&mut toml_edit::Table),
 ) -> Result<(), String> {
     if path.as_os_str().is_empty() {
@@ -675,21 +724,21 @@ fn update_appearance(
             path.display()
         ));
     }
-    match document.get("appearance") {
+    match document.get(table_name) {
         Some(item) if !item.is_table() => {
             return Err(format!(
-                "Cannot update {}: appearance must be a table",
+                "Cannot update {}: {table_name} must be a table",
                 path.display()
             ));
         }
         None => {
-            document["appearance"] = toml_edit::Item::Table(toml_edit::Table::new());
+            document[table_name] = toml_edit::Item::Table(toml_edit::Table::new());
         }
         Some(_) => {}
     }
-    let table = document["appearance"]
+    let table = document[table_name]
         .as_table_mut()
-        .expect("appearance was created or validated as a table");
+        .expect("configuration table was created or validated");
     update(table);
 
     if let Some(parent) = path
@@ -1170,6 +1219,57 @@ mod tests {
             load(Some(&path), FontOverrides::default())
                 .theme_favorites
                 .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn font_selections_round_trip_independently() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-font-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\n[appearance]\nui_font = 'inter'\n[font]\nfamily = 'Terminal Face'\nsize = 15.5\n# retain me\n",
+        )
+        .unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.ui_font, UiFontPreset::Inter);
+        assert_eq!(loaded.font.family, "Terminal Face");
+        loaded
+            .save_ui_font(UiFontPreset::AtkinsonHyperlegibleNext)
+            .unwrap();
+        loaded
+            .save_terminal_font(TerminalFontPreset::JetBrainsMono)
+            .unwrap();
+
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.ui_font, UiFontPreset::AtkinsonHyperlegibleNext);
+        assert_eq!(
+            reloaded.font.family,
+            TerminalFontPreset::JetBrainsMono.family()
+        );
+        assert_eq!(reloaded.font.size, 15.5);
+        assert!(fs::read_to_string(&path).unwrap().contains("# retain me"));
+
+        let invalid = parse(
+            "version = 1\n[appearance]\nui_font = 'unknown'",
+            FontOverrides::default(),
+        );
+        assert_eq!(invalid.ui_font, UiFontPreset::System);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("appearance.ui_font"))
         );
         fs::remove_dir_all(root).unwrap();
     }

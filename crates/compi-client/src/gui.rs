@@ -4,6 +4,7 @@ use crate::client_state::{
 use crate::commands::{self, Command};
 use crate::config::{AppearanceSettings, FontSettings, LoadedConfig};
 use crate::connection::ConnectionTarget;
+use crate::font_catalog::{TerminalFontPreset, UiFontPreset};
 use crate::input::{
     self, Key, KeypadKey, Modifiers, encode_keystroke, encode_mouse, utf16_byte_index,
 };
@@ -81,10 +82,6 @@ const WINDOW_CONTROLS_WIDTH: f32 = 0.0;
 const TITLEBAR_BRAND_WIDTH: f32 = 80.0;
 #[cfg(target_os = "macos")]
 const TITLEBAR_BRAND_WIDTH: f32 = 158.0;
-#[cfg(windows)]
-const UI_FONT: &str = "Segoe UI";
-#[cfg(target_os = "macos")]
-const UI_FONT: &str = ".SystemUIFont";
 const UI_BODY_TEXT_SIZE: f32 = 14.0;
 const UI_SMALL_TEXT_SIZE: f32 = 13.0;
 const UI_MICRO_TEXT_SIZE: f32 = 12.0;
@@ -101,6 +98,12 @@ pub fn run(
 ) {
     let empty_measurement = perf::empty_window_enabled();
     Application::new().run(move |cx: &mut App| {
+        let mut config = config;
+        if !empty_measurement
+            && let Err(error) = crate::font_catalog::register_bundled(cx.text_system())
+        {
+            config.diagnostics.push(error);
+        }
         let opened = if empty_measurement {
             open_empty_measurement_window(cx)
         } else {
@@ -453,6 +456,8 @@ enum UiEvent {
     AppearanceReloaded {
         appearance: AppearanceSettings,
         favorites: Vec<ThemePreset>,
+        ui_font: UiFontPreset,
+        terminal_font_family: String,
         diagnostics: Vec<String>,
     },
     ImagePrepared {
@@ -734,8 +739,9 @@ struct CompiApp {
     defaults: ClientState,
     config: LoadedConfig,
     theme: ThemePreset,
+    ui_font: UiFontPreset,
     theme_catalog: Option<workspace::catalog::CatalogState>,
-    pending_appearance_reload: Option<(AppearanceSettings, Vec<ThemePreset>)>,
+    pending_appearance_reload: Option<(AppearanceSettings, Vec<ThemePreset>, UiFontPreset, String)>,
     pending_image_inputs: HashSet<u64>,
     image_previews: VecDeque<workspace::media::ImagePreview>,
     image_inspector: Option<workspace::media::InspectorState>,

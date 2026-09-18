@@ -568,7 +568,7 @@ The palette supports query filtering, keyboard navigation, Enter to execute, Esc
 
 ## Configuration and appearance
 
-Use a versioned TOML configuration with documented defaults. An **Open configuration file** command, compact **Quick Appearance**, and a comprehensive in-window **Settings** panel are baseline. Settings edits appearance directly; launch profiles, fonts, limits, and advanced keybindings remain inspectable/editable through TOML.
+Use a versioned TOML configuration with documented defaults. An **Open configuration file** command, compact **Quick Appearance**, and a comprehensive in-window **Settings** panel are baseline. Settings edits appearance and bundled interface/terminal font choices directly; launch profiles, limits, custom font families, and advanced keybindings remain inspectable/editable through TOML.
 
 Settings uses a persistent section rail at normal widths and wrapped section controls in narrow windows. Overlay focus stays trapped; Settings and form dialogs use Tab/Shift-Tab for actionable controls, list dialogs use arrow navigation, Escape cancels or returns from nested theme browsing, and destructive confirmations default to Cancel. Modal text and focus treatments meet WCAG AA contrast against every bundled application surface.
 
@@ -576,7 +576,7 @@ Configuration includes profiles, shell/login behavior, starting directory, envir
 
 Invalid configuration must produce a useful diagnostic and a safe recovery path. Apply independent valid settings where possible; never silently launch an unintended executable. Configuration and client state are separate files.
 
-The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindings`, `shell`, `environment`, `profiles.NAME`, `limits`, and `clipboard` tables, with `default_profile` selecting a named profile. `appearance.theme` accepts stable IDs from the bundled theme catalog; `appearance.favorites` is an optional list of those IDs. `appearance.terminal_opacity` accepts 0.1–1.0; `appearance.background_effect` accepts `clear` or `blurred`. `layout.sidebar_width` is 200–600 logical pixels. `limits.scrollback_lines` is 0–100,000 alongside the fixed 1 MiB history byte bound; `limits.graphics_bytes` is 0–64 MiB of retained image data/reservations per surface. `clipboard.policy` controls OSC 52 (`allow`/`deny`), not explicit user Copy/Paste. Explicit program argv is literal; use `login` deliberately for shell profiles.
+The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindings`, `shell`, `environment`, `profiles.NAME`, `limits`, and `clipboard` tables, with `default_profile` selecting a named profile. `font.family` accepts a valid installed or bundled font family; Settings writes the concrete family name for bundled terminal presets. `appearance.theme` accepts stable IDs from the bundled theme catalog; `appearance.favorites` is an optional list of those IDs. `appearance.ui_font` accepts `system`, `ibm-plex-sans`, `inter`, or `atkinson-hyperlegible-next`. `appearance.terminal_opacity` accepts 0.1–1.0; `appearance.background_effect` accepts `clear` or `blurred`. `layout.sidebar_width` is 200–600 logical pixels. `limits.scrollback_lines` is 0–100,000 alongside the fixed 1 MiB history byte bound; `limits.graphics_bytes` is 0–64 MiB of retained image data/reservations per surface. `clipboard.policy` controls OSC 52 (`allow`/`deny`), not explicit user Copy/Paste. Explicit program argv is literal; use `login` deliberately for shell profiles.
 
 ### Theme presets and access
 
@@ -588,6 +588,25 @@ The implemented version-1 schema uses `font`, `appearance`, `layout`, `keybindin
 - Theme selection previews the current window without saving; cancel restores the accepted theme. **Apply globally** updates the shared configuration and open windows following those defaults, without clearing other windows' explicit overrides or changing opacity/background preferences. Window-scoped application saves only its theme override. Favorites persist independently in the global configuration.
 - Other appearance edits apply to the selected scope through atomic, comment-preserving TOML or private window JSON. **Use global defaults** clears the current window's appearance overrides. CLI overrides remain invocation-local.
 - Appearance changes never restart a process, detach a surface, reset terminal contents, or make a CLI override durable. Explicit terminal cell backgrounds and foreground text remain opaque.
+
+### Interface font presets
+
+- The native system font remains the default so upgrades preserve the current platform-native presentation.
+- **Settings → Interface** offers System default, IBM Plex Sans, Inter, and Atkinson Hyperlegible Next. Each row renders its own preview and applies immediately.
+- The three non-system families are embedded in the client binary, registered before the first production window opens, and licensed under the SIL Open Font License 1.1.
+- Interface-font selection is global and synchronizes across open windows using the same configuration path. It does not create a per-window override.
+- Interface fonts apply to application chrome, controls, dialogs, palettes, and text fields. Terminal cells and miniature terminal previews retain fixed-width terminal typography.
+- Unknown or unavailable selections produce a diagnostic and render with the native system font. Changing interface typography never restarts, detaches, resizes, or otherwise changes terminal work.
+
+### Terminal font presets
+
+- The platform-native monospace family remains the default: Cascadia Mono on Windows and Menlo on macOS.
+- **Settings → Terminal** offers System monospace, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono. Each keyboard-accessible row renders a code-oriented preview and applies immediately.
+- The three non-system families include the normal, bold, and italic faces used by terminal rendering. They are embedded from the pinned Google Fonts catalog and licensed under the SIL Open Font License 1.1.
+- Selection updates `font.family` atomically without changing size, line height, fallback families, terminal contents, processes, or layout structure. Custom installed family names remain supported through TOML and command-line overrides remain invocation-local.
+- The selected family is fixed-cell validated before use. Missing, unloadable, or proportional families produce a diagnostic and fall back to the native monospace cascade.
+- Terminal-font selection is global and synchronizes across open windows using the same configuration path. Interface typography remains unchanged.
+
 
 ### Glass and readability
 
@@ -612,7 +631,7 @@ The optional **Warm Carbon** preset uses these warm color tokens; they are not t
 | Accent | `#E5C07B` |
 | Initial terminal canvas | `#171613` |
 
-Default typography is IBM Plex Sans for chrome and IBM Plex Mono for the terminal, with appropriate native fallbacks. Users can configure terminal typography independently of application chrome; colors are selected together through a whole-app preset.
+Default interface typography is the native system font, with IBM Plex Sans, Inter, and Atkinson Hyperlegible Next bundled as global alternatives. Terminal typography remains independently configurable and fixed-cell validated; colors are selected together through a whole-app preset.
 
 Use restrained spacing, readable labels, real icons, horizontal peer actions, visible focus, and sentence case. Avoid oversized dashboard chrome, decorative status bars, and fixed compactness that makes the terminal feel squeezed.
 
