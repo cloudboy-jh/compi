@@ -390,13 +390,13 @@ fn generate_font_catalog() {
     let catalog: FontCatalog =
         serde_json::from_str(&fs::read_to_string(SOURCE).expect("read bundled fonts"))
             .expect("bundled font schema must be complete and valid");
-    let mut files = HashSet::new();
-    validate_font_presets("UI", &catalog.default, &catalog.fonts, &mut files);
+    // One bundled family may serve both catalogs without embedding it twice.
+    validate_font_presets("UI", &catalog.default, &catalog.fonts, &mut HashSet::new());
     validate_font_presets(
         "terminal",
         &catalog.terminal_default,
         &catalog.terminal_fonts,
-        &mut files,
+        &mut HashSet::new(),
     );
 
     let mut output = String::from("// Generated from fonts/catalog.json; do not edit.\n");
@@ -415,12 +415,16 @@ fn generate_font_catalog() {
     output.push_str(
         "#[cfg(any(windows, target_os = \"macos\"))]\npub fn bundled_font_data() -> Vec<std::borrow::Cow<'static, [u8]>> {\n    vec![\n",
     );
+    let mut embedded = HashSet::new();
     for file in catalog
         .fonts
         .iter()
         .chain(&catalog.terminal_fonts)
         .flat_map(|font| &font.files)
     {
+        if !embedded.insert(file) {
+            continue;
+        }
         writeln!(
             output,
             "        std::borrow::Cow::Borrowed(include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/\", {file:?})).as_slice()),"

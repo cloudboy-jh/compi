@@ -29,6 +29,18 @@
       "files": ["fonts/inter/Inter[opsz,wght].ttf"]
     },
     {
+      "variant": "JetBrainsMono",
+      "id": "jetbrains-mono",
+      "name": "JetBrains Mono",
+      "family_windows": "JetBrains Mono",
+      "family_macos": "JetBrains Mono",
+      "description": "Monospaced labels for a more technical interface.",
+      "files": [
+        "fonts/jetbrains-mono/JetBrainsMono[wght].ttf",
+        "fonts/jetbrains-mono/JetBrainsMono-Italic[wght].ttf"
+      ]
+    },
+    {
       "variant": "AtkinsonHyperlegibleNext",
       "id": "atkinson-hyperlegible-next",
       "name": "Atkinson Hyperlegible Next",

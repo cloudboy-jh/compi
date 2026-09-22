@@ -100,7 +100,7 @@ The headless diagnostic client accepts the same `--connect` and optional `--inst
 
 ## Appearance and typography
 
-Settings includes 40 bundled whole-application themes, four interface-font choices, and four terminal-font choices. Interface fonts apply globally to Compi's chrome and controls. Terminal fonts apply independently to the fixed-width terminal grid.
+Settings includes 40 bundled whole-application themes, five interface-font choices, and four terminal-font choices. Interface fonts apply globally to Compi's chrome and controls. Terminal fonts apply independently to the fixed-width terminal grid.
 
 The native system fonts remain the defaults. Interface selection uses a stable bundled ID, while terminal selection updates the existing `font.family` setting:
 

@@ -3676,6 +3676,12 @@ impl CompiApp {
                                 "Appearance…",
                                 Command::OpenQuickAppearance,
                                 cx,
+                            ))
+                            .child(self.command_button(
+                                "settings-sidebar",
+                                "Settings…",
+                                Command::OpenSettings,
+                                cx,
                             )),
                     ),
             )

@@ -369,18 +369,18 @@ impl CompiApp {
         let colors = self.colors();
         let (background, hover, foreground) = match tone {
             SettingsButtonTone::Secondary => (
-                blend_rgb(colors.surface, colors.foreground, 0.08),
-                blend_rgb(colors.surface, colors.foreground, 0.13),
+                blend_rgb(colors.surface, colors.foreground, 0.04),
+                blend_rgb(colors.surface, colors.foreground, 0.09),
                 colors.foreground,
             ),
             SettingsButtonTone::Primary => (
-                blend_rgb(colors.surface, colors.accent, 0.34),
-                blend_rgb(colors.surface, colors.accent, 0.44),
+                blend_rgb(colors.surface, colors.accent, 0.12),
+                blend_rgb(colors.surface, colors.accent, 0.20),
                 colors.foreground,
             ),
             SettingsButtonTone::Destructive => (
-                blend_rgb(colors.surface, colors.error, 0.14),
-                blend_rgb(colors.surface, colors.error, 0.22),
+                blend_rgb(colors.surface, colors.error, 0.06),
+                blend_rgb(colors.surface, colors.error, 0.12),
                 colors.error,
             ),
         };
@@ -402,7 +402,7 @@ impl CompiApp {
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
+            .rounded_sm()
             .border_1()
             .border_color(color(border))
             .bg(color(background))
@@ -459,8 +459,8 @@ impl CompiApp {
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
         let colors = self.colors();
-        let group = blend_rgb(colors.surface, colors.foreground, 0.06);
-        let selected = blend_rgb(colors.surface, colors.accent, 0.19);
+        let group = colors.surface;
+        let selected = blend_rgb(colors.surface, colors.accent, 0.08);
         let background = if active { selected } else { group };
         div()
             .id(id)
@@ -468,7 +468,11 @@ impl CompiApp {
             .px_2()
             .rounded_sm()
             .border_1()
-            .border_color(color(if focused { colors.accent } else { background }))
+            .border_color(color(if focused || active {
+                colors.accent
+            } else {
+                colors.border
+            }))
             .bg(color(background))
             .flex()
             .items_center()
@@ -511,7 +515,7 @@ impl CompiApp {
         div()
             .id(id)
             .size(px(36.0))
-            .rounded_md()
+            .rounded_sm()
             .flex()
             .items_center()
             .justify_center()
@@ -553,7 +557,7 @@ impl CompiApp {
             .map(|(index, section)| {
                 let active = self.settings_section == section;
                 let focused = self.overlay_focus == index;
-                let active_background = blend_rgb(colors.surface, colors.accent, 0.16);
+                let active_background = blend_rgb(colors.surface, colors.foreground, 0.06);
                 let background = if active {
                     active_background
                 } else {
@@ -632,7 +636,7 @@ impl CompiApp {
 
     fn render_interface_settings(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
-        let selected_background = blend_rgb(colors.surface, colors.accent, 0.14);
+        let selected_background = blend_rgb(colors.surface, colors.accent, 0.06);
         let fonts = UiFontPreset::ALL
             .into_iter()
             .enumerate()
@@ -655,10 +659,8 @@ impl CompiApp {
                     .gap_4()
                     .rounded_sm()
                     .border_1()
-                    .border_color(color(if focused {
+                    .border_color(color(if focused || active {
                         colors.accent
-                    } else if active {
-                        blend_rgb(colors.border, colors.accent, 0.35)
                     } else {
                         colors.border
                     }))
@@ -705,13 +707,9 @@ impl CompiApp {
                         row.child(
                             div()
                                 .flex_none()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(color(blend_rgb(background, colors.accent, 0.18)))
                                 .text_size(px(UI_MICRO_TEXT_SIZE))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(color(modal_text_color(colors.foreground, colors)))
+                                .text_color(color(ui_text_color(colors.accent, background)))
                                 .child("Selected"),
                         )
                     })
@@ -792,7 +790,7 @@ impl CompiApp {
 
     fn render_terminal_settings(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
-        let selected_background = blend_rgb(colors.surface, colors.accent, 0.14);
+        let selected_background = blend_rgb(colors.surface, colors.accent, 0.06);
         let fonts = TerminalFontPreset::ALL
             .into_iter()
             .enumerate()
@@ -819,10 +817,8 @@ impl CompiApp {
                     .gap_4()
                     .rounded_sm()
                     .border_1()
-                    .border_color(color(if focused {
+                    .border_color(color(if focused || active {
                         colors.accent
-                    } else if active {
-                        blend_rgb(colors.border, colors.accent, 0.35)
                     } else {
                         colors.border
                     }))
@@ -872,13 +868,9 @@ impl CompiApp {
                         row.child(
                             div()
                                 .flex_none()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(color(blend_rgb(background, colors.accent, 0.18)))
                                 .text_size(px(UI_MICRO_TEXT_SIZE))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(color(modal_text_color(colors.foreground, colors)))
+                                .text_color(color(ui_text_color(colors.accent, background)))
                                 .child("Selected"),
                         )
                     })

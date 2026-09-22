@@ -1260,6 +1260,15 @@ mod tests {
         assert_eq!(reloaded.font.size, 15.5);
         assert!(fs::read_to_string(&path).unwrap().contains("# retain me"));
 
+        let mut reloaded = reloaded;
+        reloaded.save_ui_font(UiFontPreset::JetBrainsMono).unwrap();
+        let jetbrains = load(Some(&path), FontOverrides::default());
+        assert_eq!(jetbrains.ui_font, UiFontPreset::JetBrainsMono);
+        assert_eq!(
+            jetbrains.font.family,
+            TerminalFontPreset::JetBrainsMono.family()
+        );
+
         let invalid = parse(
             "version = 1\n[appearance]\nui_font = 'unknown'",
             FontOverrides::default(),

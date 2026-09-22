@@ -30,7 +30,7 @@ impl CompiApp {
             .enumerate()
             .map(|(index, choice)| {
                 let selected = index == self.overlay_index;
-                let selected_background = blend_rgb(colors.surface, colors.accent, 0.16);
+                let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
                 div()
                     .id(("pane-action-choice", index))
                     .min_h(px(40.0))
@@ -132,7 +132,7 @@ impl CompiApp {
             .enumerate()
             .map(|(index, choice)| {
                 let selected = index == self.overlay_index;
-                let selected_background = blend_rgb(colors.surface, colors.accent, 0.16);
+                let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
                 div()
                     .id(("command-choice", index))
                     .min_h(px(40.0))
