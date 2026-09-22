@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "compi-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel 2.5.0",
  "base64",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "compi-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "compi-client",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "compi-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bincode",
