@@ -7,6 +7,12 @@ This file records completed implementation and dated verification evidence. Unfi
 - The current source checkpoint completes bounded SSH transport, remote image paste/drop, image-aware logical reflow, explicit graphics protocol coverage, remote headless workflows, and current Windows release packaging.
 - Final focused verification passed 135 protocol/client/daemon tests, current release compilation and WiX validation, portable native launch/reconnect, and the headless local lifecycle. A deterministic SSH process stand-in proved successful multi-connection/reconnect behavior, while actual OpenSSH surfaced its connection-refused failure cleanly. Real-host SSH qualification, physical Windows interactions, native Mac qualification, credentialed signing/notarization, version-to-version upgrade, and a final tag workflow remain in `NEXT_STEPS.md`.
 
+### Multi-monitor window restoration — 2026-09-22
+
+- Persisted window bounds now reopen on the display containing their saved center. The client passes that display ID to GPUI, preventing GPUI's primary-display validation from replacing valid secondary-monitor coordinates and dimensions with default bounds.
+- Saved bounds whose display is no longer connected retain the existing safe fallback to the primary display.
+- Client tests passed 63/63 and warning-denied all-target client Clippy passed. A native Windows check moved an isolated window to the secondary monitor, persisted a 778×520 GPUI content geometry at negative desktop coordinates, and reopened the same instance twice with the exact native outer rectangle restored without drift.
+
 ### Plain terminal link activation — 2026-09-17
 
 - Ctrl/Cmd-click now opens validated `http://` and `https://` links printed as ordinary terminal text, including URLs split by terminal wrapping. Explicit OSC 8 links remain supported, non-web schemes remain blocked, and link activation still overrides application mouse reporting.

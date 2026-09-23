@@ -22,76 +22,82 @@ impl CompiApp {
             .into_any_element()
     }
 
-    pub(super) fn render_pane_actions_menu(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_action_menu(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
-        let rows = self
-            .overlay_choices(cx)
-            .into_iter()
-            .enumerate()
-            .map(|(index, choice)| {
-                let selected = index == self.overlay_index;
-                let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
-                div()
-                    .id(("pane-action-choice", index))
-                    .min_h(px(40.0))
-                    .px_3()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .gap_1()
-                    .border_1()
-                    .border_color(color(if selected {
-                        colors.accent
+        let choices = self.overlay_choices(cx);
+        let menu_position = match self.overlay.as_ref() {
+            Some(Overlay::TabActions { position } | Overlay::HeaderActions { position }) => {
+                let (viewport_width, viewport_height) = overlay_viewport_size(window);
+                let menu_height = choices.len() as f32 * 36.0 + 8.0;
+                Some((
+                    f32::from(position.x).clamp(6.0, (viewport_width - 266.0).max(6.0)),
+                    f32::from(position.y).clamp(6.0, (viewport_height - menu_height).max(6.0)),
+                ))
+            }
+            _ => None,
+        };
+        let rows = choices.into_iter().enumerate().map(|(index, choice)| {
+            let selected = index == self.overlay_index;
+            let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
+            div()
+                .id(("action-choice", index))
+                .min_h(px(32.0))
+                .px_2()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap_1()
+                .border_1()
+                .border_color(color(if selected {
+                    colors.accent
+                } else {
+                    colors.surface
+                }))
+                .bg(color(if selected {
+                    selected_background
+                } else {
+                    colors.surface
+                }))
+                .text_color(color(modal_text_color(
+                    if choice.reason.is_some() {
+                        colors.muted
                     } else {
-                        colors.surface
-                    }))
-                    .bg(color(if selected {
-                        selected_background
-                    } else {
-                        colors.surface
-                    }))
-                    .font_weight(if selected {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .text_color(color(modal_text_color(
-                        if choice.reason.is_some() {
-                            colors.muted
-                        } else {
-                            colors.foreground
-                        },
-                        colors,
-                    )))
-                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.overlay_index = index;
-                        this.activate_overlay(window, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .child(choice.title)
-                            .child(
-                                div()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
-                                    .child(choice.detail),
-                            ),
-                    )
-                    .when_some(choice.reason, |row, reason| {
-                        row.child(
+                        colors.foreground
+                    },
+                    colors,
+                )))
+                .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.overlay_index = index;
+                    this.activate_overlay(window, cx);
+                    cx.stop_propagation();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(div().font_weight(FontWeight::MEDIUM).child(choice.title))
+                        .child(
                             div()
-                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .font_weight(FontWeight::NORMAL)
                                 .text_color(color(modal_text_color(colors.muted, colors)))
-                                .child(reason),
-                        )
-                    })
-            });
+                                .child(choice.detail),
+                        ),
+                )
+                .when_some(choice.reason, |row, reason| {
+                    row.child(
+                        div()
+                            .pt_1()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .child(reason),
+                    )
+                })
+        });
         div()
             .absolute()
             .inset_0()
@@ -105,13 +111,16 @@ impl CompiApp {
             .child(
                 div()
                     .absolute()
-                    .top(px(CHROME_HEIGHT + 6.0))
-                    .right(px(WINDOW_CONTROLS_WIDTH + 6.0))
-                    .w(px(276.0))
+                    .when_some(menu_position, |menu, (x, y)| menu.left(px(x)).top(px(y)))
+                    .when(menu_position.is_none(), |menu| {
+                        menu.top(px(CHROME_HEIGHT + 6.0))
+                            .right(px(WINDOW_CONTROLS_WIDTH + 6.0))
+                    })
+                    .w(px(260.0))
                     .p_1()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_0()
                     .rounded_md()
                     .border_1()
                     .border_color(color(colors.border))
@@ -126,77 +135,103 @@ impl CompiApp {
 
     fn render_choice_rows(&self, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
-        let rows = self
-            .overlay_choices(cx)
-            .into_iter()
-            .enumerate()
-            .map(|(index, choice)| {
-                let selected = index == self.overlay_index;
-                let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
-                div()
-                    .id(("command-choice", index))
-                    .min_h(px(40.0))
-                    .px_3()
-                    .py_1()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .gap_1()
-                    .border_1()
-                    .border_color(color(if selected {
-                        colors.accent
+        let choices = self.overlay_choices(cx);
+        let mut rows = Vec::new();
+        let mut previous_group = None;
+        for (index, choice) in choices.into_iter().enumerate() {
+            let group_heading = if choice.group != previous_group {
+                previous_group = choice.group;
+                choice.group
+            } else {
+                None
+            };
+            let selected = index == self.overlay_index;
+            let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
+            let row = div()
+                .id(("command-choice", index))
+                .min_h(px(40.0))
+                .px_3()
+                .py_1()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap_1()
+                .border_1()
+                .border_color(color(if selected {
+                    colors.accent
+                } else {
+                    colors.surface
+                }))
+                .bg(color(if selected {
+                    selected_background
+                } else {
+                    colors.surface
+                }))
+                .text_color(color(modal_text_color(
+                    if choice.reason.is_some() {
+                        colors.muted
                     } else {
-                        colors.surface
-                    }))
-                    .bg(color(if selected {
-                        selected_background
-                    } else {
-                        colors.surface
-                    }))
-                    .font_weight(if selected {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .text_color(color(modal_text_color(
-                        if choice.reason.is_some() {
-                            colors.muted
-                        } else {
-                            colors.foreground
-                        },
-                        colors,
-                    )))
-                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.overlay_index = index;
-                        this.activate_overlay(window, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .child(div().min_w_0().flex_1().child(choice.title))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
-                                    .child(choice.detail),
-                            ),
-                    )
-                    .when_some(choice.reason, |row, reason| {
-                        row.child(
+                        colors.foreground
+                    },
+                    colors,
+                )))
+                .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.overlay_index = index;
+                    this.activate_overlay(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
                             div()
-                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .min_w_0()
+                                .flex_1()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(choice.title),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .font_weight(FontWeight::NORMAL)
                                 .text_color(color(modal_text_color(colors.muted, colors)))
-                                .child(reason),
+                                .child(choice.detail),
+                        ),
+                )
+                .when_some(choice.reason, |row, reason| {
+                    row.child(
+                        div()
+                            .pt_1()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .child(reason),
+                    )
+                });
+            rows.push(
+                div()
+                    .when_some(group_heading, |item, group| {
+                        item.child(
+                            div()
+                                .px_3()
+                                .pt_3()
+                                .pb_1()
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(color(modal_text_color(colors.muted, colors)))
+                                .child(group),
                         )
                     })
-            });
+                    .child(row)
+                    .into_any_element(),
+            );
+        }
         div()
             .id("overlay-list")
             .min_h_0()
@@ -601,21 +636,6 @@ impl CompiApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(self.render_dialog_header(title, cx))
                     .when(editable, |panel| panel.child(self.render_editor(cx)))
-                    .when(matches!(self.overlay, Some(Overlay::Palette)), |panel| {
-                        panel.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .border_b_1()
-                                .border_color(color(colors.border))
-                                .child(self.command_button(
-                                    "appearance-menu",
-                                    "Quick Appearance",
-                                    Command::OpenQuickAppearance,
-                                    cx,
-                                )),
-                        )
-                    })
                     .child(self.render_choice_rows(cx)),
             )
             .into_any_element()
@@ -679,8 +699,11 @@ impl CompiApp {
             self.render_image_inspector(cx)
         } else if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
             self.render_theme_catalog(window, cx)
-        } else if matches!(self.overlay, Some(Overlay::PaneActions)) {
-            self.render_pane_actions_menu(cx)
+        } else if matches!(
+            self.overlay,
+            Some(Overlay::PaneActions | Overlay::TabActions { .. } | Overlay::HeaderActions { .. })
+        ) {
+            self.render_action_menu(window, cx)
         } else if matches!(
             self.overlay,
             Some(Overlay::QuickAppearance | Overlay::Settings)

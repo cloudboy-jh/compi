@@ -2497,37 +2497,58 @@ fn run_tab_connection(
     connection_target: &ConnectionTarget,
 ) -> crate::Result<()> {
     let mut client = connection_target.connect()?;
-    let workspace = client.workspace()?;
-    let Some(surface) = workspace.surface(surface_id).cloned() else {
-        stop.store(true, Ordering::Release);
-        let _ = sender.send(UiEvent::TabControl {
-            tab_id,
-            message: ServerMessage::Error {
-                code: compi_protocol::ErrorCode::SurfaceNotFound,
-                message: "surface no longer exists".into(),
-                current_revision: Some(workspace.revision),
-            },
-        });
-        return Ok(());
-    };
-    if surface.status == SurfaceStatus::Lost {
-        stop.store(true, Ordering::Release);
-        let _ = sender.send(UiEvent::TabControl {
-            tab_id,
-            message: ServerMessage::Error {
-                code: compi_protocol::ErrorCode::SurfaceUnavailable,
-                message: surface
-                    .error
-                    .unwrap_or_else(|| format!("surface is {:?}", surface.status).to_lowercase()),
-                current_revision: Some(workspace.revision),
-            },
-        });
-        return Ok(());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let workspace = client.workspace()?;
+        let Some(surface) = workspace.surface(surface_id).cloned() else {
+            stop.store(true, Ordering::Release);
+            let _ = sender.send(UiEvent::TabControl {
+                tab_id,
+                message: ServerMessage::Error {
+                    code: compi_protocol::ErrorCode::SurfaceNotFound,
+                    message: "surface no longer exists".into(),
+                    current_revision: Some(workspace.revision),
+                },
+            });
+            return Ok(());
+        };
+        if surface.status == SurfaceStatus::Lost {
+            stop.store(true, Ordering::Release);
+            let _ = sender.send(UiEvent::TabControl {
+                tab_id,
+                message: ServerMessage::Error {
+                    code: compi_protocol::ErrorCode::SurfaceUnavailable,
+                    message: surface.error.unwrap_or_else(|| {
+                        format!("surface is {:?}", surface.status).to_lowercase()
+                    }),
+                    current_revision: Some(workspace.revision),
+                },
+            });
+            return Ok(());
+        }
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match client.attach_surface(&surface, cols, rows) {
+            Ok(()) => break,
+            Err(error)
+                if surface.status == SurfaceStatus::Starting
+                    && Instant::now() < deadline
+                    && error
+                        .downcast_ref::<compi_protocol::DaemonError>()
+                        .is_some_and(|error| {
+                            matches!(
+                                error.code,
+                                compi_protocol::ErrorCode::SurfaceNotFound
+                                    | compi_protocol::ErrorCode::SurfaceUnavailable
+                            )
+                        }) =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
     }
-    if stop.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    client.attach_surface(&surface, cols, rows)?;
     while let Some(message) = client.take_pending_screen() {
         let _ = sender.send(UiEvent::TabScreen { tab_id, message });
     }

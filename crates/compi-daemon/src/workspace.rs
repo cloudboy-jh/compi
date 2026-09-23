@@ -117,6 +117,7 @@ struct PendingCommit {
     candidate: StoredWorkspace,
     receipt: Option<MutationReceipt>,
     effects: Vec<WorkspaceEffect>,
+    prelaunched: Vec<(SurfaceId, ProcessLifetimeId)>,
     reply: Option<SyncSender<std::result::Result<MutationReceipt, ActorError>>>,
 }
 
@@ -318,12 +319,46 @@ fn process_command(
                 }
                 Ok(Prepared::Commit(mut pending)) => {
                     pending.reply = Some(reply);
-                    if persist_sender
+                    let mut launch_failed = false;
+                    for effect in std::mem::take(&mut pending.effects) {
+                        let WorkspaceEffect::Launch(info, _) = &effect else {
+                            pending.effects.push(effect);
+                            continue;
+                        };
+                        if state.effect_sender.send(effect.clone()).is_err() {
+                            launch_failed = true;
+                            break;
+                        }
+                        pending
+                            .prelaunched
+                            .push((info.id.clone(), info.process_lifetime_id.clone()));
+                    }
+                    if launch_failed {
+                        for (surface_id, process_lifetime_id) in pending.prelaunched {
+                            let _ = state.effect_sender.send(WorkspaceEffect::End {
+                                surface_id,
+                                process_lifetime_id,
+                            });
+                        }
+                        let _ = pending.reply.take().unwrap().send(Err(ActorError::new(
+                            ErrorCode::PersistenceUnavailable,
+                            "workspace runtime effect worker stopped",
+                            Some(state.workspace.revision),
+                        )));
+                        state.read_only_error =
+                            Some("workspace runtime effect worker stopped".into());
+                    } else if persist_sender
                         .send(PersistJob {
                             candidate: pending.candidate.clone(),
                         })
                         .is_err()
                     {
+                        for (surface_id, process_lifetime_id) in pending.prelaunched {
+                            let _ = state.effect_sender.send(WorkspaceEffect::End {
+                                surface_id,
+                                process_lifetime_id,
+                            });
+                        }
                         let _ = pending.reply.take().unwrap().send(Err(ActorError::new(
                             ErrorCode::PersistenceUnavailable,
                             "workspace persistence worker stopped",
@@ -348,6 +383,7 @@ fn process_command(
                     candidate,
                     receipt: None,
                     effects: Vec::new(),
+                    prelaunched: Vec::new(),
                     reply: None,
                 };
                 if persist_sender
@@ -390,6 +426,12 @@ fn finish_commit(state: &mut ActorState, completion: PersistResult) {
             }
         }
         Err(error) => {
+            for (surface_id, process_lifetime_id) in pending.prelaunched {
+                let _ = state.effect_sender.send(WorkspaceEffect::End {
+                    surface_id,
+                    process_lifetime_id,
+                });
+            }
             let message = format!("workspace persistence is unavailable: {error}");
             state.read_only_error = Some(message.clone());
             if let Some(reply) = pending.reply {
@@ -549,6 +591,7 @@ fn prepare_mutation(
         candidate,
         receipt: Some(receipt),
         effects,
+        prelaunched: Vec::new(),
         reply: None,
     }))
 }

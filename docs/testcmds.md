@@ -65,6 +65,14 @@ compi-probe --connect user@host:22 --instance qualification surface inspect <sur
 Closing or detaching the probe must leave the remote surface running. A later `workspace` or `surface attach` must report the same server, surface, and process-lifetime IDs. Use `surface end` for one process and `shutdown` only for a disposable instance. Unknown host keys, authentication failures, missing remote binaries, and dropped relays must fail visibly; Compi does not bypass OpenSSH policy or fall back to a local daemon.
 
 
+## Current local packaged build
+
+Run the latest local portable build under its isolated instance so it does not collide with the installed default daemon:
+
+```powershell
+& 'C:\Users\johns\OneDrive\Desktop\Proj\compi\target\distribution-current\Compi-0.1.1-current\compi.exe' --instance latest-local
+```
+
 ## Phase 4 native workspace checks
 
 Use matching protocol 12 client/daemon binaries and an isolated instance. Do not stop an older daemon that owns valuable work merely to try the new client.

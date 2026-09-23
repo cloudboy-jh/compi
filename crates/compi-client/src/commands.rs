@@ -23,21 +23,35 @@ impl Platform {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandCategory {
-    Workspace,
-    Terminal,
+    Tabs,
     Panes,
+    Workspaces,
+    Terminal,
+    Window,
     Appearance,
-    Application,
+    System,
 }
 
 impl CommandCategory {
+    pub const ALL: [Self; 7] = [
+        Self::Tabs,
+        Self::Panes,
+        Self::Workspaces,
+        Self::Terminal,
+        Self::Window,
+        Self::Appearance,
+        Self::System,
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Workspace => "Workspace",
-            Self::Terminal => "Terminal",
+            Self::Tabs => "Tabs",
             Self::Panes => "Panes",
+            Self::Workspaces => "Workspaces",
+            Self::Terminal => "Terminal",
+            Self::Window => "Window",
             Self::Appearance => "Appearance",
-            Self::Application => "Application",
+            Self::System => "System",
         }
     }
 }
@@ -63,15 +77,15 @@ macro_rules! registry {
 
 registry! {
     OpenPalette, "open_palette", "Open command palette", Some("cmd-shift-p"), Some("ctrl-shift-p");
-    CreateWorkspace, "create_workspace", "Create workspace", Some("cmd-alt-n"), Some("ctrl-shift-alt-n");
+    CreateWorkspace, "create_workspace", "New workspace…", Some("cmd-alt-n"), Some("ctrl-shift-alt-n");
     SwitchWorkspace, "switch_workspace", "Switch workspace", None, None;
-    RenameWorkspace, "rename_workspace", "Rename workspace", None, None;
+    RenameWorkspace, "rename_workspace", "Rename workspace…", None, None;
     RemoveWorkspace, "remove_workspace", "Remove workspace…", None, None;
     NewTab, "new_tab", "New terminal tab", Some("cmd-t"), Some("ctrl-t");
     SwitchTab, "switch_tab", "Switch terminal tab", None, None;
     PreviousTab, "previous_tab", "Previous terminal tab", Some("cmd-shift-left"), Some("ctrl-shift-tab");
     NextTab, "next_tab", "Next terminal tab", Some("cmd-shift-right"), Some("ctrl-tab");
-    RenameTab, "rename_tab", "Rename terminal tab", None, None;
+    RenameTab, "rename_tab", "Rename terminal tab…", None, None;
     MoveTabLeft, "move_tab_left", "Move terminal tab left", Some("cmd-alt-shift-left"), Some("ctrl-shift-alt-left");
     MoveTabRight, "move_tab_right", "Move terminal tab right", Some("cmd-alt-shift-right"), Some("ctrl-shift-alt-right");
     RemoveTab, "remove_tab", "Remove terminal tab…", None, None;
@@ -93,7 +107,7 @@ registry! {
     RemovePane, "remove_pane", "Remove pane…", None, Some("ctrl-shift-w");
     EndSurface, "end_surface", "End surface process…", None, None;
     RestartSurface, "restart_surface", "Restart exited, failed, or lost surface", None, None;
-    ToggleSidebar, "toggle_sidebar", "Show/hide workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");
+    ToggleSidebar, "toggle_sidebar", "Toggle workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");
     ResetSidebarWidth, "reset_sidebar_width", "Reset sidebar width", None, None;
     Copy, "copy", "Copy selection", Some("cmd-c"), Some("ctrl-shift-c");
     Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-v");
@@ -206,20 +220,21 @@ impl Command {
     pub const fn category(self) -> CommandCategory {
         use Command::*;
         match self {
-            CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace | SwitchTab
-            | PreviousTab | NextTab | RenameTab | MoveTabLeft | MoveTabRight | RemoveTab
-            | DetachTab | RestoreHiddenTab | NewWindow | MoveTabToNewWindow | MoveTabToWindow => {
-                CommandCategory::Workspace
-            }
-            NewTab | Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
-            | RestartSurface | EndSurface => CommandCategory::Terminal,
+            NewTab | SwitchTab | PreviousTab | NextTab | RenameTab | MoveTabLeft | MoveTabRight
+            | RemoveTab | DetachTab | RestoreHiddenTab => CommandCategory::Tabs,
             SplitRight | SplitDown | TogglePaneZoom | FocusLeft | FocusRight | FocusUp
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | RemovePane => CommandCategory::Panes,
+            CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
+            | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
+            Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
+            | RestartSurface | EndSurface => CommandCategory::Terminal,
+            NewWindow | MoveTabToNewWindow | MoveTabToWindow | ResetClientLayout | Reconnect => {
+                CommandCategory::Window
+            }
             OpenQuickAppearance | OpenSettings | OpenThemeCatalog => CommandCategory::Appearance,
-            OpenPalette | ToggleSidebar | ResetSidebarWidth | OpenConfiguration
-            | ResetClientLayout | Reconnect | RestartDaemon | OpenDiagnostics | Quit => {
-                CommandCategory::Application
+            OpenPalette | OpenConfiguration | RestartDaemon | OpenDiagnostics | Quit => {
+                CommandCategory::System
             }
         }
     }
@@ -1152,7 +1167,7 @@ mod tests {
         assert!(search("appearance settings").any(|spec| spec.command == Command::OpenSettings));
         assert_eq!(
             Command::RestartDaemon.spec().category(),
-            CommandCategory::Application
+            CommandCategory::System
         );
         assert!(shortcut_matches(
             "Ctrl+Shift+P",

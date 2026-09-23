@@ -29,6 +29,12 @@ pub(super) enum TextPurpose {
 pub(super) enum Overlay {
     Palette,
     PaneActions,
+    TabActions {
+        position: Point<Pixels>,
+    },
+    HeaderActions {
+        position: Point<Pixels>,
+    },
     QuickAppearance,
     Settings,
     ThemeCatalog,
@@ -59,6 +65,113 @@ pub(super) const MODAL_SCRIM_OPACITY: f32 = 0.72;
 pub(super) fn overlay_viewport_size(window: &Window) -> (f32, f32) {
     let viewport = window.viewport_size();
     (f32::from(viewport.width), f32::from(viewport.height))
+}
+
+fn display_index_for_bounds(
+    window_bounds: Bounds<Pixels>,
+    displays: impl IntoIterator<Item = Bounds<Pixels>>,
+) -> Option<usize> {
+    let center = window_bounds.center();
+    displays
+        .into_iter()
+        .position(|display_bounds| display_bounds.contains(&center))
+}
+
+#[cfg(windows)]
+fn restore_native_window_geometry(
+    window: &mut Window,
+    geometry: &WindowGeometry,
+    display_index: usize,
+) {
+    use windows::{
+        Win32::{
+            Foundation::{LPARAM, RECT},
+            Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
+            UI::{
+                HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+                WindowsAndMessaging::{
+                    GetWindowRect, SW_MAXIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE,
+                    SWP_NOZORDER, SetWindowPos, ShowWindow,
+                },
+            },
+        },
+        core::BOOL,
+    };
+
+    unsafe extern "system" fn collect_monitor(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        monitors: LPARAM,
+    ) -> BOOL {
+        let monitors = unsafe { &mut *(monitors.0 as *mut Vec<HMONITOR>) };
+        monitors.push(monitor);
+        true.into()
+    }
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+    let mut monitors = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut monitors as *mut _ as isize),
+        );
+    }
+    let Some(&monitor) = monitors.get(display_index) else {
+        return;
+    };
+    let (mut dpi_x, mut dpi_y) = (0, 0);
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_err()
+        || dpi_x == 0
+    {
+        return;
+    }
+    let scale = dpi_x as f32 / 96.0;
+    let x = (geometry.x * scale).round() as i32;
+    let y = (geometry.y * scale).round() as i32;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    window.resize(size(px(geometry.width), px(geometry.height)));
+    let mut outer = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut outer) }.is_ok() {
+        let current = window.window_bounds().get_bounds();
+        let border_x = (f32::from(current.origin.x) * scale).round() as i32 - outer.left;
+        let border_y = (f32::from(current.origin.y) * scale).round() as i32 - outer.top;
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x - border_x,
+                y - border_y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    if geometry.maximized {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
+    }
 }
 
 pub(super) struct DividerDrag {
@@ -96,9 +209,18 @@ pub(super) fn open_compi_window(
     {
         return Err("The transferred terminal tab no longer exists".into());
     }
-    let bounds = slot
-        .state
-        .geometry
+    let restored_geometry = slot.state.geometry.clone();
+    let displays = cx.displays();
+    let restored_display_index = restored_geometry.as_ref().and_then(|geometry| {
+        let bounds = Bounds::new(
+            point(px(geometry.x), px(geometry.y)),
+            size(px(geometry.width), px(geometry.height)),
+        );
+        display_index_for_bounds(bounds, displays.iter().map(|display| display.bounds()))
+    });
+    let display_id =
+        restored_display_index.and_then(|index| displays.get(index).map(|display| display.id()));
+    let bounds = restored_geometry
         .as_ref()
         .map(|geometry| {
             let bounds = Bounds::new(
@@ -117,6 +239,7 @@ pub(super) fn open_compi_window(
     let window = cx.open_window(
         WindowOptions {
             window_bounds: Some(bounds),
+            display_id,
             window_min_size: Some(size(px(420.0), px(280.0))),
             window_background: if native_material_available() {
                 WindowBackgroundAppearance::Blurred
@@ -151,6 +274,14 @@ pub(super) fn open_compi_window(
             })
         },
     )?;
+    #[cfg(windows)]
+    if let (Some(geometry), Some(display_index)) =
+        (restored_geometry.as_ref(), restored_display_index)
+    {
+        window.update(cx, |_, window, _| {
+            restore_native_window_geometry(window, geometry, display_index);
+        })?;
+    }
     window.update(cx, |view, window, cx| {
         window.focus(&view.focus_handle);
         cx.activate(true);
@@ -1440,10 +1571,6 @@ impl CompiApp {
                 view.state = ConnectionState::Failed;
                 continue;
             }
-            if surface.status == SurfaceStatus::Starting {
-                view.state = ConnectionState::Connecting;
-                continue;
-            }
             if view.stop.load(Ordering::Acquire) {
                 if let Ok(mut routes) = EVENT_ROUTES.lock() {
                     routes.remove(&view.id);
@@ -1965,6 +2092,8 @@ impl CompiApp {
                         self.overlay,
                         Some(
                             Overlay::PaneActions
+                                | Overlay::TabActions { .. }
+                                | Overlay::HeaderActions { .. }
                                 | Overlay::QuickAppearance
                                 | Overlay::Settings
                                 | Overlay::Confirm { .. }
@@ -2014,8 +2143,14 @@ impl CompiApp {
                 }
                 _ => {
                     // Printable and composing input belongs to native text fields, never menus.
-                    if !matches!(self.overlay, Some(Overlay::PaneActions))
-                        && key.key_char.is_some()
+                    if !matches!(
+                        self.overlay,
+                        Some(
+                            Overlay::PaneActions
+                                | Overlay::TabActions { .. }
+                                | Overlay::HeaderActions { .. }
+                        )
+                    ) && key.key_char.is_some()
                         && !key.modifiers.control
                         && !key.modifiers.platform
                     {
@@ -2064,6 +2199,8 @@ impl CompiApp {
             self.overlay,
             Some(
                 Overlay::PaneActions
+                    | Overlay::TabActions { .. }
+                    | Overlay::HeaderActions { .. }
                     | Overlay::QuickAppearance
                     | Overlay::Settings
                     | Overlay::Confirm { .. }
@@ -2628,6 +2765,7 @@ enum ChoiceAction {
 struct Choice {
     title: String,
     detail: String,
+    group: Option<&'static str>,
     reason: Option<String>,
     action: ChoiceAction,
 }
@@ -2766,16 +2904,51 @@ impl CompiApp {
         let query = self.ime_text.to_lowercase();
         let mut choices = Vec::new();
         match &self.overlay {
-            Some(Overlay::PaneActions) => {
+            Some(
+                Overlay::PaneActions | Overlay::TabActions { .. } | Overlay::HeaderActions { .. },
+            ) => {
                 let context = self.command_context(cx);
-                for command in [
-                    Command::SplitRight,
-                    Command::SplitDown,
-                    Command::TogglePaneZoom,
-                ] {
+                let commands: &[Command] = match self.overlay.as_ref() {
+                    Some(Overlay::PaneActions) => &[
+                        Command::SplitRight,
+                        Command::SplitDown,
+                        Command::TogglePaneZoom,
+                    ],
+                    Some(Overlay::TabActions { .. }) => &[
+                        Command::NewTab,
+                        Command::RenameTab,
+                        Command::SplitRight,
+                        Command::SplitDown,
+                        Command::MoveTabToNewWindow,
+                        Command::DetachTab,
+                        Command::RemoveTab,
+                    ],
+                    Some(Overlay::HeaderActions { .. }) => &[
+                        Command::NewTab,
+                        Command::CreateWorkspace,
+                        Command::SplitRight,
+                        Command::SplitDown,
+                        Command::ToggleSidebar,
+                    ],
+                    _ => unreachable!(),
+                };
+                for &command in commands {
+                    let title = match command {
+                        Command::NewTab => "New Tab",
+                        Command::CreateWorkspace => "New Workspace…",
+                        Command::RenameTab => "Rename Tab…",
+                        Command::SplitRight => "Split Right",
+                        Command::SplitDown => "Split Down",
+                        Command::MoveTabToNewWindow => "Move to New Window",
+                        Command::DetachTab => "Hide Tab",
+                        Command::RemoveTab => "Remove Tab…",
+                        Command::ToggleSidebar => "Toggle Sidebar",
+                        _ => self.command_label(command),
+                    };
                     choices.push(Choice {
-                        title: self.command_label(command).into(),
+                        title: title.into(),
                         detail: self.configured_shortcut(command).unwrap_or("").into(),
+                        group: None,
                         reason: command.disabled_reason(&context).map(str::to_owned),
                         action: ChoiceAction::Command(command),
                     });
@@ -2784,16 +2957,20 @@ impl CompiApp {
             Some(Overlay::QuickAppearance | Overlay::Settings | Overlay::ThemeCatalog) => {}
             Some(Overlay::Palette) => {
                 let context = self.command_context(cx);
-                for spec in commands::REGISTRY
-                    .iter()
-                    .filter(|spec| spec.matches_query(&self.ime_text))
-                {
-                    choices.push(Choice {
-                        title: self.command_label(spec.command).into(),
-                        detail: self.configured_shortcut(spec.command).unwrap_or("").into(),
-                        reason: spec.command.disabled_reason(&context).map(str::to_owned),
-                        action: ChoiceAction::Command(spec.command),
-                    });
+                for category in commands::CommandCategory::ALL {
+                    for spec in commands::REGISTRY.iter().filter(|spec| {
+                        spec.command != Command::OpenPalette
+                            && spec.category() == category
+                            && spec.matches_query(&self.ime_text)
+                    }) {
+                        choices.push(Choice {
+                            title: self.command_label(spec.command).into(),
+                            detail: self.configured_shortcut(spec.command).unwrap_or("").into(),
+                            group: Some(category.label()),
+                            reason: spec.command.disabled_reason(&context).map(str::to_owned),
+                            action: ChoiceAction::Command(spec.command),
+                        });
+                    }
                 }
                 if let Some(workspace) = &self.workspace {
                     for session in &workspace.sessions {
@@ -2803,6 +2980,7 @@ impl CompiApp {
                                 choices.push(Choice {
                                     title,
                                     detail: self.tab_status(tab),
+                                    group: Some("Open tabs"),
                                     reason: None,
                                     action: ChoiceAction::Tab(tab.id.clone()),
                                 });
@@ -2818,6 +2996,7 @@ impl CompiApp {
                             choices.push(Choice {
                                 title: session.label.clone(),
                                 detail: format!("{} terminal tabs", session.tabs.len()),
+                                group: None,
                                 reason: None,
                                 action: ChoiceAction::Workspace(session.id.clone()),
                             });
@@ -2836,6 +3015,7 @@ impl CompiApp {
                                 choices.push(Choice {
                                     title,
                                     detail: self.tab_status(tab),
+                                    group: None,
                                     reason: None,
                                     action: ChoiceAction::Tab(tab.id.clone()),
                                 });
@@ -2856,6 +3036,7 @@ impl CompiApp {
                             choices.push(Choice {
                                 title,
                                 detail: other.slot_id.clone(),
+                                group: None,
                                 reason: None,
                                 action: ChoiceAction::Window(handle),
                             });
@@ -3257,6 +3438,7 @@ impl CompiApp {
             .unwrap_or_default();
         let tabs = visible.into_iter().enumerate().map(|(index, tab)| {
             let id = tab.id.clone();
+            let context_id = id.clone();
             let close_id = id.clone();
             let selected = self
                 .selected_tab()
@@ -3305,8 +3487,15 @@ impl CompiApp {
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
-                        this.open_overlay(Overlay::Palette, "tab");
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.select_terminal(context_id.clone(), false);
+                        this.open_overlay(
+                            Overlay::TabActions {
+                                position: event.position,
+                            },
+                            "",
+                        );
+                        cx.stop_propagation();
                         cx.notify();
                     }),
                 )
@@ -3356,6 +3545,19 @@ impl CompiApp {
                         toggle_window_maximized(window);
                         this.titlebar_drag = false;
                     }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.open_overlay(
+                        Overlay::HeaderActions {
+                            position: event.position,
+                        },
+                        "",
+                    );
+                    cx.stop_propagation();
+                    cx.notify();
                 }),
             )
             .child(
@@ -3667,19 +3869,19 @@ impl CompiApp {
                             .border_color(color(colors.border))
                             .child(self.command_button(
                                 "workspace-actions",
-                                "Workspace actions…",
+                                "Commands",
                                 Command::OpenPalette,
                                 cx,
                             ))
                             .child(self.command_button(
                                 "appearance-sidebar",
-                                "Appearance…",
+                                "Appearance",
                                 Command::OpenQuickAppearance,
                                 cx,
                             ))
                             .child(self.command_button(
                                 "settings-sidebar",
-                                "Settings…",
+                                "Settings",
                                 Command::OpenSettings,
                                 cx,
                             )),
@@ -4890,8 +5092,8 @@ mod tests {
     use super::{
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
-        WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, header_metrics,
-        opacity_at_slider_position,
+        WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, display_index_for_bounds,
+        header_metrics, opacity_at_slider_position,
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};
@@ -4900,6 +5102,24 @@ mod tests {
     #[test]
     fn windows_pointer_coordinates_follow_logical_terminal_geometry() {
         assert_eq!(pointer_coordinate(px(114.0), 1.5), 76.0);
+    }
+
+    #[test]
+    fn restored_window_selects_the_display_containing_its_saved_center() {
+        let displays = [
+            Bounds::new(point(px(0.0), px(0.0)), size(px(1706.0), px(928.0))),
+            Bounds::new(point(px(-3440.0), px(0.0)), size(px(3440.0), px(1392.0))),
+        ];
+        let saved = Bounds::new(point(px(-3275.0), px(368.0)), size(px(953.0), px(636.0)));
+
+        assert_eq!(display_index_for_bounds(saved, displays), Some(1));
+        assert_eq!(
+            display_index_for_bounds(
+                Bounds::new(point(px(9000.0), px(9000.0)), size(px(953.0), px(636.0)),),
+                displays,
+            ),
+            None
+        );
     }
 
     #[test]
