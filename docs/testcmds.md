@@ -65,12 +65,22 @@ compi-probe --connect user@host:22 --instance qualification surface inspect <sur
 Closing or detaching the probe must leave the remote surface running. A later `workspace` or `surface attach` must report the same server, surface, and process-lifetime IDs. Use `surface end` for one process and `shutdown` only for a disposable instance. Unknown host keys, authentication failures, missing remote binaries, and dropped relays must fail visibly; Compi does not bypass OpenSSH policy or fall back to a local daemon.
 
 
-## Current local packaged build
+## Current local portable build
 
-Run the latest local portable build under its isolated instance so it does not collide with the installed default daemon:
+From the repository root on Windows, prepare the runtime and build a matching release pair. Set `GPUI_FXC_PATH` to your Windows SDK's x64 `fxc.exe` if it is not already discoverable:
 
 ```powershell
-& 'C:\Users\johns\OneDrive\Desktop\Proj\compi\target\distribution-current\Compi-0.1.1-current\compi.exe' --instance latest-local
+pwsh -File tools/prepare-conpty.ps1
+cargo build --locked --release --target-dir target/compi-latest -p compi-client -p compi-daemon --bins
+New-Item -ItemType Directory -Force target/compi-latest/portable | Out-Null
+Copy-Item target/compi-latest/release/compi.exe target/compi-latest/portable/compi-latest.exe
+Copy-Item target/compi-latest/release/compi-daemon.exe,target/compi-latest/release/conpty.dll,target/compi-latest/release/OpenConsole.exe,target/compi-latest/release/ConPTY-LICENSE.txt,LICENSE target/compi-latest/portable/
+```
+
+Keep the runtime beside the daemon. Launch under a separate instance to avoid the installed default daemon:
+
+```powershell
+& '.\target\compi-latest\portable\compi-latest.exe' --instance compi-latest-local
 ```
 
 ## Phase 4 native workspace checks

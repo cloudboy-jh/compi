@@ -167,7 +167,7 @@ fn fuzzy_score(path: &[u8], query: &[u8]) -> Option<i32> {
     let mut previous_match = None;
     let mut score = 0;
     for (index, &byte) in path.iter().enumerate() {
-        if byte.to_ascii_lowercase() != query[matched].to_ascii_lowercase() {
+        if !byte.eq_ignore_ascii_case(&query[matched]) {
             continue;
         }
         score += 8;

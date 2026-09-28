@@ -313,11 +313,37 @@ fn process_command(
                 )));
                 return false;
             }
-            match prepare_mutation(state, &request) {
-                Ok(Prepared::Duplicate(receipt)) => {
-                    let _ = reply.send(Ok(receipt));
+            let fingerprint = match fingerprint(&request) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    let _ = reply.send(Err(ActorError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("could not fingerprint mutation: {error}"),
+                        Some(state.workspace.revision),
+                    )));
+                    return false;
                 }
-                Ok(Prepared::Commit(mut pending)) => {
+            };
+            if let Some(receipt) = state
+                .workspace
+                .receipts
+                .iter()
+                .find(|receipt| receipt.mutation_id == request.mutation_id)
+            {
+                let result = if receipt.fingerprint == fingerprint {
+                    Ok(receipt.clone())
+                } else {
+                    Err(ActorError::new(
+                        ErrorCode::MutationIdReused,
+                        "mutation ID was already used for different content",
+                        Some(state.workspace.revision),
+                    ))
+                };
+                let _ = reply.send(result);
+                return false;
+            }
+            match prepare_mutation(state, &request, fingerprint) {
+                Ok(mut pending) => {
                     pending.reply = Some(reply);
                     let mut launch_failed = false;
                     for effect in std::mem::take(&mut pending.effects) {
@@ -445,38 +471,11 @@ fn finish_commit(state: &mut ActorState, completion: PersistResult) {
     }
 }
 
-enum Prepared {
-    Duplicate(MutationReceipt),
-    Commit(PendingCommit),
-}
-
 fn prepare_mutation(
     state: &mut ActorState,
     request: &MutationRequest,
-) -> std::result::Result<Prepared, ActorError> {
-    let fingerprint = fingerprint(request).map_err(|error| {
-        ActorError::new(
-            ErrorCode::InvalidRequest,
-            format!("could not fingerprint mutation: {error}"),
-            Some(state.workspace.revision),
-        )
-    })?;
-    if let Some(receipt) = state
-        .workspace
-        .receipts
-        .iter()
-        .find(|receipt| receipt.mutation_id == request.mutation_id)
-    {
-        return if receipt.fingerprint == fingerprint {
-            Ok(Prepared::Duplicate(receipt.clone()))
-        } else {
-            Err(ActorError::new(
-                ErrorCode::MutationIdReused,
-                "mutation ID was already used for different content",
-                Some(state.workspace.revision),
-            ))
-        };
-    }
+    fingerprint: String,
+) -> std::result::Result<PendingCommit, ActorError> {
     if request.server_id != state.workspace.server_id {
         return Err(ActorError::new(
             ErrorCode::InvalidRequest,
@@ -587,13 +586,13 @@ fn prepare_mutation(
             Some(state.workspace.revision),
         )
     })?;
-    Ok(Prepared::Commit(PendingCommit {
+    Ok(PendingCommit {
         candidate,
         receipt: Some(receipt),
         effects,
         prelaunched: Vec::new(),
         reply: None,
-    }))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

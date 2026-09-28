@@ -27,12 +27,23 @@ pub(super) enum TextPurpose {
     RenameTab(TabId),
 }
 
+const STALE_TAB_MENU: &str =
+    "Workspace changed while the terminal menu was open. Reopen it to review the current panes.";
+
 #[derive(Clone)]
 pub(super) enum Overlay {
     Palette,
     PaneActions,
     TabActions {
         position: Point<Pixels>,
+        tab_id: TabId,
+        revision: u64,
+    },
+    TabPaneActions {
+        position: Point<Pixels>,
+        tab_id: TabId,
+        pane_id: PaneId,
+        revision: u64,
     },
     HeaderActions {
         position: Point<Pixels>,
@@ -401,6 +412,7 @@ impl CompiApp {
             ime_marked_range: None,
             ime_selected_range: 0..0,
             surface_views: Vec::new(),
+            surface_names: HashMap::new(),
             focused_view: None,
             file_tree: None,
             tree_scroll: ScrollHandle::new(),
@@ -1072,6 +1084,10 @@ impl CompiApp {
             .is_some_and(|old| old.server_generation != workspace.server_generation);
         if generation_changed {
             self.pane_zoom.clear_all();
+            self.surface_names.clear();
+        } else {
+            self.surface_names
+                .retain(|id, _| workspace.surface(id).is_some());
         }
         self.reconcile_pane_zoom(&workspace);
         let changed = self.workspace.as_ref().is_none_or(|old| {
@@ -1556,8 +1572,24 @@ impl CompiApp {
             collect_leaves(&tab.layout, &mut leaves);
         }
         let wanted: HashSet<_> = leaves.iter().map(|(_, surface)| surface.clone()).collect();
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
         for view in &mut self.surface_views {
             if !wanted.contains(&view.surface_id) {
+                if workspace.surface(&view.surface_id).is_some()
+                    && let Some(snapshot) = view.mirror.snapshot()
+                    && !snapshot.title.trim().is_empty()
+                {
+                    self.surface_names.insert(
+                        view.surface_id.clone(),
+                        (
+                            view.lifetime.clone(),
+                            concise_tab_title(&snapshot.title),
+                            snapshot.current_directory.clone(),
+                        ),
+                    );
+                }
                 view.stop.store(true, Ordering::Release);
                 if let Some(transport) = view.transport.take() {
                     transport.close();
@@ -1569,9 +1601,6 @@ impl CompiApp {
             }
         }
         let metrics = self.metrics();
-        let Some(workspace) = &self.workspace else {
-            return;
-        };
         self.surface_views.retain(|view| {
             workspace.surface(&view.surface_id).is_some()
                 && (wanted.contains(&view.surface_id) || !view.closed.load(Ordering::Acquire))
@@ -2181,6 +2210,7 @@ impl CompiApp {
                         Some(
                             Overlay::PaneActions
                                 | Overlay::TabActions { .. }
+                                | Overlay::TabPaneActions { .. }
                                 | Overlay::HeaderActions { .. }
                                 | Overlay::QuickAppearance
                                 | Overlay::Settings
@@ -2236,6 +2266,7 @@ impl CompiApp {
                         Some(
                             Overlay::PaneActions
                                 | Overlay::TabActions { .. }
+                                | Overlay::TabPaneActions { .. }
                                 | Overlay::HeaderActions { .. }
                         )
                     ) && key.key_char.is_some()
@@ -2288,6 +2319,7 @@ impl CompiApp {
             Some(
                 Overlay::PaneActions
                     | Overlay::TabActions { .. }
+                    | Overlay::TabPaneActions { .. }
                     | Overlay::HeaderActions { .. }
                     | Overlay::QuickAppearance
                     | Overlay::Settings
@@ -2756,10 +2788,99 @@ impl CompiApp {
         );
     }
 
+    fn pane_action_reason(
+        &self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        action: PaneAction,
+    ) -> Option<&'static str> {
+        let Some((count, surface_id)) = self.tab_pane_target(tab_id, pane_id) else {
+            return Some("This terminal is no longer in the selected tab");
+        };
+        match action {
+            PaneAction::Detach if count < 2 => Some("The tab has only one pane"),
+            PaneAction::End
+                if self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.surface(&surface_id))
+                    .is_none_or(|surface| {
+                        !matches!(
+                            surface.status,
+                            SurfaceStatus::Running | SurfaceStatus::Starting
+                        )
+                    }) =>
+            {
+                Some("The terminal process is not running")
+            }
+            _ => None,
+        }
+    }
+
+    fn activate_tab_pane_action(
+        &mut self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        action: PaneAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let valid_menu = matches!(
+            &self.overlay,
+            Some(Overlay::TabPaneActions {
+                tab_id: clicked,
+                pane_id: selected,
+                revision,
+                ..
+            }) if clicked == &tab_id && selected == &pane_id
+                && self.workspace.as_ref().is_some_and(|workspace| workspace.revision == *revision)
+        );
+        if !valid_menu {
+            self.dismiss_overlay();
+            self.global_error = Some(STALE_TAB_MENU.into());
+        } else if let Some(reason) = self.pane_action_reason(&tab_id, &pane_id, action) {
+            self.global_error = Some(reason.into());
+        } else {
+            self.dismiss_overlay();
+            match action {
+                PaneAction::Detach => self.mutate(WorkspaceMutation::DetachPane { pane_id }, true),
+                PaneAction::End => {
+                    if let Some((_, surface_id)) = self.tab_pane_target(&tab_id, &pane_id)
+                        && let Some(surface) = self
+                            .workspace
+                            .as_ref()
+                            .and_then(|workspace| workspace.surface(&surface_id))
+                    {
+                        self.confirm_removal(
+                            WorkspaceMutation::EndSurface {
+                                surface_id: surface.id.clone(),
+                                expected_lifetime: surface.process_lifetime_id.clone(),
+                            },
+                            "End this terminal's process tree? The final grid will remain readable.",
+                        );
+                    }
+                }
+            }
+        }
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
     fn activate_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(overlay) = self.overlay.clone() else {
             return;
         };
+        if let Overlay::TabActions { revision, .. } | Overlay::TabPaneActions { revision, .. } =
+            &overlay
+            && self
+                .workspace
+                .as_ref()
+                .is_none_or(|workspace| workspace.revision != *revision)
+        {
+            self.dismiss_overlay();
+            self.global_error = Some(STALE_TAB_MENU.into());
+            return;
+        }
         match overlay {
             Overlay::ThemeCatalog => self.apply_catalog_theme(window, cx),
             Overlay::QuickAppearance | Overlay::Settings | Overlay::ImageInspector => {
@@ -2817,14 +2938,16 @@ impl CompiApp {
                 self.begin_daemon_restart();
             }
             Overlay::Diagnostics => self.dismiss_overlay(),
-            _ => {
+            other => {
                 let choices = self.overlay_choices(cx);
                 if let Some(choice) = choices.get(self.overlay_index).cloned() {
                     if let Some(reason) = choice.reason {
                         self.global_error = Some(reason);
                         return;
                     }
-                    self.dismiss_overlay();
+                    if !matches!(choice.action, ChoiceAction::Pane { .. }) {
+                        self.dismiss_overlay();
+                    }
                     match choice.action {
                         ChoiceAction::Command(command) => self.execute(command, window, cx),
                         ChoiceAction::Workspace(id) => {
@@ -2835,6 +2958,26 @@ impl CompiApp {
                             self.save_state();
                         }
                         ChoiceAction::Tab(id) => self.select_terminal(id, true),
+                        ChoiceAction::Pane { tab_id, pane_id } => {
+                            if let Overlay::TabActions {
+                                position, revision, ..
+                            }
+                            | Overlay::TabPaneActions {
+                                position, revision, ..
+                            } = other
+                            {
+                                self.overlay = Some(Overlay::TabPaneActions {
+                                    position,
+                                    tab_id: tab_id.clone(),
+                                    pane_id: pane_id.clone(),
+                                    revision,
+                                });
+                                self.overlay_focus = usize::from(
+                                    self.pane_action_reason(&tab_id, &pane_id, PaneAction::Detach)
+                                        .is_some(),
+                                );
+                            }
+                        }
                         ChoiceAction::Window(handle) => {
                             if let Some(tab) = self.selected_tab().map(|tab| tab.id.clone()) {
                                 self.transfer_tab(tab, Some(handle), window, cx);
@@ -2854,8 +2997,15 @@ enum ChoiceAction {
     Command(Command),
     Workspace(SessionId),
     Tab(TabId),
+    Pane { tab_id: TabId, pane_id: PaneId },
     Window(AnyWindowHandle),
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneAction {
+    Detach,
+    End,
+}
+
 #[derive(Clone)]
 struct Choice {
     title: String,
@@ -2916,32 +3066,106 @@ fn concise_tab_title(title: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct TabPane {
+    pane_id: PaneId,
+    title: String,
+    directory: Option<String>,
+}
+
+fn tab_caption(custom: &str, panes: &[TabPane]) -> (String, Option<String>) {
+    let custom = custom.trim();
+    let primary = if custom.is_empty() {
+        panes
+            .first()
+            .map(|pane| pane.title.clone())
+            .unwrap_or_else(|| "Terminal".into())
+    } else {
+        custom.to_owned()
+    };
+    let secondary = match panes.len() {
+        0 | 1 => None,
+        2 if custom.is_empty() => Some(panes[1].title.clone()),
+        2 => Some("2".into()),
+        count => Some(format!("{count}+")),
+    };
+    (primary, secondary)
+}
+
 impl CompiApp {
-    fn tab_label(&self, tab: &WorkspaceTab) -> String {
-        if !tab.label.trim().is_empty() {
-            return tab.label.clone();
-        }
+    fn tab_panes(&self, tab: &WorkspaceTab) -> Vec<TabPane> {
         let mut leaves = Vec::new();
         collect_leaves(&tab.layout, &mut leaves);
         leaves
-            .iter()
-            .find_map(|(_, id)| {
-                self.surface_views
+            .into_iter()
+            .enumerate()
+            .map(|(index, (pane_id, surface_id))| {
+                let surface = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.surface(&surface_id));
+                let view = self
+                    .surface_views
                     .iter()
-                    .find(|view| &view.surface_id == id)
-                    .map(|view| concise_tab_title(&view.title()))
+                    .find(|view| view.surface_id == surface_id);
+                let snapshot = view.and_then(|view| view.mirror.snapshot());
+                let cached = self
+                    .surface_names
+                    .get(&surface_id)
+                    .filter(|(lifetime, _, _)| {
+                        surface.is_some_and(|surface| surface.process_lifetime_id == *lifetime)
+                    });
+                let directory = snapshot
+                    .and_then(|snapshot| snapshot.current_directory.clone())
+                    .or_else(|| cached.and_then(|(_, _, directory)| directory.clone()))
+                    .or_else(|| {
+                        surface?
+                            .working_directory
+                            .as_ref()
+                            .map(|cwd| cwd.resolved_wsl_path.clone())
+                    });
+                let title = snapshot
+                    .map(|snapshot| snapshot.title.trim())
+                    .filter(|title| !title.is_empty())
+                    .map(concise_tab_title)
+                    .or_else(|| cached.map(|(_, title, _)| title.clone()))
+                    .or_else(|| directory.as_deref().map(concise_path_title))
+                    .unwrap_or_else(|| format!("Terminal {}", index + 1));
+                TabPane {
+                    pane_id,
+                    title,
+                    directory,
+                }
             })
-            .or_else(|| {
-                leaves.first().and_then(|(_, id)| {
-                    self.workspace
-                        .as_ref()?
-                        .surface(id)?
-                        .working_directory
-                        .as_ref()
-                        .map(|cwd| concise_path_title(&cwd.resolved_wsl_path))
-                })
-            })
-            .unwrap_or_else(|| "Terminal".into())
+            .collect()
+    }
+
+    fn tab_by_id(&self, tab_id: &TabId) -> Option<&WorkspaceTab> {
+        self.workspace
+            .as_ref()?
+            .sessions
+            .iter()
+            .flat_map(|session| &session.tabs)
+            .find(|tab| &tab.id == tab_id)
+    }
+
+    fn tab_pane_target(&self, tab_id: &TabId, pane_id: &PaneId) -> Option<(usize, SurfaceId)> {
+        let mut leaves = Vec::new();
+        collect_leaves(&self.tab_by_id(tab_id)?.layout, &mut leaves);
+        let count = leaves.len();
+        leaves
+            .into_iter()
+            .find(|(id, _)| id == pane_id)
+            .map(|(_, surface_id)| (count, surface_id))
+    }
+
+    fn tab_label(&self, tab: &WorkspaceTab) -> String {
+        let panes = self.tab_panes(tab);
+        let (primary, secondary) = tab_caption(&tab.label, &panes);
+        match secondary {
+            Some(secondary) => format!("{primary} · {secondary}"),
+            None => primary,
+        }
     }
 
     fn tab_status(&self, tab: &WorkspaceTab) -> String {
@@ -3000,7 +3224,10 @@ impl CompiApp {
         let mut choices = Vec::new();
         match &self.overlay {
             Some(
-                Overlay::PaneActions | Overlay::TabActions { .. } | Overlay::HeaderActions { .. },
+                Overlay::PaneActions
+                | Overlay::TabActions { .. }
+                | Overlay::TabPaneActions { .. }
+                | Overlay::HeaderActions { .. },
             ) => {
                 let context = self.command_context(cx);
                 let commands: &[Command] = match self.overlay.as_ref() {
@@ -3009,12 +3236,11 @@ impl CompiApp {
                         Command::SplitDown,
                         Command::TogglePaneZoom,
                     ],
-                    Some(Overlay::TabActions { .. }) => &[
+                    Some(Overlay::TabActions { .. } | Overlay::TabPaneActions { .. }) => &[
                         Command::NewTab,
                         Command::RenameTab,
                         Command::SplitRight,
                         Command::SplitDown,
-                        Command::DetachPane,
                         Command::MoveTabToNewWindow,
                         Command::DetachTab,
                         Command::RemoveTab,
@@ -3048,6 +3274,24 @@ impl CompiApp {
                         reason: command.disabled_reason(&context).map(str::to_owned),
                         action: ChoiceAction::Command(command),
                     });
+                }
+                if let Some(
+                    Overlay::TabActions { tab_id, .. } | Overlay::TabPaneActions { tab_id, .. },
+                ) = &self.overlay
+                    && let Some(tab) = self.tab_by_id(tab_id)
+                {
+                    for (index, pane) in self.tab_panes(tab).into_iter().enumerate() {
+                        choices.push(Choice {
+                            title: format!("{}. {}", index + 1, pane.title),
+                            detail: pane.directory.unwrap_or_default(),
+                            group: Some("Terminals"),
+                            reason: None,
+                            action: ChoiceAction::Pane {
+                                tab_id: tab_id.clone(),
+                                pane_id: pane.pane_id,
+                            },
+                        });
+                    }
                 }
             }
             Some(Overlay::QuickAppearance | Overlay::Settings | Overlay::ThemeCatalog) => {}
@@ -3539,6 +3783,14 @@ impl CompiApp {
             let selected = self
                 .selected_tab()
                 .is_some_and(|selected| selected.id == id);
+            let panes = self.tab_panes(tab);
+            let (primary, secondary) = tab_caption(&tab.label, &panes);
+            let count_badge = panes.len() > 2 || (!tab.label.trim().is_empty() && panes.len() > 1);
+            let tooltip_title = (!tab.label.trim().is_empty()).then(|| tab.label.clone());
+            let tooltip_panes = panes
+                .into_iter()
+                .map(|pane| (pane.title, pane.directory))
+                .collect::<Vec<_>>();
             div()
                 .id(("terminal-tab", index))
                 .h_full()
@@ -3570,6 +3822,16 @@ impl CompiApp {
                         .bg(color(colors.surface_hover).opacity(header_alpha))
                         .cursor_pointer()
                 })
+                .when(self.overlay.is_none(), |tab| {
+                    tab.tooltip(move |_, cx| {
+                        cx.new(|_| TabTooltip {
+                            title: tooltip_title.clone(),
+                            panes: tooltip_panes.clone(),
+                            colors,
+                        })
+                        .into()
+                    })
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -3588,6 +3850,11 @@ impl CompiApp {
                         this.open_overlay(
                             Overlay::TabActions {
                                 position: event.position,
+                                tab_id: context_id.clone(),
+                                revision: this
+                                    .workspace
+                                    .as_ref()
+                                    .map_or(0, |workspace| workspace.revision),
                             },
                             "",
                         );
@@ -3597,11 +3864,32 @@ impl CompiApp {
                 )
                 .child(
                     div()
+                        .min_w_0()
                         .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(self.tab_label(tab)),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(primary),
+                        )
+                        .when_some(secondary, |label, secondary| {
+                            label.child(div().flex_none().child("·")).child(
+                                div()
+                                    .min_w_0()
+                                    .when(count_badge, |part| part.flex_none())
+                                    .when(!count_badge, |part| part.flex_1())
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(secondary),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -5233,8 +5521,8 @@ mod tests {
     use super::{
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
-        WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, display_index_for_bounds,
-        header_metrics, opacity_at_slider_position,
+        TabPane, WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title,
+        display_index_for_bounds, header_metrics, opacity_at_slider_position, tab_caption,
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};
@@ -5276,6 +5564,33 @@ mod tests {
         assert_eq!(
             concise_tab_title("user@host: ~/compi"),
             "user@host: ~/compi"
+        );
+    }
+
+    #[test]
+    fn split_tab_caption_shows_both_names_then_a_total_count() {
+        let panes: Vec<_> = ["shell", "server", "logs", "tests"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, title)| TabPane {
+                pane_id: PaneId::new(format!("pane-{index}")),
+                title: title.into(),
+                directory: None,
+            })
+            .collect();
+        assert_eq!(tab_caption("", &panes[..1]), ("shell".into(), None));
+        assert_eq!(
+            tab_caption("", &panes[..2]),
+            ("shell".into(), Some("server".into()))
+        );
+        assert_eq!(
+            tab_caption("", &panes[..3]),
+            ("shell".into(), Some("3+".into()))
+        );
+        assert_eq!(tab_caption("", &panes), ("shell".into(), Some("4+".into())));
+        assert_eq!(
+            tab_caption("my project", &panes[..2]),
+            ("my project".into(), Some("2".into()))
         );
     }
 

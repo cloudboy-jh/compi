@@ -25,21 +25,51 @@ impl CompiApp {
     pub(super) fn render_action_menu(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = self.colors();
         let choices = self.overlay_choices(cx);
+        let (viewport_width, viewport_height) = overlay_viewport_size(window);
+        let menu_height = (choices.len() as f32 * 44.0
+            + 32.0
+            + if matches!(self.overlay, Some(Overlay::TabPaneActions { .. })) {
+                48.0
+            } else {
+                0.0
+            })
+        .min((viewport_height - 12.0).max(80.0));
         let menu_position = match self.overlay.as_ref() {
-            Some(Overlay::TabActions { position } | Overlay::HeaderActions { position }) => {
-                let (viewport_width, viewport_height) = overlay_viewport_size(window);
-                let menu_height = choices.len() as f32 * 36.0 + 8.0;
-                Some((
-                    f32::from(position.x).clamp(6.0, (viewport_width - 266.0).max(6.0)),
-                    f32::from(position.y).clamp(6.0, (viewport_height - menu_height).max(6.0)),
-                ))
-            }
+            Some(
+                Overlay::TabActions { position, .. }
+                | Overlay::TabPaneActions { position, .. }
+                | Overlay::HeaderActions { position },
+            ) => Some((
+                f32::from(position.x).clamp(6.0, (viewport_width - 346.0).max(6.0)),
+                f32::from(position.y).clamp(6.0, (viewport_height - menu_height).max(6.0)),
+            )),
             _ => None,
         };
+        let mut previous_group = None;
         let rows = choices.into_iter().enumerate().map(|(index, choice)| {
+            let group_heading = if choice.group != previous_group {
+                previous_group = choice.group;
+                choice.group
+            } else {
+                None
+            };
             let selected = index == self.overlay_index;
             let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
-            div()
+            let is_pane = matches!(choice.action, ChoiceAction::Pane { .. });
+            let pane_selected = matches!(
+                (&self.overlay, &choice.action),
+                (
+                    Some(Overlay::TabPaneActions {
+                        tab_id: selected_tab,
+                        pane_id: selected_pane,
+                        ..
+                    }),
+                    ChoiceAction::Pane { tab_id, pane_id }
+                ) if selected_tab == tab_id && selected_pane == pane_id
+            );
+            let shortcut = (!is_pane && !choice.detail.is_empty()).then(|| choice.detail.clone());
+            let directory = (is_pane && !choice.detail.is_empty()).then_some(choice.detail);
+            let row = div()
                 .id(("action-choice", index))
                 .min_h(px(32.0))
                 .px_2()
@@ -48,7 +78,7 @@ impl CompiApp {
                 .justify_center()
                 .gap_1()
                 .border_1()
-                .border_color(color(if selected {
+                .border_color(color(if selected && !pane_selected {
                     colors.accent
                 } else {
                     colors.surface
@@ -74,29 +104,62 @@ impl CompiApp {
                 }))
                 .child(
                     div()
+                        .w_full()
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap_3()
-                        .child(div().font_weight(FontWeight::MEDIUM).child(choice.title))
+                        .gap_2()
                         .child(
                             div()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(color(modal_text_color(colors.muted, colors)))
-                                .child(choice.detail),
-                        ),
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(choice.title),
+                        )
+                        .when_some(shortcut, |row, shortcut| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(color(modal_text_color(colors.muted, colors)))
+                                    .child(shortcut),
+                            )
+                        }),
                 )
-                .when_some(choice.reason, |row, reason| {
+                .when_some(directory, |row, directory| {
                     row.child(
                         div()
-                            .pt_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .font_weight(FontWeight::NORMAL)
                             .text_color(color(modal_text_color(colors.muted, colors)))
-                            .child(reason),
+                            .child(directory),
                     )
                 })
+                .when(pane_selected, |row| {
+                    row.child(self.render_tab_pane_tooltip(cx))
+                });
+            div()
+                .when_some(group_heading, |item, group| {
+                    item.child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .pb_1()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .child(group),
+                    )
+                })
+                .child(row)
+                .into_any_element()
         });
         div()
             .absolute()
@@ -116,11 +179,10 @@ impl CompiApp {
                         menu.top(px(CHROME_HEIGHT + 6.0))
                             .right(px(WINDOW_CONTROLS_WIDTH + 6.0))
                     })
-                    .w(px(260.0))
+                    .w(px(340.0))
                     .p_1()
                     .flex()
                     .flex_col()
-                    .gap_0()
                     .rounded_md()
                     .border_1()
                     .border_color(color(colors.border))
@@ -128,8 +190,142 @@ impl CompiApp {
                     .text_color(color(modal_text_color(colors.foreground, colors)))
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .children(rows),
+                    .child(
+                        div()
+                            .id("action-menu-list")
+                            .max_h(px(menu_height - 8.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.overlay_scroll)
+                            .children(rows),
+                    ),
             )
+            .into_any_element()
+    }
+
+    fn render_tab_pane_tooltip(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(Overlay::TabPaneActions {
+            tab_id, pane_id, ..
+        }) = &self.overlay
+        else {
+            unreachable!("terminal action tooltip requires a selected pane");
+        };
+        let colors = self.colors();
+        let detach_disabled = self
+            .pane_action_reason(tab_id, pane_id, PaneAction::Detach)
+            .is_some();
+        let end_disabled = self
+            .pane_action_reason(tab_id, pane_id, PaneAction::End)
+            .is_some();
+        let detach_tab = tab_id.clone();
+        let detach_pane = pane_id.clone();
+        let end_tab = tab_id.clone();
+        let end_pane = pane_id.clone();
+        let button_background = blend_rgb(colors.surface, colors.foreground, 0.08);
+        let disabled_button = |label| {
+            div()
+                .flex_1()
+                .min_h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .border_1()
+                .border_color(color(button_background))
+                .bg(color(button_background))
+                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .text_color(color(modal_text_color(colors.muted, colors)))
+                .child(label)
+                .into_any_element()
+        };
+        div()
+            .id("terminal-action-tooltip")
+            .w(px(160.0))
+            .mt_1()
+            .mb_1()
+            .p_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(color(colors.border))
+            .bg(color(blend_rgb(colors.surface, colors.foreground, 0.04)))
+            .text_color(color(modal_text_color(colors.foreground, colors)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(if detach_disabled {
+                disabled_button("Detach")
+            } else {
+                div()
+                    .id("terminal-action-detach")
+                    .flex_1()
+                    .min_h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color(if self.overlay_focus == 0 {
+                        colors.accent
+                    } else {
+                        button_background
+                    }))
+                    .bg(color(button_background))
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_tab_pane_action(
+                            detach_tab.clone(),
+                            detach_pane.clone(),
+                            PaneAction::Detach,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }))
+                    .child("Detach")
+                    .into_any_element()
+            })
+            .child(if end_disabled {
+                disabled_button("End…")
+            } else {
+                div()
+                    .id("terminal-action-end")
+                    .flex_1()
+                    .min_h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color(if self.overlay_focus == 1 {
+                        colors.accent
+                    } else {
+                        button_background
+                    }))
+                    .bg(color(button_background))
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .text_color(color(modal_text_color(colors.error, colors)))
+                    .hover(move |style| {
+                        style
+                            .bg(color(blend_rgb(colors.surface, colors.error, 0.12)))
+                            .cursor_pointer()
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_tab_pane_action(
+                            end_tab.clone(),
+                            end_pane.clone(),
+                            PaneAction::End,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }))
+                    .child("End…")
+                    .into_any_element()
+            })
             .into_any_element()
     }
 
@@ -269,6 +465,7 @@ impl CompiApp {
             div()
                 .w_full()
                 .max_w(px(520.0))
+                .min_h(px(220.0))
                 .flex()
                 .flex_col()
                 .rounded_md()
@@ -300,6 +497,7 @@ impl CompiApp {
                 .child(
                     div()
                         .min_h(px(48.0))
+                        .flex_none()
                         .px_4()
                         .flex()
                         .items_center()
@@ -663,6 +861,51 @@ impl CompiApp {
             cx.notify();
             return true;
         }
+        if let Some(Overlay::TabPaneActions {
+            tab_id, pane_id, ..
+        }) = self.overlay.clone()
+        {
+            match key.key.as_str() {
+                "escape" | "left" => {
+                    if let Some(Overlay::TabPaneActions {
+                        position, revision, ..
+                    }) = self.overlay.clone()
+                    {
+                        self.overlay = Some(Overlay::TabActions {
+                            position,
+                            tab_id,
+                            revision,
+                        });
+                    }
+                }
+                "tab" | "up" | "down" | "right" => {
+                    let candidate = 1 - self.overlay_focus;
+                    let action = if candidate == 0 {
+                        PaneAction::Detach
+                    } else {
+                        PaneAction::End
+                    };
+                    if self.pane_action_reason(&tab_id, &pane_id, action).is_none() {
+                        self.overlay_focus = candidate;
+                    }
+                }
+                "enter" | "space" => self.activate_tab_pane_action(
+                    tab_id,
+                    pane_id,
+                    if self.overlay_focus == 0 {
+                        PaneAction::Detach
+                    } else {
+                        PaneAction::End
+                    },
+                    window,
+                    cx,
+                ),
+                _ => return true,
+            }
+            cx.notify();
+            return true;
+        }
+
         if matches!(self.overlay, Some(Overlay::Text { .. })) {
             match key.key.as_str() {
                 "escape" => self.dismiss_overlay(),
@@ -701,7 +944,12 @@ impl CompiApp {
             self.render_theme_catalog(window, cx)
         } else if matches!(
             self.overlay,
-            Some(Overlay::PaneActions | Overlay::TabActions { .. } | Overlay::HeaderActions { .. })
+            Some(
+                Overlay::PaneActions
+                    | Overlay::TabActions { .. }
+                    | Overlay::TabPaneActions { .. }
+                    | Overlay::HeaderActions { .. }
+            )
         ) {
             self.render_action_menu(window, cx)
         } else if matches!(

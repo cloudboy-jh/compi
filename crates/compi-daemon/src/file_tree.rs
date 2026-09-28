@@ -41,10 +41,15 @@ struct ScannedEntry {
 /// List immediate children of an absolute path in the terminal's path namespace.
 /// On Windows, the path is a WSL path and `distribution` selects its WSL2 share.
 pub fn list_directory(path: &str, distribution: Option<&str>) -> Result<Vec<DirectoryEntry>> {
-    let mut root = resolve_root(path, distribution)?;
+    let root = resolve_root(path, distribution)?;
+    #[cfg(windows)]
+    let mut root = root;
     let mut count = 0;
     let entries = scan_directory(
+        #[cfg(windows)]
         &mut root.host,
+        #[cfg(not(windows))]
+        root.host.as_path(),
         &root.shell,
         #[cfg(windows)]
         &root.distribution,
@@ -91,9 +96,14 @@ pub fn search_files(
     let mut result_bytes = 0;
     let mut pending = vec![(root.host, root.shell, String::new(), 0_usize)];
 
-    while let Some((mut host, shell, relative, depth)) = pending.pop() {
+    while let Some((host, shell, relative, depth)) = pending.pop() {
+        #[cfg(windows)]
+        let mut host = host;
         let entries = scan_directory(
+            #[cfg(windows)]
             &mut host,
+            #[cfg(not(windows))]
+            host.as_path(),
             &shell,
             #[cfg(windows)]
             &root.distribution,
@@ -147,7 +157,8 @@ pub fn search_files(
 }
 
 fn scan_directory(
-    host: &mut PathBuf,
+    #[cfg(windows)] host: &mut PathBuf,
+    #[cfg(not(windows))] host: &std::path::Path,
     shell: &str,
     #[cfg(windows)] distribution: &str,
     started: Instant,
@@ -156,7 +167,11 @@ fn scan_directory(
     skip_unreadable: bool,
 ) -> Result<Vec<ScannedEntry>> {
     check_time(started)?;
-    let directory = match fs::read_dir(host.as_path()) {
+    #[cfg(windows)]
+    let directory = fs::read_dir(host.as_path());
+    #[cfg(not(windows))]
+    let directory = fs::read_dir(host);
+    let directory = match directory {
         Ok(directory) => directory,
         #[cfg(windows)]
         Err(error)

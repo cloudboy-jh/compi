@@ -231,7 +231,7 @@ fn native_default_distribution() -> Option<Result<DefaultDistribution>> {
                 &mut size,
             )
         };
-        if status != 0 || size < 2 || size > 1024 || size % 2 != 0 {
+        if status != 0 || !(2..=1024).contains(&size) || size % 2 != 0 {
             return None;
         }
         let mut words = vec![0u16; (size / 2) as usize];

@@ -135,10 +135,10 @@ impl CompiApp {
             .mirror
             .snapshot()
             .and_then(|snapshot| snapshot.current_directory.clone());
-        if let Some(path) = current.as_deref() {
-            if self.state.project_history.record(path) {
-                self.save_state();
-            }
+        if let Some(path) = current.as_deref()
+            && self.state.project_history.record(path)
+        {
+            self.save_state();
         }
         if self.file_tree.is_some() {
             self.close_file_tree();
@@ -494,8 +494,8 @@ impl CompiApp {
                 (depth > 0 && !tree.project_mode && (!tree.searching || tree.query.is_empty()))
                     .then(|| {
                         let mut prefix = String::with_capacity(depth * 3);
-                        for level in 1..depth {
-                            prefix.push_str(if continuing[level] { "│  " } else { "   " });
+                        for &has_next in continuing.iter().take(depth).skip(1) {
+                            prefix.push_str(if has_next { "│  " } else { "   " });
                         }
                         prefix.push_str(if row.has_next_sibling {
                             "├─"

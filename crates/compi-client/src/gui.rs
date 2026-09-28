@@ -250,15 +250,6 @@ struct SurfaceView {
 }
 
 impl SurfaceView {
-    fn title(&self) -> String {
-        self.mirror
-            .snapshot()
-            .map(|snapshot| snapshot.title.trim())
-            .filter(|title| !title.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| short_surface_id(&self.surface_id))
-    }
-
     fn send(&mut self, message: ClientMessage) {
         if matches!(message, ClientMessage::Input { .. }) && self.state != ConnectionState::Attached
         {
@@ -729,6 +720,7 @@ struct CompiApp {
     ime_marked_range: Option<Range<usize>>,
     ime_selected_range: Range<usize>,
     surface_views: Vec<SurfaceView>,
+    surface_names: HashMap<SurfaceId, (compi_protocol::ProcessLifetimeId, String, Option<String>)>,
     focused_view: Option<u64>,
     file_tree: Option<workspace::tree::FileTree>,
     tree_scroll: ScrollHandle,
@@ -1183,13 +1175,13 @@ impl CompiApp {
                 });
             }
         } else {
-            if tab.selecting {
-                if let Some(absolute) = point.and_then(|point| {
+            if tab.selecting
+                && let Some(absolute) = point.and_then(|point| {
                     visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
-                }) && let Some(selection) = tab.selection.as_mut()
-                {
-                    selection.head = absolute;
-                }
+                })
+                && let Some(selection) = tab.selection.as_mut()
+            {
+                selection.head = absolute;
             }
             tab.selecting = false;
             let clicked_link = if let Some(selection) = tab.selection
@@ -1288,6 +1280,116 @@ impl Render for HeaderTooltip {
                         .child(reason),
                 )
             })
+    }
+}
+struct TabTooltip {
+    title: Option<String>,
+    panes: Vec<(String, Option<String>)>,
+    colors: &'static ThemeColors,
+}
+
+impl Render for TabTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let pane_count = self.panes.len();
+        let header = self
+            .title
+            .clone()
+            .or_else(|| (pane_count > 1).then(|| format!("{pane_count} terminals")));
+        let count_header = self.title.is_none();
+        div()
+            .w(px(if pane_count == 1 { 240.0 } else { 284.0 }))
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(color(self.colors.border))
+            .bg(color(self.colors.surface))
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .text_color(color(modal_text_color(self.colors.foreground, self.colors)))
+            .when_some(header, |tooltip, header| {
+                tooltip.child(
+                    div()
+                        .pb_1()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(color(modal_text_color(
+                            if count_header {
+                                self.colors.muted
+                            } else {
+                                self.colors.foreground
+                            },
+                            self.colors,
+                        )))
+                        .child(header),
+                )
+            })
+            .child(
+                div()
+                    .id("tab-tooltip-panes")
+                    .max_h(px(320.0))
+                    .overflow_y_scroll()
+                    .children(
+                        self.panes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (name, directory))| {
+                                div()
+                                    .when(index > 0, |row| {
+                                        row.mt_1()
+                                            .pt_2()
+                                            .border_t_1()
+                                            .border_color(color(self.colors.border))
+                                    })
+                                    .flex()
+                                    .items_start()
+                                    .gap_2()
+                                    .when(pane_count > 1, |row| {
+                                        row.child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                .text_color(color(modal_text_color(
+                                                    self.colors.muted,
+                                                    self.colors,
+                                                )))
+                                                .child(format!("{}", index + 1)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .child(name.clone()),
+                                            )
+                                            .when_some(directory.clone(), |row, directory| {
+                                                row.child(
+                                                    div()
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                        .text_color(color(modal_text_color(
+                                                            self.colors.muted,
+                                                            self.colors,
+                                                        )))
+                                                        .child(directory),
+                                                )
+                                            }),
+                                    )
+                            }),
+                    ),
+            )
     }
 }
 
@@ -2678,16 +2780,6 @@ fn run_tab_connection(
         }
     }
 }
-fn short_surface_id(id: &SurfaceId) -> String {
-    id.as_str()
-        .rsplit('-')
-        .next()
-        .unwrap_or(id.as_str())
-        .chars()
-        .take(8)
-        .collect()
-}
-
 fn snapshot_contains_marker(snapshot: Option<&ScreenSnapshot>, marker: &str) -> bool {
     snapshot.is_some_and(|snapshot| {
         snapshot

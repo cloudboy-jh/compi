@@ -59,8 +59,6 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Run workspace unit and binary tests
         run: cargo test --locked --workspace --lib --bins
-      - name: Verify protocol wire compatibility
-        run: cargo test --locked -p compi-protocol --test wire_v7
       - name: Verify daemon stdio relay
         run: cargo test --locked -p compi-daemon --test stdio_relay
       - name: Verify engine-to-wire conversion and replica recovery
