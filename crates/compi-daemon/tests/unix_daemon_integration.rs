@@ -5,8 +5,8 @@ mod kitty;
 
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::{
-    ClientMessage, DaemonClient, PROTOCOL_VERSION, ScreenSnapshot, ServerEvent, ServerMessage,
-    SurfaceId, SurfaceInfo, SurfaceStatus,
+    ClientMessage, DaemonClient, DaemonError, ErrorCode, PROTOCOL_VERSION, ScreenSnapshot,
+    ServerEvent, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus,
 };
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -28,6 +28,70 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const KITTY_TRANSFER_DIMENSIONS: (u32, u32) = (1024, 768);
 #[cfg(not(target_os = "macos"))]
 const KITTY_TRANSFER_DIMENSIONS: (u32, u32) = (3840, 2160);
+
+#[test]
+fn directory_rpc_reads_surface_filesystem_and_rejects_invalid_paths() {
+    let mut daemon = DaemonGuard::start();
+    let root = daemon.directory.join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("source")).unwrap();
+    fs::write(root.join("source").join("needle.rs"), b"from daemon").unwrap();
+    let root = root.to_string_lossy().into_owned();
+    let mut client = daemon.client();
+    let surface = client.create_surface(80, 24, Some(root.clone())).unwrap();
+
+    let entries = client
+        .list_directory(surface.id.clone(), root.clone())
+        .unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == "source" && entry.is_directory)
+    );
+    let matches = client
+        .search_directory(surface.id.clone(), root.clone(), "needle".into())
+        .unwrap();
+    assert!(
+        matches.iter().any(|entry| {
+            entry.path == format!("{root}/source/needle.rs") && !entry.is_directory
+        })
+    );
+
+    let code = |error: compi_protocol::Error| error.downcast::<DaemonError>().unwrap().code;
+    assert_eq!(
+        code(
+            client
+                .list_directory(surface.id.clone(), "relative".into())
+                .unwrap_err()
+        ),
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        code(
+            client
+                .list_directory(surface.id.clone(), "/missing-compi-directory-825932".into())
+                .unwrap_err()
+        ),
+        ErrorCode::Internal
+    );
+    assert_eq!(
+        code(
+            client
+                .list_directory(SurfaceId::new("not-this-server"), root.clone())
+                .unwrap_err()
+        ),
+        ErrorCode::SurfaceNotFound
+    );
+    assert_eq!(
+        code(
+            client
+                .search_directory(surface.id.clone(), root, "".into())
+                .unwrap_err()
+        ),
+        ErrorCode::InvalidRequest
+    );
+    daemon.shutdown();
+}
 
 struct DaemonGuard {
     child: Child,

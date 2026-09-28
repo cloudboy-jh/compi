@@ -97,6 +97,7 @@ registry! {
     SplitRight, "split_right", "Split right", Some("cmd-d"), Some("alt-shift-plus");
     SplitDown, "split_down", "Split down", Some("cmd-shift-d"), Some("alt-shift-minus");
     TogglePaneZoom, "toggle_pane_zoom", "Zoom pane", None, None;
+    DetachPane, "detach_pane", "Detach Split to New Tab", None, None;
     FocusLeft, "focus_left", "Focus pane left", Some("cmd-alt-left"), Some("alt-left");
     FocusRight, "focus_right", "Focus pane right", Some("cmd-alt-right"), Some("alt-right");
     FocusUp, "focus_up", "Focus pane above", Some("cmd-alt-up"), Some("alt-up");
@@ -113,6 +114,8 @@ registry! {
     Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-v");
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
+    BrowseFiles, "browse_files", "Browse files in terminal pane", Some("cmd-shift-e"), Some("ctrl-shift-e");
+    JumpProject, "jump_project", "Jump to project directory…", None, None;
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
     ZoomReset, "zoom_reset", "Reset font size", Some("cmd-0"), Some("ctrl-0");
@@ -222,13 +225,13 @@ impl Command {
         match self {
             NewTab | SwitchTab | PreviousTab | NextTab | RenameTab | MoveTabLeft | MoveTabRight
             | RemoveTab | DetachTab | RestoreHiddenTab => CommandCategory::Tabs,
-            SplitRight | SplitDown | TogglePaneZoom | FocusLeft | FocusRight | FocusUp
-            | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
+            SplitRight | SplitDown | TogglePaneZoom | DetachPane | FocusLeft | FocusRight
+            | FocusUp | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | RemovePane => CommandCategory::Panes,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
-            | RestartSurface | EndSurface => CommandCategory::Terminal,
+            | BrowseFiles | JumpProject | RestartSurface | EndSurface => CommandCategory::Terminal,
             NewWindow | MoveTabToNewWindow | MoveTabToWindow | ResetClientLayout | Reconnect => {
                 CommandCategory::Window
             }
@@ -304,6 +307,7 @@ impl Command {
                 | RemoveTab
                 | SplitRight
                 | SplitDown
+                | DetachPane
                 | ResizeSplitDecrease
                 | ResizeSplitIncrease
                 | ResetSplitRatio
@@ -404,6 +408,13 @@ impl Command {
                     None
                 }
             }
+            DetachPane => {
+                if !c.has_pane {
+                    Some("Select a pane first")
+                } else {
+                    (c.pane_count < 2).then_some("This tab has only one pane")
+                }
+            }
             RemovePane => (!c.has_pane).then_some("Select a pane first"),
             EndSurface => {
                 if !c.has_pane {
@@ -429,6 +440,7 @@ impl Command {
                     Some("Only exited, failed, or lost surfaces can be restarted")
                 }
             }
+            BrowseFiles | JumpProject => (!c.has_pane).then_some("Select a terminal pane first"),
             Copy => (!c.has_selection).then_some("Select terminal text to copy"),
             Paste => {
                 if !c.has_pane
@@ -548,6 +560,24 @@ pub fn resolve_key(
         } else {
             KeyRoute::Terminal
         };
+    }
+    // GPUI may report the physical Ctrl+Shift+= either as Shift+equal or
+    // as Shift+plus. Check overrides first (above), including an unbound zoom.
+    if platform == Platform::Windows
+        && key.control
+        && !key.alt
+        && !key.command
+        && !overrides.contains_key("zoom_in")
+        && ((key.shift
+            && ["equal", "=", "plus", "+"]
+                .iter()
+                .any(|candidate| key.key.eq_ignore_ascii_case(candidate)))
+            || (!key.shift
+                && ["plus", "+"]
+                    .iter()
+                    .any(|candidate| key.key.eq_ignore_ascii_case(candidate))))
+    {
+        return route_command(Command::ZoomIn, context);
     }
     if platform == Platform::Windows && key.alt && !key.control && !key.command {
         let command = if key.key == "+"
@@ -1096,9 +1126,57 @@ mod tests {
 
         // GPUI folds Shift into printable punctuation on Windows.
         assert_eq!(route(ctrl("+")), KeyRoute::Command(Command::ZoomIn));
+        assert_eq!(
+            route(ShortcutKey {
+                shift: true,
+                ..ctrl("=")
+            }),
+            KeyRoute::Command(Command::ZoomIn)
+        );
+        assert_eq!(
+            route(ShortcutKey {
+                shift: true,
+                ..ctrl("+")
+            }),
+            KeyRoute::Command(Command::ZoomIn)
+        );
+        assert_eq!(
+            route(ShortcutKey {
+                shift: true,
+                ..ctrl("plus")
+            }),
+            KeyRoute::Command(Command::ZoomIn)
+        );
         assert_eq!(route(ctrl("-")), KeyRoute::Command(Command::ZoomOut));
         assert_eq!(route(ctrl("0")), KeyRoute::Command(Command::ZoomReset));
         assert_eq!(route(ctrl(",")), KeyRoute::Command(Command::OpenSettings));
+        let overrides = HashMap::from([
+            ("new_tab".to_owned(), "ctrl-shift-equal".to_owned()),
+            ("zoom_in".to_owned(), String::new()),
+        ]);
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ShortcutKey {
+                    shift: true,
+                    ..ctrl("=")
+                },
+                InputOwner::Terminal,
+                &context,
+                &overrides,
+            ),
+            KeyRoute::Command(Command::NewTab)
+        );
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ctrl("+"),
+                InputOwner::Terminal,
+                &context,
+                &overrides,
+            ),
+            KeyRoute::Terminal
+        );
     }
     #[test]
     fn displayed_shortcuts_follow_overrides_and_explicit_unbinding() {

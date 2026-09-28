@@ -33,5 +33,6 @@ pub fn delta(change: Delta) -> ScreenDelta {
         latency_ids: change.latency_ids,
         placements: change.placements,
         clipboard_writes: change.clipboard_writes,
+        shell_action: change.shell_action,
     }
 }

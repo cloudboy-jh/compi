@@ -6,9 +6,9 @@ mod kitty;
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::frame;
 use compi_protocol::{
-    CONTROL_FRAME, ClientControl, ClientMessage, Color, ErrorCode, MutationId, MutationRequest,
-    ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus, WorkspaceMutation,
-    decode_server, encode_client,
+    CONTROL_FRAME, ClientControl, ClientMessage, Color, DaemonError, ErrorCode, MutationId,
+    MutationRequest, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus,
+    WorkspaceMutation, decode_server, encode_client,
 };
 use compi_protocol::{DaemonClient, ServerEvent, identity, pipe};
 use std::fs;
@@ -121,6 +121,140 @@ impl Drop for DaemonGuard {
             let _ = self.child.wait();
         }
     }
+}
+
+#[test]
+fn directory_rpc_uses_surface_wsl_namespace() {
+    let mut daemon = DaemonGuard::start();
+    let launch = compi_protocol::wsl::resolve_launch(Some("/tmp"), None).unwrap();
+    let distribution = launch.distribution.unwrap();
+    let name = format!("compi-tree-{}-{}", std::process::id(), daemon.instance);
+    let root = format!("/tmp/{name}");
+    let host_directory = PathBuf::from(r"\\wsl.localhost")
+        .join(&distribution)
+        .join("tmp")
+        .join(&name);
+    fs::create_dir(&host_directory).unwrap();
+    fs::create_dir(host_directory.join("source")).unwrap();
+    fs::write(host_directory.join("source").join("needle.rs"), b"from WSL").unwrap();
+    let windows_directory = std::env::temp_dir().join(&name);
+    fs::create_dir(&windows_directory).unwrap();
+    fs::write(
+        windows_directory.join("needle-from-link.rs"),
+        b"from Windows",
+    )
+    .unwrap();
+    fs::create_dir(windows_directory.join("child")).unwrap();
+    fs::write(
+        windows_directory.join("child").join("needle-in-child.rs"),
+        b"nested through a WSL symlink",
+    )
+    .unwrap();
+    let mapped = compi_protocol::wsl::resolve_launch(
+        Some(windows_directory.to_str().unwrap()),
+        Some(&distribution),
+    )
+    .unwrap()
+    .directory;
+    let link = format!("{root}/windows-link");
+    assert!(
+        Command::new(r"C:\Windows\System32\wsl.exe")
+            .args([
+                "--distribution",
+                &distribution,
+                "--exec",
+                "ln",
+                "-s",
+                "--",
+                &mapped,
+                &link
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut client = daemon.client();
+    let surface = client.create_surface(80, 24, Some(root.clone())).unwrap();
+    assert_eq!(
+        surface
+            .working_directory
+            .as_ref()
+            .unwrap()
+            .resolved_wsl_path,
+        root
+    );
+    let entries = client
+        .list_directory(surface.id.clone(), root.clone())
+        .unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == "source" && entry.is_directory)
+    );
+    let matches = client
+        .search_directory(surface.id.clone(), root.clone(), "needle".into())
+        .unwrap();
+    assert!(
+        matches.iter().any(|entry| {
+            entry.path == format!("{root}/source/needle.rs") && !entry.is_directory
+        })
+    );
+    let linked_entries = client
+        .list_directory(surface.id.clone(), link.clone())
+        .unwrap();
+    assert!(
+        linked_entries
+            .iter()
+            .any(|entry| { entry.name == "needle-from-link.rs" && !entry.is_directory })
+    );
+    let nested_entries = client
+        .list_directory(surface.id.clone(), format!("{link}/child"))
+        .unwrap();
+    assert!(
+        nested_entries
+            .iter()
+            .any(|entry| { entry.name == "needle-in-child.rs" && !entry.is_directory })
+    );
+    let linked_matches = client
+        .search_directory(surface.id.clone(), link.clone(), "needle-from-link".into())
+        .unwrap();
+    assert!(linked_matches.iter().any(|entry| {
+        entry.path == format!("{link}/needle-from-link.rs") && !entry.is_directory
+    }));
+    let nested_matches = client
+        .search_directory(surface.id.clone(), link.clone(), "needle-in-child".into())
+        .unwrap();
+    assert!(nested_matches.iter().any(|entry| {
+        entry.path == format!("{link}/child/needle-in-child.rs") && !entry.is_directory
+    }));
+    let invalid_path = client
+        .list_directory(
+            surface.id.clone(),
+            host_directory.to_string_lossy().into_owned(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        invalid_path.downcast::<DaemonError>().unwrap().code,
+        ErrorCode::InvalidRequest
+    );
+    let missing_surface = client
+        .list_directory(SurfaceId::new("not-this-server"), root)
+        .unwrap_err();
+    assert_eq!(
+        missing_surface.downcast::<DaemonError>().unwrap().code,
+        ErrorCode::SurfaceNotFound
+    );
+    client.end_surface(&surface).unwrap();
+    daemon.shutdown();
+    assert!(
+        Command::new(r"C:\Windows\System32\wsl.exe")
+            .args(["--distribution", &distribution, "--exec", "rm", "--", &link])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::remove_dir_all(host_directory).unwrap();
+    fs::remove_dir_all(windows_directory).unwrap();
 }
 
 #[test]

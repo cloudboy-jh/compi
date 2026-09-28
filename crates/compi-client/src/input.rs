@@ -36,11 +36,23 @@ pub fn encode_keystroke(
     keystroke: &Key<'_>,
     application_cursor: bool,
     keypad: Option<KeypadKey>,
+    keyboard_protocol_flags: u8,
 ) -> Option<Vec<u8>> {
     if let Some(keypad) = keypad {
         return Some(encode_application_keypad(keypad));
     }
 
+    // Legacy terminals cannot distinguish Ctrl+Enter from Enter. Only send
+    // CSI u once the terminal application enables Kitty's disambiguation flag.
+    if keystroke.key == "enter" && keystroke.modifiers.control {
+        return Some(if keyboard_protocol_flags & 1 != 0 {
+            format!("\x1b[13;{}u", xterm_modifier(&keystroke.modifiers)).into_bytes()
+        } else if keystroke.modifiers.alt {
+            b"\x1b\r".to_vec()
+        } else {
+            b"\r".to_vec()
+        });
+    }
     if keystroke.key == "backspace" && keystroke.modifiers.control {
         let mut bytes = Vec::with_capacity(1 + usize::from(keystroke.modifiers.alt));
         if keystroke.modifiers.alt {
@@ -306,24 +318,33 @@ mod tests {
             key: "c",
             key_char: None,
         };
-        assert_eq!(encode_keystroke(&ctrl_c, false, None), Some(vec![3]));
+        assert_eq!(encode_keystroke(&ctrl_c, false, None, 0), Some(vec![3]));
         let space = Key {
             key: "space",
             ..Default::default()
         };
-        assert_eq!(encode_keystroke(&space, false, None), Some(b" ".to_vec()));
+        assert_eq!(
+            encode_keystroke(&space, false, None, 0),
+            Some(b" ".to_vec())
+        );
         let up = Key {
             key: "up",
             ..Default::default()
         };
-        assert_eq!(encode_keystroke(&up, false, None), Some(b"\x1b[A".to_vec()));
-        assert_eq!(encode_keystroke(&up, true, None), Some(b"\x1bOA".to_vec()));
+        assert_eq!(
+            encode_keystroke(&up, false, None, 0),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            encode_keystroke(&up, true, None, 0),
+            Some(b"\x1bOA".to_vec())
+        );
         let application_home = Key {
             key: "home",
             ..Default::default()
         };
         assert_eq!(
-            encode_keystroke(&application_home, true, None),
+            encode_keystroke(&application_home, true, None, 0),
             Some(b"\x1bOH".to_vec())
         );
         let modified_up = Key {
@@ -336,7 +357,7 @@ mod tests {
             key_char: None,
         };
         assert_eq!(
-            encode_keystroke(&modified_up, true, None),
+            encode_keystroke(&modified_up, true, None, 0),
             Some(b"\x1b[1;6A".to_vec())
         );
         let ctrl_space = Key {
@@ -347,7 +368,7 @@ mod tests {
             key: "space",
             key_char: None,
         };
-        assert_eq!(encode_keystroke(&ctrl_space, false, None), Some(vec![0]));
+        assert_eq!(encode_keystroke(&ctrl_space, false, None, 0), Some(vec![0]));
         let ctrl_backspace = Key {
             modifiers: Modifiers {
                 control: true,
@@ -357,12 +378,44 @@ mod tests {
             key_char: None,
         };
         assert_eq!(
-            encode_keystroke(&ctrl_backspace, false, None),
+            encode_keystroke(&ctrl_backspace, false, None, 0),
             Some(vec![0x17])
         );
         assert_eq!(
-            encode_keystroke(&space, false, Some(KeypadKey::Digit(7))),
+            encode_keystroke(&space, false, Some(KeypadKey::Digit(7)), 0),
             Some(b"\x1bOw".to_vec())
+        );
+    }
+    #[test]
+    fn ctrl_enter_requires_negotiated_keyboard_mode() {
+        let key = Key {
+            modifiers: Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "enter",
+            ..Default::default()
+        };
+        assert_eq!(encode_keystroke(&key, false, None, 0), Some(b"\r".to_vec()));
+        assert_eq!(
+            encode_keystroke(&key, false, None, 1),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+        assert_eq!(encode_keystroke(&key, false, None, 2), Some(b"\r".to_vec()));
+        let alt_ctrl_enter = Key {
+            modifiers: Modifiers {
+                alt: true,
+                ..key.modifiers
+            },
+            ..key
+        };
+        assert_eq!(
+            encode_keystroke(&alt_ctrl_enter, false, None, 0),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            encode_keystroke(&alt_ctrl_enter, false, None, 1),
+            Some(b"\x1b[13;7u".to_vec())
         );
     }
 

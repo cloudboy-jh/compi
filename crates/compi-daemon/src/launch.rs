@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Result, shell_integration};
 use compi_protocol::WorkingDirectory;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -45,19 +45,17 @@ impl LaunchDescription {
 pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
     let launch = compi_protocol::wsl::resolve_launch(working_directory, None)?;
     let mut argv = Vec::new();
+    shell_integration::prepare_wsl(launch.distribution.as_deref(), None, None, false, &mut argv)?;
+    let mut prefix = Vec::new();
     if let Some(distribution) = launch.distribution {
-        argv.extend([OsString::from("--distribution"), distribution.into()]);
+        prefix.extend([OsString::from("--distribution"), distribution.into()]);
     }
-    argv.extend([
-        "--cd".into(),
-        launch.directory.into(),
-        "--exec".into(),
-        "/bin/bash".into(),
-        "-i".into(),
-    ]);
+    prefix.extend(["--cd".into(), launch.directory.into(), "--exec".into()]);
+    prefix.append(&mut argv);
+    prefix.push("-i".into());
     Ok(LaunchDescription {
         executable: r"C:\Windows\System32\wsl.exe".into(),
-        argv,
+        argv: prefix,
         cwd: None,
         env: Vec::new(),
         metadata: launch.metadata,
@@ -66,6 +64,14 @@ pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescripti
 
 #[cfg(unix)]
 pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
+    resolve_unix_launch(working_directory, true)
+}
+
+#[cfg(unix)]
+fn resolve_unix_launch(
+    working_directory: Option<&str>,
+    install_bridge: bool,
+) -> Result<LaunchDescription> {
     let (account_shell, account_home) = user_defaults()?;
     let executable = std::env::var_os("SHELL")
         .filter(|shell| !shell.is_empty())
@@ -77,7 +83,7 @@ pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescripti
         None => std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)
-            .unwrap_or(account_home),
+            .unwrap_or_else(|| account_home.clone()),
     };
     if !cwd.is_absolute() || !cwd.is_dir() {
         return Err(format!(
@@ -88,17 +94,24 @@ pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescripti
     }
     let cwd = std::fs::canonicalize(cwd)?;
     let mut argv = Vec::new();
-    if cfg!(target_os = "macos") {
+    let login = cfg!(target_os = "macos");
+    if login {
         argv.push("-l".into());
     }
     argv.push("-i".into());
+    let mut env = vec![("SHELL".into(), executable.clone())];
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| account_home);
+    if install_bridge {
+        shell_integration::prepare_unix(&executable, &home, &mut env, &mut argv, login)?;
+    }
     Ok(LaunchDescription {
-        executable: executable.clone(),
+        executable,
         argv,
         cwd: Some(cwd),
-        env: vec![("SHELL".into(), executable)],
-        // v7's directory metadata is WSL-specific; native paths stay in the
-        // launch description rather than pretending to be a distribution.
+        env,
         metadata: None,
     })
 }
@@ -203,7 +216,7 @@ pub fn resolve_profile(
                     .filter(|home| !home.is_empty())
                     .map(PathBuf::from)
             })
-            .unwrap_or(account_home);
+            .unwrap_or_else(|| account_home.clone());
         if !cwd.is_absolute() || !cwd.is_dir() {
             return Err(format!(
                 "working directory must be an existing absolute directory: {}",
@@ -219,6 +232,22 @@ pub fn resolve_profile(
                     .iter()
                     .map(|(key, value)| (key.into(), value.into())),
             );
+        }
+        let automatic = profile.executable.is_none() && profile.args.is_empty();
+        if automatic {
+            let home = env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "HOME")
+                .map(|(_, value)| PathBuf::from(value))
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .filter(|home| !home.is_empty())
+                        .map(PathBuf::from)
+                })
+                .unwrap_or_else(|| account_home.clone());
+            let login = args.iter().any(|arg| arg == "-l");
+            shell_integration::prepare_unix(&executable, &home, &mut env, &mut args, login)?;
         }
         Ok(LaunchDescription {
             executable,
@@ -237,7 +266,8 @@ pub fn resolve_profile(
             return Err("configured WSL executable must be an absolute Linux path".into());
         }
         let mut argv: Vec<OsString> = Vec::new();
-        if let Some(distribution) = resolved.distribution {
+        let distribution = resolved.distribution.as_deref();
+        if let Some(distribution) = distribution {
             argv.extend(["--distribution".into(), distribution.into()]);
         }
         argv.extend(["--cd".into(), resolved.directory.into(), "--exec".into()]);
@@ -252,7 +282,18 @@ pub fn resolve_profile(
                     .map(|(key, value)| OsString::from(format!("{key}={value}"))),
             );
         }
-        argv.push(executable.into());
+        if profile.executable.is_none() && profile.args.is_empty() {
+            let login = args.iter().any(|arg| arg == "-l");
+            shell_integration::prepare_wsl(
+                distribution,
+                context.and_then(|context| context.env.get("HOME").map(String::as_str)),
+                context.and_then(|context| context.env.get("PROMPT_COMMAND").map(String::as_str)),
+                login,
+                &mut argv,
+            )?;
+        } else {
+            argv.push(executable.into());
+        }
         argv.extend(args);
         Ok(LaunchDescription {
             executable: r"C:\Windows\System32\wsl.exe".into(),
@@ -268,11 +309,43 @@ pub fn check_system() -> Result<()> {
     #[cfg(windows)]
     compi_protocol::wsl::ensure_default_wsl2()?;
     #[cfg(unix)]
-    let _ = resolve_launch(None)?;
+    let _ = resolve_unix_launch(None, false)?;
     #[cfg(unix)]
     validate_executable(std::ffi::OsStr::new("/bin/ps"))?;
     // Validate PTY availability too, without starting a shell or interpreting
     // startup files. Handles are closed immediately on success.
     let _ = portable_pty::native_pty_system().openpty(portable_pty::PtySize::default())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_non_shell_program_ignores_shell_integration() {
+        let mut context = compi_protocol::LaunchContext::default();
+        context.profile.executable = Some("/bin/echo".into());
+        context.profile.args = vec!["unchanged".into()];
+        context.profile.login = Some(false);
+        context
+            .env
+            .insert("HOME".into(), "/compi-nonexistent-home-directory".into());
+        let request = compi_protocol::LaunchRequest {
+            working_directory: None,
+            profile: None,
+        };
+        let launch = resolve_profile(&request, Some(&context)).unwrap();
+        let output = std::process::Command::new(launch.executable)
+            .args(launch.argv)
+            .envs(launch.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"unchanged\n");
+    }
 }

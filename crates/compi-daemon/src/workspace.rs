@@ -772,6 +772,45 @@ fn apply_mutation(
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
+        WorkspaceMutation::DetachPane { pane_id } => {
+            for session in &mut workspace.sessions {
+                let Some(index) = session
+                    .tabs
+                    .iter()
+                    .position(|tab| contains_pane(&tab.layout, pane_id))
+                else {
+                    continue;
+                };
+                let tab = &mut session.tabs[index];
+                if matches!(tab.layout, LayoutNode::Pane { .. }) {
+                    return Err(invalid(format!(
+                        "pane {pane_id} is the only pane in its tab"
+                    )));
+                }
+                let detached =
+                    extract_pane(&mut tab.layout, pane_id).expect("pane was found in a split tab");
+                let LayoutNode::Pane { surface_id, .. } = &detached else {
+                    unreachable!("only a leaf can be detached");
+                };
+                let surface_id = surface_id.clone();
+                let old_tab_id = tab.id.clone();
+                let new_tab_id = TabId::new(allocate("tab", ordinal));
+                session.tabs.insert(
+                    index + 1,
+                    WorkspaceTab {
+                        id: new_tab_id.clone(),
+                        label: String::new(),
+                        layout: detached,
+                    },
+                );
+                affected_sessions.push(session.id.clone());
+                affected_tabs.extend([new_tab_id, old_tab_id]);
+                affected_panes.push(pane_id.clone());
+                affected_surfaces.push(surface_id);
+                return Ok("committed".into());
+            }
+            Err(invalid(format!("pane {pane_id} was not found")))
+        }
         WorkspaceMutation::SetSplitRatio {
             tab_id,
             path,
@@ -1204,6 +1243,47 @@ fn contains_pane(node: &LayoutNode, target: &PaneId) -> bool {
     }
 }
 
+// Remove a leaf by promoting its sibling without rebuilding ancestor splits.
+fn extract_pane(node: &mut LayoutNode, target: &PaneId) -> Option<LayoutNode> {
+    let LayoutNode::Split { first, second, .. } = node else {
+        return None;
+    };
+    let child = match (&**first, &**second) {
+        (
+            LayoutNode::Pane {
+                pane_id,
+                surface_id,
+            },
+            _,
+        ) if pane_id == target => Some((true, pane_id, surface_id)),
+        (
+            _,
+            LayoutNode::Pane {
+                pane_id,
+                surface_id,
+            },
+        ) if pane_id == target => Some((false, pane_id, surface_id)),
+        _ => None,
+    };
+    if let Some((take_first, pane_id, surface_id)) = child {
+        let placeholder = LayoutNode::Pane {
+            pane_id: pane_id.clone(),
+            surface_id: surface_id.clone(),
+        };
+        let LayoutNode::Split { first, second, .. } = std::mem::replace(node, placeholder) else {
+            unreachable!("the node was a split");
+        };
+        return if take_first {
+            *node = *second;
+            Some(*first)
+        } else {
+            *node = *first;
+            Some(*second)
+        };
+    }
+    extract_pane(first, target).or_else(|| extract_pane(second, target))
+}
+
 fn collect_surfaces(node: &LayoutNode, output: &mut Vec<SurfaceId>) {
     match node {
         LayoutNode::Pane { surface_id, .. } => output.push(surface_id.clone()),
@@ -1551,6 +1631,203 @@ mod tests {
             effects.recv().unwrap(),
             WorkspaceEffect::Launch(_, _)
         ));
+    }
+
+    #[test]
+    fn detach_preserves_nested_survivors_and_running_surface_in_durable_shape() {
+        let (actor, effects) = WorkspaceActor::memory();
+        actor
+            .mutate(request(
+                &actor,
+                "detach-init",
+                0,
+                WorkspaceMutation::Initialize {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        let initial = actor.snapshot().unwrap();
+        let LayoutNode::Pane { pane_id: a, .. } = &initial.sessions[0].tabs[0].layout else {
+            panic!("expected initial leaf");
+        };
+        let a = a.clone();
+        let split = |id: &str, pane_id: PaneId| {
+            actor
+                .mutate(request(
+                    &actor,
+                    id,
+                    actor.snapshot().unwrap().revision,
+                    WorkspaceMutation::SplitPane {
+                        pane_id,
+                        axis: SplitAxis::Horizontal,
+                        cols: 80,
+                        rows: 24,
+                        working_directory: None,
+                        geometry: compi_protocol::SplitGeometry {
+                            width: 800.0,
+                            height: 480.0,
+                            min_width: 160.0,
+                            min_height: 80.0,
+                            divider: 4.0,
+                        },
+                    },
+                ))
+                .unwrap()
+                .affected_panes[1]
+                .clone()
+        };
+        let b = split("detach-root", a.clone());
+        let c = split("detach-left", a.clone());
+        let d = split("detach-right", b.clone());
+        for (id, path, ratio) in [
+            ("detach-ratio-root", vec![], 0.63),
+            ("detach-ratio-left", vec![false], 0.27),
+            ("detach-ratio-right", vec![true], 0.71),
+        ] {
+            actor
+                .mutate(request(
+                    &actor,
+                    id,
+                    actor.snapshot().unwrap().revision,
+                    WorkspaceMutation::SetSplitRatio {
+                        tab_id: initial.sessions[0].tabs[0].id.clone(),
+                        path,
+                        ratio,
+                    },
+                ))
+                .unwrap();
+        }
+        for _ in 0..3 {
+            assert!(matches!(
+                effects.recv().unwrap(),
+                WorkspaceEffect::Launch(_, _)
+            ));
+        }
+        let WorkspaceEffect::Launch(detached_surface, _) = effects.recv().unwrap() else {
+            panic!("expected detached pane launch");
+        };
+        let revision = actor.snapshot().unwrap().revision;
+        actor.observe(RuntimeObservation::Running {
+            surface_id: detached_surface.id.clone(),
+            process_lifetime_id: detached_surface.process_lifetime_id.clone(),
+            working_directory: None,
+        });
+        let before = wait_revision(&actor, revision + 1);
+        let receipt = actor
+            .mutate(request(
+                &actor,
+                "detach-leaf",
+                before.revision,
+                WorkspaceMutation::DetachPane { pane_id: d.clone() },
+            ))
+            .unwrap();
+        let after = actor.snapshot().unwrap();
+        let session = &after.sessions[0];
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(session.tabs.len(), 2);
+        assert_eq!(receipt.revision, after.revision);
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(receipt.affected_sessions, vec![session.id.clone()]);
+        assert_eq!(
+            receipt.affected_tabs,
+            vec![session.tabs[1].id.clone(), session.tabs[0].id.clone()]
+        );
+        assert_eq!(receipt.affected_panes, vec![d.clone()]);
+        assert_eq!(receipt.affected_surfaces, vec![detached_surface.id.clone()]);
+        assert_eq!(session.tabs[0].id, before.sessions[0].tabs[0].id);
+        assert!(session.tabs[1].label.is_empty());
+        assert!(matches!(
+            &session.tabs[1].layout,
+            LayoutNode::Pane { pane_id, surface_id }
+                if pane_id == &d && surface_id == &detached_surface.id
+        ));
+        let LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: root_ratio,
+            first,
+            second,
+        } = &session.tabs[0].layout
+        else {
+            panic!("expected surviving root split");
+        };
+        assert_eq!(*root_ratio, 0.63);
+        assert!(matches!(&**second, LayoutNode::Pane { pane_id, .. } if pane_id == &b));
+        let LayoutNode::Split {
+            ratio: left_ratio,
+            first: left_first,
+            second: left_second,
+            ..
+        } = &**first
+        else {
+            panic!("expected surviving nested split");
+        };
+        assert_eq!(*left_ratio, 0.27);
+        assert!(matches!(&**left_first, LayoutNode::Pane { pane_id, .. } if pane_id == &a));
+        assert!(matches!(&**left_second, LayoutNode::Pane { pane_id, .. } if pane_id == &c));
+        assert_eq!(after.surfaces, before.surfaces);
+        assert_eq!(
+            after.surface(&detached_surface.id).unwrap().status,
+            SurfaceStatus::Running
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+
+        let stored = StoredWorkspace {
+            server_id: after.server_id.clone(),
+            revision: after.revision,
+            initialized: after.initialized,
+            sessions: after.sessions.clone(),
+            surfaces: after.surfaces.clone(),
+            receipts: vec![receipt],
+            pending_removals: vec![],
+            recovery_message: after.recovery_message.clone(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "compi-detach-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        store.commit(&stored).unwrap();
+        let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.sessions, stored.sessions);
+        assert_eq!(reopened.receipts, stored.receipts);
+        assert_eq!(reopened.server_id, stored.server_id);
+        assert_eq!(reopened.surfaces.len(), stored.surfaces.len());
+        for (restored, original) in reopened.surfaces.iter().zip(&stored.surfaces) {
+            assert_eq!(restored.id, original.id);
+            assert_eq!(restored.process_lifetime_id, original.process_lifetime_id);
+            assert_eq!(restored.status, SurfaceStatus::Lost);
+        }
+        std::fs::remove_file(path).unwrap();
+
+        let survivor = actor
+            .mutate(request(
+                &actor,
+                "detach-survivor",
+                after.revision,
+                WorkspaceMutation::DetachPane { pane_id: b.clone() },
+            ))
+            .unwrap();
+        let collapsed = actor.snapshot().unwrap();
+        assert_eq!(survivor.revision, collapsed.revision);
+        assert_eq!(collapsed.sessions[0].tabs.len(), 3);
+        assert!(matches!(
+            &collapsed.sessions[0].tabs[0].layout,
+            LayoutNode::Split { ratio, .. } if *ratio == 0.27
+        ));
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+        let refused = actor
+            .mutate(request(
+                &actor,
+                "detach-single",
+                collapsed.revision,
+                WorkspaceMutation::DetachPane { pane_id: d },
+            ))
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidRequest);
+        assert_eq!(actor.snapshot().unwrap(), collapsed);
     }
 
     #[test]

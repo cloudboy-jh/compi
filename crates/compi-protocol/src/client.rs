@@ -1,11 +1,11 @@
 use crate::Result;
 use crate::frame;
 use crate::{
-    CONTROL_FRAME, ClientControl, ClientMessage, ErrorCode, IMAGE_UPLOAD_CHUNK_BYTES,
-    MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION,
-    RuntimeMetrics, SCREEN_FRAME, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus,
-    TerminalTarget, WorkspaceMutation, WorkspaceSnapshot, decode_server, decode_terminal_frame,
-    encode_client,
+    CONTROL_FRAME, ClientControl, ClientMessage, DirectoryEntry, ErrorCode,
+    IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest,
+    PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId,
+    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
+    decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
@@ -225,6 +225,36 @@ impl DaemonClient {
     pub fn runtime_metrics(&mut self) -> Result<RuntimeMetrics> {
         match self.request(ClientMessage::GetRuntimeMetrics)? {
             ServerMessage::RuntimeMetrics { metrics } => Ok(metrics),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// List immediate children in the filesystem namespace of a workspace surface.
+    /// `path` must be an absolute Unix/WSL path, even when the client runs on Windows.
+    pub fn list_directory(
+        &mut self,
+        surface_id: SurfaceId,
+        path: String,
+    ) -> Result<Vec<DirectoryEntry>> {
+        match self.request(ClientMessage::ListDirectory { surface_id, path })? {
+            ServerMessage::DirectoryListed { entries } => Ok(entries),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Search descendant names beneath an absolute Unix/WSL root for one workspace surface.
+    pub fn search_directory(
+        &mut self,
+        surface_id: SurfaceId,
+        root: String,
+        query: String,
+    ) -> Result<Vec<SearchEntry>> {
+        match self.request(ClientMessage::SearchDirectory {
+            surface_id,
+            root,
+            query,
+        })? {
+            ServerMessage::DirectorySearched { entries } => Ok(entries),
             message => Err(unexpected_response(message)),
         }
     }

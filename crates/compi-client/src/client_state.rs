@@ -8,6 +8,7 @@ use crate::{
         DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MAX_TERMINAL_OPACITY, MIN_SIDEBAR_WIDTH,
         MIN_TERMINAL_OPACITY,
     },
+    project_history::ProjectHistory,
     theme::{BackgroundEffect, ThemePreset},
 };
 use compi_protocol::{
@@ -110,6 +111,8 @@ pub struct ClientState {
     pub hidden_tabs: HashSet<TabId>,
     #[serde(default)]
     pub viewports: HashMap<String, SavedViewport>,
+    #[serde(default)]
+    pub project_history: ProjectHistory,
 }
 
 impl Default for ClientState {
@@ -126,6 +129,7 @@ impl Default for ClientState {
             focused_panes: HashMap::new(),
             hidden_tabs: HashSet::new(),
             viewports: HashMap::new(),
+            project_history: ProjectHistory::default(),
         }
     }
 }
@@ -489,6 +493,7 @@ impl ClientState {
                 + self.focused_panes.len()
                 + self.hidden_tabs.len()
                 + self.viewports.len();
+        changed |= self.project_history.sanitize();
         Ok(changed)
     }
 }
@@ -965,6 +970,33 @@ mod tests {
         state.appearance.terminal_opacity = Some(f32::NAN);
         assert!(state.sanitize(&ClientState::default()).unwrap());
         assert_eq!(state.appearance.terminal_opacity, None);
+    }
+
+    #[test]
+    fn legacy_state_without_project_history_loads_and_history_survives_restart() {
+        let directory = Directory::new();
+        let mut slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        let path = slot.path.clone();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("project_history");
+        drop(slot);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        assert!(slot.state.project_history.search("").is_empty());
+        assert!(slot.state.project_history.record("/mnt/c/code/compi"));
+        assert!(slot.state.project_history.record("/home/user/project"));
+        slot.save().unwrap();
+        drop(slot);
+        let slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        assert_eq!(
+            slot.state.project_history.search("code"),
+            ["/mnt/c/code/compi"]
+        );
+        assert_eq!(
+            slot.state.project_history.search(""),
+            ["/home/user/project", "/mnt/c/code/compi"]
+        );
     }
 
     #[test]

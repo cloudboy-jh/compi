@@ -3,8 +3,8 @@ pub mod trace;
 use base64::Engine;
 use compi_protocol::{
     Cell, Color, CursorShape, CursorState, DEFAULT_GRAPHICS_BYTES, KittyImage, KittyPlacement,
-    MAX_DECODED_IMAGE_BYTES, MAX_GRAPHICS_BYTES, MouseMode, Row, RowUpdate, TerminalModes,
-    TextAttributes,
+    MAX_DECODED_IMAGE_BYTES, MAX_GRAPHICS_BYTES, MouseMode, Row, RowUpdate, ShellAction,
+    TerminalModes, TextAttributes,
 };
 use flate2::read::ZlibDecoder;
 use smol_str::SmolStr;
@@ -23,6 +23,8 @@ const MAX_APC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OSC8_URI_BYTES: usize = 2048;
 const MAX_UNSUPPORTED_SIGNATURES: usize = 128;
 const MAX_OSC52_DECODED_BYTES: usize = 1024 * 1024;
+const MAX_KEYBOARD_PROTOCOL_STACK: usize = 32;
+const KITTY_KEYBOARD_SUPPORTED_FLAGS: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -54,6 +56,7 @@ pub struct Delta {
     pub latency_ids: Vec<u64>,
     pub placements: Option<Vec<KittyPlacement>>,
     pub clipboard_writes: Vec<String>,
+    pub shell_action: Option<ShellAction>,
 }
 
 struct Buffer {
@@ -183,6 +186,7 @@ pub struct TerminalState {
     title: String,
     current_directory: Option<String>,
     modes: TerminalModes,
+    keyboard_protocol_stack: Vec<u8>,
     scroll_top: usize,
     scroll_bottom: usize,
     pending_wrap: bool,
@@ -192,6 +196,7 @@ pub struct TerminalState {
     image_generation: u64,
     replies: Vec<Vec<u8>>,
     clipboard_writes: Vec<String>,
+    shell_action: Option<ShellAction>,
     images: HashMap<u32, KittyImage>,
     placements: Vec<KittyPlacement>,
     transfers: HashMap<u32, KittyTransfer>,
@@ -224,12 +229,14 @@ impl TerminalState {
                 auto_wrap: true,
                 ..TerminalModes::default()
             },
+            keyboard_protocol_stack: Vec::new(),
             scroll_top: 0,
             scroll_bottom: rows,
             pending_wrap: false,
             sequence: 0,
             replies: Vec::new(),
             clipboard_writes: Vec::new(),
+            shell_action: None,
             images: HashMap::new(),
             scrollback_generation: 0,
             graphics_generation: 0,
@@ -430,6 +437,7 @@ impl TerminalState {
 
     fn finish_change(&mut self, before: ChangeBaseline) -> (Option<Delta>, Vec<Vec<u8>>) {
         let replies = std::mem::take(&mut self.replies);
+        let shell_action = self.shell_action.take();
         let clipboard_writes = std::mem::take(&mut self.clipboard_writes);
         let row_hashes: Vec<_> = self.buffer().rows.iter().map(row_hash).collect();
         let all_rows = before.cols != self.cols()
@@ -445,7 +453,8 @@ impl TerminalState {
             || before.modes != self.modes
             || before.title != self.title
             || before.current_directory != self.current_directory
-            || !clipboard_writes.is_empty();
+            || !clipboard_writes.is_empty()
+            || shell_action.is_some();
         if !changed {
             return (None, replies);
         }
@@ -493,6 +502,7 @@ impl TerminalState {
             latency_ids: Vec::new(),
             placements,
             clipboard_writes,
+            shell_action,
         };
         (Some(delta), replies)
     }
@@ -1521,6 +1531,13 @@ impl Perform for TerminalState {
                     self.clipboard_writes.push(text);
                 }
             }
+            "777" if params.len() == 3 && params[1] == b"compi" => {
+                if params[2] == b"tree" {
+                    self.shell_action = Some(ShellAction::BrowseFiles);
+                } else if params[2] == b"jump" {
+                    self.shell_action = Some(ShellAction::JumpProject);
+                }
+            }
             _ => {}
         }
     }
@@ -1585,7 +1602,30 @@ impl Perform for TerminalState {
             ('h', _) => self.set_mode(private, params, true),
             ('l', _) => self.set_mode(private, params, false),
             ('s', _) => self.saved_cursor = self.cursor,
-            ('u', _) => self.cursor = self.saved_cursor,
+            ('u', b"") => self.cursor = self.saved_cursor,
+            ('u', b"?") => self
+                .replies
+                .push(format!("\x1b[?{}u", self.modes.keyboard_protocol_flags).into_bytes()),
+            ('u', b"=") => {
+                self.modes.keyboard_protocol_flags =
+                    (first_param(params, 0) & KITTY_KEYBOARD_SUPPORTED_FLAGS) as u8;
+            }
+            ('u', b">") => {
+                if self.keyboard_protocol_stack.len() < MAX_KEYBOARD_PROTOCOL_STACK {
+                    self.keyboard_protocol_stack
+                        .push(self.modes.keyboard_protocol_flags);
+                    self.modes.keyboard_protocol_flags =
+                        (first_param(params, 0) & KITTY_KEYBOARD_SUPPORTED_FLAGS) as u8;
+                }
+            }
+            ('u', b"<") => {
+                let levels = usize::from(first_param(params, 1).max(1))
+                    .min(self.keyboard_protocol_stack.len());
+                for _ in 0..levels {
+                    self.modes.keyboard_protocol_flags =
+                        self.keyboard_protocol_stack.pop().unwrap_or(0);
+                }
+            }
             ('n', _) if first_param(params, 0) == 5 => self.replies.push(b"\x1b[0n".to_vec()),
             ('n', _) if first_param(params, 0) == 6 => self.replies.push(
                 format!("\x1b[{};{}R", self.cursor.row + 1, self.cursor.col + 1).into_bytes(),
@@ -2055,6 +2095,45 @@ mod tests {
     }
 
     #[test]
+    fn shell_actions_are_bounded_one_shot_delta_effects() {
+        let mut terminal = TerminalState::new(12, 3);
+        assert!(terminal.advance(b"\x1b]777;compi;tr").0.is_none());
+        let (delta, replies) = terminal.advance(b"ee\x07");
+        assert!(replies.is_empty());
+        let delta = delta.expect("action alone must generate a delta");
+        assert_eq!(delta.shell_action, Some(ShellAction::BrowseFiles));
+        assert_eq!(terminal.snapshot().sequence, delta.sequence);
+        assert!(terminal.advance(b"").0.is_none());
+        assert_eq!(terminal.resize(14, 3).unwrap().shell_action, None);
+        assert_eq!(
+            terminal
+                .advance(b"\x1b]777;compi;jump\x07")
+                .0
+                .unwrap()
+                .shell_action,
+            Some(ShellAction::JumpProject)
+        );
+        assert!(terminal.advance(b"").0.is_none());
+
+        for payload in [
+            b"\x1b]777;compi;tree;extra\x07".as_slice(),
+            b"\x1b]777;else;tree\x07",
+            b"\x1b]777;compi;TREE\x07",
+            b"\x1b]777;compi;jump;extra\x07",
+        ] {
+            assert!(terminal.advance(payload).0.is_none());
+        }
+        assert_eq!(
+            terminal
+                .advance(b"\x1b]777;compi;tree\x07\x1b]777;compi;bad\x07")
+                .0
+                .unwrap()
+                .shell_action,
+            Some(ShellAction::BrowseFiles)
+        );
+    }
+
+    #[test]
     fn tracks_osc8_hyperlinks_on_printed_cells() {
         let mut terminal = TerminalState::new(12, 2);
         terminal.advance(b"\x1b]8;;https://example.com/docs\x07link\x1b]8;;\x07 plain");
@@ -2197,6 +2276,24 @@ mod tests {
         let disabled = terminal.snapshot();
         assert!(!disabled.modes.application_cursor);
         assert!(!disabled.modes.application_keypad);
+    }
+
+    #[test]
+    fn negotiates_keyboard_disambiguation_and_restores_previous_mode() {
+        let mut terminal = TerminalState::new(8, 2);
+        let (delta, replies) = terminal.advance(b"\x1b[>1u\x1b[?u");
+        assert_eq!(delta.unwrap().modes.keyboard_protocol_flags, 1);
+        assert_eq!(replies, vec![b"\x1b[?1u".to_vec()]);
+
+        terminal.advance(b"\x1b[>2u");
+        assert_eq!(terminal.snapshot().modes.keyboard_protocol_flags, 0);
+        terminal.advance(b"\x1b[<u");
+        assert_eq!(terminal.snapshot().modes.keyboard_protocol_flags, 1);
+        terminal.advance(b"\x1b[<u");
+        assert_eq!(terminal.snapshot().modes.keyboard_protocol_flags, 0);
+
+        terminal.advance(b"\x1b[=1u\x1bc");
+        assert_eq!(terminal.snapshot().modes.keyboard_protocol_flags, 0);
     }
 
     #[test]

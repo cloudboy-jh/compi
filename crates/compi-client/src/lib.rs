@@ -14,6 +14,7 @@ pub mod image_input;
 pub mod input;
 pub mod layout;
 pub mod probe;
+pub mod project_history;
 mod replica;
 pub mod selection;
 pub mod theme;

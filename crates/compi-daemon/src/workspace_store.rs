@@ -110,7 +110,10 @@ impl WorkspaceStore {
         Self::open_path(path, &legacy)
     }
 
-    fn open_path(path: PathBuf, legacy_paths: &[PathBuf]) -> Result<(Self, StoredWorkspace)> {
+    pub(crate) fn open_path(
+        path: PathBuf,
+        legacy_paths: &[PathBuf],
+    ) -> Result<(Self, StoredWorkspace)> {
         let store = Self {
             path: Some(path.clone()),
         };

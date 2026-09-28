@@ -231,6 +231,7 @@ struct SurfaceView {
     scroll_offset: usize,
     selection: Option<Selection>,
     selecting: bool,
+    mouse_reporting_down: bool,
     image_cache: HashMap<u32, (u64, Arc<RenderImage>)>,
     image_pending: HashMap<u32, u64>,
     image_rejected: HashMap<u32, u64>,
@@ -427,6 +428,7 @@ impl SurfaceView {
         self.selection = None;
         self.scroll_offset = 0;
         self.selecting = false;
+        self.mouse_reporting_down = false;
         self.image_cache.clear();
         self.image_pending.clear();
         self.image_rejected.clear();
@@ -471,6 +473,17 @@ enum UiEvent {
     ImageClipboardReady(Result<gpui::Image, String>),
     ImageOperationFinished(Result<String, String>),
     SurfacesLoaded(Result<compi_protocol::WorkspaceSnapshot, String>),
+    TreeListed {
+        pane_id: PaneId,
+        request: u64,
+        parent: String,
+        result: Result<Vec<compi_protocol::DirectoryEntry>, String>,
+    },
+    TreeSearched {
+        pane_id: PaneId,
+        request: u64,
+        result: Result<Vec<compi_protocol::SearchEntry>, String>,
+    },
     DaemonRestarted(Result<compi_protocol::WorkspaceSnapshot, String>),
     MutationFinished {
         result: Result<(WorkspaceSnapshot, compi_protocol::MutationReceipt), String>,
@@ -717,6 +730,8 @@ struct CompiApp {
     ime_selected_range: Range<usize>,
     surface_views: Vec<SurfaceView>,
     focused_view: Option<u64>,
+    file_tree: Option<workspace::tree::FileTree>,
+    tree_scroll: ScrollHandle,
     tab_scroll_handle: ScrollHandle,
     workspace_scroll: ScrollHandle,
     sidebar_scroll: ScrollHandle,
@@ -830,13 +845,14 @@ impl CompiApp {
         let Some(tab) = self.focused_view_mut() else {
             return false;
         };
-        let (application_cursor, application_keypad) = tab
+        let (application_cursor, application_keypad, keyboard_protocol_flags) = tab
             .mirror
             .snapshot()
             .map(|snapshot| {
                 (
                     snapshot.modes.application_cursor,
                     snapshot.modes.application_keypad,
+                    snapshot.modes.keyboard_protocol_flags,
                 )
             })
             .unwrap_or_default();
@@ -852,8 +868,12 @@ impl CompiApp {
             // composition. Commands must not leak into the PTY.
             return false;
         }
-        if let Some(bytes) = encode_keystroke(&terminal_key(keystroke), application_cursor, keypad)
-        {
+        if let Some(bytes) = encode_keystroke(
+            &terminal_key(keystroke),
+            application_cursor,
+            keypad,
+            keyboard_protocol_flags,
+        ) {
             tab.scroll_offset = 0;
             let latency_id = perf::begin_input_latency();
             if let Some(latency_id) = latency_id {
@@ -1010,6 +1030,7 @@ impl CompiApp {
                 .and_then(|point| web_link_at(tab.mirror.snapshot(), point))
                 .is_some(),
         );
+        tab.mouse_reporting_down = false;
         if Self::terminal_owns_mouse(mouse_mode, event.modifiers, activates_hyperlink) {
             if let Some(data) = encode_mouse(
                 Some(terminal_button(event.button)),
@@ -1019,6 +1040,7 @@ impl CompiApp {
                 visible_row(tab.rows, point.row),
                 terminal_modifiers(event.modifiers),
             ) {
+                tab.mouse_reporting_down = true;
                 tab.send(ClientMessage::Input {
                     data,
                     latency_id: None,
@@ -1045,13 +1067,48 @@ impl CompiApp {
     fn on_terminal_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
+        pane_id: &PaneId,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(point) = self.grid_point(event.position) else {
+        if let Some(selecting_id) = self
+            .surface_views
+            .iter()
+            .find(|view| view.selecting)
+            .map(|view| view.pane_id.clone())
+            && event.dragging()
+        {
+            let point = self.grid_point_for_pane(event.position, &selecting_id, true);
+            if let Some(tab) = self
+                .surface_views
+                .iter_mut()
+                .find(|view| view.pane_id == selecting_id)
+                && let Some(absolute) = point.and_then(|point| {
+                    visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
+                })
+                && let Some(selection) = tab.selection.as_mut()
+            {
+                selection.head = absolute;
+                cx.notify();
+            }
             return;
+        }
+        let reporting_id = self
+            .surface_views
+            .iter()
+            .find(|view| view.mouse_reporting_down)
+            .map(|view| view.pane_id.clone());
+        let target = if event.pressed_button.is_some() {
+            reporting_id.as_ref().unwrap_or(pane_id)
+        } else {
+            pane_id
         };
-        let Some(tab) = self.focused_view_mut() else {
+        let point = self.grid_point_for_pane(event.position, target, reporting_id.is_some());
+        let Some(tab) = self
+            .surface_views
+            .iter_mut()
+            .find(|view| &view.pane_id == target)
+        else {
             return;
         };
         let mouse_mode = tab
@@ -1059,79 +1116,92 @@ impl CompiApp {
             .snapshot()
             .map(|snapshot| snapshot.modes.mouse)
             .unwrap_or_default();
-        let report_motion = input::reports_mouse_motion(mouse_mode, event.pressed_button.is_some());
-        if report_motion && !event.modifiers.shift {
-            if let Some(data) = encode_mouse(
+        if input::reports_mouse_motion(mouse_mode, event.pressed_button.is_some())
+            && (tab.mouse_reporting_down || !event.modifiers.shift)
+            && let Some(point) = point
+            && let Some(data) = encode_mouse(
                 event.pressed_button.map(terminal_button),
                 false,
                 true,
                 point.col,
                 visible_row(tab.rows, point.row),
                 terminal_modifiers(event.modifiers),
-            ) {
-                tab.send(ClientMessage::Input {
-                    data,
-                    latency_id: None,
-                });
-            }
-        } else if tab.selecting
-            && event.dragging()
-            && let Some(absolute) =
-                visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
-            && let Some(selection) = tab.selection.as_mut()
+            )
         {
-            selection.head = absolute;
-            cx.notify();
+            tab.send(ClientMessage::Input {
+                data,
+                latency_id: None,
+            });
         }
     }
 
     fn on_terminal_mouse_up(
         &mut self,
         event: &MouseUpEvent,
+        pane_id: &PaneId,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(point) = self.grid_point(event.position) else {
+        let selecting_id = self
+            .surface_views
+            .iter()
+            .find(|view| view.selecting)
+            .map(|view| view.pane_id.clone());
+        let reporting_id = self
+            .surface_views
+            .iter()
+            .find(|view| view.mouse_reporting_down)
+            .map(|view| view.pane_id.clone());
+        let target = selecting_id
+            .as_ref()
+            .or(reporting_id.as_ref())
+            .unwrap_or(pane_id);
+        let strict_point = self.grid_point_for_pane(event.position, target, false);
+        let point = self.grid_point_for_pane(event.position, target, true);
+        let Some(tab) = self
+            .surface_views
+            .iter_mut()
+            .find(|view| &view.pane_id == target)
+        else {
             return;
         };
-        let Some(tab) = self.focused_view_mut() else {
-            return;
-        };
-        let mouse_mode = tab
-            .mirror
-            .snapshot()
-            .map(|snapshot| snapshot.modes.mouse)
-            .unwrap_or_default();
-        let activates_hyperlink = Self::activates_hyperlink(
-            event.button,
-            event.modifiers,
-            visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
-                .and_then(|point| web_link_at(tab.mirror.snapshot(), point))
-                .is_some(),
-        );
-        if Self::terminal_owns_mouse(mouse_mode, event.modifiers, activates_hyperlink) {
-            if let Some(data) = encode_mouse(
-                Some(terminal_button(event.button)),
-                true,
-                false,
-                point.col,
-                visible_row(tab.rows, point.row),
-                terminal_modifiers(event.modifiers),
-            ) {
+        if tab.mouse_reporting_down {
+            tab.mouse_reporting_down = false;
+            if let Some(point) = point
+                && let Some(data) = encode_mouse(
+                    Some(terminal_button(event.button)),
+                    true,
+                    false,
+                    point.col,
+                    visible_row(tab.rows, point.row),
+                    terminal_modifiers(event.modifiers),
+                )
+            {
                 tab.send(ClientMessage::Input {
                     data,
                     latency_id: None,
                 });
             }
         } else {
+            if tab.selecting {
+                if let Some(absolute) = point.and_then(|point| {
+                    visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
+                }) && let Some(selection) = tab.selection.as_mut()
+                {
+                    selection.head = absolute;
+                }
+            }
             tab.selecting = false;
             let clicked_link = if let Some(selection) = tab.selection
                 && selection.anchor == selection.head
             {
                 tab.selection = None;
-                (event.button == MouseButton::Left && event.modifiers.secondary())
-                    .then(|| web_link_at(tab.mirror.snapshot(), selection.head))
-                    .flatten()
+                (target == pane_id
+                    && strict_point.is_some()
+                    && event.button == MouseButton::Left
+                    && event.modifiers.secondary())
+                .then(|| web_link_at(tab.mirror.snapshot(), selection.head))
+                .flatten()
             } else {
                 None
             };
@@ -1318,16 +1388,10 @@ fn chrome_icon(icon: ChromeIcon, tint: Hsla) -> impl IntoElement {
                     path.line_to(point(x(2.5), y(10.0)));
                 }
                 ChromeIcon::PaneActions => {
-                    path.move_to(point(x(2.5), y(3.0)));
-                    path.line_to(point(x(11.5), y(3.0)));
-                    path.line_to(point(x(11.5), y(13.0)));
-                    path.line_to(point(x(2.5), y(13.0)));
-                    path.line_to(point(x(2.5), y(3.0)));
-                    path.move_to(point(x(7.0), y(3.0)));
-                    path.line_to(point(x(7.0), y(13.0)));
-                    path.move_to(point(x(11.5), y(6.0)));
-                    path.line_to(point(x(14.0), y(8.0)));
-                    path.line_to(point(x(11.5), y(10.0)));
+                    for x_offset in [4.0, 8.0, 12.0] {
+                        path.move_to(point(x(x_offset - 0.5), y(8.0)));
+                        path.line_to(point(x(x_offset + 0.5), y(8.0)));
+                    }
                 }
                 ChromeIcon::Minimize => {
                     path.move_to(point(x(3.0), y(11.0)));
@@ -1527,6 +1591,11 @@ impl EntityInputHandler for CompiApp {
     ) {
         if self.overlay.is_some() {
             self.edit_overlay_text(range, text);
+            cx.notify();
+            return;
+        }
+        if self.file_tree.is_some() {
+            self.append_tree_text(text);
             cx.notify();
             return;
         }

@@ -1,0 +1,2 @@
+assets/compi-shell.sh text eol=lf
+tools/test-compi-shell.py text eol=lf

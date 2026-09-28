@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::file_tree;
 use crate::launch;
 use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
 use compi_protocol::frame;
@@ -7,8 +8,9 @@ use compi_protocol::identity::PipeSecurity;
 use compi_protocol::identity::{self, InstanceNames};
 use compi_protocol::pipe;
 use compi_protocol::{
-    CONTROL_FRAME, ClientMessage, ErrorCode, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES,
-    PROTOCOL_VERSION, RuntimeMetrics, ServerControl, ServerMessage, SurfaceId, SurfaceStatus,
+    CONTROL_FRAME, ClientMessage, DirectoryEntry, ErrorCode, IMAGE_UPLOAD_CHUNK_BYTES,
+    MAX_DIRECTORY_PATH_BYTES, MAX_DIRECTORY_QUERY_BYTES, MAX_IMAGE_UPLOAD_BYTES, PROTOCOL_VERSION,
+    RuntimeMetrics, SearchEntry, ServerControl, ServerMessage, SurfaceId, SurfaceStatus,
     TerminalTarget, UploadId, decode_client,
 };
 use sha2::{Digest, Sha256};
@@ -716,6 +718,83 @@ fn handle_connection(
                     }
                     Err(error) => send_actor_error(&sink, request_id, &error),
                 },
+                ClientMessage::ListDirectory { surface_id, path } => {
+                    match directory_distribution(&manager, &surface_id, target.as_ref()).and_then(
+                        |distribution| {
+                            validate_directory_path(&path)?;
+                            Ok(distribution)
+                        },
+                    ) {
+                        Ok(distribution) => {
+                            match file_tree::list_directory(&path, distribution.as_deref()) {
+                                Ok(entries) => sink.send_control(&ServerControl {
+                                    request_id: Some(request_id),
+                                    message: ServerMessage::DirectoryListed {
+                                        entries: entries
+                                            .into_iter()
+                                            .map(|entry| DirectoryEntry {
+                                                name: entry.name,
+                                                is_directory: entry.is_directory,
+                                            })
+                                            .collect(),
+                                    },
+                                })?,
+                                Err(error) => send_error(
+                                    &sink,
+                                    Some(request_id),
+                                    ErrorCode::Internal,
+                                    &format!("could not list directory: {error}"),
+                                ),
+                            }
+                        }
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, message),
+                    }
+                }
+                ClientMessage::SearchDirectory {
+                    surface_id,
+                    root,
+                    query,
+                } => {
+                    match directory_distribution(&manager, &surface_id, target.as_ref()).and_then(
+                        |distribution| {
+                            validate_directory_path(&root)?;
+                            if query.is_empty()
+                                || query.len() > MAX_DIRECTORY_QUERY_BYTES
+                                || query.contains('\0')
+                            {
+                                return Err((
+                                    ErrorCode::InvalidRequest,
+                                    "search query must contain 1 through 256 bytes and no NUL",
+                                ));
+                            }
+                            Ok(distribution)
+                        },
+                    ) {
+                        Ok(distribution) => {
+                            match file_tree::search_files(&root, distribution.as_deref(), &query) {
+                                Ok(entries) => sink.send_control(&ServerControl {
+                                    request_id: Some(request_id),
+                                    message: ServerMessage::DirectorySearched {
+                                        entries: entries
+                                            .into_iter()
+                                            .map(|entry| SearchEntry {
+                                                path: entry.path,
+                                                is_directory: entry.is_directory,
+                                            })
+                                            .collect(),
+                                    },
+                                })?,
+                                Err(error) => send_error(
+                                    &sink,
+                                    Some(request_id),
+                                    ErrorCode::Internal,
+                                    &format!("could not search directory: {error}"),
+                                ),
+                            }
+                        }
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, message),
+                    }
+                }
                 ClientMessage::Mutate { mutation } => match manager.mutate(mutation) {
                     Ok(receipt) => {
                         send_workspace_events(&sink, &mut workspace_events, &manager)?;
@@ -914,6 +993,49 @@ fn handle_connection(
         session.detach_connection(sink.id());
     }
     result
+}
+
+fn directory_distribution(
+    manager: &SurfaceManager,
+    surface_id: &SurfaceId,
+    target: Option<&TerminalTarget>,
+) -> std::result::Result<Option<String>, (ErrorCode, &'static str)> {
+    if target.is_some() {
+        return Err((
+            ErrorCode::InvalidRequest,
+            "directory operations do not accept an attachment target",
+        ));
+    }
+    let surface = manager
+        .get_info(surface_id)
+        .ok_or((ErrorCode::SurfaceNotFound, "surface was not found"))?;
+    #[cfg(windows)]
+    {
+        Ok(surface
+            .working_directory
+            .map(|directory| directory.distribution)
+            .or_else(|| {
+                surface
+                    .launch
+                    .profile
+                    .and_then(|profile| profile.distribution)
+            }))
+    }
+    #[cfg(unix)]
+    {
+        let _ = surface;
+        Ok(None)
+    }
+}
+
+fn validate_directory_path(path: &str) -> std::result::Result<(), (ErrorCode, &'static str)> {
+    if !path.starts_with('/') || path.len() > MAX_DIRECTORY_PATH_BYTES || path.contains('\0') {
+        return Err((
+            ErrorCode::InvalidRequest,
+            "directory path must be an absolute Unix path of at most 4096 bytes without NUL",
+        ));
+    }
+    Ok(())
 }
 
 fn read_next(

@@ -23,6 +23,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 
 - Qualify the bundled application, not a bare `cargo run`, across the complete workspace flow: shell and fullscreen-editor input, resize, close/reopen, same-process persistence, workspace/tab/split operations, tear-off and transfer, Settings, appearance, and recovery states.
 - Exercise physical Cmd/Ctrl/Option keys, clipboard, dead keys/IME, exact user font and fallback glyphs, native controls, fullscreen, scaling, mixed displays/DPI, and display pacing.
+- On a native Mac, exercise the bundled interactive Zsh/Bash startup bridge, in-pane tree/search, `compi tree` and `compi z` changing the live shell, cwd inheritance, pane detach, and negotiated Ctrl+Enter in an installed terminal application. Windows/WSL native coverage is recorded in `COMPLETED.md`; cross-target builds and WSL PTY tests are not Mac visual proof.
 - Repeat the UI state/size/scale matrix on Mac and verify image paste, file drop, preview, inspector, save, and reconnect behavior.
 - Keep native Linux core CI passing and qualify the Linux graphical client separately; cross-compilation and headless tests are insufficient graphical evidence.
 - Run focused regressions and final workspace/dependency checks after integration. Report unavailable physical-platform checks explicitly.

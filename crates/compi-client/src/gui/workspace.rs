@@ -6,6 +6,8 @@ pub(in crate::gui) mod dialogs;
 pub(super) mod media;
 pub(in crate::gui) mod performance;
 pub(in crate::gui) mod settings;
+pub(super) mod tree;
+mod tree_ui;
 
 #[derive(Clone)]
 pub(super) struct TransferSeed {
@@ -400,6 +402,8 @@ impl CompiApp {
             ime_selected_range: 0..0,
             surface_views: Vec::new(),
             focused_view: None,
+            file_tree: None,
+            tree_scroll: ScrollHandle::new(),
             tab_scroll_handle: ScrollHandle::new(),
             workspace_scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
@@ -1180,6 +1184,21 @@ impl CompiApp {
                     Err(error) => error,
                 })
             }
+            UiEvent::TreeListed {
+                pane_id,
+                request,
+                parent,
+                result,
+            } => {
+                self.tree_listed(pane_id, request, parent, result);
+            }
+            UiEvent::TreeSearched {
+                pane_id,
+                request,
+                result,
+            } => {
+                self.tree_searched(pane_id, request, result);
+            }
             UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.connection_error = None;
                 self.accept_workspace(workspace);
@@ -1284,6 +1303,10 @@ impl CompiApp {
                     ScreenMessage::Delta { delta } => delta.clipboard_writes.last().cloned(),
                     _ => None,
                 };
+                let shell_action = match &message {
+                    ScreenMessage::Delta { delta } => delta.shell_action,
+                    _ => None,
+                };
                 let images_changed = match &message {
                     ScreenMessage::Snapshot { .. } => true,
                     ScreenMessage::Delta { delta } => {
@@ -1326,7 +1349,20 @@ impl CompiApp {
                     });
                 let ready_probe_marker = self.ready_probe_marker.clone();
                 let mut ready_probe_observed = false;
+                let mut observed_directory = None;
                 if let Some(view) = self.surface_view_mut(tab_id) {
+                    let incoming_directory = match &message {
+                        ScreenMessage::Snapshot { snapshot } => {
+                            snapshot.current_directory.as_deref()
+                        }
+                        ScreenMessage::Delta { delta } => delta.current_directory.as_deref(),
+                    };
+                    let directory_changed = incoming_directory.is_some()
+                        && view
+                            .mirror
+                            .snapshot()
+                            .and_then(|old| old.current_directory.as_deref())
+                            != incoming_directory;
                     if let ScreenMessage::Delta { delta } = &message
                         && let Some(old) = view.mirror.snapshot()
                     {
@@ -1390,6 +1426,40 @@ impl CompiApp {
                     ready_probe_observed = ready_probe_marker.as_deref().is_some_and(|marker| {
                         snapshot_contains_marker(view.mirror.snapshot(), marker)
                     });
+                    if directory_changed {
+                        observed_directory = view
+                            .mirror
+                            .snapshot()
+                            .and_then(|snapshot| snapshot.current_directory.clone());
+                    }
+                }
+                if let Some(path) = observed_directory
+                    && self.state.project_history.record(&path)
+                {
+                    self.save_state();
+                }
+                if let Some(action) = shell_action
+                    && let Some(pane_id) = self
+                        .surface_views
+                        .iter()
+                        .find(|view| view.id == tab_id)
+                        .map(|view| view.pane_id.clone())
+                {
+                    if self.overlay.is_some() {
+                        self.reply_to_shell(&pane_id, None);
+                        self.global_error =
+                            Some("Close the active dialog before browsing directories".into());
+                    } else {
+                        self.focus_pane(pane_id);
+                        match action {
+                            compi_protocol::ShellAction::BrowseFiles => {
+                                self.open_file_tree_with_shell(true)
+                            }
+                            compi_protocol::ShellAction::JumpProject => {
+                                self.open_project_jump_with_shell(true)
+                            }
+                        }
+                    }
                 }
                 self.ready_probe_render_pending |= ready_probe_observed;
                 if self.focused_view == Some(tab_id)
@@ -1537,6 +1607,7 @@ impl CompiApp {
                     scroll_offset: 0,
                     selection: None,
                     selecting: false,
+                    mouse_reporting_down: false,
                     image_cache: HashMap::new(),
                     image_pending: HashMap::new(),
                     image_rejected: HashMap::new(),
@@ -1608,6 +1679,7 @@ impl CompiApp {
     }
 
     fn select_terminal(&mut self, id: TabId, restore: bool) {
+        self.close_file_tree();
         self.report_focus(false);
         if let Some(workspace) = &self.workspace {
             if restore {
@@ -1642,6 +1714,13 @@ impl CompiApp {
     fn focus_pane(&mut self, pane: PaneId) {
         if self.focused_view().is_some_and(|view| view.pane_id == pane) {
             return;
+        }
+        if self
+            .file_tree
+            .as_ref()
+            .is_some_and(|tree| tree.pane_id != pane)
+        {
+            self.close_file_tree();
         }
         let tab_id = self.selected_tab().map(|tab| tab.id.clone());
         self.report_focus(false);
@@ -1796,9 +1875,22 @@ impl CompiApp {
 
     pub(super) fn grid_point(&self, position: Point<Pixels>) -> Option<GridPoint> {
         let view = self.focused_view()?;
-        let pane = self.visible_layout()?.pane(&view.pane_id)?;
+        self.grid_point_for_pane(position, &view.pane_id, false)
+    }
+
+    pub(super) fn grid_point_for_pane(
+        &self,
+        position: Point<Pixels>,
+        pane_id: &PaneId,
+        clamp: bool,
+    ) -> Option<GridPoint> {
+        let view = self
+            .surface_views
+            .iter()
+            .find(|view| &view.pane_id == pane_id)?;
+        let pane = self.visible_layout()?.pane(pane_id)?;
         let offset = self.workspace_scroll.offset();
-        let x = pointer_coordinate(position.x, self.typography_scale)
+        let x = f32::from(position.x)
             - if self.sidebar_open {
                 self.sidebar_width + 5.0
             } else {
@@ -1806,36 +1898,28 @@ impl CompiApp {
             }
             - pane.canvas.x
             - f32::from(offset.x);
-        let y = pointer_coordinate(position.y, self.typography_scale)
-            - CHROME_HEIGHT
-            - pane.canvas.y
-            - f32::from(offset.y);
-        if x < 0.0 || y < 0.0 {
+        let y = f32::from(position.y) - CHROME_HEIGHT - pane.canvas.y - f32::from(offset.y);
+        if !x.is_finite() || !y.is_finite() || view.cols <= 0 || view.rows <= 0 {
             return None;
         }
-        let col = (x / self.typography.cell_width).floor() as usize;
-        let row = (y / self.typography.cell_height).floor() as usize;
-        (col < view.cols as usize && row < view.rows as usize).then_some(GridPoint { row, col })
+        if !clamp && (x < 0.0 || y < 0.0) {
+            return None;
+        }
+        let col = (x / self.typography.cell_width).floor();
+        let row = (y / self.typography.cell_height).floor();
+        if !clamp && (col >= f32::from(view.cols) || row >= f32::from(view.rows)) {
+            return None;
+        }
+        Some(GridPoint {
+            row: (row as usize).min(view.rows as usize - 1),
+            col: (col as usize).min(view.cols as usize - 1),
+        })
     }
 }
 
 fn logical_viewport_dimensions(window: &Window) -> (f32, f32) {
     let viewport = window.viewport_size();
     (f32::from(viewport.width), f32::from(viewport.height))
-}
-
-fn pointer_coordinate(value: Pixels, scale_factor: f32) -> f32 {
-    #[cfg(windows)]
-    {
-        // GPUI 0.2.2 reports Windows pointer positions in device pixels while
-        // viewport dimensions and element layout already use logical pixels.
-        f32::from(value) / scale_factor.max(1.0)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = scale_factor;
-        f32::from(value)
-    }
 }
 
 fn opacity_at_slider_position(position: Pixels, bounds: Bounds<Pixels>) -> f32 {
@@ -1961,6 +2045,7 @@ impl CompiApp {
     }
 
     fn open_overlay(&mut self, overlay: Overlay, text: &str) {
+        self.close_file_tree();
         self.finish_dismiss_overlay();
         self.report_focus(false);
         self.overlay_revision = self.workspace.as_ref().map(|workspace| workspace.revision);
@@ -2035,6 +2120,9 @@ impl CompiApp {
     ) -> bool {
         let key = &event.keystroke;
         if self.inspector_key(key, window, cx) {
+            return true;
+        }
+        if self.handle_tree_key(key, cx) {
             return true;
         }
         if key.key == "escape" && self.dragging_tab.is_some() {
@@ -2479,6 +2567,11 @@ impl CompiApp {
                     }
                 }
             }
+            Command::DetachPane => {
+                if let Some(pane_id) = pane_id {
+                    self.mutate(WorkspaceMutation::DetachPane { pane_id }, true);
+                }
+            }
             Command::RemovePane => {
                 if let Some(pane_id) = pane_id {
                     self.confirm_removal(
@@ -2517,6 +2610,8 @@ impl CompiApp {
                 self.state.sidebar_width = self.sidebar_width;
                 self.save_state();
             }
+            Command::BrowseFiles => self.open_file_tree(),
+            Command::JumpProject => self.open_project_jump(),
             Command::Copy => self.copy_selection(cx),
             Command::Paste => self.paste_clipboard(cx),
             Command::SelectAll => {
@@ -2919,6 +3014,7 @@ impl CompiApp {
                         Command::RenameTab,
                         Command::SplitRight,
                         Command::SplitDown,
+                        Command::DetachPane,
                         Command::MoveTabToNewWindow,
                         Command::DetachTab,
                         Command::RemoveTab,
@@ -3970,9 +4066,16 @@ impl CompiApp {
         };
         let panes = layout.panes.iter().enumerate().map(|(index, geometry)| {
             let pane_id = geometry.pane_id.clone();
+            let tree_active = self
+                .file_tree
+                .as_ref()
+                .is_some_and(|tree| tree.pane_id == pane_id);
             let focus_id = pane_id.clone();
             let input_id = pane_id.clone();
             let scroll_id = pane_id.clone();
+            let move_id = pane_id.clone();
+            let release_id = pane_id.clone();
+            let release_out_id = pane_id.clone();
             let view = self
                 .surface_views
                 .iter()
@@ -4114,81 +4217,99 @@ impl CompiApp {
                             .child(error),
                     )
                 })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .p(px(TERMINAL_PADDING))
-                        .relative()
-                        .overflow_hidden()
-                        .cursor(gpui::CursorStyle::IBeam)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                this.focus_pane(input_id.clone());
-                                this.on_terminal_mouse_down(event, window, cx);
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-                        .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-                        .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
-                        .on_scroll_wheel(cx.listener(
-                            move |this, event: &ScrollWheelEvent, window, cx| {
-                                // Wheel input targets the hovered pane without changing keyboard focus.
-                                let previous = this.focused_view;
-                                this.focused_view = this
-                                    .surface_views
-                                    .iter()
-                                    .find(|view| view.pane_id == scroll_id)
-                                    .map(|view| view.id);
-                                this.on_terminal_scroll(event, window, cx);
-                                this.focused_view = previous;
-                                cx.stop_propagation();
-                            },
-                        ))
-                        .child(
-                            canvas(
-                                move |_, _, _| (),
-                                move |bounds, _, window, cx| {
-                                    if focused {
-                                        window.handle_input(
-                                            &input_focus,
-                                            ElementInputHandler::new(bounds, input.clone()),
-                                            cx,
-                                        );
-                                    }
-                                    if let Some(paint) = paint {
-                                        paint_terminal(bounds, &paint, window);
-                                        if let Some(composition) = composition {
-                                            paint_composition(
-                                                bounds,
-                                                paint.cursor,
-                                                composition,
-                                                &paint.typography,
-                                                paint.theme,
-                                                window,
+                .when(!tree_active, |pane| {
+                    pane.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .p(px(TERMINAL_PADDING))
+                            .relative()
+                            .overflow_hidden()
+                            .cursor(gpui::CursorStyle::IBeam)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    this.focus_pane(input_id.clone());
+                                    this.on_terminal_mouse_down(event, window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, event, window, cx| {
+                                    this.on_terminal_mouse_up(event, &release_id, window, cx);
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(move |this, event, window, cx| {
+                                    this.on_terminal_mouse_up(event, &release_out_id, window, cx);
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                                this.on_terminal_mouse_move(event, &move_id, window, cx);
+                            }))
+                            .on_scroll_wheel(cx.listener(
+                                move |this, event: &ScrollWheelEvent, window, cx| {
+                                    // Wheel input targets the hovered pane without changing keyboard focus.
+                                    let previous = this.focused_view;
+                                    this.focused_view = this
+                                        .surface_views
+                                        .iter()
+                                        .find(|view| view.pane_id == scroll_id)
+                                        .map(|view| view.id);
+                                    this.on_terminal_scroll(event, window, cx);
+                                    this.focused_view = previous;
+                                    cx.stop_propagation();
+                                },
+                            ))
+                            .child(
+                                canvas(
+                                    move |_, _, _| (),
+                                    move |bounds, _, window, cx| {
+                                        if focused {
+                                            window.handle_input(
+                                                &input_focus,
+                                                ElementInputHandler::new(bounds, input.clone()),
                                                 cx,
                                             );
                                         }
-                                    }
-                                },
-                            )
-                            .size_full(),
-                        ),
-                )
-                .when_some(terminal_scroll, |pane, (position, length)| {
-                    pane.child(
-                        div()
-                            .absolute()
-                            .right(px(2.0))
-                            .top(px(2.0 + position))
-                            .w(px(2.0))
-                            .h(px(length))
-                            .rounded_sm()
-                            .bg(color(colors.muted).opacity(0.32)),
+                                        if let Some(paint) = paint {
+                                            paint_terminal(bounds, &paint, window);
+                                            if let Some(composition) = composition {
+                                                paint_composition(
+                                                    bounds,
+                                                    paint.cursor,
+                                                    composition,
+                                                    &paint.typography,
+                                                    paint.theme,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                    },
+                                )
+                                .size_full(),
+                            ),
                     )
                 })
+                .when(tree_active, |pane| pane.child(self.render_file_tree(cx)))
+                .when_some(
+                    terminal_scroll.filter(|_| !tree_active),
+                    |pane, (position, length)| {
+                        pane.child(
+                            div()
+                                .absolute()
+                                .right(px(2.0))
+                                .top(px(2.0 + position))
+                                .w(px(2.0))
+                                .h(px(length))
+                                .rounded_sm()
+                                .bg(color(colors.muted).opacity(0.32)),
+                        )
+                    },
+                )
         });
         let dividers = layout.dividers.iter().enumerate().map(|(index, divider)| {
             div()
@@ -4363,6 +4484,18 @@ impl CompiApp {
         if !event.dragging() {
             return;
         }
+        if let Some(pane_id) = self
+            .surface_views
+            .iter()
+            .find(|view| view.selecting || view.mouse_reporting_down)
+            .map(|view| view.pane_id.clone())
+            && self
+                .grid_point_for_pane(event.position, &pane_id, false)
+                .is_none()
+        {
+            self.on_terminal_mouse_move(event, &pane_id, window, cx);
+            return;
+        }
         if let Some(horizontal) = self.workspace_scroll_drag {
             self.scroll_workspace_to(event.position, horizontal);
             cx.stop_propagation();
@@ -4433,6 +4566,16 @@ impl CompiApp {
             cx.notify();
             return;
         }
+        if let Some(pane_id) = self
+            .surface_views
+            .iter()
+            .find(|view| view.selecting || view.mouse_reporting_down)
+            .map(|view| view.pane_id.clone())
+        {
+            self.on_terminal_mouse_up(event, &pane_id, window, cx);
+            cx.notify();
+            return;
+        }
         if self.workspace_scroll_drag.take().is_some() {
             cx.notify();
             return;
@@ -4478,8 +4621,8 @@ impl CompiApp {
             && moved
         {
             let (viewport_width, viewport_height) = logical_viewport_dimensions(window);
-            let pointer_x = pointer_coordinate(event.position.x, self.typography_scale);
-            let pointer_y = pointer_coordinate(event.position.y, self.typography_scale);
+            let pointer_x = f32::from(event.position.x);
+            let pointer_y = f32::from(event.position.y);
             let inside = pointer_x >= 0.0
                 && pointer_y >= 0.0
                 && pointer_x < viewport_width
@@ -5087,8 +5230,6 @@ fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
-    use super::pointer_coordinate;
     use super::{
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
@@ -5097,12 +5238,6 @@ mod tests {
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_pointer_coordinates_follow_logical_terminal_geometry() {
-        assert_eq!(pointer_coordinate(px(114.0), 1.5), 76.0);
-    }
 
     #[test]
     fn restored_window_selects_the_display_containing_its_saved_center() {

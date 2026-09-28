@@ -63,10 +63,10 @@ pub fn selected_text(
                 result.push_str(&cell.text);
             }
         }
-        while result.ends_with(' ') {
-            result.pop();
-        }
         if row_index != end.row && !row.wrapped {
+            while result.ends_with(' ') {
+                result.pop();
+            }
             result.push('\n');
         }
     }
@@ -189,6 +189,19 @@ mod tests {
         assert_eq!(
             ctrl_c_behavior(Some(&snapshot), None),
             CtrlCBehavior::Interrupt
+        );
+    }
+
+    #[test]
+    fn copies_highlighted_spaces_across_wrapped_rows() {
+        let screen = snapshot(vec![row("ab c", true)], vec![row("de f", false)]);
+        let selection = Some(Selection {
+            anchor: GridPoint { row: 0, col: 1 },
+            head: GridPoint { row: 1, col: 2 },
+        });
+        assert_eq!(
+            selected_text(Some(&screen), selection).as_deref(),
+            Some("b cde ")
         );
     }
 }

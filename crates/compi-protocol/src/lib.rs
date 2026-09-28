@@ -12,8 +12,8 @@ pub mod wsl;
 
 pub use screen::{
     Cell, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode, Row, RowUpdate,
-    ScreenDelta, ScreenMessage, ScreenSnapshot, TerminalFrame, TerminalModes, TextAttributes,
-    decode_screen, decode_terminal_frame, encode_screen, encode_terminal_frame,
+    ScreenDelta, ScreenMessage, ScreenSnapshot, ShellAction, TerminalFrame, TerminalModes,
+    TextAttributes, decode_screen, decode_terminal_frame, encode_screen, encode_terminal_frame,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -24,8 +24,8 @@ pub use client::{ClientIo, DaemonClient, DaemonError, ServerEvent};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Version 12 adds bounded, chunked image uploads for remote terminals.
-pub const PROTOCOL_VERSION: u32 = 12;
+// Version 14 adds one-shot shell actions to screen deltas.
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -38,6 +38,8 @@ pub const MAX_GRAPHICS_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_IMAGE_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const IMAGE_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+pub const MAX_DIRECTORY_PATH_BYTES: usize = 4096;
+pub const MAX_DIRECTORY_QUERY_BYTES: usize = 256;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -123,6 +125,15 @@ pub enum ClientMessage {
     },
     GetRuntimeMetrics,
     GetWorkspace,
+    ListDirectory {
+        surface_id: SurfaceId,
+        path: String,
+    },
+    SearchDirectory {
+        surface_id: SurfaceId,
+        root: String,
+        query: String,
+    },
     Mutate {
         mutation: MutationRequest,
     },
@@ -181,6 +192,12 @@ pub enum ServerMessage {
     },
     Workspace {
         workspace: WorkspaceSnapshot,
+    },
+    DirectoryListed {
+        entries: Vec<DirectoryEntry>,
+    },
+    DirectorySearched {
+        entries: Vec<SearchEntry>,
     },
     WorkspaceChanged {
         revision: u64,
@@ -258,6 +275,19 @@ pub enum SurfaceStatus {
     Exited,
     Failed,
     Lost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub is_directory: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchEntry {
+    /// Absolute path in the terminal's filesystem namespace.
+    pub path: String,
+    pub is_directory: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -479,6 +509,9 @@ pub enum WorkspaceMutation {
         working_directory: Option<String>,
         geometry: SplitGeometry,
     },
+    DetachPane {
+        pane_id: PaneId,
+    },
     SetSplitRatio {
         tab_id: TabId,
         path: Vec<bool>,
@@ -536,6 +569,58 @@ mod tests {
         let surface = SurfaceId::new("surface-1");
         assert_eq!(serde_json::to_string(&surface).unwrap(), "\"surface-1\"");
         assert_eq!(surface.as_str(), "surface-1");
+    }
+
+    #[test]
+    fn filesystem_requests_and_replies_roundtrip() {
+        let surface_id = SurfaceId::new("surface-from-workspace");
+        let requests = [
+            ClientMessage::ListDirectory {
+                surface_id: surface_id.clone(),
+                path: "/home/user".into(),
+            },
+            ClientMessage::SearchDirectory {
+                surface_id,
+                root: "/home/user".into(),
+                query: "main.rs".into(),
+            },
+        ];
+        for message in requests {
+            let request = ClientControl {
+                request_id: 7,
+                target: None,
+                message,
+            };
+            assert_eq!(
+                decode_client(&encode_client(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+
+        let replies = [
+            ServerMessage::DirectoryListed {
+                entries: vec![DirectoryEntry {
+                    name: "src".into(),
+                    is_directory: true,
+                }],
+            },
+            ServerMessage::DirectorySearched {
+                entries: vec![SearchEntry {
+                    path: "/home/user/src/main.rs".into(),
+                    is_directory: false,
+                }],
+            },
+        ];
+        for message in replies {
+            let response = ServerControl {
+                request_id: Some(7),
+                message,
+            };
+            assert_eq!(
+                decode_server(&encode_server(&response).unwrap()).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]

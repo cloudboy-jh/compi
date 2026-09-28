@@ -127,6 +127,24 @@ pub fn resolve_launch(
     })
 }
 
+/// Resolve a WSL path through Linux symlinks, including links into mounted Windows drives.
+pub fn windows_path_for_wsl(path: &str, distribution: &str) -> Result<PathBuf> {
+    let output = run_wsl([
+        "--distribution",
+        distribution,
+        "--exec",
+        "wslpath",
+        "-a",
+        "-w",
+        "--",
+        path,
+    ])?;
+    Ok(PathBuf::from(checked_output(
+        output,
+        "could not resolve the WSL directory",
+    )?))
+}
+
 fn selected_wsl2_distribution(name: &str) -> Result<DefaultDistribution> {
     let output = run_wsl(["--list", "--verbose"])?;
     if !output.status.success() {
@@ -170,9 +188,119 @@ fn default_wsl2_distribution() -> Result<DefaultDistribution> {
         None => Err("no default WSL distribution was found; Compi requires WSL2".into()),
     }
 }
+/// Resolve only the WSL2 distribution, without starting Linux to validate a path.
+/// File-tree access validates the requested directory through its WSL UNC share.
+pub fn directory_distribution(requested_distribution: Option<&str>) -> Result<String> {
+    let distribution = match requested_distribution {
+        Some(name) => selected_wsl2_distribution(name)?,
+        None => native_default_distribution().unwrap_or_else(default_wsl2_distribution)?,
+    };
+    Ok(distribution.name)
+}
+
+fn native_default_distribution() -> Option<Result<DefaultDistribution>> {
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut core::ffi::c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+    const HKCU: isize = 0x8000_0001u32 as i32 as isize;
+    const REG_SZ: u32 = 0x2;
+    const REG_DWORD: u32 = 0x10;
+    const ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss";
+    fn query_string(subkey: &str, value: &str) -> Option<String> {
+        let subkey: Vec<_> = subkey.encode_utf16().chain([0]).collect();
+        let value: Vec<_> = value.encode_utf16().chain([0]).collect();
+        let mut size = 0;
+        // Query the byte count first; distribution names are not bounded by GUID size.
+        let status = unsafe {
+            RegGetValueW(
+                HKCU,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        if status != 0 || size < 2 || size > 1024 || size % 2 != 0 {
+            return None;
+        }
+        let mut words = vec![0u16; (size / 2) as usize];
+        let status = unsafe {
+            RegGetValueW(
+                HKCU,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                REG_SZ,
+                std::ptr::null_mut(),
+                words.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status != 0 || size < 2 || size as usize > words.len() * 2 {
+            return None;
+        }
+        let end = words.iter().position(|word| *word == 0)?;
+        String::from_utf16(&words[..end]).ok()
+    }
+    let guid = query_string(ROOT, "DefaultDistribution")?;
+    if guid.len() != 38
+        || !guid.starts_with('{')
+        || !guid.ends_with('}')
+        || guid[1..37].bytes().enumerate().any(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte != b'-'
+            } else {
+                !byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return None;
+    }
+    let subkey = format!("{ROOT}\\{guid}");
+    let name = query_string(&subkey, "DistributionName")?;
+    let mut version = 0u32;
+    let mut size = 4u32;
+    let subkey: Vec<_> = subkey.encode_utf16().chain([0]).collect();
+    let value: Vec<_> = "Version".encode_utf16().chain([0]).collect();
+    let status = unsafe {
+        RegGetValueW(
+            HKCU,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut version as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    if status != 0 || size != 4 {
+        return None;
+    }
+    if version != 2 {
+        return Some(Err(format!(
+            "the default WSL distribution {name} uses WSL{version}; Compi requires WSL2"
+        )
+        .into()));
+    }
+    Some(Ok(DefaultDistribution { name, version }))
+}
 
 fn run_wsl<'a>(args: impl IntoIterator<Item = &'a str>) -> std::io::Result<Output> {
-    Command::new(WSL_EXE).args(args).output()
+    use std::os::windows::process::CommandExt;
+    Command::new(WSL_EXE)
+        .args(args)
+        .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+        .output()
 }
 
 fn checked_output(output: Output, context: &str) -> Result<String> {

@@ -1,9 +1,11 @@
 #[cfg(windows)]
 pub mod conpty;
 pub mod daemon;
+pub mod file_tree;
 pub mod launch;
 pub mod pty;
 pub mod screen;
+mod shell_integration;
 #[cfg(windows)]
 pub mod supervisor;
 pub mod surface;

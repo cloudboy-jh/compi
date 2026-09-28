@@ -100,6 +100,9 @@ pub struct TerminalModes {
     pub mouse: MouseMode,
     pub sgr_mouse: bool,
     pub focus_events: bool,
+    /// Kitty keyboard protocol flags negotiated by the foreground application.
+    #[serde(default)]
+    pub keyboard_protocol_flags: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +147,12 @@ pub struct RowUpdate {
     pub row: Row,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ShellAction {
+    BrowseFiles,
+    JumpProject,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScreenDelta {
     pub sequence: u64,
@@ -159,6 +168,8 @@ pub struct ScreenDelta {
     pub latency_ids: Vec<u64>,
     pub placements: Option<Vec<KittyPlacement>>,
     pub clipboard_writes: Vec<String>,
+    #[serde(default)]
+    pub shell_action: Option<ShellAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

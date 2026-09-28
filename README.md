@@ -70,23 +70,21 @@ pwsh -File tools/prepare-conpty.ps1
 
 Preparation checks the pinned archive SHA256 and Microsoft Authenticode signatures, reuses only verified cached content, and stages `conpty.dll`, `OpenConsole.exe`, and `ConPTY-LICENSE.txt` in `target/conpty-runtime/x64`. The archive cache is `target/conpty-runtime/cache/`; the version, digest, package-signature provenance, and upstream license notice are recorded in `tools/prepare-conpty.ps1`. `-Architecture arm64` prepares the upstream ARM64 pair for a native ARM64 build; distributed Windows artifacts remain x64. Cargo copies the staged files beside the daemon and test executables, including custom target directories/profiles and explicit target triples. Compilation without preparation is allowed, but Windows terminal startup fails clearly if the bundled runtime is absent. The Windows installer build and both Windows CI workflows run preparation automatically.
 
-Build the client and server:
+Build and run on macOS:
 
 ```sh
 cargo build --locked -p compi-client -p compi-daemon --bins
-```
-
-Run on macOS:
-
-```sh
 ./target/debug/compi --instance development
 ```
 
-Run on Windows:
+Build and run an isolated source preview on Windows:
 
 ```powershell
-.\target\debug\compi.exe --instance development
+cargo build --locked --target-dir target\compi-preview -p compi-client -p compi-daemon --bins
+.\target\compi-preview\debug\compi.exe --instance compi-preview
 ```
+
+The daemon keeps shells alive after the client closes, so Windows cannot overwrite a running `compi-daemon.exe`. If Cargo reports `Access is denied`, the build failed: do **not** launch an existing executable and assume it contains your changes. Use a fresh target directory and instance name for another preview, or first shut down only a disposable preview daemon whose shells you no longer need. Opening an old tab reconnects to its old shell; create a new tab in the newly built instance to load the current shell bridge.
 
 Compi starts its sibling server automatically. Relaunch with the same instance name to reconnect to the existing workspace. Use `--working-directory PATH` when you intentionally want new work to start in a specific directory.
 
@@ -97,6 +95,17 @@ compi --connect dev@example.com:2222
 ```
 
 The headless diagnostic client accepts the same `--connect` and optional `--instance` options. For example, `compi-probe --connect dev@example.com workspace` prints the remote hierarchy and lifecycle state, while its session, tab, pane, surface, soak, and shutdown commands operate through the same protocol. The remote host must provide `compi-daemon` on `PATH`.
+
+## Files and projects in the terminal
+
+- **Browse files:** `Ctrl+Shift+E` on Windows (`Cmd+Shift+E` on macOS), or “Browse files in terminal pane” in the command palette. The tree replaces only the focused pane's terminal view; it is not an editor or sidebar. Folder and file icons, branch guides, and single-click disclosure arrows show the expanded hierarchy; selection and hover highlight the item rather than the entire pane width. Double-clicking a folder row also expands it. `/` or `Ctrl+F` searches paths below the current folder. Arrow keys select, Enter expands a folder or copies a file path, `C` copies the selected path outside search (use `Ctrl+C` while searching), and Esc returns to the terminal.
+- **Change the same shell's directory:** At an interactive Bash/Zsh prompt, run `compi tree`. Select a folder and use **Enter folder** or `Ctrl+Enter`; the shell itself performs `cd`. Esc cancels. The keyboard shortcut opens browsing and copying without changing the shell: a running program or partially typed command must never receive an injected `cd`.
+- **Jump to visited directories:** Run `compi z` (or `compi jump`) from the prompt, type to filter, choose with arrows, and press Enter. This integration does not install a bare `z` command; `z orangebox` is not a Compi command. “Jump to project directory” in the palette opens the same picker for path copying; only the shell-origin picker changes cwd. Project history follows OSC 7 cwd reports, including ordinary `cd` in supported interactive shells.
+- New tabs and splits inherit the focused pane's reported cwd. Right-click a tab and choose **Detach Split to New Tab** to move that tab's focused split without restarting either shell; the option is disabled on an unsplit tab. Mouse dragging highlights terminal text; `Ctrl+C` copies a selection instead of interrupting the shell. `Ctrl++` increases font size on Windows; `Ctrl+Enter` is distinct from Enter when a terminal program enables Kitty keyboard disambiguation.
+
+Compi installs its bundled Bash/Zsh shell integration into the shell's home directory when starting supported default shells (Windows/WSL2, macOS, and remote Unix daemons); it does not edit your startup files. Explicit custom executable/argument profiles are left untouched. A Bash login profile that replaces `PROMPT_COMMAND` may suppress cwd reports after ordinary `cd`; `compi tree` and `compi z` report the shell's current directory before opening their picker, so they start from the directory you are in even without the prompt hook.
+
+On Windows/WSL2, the tree can browse a shell directory linked into a mounted Windows drive. If the WSL share cannot follow the link, Compi resolves that directory in WSL and retries through its Windows path.
 
 ## Appearance and typography
 
