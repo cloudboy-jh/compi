@@ -10,6 +10,8 @@ Compi is a **superterminal**: it feels like a normal native terminal, but its sh
 
 No prefix key. No nested multiplexer UI. No session-management ceremony.
 
+![Compi workspace](assets/compi-workspace.png)
+
 ## Why Compi?
 
 A terminal gives you a shell. A multiplexer keeps that shell alive and organizes several of them. Compi treats both jobs as one product:
