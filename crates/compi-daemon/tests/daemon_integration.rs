@@ -26,6 +26,8 @@ use windows::Win32::System::Threading::{
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DAEMON_LOCK: Mutex<()> = Mutex::new(());
 const TIMEOUT: Duration = Duration::from_secs(30);
+// A 16 MiB Bash/PTY flood is not a 30-second debug-build throughput gate.
+const FLOOD_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct DaemonGuard {
@@ -446,7 +448,7 @@ fn persistent_multi_surface_lifecycle() {
     drop(reattached);
     wait_for_attachment(&mut control, &second.id, false);
     fs::write(output_directory.join("detached-release"), b"release").unwrap();
-    wait_for_file(&output_directory.join("detached-complete"));
+    wait_for_file(&output_directory.join("detached-complete"), TIMEOUT);
     let mut after_crash = daemon.client();
     after_crash.attach_surface(&second, 90, 30).unwrap();
     let crash_output = collect_until_marker(&mut after_crash, b"REATTACHED_42");
@@ -466,7 +468,7 @@ fn persistent_multi_surface_lifecycle() {
     // 16 MiB through the PTY. The file is an independent completion channel.
     // Repaint in place so this measures transport pressure, not unbounded
     // scrollback/reflow work in an unrelated debug-build throughput benchmark.
-    wait_for_file(&output_directory.join("flood-complete"));
+    wait_for_file(&output_directory.join("flood-complete"), FLOOD_TIMEOUT);
     assert!(
         control
             .list_surfaces()
@@ -876,7 +878,7 @@ fn query_surfaces(
     }
 }
 
-fn wait_for_file(path: &Path) {
+fn wait_for_file(path: &Path, timeout: Duration) {
     let started = Instant::now();
     loop {
         let contents = fs::read(path);
@@ -887,7 +889,7 @@ fn wait_for_file(path: &Path) {
             return;
         }
         assert!(
-            started.elapsed() < TIMEOUT,
+            started.elapsed() < timeout,
             "missing completion marker {path:?} after {:?}; last file state: {contents:?}",
             started.elapsed()
         );

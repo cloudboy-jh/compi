@@ -27,6 +27,7 @@ cargo test --locked -p compi-daemon --test daemon_integration -- --test-threads=
 ```
 
 The daemon build does not require GPUI or `GPUI_FXC_PATH`. A failed WSL readiness check is missing runtime coverage, not a reason to count skipped daemon tests as passing. The Windows integration cases run one at a time on shared WSL2 runners: simultaneous guest startups have returned `0xffffffff` without diagnostic output, even though individual tests run. The commands in Tier 1 below require a working default WSL distribution for the full integration suite.
+The 16 MiB output-backpressure case allows two minutes for shell output to complete on a debug CI runner; ordinary control-path waits remain 30 seconds.
 
 ## Phase 2 native Unix and Mac checks
 
