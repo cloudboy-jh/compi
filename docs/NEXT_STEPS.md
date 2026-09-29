@@ -16,8 +16,14 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - Measure key receipt → PTY → replica → presentation latency, scrolling, resizing, and frame pacing under idle and sustained-output workloads. Use the current-FPS overlay for live feedback, not as a substitute for attributed timing.
 - Record build and display context and compare identical workloads before and after any fix. Confirm opt-in continuous frame scheduling remains inactive when Performance and the FPS overlay are both hidden.
 - Fix only demonstrated stalls, avoidable shaping or allocation, repaint scheduling, or queue problems. Keep caches and transport queues bounded; do not replace the terminal engine.
-- Run the macOS measurement/soak runner on native release binaries. Repeat the Windows harnesses only after relevant source or environment changes.
-- Produce attributable Mac resource measurements and a current Mac dogfood artifact; the current Windows release artifact and measurements are complete.
+- Run the macOS measurement/soak runner on native release binaries. Repeat the Windows measurement and soak harnesses against the current source after the recent navigation and UI changes; older measurements remain dated baselines, not current-source performance qualification.
+- Produce attributable Mac resource measurements and a current Mac dogfood artifact. A recent Windows release bundle passed isolated launch smoke, but its navigation and UI changes still need release-mode performance and daily-use qualification.
+
+### Remaining protocol and persistence contracts
+
+- Protocol 14 rejects mismatched versions but does not negotiate capabilities or server identity/generation in `Hello`. Implement the explicit handshake required by [the wire contract](Spec.md#wire-contract) before treating that acceptance gate as complete.
+- Snapshots and deltas carry bounded scrollback, but there is no on-demand history paging or history epoch for reconnect and selection anchors. Implement and verify the stronger [replication contract](Spec.md#replication), including eviction/reflow behavior; current identity/sequence/geometry/content checks are not equivalent.
+- Exercise durable workspace mutations and lifecycle recovery with fault injection at commit boundaries across supported hosts. Existing actor, receipt, migration, and quarantine coverage is not exhaustive.
 
 ## 3. Native Mac and shared-platform qualification
 

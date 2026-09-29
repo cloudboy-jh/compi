@@ -1,6 +1,6 @@
 # Compi completed work
 
-This file records completed implementation and dated verification evidence. Unfinished work is tracked only in [Next steps](NEXT_STEPS.md).
+This is an implementation history with dated verification evidence, not a claim of current cross-platform qualification. The latest recorded Windows handoff is summarized first; unfinished work is tracked in [Next steps](NEXT_STEPS.md).
 
 ## Latest completed handoff
 
@@ -96,8 +96,8 @@ The [main-branch Core CI run at d7552028](https://github.com/cloudboy-jh/compi/a
 - Source image storage/reservations default to 64 MiB per surface; decoded caches admit 64 MiB per pane. Offscreen decoded assets and sprite-atlas entries are released without deleting referenced authoritative pixels. Transfers, decoder queues, frame queues, and cache admission remain bounded; rejection preserves existing images and produces Kitty errors. This is not a daemon-wide memory cap.
 - The first real Windows graphics test exposed stock ConPTY dropping every Kitty APC sequence: the bounded raw PTY trace contained 439 bytes and the completion marker, but zero image sequences. The approved scope expansion bundles official Microsoft ConPTY/OpenConsole 1.24.260710001 with SHA-256-pinned preparation, Microsoft signature verification, and license text. Source builds, Windows CI, MSI and portable packaging use the matching pair without an unsupported system fallback.
 - The real 4K RGBA fixture represents 31.64 MiB of pixels and produces a 42.19 MiB retained replica payload, then compares image bytes and placement after a new attachment. Its repetitive PTY fixture uses Kitty zlib compression so hosted debug builds exercise the large retained frame without spending their timeout parsing redundant base64. It passes on Windows with the pinned runtime and on native Linux under WSL. Large-frame polling drains up to 1 MiB per call, avoiding artificial 32 KiB-per-poll throttling.
-- At that graphics checkpoint, resize preserved image bytes and grid coordinates/extents while text reflowed independently. Protocol 12 now supersedes the grid-coordinate behavior with logical-line image reanchoring.
-- That checkpoint raised the wire protocol to 10; the current wire protocol is 12 and GUI window-forwarding remains 2. Older clients/daemons must be closed/restarted deliberately after accounting for running work. The old v7 golden fixtures remain unchanged.
+- At that graphics checkpoint, resize preserved image bytes and grid coordinates/extents while text reflowed independently. Protocol 12 later superseded the grid-coordinate behavior with logical-line image reanchoring.
+- That checkpoint raised the wire protocol to 10; the protocol in this checkout is 14, while GUI window-forwarding remains 2. Older clients/daemons must be closed/restarted deliberately after accounting for running work. The old v7 golden fixtures remain unchanged.
 - Final verification: 123 Windows tests and 99 native Linux tests passed, including real 4K image reconnect and unchanged v7 fixtures. Workspace formatting, warning-denied Clippy and production dependency boundaries passed. The rebuilt Windows MSI validated and the extracted portable package passed native launch/sibling-daemon/reconnect smoke with the pinned runtime.
 
 
@@ -289,12 +289,12 @@ Runtime verification found and fixed a GPUI animation request outside a render c
 - Added installed-font resolution with fixed-ASCII validation, font-derived device-snapped cell metrics, user fallbacks, an installed Nerd/Powerline fallback, and platform Unicode/symbol/emoji fallbacks.
 - Replaced fixed Menlo-era geometry throughout PTY sizing, terminal painting, cursor, selection, hit-testing, scrolling, Kitty images, and IME caret placement.
 - Rebased each shaped grapheme onto its protocol-defined logical cell while preserving intra-grapheme offsets, wide-cell spans, fallback font IDs, and color-emoji painting.
-- Kept the bounded row-shaping cache and invalidated it when display scale changes. Native UI chrome continues to use the system font.
+- Kept the bounded row-shaping cache and invalidated it when display scale changes. At this 2026-09-07 checkpoint, native UI chrome still used the system font; the bundled interface-font selection added on 2026-09-17 superseded that restriction.
 - Verified the Mac build, all 54 workspace tests, warning-free workspace Clippy, diff hygiene, first terminal frame, and an AppKit event-loop smoke. Pixel-level comparison and physical-input qualification remain blocked by unavailable screen-capture/accessibility permissions.
 
 ## Historical references
 
-- [Windows terminal test recipes](testcmds.md): procedures for the existing implementation, to adapt using the acceptance map. Old shell-session and close-after-end UI expectations are not the new workspace contract.
+- [Windows terminal test recipes](testcmds.md): Windows/WSL regression procedures and native Unix/Mac bring-up commands, not a complete cross-platform qualification matrix. Older shell-session and close-after-end UI expectations belong to the previous product baseline, not the current workspace contract.
 - [Historical Windows acceptance results](ACCEPTANCE_RESULTS_2026-09-02.md): dated observations, not current cross-platform qualification.
 
 The superseded specification, status report, release targets, and detailed old roadmap remain available in Git history.

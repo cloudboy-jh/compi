@@ -1,6 +1,6 @@
-# Compi acceptance results — 2026-09-02
+# Compi acceptance results — 2026-09-02–03
 
-> Historical Windows/WSL evidence from the previous product baseline. Results and open gates below describe the recorded runs, not the current checkout or qualification of the new cross-platform product. [Spec.md](Spec.md) defines the current requirements; [NEXT_STEPS.md](NEXT_STEPS.md) defines the pending handoff.
+> Historical Windows/WSL evidence from the previous product baseline. The measurements began on 2026-09-02; the explicitly labeled implementation and final gate updates are from 2026-09-03. Results and open gates below describe those recorded runs, not the current checkout or qualification of the new cross-platform product. [Spec.md](Spec.md) defines the current requirements; [NEXT_STEPS.md](NEXT_STEPS.md) defines the pending handoff.
 
 ## Environment
 
@@ -17,7 +17,7 @@
 | Check | Result | Evidence |
 |---|---|---|
 | `cargo fmt --all -- --check` | Pass | Exit 0 in the final chained gate. |
-| `cargo clippy --all-targets --all-features -- -D warnings` | Pass | Exit 0. Cargo still reports upstream future-incompatibility in `proc-macro-error2 v2.0.1`; this is not a current Clippy failure. |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Pass | Exit 0. Cargo reported upstream future-incompatibility in `proc-macro-error2 v2.0.1`; this was not a Clippy failure in that run. |
 | `cargo test --all-targets` | Pass | 52 tests across six suites as of 2026-09-03, including Windows daemon lifecycle, transient-connection cleanup, working-directory, protocol-v6, metadata-v2 migration, and terminal recovery coverage. |
 | Output-flood control and recovery | Pass | The integration test keeps the controlling client attached during three seconds of unbounded `yes` output, sends byte 3 (`Ctrl+C`), recovers delta gaps by snapshot, observes `FLOOD_INTERRUPTED`, and exits cleanly. |
 | `cargo build --release --bins --target-dir target/verify-release` | Pass | Built with the Windows 10 SDK 10.0.22621.0 `fxc.exe` directory on `PATH`. |
@@ -33,9 +33,9 @@ The default `target/release` rebuild could not replace the running `compi-daemon
 - A release UI smoke launched in `C:\Users\johns\OneDrive\Desktop\Proj\compi` and rendered a Bash prompt at `/mnt/c/Users/johns/OneDrive/Desktop/Proj/compi`.
 - A 30-minute automated soak passed with three sustained-output sessions plus repeated create/kill and transient-client churn. Daemon handles stayed at 152–153 during active load and fell to 115 after cleanup. Client private memory stayed between 89.29 and 89.54 MiB; daemon private memory peaked at 37.31 MiB.
 - Final warm diagnostics measured first-window p95 at 376 ms, ready-for-input p95 at 544 ms, and input-to-render p95 at 153 ms. `gpui::Application::new` consumed roughly 321–369 ms in typical samples, and disabling thin LTO produced no improvement. Reducing the initial absent-daemon wait from 250 ms to 25 ms lowered the best cold first-terminal p95 to 935 ms; subsequent fresh unsigned daemon launches showed a repeatable 3.17-second host-side process-start delay despite 36 ms of instrumented daemon initialization.
-- The final unsigned `0.1.0` setup and portable ZIP build successfully, their embedded product versions agree, and both generated SHA-256 values match the packaged bytes. The release workflow requires signing secrets and creates a draft GitHub release.
+- The final unsigned `0.1.0` setup and portable ZIP built successfully, their embedded product versions agreed, and both generated SHA-256 values matched the packaged bytes. At this checkpoint, the Windows-only release workflow required signing secrets and created a draft GitHub release; the current cross-platform workflow does not require signing secrets.
 
-The 2026-09-03 launch measurements used the Meta Virtual Monitor and are diagnostic only. Code signing, a version-to-version upgrade, physical-display/keyboard checks, the full compatibility matrix, and clean Windows 10/11 qualification remain release blockers.
+The 2026-09-03 launch measurements used the Meta Virtual Monitor and were diagnostic only. At that checkpoint, code signing, a version-to-version upgrade, physical-display/keyboard checks, the full compatibility matrix, and clean Windows 10/11 qualification were release blockers; current pending work is tracked in [NEXT_STEPS.md](NEXT_STEPS.md).
 
 
 ## Native client checks
@@ -76,10 +76,10 @@ A separate post-output process sample reported 63,889,408 bytes working set and 
 
 - Terminal painting is well below a single 100/120 Hz frame budget.
 - The observed frame interval does not meet 120 Hz pacing. The automation ran through Meta Virtual Monitor with no reported refresh rate, so repeat on the physical display before attributing the interval entirely to Compi.
-- The 35 MB private-byte target is not met. A blank GPUI-window baseline is still needed to separate framework/GPU allocation from terminal state.
+- The 35 MB private-byte target was not met. At the time of these short samples, a blank GPUI-window baseline was still needed to separate framework/GPU allocation from terminal state; that baseline was recorded in the next section.
 - No long-duration claim is available from these short samples.
 
-### Phase 2 diagnostic baseline
+### Historical Windows Phase 2 diagnostic baseline — 2026-09-02
 
 The new release harness exercised ten empty-window launches, ten cold-daemon launches, and ten warm existing-session launches. It ran through the Meta Virtual Monitor, so these results are diagnostic and explicitly not a qualified physical-display run. The environment record identified Windows 10.0.26200, an AMD Ryzen 7 7800X3D, Ubuntu on WSL2, and a 3440×1440 100 Hz NVIDIA display that was not the automation surface.
 
@@ -116,7 +116,7 @@ An additional isolated diagnostic measured fresh daemons and clients with one, t
 
 This single run (`release-20260902-161010-12532`) indicates approximately 0.6 MiB of marginal daemon private memory per blank session. It is diagnostic, not a distribution or release gate.
 
-This establishes that most of the one-session private-byte gap exists in the blank GPUI client: the warm client adds roughly 4 MiB at p50, while the daemon is roughly 2 MiB. Daemon scrollback compression and PTY parking therefore do not address the P0 client-memory failure. All measured launch gates still fail, and the 1,149–1,200 ms p95 first-window outliers require reproduction on the physical display before attribution.
+For that baseline, most of the one-session private-byte gap existed in the blank GPUI client: the warm client added roughly 4 MiB at p50, while the daemon was roughly 2 MiB. Daemon scrollback compression and PTY parking therefore did not address the then-measured P0 client-memory failure. The measured launch gates at that checkpoint still failed, and the 1,149–1,200 ms p95 first-window outliers required reproduction on the physical display before attribution.
 
 ## Installer lifecycle
 
@@ -156,10 +156,10 @@ The per-user installer was built and exercised under a non-elevated Windows toke
 - Added an installed GPUI maintenance surface and relocation-based uninstall path so the running maintenance executable cannot lock the install directory.
 - Added an independent installer-state preview executable and a pinned, reproducible packaging script that emits setup, portable ZIP, and SHA-256 checksum artifacts.
 
-## Still open before the release-feel gate passes
+## Gates still open at the 2026-09-03 checkpoint (historical)
 
 - Physical-keyboard `Ctrl+C` during sustained output.
 - Physical-display frame pacing at 100/120 Hz.
 - Physical-display confirmation of the blank GPUI baseline plus extended memory/handle/GPU-memory soak.
 - Full TUI, selection, scrollback-resize, Kitty graphics, mixed-DPI, multi-monitor, narrow/wide/maximized, and 30-minute interactive matrix.
-- Sub-200 ms warm interaction; current median is about 400 ms to terminal content.
+- Sub-200 ms warm interaction; the then-measured median was about 400 ms to terminal content.

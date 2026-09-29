@@ -10,7 +10,7 @@ Record Windows build, WSL distribution and version, display scale, monitor refre
 
 ## Phase 1 dependency and compatibility checks
 
-The three product crates can be tested together on macOS, Linux, or Windows:
+The three product crates can be tested together on macOS, Linux, or Windows. On Windows, first run `pwsh -File tools/prepare-conpty.ps1` and verify the default WSL2 guest with `wsl.exe --exec /bin/bash -lc true`; otherwise integration tests may be skipped or fail before exercising a shell:
 
 ```text
 cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
@@ -22,7 +22,7 @@ On native Windows, verify the headless build separately from application/install
 ```powershell
 python tools/check-dependencies.py --target x86_64-pc-windows-msvc
 cargo build --locked --release -p compi-daemon --bin compi-daemon
-wsl.exe --exec true
+wsl.exe --exec /bin/bash -lc true
 cargo test --locked -p compi-daemon --test daemon_integration -- --test-threads=1
 ```
 
@@ -55,15 +55,18 @@ CI is configured to run the Unix integration suite natively on Mac/Linux. Window
 
 ## SSH and headless checks
 
-Install the matching `compi-daemon` on an SSH host, then exercise discovery and lifecycle without GPUI:
+Build the local development probe and install a matching `compi-daemon` on the SSH host (on its `PATH`). On macOS/Linux, exercise discovery and lifecycle without GPUI:
 
 ```sh
-compi-probe --connect user@host:22 --instance qualification workspace
-compi-probe --connect user@host:22 --instance qualification start
-compi-probe --connect user@host:22 --instance qualification surface inspect <surface-id>
+cargo build --locked -p compi-client --example compi-probe
+./target/debug/examples/compi-probe --connect user@host:22 --instance qualification workspace
+./target/debug/examples/compi-probe --connect user@host:22 --instance qualification start
+./target/debug/examples/compi-probe --connect user@host:22 --instance qualification workspace
+SURFACE_ID='paste-id-from-workspace'
+./target/debug/examples/compi-probe --connect user@host:22 --instance qualification surface inspect "$SURFACE_ID"
 ```
 
-Closing or detaching the probe must leave the remote surface running. A later `workspace` or `surface attach` must report the same server, surface, and process-lifetime IDs. Use `surface end` for one process and `shutdown` only for a disposable instance. Unknown host keys, authentication failures, missing remote binaries, and dropped relays must fail visibly; Compi does not bypass OpenSSH policy or fall back to a local daemon.
+Replace `user@host:22` with a reachable OpenSSH destination and assign `SURFACE_ID` from the second `workspace` listing after detaching the interactive `start` with Ctrl+]; do not terminate the shell. On Windows, use `.\target\debug\examples\compi-probe.exe` instead of `./target/debug/examples/compi-probe`. Closing or detaching the probe must leave the remote surface running. A later `workspace` or `surface attach` must report the same server, surface, and process-lifetime IDs. Use `surface end` with that ID for one process and `shutdown` only for a disposable instance. Unknown host keys, authentication failures, missing remote binaries, and dropped relays must fail visibly; Compi does not bypass OpenSSH policy or fall back to a local daemon.
 
 
 ## Current local portable build
@@ -86,15 +89,15 @@ Keep the runtime beside the daemon. Launch under a separate instance to avoid th
 
 ## Phase 4 native workspace checks
 
-Use matching protocol 12 client/daemon binaries and an isolated instance. Do not stop an older daemon that owns valuable work merely to try the new client.
+Use matching protocol 14 client/daemon binaries and an isolated instance. Set `GPUI_FXC_PATH` as described in Tier 1 before building the Windows client. Do not stop an older daemon that owns valuable work merely to try the new client.
 
 ```powershell
-cargo test --locked --workspace --all-targets --release
+cargo test --locked --workspace --all-targets --release -- --test-threads=1
 cargo build --locked --release --workspace --bins --examples
 .\target\release\compi.exe --instance phase4
 ```
 
-Set `GPUI_FXC_PATH` as described below. First launch creates one shell; later windows/relaunches do not repair hidden or intentionally empty work by creating replacement shells.
+First launch creates one shell; later windows/relaunches do not repair hidden or intentionally empty work by creating replacement shells.
 
 1. With the sidebar closed, create/rename/reorder terminal tabs. Open the sidebar explicitly, create/switch a workspace, and verify the top tabs remain primary. Hide and restore a tab without changing its process.
 2. Build nested Split right/down layouts. Drag a divider repeatedly within 32 ms intervals, including while PTY resize metadata arrives. The final ratio must commit without a GPUI panic or self-generated revision conflict.
@@ -112,12 +115,7 @@ Windows shortcuts: Ctrl-T/W, Ctrl-Tab / Ctrl-Shift-Tab, Ctrl-Shift-T restore, Ct
 
 ## Tier 1: automated regression
 
-```powershell
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-cargo build --release --bins
-```
+On Windows, prepare the pinned ConPTY runtime with `pwsh -File tools/prepare-conpty.ps1`, verify the default WSL2 distribution with `wsl.exe --exec /bin/bash -lc true`, and set `GPUI_FXC_PATH` using the discovery snippet that follows before building the client. Hosted WSL2 guests should run daemon integration tests serially.
 
 Release builds of GPUI require the Windows SDK shader compiler. Resolve the newest installed x64 compiler and pass its executable path through `GPUI_FXC_PATH`:
 
@@ -133,13 +131,22 @@ $env:GPUI_FXC_PATH = $fxc.FullName
 
 `GPUI_FXC_PATH` must name `fxc.exe`, not its containing directory. Native Windows builds and the tag-triggered release workflow use this discovery rule.
 
-Required result: every command exits zero. The release directory contains `compi.exe` and `compi-daemon.exe`; it does not contain `compi-probe.exe`.
+```powershell
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets -- --test-threads=1
+cargo build --locked --release --workspace --bins
+```
+
+Required result: every command exits zero. The release directory contains `compi.exe` and `compi-daemon.exe` (and the prepared ConPTY runtime on Windows); it does not contain `compi-probe.exe`, which is a development example under `release\examples` when built separately.
 
 ## Tier 2: scripted terminal and performance checks
 
-Start an isolated daemon:
+Start an isolated daemon with opt-in instrumentation in one PowerShell window, if collecting the resource logs below:
 
 ```powershell
+$env:COMPI_PERF_LOG = '1'
+$env:COMPI_PERF_SAMPLE = 'manual-01'
 .\target\release\compi-daemon.exe --instance acceptance
 ```
 
@@ -152,11 +159,11 @@ In a second PowerShell window, launch the GUI against that instance:
 Use `.\target\release\examples\compi-probe.exe --instance acceptance ...` only if the explicitly built development example is needed:
 
 ```powershell
-cargo build --release --example compi-probe
+cargo build --locked --release -p compi-client --example compi-probe
 .\target\release\examples\compi-probe.exe --instance acceptance workspace
 ```
 
-Run these commands inside an attached 100x30 Compi terminal. Capture pass/fail, elapsed time, peak private bytes, peak working set, peak handles, and any visible corruption.
+Run these commands in WSL Bash inside an attached 100x30 Compi terminal; they use Bash syntax and common Ubuntu command-line tools. Capture pass/fail, elapsed time, peak private bytes, peak working set, peak handles, and any visible corruption.
 
 | Case | Command/action | Required result |
 |---|---|---|
@@ -180,12 +187,12 @@ Run these commands inside an attached 100x30 Compi terminal. Capture pass/fail, 
 | Resize stream | `watch -n 0.2 date` while continuously resizing | TUI redraws cleanly; no garbage rows or crash. |
 | Resize flood | Rapidly drag a corner for 15 seconds | Final grid matches final window size; client and daemon remain alive. |
 | Escape flood | `timeout 10s sh -c 'while :; do printf "\033[31mX\033[0m"; done'` | Parser remains responsive; attributes do not bleed into prompt. |
-| 10 KiB paste | Paste a deterministic 10 KiB ASCII block into `wc -c` input, then `Ctrl+D` | Reported byte count matches the source exactly. |
+| 10 KiB paste | In WSL Bash, run `stty -icanon -echo min 1; dd bs=10240 count=1 iflag=fullblock status=none | wc -c; stty sane`. Paste exactly 10,240 printable ASCII bytes (no newline). If interrupted, run `stty sane`. | The count is `10240`; noncanonical input avoids the shell's canonical-line input limit. |
 | Reattach under output | Start a build or count loop, close Compi, wait, reopen and attach | Process never stops; current screen and subsequent output are coherent. |
 
 Settings provides the normal interactive monitor. The environment-gated logs below remain the attributed measurement path for release qualification and correlated latency work.
 
-For ad hoc performance sampling, launch the release client with opt-in instrumentation:
+For ad hoc performance sampling, launch the release client with opt-in instrumentation in its PowerShell window (the daemon needs `COMPI_PERF_LOG=1` at startup for daemon resource records):
 
 ```powershell
 $env:COMPI_PERF_LOG = '1'
@@ -196,8 +203,8 @@ $env:COMPI_PERF_SAMPLE = 'manual-01'
 Instrumentation writes:
 
 - `%LOCALAPPDATA%\Compi\client-startup.log`: daemon connection, first window, first terminal frame, and optional ready-probe timing;
-- `%LOCALAPPDATA%\Compi\client-resource-<pid>.log`: six-second client private bytes, working set, handles, workload, and attached-tab count;
-- `%LOCALAPPDATA%\Compi\daemon-resource-<pid>.log`: six-second daemon private bytes, working set, handles, and session count;
+- `%LOCALAPPDATA%\Compi\client-resource-<pid>.log`: six-second client private bytes, working set, handles, workload, and workspace surface count (under the `sessions` field);
+- `%LOCALAPPDATA%\Compi\daemon-resource-<pid>.log`: six-second daemon private bytes, working set, handles, and surface count (under the `sessions` field);
 - `%LOCALAPPDATA%\Compi\client-perf.log`: frame-interval and terminal-paint distributions under active output.
 - `%LOCALAPPDATA%\Compi\latency-<pid>.log`: correlated input IDs at GPUI receipt, client queue/send, daemon receipt, PTY output, terminal-state sequence, and the next presented frame.
 
@@ -208,7 +215,8 @@ For deterministic terminal debugging, set `COMPI_TERMINAL_TRACE_DIR` on an isola
 The release harness runs empty-window, warm-daemon, and cold-daemon launch samples; measures fresh one-, two-, and four-session client/daemon pairs; queries Windows GPU process-memory counters; and writes CSV plus environment JSON under `%LOCALAPPDATA%\Compi\measurements`:
 
 ```powershell
-cargo build --release --bins --example compi-probe
+cargo build --locked --release --workspace --bins
+cargo build --locked --release -p compi-client --example compi-probe
 .\tools\measure-release.ps1 -Samples 10 -ConfirmPhysicalDisplay
 ```
 
