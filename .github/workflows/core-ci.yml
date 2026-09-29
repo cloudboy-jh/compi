@@ -78,7 +78,8 @@ jobs:
           COMPI_TERMINAL_TRACE_DIR: ${{ runner.temp }}/compi-terminal-traces
         shell: pwsh
         run: |
-          cargo test --locked -p compi-daemon --test daemon_integration
+          # The hosted WSL2 guest cannot reliably start many test shells at once.
+          cargo test --locked -p compi-daemon --test daemon_integration -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Windows/WSL daemon regressions failed' }
       - name: Build real Windows daemon without graphics setup
         if: runner.os == 'Windows'

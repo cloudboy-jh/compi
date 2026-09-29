@@ -47,7 +47,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Formatting failed' }
           cargo clippy --locked --workspace --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
-          cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
+          # One hosted WSL2 guest backs every daemon integration test.
+          cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
           python tools/check-dependencies.py --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Dependency boundaries failed' }

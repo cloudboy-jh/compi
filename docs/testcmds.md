@@ -23,10 +23,10 @@ On native Windows, verify the headless build separately from application/install
 python tools/check-dependencies.py --target x86_64-pc-windows-msvc
 cargo build --locked --release -p compi-daemon --bin compi-daemon
 wsl.exe --exec true
-cargo test --locked -p compi-daemon --test daemon_integration
+cargo test --locked -p compi-daemon --test daemon_integration -- --test-threads=1
 ```
 
-The daemon build does not require GPUI or `GPUI_FXC_PATH`. A failed WSL readiness check is missing runtime coverage, not a reason to count skipped daemon tests as passing. The commands in Tier 1 below require a working default WSL distribution for the full integration suite.
+The daemon build does not require GPUI or `GPUI_FXC_PATH`. A failed WSL readiness check is missing runtime coverage, not a reason to count skipped daemon tests as passing. The Windows integration cases run one at a time on shared WSL2 runners: simultaneous guest startups have returned `0xffffffff` without diagnostic output, even though individual tests run. The commands in Tier 1 below require a working default WSL distribution for the full integration suite.
 
 ## Phase 2 native Unix and Mac checks
 
