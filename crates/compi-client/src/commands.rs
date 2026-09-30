@@ -89,7 +89,7 @@ registry! {
     MoveTabLeft, "move_tab_left", "Move terminal tab left", Some("cmd-alt-shift-left"), Some("ctrl-shift-alt-left");
     MoveTabRight, "move_tab_right", "Move terminal tab right", Some("cmd-alt-shift-right"), Some("ctrl-shift-alt-right");
     RemoveTab, "remove_tab", "Remove terminal tab…", None, None;
-    DetachTab, "detach_tab", "Hide terminal tab (keep processes running)", Some("cmd-w"), Some("ctrl-w");
+    DetachTab, "detach_tab", "Hide terminal tab", Some("cmd-w"), Some("ctrl-w");
     RestoreHiddenTab, "restore_hidden_tab", "Restore hidden terminal tab", Some("cmd-shift-t"), Some("ctrl-shift-t");
     NewWindow, "new_window", "New window", Some("cmd-n"), Some("ctrl-shift-n");
     MoveTabToNewWindow, "move_tab_to_new_window", "Move terminal tab to new window", None, None;
@@ -97,7 +97,7 @@ registry! {
     SplitRight, "split_right", "Split right", Some("cmd-d"), Some("alt-shift-plus");
     SplitDown, "split_down", "Split down", Some("cmd-shift-d"), Some("alt-shift-minus");
     TogglePaneZoom, "toggle_pane_zoom", "Zoom pane", None, None;
-    DetachPane, "detach_pane", "Detach Split to New Tab", None, None;
+    DetachPane, "detach_pane", "Move pane to new tab", None, None;
     FocusLeft, "focus_left", "Focus pane left", Some("cmd-alt-left"), Some("alt-left");
     FocusRight, "focus_right", "Focus pane right", Some("cmd-alt-right"), Some("alt-right");
     FocusUp, "focus_up", "Focus pane above", Some("cmd-alt-up"), Some("alt-up");
@@ -106,8 +106,8 @@ registry! {
     ResizeSplitIncrease, "resize_split_increase", "Move divider toward second pane", Some("cmd-alt-equal"), Some("alt-shift-right");
     ResetSplitRatio, "reset_split_ratio", "Equalize focused split", None, None;
     RemovePane, "remove_pane", "Remove pane…", None, Some("ctrl-shift-w");
-    EndSurface, "end_surface", "End surface process…", None, None;
-    RestartSurface, "restart_surface", "Restart exited, failed, or lost surface", None, None;
+    EndSurface, "end_surface", "End terminal…", None, None;
+    RestartSurface, "restart_surface", "Restart terminal", None, None;
     ToggleSidebar, "toggle_sidebar", "Toggle workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");
     ResetSidebarWidth, "reset_sidebar_width", "Reset sidebar width", None, None;
     Copy, "copy", "Copy selection", Some("cmd-c"), Some("ctrl-shift-c");
@@ -123,11 +123,11 @@ registry! {
     OpenThemeCatalog, "open_theme_catalog", "Browse theme catalog", None, None;
     OpenSettings, "open_settings", "Open Settings", Some("cmd-,"), Some("ctrl-,");
     OpenConfiguration, "open_configuration", "Open configuration file", None, None;
-    ResetClientLayout, "reset_client_layout", "Reset client layout", None, None;
-    Reconnect, "reconnect", "Reconnect window to daemon", None, None;
+    ResetClientLayout, "reset_client_layout", "Reset window layout", None, None;
+    Reconnect, "reconnect", "Reconnect window", None, None;
     RestartDaemon, "restart_daemon", "Restart daemon…", None, None;
     OpenDiagnostics, "open_diagnostics", "Open diagnostics", None, None;
-    Quit, "quit", "Quit client (keep daemon running)", Some("cmd-q"), Some("ctrl-shift-q");
+    Quit, "quit", "Quit Compi", Some("cmd-q"), Some("ctrl-shift-q");
 }
 
 impl CommandSpec {
@@ -242,6 +242,32 @@ impl Command {
         }
     }
 
+    pub(crate) const fn description(self) -> Option<&'static str> {
+        use Command::*;
+        match self {
+            RemoveWorkspace => Some("Stops every terminal in this workspace and removes it."),
+            RemoveTab => Some("Stops every terminal in this tab and removes it."),
+            DetachTab => Some("Hides this tab without stopping its terminals."),
+            NewWindow => Some("Opens another window without duplicating your terminals."),
+            MoveTabToNewWindow | MoveTabToWindow => {
+                Some("Moves this tab and its splits without stopping terminals.")
+            }
+            TogglePaneZoom => Some("Switches between one pane and the full split layout."),
+            DetachPane => Some("Moves this pane to its own tab without stopping its terminal."),
+            RemovePane => Some("Stops this terminal and removes its pane."),
+            EndSurface => Some("Stops this terminal and its child processes; keeps its contents."),
+            RestartSurface => Some("Starts a new process in this terminal."),
+            BrowseFiles | JumpProject => {
+                Some("Browses folders without sending commands to your terminal.")
+            }
+            ResetClientLayout => Some("Resets this window's layout without changing your tabs."),
+            Reconnect => Some("Reconnects this window without stopping your terminals."),
+            RestartDaemon => Some("Stops all running terminals before restarting the server."),
+            Quit => Some("Closes Compi windows; your terminals keep running."),
+            _ => None,
+        }
+    }
+
     pub const fn aliases(self) -> &'static str {
         use Command::*;
         match self {
@@ -254,6 +280,9 @@ impl Command {
             Reconnect => "server attach retry",
             DetachTab => "hide close keep running",
             RestoreHiddenTab => "reopen unhide",
+            DetachPane => "detach split pane tab",
+            RestartSurface => "exited failed lost process surface",
+            Quit => "client close keep running daemon",
             _ => "",
         }
     }
@@ -290,7 +319,7 @@ impl Command {
         if self == RestartDaemon {
             return c
                 .daemon_restarting
-                .then_some("Wait for the daemon restart to finish");
+                .then_some("Wait for the server to restart");
         }
         if c.revision != c.current_revision {
             return Some("Workspace changed; select the command again");
@@ -328,7 +357,7 @@ impl Command {
             return Some("Wait for the current workspace change to finish");
         }
         if c.transfer_in_progress && !matches!(self, Copy | SelectAll) {
-            return Some("Wait for the terminal tab transfer to finish");
+            return Some("Wait for the tab to finish moving");
         }
         match self {
             CreateWorkspace => None,
@@ -353,7 +382,7 @@ impl Command {
                     Some("Select a terminal tab first")
                 } else {
                     (!c.other_window_available)
-                        .then_some("No other window for this server is available")
+                        .then_some("No other window connected to this server")
                 }
             }
             MoveTabLeft => {
@@ -425,7 +454,7 @@ impl Command {
                 ) {
                     None
                 } else {
-                    Some("The surface has no live process")
+                    Some("This terminal is not running")
                 }
             }
             RestartSurface => {
@@ -437,7 +466,7 @@ impl Command {
                 ) {
                     None
                 } else {
-                    Some("Only exited, failed, or lost surfaces can be restarted")
+                    Some("Wait for this terminal to stop before restarting")
                 }
             }
             BrowseFiles | JumpProject => (!c.has_pane).then_some("Select a terminal pane first"),

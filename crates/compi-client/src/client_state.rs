@@ -9,7 +9,7 @@ use crate::{
         MIN_TERMINAL_OPACITY,
     },
     project_history::ProjectHistory,
-    theme::{BackgroundEffect, ThemePreset},
+    theme::{BackgroundEffect, ThemeId},
 };
 use compi_protocol::{
     LayoutNode, PaneId, ServerId, SessionId, TabId, TerminalIdentity, WorkspaceSession,
@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CLIENT_STATE_VERSION: u32 = 3;
+pub const CLIENT_STATE_VERSION: u32 = 5;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_REFERENCES: usize = 16_384;
 const MAX_ID_BYTES: usize = 256;
@@ -73,10 +73,16 @@ pub struct WindowGeometry {
     pub maximized: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowAppearanceOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme: Option<ThemePreset>,
+    pub theme: Option<ThemeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_theme: Option<ThemeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_theme_override: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_background: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_opacity: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,7 +97,7 @@ impl WindowAppearanceOverrides {
     }
 
     fn is_default(value: &Self) -> bool {
-        *value == Self::default()
+        value == &Self::default()
     }
 }
 
@@ -401,7 +407,7 @@ impl ClientState {
             return false;
         };
         self.geometry = None;
-        self.appearance = source.appearance;
+        self.appearance = source.appearance.clone();
         self.font_zoom = source.font_zoom;
         self.sidebar_width = source.sidebar_width;
         self.show_fps = source.show_fps;
@@ -429,9 +435,28 @@ impl ClientState {
         let mut changed = false;
         match self.version {
             CLIENT_STATE_VERSION => {}
-            // Versions 1 and 2 predate the optional window-level FPS overlay.
-            // Version 1 also stored a materialized theme copied from configuration.
-            1 | 2 => {
+            // Before v4, a window theme applied to both axes. In v4, omitted
+            // axes inherited independently; keep that behavior until Follow theme.
+            1..=4 => {
+                if self.version <= 3 && self.appearance.terminal_theme.is_none() {
+                    self.appearance.terminal_theme = self.appearance.theme.clone();
+                }
+                if self.appearance.terminal_theme_override.is_none()
+                    && (self.appearance.theme.is_some() || self.appearance.terminal_theme.is_some())
+                {
+                    self.appearance.terminal_theme_override = Some(true);
+                }
+                if self.appearance.transparent_background.is_none() {
+                    self.appearance.transparent_background = match self.appearance.background_effect
+                    {
+                        Some(BackgroundEffect::Opaque) => Some(false),
+                        Some(_) => Some(true),
+                        None => None,
+                    };
+                }
+                if self.appearance.background_effect == Some(BackgroundEffect::Opaque) {
+                    self.appearance.background_effect = Some(BackgroundEffect::Clear);
+                }
                 self.version = CLIENT_STATE_VERSION;
                 changed = true;
             }
@@ -970,6 +995,148 @@ mod tests {
         state.appearance.terminal_opacity = Some(f32::NAN);
         assert!(state.sanitize(&ClientState::default()).unwrap());
         assert_eq!(state.appearance.terminal_opacity, None);
+    }
+
+    #[test]
+    fn legacy_overrides_migrate_both_axes_without_changing_navigation_or_geometry() {
+        let mut original = ClientState {
+            geometry: Some(WindowGeometry {
+                x: 45.0,
+                y: 60.0,
+                width: 1100.0,
+                height: 760.0,
+                maximized: false,
+            }),
+            selected_session: Some(SessionId::from("one")),
+            ..ClientState::default()
+        };
+        original
+            .selected_tabs
+            .insert("one".to_owned(), TabId::from("one-b"));
+        original.appearance.theme = Some(ThemeId::parse("user-uninstalled").unwrap());
+        original.appearance.terminal_opacity = Some(0.55);
+        original.appearance.background_effect = Some(BackgroundEffect::Clear);
+        for version in [2, 3] {
+            let mut stored = serde_json::to_value(&original).unwrap();
+            stored["version"] = serde_json::json!(version);
+            stored["appearance"]
+                .as_object_mut()
+                .unwrap()
+                .remove("terminal_theme");
+            let mut migrated: ClientState = serde_json::from_value(stored).unwrap();
+            assert!(migrated.sanitize(&ClientState::default()).unwrap());
+            assert_eq!(migrated.version, CLIENT_STATE_VERSION);
+            assert_eq!(migrated.appearance.theme, original.appearance.theme);
+            assert_eq!(
+                migrated.appearance.terminal_theme,
+                original.appearance.theme
+            );
+            assert_eq!(migrated.appearance.terminal_opacity, Some(0.55));
+            assert_eq!(
+                migrated.appearance.background_effect,
+                Some(BackgroundEffect::Clear)
+            );
+            assert_eq!(migrated.geometry, original.geometry);
+            assert_eq!(migrated.selected_session, original.selected_session);
+            assert_eq!(migrated.selected_tabs, original.selected_tabs);
+
+            let mut inherited = serde_json::to_value(&original).unwrap();
+            inherited["version"] = serde_json::json!(version);
+            inherited["appearance"]
+                .as_object_mut()
+                .unwrap()
+                .remove("theme");
+            let mut inherited: ClientState = serde_json::from_value(inherited).unwrap();
+            inherited.sanitize(&ClientState::default()).unwrap();
+            assert_eq!(inherited.appearance.theme, None);
+            assert_eq!(inherited.appearance.terminal_theme, None);
+        }
+    }
+
+    #[test]
+    fn version_four_migration_preserves_independent_inheritance_and_opaque_material() {
+        for (application, terminal) in [
+            (Some("nord"), None),
+            (None, Some("dracula")),
+            (Some("nord"), Some("dracula")),
+            (None, None),
+        ] {
+            let original = ClientState {
+                version: 4,
+                appearance: WindowAppearanceOverrides {
+                    theme: application.and_then(ThemeId::parse),
+                    terminal_theme: terminal.and_then(ThemeId::parse),
+                    terminal_opacity: Some(0.43),
+                    background_effect: Some(BackgroundEffect::Opaque),
+                    ..WindowAppearanceOverrides::default()
+                },
+                ..ClientState::default()
+            };
+            let mut migrated: ClientState =
+                serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+            migrated.sanitize(&ClientState::default()).unwrap();
+            assert_eq!(migrated.appearance.theme, original.appearance.theme);
+            assert_eq!(
+                migrated.appearance.terminal_theme,
+                original.appearance.terminal_theme
+            );
+            assert_eq!(
+                migrated.appearance.terminal_theme_override,
+                (application.is_some() || terminal.is_some()).then_some(true),
+            );
+            assert_eq!(migrated.appearance.transparent_background, Some(false));
+            assert_eq!(
+                migrated.appearance.background_effect,
+                Some(BackgroundEffect::Clear)
+            );
+            assert_eq!(migrated.appearance.terminal_opacity, Some(0.43));
+            let mut restarted: ClientState =
+                serde_json::from_value(serde_json::to_value(&migrated).unwrap()).unwrap();
+            assert!(!restarted.sanitize(&ClientState::default()).unwrap());
+            assert_eq!(restarted, migrated);
+        }
+    }
+
+    #[test]
+    fn independent_overrides_and_uninstalled_ids_survive_state_restart() {
+        let directory = Directory::new();
+        let mut slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        slot.state.selected_session = Some(SessionId::from("two"));
+        slot.state
+            .selected_tabs
+            .insert("two".to_owned(), TabId::from("two-c"));
+        slot.state.font_zoom = 1.25;
+        let path = slot.path.clone();
+        let combinations = [
+            (Some("user-uninstalled"), None),
+            (None, Some("user-uninstalled")),
+            (Some("warm-carbon"), Some("nord")),
+        ];
+        for (application, terminal) in combinations {
+            slot.state.appearance.theme = application.and_then(ThemeId::parse);
+            slot.state.appearance.terminal_theme = terminal.and_then(ThemeId::parse);
+            let expected = slot.state.clone();
+            slot.save().unwrap();
+            drop(slot);
+            slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+            assert_eq!(slot.path, path);
+            assert_eq!(slot.state, expected);
+            assert!(slot.diagnostics.is_empty());
+        }
+
+        let mut stored = serde_json::to_value(&slot.state).unwrap();
+        stored["appearance"]["terminal_theme"] = serde_json::Value::Null;
+        let mut explicit_inheritance: ClientState = serde_json::from_value(stored).unwrap();
+        assert!(
+            !explicit_inheritance
+                .sanitize(&ClientState::default())
+                .unwrap()
+        );
+        assert_eq!(explicit_inheritance.appearance.terminal_theme, None);
+        assert_eq!(
+            explicit_inheritance.appearance.theme.as_ref().unwrap().id(),
+            "warm-carbon"
+        );
     }
 
     #[test]

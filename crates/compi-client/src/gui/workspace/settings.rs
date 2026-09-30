@@ -1,3 +1,4 @@
+use super::catalog::CatalogTarget;
 use super::*;
 
 const SETTINGS_NAV_ITEMS: usize = 6;
@@ -5,8 +6,11 @@ const SETTINGS_NAV_ITEMS: usize = 6;
 #[derive(Clone, Copy)]
 enum SettingsAction {
     Scope(SettingsScope),
-    BrowseThemes,
-    Background(BackgroundEffect),
+    BrowseThemes(CatalogTarget),
+    ToggleTransparency,
+    ToggleBlur,
+    FollowTheme,
+    ToggleFontPicker,
     Opacity(f32),
     ResetWindowAppearance,
     UiFont(UiFontPreset),
@@ -16,6 +20,7 @@ enum SettingsAction {
     Zoom(Command),
     OpenConfiguration,
     OpenPalette,
+    OpenSettings,
     ToggleFps,
     RebuildRenderer,
     CopyPerformance,
@@ -36,57 +41,68 @@ impl CompiApp {
         SETTINGS_NAV_ITEMS + offset
     }
 
+    fn font_picker_open(&self) -> bool {
+        self.settings_font_picker == Some(self.settings_section)
+            && matches!(
+                self.settings_section,
+                SettingsSection::Interface | SettingsSection::Terminal
+            )
+    }
+
+    fn font_choice_count(&self) -> usize {
+        if !self.font_picker_open() {
+            return 0;
+        }
+        match self.settings_section {
+            SettingsSection::Interface => UiFontPreset::ALL.len(),
+            SettingsSection::Terminal => TerminalFontPreset::ALL.len(),
+            _ => 0,
+        }
+    }
+
     fn settings_action_count(&self) -> usize {
         match self.settings_section {
-            SettingsSection::Appearance => {
-                if self.settings_scope == SettingsScope::Window {
-                    7
-                } else {
-                    6
-                }
-            }
-            SettingsSection::Interface => UiFontPreset::ALL.len() + 2,
-            SettingsSection::Terminal => TerminalFontPreset::ALL.len() + 4,
+            SettingsSection::Appearance => self.appearance_action_count(),
+            SettingsSection::Interface => self.font_choice_count() + 3,
+            SettingsSection::Terminal => self.font_choice_count() + 5,
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
-            SettingsSection::Advanced => 4,
+            SettingsSection::Advanced => 8,
         }
     }
 
     fn settings_action(&self, offset: usize) -> Option<SettingsAction> {
         match self.settings_section {
-            SettingsSection::Appearance => match offset {
-                0 => Some(SettingsAction::Scope(SettingsScope::Global)),
-                1 => Some(SettingsAction::Scope(SettingsScope::Window)),
-                2 => Some(SettingsAction::BrowseThemes),
-                3 => Some(SettingsAction::Background(BackgroundEffect::Clear)),
-                4 => Some(SettingsAction::Background(BackgroundEffect::Blurred)),
-                5 => Some(SettingsAction::Opacity(0.05)),
-                6 if self.settings_scope == SettingsScope::Window => {
-                    Some(SettingsAction::ResetWindowAppearance)
+            SettingsSection::Appearance => self.appearance_action(offset),
+            SettingsSection::Interface | SettingsSection::Terminal => {
+                if offset == 0 {
+                    return Some(SettingsAction::ToggleFontPicker);
                 }
-                _ => None,
-            },
-            SettingsSection::Interface => UiFontPreset::ALL
-                .get(offset)
-                .copied()
-                .map(SettingsAction::UiFont)
-                .or_else(|| match offset - UiFontPreset::ALL.len() {
-                    0 => Some(SettingsAction::ResetSidebar),
-                    1 => Some(SettingsAction::ResetLayout),
+                let choices = self.font_choice_count();
+                if offset <= choices {
+                    return match self.settings_section {
+                        SettingsSection::Interface => UiFontPreset::ALL
+                            .get(offset - 1)
+                            .copied()
+                            .map(SettingsAction::UiFont),
+                        _ => TerminalFontPreset::ALL
+                            .get(offset - 1)
+                            .copied()
+                            .map(SettingsAction::TerminalFont),
+                    };
+                }
+                match (self.settings_section, offset - choices - 1) {
+                    (SettingsSection::Interface, 0) => Some(SettingsAction::ResetSidebar),
+                    (SettingsSection::Interface, 1) => Some(SettingsAction::ResetLayout),
+                    (SettingsSection::Terminal, 0) => Some(SettingsAction::Zoom(Command::ZoomOut)),
+                    (SettingsSection::Terminal, 1) => {
+                        Some(SettingsAction::Zoom(Command::ZoomReset))
+                    }
+                    (SettingsSection::Terminal, 2) => Some(SettingsAction::Zoom(Command::ZoomIn)),
+                    (SettingsSection::Terminal, 3) => Some(SettingsAction::OpenConfiguration),
                     _ => None,
-                }),
-            SettingsSection::Terminal => TerminalFontPreset::ALL
-                .get(offset)
-                .copied()
-                .map(SettingsAction::TerminalFont)
-                .or_else(|| match offset - TerminalFontPreset::ALL.len() {
-                    0 => Some(SettingsAction::Zoom(Command::ZoomOut)),
-                    1 => Some(SettingsAction::Zoom(Command::ZoomReset)),
-                    2 => Some(SettingsAction::Zoom(Command::ZoomIn)),
-                    3 => Some(SettingsAction::OpenConfiguration),
-                    _ => None,
-                }),
+                }
+            }
             SettingsSection::Keyboard => match offset {
                 0 => Some(SettingsAction::OpenPalette),
                 1 => Some(SettingsAction::OpenConfiguration),
@@ -99,13 +115,61 @@ impl CompiApp {
                 _ => None,
             },
             SettingsSection::Advanced => match offset {
-                0 => Some(SettingsAction::OpenConfiguration),
-                1 => Some(SettingsAction::Reconnect),
-                2 => Some(SettingsAction::OpenDiagnostics),
-                3 => Some(SettingsAction::RestartDaemon),
+                0 => Some(SettingsAction::Scope(SettingsScope::Global)),
+                1 => Some(SettingsAction::Scope(SettingsScope::Window)),
+                2 => Some(SettingsAction::FollowTheme),
+                3 => Some(SettingsAction::BrowseThemes(CatalogTarget::Terminal)),
+                4 => Some(SettingsAction::OpenConfiguration),
+                5 => Some(SettingsAction::Reconnect),
+                6 => Some(SettingsAction::OpenDiagnostics),
+                7 => Some(SettingsAction::RestartDaemon),
                 _ => None,
             },
         }
+    }
+
+    fn normalize_settings_focus(&mut self) {
+        if !matches!(
+            self.overlay,
+            Some(Overlay::Settings | Overlay::QuickAppearance)
+        ) {
+            return;
+        }
+        let base = if matches!(self.overlay, Some(Overlay::Settings)) {
+            SETTINGS_NAV_ITEMS
+        } else {
+            0
+        };
+        let count = if base == 0 {
+            self.appearance_action_count()
+        } else {
+            self.settings_action_count()
+        };
+        self.overlay_focus = self.overlay_focus.min(base + count.saturating_sub(1));
+    }
+
+    fn toggle_settings_font_picker(&mut self) {
+        self.settings_scroll_to_focus = true;
+        if self.font_picker_open() {
+            self.settings_font_picker = None;
+            self.overlay_focus = SETTINGS_NAV_ITEMS;
+            return;
+        }
+        self.settings_font_picker = Some(self.settings_section);
+        let selected = match self.settings_section {
+            SettingsSection::Interface => UiFontPreset::ALL
+                .iter()
+                .position(|preset| *preset == self.config.ui_font),
+            SettingsSection::Terminal => TerminalFontPreset::ALL.iter().position(|preset| {
+                self.config
+                    .configured_font
+                    .family
+                    .eq_ignore_ascii_case(preset.family())
+            }),
+            _ => None,
+        }
+        .unwrap_or(0);
+        self.overlay_focus = SETTINGS_NAV_ITEMS + selected + 1;
     }
 
     pub(super) fn handle_settings_key(
@@ -120,89 +184,153 @@ impl CompiApp {
             return false;
         }
         if key.key == "escape" {
-            self.dismiss_overlay();
+            if full && self.font_picker_open() {
+                self.settings_font_picker = None;
+                self.overlay_focus = SETTINGS_NAV_ITEMS;
+                self.settings_scroll_to_focus = true;
+            } else {
+                self.settings_font_picker = None;
+                self.dismiss_overlay();
+            }
             cx.notify();
             return true;
         }
+        self.normalize_settings_focus();
         let base = if full { SETTINGS_NAV_ITEMS } else { 0 };
-        let action_count = if full {
-            self.settings_action_count()
-        } else if self.settings_scope == SettingsScope::Window {
-            7
+        let offset = self.overlay_focus.saturating_sub(base);
+        let action = if full {
+            self.settings_action(offset)
         } else {
-            6
+            self.appearance_action(offset)
         };
-        let total = base + action_count;
+        if full
+            && self.font_picker_open()
+            && self.overlay_focus >= base
+            && matches!(key.key.as_str(), "up" | "down" | "home" | "end")
+        {
+            let count = self.font_choice_count();
+            let selected = offset.saturating_sub(1).min(count - 1);
+            let next = match key.key.as_str() {
+                "up" => (selected + count - 1) % count,
+                "down" => (selected + 1) % count,
+                "home" => 0,
+                _ => count - 1,
+            };
+            self.overlay_focus = base + next + 1;
+            self.settings_scroll_to_focus = true;
+            cx.notify();
+            return true;
+        }
         match key.key.as_str() {
             "tab" => {
-                if total > 0 {
-                    self.overlay_focus = if key.modifiers.shift {
-                        (self.overlay_focus + total - 1) % total
+                if full && self.font_picker_open() {
+                    let choices = self.font_choice_count();
+                    self.settings_font_picker = None;
+                    self.overlay_focus = if offset <= choices {
+                        base
                     } else {
-                        (self.overlay_focus + 1) % total
+                        base + offset.saturating_sub(match self.settings_section {
+                            SettingsSection::Interface => UiFontPreset::ALL.len(),
+                            _ => TerminalFontPreset::ALL.len(),
+                        })
                     };
                 }
+                let count = if full {
+                    self.settings_action_count()
+                } else {
+                    self.appearance_action_count()
+                };
+                let total = base + count;
+                self.overlay_focus = if key.modifiers.shift {
+                    (self.overlay_focus + total - 1) % total
+                } else {
+                    (self.overlay_focus + 1) % total
+                };
             }
             "up" | "down" if full && self.overlay_focus < SETTINGS_NAV_ITEMS => {
-                let current = self.overlay_focus;
                 let next = if key.key == "up" {
-                    (current + SETTINGS_NAV_ITEMS - 1) % SETTINGS_NAV_ITEMS
+                    (self.overlay_focus + SETTINGS_NAV_ITEMS - 1) % SETTINGS_NAV_ITEMS
                 } else {
-                    (current + 1) % SETTINGS_NAV_ITEMS
+                    (self.overlay_focus + 1) % SETTINGS_NAV_ITEMS
                 };
+                self.settings_font_picker = None;
                 self.overlay_focus = next;
                 self.settings_section = SettingsSection::ALL[next];
+                self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+            }
+            "left" | "right"
+                if matches!(action, Some(SettingsAction::Opacity(_)))
+                    && self.overlay_focus >= base =>
+            {
+                self.adjust_opacity(if key.key == "left" { -0.05 } else { 0.05 }, window, cx);
             }
             "right" if full && self.overlay_focus < SETTINGS_NAV_ITEMS => {
                 self.overlay_focus = SETTINGS_NAV_ITEMS;
             }
             "left" if full && self.overlay_focus >= SETTINGS_NAV_ITEMS => {
+                self.settings_font_picker = None;
                 self.overlay_focus = self.settings_section as usize;
+            }
+            "up" | "down" if self.overlay_focus >= base => {
+                let count = if full {
+                    self.settings_action_count()
+                } else {
+                    self.appearance_action_count()
+                };
+                self.overlay_focus = base
+                    + if key.key == "up" {
+                        (offset + count - 1) % count
+                    } else {
+                        (offset + 1) % count
+                    };
             }
             "enter" | "space" => {
                 if full && self.overlay_focus < SETTINGS_NAV_ITEMS {
+                    self.settings_font_picker = None;
                     self.settings_section = SettingsSection::ALL[self.overlay_focus];
-                } else {
-                    let offset = self.overlay_focus.saturating_sub(base);
-                    let action = if full {
-                        self.settings_action(offset)
-                    } else {
-                        self.appearance_action(offset)
-                    };
-                    if let Some(action) = action {
-                        self.activate_settings_action(action, window, cx);
-                    }
-                }
-            }
-            "left" | "right" => {
-                let offset = self.overlay_focus.saturating_sub(base);
-                if matches!(
-                    if full {
-                        self.settings_action(offset)
-                    } else {
-                        self.appearance_action(offset)
-                    },
-                    Some(SettingsAction::Opacity(_))
-                ) {
-                    self.adjust_opacity(if key.key == "left" { -0.05 } else { 0.05 }, window, cx);
+                    self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+                } else if let Some(action) = action {
+                    self.activate_settings_action(action, window, cx);
                 }
             }
             _ => return true,
         }
+        self.normalize_settings_focus();
+        self.settings_scroll_to_focus = true;
         cx.notify();
         true
+    }
+
+    fn appearance_action_count(&self) -> usize {
+        4 + usize::from(self.scoped_appearance().transparent_background) * 2
+            + usize::from(self.settings_scope == SettingsScope::Window)
+            + usize::from(matches!(self.overlay, Some(Overlay::QuickAppearance)))
     }
 
     fn appearance_action(&self, offset: usize) -> Option<SettingsAction> {
         match offset {
             0 => Some(SettingsAction::Scope(SettingsScope::Global)),
             1 => Some(SettingsAction::Scope(SettingsScope::Window)),
-            2 => Some(SettingsAction::BrowseThemes),
-            3 => Some(SettingsAction::Background(BackgroundEffect::Clear)),
-            4 => Some(SettingsAction::Background(BackgroundEffect::Blurred)),
-            5 => Some(SettingsAction::Opacity(0.05)),
-            6 if self.settings_scope == SettingsScope::Window => {
+            2 => Some(SettingsAction::BrowseThemes(CatalogTarget::Both)),
+            3 => Some(SettingsAction::ToggleTransparency),
+            4 if self.scoped_appearance().transparent_background => {
+                Some(SettingsAction::Opacity(0.05))
+            }
+            5 if self.scoped_appearance().transparent_background => {
+                Some(SettingsAction::ToggleBlur)
+            }
+            value
+                if value
+                    == 4 + usize::from(self.scoped_appearance().transparent_background) * 2
+                    && self.settings_scope == SettingsScope::Window =>
+            {
                 Some(SettingsAction::ResetWindowAppearance)
+            }
+            value
+                if matches!(self.overlay, Some(Overlay::QuickAppearance))
+                    && value == self.appearance_action_count() - 1 =>
+            {
+                Some(SettingsAction::OpenSettings)
             }
             _ => None,
         }
@@ -216,16 +344,37 @@ impl CompiApp {
     ) {
         match action {
             SettingsAction::Scope(scope) => self.settings_scope = scope,
-            SettingsAction::BrowseThemes => self.open_theme_catalog(self.settings_scope),
-            SettingsAction::Background(effect) => {
-                let mut appearance = self.scoped_appearance();
-                appearance.background_effect = effect;
-                self.apply_scoped_appearance(appearance, window, cx);
+            SettingsAction::BrowseThemes(target) => {
+                self.open_theme_catalog_target(self.settings_scope, target)
             }
+            SettingsAction::ToggleTransparency => {
+                self.set_transparent_background(
+                    !self.scoped_appearance().transparent_background,
+                    window,
+                    cx,
+                );
+            }
+            SettingsAction::ToggleBlur => {
+                self.set_blur_background(
+                    self.scoped_appearance().background_effect != BackgroundEffect::Blurred,
+                    window,
+                    cx,
+                );
+            }
+            SettingsAction::FollowTheme => self.follow_theme_terminal_colors(window, cx),
+            SettingsAction::ToggleFontPicker => self.toggle_settings_font_picker(),
             SettingsAction::Opacity(delta) => self.adjust_opacity(delta, window, cx),
             SettingsAction::ResetWindowAppearance => self.reset_window_appearance(window),
-            SettingsAction::UiFont(preset) => self.apply_ui_font(preset, window, cx),
-            SettingsAction::TerminalFont(preset) => self.apply_terminal_font(preset, window, cx),
+            SettingsAction::UiFont(preset) => {
+                self.apply_ui_font(preset, window, cx);
+                self.settings_font_picker = None;
+                self.overlay_focus = SETTINGS_NAV_ITEMS;
+            }
+            SettingsAction::TerminalFont(preset) => {
+                self.apply_terminal_font(preset, window, cx);
+                self.settings_font_picker = None;
+                self.overlay_focus = SETTINGS_NAV_ITEMS;
+            }
             SettingsAction::ResetSidebar => self.execute(Command::ResetSidebarWidth, window, cx),
             SettingsAction::ResetLayout => self.execute(Command::ResetClientLayout, window, cx),
             SettingsAction::Zoom(command) => self.execute(command, window, cx),
@@ -242,7 +391,13 @@ impl CompiApp {
             SettingsAction::Reconnect => self.execute(Command::Reconnect, window, cx),
             SettingsAction::OpenDiagnostics => self.execute(Command::OpenDiagnostics, window, cx),
             SettingsAction::RestartDaemon => self.execute(Command::RestartDaemon, window, cx),
+            SettingsAction::OpenSettings => {
+                self.settings_font_picker = None;
+                self.open_overlay(Overlay::Settings, "");
+            }
         }
+        self.normalize_settings_focus();
+        self.settings_scroll_to_focus = true;
     }
 
     fn adjust_opacity(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -320,40 +475,21 @@ impl CompiApp {
             Some("Renderer rebuilt. Visual caches will repopulate as needed.".into());
     }
 
-    pub(super) fn settings_heading(
-        &self,
-        title: &'static str,
-        description: &'static str,
-    ) -> AnyElement {
-        let colors = self.colors();
+    pub(super) fn settings_heading(&self, title: &'static str) -> AnyElement {
         div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(18.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .max_w(px(620.0))
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(color(modal_text_color(colors.muted, colors)))
-                    .child(description),
-            )
+            .text_size(px(18.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(title)
             .into_any_element()
     }
 
     pub(super) fn settings_subheading(&self, label: &'static str) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         div()
             .pb_1()
             .text_size(px(UI_MICRO_TEXT_SIZE))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(color(modal_text_color(colors.muted, colors)))
+            .text_color(color(modal_text_color(colors.muted, &colors)))
             .child(label.to_uppercase())
             .into_any_element()
     }
@@ -366,7 +502,7 @@ impl CompiApp {
         tone: SettingsButtonTone,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let (background, hover, foreground) = match tone {
             SettingsButtonTone::Secondary => (
                 blend_rgb(colors.surface, colors.foreground, 0.04),
@@ -397,11 +533,17 @@ impl CompiApp {
         };
         div()
             .id(id)
-            .min_h(px(32.0))
+            .h(px(32.0))
+            .min_w(px(72.0))
+            .flex_none()
             .px_3()
             .flex()
             .items_center()
             .justify_center()
+            .text_size(px(UI_BODY_TEXT_SIZE))
+            .line_height(px(UI_BODY_LINE_HEIGHT))
+            .text_center()
+            .whitespace_nowrap()
             .rounded_sm()
             .border_1()
             .border_color(color(border))
@@ -458,14 +600,16 @@ impl CompiApp {
         focused: bool,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let group = colors.surface;
         let selected = blend_rgb(colors.surface, colors.accent, 0.08);
         let background = if active { selected } else { group };
         div()
             .id(id)
-            .min_h(px(32.0))
-            .px_2()
+            .h(px(32.0))
+            .min_w(px(72.0))
+            .flex_none()
+            .px_3()
             .rounded_sm()
             .border_1()
             .border_color(color(if focused || active {
@@ -476,6 +620,11 @@ impl CompiApp {
             .bg(color(background))
             .flex()
             .items_center()
+            .justify_center()
+            .text_size(px(UI_BODY_TEXT_SIZE))
+            .line_height(px(UI_BODY_LINE_HEIGHT))
+            .text_center()
+            .whitespace_nowrap()
             .font_weight(if active {
                 FontWeight::SEMIBOLD
             } else {
@@ -509,7 +658,7 @@ impl CompiApp {
         id: impl Into<gpui::ElementId>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let background = blend_rgb(colors.surface, colors.foreground, 0.07);
         let hover = blend_rgb(colors.surface, colors.foreground, 0.13);
         div()
@@ -529,6 +678,7 @@ impl CompiApp {
                 .into()
             })
             .on_click(cx.listener(|this, _, _, cx| {
+                this.settings_font_picker = None;
                 this.dismiss_overlay();
                 cx.stop_propagation();
                 cx.notify();
@@ -550,7 +700,7 @@ impl CompiApp {
     }
 
     fn render_settings_navigation(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let items = SettingsSection::ALL
             .into_iter()
             .enumerate()
@@ -566,6 +716,7 @@ impl CompiApp {
                 div()
                     .id(("settings-nav", index))
                     .min_h(px(36.0))
+                    .flex_none()
                     .px_2()
                     .flex()
                     .items_center()
@@ -579,7 +730,7 @@ impl CompiApp {
                         } else {
                             colors.muted
                         },
-                        colors,
+                        &colors,
                     )))
                     .font_weight(if active {
                         FontWeight::SEMIBOLD
@@ -589,6 +740,7 @@ impl CompiApp {
                     .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_section = section;
+                        this.settings_font_picker = None;
                         this.overlay_focus = index;
                         this.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
                         cx.stop_propagation();
@@ -623,517 +775,660 @@ impl CompiApp {
         }
     }
 
-    fn render_settings_content(&self, cx: &Context<Self>) -> AnyElement {
-        match self.settings_section {
-            SettingsSection::Appearance => self.render_appearance_controls(true, cx),
-            SettingsSection::Interface => self.render_interface_settings(cx),
-            SettingsSection::Terminal => self.render_terminal_settings(cx),
-            SettingsSection::Keyboard => self.render_keyboard_settings(cx),
-            SettingsSection::Performance => self.render_performance_section(cx),
-            SettingsSection::Advanced => self.render_advanced_settings(cx),
-        }
+    pub(super) fn settings_focus_anchor(&self, focused: bool, cx: &Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                if !focused {
+                    return;
+                }
+                entity.update(cx, |this, _| {
+                    if !this.settings_scroll_to_focus {
+                        return;
+                    }
+                    let Some(viewport) = this.settings_scroll_bounds else {
+                        return;
+                    };
+                    this.settings_scroll_to_focus = false;
+                    let top = viewport.top() + px(8.0);
+                    let bottom = viewport.bottom() - px(8.0);
+                    let delta = if bounds.top() < top {
+                        top - bounds.top()
+                    } else if bounds.bottom() > bottom {
+                        bottom - bounds.bottom()
+                    } else {
+                        px(0.0)
+                    };
+                    if delta != px(0.0) {
+                        let offset = this.overlay_scroll.offset();
+                        this.overlay_scroll
+                            .set_offset(point(offset.x, offset.y + delta));
+                        window.refresh();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()
     }
-
-    fn render_interface_settings(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
-        let selected_background = blend_rgb(colors.surface, colors.accent, 0.06);
-        let fonts = UiFontPreset::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, preset)| {
-                let active = self.config.ui_font == preset;
-                let focused = self.overlay_focus == self.settings_content_focus(index);
-                let background = if active {
-                    selected_background
-                } else {
-                    colors.surface
-                };
+    fn render_settings_toggle(
+        &self,
+        enabled: bool,
+        action: SettingsAction,
+        offset: usize,
+        full: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let base = if full { SETTINGS_NAV_ITEMS } else { 0 };
+        let focused = self.overlay_focus == base + offset;
+        let colors = *self.colors();
+        div()
+            .id(("settings-toggle", offset))
+            .relative()
+            .flex_none()
+            .min_w(px(92.0))
+            .min_h(px(36.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(color(if focused {
+                colors.accent
+            } else {
+                colors.border
+            }))
+            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.overlay_focus = base + offset;
+                this.activate_settings_action(action, window, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(if enabled { "On" } else { "Off" })
+            .child(
                 div()
-                    .id(("settings-ui-font", index))
-                    .min_h(px(58.0))
-                    .px_3()
-                    .py_2()
+                    .w(px(32.0))
+                    .h(px(18.0))
+                    .p(px(2.0))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color(if focused || active {
+                    .rounded_full()
+                    .bg(color(if enabled {
                         colors.accent
                     } else {
                         colors.border
                     }))
-                    .bg(color(background))
-                    .font_family(preset.family())
-                    .hover(move |style| {
-                        style
-                            .bg(color(if active {
-                                selected_background
-                            } else {
-                                colors.surface_hover
-                            }))
-                            .cursor_pointer()
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.overlay_focus = this.settings_content_focus(index);
-                        this.apply_ui_font(preset, window, cx);
-                        cx.stop_propagation();
-                    }))
+                    .when(enabled, |switch| switch.justify_end())
                     .child(
                         div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(preset.label()),
-                            )
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
-                                    .child(format!("{} · Aa Bb 0123", preset.description())),
-                            ),
-                    )
-                    .when(active, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(color(ui_text_color(colors.accent, background)))
-                                .child("Selected"),
-                        )
-                    })
-            });
-        let reset_offset = UiFontPreset::ALL.len();
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.settings_heading(
-                "Interface",
-                "Choose application typography independently from the terminal grid.",
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(self.settings_subheading("Interface font"))
-                    .children(fonts)
-                    .child(
-                        div()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, colors)))
-                            .child("Bundled families are licensed under the SIL Open Font License 1.1."),
+                            .size(px(14.0))
+                            .rounded_full()
+                            .bg(color(colors.foreground)),
                     ),
             )
-            .child(
-                div()
-                    .min_h(px(44.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .border_b_1()
-                    .border_color(color(colors.border))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child("Workspace sidebar")
-                            .child(
-                                div()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
-                                    .child(format!("Current width: {:.0}px", self.sidebar_width)),
-                            ),
-                    )
-                    .child(self.settings_action_button(
-                        "settings-reset-sidebar",
-                        "Reset width",
-                        self.overlay_focus == self.settings_content_focus(reset_offset),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::ResetSidebarWidth, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .child(self.settings_action_button(
-                        "settings-reset-layout",
-                        "Reset client layout",
-                        self.overlay_focus == self.settings_content_focus(reset_offset + 1),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::ResetClientLayout, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )),
-            )
+            .child(self.settings_focus_anchor(focused, cx))
             .into_any_element()
     }
 
-    fn render_terminal_settings(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
-        let selected_background = blend_rgb(colors.surface, colors.accent, 0.06);
-        let fonts = TerminalFontPreset::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, preset)| {
-                let active = self
-                    .config
-                    .configured_font
-                    .family
-                    .eq_ignore_ascii_case(preset.family());
-                let focused = self.overlay_focus == self.settings_content_focus(index);
-                let background = if active {
-                    selected_background
-                } else {
-                    colors.surface
-                };
-                div()
-                    .id(("settings-terminal-font", index))
-                    .min_h(px(58.0))
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color(if focused || active {
-                        colors.accent
-                    } else {
-                        colors.border
-                    }))
-                    .bg(color(background))
-                    .font_family(preset.family())
-                    .hover(move |style| {
-                        style
-                            .bg(color(if active {
-                                selected_background
-                            } else {
-                                colors.surface_hover
-                            }))
-                            .cursor_pointer()
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.overlay_focus = this.settings_content_focus(index);
-                        this.apply_terminal_font(preset, window, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(preset.label()),
-                            )
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
-                                    .child(format!(
-                                        "{} · $ cargo test  0O1l {{}} []",
-                                        preset.description()
-                                    )),
-                            ),
-                    )
-                    .when(active, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(color(ui_text_color(colors.accent, background)))
-                                .child("Selected"),
-                        )
-                    })
-            });
-        let zoom_offset = TerminalFontPreset::ALL.len();
+    fn settings_row(
+        &self,
+        label: &'static str,
+        detail: String,
+        control: AnyElement,
+        compact: bool,
+    ) -> AnyElement {
+        let colors = *self.colors();
         div()
+            .min_w_0()
             .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.settings_heading(
-                "Terminal",
-                "Choose fixed-cell typography independently from the application interface.",
-            ))
+            .gap_3()
+            .py_3()
+            .border_b_1()
+            .border_color(color(colors.border))
+            .when(compact, |row| row.flex_col().items_start())
+            .when(!compact, |row| row.items_center().justify_between())
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(self.settings_subheading("Terminal font"))
-                    .children(fonts)
-                    .child(
-                        div()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, colors)))
-                            .child(
-                                "Bundled families use the SIL Open Font License 1.1. Custom font.family values remain supported.",
-                            ),
-                    ),
-            )
-            .child(
-                div()
+                    .min_w_0()
+                    .when(!compact, |label| label.flex_1())
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(self.settings_subheading("Typography"))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(self.font_settings.family.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, colors)))
-                            .child(format!(
-                                "{:.1}px · {:.2} line height · {:.0}% zoom",
-                                self.font_settings.size,
-                                self.font_settings.line_height,
-                                self.zoom * 100.0
-                            )),
-                    ),
+                    .child(div().font_weight(FontWeight::MEDIUM).child(label))
+                    .when(!detail.is_empty(), |label| {
+                        label.child(
+                            div()
+                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .text_color(color(modal_text_color(colors.muted, &colors)))
+                                .child(detail),
+                        )
+                    }),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(self.settings_action_button(
-                        "settings-zoom-out",
-                        "Zoom out",
-                        self.overlay_focus == self.settings_content_focus(zoom_offset),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::ZoomOut, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(self.settings_action_button(
-                        "settings-zoom-reset",
-                        "Reset zoom",
-                        self.overlay_focus == self.settings_content_focus(zoom_offset + 1),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::ZoomReset, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(self.settings_action_button(
-                        "settings-zoom-in",
-                        "Zoom in",
-                        self.overlay_focus == self.settings_content_focus(zoom_offset + 2),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::ZoomIn, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .child(self.settings_action_button(
-                        "settings-terminal-config",
-                        "Edit terminal configuration",
-                        self.overlay_focus == self.settings_content_focus(zoom_offset + 3),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::OpenConfiguration, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )),
+                    .min_w_0()
+                    .flex_none()
+                    .when(compact, |control| control.w_full())
+                    .child(control),
             )
             .into_any_element()
     }
 
-    fn render_keyboard_settings(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+    fn settings_control_button(
+        &self,
+        label: &'static str,
+        action: SettingsAction,
+        offset: usize,
+        destructive: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let focused = self.overlay_focus == self.settings_content_focus(offset);
         div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.settings_heading(
-                "Keyboard",
-                "Compi commands remain searchable and TOML keybindings override platform defaults.",
+            .relative()
+            .flex_none()
+            .child(self.settings_action_button(
+                ("settings-action", offset),
+                label,
+                focused,
+                destructive,
+                cx.listener(move |this, _, window, cx| {
+                    this.overlay_focus = this.settings_content_focus(offset);
+                    this.activate_settings_action(action, window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
             ))
-            .child(
-                div()
-                    .min_h(px(44.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(color(colors.border))
-                    .child("Available commands")
-                    .child(format!("{}", commands::REGISTRY.len())),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(self.settings_action_button(
-                        "settings-open-palette",
-                        "Open command palette",
-                        self.overlay_focus == self.settings_content_focus(0),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::OpenPalette, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(self.settings_action_button(
-                        "settings-keyboard-config",
-                        "Edit keybindings",
-                        self.overlay_focus == self.settings_content_focus(1),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::OpenConfiguration, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )),
-            )
+            .child(self.settings_focus_anchor(focused, cx))
             .into_any_element()
     }
 
-    fn render_advanced_settings(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
-        let live_surfaces = self.command_context(cx).live_surface_count;
-        div()
+    fn render_settings_scope(&self, full: bool, compact: bool, cx: &Context<Self>) -> AnyElement {
+        let base = if full { SETTINGS_NAV_ITEMS } else { 0 };
+        let choices = [
+            (SettingsScope::Global, "Global defaults"),
+            (SettingsScope::Window, "This window"),
+        ];
+        let controls = div()
             .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.settings_heading(
-                "Advanced",
-                "Configuration, connection recovery, diagnostics, and daemon lifecycle.",
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(self.settings_subheading("Configuration"))
-                    .child(self.settings_action_button(
-                        "settings-open-config",
-                        "Open configuration file",
-                        self.overlay_focus == self.settings_content_focus(0),
-                        false,
-                        cx.listener(|this, _, window, cx| {
-                            this.execute(Command::OpenConfiguration, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(self.settings_subheading("Recovery"))
-                    .child(
-                        div().text_size(px(UI_SMALL_TEXT_SIZE)).text_color(color(modal_text_color(colors.muted, colors)))
-                            .child("Reconnect reloads terminal views without ending daemon-owned processes."),
-                    )
-                    .child(
+            .when(compact, |controls| controls.flex_col().items_start())
+            .gap_2()
+            .children(
+                choices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (scope, label))| {
+                        let focused = self.overlay_focus == base + index;
                         div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(self.settings_action_button(
-                                "settings-reconnect",
-                                "Reconnect window",
-                                self.overlay_focus == self.settings_content_focus(1),
-                                false,
-                                cx.listener(|this, _, window, cx| {
-                                    this.execute(Command::Reconnect, window, cx);
+                            .relative()
+                            .flex_none()
+                            .child(self.settings_segment_button(
+                                ("settings-scope", index),
+                                label,
+                                self.settings_scope == scope,
+                                focused,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.overlay_focus = base + index;
+                                    this.activate_settings_action(
+                                        SettingsAction::Scope(scope),
+                                        window,
+                                        cx,
+                                    );
                                     cx.stop_propagation();
+                                    cx.notify();
                                 }),
                             ))
-                            .child(self.settings_action_button(
-                                "settings-open-diagnostics",
-                                "Open diagnostics",
-                                self.overlay_focus == self.settings_content_focus(2),
-                                false,
-                                cx.listener(|this, _, window, cx| {
-                                    this.execute(Command::OpenDiagnostics, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            )),
+                            .child(self.settings_focus_anchor(focused, cx))
+                    }),
+            )
+            .into_any_element();
+        self.settings_row(
+            "Scope",
+            match self.settings_scope {
+                SettingsScope::Global => "Defaults for windows without an override.",
+                SettingsScope::Window => "Only this window; global defaults stay unchanged.",
+            }
+            .into(),
+            controls,
+            compact,
+        )
+    }
+
+    fn render_font_selector(&self, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let focused = self.overlay_focus == self.settings_content_focus(0);
+        let label = match self.settings_section {
+            SettingsSection::Interface => self.config.ui_font.label().to_string(),
+            _ => self.config.configured_font.family.clone(),
+        };
+        div()
+            .id("settings-font-selector")
+            .relative()
+            .min_w_0()
+            .w_full()
+            .min_h(px(38.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .rounded_sm()
+            .border_1()
+            .border_color(color(if focused {
+                colors.accent
+            } else {
+                colors.border
+            }))
+            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_settings_font_picker();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .child(div().flex_none().child(if self.font_picker_open() {
+                "▴"
+            } else {
+                "▾"
+            }))
+            .child(self.settings_focus_anchor(focused, cx))
+            .into_any_element()
+    }
+
+    fn render_font_option(
+        &self,
+        index: usize,
+        (label, family): (&'static str, &'static str),
+        sample: &'static str,
+        active: bool,
+        action: SettingsAction,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let focused = self.overlay_focus == self.settings_content_focus(index + 1);
+        div()
+            .id(("settings-font-option", index))
+            .relative()
+            .min_w_0()
+            .min_h(px(52.0))
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_1()
+            .border_color(color(if focused {
+                colors.accent
+            } else {
+                colors.surface
+            }))
+            .bg(color(if active {
+                blend_rgb(colors.surface, colors.accent, 0.08)
+            } else {
+                colors.surface
+            }))
+            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.activate_settings_action(action, window, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .font_family(family)
+                    .child(div().font_weight(FontWeight::MEDIUM).child(label))
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
+                            .child(sample),
                     ),
             )
             .child(
                 div()
+                    .w(px(16.0))
+                    .flex_none()
+                    .child(if active { "✓" } else { "" }),
+            )
+            .child(self.settings_focus_anchor(focused, cx))
+            .into_any_element()
+    }
+    fn render_settings_content(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
+        match self.settings_section {
+            SettingsSection::Appearance => self.render_appearance_controls(true, compact, cx),
+            SettingsSection::Interface => self.render_interface_settings(compact, cx),
+            SettingsSection::Terminal => self.render_terminal_settings(compact, cx),
+            SettingsSection::Keyboard => self.render_keyboard_settings(compact, cx),
+            SettingsSection::Performance => self.render_performance_section(cx),
+            SettingsSection::Advanced => self.render_advanced_settings(compact, cx),
+        }
+    }
+
+    fn render_interface_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
+        let choices = self.font_choice_count();
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.settings_heading("Interface"))
+            .child(self.settings_row(
+                "Interface font",
+                String::new(),
+                self.render_font_selector(cx),
+                true,
+            ))
+            .when(self.font_picker_open(), |section| {
+                section.child(
+                    div().flex().flex_col().children(
+                        UiFontPreset::ALL
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, preset)| {
+                                self.render_font_option(
+                                    index,
+                                    (preset.label(), preset.family()),
+                                    "Aa Bb 0123",
+                                    self.config.ui_font == preset,
+                                    SettingsAction::UiFont(preset),
+                                    cx,
+                                )
+                            }),
+                    ),
+                )
+            })
+            .child(self.settings_row(
+                "Sidebar width",
+                format!("{:.0}px", self.sidebar_width),
+                self.settings_control_button(
+                    "Reset width",
+                    SettingsAction::ResetSidebar,
+                    choices + 1,
+                    false,
+                    cx,
+                ),
+                compact,
+            ))
+            .child(self.settings_row(
+                "Window layout",
+                "Restore the saved layout defaults.".into(),
+                self.settings_control_button(
+                    "Reset layout",
+                    SettingsAction::ResetLayout,
+                    choices + 2,
+                    false,
+                    cx,
+                ),
+                compact,
+            ))
+            .into_any_element()
+    }
+
+    fn render_terminal_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
+        let choices = self.font_choice_count();
+        let zoom = div()
+            .flex()
+            .gap_2()
+            .child(self.settings_control_button(
+                "−",
+                SettingsAction::Zoom(Command::ZoomOut),
+                choices + 1,
+                false,
+                cx,
+            ))
+            .child(self.settings_control_button(
+                "Reset",
+                SettingsAction::Zoom(Command::ZoomReset),
+                choices + 2,
+                false,
+                cx,
+            ))
+            .child(self.settings_control_button(
+                "+",
+                SettingsAction::Zoom(Command::ZoomIn),
+                choices + 3,
+                false,
+                cx,
+            ))
+            .into_any_element();
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.settings_heading("Terminal"))
+            .child(self.settings_row(
+                "Terminal font",
+                String::new(),
+                self.render_font_selector(cx),
+                true,
+            ))
+            .when(self.font_picker_open(), |section| {
+                section.child(
+                    div().flex().flex_col().children(
+                        TerminalFontPreset::ALL
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, preset)| {
+                                self.render_font_option(
+                                    index,
+                                    (preset.label(), preset.family()),
+                                    "0O1l {} [] $ cargo",
+                                    self.config
+                                        .configured_font
+                                        .family
+                                        .eq_ignore_ascii_case(preset.family()),
+                                    SettingsAction::TerminalFont(preset),
+                                    cx,
+                                )
+                            }),
+                    ),
+                )
+            })
+            .child(self.settings_row(
+                "Zoom",
+                format!(
+                    "{:.0}% · {:.1}px · {:.2} line height",
+                    self.zoom * 100.0,
+                    self.font_settings.size,
+                    self.font_settings.line_height
+                ),
+                zoom,
+                compact,
+            ))
+            .child(self.settings_row(
+                "Custom typography",
+                "Set a custom font, size, or line height in the configuration file.".into(),
+                self.settings_control_button(
+                    "Edit configuration",
+                    SettingsAction::OpenConfiguration,
+                    choices + 4,
+                    false,
+                    cx,
+                ),
+                compact,
+            ))
+            .into_any_element()
+    }
+
+    fn render_keyboard_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.settings_heading("Keyboard"))
+            .child(self.settings_row(
+                "Commands",
+                format!(
+                    "Search {} commands and their shortcuts.",
+                    commands::REGISTRY.len()
+                ),
+                self.settings_control_button(
+                    "Open palette",
+                    SettingsAction::OpenPalette,
+                    0,
+                    false,
+                    cx,
+                ),
+                compact,
+            ))
+            .child(self.settings_row(
+                "Keybindings",
+                "Custom shortcuts replace the platform defaults.".into(),
+                self.settings_control_button(
+                    "Edit keybindings",
+                    SettingsAction::OpenConfiguration,
+                    1,
+                    false,
+                    cx,
+                ),
+                compact,
+            ))
+            .into_any_element()
+    }
+
+    fn render_advanced_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let appearance = self.scoped_appearance();
+        let live_processes = self.command_context(cx).live_surface_count;
+        let theme_locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
+        let terminal_colors = div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().font_weight(FontWeight::MEDIUM).child(
+                if appearance.terminal_theme_override {
+                    self.resolve_theme(&appearance.terminal_theme)
+                        .label()
+                        .to_string()
+                } else {
+                    "Follow theme".into()
+                },
+            ))
+            .child(
+                div()
                     .flex()
-                    .flex_col()
+                    .flex_wrap()
                     .gap_2()
+                    .child(self.settings_control_button(
+                        "Follow theme",
+                        SettingsAction::FollowTheme,
+                        2,
+                        false,
+                        cx,
+                    ))
+                    .child(self.settings_control_button(
+                        "Choose override…",
+                        SettingsAction::BrowseThemes(CatalogTarget::Terminal),
+                        3,
+                        false,
+                        cx,
+                    )),
+            )
+            .into_any_element();
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.settings_heading("Advanced"))
+            .child(self.render_settings_scope(true, compact, cx))
+            .child(self.settings_row(
+                "Terminal colors",
+                if theme_locked {
+                    "Colors are fixed by --theme.".into()
+                } else {
+                    "Override the theme's terminal colors; colors set by programs stay unchanged."
+                        .into()
+                },
+                terminal_colors,
+                true,
+            ))
+            .child(self.settings_row(
+                "Configuration",
+                String::new(),
+                self.settings_control_button(
+                    "Open file",
+                    SettingsAction::OpenConfiguration,
+                    4,
+                    false,
+                    cx,
+                ),
+                compact,
+            ))
+            .child(self.settings_row(
+                "Connection",
+                "Reconnect without stopping running processes.".into(),
+                self.settings_control_button("Reconnect", SettingsAction::Reconnect, 5, false, cx),
+                compact,
+            ))
+            .child(self.settings_row(
+                "Diagnostics",
+                "Inspect connection and rendering details.".into(),
+                self.settings_control_button(
+                    "Open diagnostics",
+                    SettingsAction::OpenDiagnostics,
+                    6,
+                    false,
+                    cx,
+                ),
+                compact,
+            ))
+            .child(
+                div()
                     .pt_3()
                     .border_t_1()
                     .border_color(color(colors.error).opacity(0.55))
-                    .child(self.settings_subheading("Danger zone"))
-                    .child(
-                        div().text_size(px(UI_SMALL_TEXT_SIZE)).text_color(color(modal_text_color(colors.muted, colors)))
-                            .child(format!(
-                                "{} live surface{}. Restarting the daemon ends all live process trees.",
-                                live_surfaces,
-                                if live_surfaces == 1 { "" } else { "s" }
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .child(self.settings_action_button(
-                                "settings-restart-daemon",
-                                if live_surfaces == 0 {
-                                    "Restart daemon"
-                                } else {
-                                    "Review and restart daemon"
-                                },
-                                self.overlay_focus == self.settings_content_focus(3),
-                                live_surfaces > 0,
-                                cx.listener(|this, _, window, cx| {
-                                    this.execute(Command::RestartDaemon, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            )),
-                    ),
+                    .child(self.settings_row(
+                        "Restart daemon",
+                        format!(
+                            "{} running terminal{}. Restarting stops all running terminals.",
+                            live_processes,
+                            if live_processes == 1 { "" } else { "s" }
+                        ),
+                        self.settings_control_button(
+                            if live_processes == 0 {
+                                "Restart"
+                            } else {
+                                "Review restart…"
+                            },
+                            SettingsAction::RestartDaemon,
+                            7,
+                            live_processes > 0,
+                            cx,
+                        ),
+                        compact,
+                    )),
             )
             .into_any_element()
     }
 
-    pub(super) fn render_appearance_controls(&self, full: bool, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+    pub(super) fn render_appearance_controls(
+        &self,
+        full: bool,
+        compact: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
         let mut appearance = self.scoped_appearance();
         if self.opacity_drag_origin.is_some() {
             appearance.terminal_opacity = self.terminal_opacity;
@@ -1146,45 +1441,7 @@ impl CompiApp {
                     offset
                 }
         };
-        let theme_locked = self.settings_scope == SettingsScope::Window
-            && self.config.provenance.theme == crate::config::ValueSource::CommandLine;
-        let scopes = [
-            (SettingsScope::Global, "Global defaults"),
-            (SettingsScope::Window, "This window"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (scope, label))| {
-            self.settings_segment_button(
-                ("settings-scope", index),
-                label,
-                self.settings_scope == scope,
-                focus(index),
-                cx.listener(move |this, _, _, cx| {
-                    this.settings_scope = scope;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-        });
-        let effects = BackgroundEffect::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, effect)| {
-                self.settings_segment_button(
-                    ("background-effect", index),
-                    effect.label(),
-                    appearance.background_effect == effect,
-                    focus(3 + index),
-                    cx.listener(move |this, _, window, cx| {
-                        let mut next = this.scoped_appearance();
-                        next.background_effect = effect;
-                        this.apply_scoped_appearance(next, window, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                )
-            });
+        let theme_locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
         let opacity_progress = ((appearance.terminal_opacity
             - crate::config::MIN_TERMINAL_OPACITY)
             / (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY))
@@ -1201,6 +1458,7 @@ impl CompiApp {
                         }
                         let opacity = opacity_at_slider_position(event.position.x, bounds);
                         input.update(cx, |this, cx| {
+                            this.overlay_focus = if full { SETTINGS_NAV_ITEMS + 4 } else { 4 };
                             this.preview_terminal_opacity(opacity, window);
                             cx.stop_propagation();
                             cx.notify();
@@ -1227,132 +1485,167 @@ impl CompiApp {
         )
         .absolute()
         .inset_0();
-        div()
+        let theme_control = div()
+            .relative()
+            .min_w_0()
+            .child(self.render_theme_catalog_entry_target(
+                self.resolve_theme(&appearance.theme),
+                CatalogTarget::Both,
+                focus(2),
+                cx,
+            ))
+            .child(self.settings_focus_anchor(focus(2), cx))
+            .into_any_element();
+        let opacity_control = div()
+            .relative()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(if full { 16.0 } else { 12.0 }))
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_3()
+                    .child("Opacity")
+                    .child(format!("{:.0}%", appearance.terminal_opacity * 100.0)),
+            )
+            .child(
+                div()
+                    .id("opacity-slider")
+                    .relative()
+                    .mx_2()
+                    .h(px(44.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color(if focus(4) {
+                        colors.accent
+                    } else {
+                        colors.surface
+                    }))
+                    .cursor(gpui::CursorStyle::ResizeLeftRight)
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px(20.0))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(color(colors.border)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(20.0))
+                            .w(gpui::relative(opacity_progress))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(color(colors.accent)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(gpui::relative(opacity_progress))
+                            .top(px(14.0))
+                            .ml(px(-7.0))
+                            .size(px(14.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(color(colors.foreground))
+                            .bg(color(colors.accent)),
+                    )
+                    .child(opacity_slider_input),
+            )
+            .child(self.settings_focus_anchor(focus(4), cx))
+            .into_any_element();
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
             .when(full, |section| {
-                section.child(self.settings_heading(
-                    "Appearance",
-                    "Choose coordinated application and terminal colors without forcing accent decoration.",
+                section.child(self.settings_heading("Appearance"))
+            })
+            .child(self.render_settings_scope(full, compact, cx))
+            .child(self.settings_row(
+                "Theme",
+                if theme_locked {
+                    "Colors are fixed by --theme.".into()
+                } else {
+                    String::new()
+                },
+                theme_control,
+                true,
+            ))
+            .when(appearance.terminal_theme_override, |section| {
+                section.child(
+                    div()
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .text_color(color(modal_text_color(colors.muted, &colors)))
+                        .child("Terminal colors overridden. Change or reset in Advanced."),
+                )
+            })
+            .child(self.settings_row(
+                "Transparent background",
+                String::new(),
+                self.render_settings_toggle(
+                    appearance.transparent_background,
+                    SettingsAction::ToggleTransparency,
+                    3,
+                    full,
+                    cx,
+                ),
+                compact,
+            ))
+            .when(appearance.transparent_background, |section| {
+                section.child(opacity_control).child(self.settings_row(
+                    "Blur background",
+                    "Soften what's behind the window.".into(),
+                    self.render_settings_toggle(
+                        appearance.background_effect == BackgroundEffect::Blurred,
+                        SettingsAction::ToggleBlur,
+                        5,
+                        full,
+                        cx,
+                    ),
+                    compact,
                 ))
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap_1()
-                    .child(self.settings_subheading("Scope"))
-                    .child(
-                        div().flex().gap_1().children(scopes),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(self.settings_subheading("Theme"))
-                    .child(self.render_theme_catalog_entry(appearance.theme, focus(2), cx))
-                    .when(theme_locked, |section| {
-                        section.child(
-                            div().text_size(px(UI_SMALL_TEXT_SIZE)).text_color(color(modal_text_color(colors.muted, colors)))
-                                .child("Theme is fixed by the current command-line override."),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap_1()
-                    .child(self.settings_subheading("Background"))
-                    .child(
-                        div().flex().gap_1().children(effects),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Terminal opacity")
-                            .child(format!("{:.0}%", appearance.terminal_opacity * 100.0)),
-                    )
-                    .child(
-                        div()
-                            .id("opacity-slider")
-                            .relative()
-                            .mx_2()
-                            .h(px(44.0))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(color(if focus(5) {
-                                colors.accent
-                            } else {
-                                colors.surface
-                            }))
-                            .cursor(gpui::CursorStyle::ResizeLeftRight)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .right_0()
-                                    .top(px(20.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(color(colors.border)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top(px(20.0))
-                                    .w(gpui::relative(opacity_progress))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(color(colors.accent)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(gpui::relative(opacity_progress))
-                                    .top(px(14.0))
-                                    .ml(px(-7.0))
-                                    .size(px(14.0))
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(color(colors.foreground))
-                                    .bg(color(colors.accent)),
-                            )
-                            .child(opacity_slider_input),
-                    )
-                    .child(
-                        div().text_size(px(UI_SMALL_TEXT_SIZE)).text_color(color(modal_text_color(colors.muted, colors)))
-                            .child("10–100%. Terminal and header backgrounds fade together."),
-                    ),
-            )
             .when(self.settings_scope == SettingsScope::Window, |section| {
-                section.child(
-                    div().flex().justify_end().child(self.settings_action_button(
+                let offset = 4 + usize::from(appearance.transparent_background) * 2;
+                let control = div()
+                    .relative()
+                    .flex_none()
+                    .child(self.settings_action_button(
                         "reset-window-appearance",
                         "Use global defaults",
-                        focus(6),
+                        focus(offset),
                         false,
-                        cx.listener(|this, _, window, cx| {
-                            this.reset_window_appearance(window);
+                        cx.listener(move |this, _, window, cx| {
+                            this.overlay_focus = if full {
+                                SETTINGS_NAV_ITEMS + offset
+                            } else {
+                                offset
+                            };
+                            this.activate_settings_action(
+                                SettingsAction::ResetWindowAppearance,
+                                window,
+                                cx,
+                            );
                             cx.stop_propagation();
                             cx.notify();
                         }),
-                    )),
-                )
+                    ))
+                    .child(self.settings_focus_anchor(focus(offset), cx))
+                    .into_any_element();
+                section.child(self.settings_row(
+                    "Window overrides",
+                    "Reset this window's appearance to the global defaults.".into(),
+                    control,
+                    compact,
+                ))
             })
             .into_any_element()
     }
@@ -1362,7 +1655,7 @@ impl CompiApp {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let full = matches!(self.overlay, Some(Overlay::Settings));
         let (responsive_width, responsive_height) = overlay_viewport_size(window);
         let compact = responsive_width < 620.0;
@@ -1371,6 +1664,19 @@ impl CompiApp {
         let panel_height = (overlay_height - 48.0)
             .max(1.0)
             .min(if full { 560.0 } else { 500.0 });
+        let content_width = panel_width
+            - if full && !compact { 184.0 } else { 0.0 }
+            - if full { 32.0 } else { 24.0 };
+        let stacked = content_width < 480.0;
+        let scroll_entity = cx.entity();
+        let scroll_viewport = canvas(
+            |_, _, _| (),
+            move |bounds, _, _, cx| {
+                scroll_entity.update(cx, |this, _| this.settings_scroll_bounds = Some(bounds));
+            },
+        )
+        .absolute()
+        .inset_0();
         let panel = div()
             .w(px(panel_width))
             .h(px(panel_height))
@@ -1380,7 +1686,7 @@ impl CompiApp {
             .border_1()
             .border_color(color(colors.border))
             .bg(color(colors.surface))
-            .text_color(color(modal_text_color(colors.foreground, colors)))
+            .text_color(color(modal_text_color(colors.foreground, &colors)))
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
@@ -1406,6 +1712,7 @@ impl CompiApp {
             })
             .child(
                 div()
+                    .relative()
                     .min_w_0()
                     .flex()
                     .min_h_0()
@@ -1416,6 +1723,7 @@ impl CompiApp {
                     .child(
                         div()
                             .id("settings-scroll")
+                            .relative()
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
@@ -1424,11 +1732,12 @@ impl CompiApp {
                             .when(full, |content| content.p_4())
                             .when(!full, |content| content.p_3())
                             .child(if full {
-                                self.render_settings_content(cx)
+                                self.render_settings_content(stacked, cx)
                             } else {
-                                self.render_appearance_controls(false, cx)
+                                self.render_appearance_controls(false, stacked, cx)
                             }),
-                    ),
+                    )
+                    .child(scroll_viewport),
             )
             .when(!full, |panel| {
                 panel.child(
@@ -1444,9 +1753,13 @@ impl CompiApp {
                         .child(self.settings_primary_button(
                             "open-full-settings",
                             "Open full settings",
-                            false,
-                            cx.listener(|this, _, _, cx| {
-                                this.open_overlay(Overlay::Settings, "");
+                            self.overlay_focus == self.appearance_action_count() - 1,
+                            cx.listener(|this, _, window, cx| {
+                                this.activate_settings_action(
+                                    SettingsAction::OpenSettings,
+                                    window,
+                                    cx,
+                                );
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
@@ -1467,6 +1780,7 @@ impl CompiApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.settings_font_picker = None;
                     this.dismiss_overlay();
                     cx.notify();
                 }),

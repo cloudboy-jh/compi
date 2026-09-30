@@ -7,6 +7,10 @@ use std::{
 
 use serde::Deserialize;
 
+#[allow(dead_code)]
+#[path = "src/theme_file.rs"]
+mod theme_file;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Catalog {
@@ -22,9 +26,9 @@ struct Theme {
     name: String,
     family: String,
     description: String,
-    mode: Mode,
     source: String,
-    colors: Colors,
+    file: String,
+    theme_index: usize,
 }
 
 #[derive(Deserialize)]
@@ -48,63 +52,37 @@ struct FontPreset {
     files: Vec<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Mode {
-    Dark,
-    Light,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Colors {
-    background: String,
-    surface: String,
-    surface_hover: String,
-    border: String,
-    foreground: String,
-    muted: String,
-    accent: String,
-    error: String,
-    selection: String,
-    cursor: String,
-    ansi: [String; 16],
-}
-
-fn rgb(value: &str, theme: &str, field: &str) -> u32 {
-    assert!(
-        value.len() == 7
-            && value.starts_with('#')
-            && value[1..].bytes().all(|b| b.is_ascii_hexdigit()),
-        "theme {theme}: {field} must be #RRGGBB, got {value:?}"
-    );
-    u32::from_str_radix(&value[1..], 16).expect("validated RGB")
-}
-
 fn generate_catalog() {
     const SOURCE: &str = "themes/catalog.json";
     println!("cargo:rerun-if-changed={SOURCE}");
     println!("cargo:rerun-if-changed=themes/ATTRIBUTION.txt");
+    println!("cargo:rerun-if-changed=src/theme_file.rs");
     let catalog: Catalog =
         serde_json::from_str(&fs::read_to_string(SOURCE).expect("read bundled themes"))
-            .expect("bundled theme schema must be complete and valid");
+            .expect("bundled identity manifest must be complete and valid");
     assert!(!catalog.themes.is_empty(), "theme catalog cannot be empty");
     let mut ids = HashSet::new();
     let mut variants = HashSet::new();
+    let mut palettes = Vec::with_capacity(catalog.themes.len());
     for theme in &catalog.themes {
         assert!(
             !theme.id.is_empty()
                 && theme.id.split('-').all(|part| !part.is_empty()
                     && part
                         .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
                 && ids.insert(&theme.id),
             "invalid or duplicate theme ID: {:?}",
             theme.id
         );
         assert!(
-            theme.variant.starts_with(|c: char| c.is_ascii_uppercase())
-                && theme.variant.bytes().all(|b| b.is_ascii_alphanumeric())
+            theme
+                .variant
+                .starts_with(|character: char| character.is_ascii_uppercase())
+                && theme
+                    .variant
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric())
                 && theme.variant != "Self"
                 && variants.insert(&theme.variant),
             "invalid or duplicate theme variant: {:?}",
@@ -122,6 +100,42 @@ fn generate_catalog() {
                 theme.id
             );
         }
+        let path = Path::new(&theme.file);
+        assert!(
+            theme.file.starts_with("themes/")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                && path.is_relative()
+                && !path.components().any(|component| matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )),
+            "theme {} has an invalid source file: {:?}",
+            theme.id,
+            theme.file
+        );
+        println!("cargo:rerun-if-changed={}", theme.file);
+        let bytes = fs::read(path).expect("read bundled Zed family");
+        let family =
+            theme_file::parse(&bytes).unwrap_or_else(|error| panic!("theme {}: {error}", theme.id));
+        let selected = family
+            .themes
+            .get(theme.theme_index)
+            .unwrap_or_else(|| panic!("theme {} has an invalid variant index", theme.id));
+        assert_eq!(
+            selected.name, theme.name,
+            "bundled theme name must match manifest"
+        );
+        assert_eq!(
+            family.name, theme.family,
+            "bundled family must match manifest"
+        );
+        let appearance = selected.appearance;
+        let resolved = family
+            .resolve(theme.theme_index)
+            .unwrap_or_else(|error| panic!("theme {}: {error}", theme.id));
+        palettes.push((appearance, resolved));
     }
     assert!(
         ids.contains(&catalog.default),
@@ -129,7 +143,7 @@ fn generate_catalog() {
     );
 
     let mut output = String::from(
-        "// Generated from themes/catalog.json; do not edit.\n#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]\npub enum ThemePreset {\n",
+        "// Generated from themes/catalog.json and standard Zed families; do not edit.\n#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]\npub enum ThemePreset {\n",
     );
     for theme in &catalog.themes {
         if theme.id == catalog.default {
@@ -153,7 +167,7 @@ fn generate_catalog() {
         write!(output, "Self::{},", theme.variant).unwrap();
     }
     output.push_str("];\n");
-    for method in ["id", "label", "family", "description"] {
+    for method in ["id", "label", "family", "description", "source"] {
         writeln!(
             output,
             "    pub const fn {method}(self) -> &'static str {{ match self {{"
@@ -165,49 +179,71 @@ fn generate_catalog() {
                 "label" => &theme.name,
                 "family" => &theme.family,
                 "description" => &theme.description,
+                "source" => &theme.source,
                 _ => unreachable!(),
             };
             writeln!(output, "        Self::{} => {:?},", theme.variant, value).unwrap();
         }
         output.push_str("    }}\n");
     }
-    output.push_str("    pub const fn is_dark(self) -> bool { match self {\n");
+    output.push_str("    pub const fn theme_file(self) -> &'static str { match self {\n");
     for theme in &catalog.themes {
+        writeln!(
+            output,
+            "        Self::{} => include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/\", {:?})),",
+            theme.variant, theme.file
+        )
+        .unwrap();
+    }
+    output.push_str("    }}\n    pub const fn is_dark(self) -> bool { match self {\n");
+    for (theme, (appearance, _)) in catalog.themes.iter().zip(&palettes) {
         writeln!(
             output,
             "        Self::{} => {},",
             theme.variant,
-            matches!(theme.mode, Mode::Dark)
+            matches!(appearance, theme_file::ThemeAppearance::Dark)
         )
         .unwrap();
     }
     output
         .push_str("    }}\n    pub const fn colors(self) -> &'static ThemeColors { match self {\n");
-    for theme in &catalog.themes {
+    let application_fields = [
+        "background",
+        "surface",
+        "surface_hover",
+        "border",
+        "foreground",
+        "muted",
+        "accent",
+        "error",
+        "selection",
+    ];
+    for (theme, (_, palette)) in catalog.themes.iter().zip(&palettes) {
         writeln!(output, "        Self::{} => &ThemeColors {{", theme.variant).unwrap();
-        let colors = &theme.colors;
-        for (field, value) in [
-            ("background", &colors.background),
-            ("surface", &colors.surface),
-            ("surface_hover", &colors.surface_hover),
-            ("border", &colors.border),
-            ("foreground", &colors.foreground),
-            ("muted", &colors.muted),
-            ("accent", &colors.accent),
-            ("error", &colors.error),
-            ("selection", &colors.selection),
-            ("cursor", &colors.cursor),
-        ] {
-            writeln!(
-                output,
-                "            {field}: 0x{:06x},",
-                rgb(value, &theme.id, field)
-            )
-            .unwrap();
+        for (field, value) in application_fields.iter().zip(palette.application) {
+            writeln!(output, "            {field}: 0x{value:08x},").unwrap();
+        }
+        output.push_str("        },\n");
+    }
+    output.push_str(
+        "    }}\n    pub const fn terminal(self) -> &'static TerminalPalette { match self {\n",
+    );
+    for (theme, (_, palette)) in catalog.themes.iter().zip(&palettes) {
+        writeln!(
+            output,
+            "        Self::{} => &TerminalPalette {{",
+            theme.variant
+        )
+        .unwrap();
+        for (field, value) in ["background", "foreground", "selection", "cursor"]
+            .iter()
+            .zip(palette.terminal)
+        {
+            writeln!(output, "            {field}: 0x{value:08x},").unwrap();
         }
         output.push_str("            ansi: [");
-        for value in &colors.ansi {
-            write!(output, "0x{:06x},", rgb(value, &theme.id, "ansi")).unwrap();
+        for value in &palette.terminal[4..] {
+            write!(output, "0x{value:08x},").unwrap();
         }
         output.push_str("],\n        },\n");
     }

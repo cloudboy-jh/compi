@@ -475,7 +475,7 @@ impl CompiApp {
     }
 
     pub(super) fn render_image_previews(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let focused = self.focused_view();
         let previews = self
             .image_previews
@@ -527,7 +527,7 @@ impl CompiApp {
                             .child(
                                 div()
                                     .text_size(px(UI_MICRO_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
+                                    .text_color(color(modal_text_color(colors.muted, &colors)))
                                     .child(format!(
                                         "{} × {} · {:.1} KiB",
                                         preview.image.width,
@@ -583,7 +583,7 @@ impl CompiApp {
         let Some(inspector) = &self.image_inspector else {
             return div().into_any_element();
         };
-        let colors = self.colors();
+        let colors = *self.colors();
         let viewport = inspector.viewport.clone();
         let entity = cx.entity();
         let image = inspector.image.clone();
@@ -708,7 +708,7 @@ impl CompiApp {
             .right_0()
             .p_3()
             .bg(color(colors.background).opacity(0.8))
-            .text_color(color(modal_text_color(colors.foreground, colors)))
+            .text_color(color(modal_text_color(colors.foreground, &colors)))
             .flex()
             .flex_col()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -811,7 +811,7 @@ impl CompiApp {
                             .px_3()
                             .py_2()
                             .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
                             .child(status),
                     ),
             )
@@ -825,7 +825,7 @@ impl CompiApp {
         cx: &Context<Self>,
         action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         div()
             .min_h(px(44.0))
             .min_w(px(44.0))

@@ -11,6 +11,15 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - Verify hover, focus, active, disabled, pending, and destructive states without relying on color alone. Keep New terminal, pane actions, and custom Windows controls visible, reachable, and non-overlapping.
 - Exercise physical keyboard navigation, terminal input, native drag, maximize, close, platform shortcuts, clipboard, IME/dead keys, exact user fonts, and fallback glyphs on supported Windows display configurations.
 
+### Appearance and theme follow-through
+
+- Treat Compi Neutral, simplified Theme/Advanced terminal colors, independent transparency/blur controls, and the standard Zed JSON catalog cutover as completed. Preserve Current-first ordering, favorites, scoped preview/apply/cancel, protected variant removal, and program-supplied terminal colors; change them only for demonstrated defects.
+- Wire `compi theme install <file.json>` in the separate CLI session to the existing headless `ThemeLibrary::import_file` installation path. UI import, CLI installation, and direct-directory discovery must use the same validator, stable identities, and application library. WSL installation must target the Windows application's library, not a separate Linux daemon directory; installing must not apply, publish, or restart shells.
+- Exercise an unmodified downloaded Zed family through the finished Bash/WSL command, observe all variants in the native catalog, apply explicitly, and export. Exported JSON already passes the published schema; load it in a real Zed application to qualify interoperability beyond schema validation.
+- Qualify Clear/Blurred and solid fallback on native macOS and with reduced-transparency settings. Compare Compi Neutral side by side with the Tern reference on light, dark, and busy desktops; low opacity cannot guarantee arbitrary-wallpaper contrast.
+- Repeat catalog, settings, alternate-font, and tab-menu interactions across real display scales and mixed-DPI transitions. Cover keyboard/pointer selection, tooltip suppression, disabled lone-pane Detach, confirmed End, and workspace-revision invalidation without replacing shell processes.
+- Online publishing is not implemented. If requested, define it separately with explicit consent, authorship, licensing, and validation; local import must never publish implicitly. Native editor, notes, web-preview, and diff features remain separate scope, not surfaces delivered by the appearance changes.
+
 ## 2. Performance and daily-use qualification
 
 - Measure key receipt → PTY → replica → presentation latency, scrolling, resizing, and frame pacing under idle and sustained-output workloads. Use the current-FPS overlay for live feedback, not as a substitute for attributed timing.
@@ -32,6 +41,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - On a native Mac, exercise the bundled interactive Zsh/Bash startup bridge, in-pane tree/search, `compi tree` and `compi z` changing the live shell, cwd inheritance, pane detach, and negotiated Ctrl+Enter in an installed terminal application. Windows/WSL native coverage is recorded in `COMPLETED.md`; cross-target builds and WSL PTY tests are not Mac visual proof.
 - Repeat the UI state/size/scale matrix on Mac and verify image paste, file drop, preview, inspector, save, and reconnect behavior.
 - Keep native Linux core CI passing and qualify the Linux graphical client separately; cross-compilation and headless tests are insufficient graphical evidence.
+- Exercise imported multi-variant Zed themes, migrated local themes, scoped appearance inheritance, remembered opacity/blur, material accessibility fallbacks, and split-tab pane actions in the installed Mac bundle. Windows native evidence and schema validation do not qualify Mac rendering or interaction.
 - Run focused regressions and final workspace/dependency checks after integration. Report unavailable physical-platform checks explicitly.
 
 ## 4. Distribution and process discovery

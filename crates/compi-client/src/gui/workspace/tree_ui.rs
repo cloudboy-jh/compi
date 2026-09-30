@@ -480,7 +480,7 @@ impl CompiApp {
         let Some(tree) = self.file_tree.as_ref() else {
             return div().into_any_element();
         };
-        let colors = self.colors();
+        let colors = *self.colors();
         let can_enter = tree.pending_shell && tree.selected().is_some_and(|row| row.directory);
         let input = cx.entity();
         let focus = self.focus_handle.clone();

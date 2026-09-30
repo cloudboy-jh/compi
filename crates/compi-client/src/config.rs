@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     font_catalog::{TerminalFontPreset, UiFontPreset},
-    theme::{BackgroundEffect, ThemePreset},
+    theme::{BackgroundEffect, ThemeId},
 };
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
@@ -29,17 +29,68 @@ pub const DEFAULT_TERMINAL_OPACITY: f32 = 1.0;
 pub const MIN_TERMINAL_OPACITY: f32 = 0.1;
 pub const MAX_TERMINAL_OPACITY: f32 = 1.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AppearanceSettings {
-    pub theme: ThemePreset,
+    pub theme: ThemeId,
+    pub terminal_theme: ThemeId,
+    pub terminal_theme_override: bool,
+    pub transparent_background: bool,
     pub terminal_opacity: f32,
     pub background_effect: BackgroundEffect,
+}
+
+impl<'de> Deserialize<'de> for AppearanceSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct StoredAppearance {
+            theme: ThemeId,
+            terminal_theme: Option<ThemeId>,
+            terminal_theme_override: Option<bool>,
+            transparent_background: Option<bool>,
+            terminal_opacity: f32,
+            background_effect: BackgroundEffect,
+        }
+        let stored = StoredAppearance::deserialize(deserializer)?;
+        let terminal_theme = stored
+            .terminal_theme
+            .unwrap_or_else(|| stored.theme.clone());
+        Ok(Self {
+            terminal_theme_override: stored
+                .terminal_theme_override
+                .unwrap_or(terminal_theme != stored.theme),
+            transparent_background: stored
+                .transparent_background
+                .unwrap_or(stored.background_effect != BackgroundEffect::Opaque),
+            terminal_theme,
+            theme: stored.theme,
+            terminal_opacity: stored.terminal_opacity,
+            background_effect: if stored.background_effect == BackgroundEffect::Opaque {
+                BackgroundEffect::Clear
+            } else {
+                stored.background_effect
+            },
+        })
+    }
+}
+
+impl AppearanceSettings {
+    /// The stored terminal ID is a remembered override, not the followed palette.
+    pub fn effective_terminal_theme(&self) -> &ThemeId {
+        if self.terminal_theme_override {
+            &self.terminal_theme
+        } else {
+            &self.theme
+        }
+    }
 }
 
 impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
-            theme: ThemePreset::default(),
+            theme: ThemeId::default(),
+            terminal_theme: ThemeId::default(),
+            terminal_theme_override: false,
+            transparent_background: true,
             terminal_opacity: DEFAULT_TERMINAL_OPACITY,
             background_effect: BackgroundEffect::default(),
         }
@@ -114,7 +165,7 @@ pub struct LoadedConfig {
     pub appearance: AppearanceSettings,
     pub configured_appearance: AppearanceSettings,
     #[serde(default)]
-    pub theme_favorites: Vec<ThemePreset>,
+    pub theme_favorites: Vec<ThemeId>,
     #[serde(default)]
     pub ui_font: UiFontPreset,
     pub sidebar_width: f32,
@@ -159,11 +210,13 @@ impl LoadedConfig {
         sidebar_width: Option<f32>,
     ) {
         if let Some(value) = theme {
-            if let Some(theme) = ThemePreset::parse(value) {
+            if let Some(theme) = ThemeId::parse(value) {
+                self.appearance.terminal_theme = theme.clone();
                 self.appearance.theme = theme;
+                self.appearance.terminal_theme_override = false;
                 self.provenance.theme = ValueSource::CommandLine;
             } else {
-                invalid(self, "--theme", "a bundled theme ID", "CLI");
+                invalid(self, "--theme", "a valid theme ID", "CLI");
             }
         }
         if let Some(width) = sidebar_width {
@@ -184,25 +237,28 @@ impl LoadedConfig {
     /// Persist user-facing global appearance without rewriting comments,
     /// launch configuration, or unknown future keys.
     pub fn save_global_appearance(&mut self, appearance: AppearanceSettings) -> Result<(), String> {
-        save_appearance(&self.path, appearance)?;
-        self.configured_appearance = appearance;
+        save_appearance(&self.path, &appearance)?;
         self.provenance.terminal_opacity = ValueSource::Configuration;
         self.provenance.background_effect = ValueSource::Configuration;
         if self.provenance.theme != ValueSource::CommandLine {
-            self.appearance.theme = appearance.theme;
+            self.appearance.theme = appearance.theme.clone();
+            self.appearance.terminal_theme = appearance.terminal_theme.clone();
+            self.appearance.terminal_theme_override = appearance.terminal_theme_override;
             self.provenance.theme = ValueSource::Configuration;
         }
         self.appearance.terminal_opacity = appearance.terminal_opacity;
+        self.appearance.transparent_background = appearance.transparent_background;
         self.appearance.background_effect = appearance.background_effect;
+        self.configured_appearance = appearance;
         Ok(())
     }
 
     /// Persist global favorites in display order without changing appearance.
-    pub fn save_theme_favorites(&mut self, favorites: &[ThemePreset]) -> Result<(), String> {
+    pub fn save_theme_favorites(&mut self, favorites: &[ThemeId]) -> Result<(), String> {
         let mut unique = Vec::with_capacity(favorites.len());
-        for &theme in favorites {
-            if !unique.contains(&theme) {
-                unique.push(theme);
+        for theme in favorites {
+            if !unique.contains(theme) {
+                unique.push(theme.clone());
             }
         }
         update_appearance(&self.path, |table| {
@@ -333,14 +389,41 @@ fn table<'a>(
 fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
     if let Some(appearance) = table(document, "appearance", loaded) {
         if let Some(value) = appearance.get("theme") {
-            if let Some(theme) = value.as_str().and_then(ThemePreset::parse) {
+            if let Some(theme) = value.as_str().and_then(ThemeId::parse) {
+                loaded.appearance.terminal_theme = theme.clone();
                 loaded.appearance.theme = theme;
                 loaded.provenance.theme = ValueSource::Configuration;
             } else {
                 invalid(
                     loaded,
                     "appearance.theme",
-                    "a bundled theme ID",
+                    "a valid theme ID",
+                    "configuration",
+                );
+            }
+        }
+        if let Some(value) = appearance.get("terminal_theme") {
+            if let Some(theme) = value.as_str().and_then(ThemeId::parse) {
+                loaded.appearance.terminal_theme = theme;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.terminal_theme",
+                    "a valid theme ID",
+                    "configuration",
+                );
+            }
+        }
+        loaded.appearance.terminal_theme_override =
+            loaded.appearance.terminal_theme != loaded.appearance.theme;
+        if let Some(value) = appearance.get("terminal_theme_override") {
+            if let Some(enabled) = value.as_bool() {
+                loaded.appearance.terminal_theme_override = enabled;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.terminal_theme_override",
+                    "a boolean",
                     "configuration",
                 );
             }
@@ -348,7 +431,7 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
         if let Some(value) = appearance.get("favorites") {
             if let Some(favorites) = value.as_array() {
                 for (index, value) in favorites.iter().enumerate() {
-                    if let Some(theme) = value.as_str().and_then(ThemePreset::parse) {
+                    if let Some(theme) = value.as_str().and_then(ThemeId::parse) {
                         if !loaded.theme_favorites.contains(&theme) {
                             loaded.theme_favorites.push(theme);
                         }
@@ -356,7 +439,7 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
                         invalid(
                             loaded,
                             &format!("appearance.favorites[{index}]"),
-                            "a bundled theme ID",
+                            "a valid theme ID",
                             "configuration",
                         );
                     }
@@ -365,7 +448,7 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
                 invalid(
                     loaded,
                     "appearance.favorites",
-                    "an array of bundled theme IDs",
+                    "an array of valid theme IDs",
                     "configuration",
                 );
             }
@@ -391,7 +474,24 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
                 invalid(
                     loaded,
                     "appearance.background_effect",
-                    "clear or blurred",
+                    "opaque, clear or blurred",
+                    "configuration",
+                );
+            }
+        }
+        loaded.appearance.transparent_background =
+            loaded.appearance.background_effect != BackgroundEffect::Opaque;
+        if loaded.appearance.background_effect == BackgroundEffect::Opaque {
+            loaded.appearance.background_effect = BackgroundEffect::Clear;
+        }
+        if let Some(value) = appearance.get("transparent_background") {
+            if let Some(enabled) = value.as_bool() {
+                loaded.appearance.transparent_background = enabled;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.transparent_background",
+                    "a boolean",
                     "configuration",
                 );
             }
@@ -659,18 +759,33 @@ pub fn load(path: Option<&Path>, overrides: FontOverrides) -> LoadedConfig {
         Err(error) => loaded.diagnostics.push(error),
     }
     loaded.configured_font = loaded.font.clone();
-    loaded.configured_appearance = loaded.appearance;
+    loaded.configured_appearance = loaded.appearance.clone();
     loaded.configured_sidebar_width = loaded.sidebar_width;
     apply_overrides(overrides, &mut loaded);
     loaded
 }
 
-fn save_appearance(path: &Path, appearance: AppearanceSettings) -> Result<(), String> {
+fn save_appearance(path: &Path, appearance: &AppearanceSettings) -> Result<(), String> {
     if !valid_terminal_opacity(f64::from(appearance.terminal_opacity)) {
         return Err("Terminal opacity must be between 0.1 and 1.0".to_owned());
     }
     update_appearance(path, |table| {
         set_table_value(table, "theme", appearance.theme.id().into());
+        set_table_value(
+            table,
+            "terminal_theme",
+            appearance.terminal_theme.id().into(),
+        );
+        set_table_value(
+            table,
+            "terminal_theme_override",
+            appearance.terminal_theme_override.into(),
+        );
+        set_table_value(
+            table,
+            "transparent_background",
+            appearance.transparent_background.into(),
+        );
         let opacity = (f64::from(appearance.terminal_opacity) * 1_000_000.0).round() / 1_000_000.0;
         set_table_value(table, "terminal_opacity", opacity.into());
         set_table_value(
@@ -1007,10 +1122,117 @@ mod tests {
         };
         apply_source(source, &mut loaded);
         loaded.configured_font = loaded.font.clone();
-        loaded.configured_appearance = loaded.appearance;
+        loaded.configured_appearance = loaded.appearance.clone();
         loaded.configured_sidebar_width = loaded.sidebar_width;
         apply_overrides(overrides, &mut loaded);
         loaded
+    }
+
+    #[test]
+    fn legacy_and_independent_theme_ids_preserve_missing_library_entries() {
+        let legacy = parse(
+            "version = 1\n[appearance]\ntheme = 'user-uninstalled'\nfavorites = ['nord', 'user-uninstalled']\nterminal_opacity = 0.65\nbackground_effect = 'clear'",
+            FontOverrides::default(),
+        );
+        assert_eq!(legacy.appearance.theme.id(), "user-uninstalled");
+        assert_eq!(legacy.appearance.terminal_theme.id(), "user-uninstalled");
+        assert_eq!(legacy.appearance.terminal_opacity, 0.65);
+        assert_eq!(legacy.appearance.background_effect, BackgroundEffect::Clear);
+        assert_eq!(legacy.theme_favorites[1].id(), "user-uninstalled");
+        assert!(legacy.diagnostics.is_empty());
+
+        let independent = parse(
+            "version = 1\n[appearance]\ntheme = 'user-uninstalled'\nterminal_theme = 'nord'",
+            FontOverrides::default(),
+        );
+        assert_eq!(independent.appearance.theme.id(), "user-uninstalled");
+        assert_eq!(independent.appearance.terminal_theme.id(), "nord");
+
+        let legacy_json = serde_json::json!({
+            "theme": "user-uninstalled",
+            "terminal_opacity": 0.65,
+            "background_effect": "clear"
+        });
+        let migrated: AppearanceSettings = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(migrated.theme, migrated.terminal_theme);
+        let serialized = serde_json::to_value(&independent.appearance).unwrap();
+        assert_eq!(serialized["terminal_theme"], "nord");
+        let restored: AppearanceSettings = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, independent.appearance);
+    }
+
+    #[test]
+    fn legacy_material_and_split_palettes_migrate_without_losing_preferences() {
+        for (effect, transparent, remembered) in [
+            ("opaque", false, BackgroundEffect::Clear),
+            ("clear", true, BackgroundEffect::Clear),
+            ("blurred", true, BackgroundEffect::Blurred),
+        ] {
+            let source = format!(
+                "version = 1\n[appearance]\ntheme = 'nord'\nterminal_theme = 'dracula'\nterminal_opacity = 0.43\nbackground_effect = '{effect}'"
+            );
+            let loaded = parse(&source, FontOverrides::default());
+            assert!(loaded.appearance.terminal_theme_override);
+            assert_eq!(loaded.appearance.effective_terminal_theme().id(), "dracula");
+            assert_eq!(loaded.appearance.transparent_background, transparent);
+            assert_eq!(loaded.appearance.terminal_opacity, 0.43);
+            assert_eq!(loaded.appearance.background_effect, remembered);
+            let migrated: AppearanceSettings = serde_json::from_value(serde_json::json!({
+                "theme": "nord",
+                "terminal_theme": "dracula",
+                "terminal_opacity": 0.43,
+                "background_effect": effect,
+            }))
+            .unwrap();
+            assert_eq!(migrated, loaded.appearance);
+        }
+    }
+
+    #[test]
+    fn explicit_follow_and_transparency_flags_preserve_remembered_choices() {
+        let loaded = parse(
+            "version = 1\n[appearance]\ntheme = 'nord'\nterminal_theme = 'dracula'\nterminal_theme_override = false\ntransparent_background = false\nterminal_opacity = 0.43\nbackground_effect = 'blurred'",
+            FontOverrides::default(),
+        );
+        let mut appearance = loaded.appearance;
+        assert_eq!(appearance.effective_terminal_theme().id(), "nord");
+        appearance.theme = ThemeId::parse("warm-carbon").unwrap();
+        assert_eq!(appearance.effective_terminal_theme().id(), "warm-carbon");
+        let restored: AppearanceSettings =
+            serde_json::from_value(serde_json::to_value(&appearance).unwrap()).unwrap();
+        assert_eq!(restored, appearance);
+        appearance.terminal_theme_override = true;
+        appearance.transparent_background = true;
+        assert_eq!(appearance.effective_terminal_theme().id(), "dracula");
+        assert_eq!(appearance.terminal_opacity, 0.43);
+        assert_eq!(appearance.background_effect, BackgroundEffect::Blurred);
+    }
+
+    #[test]
+    fn failed_appearance_and_favorites_save_leave_memory_unchanged() {
+        let mut loaded = parse(
+            "version = 1\n[appearance]\ntheme = 'warm-carbon'\nterminal_theme = 'nord'\nfavorites = ['nord']",
+            FontOverrides::default(),
+        );
+        loaded.path = PathBuf::new();
+        loaded.apply_presentation_overrides(Some("user-cli"), None);
+        let before = serde_json::to_value(&loaded).unwrap();
+        let appearance = AppearanceSettings {
+            theme: ThemeId::parse("user-new").unwrap(),
+            terminal_theme: ThemeId::parse("catppuccin-latte").unwrap(),
+            terminal_theme_override: true,
+            transparent_background: false,
+            terminal_opacity: 0.5,
+            background_effect: BackgroundEffect::Opaque,
+        };
+        assert!(loaded.save_global_appearance(appearance).is_err());
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), before);
+        assert!(
+            loaded
+                .save_theme_favorites(&[ThemeId::parse("user-new").unwrap()])
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), before);
     }
 
     #[test]
@@ -1020,7 +1242,7 @@ mod tests {
             FontOverrides::default(),
         );
         assert!(loaded.launch.is_err());
-        assert_eq!(loaded.appearance.theme, ThemePreset::WarmCarbon);
+        assert_eq!(loaded.appearance.theme.id(), "warm-carbon");
         assert_eq!(loaded.font.size, 18.0);
         assert!(loaded.validate_launch().is_ok());
         let missing_profile = parse(
@@ -1065,15 +1287,20 @@ mod tests {
             },
         );
         loaded.apply_presentation_overrides(Some("dark-glass"), Some(400.0));
-        assert_eq!(loaded.appearance.theme, ThemePreset::DarkGlass);
-        assert_eq!(loaded.configured_appearance.theme, ThemePreset::WarmCarbon);
+        assert_eq!(loaded.appearance.theme.id(), "dark-glass");
+        assert_eq!(loaded.appearance.terminal_theme.id(), "dark-glass");
+        assert_eq!(loaded.configured_appearance.theme.id(), "warm-carbon");
+        assert_eq!(
+            loaded.configured_appearance.terminal_theme.id(),
+            "warm-carbon"
+        );
         assert_eq!(loaded.sidebar_width, 400.0);
         assert_eq!(loaded.configured_sidebar_width, 320.0);
         assert_eq!(loaded.font.size, 24.0);
         assert_eq!(loaded.configured_font.size, 16.0);
         assert_eq!(loaded.provenance.font_size, ValueSource::CommandLine);
-        loaded.apply_presentation_overrides(Some("unknown"), Some(f32::NAN));
-        assert_eq!(loaded.appearance.theme, ThemePreset::DarkGlass);
+        loaded.apply_presentation_overrides(Some("Invalid!"), Some(f32::NAN));
+        assert_eq!(loaded.appearance.theme.id(), "dark-glass");
         assert_eq!(loaded.sidebar_width, 400.0);
     }
 
@@ -1169,7 +1396,10 @@ mod tests {
         loaded.apply_presentation_overrides(Some("dark-glass"), None);
         loaded
             .save_global_appearance(AppearanceSettings {
-                theme: ThemePreset::WarmCarbon,
+                theme: crate::theme::ThemeId::from(crate::theme::ThemePreset::WarmCarbon),
+                terminal_theme: ThemeId::parse("user-saved-palette").unwrap(),
+                terminal_theme_override: true,
+                transparent_background: false,
                 terminal_opacity: 0.72,
                 background_effect: BackgroundEffect::Clear,
             })
@@ -1180,10 +1410,23 @@ mod tests {
         assert!(saved.contains("# favorites comment"));
         let document = saved.parse::<toml::Table>().unwrap();
         assert_eq!(document["future"]["answer"].as_integer(), Some(42));
-        assert_eq!(loaded.appearance.theme, ThemePreset::DarkGlass);
-        assert_eq!(loaded.configured_appearance.theme, ThemePreset::WarmCarbon);
+        assert_eq!(loaded.appearance.theme.id(), "dark-glass");
+        assert_eq!(loaded.appearance.terminal_theme.id(), "dark-glass");
+        assert!(!loaded.appearance.terminal_theme_override);
+        assert!(!loaded.appearance.transparent_background);
+        assert_eq!(loaded.configured_appearance.theme.id(), "warm-carbon");
+        assert_eq!(
+            loaded.configured_appearance.terminal_theme.id(),
+            "user-saved-palette"
+        );
         let reloaded = load(Some(&path), FontOverrides::default());
-        assert_eq!(reloaded.theme_favorites, [ThemePreset::Nord]);
+        assert_eq!(reloaded.theme_favorites, [ThemeId::parse("nord").unwrap()]);
+        assert_eq!(
+            reloaded.appearance.terminal_theme.id(),
+            "user-saved-palette"
+        );
+        assert!(reloaded.appearance.terminal_theme_override);
+        assert!(!reloaded.appearance.transparent_background);
         assert_eq!(reloaded.appearance.terminal_opacity, 0.72);
         assert_eq!(
             reloaded.appearance.background_effect,
@@ -1191,18 +1434,25 @@ mod tests {
         );
         loaded
             .save_theme_favorites(&[
-                ThemePreset::CatppuccinLatte,
-                ThemePreset::Nord,
-                ThemePreset::CatppuccinLatte,
+                crate::theme::ThemeId::from(crate::theme::ThemePreset::CatppuccinLatte),
+                crate::theme::ThemeId::from(crate::theme::ThemePreset::Nord),
+                crate::theme::ThemeId::from(crate::theme::ThemePreset::CatppuccinLatte),
             ])
             .unwrap();
         let reloaded = load(Some(&path), FontOverrides::default());
         assert_eq!(
             reloaded.theme_favorites,
-            [ThemePreset::CatppuccinLatte, ThemePreset::Nord]
+            [
+                ThemeId::parse("catppuccin-latte").unwrap(),
+                ThemeId::parse("nord").unwrap()
+            ]
         );
         assert_eq!(reloaded.theme_favorites, loaded.theme_favorites);
-        assert_eq!(reloaded.appearance.theme, ThemePreset::WarmCarbon);
+        assert_eq!(reloaded.appearance.theme.id(), "warm-carbon");
+        assert_eq!(
+            reloaded.appearance.terminal_theme.id(),
+            "user-saved-palette"
+        );
         assert_eq!(reloaded.appearance.terminal_opacity, 0.72);
         assert_eq!(
             reloaded.appearance.background_effect,
@@ -1286,12 +1536,15 @@ mod tests {
     #[test]
     fn favorites_keep_valid_entries_in_order_when_siblings_are_invalid() {
         let loaded = parse(
-            "version = 1\n[appearance]\nfavorites = ['nord', 'unknown', 'catppuccin-latte', 7, 'nord']",
+            "version = 1\n[appearance]\nfavorites = ['nord', 'Invalid!', 'catppuccin-latte', 7, 'nord']",
             FontOverrides::default(),
         );
         assert_eq!(
             loaded.theme_favorites,
-            [ThemePreset::Nord, ThemePreset::CatppuccinLatte]
+            [
+                ThemeId::parse("nord").unwrap(),
+                ThemeId::parse("catppuccin-latte").unwrap()
+            ]
         );
         assert_eq!(loaded.diagnostics.len(), 2);
         assert!(

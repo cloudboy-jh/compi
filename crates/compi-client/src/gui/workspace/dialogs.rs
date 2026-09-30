@@ -23,7 +23,7 @@ impl CompiApp {
     }
 
     pub(super) fn render_action_menu(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let choices = self.overlay_choices(cx);
         let (viewport_width, viewport_height) = overlay_viewport_size(window);
         let menu_height = (choices.len() as f32 * 44.0
@@ -94,7 +94,7 @@ impl CompiApp {
                     } else {
                         colors.foreground
                     },
-                    colors,
+                    &colors,
                 )))
                 .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -125,7 +125,7 @@ impl CompiApp {
                                     .flex_none()
                                     .text_size(px(UI_MICRO_TEXT_SIZE))
                                     .font_weight(FontWeight::NORMAL)
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
+                                    .text_color(color(modal_text_color(colors.muted, &colors)))
                                     .child(shortcut),
                             )
                         }),
@@ -138,7 +138,7 @@ impl CompiApp {
                             .whitespace_nowrap()
                             .text_ellipsis()
                             .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
                             .child(directory),
                     )
                 })
@@ -154,7 +154,7 @@ impl CompiApp {
                             .pb_1()
                             .text_size(px(UI_MICRO_TEXT_SIZE))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
                             .child(group),
                     )
                 })
@@ -187,7 +187,7 @@ impl CompiApp {
                     .border_1()
                     .border_color(color(colors.border))
                     .bg(color(colors.surface))
-                    .text_color(color(modal_text_color(colors.foreground, colors)))
+                    .text_color(color(modal_text_color(colors.foreground, &colors)))
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
@@ -209,7 +209,7 @@ impl CompiApp {
         else {
             unreachable!("terminal action tooltip requires a selected pane");
         };
-        let colors = self.colors();
+        let colors = *self.colors();
         let detach_disabled = self
             .pane_action_reason(tab_id, pane_id, PaneAction::Detach)
             .is_some();
@@ -233,7 +233,7 @@ impl CompiApp {
                 .border_color(color(button_background))
                 .bg(color(button_background))
                 .text_size(px(UI_SMALL_TEXT_SIZE))
-                .text_color(color(modal_text_color(colors.muted, colors)))
+                .text_color(color(modal_text_color(colors.muted, &colors)))
                 .child(label)
                 .into_any_element()
         };
@@ -250,7 +250,7 @@ impl CompiApp {
             .border_1()
             .border_color(color(colors.border))
             .bg(color(blend_rgb(colors.surface, colors.foreground, 0.04)))
-            .text_color(color(modal_text_color(colors.foreground, colors)))
+            .text_color(color(modal_text_color(colors.foreground, &colors)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(if detach_disabled {
@@ -306,7 +306,7 @@ impl CompiApp {
                     }))
                     .bg(color(button_background))
                     .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .text_color(color(modal_text_color(colors.error, colors)))
+                    .text_color(color(modal_text_color(colors.error, &colors)))
                     .hover(move |style| {
                         style
                             .bg(color(blend_rgb(colors.surface, colors.error, 0.12)))
@@ -330,7 +330,7 @@ impl CompiApp {
     }
 
     fn render_choice_rows(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let choices = self.overlay_choices(cx);
         let mut rows = Vec::new();
         let mut previous_group = None;
@@ -343,11 +343,24 @@ impl CompiApp {
             };
             let selected = index == self.overlay_index;
             let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
+            let description = if matches!(self.overlay, Some(Overlay::Palette)) {
+                match &choice.action {
+                    ChoiceAction::Command(command) => command.description(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let (shortcut, detail) = if matches!(&choice.action, ChoiceAction::Command(_)) {
+                ((!choice.detail.is_empty()).then_some(choice.detail), None)
+            } else {
+                (None, (!choice.detail.is_empty()).then_some(choice.detail))
+            };
             let row = div()
                 .id(("command-choice", index))
                 .min_h(px(40.0))
                 .px_3()
-                .py_1()
+                .py_2()
                 .flex()
                 .flex_col()
                 .justify_center()
@@ -369,7 +382,7 @@ impl CompiApp {
                     } else {
                         colors.foreground
                     },
-                    colors,
+                    &colors,
                 )))
                 .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -381,6 +394,8 @@ impl CompiApp {
                 .child(
                     div()
                         .flex()
+                        .w_full()
+                        .min_w_0()
                         .items_center()
                         .justify_between()
                         .gap_4()
@@ -391,22 +406,46 @@ impl CompiApp {
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(choice.title),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(color(modal_text_color(colors.muted, colors)))
-                                .child(choice.detail),
-                        ),
+                        .when_some(shortcut, |row, shortcut| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(color(modal_text_color(colors.muted, &colors)))
+                                    .child(shortcut),
+                            )
+                        }),
                 )
+                .when_some(description, |row, description| {
+                    row.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
+                            .child(description),
+                    )
+                })
+                .when_some(detail, |row, detail| {
+                    row.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
+                            .child(detail),
+                    )
+                })
                 .when_some(choice.reason, |row, reason| {
                     row.child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .pt_1()
                             .text_size(px(UI_MICRO_TEXT_SIZE))
                             .font_weight(FontWeight::NORMAL)
-                            .text_color(color(modal_text_color(colors.muted, colors)))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
                             .child(reason),
                     )
                 });
@@ -420,7 +459,7 @@ impl CompiApp {
                                 .pb_1()
                                 .text_size(px(UI_MICRO_TEXT_SIZE))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(color(modal_text_color(colors.muted, colors)))
+                                .text_color(color(modal_text_color(colors.muted, &colors)))
                                 .child(group),
                         )
                     })
@@ -440,7 +479,7 @@ impl CompiApp {
     }
 
     fn render_confirmation_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let daemon_restart = matches!(self.overlay, Some(Overlay::ConfirmDaemonRestart { .. }));
         let title = if daemon_restart {
             "Restart daemon"
@@ -484,13 +523,13 @@ impl CompiApp {
                         .child(
                             div()
                                 .text_size(px(UI_BODY_TEXT_SIZE))
-                                .text_color(color(modal_text_color(colors.foreground, colors)))
+                                .text_color(color(modal_text_color(colors.foreground, &colors)))
                                 .child(message),
                         )
                         .child(
                             div()
                                 .text_size(px(UI_SMALL_TEXT_SIZE))
-                                .text_color(color(modal_text_color(colors.muted, colors)))
+                                .text_color(color(modal_text_color(colors.muted, &colors)))
                                 .child("This action cannot be undone."),
                         ),
                 )
@@ -533,7 +572,7 @@ impl CompiApp {
     }
 
     fn render_text_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let title = match &self.overlay {
             Some(Overlay::Text { title, .. }) => *title,
             _ => "Edit name",
@@ -561,7 +600,7 @@ impl CompiApp {
                         .child(
                             div()
                                 .text_size(px(UI_SMALL_TEXT_SIZE))
-                                .text_color(color(modal_text_color(colors.muted, colors)))
+                                .text_color(color(modal_text_color(colors.muted, &colors)))
                                 .child("Name"),
                         )
                         .child(self.render_editor(cx))
@@ -569,7 +608,7 @@ impl CompiApp {
                             body.child(
                                 div()
                                     .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.error, colors)))
+                                    .text_color(color(modal_text_color(colors.error, &colors)))
                                     .child("Enter a non-empty name."),
                             )
                         }),
@@ -614,7 +653,7 @@ impl CompiApp {
     }
 
     fn render_diagnostics_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let (viewport_width, viewport_height) = overlay_viewport_size(window);
         let overlay_height = (viewport_height - CHROME_HEIGHT).max(1.0);
         let panel_width = (viewport_width - 64.0).clamp(1.0, 620.0);
@@ -630,7 +669,7 @@ impl CompiApp {
                 .border_color(color(colors.border))
                 .child(
                     div()
-                        .text_color(color(modal_text_color(colors.muted, colors)))
+                        .text_color(color(modal_text_color(colors.muted, &colors)))
                         .child(label),
                 )
                 .child(div().min_w_0().child(value))
@@ -678,7 +717,7 @@ impl CompiApp {
                                             .text_size(px(UI_SMALL_TEXT_SIZE))
                                             .text_color(color(modal_text_color(
                                                 colors.muted,
-                                                colors,
+                                                &colors,
                                             )))
                                             .child(self.config_diagnostics.join("\n")),
                                     ),
@@ -688,7 +727,7 @@ impl CompiApp {
                             body.child(
                                 div()
                                     .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.muted, colors)))
+                                    .text_color(color(modal_text_color(colors.muted, &colors)))
                                     .child(warning),
                             )
                         })
@@ -696,7 +735,7 @@ impl CompiApp {
                             body.child(
                                 div()
                                     .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(modal_text_color(colors.error, colors)))
+                                    .text_color(color(modal_text_color(colors.error, &colors)))
                                     .child(error),
                             )
                         }),
@@ -728,7 +767,7 @@ impl CompiApp {
     }
 
     fn render_dialog_header(&self, title: &'static str, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         div()
             .min_h(px(44.0))
             .px_4()
@@ -753,7 +792,7 @@ impl CompiApp {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let (viewport_width, viewport_height) = overlay_viewport_size(window);
         let overlay_height = viewport_height.max(1.0);
         div()
@@ -767,7 +806,7 @@ impl CompiApp {
             .items_center()
             .justify_center()
             .bg(color(colors.background).opacity(MODAL_SCRIM_OPACITY))
-            .text_color(color(modal_text_color(colors.foreground, colors)))
+            .text_color(color(modal_text_color(colors.foreground, &colors)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -780,7 +819,7 @@ impl CompiApp {
     }
 
     fn render_list_overlay(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let (viewport_width, viewport_height) = overlay_viewport_size(window);
         let overlay_height = viewport_height.max(1.0);
         let panel_width = (viewport_width - 64.0).clamp(1.0, 620.0);
@@ -810,7 +849,7 @@ impl CompiApp {
             .justify_center()
             .items_start()
             .bg(color(colors.background).opacity(MODAL_SCRIM_OPACITY))
-            .text_color(color(modal_text_color(colors.foreground, colors)))
+            .text_color(color(modal_text_color(colors.foreground, &colors)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {

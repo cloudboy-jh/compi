@@ -18,6 +18,9 @@ pub mod project_history;
 mod replica;
 pub mod selection;
 pub mod theme;
+pub mod theme_file;
+mod theme_migration;
+pub mod theme_store;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod typography;
 pub mod viewport;

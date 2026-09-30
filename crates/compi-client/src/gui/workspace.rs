@@ -13,11 +13,128 @@ mod tree_ui;
 pub(super) struct TransferSeed {
     tab_id: TabId,
     source_state: ClientState,
-    display_theme: ThemePreset,
-    display_terminal_opacity: f32,
-    display_background_effect: BackgroundEffect,
+    display_appearance: AppearanceSettings,
     display_sidebar_width: f32,
     display_zoom: f32,
+}
+
+fn inherited_appearance(
+    config: &LoadedConfig,
+    overrides: &WindowAppearanceOverrides,
+) -> AppearanceSettings {
+    let cli = config.provenance.theme == crate::config::ValueSource::CommandLine;
+    AppearanceSettings {
+        theme: if cli {
+            config.appearance.theme.clone()
+        } else {
+            overrides
+                .theme
+                .clone()
+                .unwrap_or_else(|| config.configured_appearance.theme.clone())
+        },
+        terminal_theme: if cli {
+            config.appearance.terminal_theme.clone()
+        } else {
+            overrides
+                .terminal_theme
+                .clone()
+                .unwrap_or_else(|| config.configured_appearance.terminal_theme.clone())
+        },
+        terminal_theme_override: !cli
+            && overrides
+                .terminal_theme_override
+                .unwrap_or(config.configured_appearance.terminal_theme_override),
+        transparent_background: overrides
+            .transparent_background
+            .unwrap_or(config.configured_appearance.transparent_background),
+        terminal_opacity: overrides
+            .terminal_opacity
+            .unwrap_or(config.configured_appearance.terminal_opacity),
+        background_effect: overrides
+            .background_effect
+            .unwrap_or(config.configured_appearance.background_effect),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppearanceField {
+    TerminalOverride,
+    Transparency,
+    Effect,
+}
+
+fn commit_override<T: Clone + PartialEq>(
+    slot: &mut Option<T>,
+    previous: &T,
+    next: &T,
+    global: bool,
+    forced: bool,
+) {
+    if forced || previous != next {
+        *slot = if global { None } else { Some(next.clone()) };
+    }
+}
+
+fn commit_appearance_overrides(
+    overrides: &mut WindowAppearanceOverrides,
+    previous: &AppearanceSettings,
+    next: &AppearanceSettings,
+    global: bool,
+    colors_locked: bool,
+    field: Option<AppearanceField>,
+) {
+    if !colors_locked {
+        commit_override(
+            &mut overrides.theme,
+            &previous.theme,
+            &next.theme,
+            global,
+            false,
+        );
+        commit_override(
+            &mut overrides.terminal_theme,
+            &previous.terminal_theme,
+            &next.terminal_theme,
+            global,
+            false,
+        );
+        commit_override(
+            &mut overrides.terminal_theme_override,
+            &previous.terminal_theme_override,
+            &next.terminal_theme_override,
+            global,
+            field == Some(AppearanceField::TerminalOverride),
+        );
+    }
+    commit_override(
+        &mut overrides.terminal_opacity,
+        &previous.terminal_opacity,
+        &next.terminal_opacity,
+        global,
+        false,
+    );
+    commit_override(
+        &mut overrides.transparent_background,
+        &previous.transparent_background,
+        &next.transparent_background,
+        global,
+        field == Some(AppearanceField::Transparency),
+    );
+    commit_override(
+        &mut overrides.background_effect,
+        &previous.background_effect,
+        &next.background_effect,
+        global,
+        field == Some(AppearanceField::Effect),
+    );
+}
+
+fn material_opacity(transparent: bool, opacity: f32, native_available: bool) -> f32 {
+    if transparent && native_available {
+        opacity
+    } else {
+        1.0
+    }
 }
 
 #[derive(Clone)]
@@ -345,38 +462,21 @@ impl CompiApp {
     ) -> Self {
         let (tx, rx) = async_channel::bounded(128);
         let state = slot.state.clone();
-        let theme = transferred_seed
+        let (theme_library, library_diagnostics) = ThemeLibrary::load();
+        let inherited = inherited_appearance(&config, &state.appearance);
+        let initial_appearance = transferred_seed
             .as_ref()
-            .map(|seed| seed.display_theme)
-            .unwrap_or_else(|| {
-                if config.provenance.theme == crate::config::ValueSource::CommandLine {
-                    config.appearance.theme
-                } else {
-                    state
-                        .appearance
-                        .theme
-                        .unwrap_or(config.configured_appearance.theme)
-                }
-            });
+            .map(|seed| seed.display_appearance.clone())
+            .unwrap_or(inherited);
+        let theme = theme_library
+            .resolve(&initial_appearance.theme)
+            .unwrap_or_else(|| theme_library.fallback());
+        let terminal_theme = theme_library
+            .resolve(initial_appearance.effective_terminal_theme())
+            .unwrap_or_else(|| theme_library.fallback());
         let ui_font = crate::font_catalog::resolve_ui_font(config.ui_font, window.text_system());
-        let terminal_opacity = transferred_seed
-            .as_ref()
-            .map(|seed| seed.display_terminal_opacity)
-            .unwrap_or_else(|| {
-                state
-                    .appearance
-                    .terminal_opacity
-                    .unwrap_or(config.configured_appearance.terminal_opacity)
-            });
-        let background_effect = transferred_seed
-            .as_ref()
-            .map(|seed| seed.display_background_effect)
-            .unwrap_or_else(|| {
-                state
-                    .appearance
-                    .background_effect
-                    .unwrap_or(config.configured_appearance.background_effect)
-            });
+        let terminal_opacity = initial_appearance.terminal_opacity;
+        let background_effect = initial_appearance.background_effect;
         let sidebar_width = transferred_seed
             .as_ref()
             .map(|seed| seed.display_sidebar_width)
@@ -393,7 +493,17 @@ impl CompiApp {
             .as_ref()
             .map_or(state.font_zoom, |seed| seed.display_zoom);
         let typography = Arc::new(TerminalTypography::resolve(&config.font, zoom, window));
-        let global_warning = diagnostic_warning(&config.diagnostics, &typography.diagnostics);
+        let mut appearance_diagnostics = config.diagnostics.clone();
+        appearance_diagnostics.extend(library_diagnostics);
+        for id in [
+            &initial_appearance.theme,
+            initial_appearance.effective_terminal_theme(),
+        ] {
+            if theme_library.resolve(id).is_none() {
+                appearance_diagnostics.push(format!("Theme '{}' is unavailable; using Compi Neutral without changing the saved selection.", id.id()));
+            }
+        }
+        let global_warning = diagnostic_warning(&appearance_diagnostics, &typography.diagnostics);
         let performance_enabled = Arc::new(AtomicBool::new(state.show_fps));
         let mut this = Self {
             started_at,
@@ -437,6 +547,10 @@ impl CompiApp {
             defaults,
             glass: terminal_opacity < 1.0,
             theme,
+            terminal_theme,
+            terminal_theme_override: initial_appearance.terminal_theme_override,
+            transparent_background: initial_appearance.transparent_background,
+            theme_library,
             ui_font,
             theme_catalog: None,
             pending_appearance_reload: None,
@@ -460,6 +574,9 @@ impl CompiApp {
             overlay_generation: 0,
             overlay_closing_since: None,
             settings_section: SettingsSection::Appearance,
+            settings_font_picker: None,
+            settings_scroll_bounds: None,
+            settings_scroll_to_focus: false,
             performance_enabled: performance_enabled.clone(),
             performance: performance::PerformanceMonitor::default(),
             performance_notice: None,
@@ -477,7 +594,7 @@ impl CompiApp {
             font_settings: config.font.clone(),
             typography,
             typography_scale: window.scale_factor(),
-            config_diagnostics: config.diagnostics.clone(),
+            config_diagnostics: appearance_diagnostics,
             global_warning,
             config,
             event_tx: UiEventSender(tx),
@@ -570,11 +687,13 @@ impl CompiApp {
         let target = this.target.clone();
         let appearance_path = this.config.path.clone();
         let performance_enabled = this.performance_enabled.clone();
+        let mut polling_theme_library = this.theme_library.clone();
         let alive = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let mut appearance_stamp = fs::metadata(&appearance_path)
                 .ok()
                 .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+            let mut library_ticks = 0_u8;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
@@ -586,8 +705,10 @@ impl CompiApp {
                 let target = target.clone();
                 let appearance_path = appearance_path.clone();
                 let previous_stamp = appearance_stamp;
+                library_ticks = (library_ticks + 1) % 12;
+                let reload_library = library_ticks == 0;
                 let collect_performance = performance_enabled.load(Ordering::Acquire);
-                appearance_stamp = cx
+                (appearance_stamp, polling_theme_library) = cx
                     .background_executor()
                     .spawn(async move {
                         match target.connect() {
@@ -620,6 +741,13 @@ impl CompiApp {
                         let stamp = fs::metadata(&appearance_path)
                             .ok()
                             .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+                        if reload_library || (stamp.is_some() && stamp != previous_stamp) {
+                            let diagnostics = polling_theme_library.reload();
+                            sender.send(UiEvent::ThemeLibraryReloaded {
+                                library: polling_theme_library.clone(),
+                                diagnostics,
+                            });
+                        }
                         if stamp.is_some() && stamp != previous_stamp {
                             let loaded = crate::config::load(
                                 Some(&appearance_path),
@@ -633,7 +761,7 @@ impl CompiApp {
                                 diagnostics: loaded.diagnostics,
                             });
                         }
-                        stamp
+                        (stamp, polling_theme_library)
                     })
                     .await;
             }
@@ -659,18 +787,33 @@ impl CompiApp {
         this
     }
 
-    fn colors(&self) -> &'static ThemeColors {
+    fn colors(&self) -> &ThemeColors {
         self.theme.colors()
     }
 
+    pub(super) fn resolve_theme(&self, id: &ThemeId) -> Arc<ThemeDefinition> {
+        self.theme_library
+            .resolve(id)
+            .unwrap_or_else(|| self.theme_library.fallback())
+    }
+
+    fn effective_background_opacity(&self) -> f32 {
+        material_opacity(
+            self.transparent_background,
+            self.terminal_opacity,
+            native_material_available(),
+        )
+    }
+
     fn apply_window_background(&mut self, window: &mut Window) {
-        let translucent = self.terminal_opacity < 1.0 && native_material_available();
+        let translucent = self.effective_background_opacity() < 1.0;
         let appearance = if !translucent {
             WindowBackgroundAppearance::Opaque
         } else {
             match self.background_effect {
                 BackgroundEffect::Clear => WindowBackgroundAppearance::Transparent,
                 BackgroundEffect::Blurred => WindowBackgroundAppearance::Blurred,
+                BackgroundEffect::Opaque => WindowBackgroundAppearance::Opaque,
             }
         };
         self.glass = translucent;
@@ -678,30 +821,34 @@ impl CompiApp {
     }
 
     fn preview_terminal_opacity(&mut self, opacity: f32, window: &mut Window) {
-        let was_translucent = self.terminal_opacity < 1.0;
+        let was_translucent = self.effective_background_opacity() < 1.0;
         self.opacity_drag_origin
             .get_or_insert(self.terminal_opacity);
         self.terminal_opacity = opacity.clamp(
             crate::config::MIN_TERMINAL_OPACITY,
             crate::config::MAX_TERMINAL_OPACITY,
         );
-        if was_translucent != (self.terminal_opacity < 1.0) {
+        if was_translucent != (self.effective_background_opacity() < 1.0) {
             self.apply_window_background(window);
         }
     }
 
-    fn appearance(&self) -> AppearanceSettings {
-        AppearanceSettings {
-            theme: self.theme,
-            terminal_opacity: self.terminal_opacity,
-            background_effect: self.background_effect,
+    pub(super) fn accepted_appearance(&self) -> AppearanceSettings {
+        let mut appearance = self
+            .theme_catalog
+            .as_ref()
+            .map(|catalog| catalog.original.clone())
+            .unwrap_or_else(|| inherited_appearance(&self.config, &self.state.appearance));
+        if let Some(opacity) = self.opacity_drag_origin {
+            appearance.terminal_opacity = opacity;
         }
+        appearance
     }
 
     fn scoped_appearance(&self) -> AppearanceSettings {
         match self.settings_scope {
-            SettingsScope::Global => self.config.configured_appearance,
-            SettingsScope::Window => self.appearance(),
+            SettingsScope::Global => self.config.configured_appearance.clone(),
+            SettingsScope::Window => self.accepted_appearance(),
         }
     }
 
@@ -711,37 +858,43 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let previous = self.appearance();
-        match self.settings_scope {
-            SettingsScope::Global => {
-                if let Err(error) = self.config.save_global_appearance(appearance) {
-                    self.global_error = Some(error);
-                    return;
-                }
-                self.state.appearance = WindowAppearanceOverrides::default();
-                self.set_theme(self.config.appearance.theme);
-                self.terminal_opacity = appearance.terminal_opacity;
-                self.background_effect = appearance.background_effect;
-            }
-            SettingsScope::Window => {
-                if self.config.provenance.theme != crate::config::ValueSource::CommandLine
-                    && appearance.theme != previous.theme
-                {
-                    self.state.appearance.theme = Some(appearance.theme);
-                }
-                if appearance.terminal_opacity != previous.terminal_opacity {
-                    self.state.appearance.terminal_opacity = Some(appearance.terminal_opacity);
-                }
-                if appearance.background_effect != previous.background_effect {
-                    self.state.appearance.background_effect = Some(appearance.background_effect);
-                }
-                if self.config.provenance.theme != crate::config::ValueSource::CommandLine {
-                    self.set_theme(appearance.theme);
-                }
-                self.terminal_opacity = appearance.terminal_opacity;
-                self.background_effect = appearance.background_effect;
-            }
+        self.apply_scoped_appearance_field(appearance, None, window, cx);
+    }
+
+    fn apply_scoped_appearance_field(
+        &mut self,
+        mut appearance: AppearanceSettings,
+        field: Option<AppearanceField>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.scoped_appearance();
+        let colors_locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
+        if colors_locked {
+            appearance.theme = previous.theme.clone();
+            appearance.terminal_theme = previous.terminal_theme.clone();
+            appearance.terminal_theme_override = previous.terminal_theme_override;
         }
+        let global = self.settings_scope == SettingsScope::Global;
+        if global && let Err(error) = self.config.save_global_appearance(appearance.clone()) {
+            self.global_error = Some(error);
+            return;
+        }
+        commit_appearance_overrides(
+            &mut self.state.appearance,
+            &previous,
+            &appearance,
+            global,
+            colors_locked,
+            field,
+        );
+        let effective = inherited_appearance(&self.config, &self.state.appearance);
+        self.set_theme(self.resolve_theme(&effective.theme));
+        self.set_terminal_theme(self.resolve_theme(effective.effective_terminal_theme()));
+        self.terminal_opacity = effective.terminal_opacity;
+        self.background_effect = effective.background_effect;
+        self.terminal_theme_override = effective.terminal_theme_override;
+        self.transparent_background = effective.transparent_background;
         self.apply_window_background(window);
         self.save_state();
         if self.settings_scope == SettingsScope::Global {
@@ -751,11 +904,64 @@ impl CompiApp {
 
     fn reset_window_appearance(&mut self, window: &mut Window) {
         self.state.appearance = WindowAppearanceOverrides::default();
-        self.set_theme(self.config.appearance.theme);
+        let effective = inherited_appearance(&self.config, &self.state.appearance);
+        self.set_theme(self.resolve_theme(&effective.theme));
+        self.set_terminal_theme(self.resolve_theme(effective.effective_terminal_theme()));
         self.terminal_opacity = self.config.configured_appearance.terminal_opacity;
         self.background_effect = self.config.configured_appearance.background_effect;
+        self.terminal_theme_override = effective.terminal_theme_override;
+        self.transparent_background = effective.transparent_background;
         self.apply_window_background(window);
         self.save_state();
+    }
+
+    pub(super) fn set_transparent_background(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut appearance = self.scoped_appearance();
+        appearance.transparent_background = enabled;
+        self.apply_scoped_appearance_field(
+            appearance,
+            Some(AppearanceField::Transparency),
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn set_blur_background(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut appearance = self.scoped_appearance();
+        appearance.background_effect = if enabled {
+            BackgroundEffect::Blurred
+        } else {
+            BackgroundEffect::Clear
+        };
+        self.apply_scoped_appearance_field(appearance, Some(AppearanceField::Effect), window, cx);
+    }
+
+    pub(super) fn follow_theme_terminal_colors(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.provenance.theme == crate::config::ValueSource::CommandLine {
+            return;
+        }
+        let mut appearance = self.scoped_appearance();
+        appearance.terminal_theme_override = false;
+        self.apply_scoped_appearance_field(
+            appearance,
+            Some(AppearanceField::TerminalOverride),
+            window,
+            cx,
+        );
     }
 
     fn selected_tab(&self) -> Option<&WorkspaceTab> {
@@ -1164,6 +1370,12 @@ impl CompiApp {
         }
         match event {
             UiEvent::StateSaveFinished => {}
+            UiEvent::ThemeLibraryReloaded {
+                library,
+                diagnostics,
+            } => {
+                self.adopt_theme_library(library, diagnostics);
+            }
             UiEvent::AppearanceReloaded {
                 appearance,
                 favorites,
@@ -2129,11 +2341,16 @@ impl CompiApp {
         self.report_focus(true);
     }
 
-    fn set_theme(&mut self, theme: ThemePreset) {
-        if self.theme == theme {
+    fn set_theme(&mut self, theme: Arc<ThemeDefinition>) {
+        self.theme = theme;
+    }
+
+    fn set_terminal_theme(&mut self, theme: Arc<ThemeDefinition>) {
+        let changed = self.terminal_theme.terminal() != theme.terminal();
+        self.terminal_theme = theme;
+        if !changed {
             return;
         }
-        self.theme = theme;
         for view in &self.surface_views {
             if let Ok(mut cache) = view.row_render_cache.lock() {
                 cache.clear();
@@ -2709,22 +2926,13 @@ impl CompiApp {
                 }
                 self.sidebar_width = self.state.sidebar_width;
                 self.zoom = self.state.font_zoom;
-                self.set_theme(
-                    self.state
-                        .appearance
-                        .theme
-                        .unwrap_or(self.config.configured_appearance.theme),
-                );
-                self.terminal_opacity = self
-                    .state
-                    .appearance
-                    .terminal_opacity
-                    .unwrap_or(self.config.configured_appearance.terminal_opacity);
-                self.background_effect = self
-                    .state
-                    .appearance
-                    .background_effect
-                    .unwrap_or(self.config.configured_appearance.background_effect);
+                let effective = inherited_appearance(&self.config, &self.state.appearance);
+                self.set_theme(self.resolve_theme(&effective.theme));
+                self.set_terminal_theme(self.resolve_theme(effective.effective_terminal_theme()));
+                self.terminal_opacity = effective.terminal_opacity;
+                self.background_effect = effective.background_effect;
+                self.terminal_theme_override = effective.terminal_theme_override;
+                self.transparent_background = effective.transparent_background;
                 self.apply_window_background(window);
                 if let Some(workspace) = &self.workspace {
                     self.state.reconcile(None, workspace);
@@ -3476,7 +3684,7 @@ impl CompiApp {
                 false
             }
         });
-        let colors = self.colors();
+        let colors = *self.colors();
         let title = self
             .selected_tab()
             .map(|tab| format!("{} · Compi", self.tab_label(tab)))
@@ -3526,6 +3734,9 @@ impl CompiApp {
             .track_focus(&self.focus_handle)
             .size_full()
             .relative()
+            .when(self.effective_background_opacity() >= 1.0, |root| {
+                root.bg(material_color(colors.background, 1.0))
+            })
             .flex()
             .flex_col()
             .font_family(self.ui_font.family())
@@ -3640,7 +3851,7 @@ impl CompiApp {
         command: Command,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let reason = command.disabled_reason(&self.command_context(cx));
         div()
             .id(id)
@@ -3671,7 +3882,7 @@ impl CompiApp {
         active: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let reason = command
             .disabled_reason(&self.command_context(cx))
             .map(str::to_owned);
@@ -3726,7 +3937,7 @@ impl CompiApp {
     }
 
     fn pane_actions_menu_button(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let active = matches!(self.overlay, Some(Overlay::PaneActions));
         div()
             .id("pane-actions-menu")
@@ -3759,12 +3970,8 @@ impl CompiApp {
     }
 
     fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
-        let header_alpha = if self.glass {
-            self.terminal_opacity
-        } else {
-            1.0
-        };
+        let colors = *self.colors();
+        let header_alpha = self.effective_background_opacity();
         let (window_width, _) = logical_viewport_dimensions(window);
         let metrics = header_metrics(window_width);
         let trailing_width =
@@ -3793,6 +4000,8 @@ impl CompiApp {
                 .collect::<Vec<_>>();
             div()
                 .id(("terminal-tab", index))
+                .group("terminal-tab")
+                .relative()
                 .h_full()
                 .w(px(metrics.tab_width))
                 .flex_none()
@@ -3800,28 +4009,33 @@ impl CompiApp {
                 .flex()
                 .items_center()
                 .gap_2()
-                .bg(color(if selected {
-                    colors.surface
-                } else {
-                    colors.background
-                })
-                .opacity(header_alpha))
-                .border_b_1()
-                .border_color(color(if selected {
-                    colors.accent
-                } else {
-                    colors.border
-                }))
                 .text_color(color(if selected {
                     colors.foreground
                 } else {
                     colors.muted
                 }))
-                .hover(move |style| {
-                    style
-                        .bg(color(colors.surface_hover).opacity(header_alpha))
-                        .cursor_pointer()
-                })
+                .hover(|style| style.cursor_pointer())
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(2.0))
+                        .right(px(2.0))
+                        .top(px(4.0))
+                        .bottom(px(4.0))
+                        .rounded(px(4.0))
+                        .when(selected, |tab| {
+                            tab.bg(color(blend_rgb(colors.background, colors.foreground, 0.08))
+                                .opacity(header_alpha))
+                        })
+                        .group_hover("terminal-tab", move |style| {
+                            style.bg(color(blend_rgb(
+                                colors.background,
+                                colors.foreground,
+                                if selected { 0.11 } else { 0.04 },
+                            ))
+                            .opacity(header_alpha))
+                        }),
+                )
                 .when(self.overlay.is_none(), |tab| {
                     tab.tooltip(move |_, cx| {
                         cx.new(|_| TabTooltip {
@@ -3894,7 +4108,17 @@ impl CompiApp {
                 .child(
                     div()
                         .id(("hide-tab", index))
-                        .px_1()
+                        .size(px(20.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.0))
+                        .invisible()
+                        .group_hover("terminal-tab", |style| style.visible())
+                        .hover(move |style| {
+                            style.bg(color(blend_rgb(colors.background, colors.foreground, 0.12)))
+                        })
                         .cursor_pointer()
                         .text_color(color(colors.muted))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -3911,7 +4135,7 @@ impl CompiApp {
             .w_full()
             .flex_none()
             .relative()
-            .bg(color(colors.background).opacity(header_alpha))
+            .bg(material_color(colors.background, header_alpha))
             .border_b_1()
             .border_color(color(colors.border))
             .on_mouse_down(
@@ -4110,7 +4334,7 @@ impl CompiApp {
     }
 
     fn render_sidebar(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let mut rows = Vec::new();
         if let Some(workspace) = &self.workspace {
             for (index, session) in workspace.sessions.iter().enumerate() {
@@ -4297,7 +4521,7 @@ impl CompiApp {
     }
 
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let Some(layout) = self.visible_layout() else {
             return div()
                 .flex_1()
@@ -4306,7 +4530,7 @@ impl CompiApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(color(colors.background).opacity(self.terminal_opacity))
+                .bg(material_color(colors.background, self.effective_background_opacity()))
                 .child(
                     div()
                         .w_full()
@@ -4374,7 +4598,7 @@ impl CompiApp {
                 PaintModel::from_tab(
                     view,
                     self.typography.clone(),
-                    self.theme,
+                    self.terminal_theme.clone(),
                     focused && self.overlay.is_none(),
                 )
             });
@@ -4425,7 +4649,14 @@ impl CompiApp {
                 .top(px(geometry.rect.y))
                 .w(px(geometry.rect.width))
                 .h(px(geometry.rect.height))
-                .bg(color(colors.background).opacity(self.terminal_opacity))
+                .bg(material_color(
+                    if tree_active {
+                        colors.background
+                    } else {
+                        self.terminal_theme.terminal().background
+                    },
+                    self.effective_background_opacity(),
+                ))
                 .flex()
                 .flex_col()
                 .on_drop(
@@ -4570,7 +4801,7 @@ impl CompiApp {
                                                     paint.cursor,
                                                     composition,
                                                     &paint.typography,
-                                                    paint.theme,
+                                                    paint.theme.terminal(),
                                                     window,
                                                     cx,
                                                 );
@@ -4667,7 +4898,7 @@ impl CompiApp {
     }
 
     fn render_workspace_scrollbar(&self, horizontal: bool, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let layout = self
             .visible_layout()
             .expect("scrollbars render only with a visible layout");
@@ -5025,13 +5256,11 @@ impl CompiApp {
         } else {
             let mut config = self.config.clone();
             config.font = self.font_settings.clone();
-            let display_theme = self.theme;
+            let display_appearance = self.accepted_appearance();
             let seed = TransferSeed {
                 tab_id: tab_id.clone(),
                 source_state: self.state.clone(),
-                display_theme,
-                display_terminal_opacity: self.terminal_opacity,
-                display_background_effect: self.background_effect,
+                display_appearance,
                 display_sidebar_width: self.sidebar_width,
                 display_zoom: self.zoom,
             };
@@ -5209,7 +5438,7 @@ fn native_material_available() -> bool {
 
 impl CompiApp {
     fn render_editor(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let text = self.ime_text.clone();
         let placeholder = if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
             "Search themes by name or family…"
@@ -5238,6 +5467,15 @@ impl CompiApp {
             } else {
                 colors.border
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.overlay_focus = 0;
+                    window.focus(&this.focus_handle);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
             .child(
                 canvas(
                     move |_, _, _| (),
@@ -5261,7 +5499,7 @@ impl CompiApp {
                                 } else {
                                     colors.foreground
                                 },
-                                colors,
+                                &colors,
                             )),
                             background_color: None,
                             underline: None,
@@ -5300,7 +5538,7 @@ impl CompiApp {
                                         point(origin.x + caret, origin.y),
                                         size(px(1.0), px(20.0)),
                                     ),
-                                    color(colors.cursor),
+                                    color(colors.foreground),
                                 ));
                             }
                             if editor_focused && let Some(marked) = marked {
@@ -5332,7 +5570,7 @@ impl CompiApp {
         pane: &PaneId,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let pane = pane.clone();
         div()
             .id(id)
@@ -5519,6 +5757,11 @@ fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        AppearanceField, AppearanceSettings, BackgroundEffect, LoadedConfig, ThemeId,
+        WindowAppearanceOverrides, commit_appearance_overrides, inherited_appearance,
+        material_opacity,
+    };
+    use super::{
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
         TabPane, WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title,
@@ -5526,6 +5769,201 @@ mod tests {
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn split_overrides_inherit_independently_and_preserve_missing_theme_ids() {
+        let mut config = LoadedConfig::default();
+        config.configured_appearance.theme = ThemeId::parse("compi-neutral").unwrap();
+        config.configured_appearance.terminal_theme = ThemeId::parse("dracula").unwrap();
+        config.configured_appearance.terminal_theme_override = true;
+        let application = ThemeId::parse("user-unavailable").unwrap();
+        let overrides = WindowAppearanceOverrides {
+            theme: Some(application.clone()),
+            terminal_opacity: Some(0.7),
+            ..WindowAppearanceOverrides::default()
+        };
+        let inherited = inherited_appearance(&config, &overrides);
+        assert_eq!(inherited.theme, application);
+        assert_eq!(
+            inherited.terminal_theme,
+            config.configured_appearance.terminal_theme
+        );
+        assert_eq!(inherited.terminal_opacity, 0.7);
+        assert!(inherited.transparent_background);
+        assert_eq!(
+            material_opacity(
+                inherited.transparent_background,
+                inherited.terminal_opacity,
+                true
+            ),
+            0.7
+        );
+        config.configured_appearance.terminal_theme = ThemeId::parse("dark-glass").unwrap();
+        let updated = inherited_appearance(&config, &overrides);
+        assert_eq!(updated.theme, application);
+        assert_eq!(
+            updated.terminal_theme,
+            config.configured_appearance.terminal_theme
+        );
+    }
+
+    #[test]
+    fn cli_theme_locks_both_palettes_without_locking_window_material() {
+        let mut config = LoadedConfig::default();
+        let cli_id = ThemeId::parse("compi-neutral").unwrap();
+        config.provenance.theme = crate::config::ValueSource::CommandLine;
+        config.appearance = AppearanceSettings {
+            theme: cli_id.clone(),
+            terminal_theme: cli_id.clone(),
+            ..config.appearance
+        };
+        let overrides = WindowAppearanceOverrides {
+            theme: Some(ThemeId::parse("user-app").unwrap()),
+            terminal_theme: Some(ThemeId::parse("user-terminal").unwrap()),
+            background_effect: Some(BackgroundEffect::Clear),
+            terminal_opacity: Some(0.4),
+            terminal_theme_override: Some(true),
+            transparent_background: Some(false),
+        };
+        let inherited = inherited_appearance(&config, &overrides);
+        assert_eq!(inherited.theme, cli_id);
+        assert_eq!(inherited.terminal_theme, cli_id);
+        assert_eq!(inherited.background_effect, BackgroundEffect::Clear);
+        assert_eq!(inherited.terminal_opacity, 0.4);
+        assert!(!inherited.terminal_theme_override);
+        assert!(!inherited.transparent_background);
+    }
+
+    #[test]
+    fn follow_theme_uses_current_application_palette_and_remembers_override_across_scopes() {
+        let mut config = LoadedConfig::default();
+        config.configured_appearance.theme = ThemeId::parse("nord").unwrap();
+        config.configured_appearance.terminal_theme = ThemeId::parse("dracula").unwrap();
+        config.configured_appearance.terminal_theme_override = true;
+        let mut overrides = WindowAppearanceOverrides {
+            theme: Some(ThemeId::parse("warm-carbon").unwrap()),
+            ..WindowAppearanceOverrides::default()
+        };
+        let previous = inherited_appearance(&config, &overrides);
+        let mut next = previous.clone();
+        next.terminal_theme_override = false;
+        commit_appearance_overrides(
+            &mut overrides,
+            &previous,
+            &next,
+            false,
+            false,
+            Some(AppearanceField::TerminalOverride),
+        );
+        let followed = inherited_appearance(&config, &overrides);
+        assert_eq!(followed.effective_terminal_theme().id(), "warm-carbon");
+        assert_eq!(followed.terminal_theme.id(), "dracula");
+        config.configured_appearance.theme = ThemeId::parse("catppuccin-latte").unwrap();
+        let followed = inherited_appearance(&config, &overrides);
+        assert_eq!(followed.effective_terminal_theme().id(), "warm-carbon");
+        next = followed.clone();
+        next.terminal_theme_override = true;
+        commit_appearance_overrides(
+            &mut overrides,
+            &followed,
+            &next,
+            false,
+            false,
+            Some(AppearanceField::TerminalOverride),
+        );
+        assert_eq!(
+            inherited_appearance(&config, &overrides)
+                .effective_terminal_theme()
+                .id(),
+            "dracula"
+        );
+    }
+
+    #[test]
+    fn transparency_toggle_preserves_material_preferences_and_unrelated_overrides() {
+        let config = LoadedConfig::default();
+        let mut overrides = WindowAppearanceOverrides {
+            theme: Some(ThemeId::parse("nord").unwrap()),
+            terminal_theme: Some(ThemeId::parse("dracula").unwrap()),
+            terminal_theme_override: Some(true),
+            terminal_opacity: Some(0.43),
+            background_effect: Some(BackgroundEffect::Clear),
+            transparent_background: Some(true),
+        };
+        let original = overrides.clone();
+        for enabled in [false, true] {
+            let previous = inherited_appearance(&config, &overrides);
+            let mut next = previous.clone();
+            next.transparent_background = enabled;
+            commit_appearance_overrides(
+                &mut overrides,
+                &previous,
+                &next,
+                false,
+                false,
+                Some(AppearanceField::Transparency),
+            );
+            let effective = inherited_appearance(&config, &overrides);
+            assert_eq!(effective.terminal_opacity, 0.43);
+            assert_eq!(effective.background_effect, BackgroundEffect::Clear);
+            assert_eq!(effective.effective_terminal_theme().id(), "dracula");
+            assert_eq!(
+                material_opacity(
+                    effective.transparent_background,
+                    effective.terminal_opacity,
+                    true
+                ),
+                if enabled { 0.43 } else { 1.0 }
+            );
+            assert_eq!(
+                material_opacity(
+                    effective.transparent_background,
+                    effective.terminal_opacity,
+                    false
+                ),
+                1.0
+            );
+        }
+        assert_eq!(overrides, original);
+        // Global has the requested value already: only the explicitly edited
+        // window flag is cleared, never its remembered opacity, blur or colors.
+        commit_appearance_overrides(
+            &mut overrides,
+            &config.configured_appearance,
+            &config.configured_appearance,
+            true,
+            false,
+            Some(AppearanceField::Transparency),
+        );
+        let mut expected = original;
+        expected.transparent_background = None;
+        assert_eq!(overrides, expected);
+    }
+
+    #[test]
+    fn locked_color_commits_still_allow_scoped_material_changes() {
+        let previous = AppearanceSettings::default();
+        let mut next = previous.clone();
+        next.theme = ThemeId::parse("nord").unwrap();
+        next.terminal_theme = ThemeId::parse("dracula").unwrap();
+        next.terminal_theme_override = true;
+        next.transparent_background = false;
+        next.terminal_opacity = 0.43;
+        let mut overrides = WindowAppearanceOverrides {
+            theme: Some(ThemeId::parse("warm-carbon").unwrap()),
+            ..WindowAppearanceOverrides::default()
+        };
+        let preserved = overrides.clone();
+        commit_appearance_overrides(&mut overrides, &previous, &next, false, true, None);
+        assert_eq!(overrides.theme, preserved.theme);
+        assert_eq!(overrides.terminal_theme, preserved.terminal_theme);
+        assert_eq!(
+            overrides.terminal_theme_override,
+            preserved.terminal_theme_override
+        );
+        assert_eq!(overrides.transparent_background, Some(false));
+        assert_eq!(overrides.terminal_opacity, Some(0.43));
+    }
 
     #[test]
     fn restored_window_selects_the_display_containing_its_saved_center() {

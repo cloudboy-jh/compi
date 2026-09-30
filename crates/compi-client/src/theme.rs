@@ -1,8 +1,7 @@
-//! Whole-application presets and native background material choices.
-//! Terminal opacity controls the default terminal canvas and window header;
-//! text, controls, and explicit ANSI/true-color cell backgrounds stay opaque.
+//! Application colors, independent terminal palettes, and native materials.
 
 use serde::{Deserialize, Serialize};
+use std::{borrow::Cow, sync::Arc};
 
 // Validated bundled data becomes a const-only catalog at build time.
 include!(concat!(env!("OUT_DIR"), "/theme_catalog.rs"));
@@ -16,15 +15,17 @@ pub enum BackgroundEffect {
     Clear,
     #[default]
     Blurred,
+    Opaque,
 }
 
 impl BackgroundEffect {
-    pub const ALL: [Self; 2] = [Self::Clear, Self::Blurred];
+    pub const ALL: [Self; 3] = [Self::Clear, Self::Blurred, Self::Opaque];
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::Clear => "clear",
             Self::Blurred => "blurred",
+            Self::Opaque => "opaque",
         }
     }
 
@@ -32,6 +33,7 @@ impl BackgroundEffect {
         match self {
             Self::Clear => "Clear",
             Self::Blurred => "Blurred",
+            Self::Opaque => "Opaque",
         }
     }
 
@@ -39,11 +41,14 @@ impl BackgroundEffect {
         match value {
             "clear" => Some(Self::Clear),
             "blurred" => Some(Self::Blurred),
+            "opaque" => Some(Self::Opaque),
             _ => None,
         }
     }
 }
 
+/// Packed theme colors use `0xTTRRGGBB`, where `TT` is inverse alpha (`255 - alpha`).
+/// Existing `0xRRGGBB` constants are therefore fully opaque.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThemeColors {
     pub background: u32,
@@ -55,11 +60,20 @@ pub struct ThemeColors {
     pub accent: u32,
     pub error: u32,
     pub selection: u32,
+}
+
+/// Theme tokens retain inverse alpha like [`ThemeColors`]. Explicit terminal cell backgrounds
+/// are rendered opaque; only the semantic default exposes the pane's material transparency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalPalette {
+    pub background: u32,
+    pub foreground: u32,
+    pub selection: u32,
     pub cursor: u32,
     pub ansi: [u32; 16],
 }
 
-impl ThemeColors {
+impl TerminalPalette {
     /// Presets own ANSI 0–15; the standard color cube and gray ramp remain stable.
     pub fn indexed(&self, index: u8) -> u32 {
         match index {
@@ -79,43 +93,129 @@ impl ThemeColors {
     }
 }
 
-/// Deliberately not serializable: persistence and tear-off inheritance use only
-/// `accepted()`, while rendering uses `visible()`.
-#[derive(Clone, Copy, Debug)]
-pub struct ThemePreview {
-    accepted: ThemePreset,
-    preview: Option<ThemePreset>,
+/// Persistent identity does not depend on whether a palette is installed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ThemeId(String);
+
+impl ThemeId {
+    pub fn parse(value: &str) -> Option<Self> {
+        (value.len() <= 96
+            && !value.is_empty()
+            && value.split('-').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            }))
+        .then(|| Self(value.to_owned()))
+    }
+
+    pub fn id(&self) -> &str {
+        &self.0
+    }
 }
 
-impl ThemePreview {
-    pub const fn new(accepted: ThemePreset) -> Self {
-        Self {
-            accepted,
-            preview: None,
-        }
+impl Default for ThemeId {
+    fn default() -> Self {
+        ThemePreset::default().into()
+    }
+}
+
+impl From<ThemePreset> for ThemeId {
+    fn from(preset: ThemePreset) -> Self {
+        Self(preset.id().to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for ThemeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| serde::de::Error::custom("invalid theme identity"))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThemeMetadata {
+    pub name: Cow<'static, str>,
+    pub family: Cow<'static, str>,
+    pub description: Cow<'static, str>,
+    pub dark: bool,
+    pub author: Cow<'static, str>,
+    pub source: Cow<'static, str>,
+    pub license: Cow<'static, str>,
+    pub notices: Cow<'static, str>,
+}
+
+/// Immutable palette data, retained by an Arc throughout rendering and previews.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ThemeDefinition {
+    pub(crate) id: ThemeId,
+    pub(crate) application: ThemeColors,
+    pub(crate) terminal: TerminalPalette,
+    pub(crate) metadata: ThemeMetadata,
+    pub(crate) imported: bool,
+}
+
+impl ThemeDefinition {
+    pub fn theme_id(&self) -> &ThemeId {
+        &self.id
+    }
+    pub fn id(&self) -> &str {
+        self.id.id()
+    }
+    pub fn label(&self) -> &str {
+        &self.metadata.name
+    }
+    pub fn family(&self) -> &str {
+        &self.metadata.family
+    }
+    pub fn description(&self) -> &str {
+        &self.metadata.description
+    }
+    pub fn is_dark(&self) -> bool {
+        self.metadata.dark
+    }
+    pub fn colors(&self) -> &ThemeColors {
+        &self.application
+    }
+    pub fn terminal(&self) -> &TerminalPalette {
+        &self.terminal
+    }
+    pub fn is_imported(&self) -> bool {
+        self.imported
     }
 
-    pub fn visible(&self) -> ThemePreset {
-        self.preview.unwrap_or(self.accepted)
+    pub fn attribution(&self) -> String {
+        format!(
+            "{}\nAuthor: {}\nSource: {}\nLicense: {}\n\n{}",
+            self.label(),
+            self.metadata.author,
+            self.metadata.source,
+            self.metadata.license,
+            self.metadata.notices
+        )
     }
+}
 
-    pub const fn accepted(&self) -> ThemePreset {
-        self.accepted
-    }
-
-    pub fn preview(&mut self, preset: ThemePreset) {
-        self.preview = Some(preset);
-    }
-
-    pub fn accept(&mut self) -> ThemePreset {
-        if let Some(preset) = self.preview.take() {
-            self.accepted = preset;
-        }
-        self.accepted
-    }
-
-    pub fn cancel(&mut self) {
-        self.preview = None;
+impl ThemePreset {
+    pub(crate) fn definition(self) -> Arc<ThemeDefinition> {
+        Arc::new(ThemeDefinition {
+            id: self.into(),
+            application: *self.colors(),
+            terminal: *self.terminal(),
+            metadata: ThemeMetadata {
+                name: self.label().into(),
+                family: self.family().into(),
+                description: self.description().into(),
+                dark: self.is_dark(),
+                author: "Compi and upstream palette authors (see notices)".into(),
+                source: self.source().into(),
+                license: "Bundled palette licenses (see complete notices)".into(),
+                notices: THEME_ATTRIBUTION.into(),
+            },
+            imported: false,
+        })
     }
 }
 
@@ -124,19 +224,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preview_never_changes_remembered_theme_until_acceptance() {
-        let mut theme = ThemePreview::new(ThemePreset::DarkGlass);
-        theme.preview(ThemePreset::WarmCarbon);
-        assert_eq!(theme.visible(), ThemePreset::WarmCarbon);
-        assert_eq!(theme.accepted(), ThemePreset::DarkGlass);
-        let destination = ThemePreview::new(theme.accepted());
-        assert_eq!(destination.visible(), ThemePreset::DarkGlass);
-        theme.cancel();
-        assert_eq!(theme.visible(), ThemePreset::DarkGlass);
-        theme.preview(ThemePreset::WarmCarbon);
-        assert_eq!(theme.accept(), ThemePreset::WarmCarbon);
-        theme.preview(ThemePreset::DarkGlass);
-        theme.cancel();
-        assert_eq!(theme.visible(), ThemePreset::WarmCarbon);
+    fn unknown_valid_identity_survives_persistence_but_paths_are_rejected() {
+        let id: ThemeId = serde_json::from_str("\"user-not-installed\"").unwrap();
+        assert_eq!(
+            serde_json::to_string(&id).unwrap(),
+            "\"user-not-installed\""
+        );
+        for invalid in [
+            "",
+            "../escape",
+            "user-a/b",
+            "user--name",
+            "UPPER",
+            "user-a.json",
+        ] {
+            assert!(ThemeId::parse(invalid).is_none(), "{invalid}");
+        }
+        assert!(ThemeId::parse(&"a".repeat(97)).is_none());
+    }
+
+    #[test]
+    fn terminal_indexed_cube_and_ramp_keep_xterm_boundaries() {
+        let mut palette = *ThemePreset::CompiNeutral.terminal();
+        palette.ansi[15] |= 0x80000000;
+        assert_eq!(palette.indexed(15), palette.ansi[15]);
+        assert_eq!(palette.indexed(16), 0x000000);
+        assert_eq!(palette.indexed(21), 0x0000ff);
+        assert_eq!(palette.indexed(231), 0xffffff);
+        assert_eq!(palette.indexed(232), 0x080808);
+        assert_eq!(palette.indexed(255), 0xeeeeee);
     }
 }

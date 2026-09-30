@@ -182,11 +182,15 @@ mod tests {
 
         let mut config = compi_client::config::LoadedConfig {
             appearance: compi_client::config::AppearanceSettings {
-                theme: compi_client::theme::ThemePreset::DarkGlass,
+                theme: compi_client::theme::ThemeId::from(
+                    compi_client::theme::ThemePreset::DarkGlass,
+                ),
                 ..Default::default()
             },
             configured_appearance: compi_client::config::AppearanceSettings {
-                theme: compi_client::theme::ThemePreset::DarkGlass,
+                theme: compi_client::theme::ThemeId::from(
+                    compi_client::theme::ThemePreset::DarkGlass,
+                ),
                 ..Default::default()
             },
             sidebar_width: 240.0,
@@ -194,14 +198,14 @@ mod tests {
             ..Default::default()
         };
         config.apply_presentation_overrides(args.theme.as_deref(), args.sidebar_width);
-        assert_eq!(
-            config.appearance.theme,
-            compi_client::theme::ThemePreset::WarmCarbon
-        );
+        assert_eq!(config.appearance.theme.id(), "warm-carbon");
+        assert_eq!(config.appearance.terminal_theme.id(), "warm-carbon");
+        assert!(!config.appearance.terminal_theme_override);
         assert_eq!(config.sidebar_width, 360.0);
+        assert_eq!(config.configured_appearance.theme.id(), "dark-glass");
         assert_eq!(
-            config.configured_appearance.theme,
-            compi_client::theme::ThemePreset::DarkGlass
+            config.configured_appearance.effective_terminal_theme().id(),
+            "dark-glass"
         );
         assert_eq!(config.configured_sidebar_width, 240.0);
     }

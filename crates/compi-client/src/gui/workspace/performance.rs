@@ -186,7 +186,7 @@ impl CompiApp {
     }
 
     pub(super) fn render_fps_overlay(&self) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let label = self.performance.latest.as_ref().map_or_else(
             || "-- FPS".to_owned(),
             |latest| format!("{:.0} FPS", latest.render.updates_per_second),
@@ -202,31 +202,37 @@ impl CompiApp {
             .border_color(color(colors.border))
             .bg(color(colors.surface))
             .text_size(px(UI_SMALL_TEXT_SIZE))
-            .text_color(color(modal_text_color(colors.muted, colors)))
+            .text_color(color(modal_text_color(colors.muted, &colors)))
             .child(label)
             .into_any_element()
     }
 
     pub(super) fn render_performance_section(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let cache = self.cache_metrics();
         let latest = self.performance.latest.as_ref();
         let metric = |label: &'static str, value: String| {
             div()
-                .min_h(px(38.0))
+                .w_full()
+                .min_w_0()
+                .py_2()
                 .flex()
-                .items_center()
-                .justify_between()
-                .gap_4()
+                .flex_col()
+                .gap_1()
                 .border_b_1()
                 .border_color(color(colors.border))
                 .child(
                     div()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(color(modal_text_color(colors.muted, colors)))
+                        .text_color(color(modal_text_color(colors.muted, &colors)))
                         .child(label),
                 )
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(value))
+                .child(
+                    div()
+                        .min_w_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(value),
+                )
         };
         let render = latest.map(|latest| &latest.render);
         let client = latest.map(|latest| &latest.client);
@@ -237,7 +243,7 @@ impl CompiApp {
         };
         let process_summary = |cpu: Option<f32>, process: Option<&ProcessMetrics>| {
             format!(
-                "{} · {} · {}",
+                "CPU {} · Memory {} · {}",
                 cpu_label(cpu),
                 bytes_label(process.and_then(preferred_memory)),
                 resource_count_label(process),
@@ -250,208 +256,189 @@ impl CompiApp {
             blend_rgb(colors.surface, colors.foreground, 0.16)
         };
         div()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap_3()
-            .child(self.settings_heading(
-                "Performance",
-                "Current window frame rate and process measurements. FPS sampling runs while this page or the overlay is visible.",
+            .gap_4()
+            .child(self.settings_heading("Performance"))
+            .child(metric(
+                "Frame rate",
+                render.map_or_else(
+                    || "Waiting for measurements…".into(),
+                    |render| format!("{:.0} FPS", render.updates_per_second),
+                ),
             ))
-            .child(
-                div().flex().flex_wrap().gap_4().child(
-                    div()
-                        .flex_1()
-                        .min_w(px(280.0))
-                    .flex()
-                    .flex_col()
-                    .child(metric(
-                        "Current FPS",
-                        render.map_or_else(
-                            || "Waiting…".into(),
-                            |render| format!("{:.0} FPS", render.updates_per_second),
-                        ),
-                    ))
-                    .child(self.render_sparkline(&self.performance.fps_history)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(280.0))
-                    .flex()
-                    .flex_col()
-                    .child(self.settings_subheading("Resources"))
-                    .child(metric(
-                        "Client",
-                        process_summary(latest.and_then(|latest| latest.client_cpu), client),
-                    ))
-                    .child(metric(
-                        "Daemon",
-                        process_summary(
-                            latest.and_then(|latest| latest.daemon_cpu),
-                            daemon.map(|daemon| &daemon.process),
-                        ),
-                    ))
-                    .child(metric(
-                        "Daemon surfaces",
-                        daemon.map_or_else(|| "Waiting…".into(), |daemon| {
-                            format!(
-                                "{} live · {} attached · {} total",
-                                daemon.live_surfaces, daemon.attached_surfaces, daemon.surfaces
-                            )
-                        }),
-                    )),
+            .child(self.render_sparkline(&self.performance.fps_history))
+            .child(self.settings_subheading("Resources"))
+            .child(metric(
+                "Compi window",
+                process_summary(latest.and_then(|latest| latest.client_cpu), client),
             ))
-            .child(
-                div().flex().flex_wrap().gap_4().child(
-                div()
-                    .flex_1()
-                    .min_w(px(280.0))
-                    .flex()
-                    .flex_col()
-                    .child(self.settings_subheading("Renderer"))
-                    .child(
-                        div()
-                            .pb_2().text_size(px(UI_SMALL_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, colors)))
-                            .child(
-                                "Rebuild drops shaped-row and decoded-image caches. Terminal processes and daemon state keep running.",
-                            ),
-                    )
-                    .child(metric(
-                        "Shaped rows",
-                        format!("{} / {}", cache.shaped_rows, cache.shaped_capacity),
-                    ))
-                    .child(metric(
-                        "Decoded images",
+            .child(metric(
+                "Terminal server",
+                process_summary(
+                    latest.and_then(|latest| latest.daemon_cpu),
+                    daemon.map(|daemon| &daemon.process),
+                ),
+            ))
+            .child(metric(
+                "Terminals",
+                daemon.map_or_else(
+                    || "Waiting for measurements…".into(),
+                    |daemon| {
                         format!(
-                            "{:.1} / {:.0} MiB",
-                            cache.image_bytes as f64 / 1_048_576.0,
-                            cache.image_capacity as f64 / 1_048_576.0
-                        ),
-                    ))
-                    .child(metric("Pending decodes", cache.pending_decodes.to_string())),
-            )
+                            "{} running · {} connected · {} total",
+                            daemon.live_surfaces, daemon.attached_surfaces, daemon.surfaces
+                        )
+                    },
+                ),
+            ))
+            .child(self.settings_subheading("Renderer"))
+            .child(metric(
+                "Cached text rows",
+                format!("{} / {}", cache.shaped_rows, cache.shaped_capacity),
+            ))
+            .child(metric(
+                "Cached images",
+                format!(
+                    "{:.1} / {:.0} MiB",
+                    cache.image_bytes as f64 / 1_048_576.0,
+                    cache.image_capacity as f64 / 1_048_576.0
+                ),
+            ))
+            .child(metric(
+                "Images waiting to decode",
+                cache.pending_decodes.to_string(),
+            ))
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(280.0))
+                    .id("settings-show-fps")
+                    .relative()
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(48.0))
+                    .px_3()
+                    .py_2()
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(self.settings_subheading("Tools"))
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color(if fps_focused {
+                        colors.accent
+                    } else {
+                        toggle_background
+                    }))
+                    .bg(color(toggle_background))
+                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.show_fps = !this.state.show_fps;
+                        this.save_state();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
                     .child(
                         div()
-                            .id("settings-show-fps")
-                            .min_h(px(56.0))
-                            .px_3()
+                            .min_w_0()
+                            .flex_1()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Show FPS"),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(44.0))
+                            .h(px(24.0))
+                            .p(px(3.0))
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(color(if fps_focused {
-                                colors.accent
-                            } else {
-                                toggle_background
-                            }))
-                            .bg(color(toggle_background))
-                            .hover(move |style| {
-                                style.bg(color(colors.surface_hover)).cursor_pointer()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.show_fps = !this.state.show_fps;
-                                this.save_state();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }))
+                            .rounded_full()
+                            .bg(color(switch_background))
+                            .when(self.state.show_fps, |toggle| toggle.justify_end())
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Show FPS overlay"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                                            .text_color(color(modal_text_color(
-                                                colors.muted,
-                                                colors,
-                                            )))
-                                            .child("Current window frame rate."),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(44.0))
-                                    .h(px(24.0))
-                                    .p(px(3.0))
-                                    .flex()
-                                    .items_center()
+                                    .size(px(18.0))
                                     .rounded_full()
-                                    .bg(color(switch_background))
-                                    .when(self.state.show_fps, |toggle| toggle.justify_end())
-                                    .child(
-                                        div()
-                                            .size(px(18.0))
-                                            .rounded_full()
-                                            .bg(color(ui_text_color(
-                                                colors.foreground,
-                                                switch_background,
-                                            ))),
-                                    ),
+                                    .bg(color(ui_text_color(colors.foreground, switch_background))),
                             ),
                     )
+                    .child(self.settings_focus_anchor(fps_focused, cx)),
+            )
+            .child(
+                div()
+                    .relative()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_2()
+                    .child(self.settings_action_button(
+                        "settings-rebuild-renderer",
+                        "Rebuild renderer",
+                        self.overlay_focus == self.settings_content_focus(1),
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            this.rebuild_renderer(window);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.settings_focus_anchor(
+                        self.overlay_focus == self.settings_content_focus(1),
+                        cx,
+                    ))
                     .child(
                         div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(self.settings_action_button(
-                                "settings-rebuild-renderer",
-                                "Rebuild renderer",
-                                self.overlay_focus == self.settings_content_focus(1),
-                                false,
-                                cx.listener(|this, _, window, cx| {
-                                    this.rebuild_renderer(window);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(self.settings_action_button(
-                                "settings-copy-performance",
-                                "Copy diagnostics",
-                                self.overlay_focus == self.settings_content_focus(2),
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.copy_performance_diagnostics(cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            )),
-                    )
-                    .when_some(self.performance_notice.clone(), |section, notice| {
-                        section.child(
-                            div().text_size(px(UI_SMALL_TEXT_SIZE))
-                                .text_color(color(modal_text_color(colors.muted, colors)))
-                                .child(notice),
-                        )
-                    })
-                    .when_some(self.performance.error.clone(), |section, error| {
-                        section.child(
-                            div().text_size(px(UI_SMALL_TEXT_SIZE)).text_color(color(modal_text_color(colors.error, colors)))
-                                .child(error),
-                        )
-                    }),
-            ))
+                            .w_full()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
+                            .child("Clears rendering caches without stopping your terminals."),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .child(self.settings_action_button(
+                        "settings-copy-performance",
+                        "Copy diagnostics",
+                        self.overlay_focus == self.settings_content_focus(2),
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.copy_performance_diagnostics(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.settings_focus_anchor(
+                        self.overlay_focus == self.settings_content_focus(2),
+                        cx,
+                    )),
+            )
+            .when_some(self.performance_notice.clone(), |section, notice| {
+                section.child(
+                    div()
+                        .min_w_0()
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .text_color(color(modal_text_color(colors.muted, &colors)))
+                        .child(notice),
+                )
+            })
+            .when_some(self.performance.error.clone(), |section, error| {
+                section.child(
+                    div()
+                        .min_w_0()
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .text_color(color(modal_text_color(colors.error, &colors)))
+                        .child(error),
+                )
+            })
             .into_any_element()
     }
 
     fn render_sparkline(&self, values: &VecDeque<f32>) -> AnyElement {
-        let colors = self.colors();
+        let colors = *self.colors();
         let max = values.iter().copied().fold(1.0_f32, f32::max);
         div()
             .h(px(24.0))

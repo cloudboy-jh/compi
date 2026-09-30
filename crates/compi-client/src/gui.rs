@@ -10,7 +10,8 @@ use crate::input::{
 };
 use crate::layout::{self, LayoutMetrics, WorkspaceLayout};
 use crate::selection::{GridPoint, Selection, line_selection, selected_text, word_selection};
-use crate::theme::{BackgroundEffect, ThemeColors, ThemePreset};
+use crate::theme::{BackgroundEffect, TerminalPalette, ThemeColors, ThemeDefinition, ThemeId};
+use crate::theme_store::ThemeLibrary;
 use compi_protocol::{
     LayoutNode, MutationId, MutationRequest, PaneId, SessionId, SplitAxis, TabId,
     WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
@@ -84,6 +85,9 @@ const TITLEBAR_BRAND_WIDTH: f32 = 158.0;
 const UI_BODY_TEXT_SIZE: f32 = 14.0;
 const UI_SMALL_TEXT_SIZE: f32 = 13.0;
 const UI_MICRO_TEXT_SIZE: f32 = 12.0;
+const UI_BODY_LINE_HEIGHT: f32 = 20.0;
+const UI_SMALL_LINE_HEIGHT: f32 = 18.0;
+const UI_MICRO_LINE_HEIGHT: f32 = 16.0;
 const TAB_DRAG_THRESHOLD: f32 = 4.0;
 const TERMINAL_PADDING: f32 = 8.0;
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
@@ -445,9 +449,13 @@ impl SurfaceView {
 }
 enum UiEvent {
     StateSaveFinished,
+    ThemeLibraryReloaded {
+        library: ThemeLibrary,
+        diagnostics: Vec<String>,
+    },
     AppearanceReloaded {
         appearance: AppearanceSettings,
-        favorites: Vec<ThemePreset>,
+        favorites: Vec<ThemeId>,
         ui_font: UiFontPreset,
         terminal_font_family: String,
         diagnostics: Vec<String>,
@@ -744,10 +752,14 @@ struct CompiApp {
     state: ClientState,
     defaults: ClientState,
     config: LoadedConfig,
-    theme: ThemePreset,
+    theme: Arc<ThemeDefinition>,
+    terminal_theme: Arc<ThemeDefinition>,
+    terminal_theme_override: bool,
+    transparent_background: bool,
+    theme_library: ThemeLibrary,
     ui_font: UiFontPreset,
     theme_catalog: Option<workspace::catalog::CatalogState>,
-    pending_appearance_reload: Option<(AppearanceSettings, Vec<ThemePreset>, UiFontPreset, String)>,
+    pending_appearance_reload: Option<(AppearanceSettings, Vec<ThemeId>, UiFontPreset, String)>,
     pending_image_inputs: HashSet<u64>,
     image_previews: VecDeque<workspace::media::ImagePreview>,
     image_inspector: Option<workspace::media::InspectorState>,
@@ -769,6 +781,9 @@ struct CompiApp {
     overlay_generation: u64,
     overlay_closing_since: Option<Instant>,
     settings_section: SettingsSection,
+    pub(in crate::gui) settings_font_picker: Option<SettingsSection>,
+    pub(in crate::gui) settings_scroll_bounds: Option<Bounds<Pixels>>,
+    pub(in crate::gui) settings_scroll_to_focus: bool,
     performance_enabled: Arc<AtomicBool>,
     performance: workspace::performance::PerformanceMonitor,
     performance_notice: Option<String>,
@@ -1254,7 +1269,7 @@ impl CompiApp {
 struct HeaderTooltip {
     title: String,
     reason: Option<String>,
-    colors: &'static ThemeColors,
+    colors: ThemeColors,
 }
 
 impl Render for HeaderTooltip {
@@ -1271,12 +1286,15 @@ impl Render for HeaderTooltip {
             .bg(color(self.colors.surface))
             .text_size(px(UI_SMALL_TEXT_SIZE))
             .font_weight(FontWeight::MEDIUM)
-            .text_color(color(modal_text_color(self.colors.foreground, self.colors)))
+            .text_color(color(modal_text_color(
+                self.colors.foreground,
+                &self.colors,
+            )))
             .child(self.title.clone())
             .when_some(self.reason.clone(), |tooltip, reason| {
                 tooltip.child(
                     div()
-                        .text_color(color(modal_text_color(self.colors.muted, self.colors)))
+                        .text_color(color(modal_text_color(self.colors.muted, &self.colors)))
                         .child(reason),
                 )
             })
@@ -1285,7 +1303,7 @@ impl Render for HeaderTooltip {
 struct TabTooltip {
     title: Option<String>,
     panes: Vec<(String, Option<String>)>,
-    colors: &'static ThemeColors,
+    colors: ThemeColors,
 }
 
 impl Render for TabTooltip {
@@ -1308,7 +1326,10 @@ impl Render for TabTooltip {
             .border_color(color(self.colors.border))
             .bg(color(self.colors.surface))
             .text_size(px(UI_SMALL_TEXT_SIZE))
-            .text_color(color(modal_text_color(self.colors.foreground, self.colors)))
+            .text_color(color(modal_text_color(
+                self.colors.foreground,
+                &self.colors,
+            )))
             .when_some(header, |tooltip, header| {
                 tooltip.child(
                     div()
@@ -1320,7 +1341,7 @@ impl Render for TabTooltip {
                             } else {
                                 self.colors.foreground
                             },
-                            self.colors,
+                            &self.colors,
                         )))
                         .child(header),
                 )
@@ -1352,7 +1373,7 @@ impl Render for TabTooltip {
                                                 .text_size(px(UI_MICRO_TEXT_SIZE))
                                                 .text_color(color(modal_text_color(
                                                     self.colors.muted,
-                                                    self.colors,
+                                                    &self.colors,
                                                 )))
                                                 .child(format!("{}", index + 1)),
                                         )
@@ -1381,7 +1402,7 @@ impl Render for TabTooltip {
                                                         .text_size(px(UI_MICRO_TEXT_SIZE))
                                                         .text_color(color(modal_text_color(
                                                             self.colors.muted,
-                                                            self.colors,
+                                                            &self.colors,
                                                         )))
                                                         .child(directory),
                                                 )
@@ -1530,7 +1551,7 @@ fn window_control(
     icon: ChromeIcon,
     area: WindowControlArea,
     destructive: bool,
-    colors: &'static ThemeColors,
+    colors: ThemeColors,
 ) -> impl IntoElement {
     div()
         .id(id)
@@ -1799,7 +1820,7 @@ struct PaintModel {
     images: HashMap<u32, Arc<RenderImage>>,
     row_render_cache: Arc<Mutex<RowRenderCache>>,
     typography: Arc<TerminalTypography>,
-    theme: ThemePreset,
+    theme: Arc<ThemeDefinition>,
     focused: bool,
 }
 
@@ -1807,7 +1828,7 @@ impl PaintModel {
     fn from_tab(
         tab: &SurfaceView,
         typography: Arc<TerminalTypography>,
-        theme: ThemePreset,
+        theme: Arc<ThemeDefinition>,
         focused: bool,
     ) -> Option<Self> {
         let snapshot = tab.mirror.snapshot()?;
@@ -1842,7 +1863,14 @@ fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Windo
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         paint_images(bounds, model, base, false, typography, window);
         for (row_index, row) in visible.iter().enumerate() {
-            paint_row_backgrounds(bounds, row_index, row, typography, model.theme, window);
+            paint_row_backgrounds(
+                bounds,
+                row_index,
+                row,
+                typography,
+                model.theme.terminal(),
+                window,
+            );
         }
         if let Some(selection) = model.selection {
             paint_selection(
@@ -1851,7 +1879,7 @@ fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Windo
                 base,
                 visible.len(),
                 typography,
-                model.theme,
+                model.theme.terminal(),
                 window,
             );
         }
@@ -1863,7 +1891,7 @@ fn paint_terminal(bounds: Bounds<Pixels>, model: &PaintModel, window: &mut Windo
                 row,
                 &model.row_render_cache,
                 typography,
-                model.theme,
+                model.theme.terminal(),
                 window,
             );
         }
@@ -1877,17 +1905,13 @@ fn paint_row_backgrounds(
     row_index: usize,
     row: &Row,
     typography: &TerminalTypography,
-    theme: ThemePreset,
+    theme: &TerminalPalette,
     window: &mut Window,
 ) {
     let mut start = 0;
     while start < row.cells.len() {
-        let background = effective_colors(&row.cells[start], theme).1;
-        let mut end = start + 1;
-        while end < row.cells.len() && effective_colors(&row.cells[end], theme).1 == background {
-            end += 1;
-        }
-        if background != color(theme.colors().background) {
+        let (end, background) = background_run(&row.cells, start, theme);
+        if let Some(background) = background {
             window.paint_quad(fill(
                 Bounds::new(
                     point(
@@ -1983,7 +2007,7 @@ fn paint_row_text(
     row: &Row,
     cache: &Arc<Mutex<RowRenderCache>>,
     typography: &TerminalTypography,
-    theme: ThemePreset,
+    theme: &TerminalPalette,
     window: &mut Window,
 ) {
     let fingerprint = row_fingerprint(row);
@@ -2051,17 +2075,17 @@ fn paint_composition(
     cursor: CursorState,
     text: SharedString,
     typography: &TerminalTypography,
-    theme: ThemePreset,
+    theme: &TerminalPalette,
     window: &mut Window,
     cx: &mut App,
 ) {
     let run = TextRun {
         len: text.len(),
         font: typography.font.clone(),
-        color: color(theme.colors().foreground),
+        color: color(theme.foreground),
         background_color: None,
         underline: Some(UnderlineStyle {
-            color: Some(color(theme.colors().accent)),
+            color: Some(color(theme.cursor)),
             thickness: px(1.0),
             wavy: false,
         }),
@@ -2081,7 +2105,7 @@ fn paint_composition(
             point(origin.x, cell_top),
             size(line.width, px(typography.cell_height)),
         ),
-        color(theme.colors().background),
+        color(theme.background),
     ));
     let _ = line.paint(origin, px(typography.cell_height), window, cx);
 }
@@ -2089,7 +2113,7 @@ fn paint_composition(
 fn shape_row(
     row: &Row,
     typography: &TerminalTypography,
-    theme: ThemePreset,
+    theme: &TerminalPalette,
     window: &mut Window,
 ) -> Vec<ShapedRun> {
     let mut shaped = Vec::new();
@@ -2195,7 +2219,7 @@ fn paint_selection(
     base: usize,
     visible_rows: usize,
     typography: &TerminalTypography,
-    theme: ThemePreset,
+    theme: &TerminalPalette,
     window: &mut Window,
 ) {
     let (start, end) = selection.ordered();
@@ -2230,7 +2254,7 @@ fn paint_selection(
                     px(typography.cell_height),
                 ),
             ),
-            color(theme.colors().selection).opacity(0.82),
+            color_with_default_opacity(theme.selection, 0.82),
         ));
     }
 }
@@ -2268,7 +2292,7 @@ fn paint_cursor(
     };
     window.paint_quad(fill(
         cursor_bounds,
-        color(model.theme.colors().cursor).opacity(0.78),
+        color_with_default_opacity(model.theme.terminal().cursor, 0.78),
     ));
 }
 
@@ -2333,7 +2357,7 @@ fn same_text_style(left: &Cell, right: &Cell) -> bool {
         && left.hyperlink == right.hyperlink
 }
 
-fn effective_colors(cell: &Cell, theme: ThemePreset) -> (Hsla, Hsla) {
+fn effective_colors(cell: &Cell, theme: &TerminalPalette) -> (Hsla, Hsla) {
     let foreground = terminal_color(cell.foreground, true, theme);
     let background = terminal_color(cell.background, false, theme);
     if cell.attributes.inverse {
@@ -2341,6 +2365,29 @@ fn effective_colors(cell: &Cell, theme: ThemePreset) -> (Hsla, Hsla) {
     } else {
         (foreground, background)
     }
+}
+
+fn cell_background_fill(cell: &Cell, theme: &TerminalPalette) -> Option<Hsla> {
+    // Only the semantic default leaves the pane's desktop-transparent background exposed.
+    // Explicit backgrounds and inverse cells paint exact RGB, including translucent ANSI tokens.
+    (cell.attributes.inverse || cell.background != Color::Default).then(|| {
+        let mut background = effective_colors(cell, theme).1;
+        background.a = 1.0;
+        background
+    })
+}
+
+fn background_run(
+    cells: &[Cell],
+    start: usize,
+    palette: &TerminalPalette,
+) -> (usize, Option<Hsla>) {
+    let background = cell_background_fill(&cells[start], palette);
+    let mut end = start + 1;
+    while end < cells.len() && cell_background_fill(&cells[end], palette) == background {
+        end += 1;
+    }
+    (end, background)
 }
 fn diagnostic_warning(config: &[String], typography: &[String]) -> Option<String> {
     let warning = config
@@ -2352,22 +2399,45 @@ fn diagnostic_warning(config: &[String], typography: &[String]) -> Option<String
     (!warning.is_empty()).then_some(warning)
 }
 
-fn terminal_color(value: Color, foreground: bool, theme: ThemePreset) -> Hsla {
+fn terminal_color(value: Color, foreground: bool, theme: &TerminalPalette) -> Hsla {
     match value {
         Color::Default => color(if foreground {
-            theme.colors().foreground
+            theme.foreground
         } else {
-            theme.colors().background
+            theme.background
         }),
         Color::Rgb(red, green, blue) => {
             color((u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue))
         }
-        Color::Indexed(index) => color(theme.colors().indexed(index)),
+        Color::Indexed(index) => color(theme.indexed(index)),
     }
 }
 
 fn color(value: u32) -> Hsla {
-    rgb(value).into()
+    let mut color: Hsla = rgb(value & 0x00ff_ffff).into();
+    color.a = (255 - (value >> 24)) as f32 / 255.0;
+    color
+}
+
+fn material_color(value: u32, opacity: f32) -> Hsla {
+    let mut color = color(value);
+    if opacity >= 1.0 {
+        // Disabling window transparency must yield the token's solid RGB, regardless of its alpha.
+        color.a = 1.0;
+        color
+    } else {
+        color.opacity(opacity)
+    }
+}
+
+fn color_with_default_opacity(value: u32, default_opacity: f32) -> Hsla {
+    let color = color(value);
+    if value >> 24 == 0 {
+        color.opacity(default_opacity)
+    } else {
+        // An explicit Zed alpha supersedes the legacy opacity of opaque bundled tokens.
+        color
+    }
 }
 
 fn ui_text_color(preferred: u32, background: u32) -> u32 {
@@ -2375,13 +2445,16 @@ fn ui_text_color(preferred: u32, background: u32) -> u32 {
 }
 
 fn modal_text_color(preferred: u32, colors: &ThemeColors) -> u32 {
+    // Material is independent: assess alpha surfaces over the application color baseline.
+    let background = colors.background & 0x00ff_ffff;
+    let surface = composite_rgb(colors.surface, background);
     ui_text_color_for(
         preferred,
         &[
-            colors.background,
-            colors.surface,
-            colors.surface_hover,
-            colors.selection,
+            background,
+            surface,
+            composite_rgb(colors.surface_hover, surface),
+            composite_rgb(colors.selection, surface),
         ],
     )
 }
@@ -2420,23 +2493,52 @@ fn ui_text_color_for(preferred: u32, backgrounds: &[u32]) -> u32 {
 }
 
 fn blend_rgb(from: u32, to: u32, amount: f32) -> u32 {
+    let amount = amount.clamp(0.0, 1.0);
     let channel = |shift: u32| {
         let from = ((from >> shift) & 0xff_u32) as f32;
         let to = ((to >> shift) & 0xff_u32) as f32;
         (from + (to - from) * amount).round() as u32
     };
-    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+    // Interpolating inverse alpha is equivalent to interpolating alpha. Opaque RGB is unchanged.
+    (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 fn contrast_ratio(first: u32, second: u32) -> f32 {
-    let first = relative_luminance(first);
-    let second = relative_luminance(second);
-    let (lighter, darker) = if first >= second {
-        (first, second)
-    } else {
-        (second, first)
+    let contrast_over = |backdrop| {
+        let background = composite_rgb(second, backdrop);
+        let first = relative_luminance(composite_rgb(first, background));
+        let second = relative_luminance(background);
+        let (lighter, darker) = if first >= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (lighter + 0.05) / (darker + 0.05)
     };
-    (lighter + 0.05) / (darker + 0.05)
+    let on_black = contrast_over(0x000000);
+    if second >> 24 == 0 {
+        on_black
+    } else {
+        // A translucent surface has no known desktop backdrop. Check both light and dark
+        // backdrops rather than silently assessing its uncomposited RGB as an opaque surface.
+        on_black.min(contrast_over(0xffffff))
+    }
+}
+
+fn composite_rgb(foreground: u32, opaque_background: u32) -> u32 {
+    let inverse_alpha = foreground >> 24;
+    if inverse_alpha == 0 {
+        return foreground & 0x00ff_ffff;
+    }
+    if inverse_alpha == 255 {
+        return opaque_background & 0x00ff_ffff;
+    }
+    let alpha = (255 - inverse_alpha) as f32 / 255.0;
+    blend_rgb(
+        opaque_background & 0x00ff_ffff,
+        foreground & 0x00ff_ffff,
+        alpha,
+    )
 }
 
 fn relative_luminance(value: u32) -> f32 {
@@ -2979,12 +3081,154 @@ fn log_performance_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemePreset;
     #[test]
     fn starts_tab_drag_only_after_crossing_threshold() {
         let origin = point(px(10.0), px(10.0));
 
         assert!(!drag_threshold_crossed(origin, point(px(12.0), px(12.0))));
         assert!(drag_threshold_crossed(origin, point(px(14.0), px(10.0))));
+    }
+
+    #[test]
+    fn matching_explicit_background_is_opaque_and_not_grouped_with_default() {
+        let palette = ThemePreset::DarkGlass.terminal();
+        let value = palette.background;
+        let explicit = Cell {
+            background: Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8),
+            ..Cell::default()
+        };
+        let mut inverse = Cell::default();
+        inverse.attributes.inverse = true;
+        let cells = [
+            Cell::default(),
+            explicit.clone(),
+            explicit,
+            Cell::default(),
+            inverse,
+        ];
+        assert_eq!(background_run(&cells, 0, palette), (1, None));
+        assert_eq!(background_run(&cells, 1, palette), (3, Some(color(value))));
+        assert_eq!(background_run(&cells, 3, palette), (4, None));
+        assert_eq!(
+            background_run(&cells, 4, palette),
+            (5, Some(color(palette.foreground)))
+        );
+    }
+
+    #[test]
+    fn inverse_explicit_foreground_matching_default_background_stays_opaque() {
+        let palette = ThemePreset::DarkGlass.terminal();
+        let value = palette.background;
+        let mut cell = Cell {
+            foreground: Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8),
+            ..Cell::default()
+        };
+        cell.attributes.inverse = true;
+        assert_eq!(cell_background_fill(&cell, palette), Some(color(value)));
+    }
+
+    #[test]
+    fn packed_theme_alpha_and_material_opacity_compose_without_changing_rgb() {
+        let opaque = color(0x123456);
+        let translucent = color(0x80123456);
+        assert_eq!(
+            translucent,
+            Hsla {
+                a: 127.0 / 255.0,
+                ..opaque
+            }
+        );
+        assert_eq!(color(0xff123456), Hsla { a: 0.0, ..opaque });
+        assert_eq!(translucent.opacity(0.6).a, (127.0 / 255.0) * 0.6);
+        assert_eq!(
+            color_with_default_opacity(0x123456, 0.82),
+            opaque.opacity(0.82)
+        );
+        assert_eq!(color_with_default_opacity(0x80123456, 0.82), translucent);
+        assert_eq!(color_with_default_opacity(0xff123456, 0.82).a, 0.0);
+    }
+
+    #[test]
+    fn material_background_respects_disabled_transparency_and_theme_alpha_when_enabled() {
+        assert_eq!(material_color(0xff123456, 1.0), color(0x123456));
+        assert_eq!(material_color(0x80123456, 1.0), color(0x123456));
+        assert_eq!(
+            material_color(0x80123456, 0.6),
+            color(0x80123456).opacity(0.6)
+        );
+        assert_eq!(material_color(0xff123456, 0.6).a, 0.0);
+        assert_eq!(material_color(0x123456, 0.6), color(0x123456).opacity(0.6));
+    }
+
+    #[test]
+    fn blends_preserve_alpha_and_contrast_uses_visible_colors() {
+        assert_eq!(blend_rgb(0xff000000, 0xffffff, 0.5), 0x80808080);
+        assert_eq!(blend_rgb(0x000000, 0xffffff, 0.5), 0x808080);
+        assert_eq!(contrast_ratio(0xff000000, 0xffffff), 1.0);
+        assert_eq!(contrast_ratio(0x000000, 0xffffffff), 1.0);
+        assert!((contrast_ratio(0x000000, 0xffffff) - 21.0).abs() < 0.00001);
+        assert!(contrast_ratio(0x80000000, 0xffffff) < contrast_ratio(0x000000, 0xffffff));
+    }
+
+    #[test]
+    fn translucent_terminal_tokens_never_make_explicit_or_inverse_backgrounds_transparent() {
+        let mut palette = *ThemePreset::DarkGlass.terminal();
+        palette.background = 0xff123456;
+        palette.foreground = 0x80abcdef;
+        palette.ansi[0] = 0xc0123456;
+        assert_eq!(cell_background_fill(&Cell::default(), &palette), None);
+        assert_eq!(
+            effective_colors(&Cell::default(), &palette).0,
+            color(palette.foreground)
+        );
+        for (background, expected) in [
+            (Color::Indexed(0), 0x123456),
+            (Color::Indexed(16), 0x000000),
+            (Color::Indexed(21), 0x0000ff),
+            (Color::Indexed(232), 0x080808),
+            (Color::Rgb(0x12, 0x34, 0x56), 0x123456),
+        ] {
+            let cell = Cell {
+                background,
+                ..Cell::default()
+            };
+            assert_eq!(cell_background_fill(&cell, &palette), Some(color(expected)));
+        }
+        for (foreground, expected) in [
+            (Color::Default, 0xabcdef),
+            (Color::Indexed(0), 0x123456),
+            (Color::Indexed(21), 0x0000ff),
+            (Color::Rgb(0x12, 0x34, 0x56), 0x123456),
+        ] {
+            let mut cell = Cell {
+                foreground,
+                ..Cell::default()
+            };
+            cell.attributes.inverse = true;
+            assert_eq!(cell_background_fill(&cell, &palette), Some(color(expected)));
+        }
+        let explicit = Cell {
+            background: Color::Indexed(0),
+            ..Cell::default()
+        };
+        let cells = [Cell::default(), explicit.clone(), explicit];
+        assert_eq!(background_run(&cells, 0, &palette), (1, None));
+        assert_eq!(
+            background_run(&cells, 1, &palette),
+            (3, Some(color(0x123456)))
+        );
+    }
+
+    #[test]
+    fn modal_alpha_surfaces_keep_readable_text_over_the_solid_color_baseline() {
+        let mut colors = *ThemePreset::CompiNeutral.colors();
+        colors.background = 0xff123456;
+        colors.surface = 0x80456789;
+        let adjusted = modal_text_color(0xffffff, &colors);
+        for background in [0x123456, composite_rgb(colors.surface, 0x123456)] {
+            assert!(contrast_ratio(adjusted, background) >= 4.5);
+        }
     }
 
     #[test]
