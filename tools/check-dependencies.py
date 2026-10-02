@@ -41,7 +41,8 @@ def main():
     rules = {
         "compi-protocol": graphics | {"portable-pty", "compi-daemon"},
         "compi-client": {"portable-pty", "compi-daemon"},
-        "compi-daemon": graphics,
+        "compi-daemon": graphics | {"compi-update"},
+        "compi-update": graphics | {"portable-pty", "compi-daemon", "compi-protocol"},
     }
     for name, forbidden in rules.items():
         pending = [members[name]]
