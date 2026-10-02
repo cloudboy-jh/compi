@@ -231,7 +231,7 @@ try:
         update_cycle = json.loads(runs[0].read_text())
     qualification = {
         "schema": 1, "platform": "macos-aarch64", "version": version,
-        "daemon_protocol": 14, "qualified_daemons": [version],
+        "daemon_protocol": 15, "qualified_daemons": [version],
         "artifact_sha256": payload_hash, "installer_scenarios": scenarios,
     }
     if update_cycle:

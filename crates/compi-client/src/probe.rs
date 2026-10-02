@@ -4,8 +4,9 @@ use crate::connection::ConnectionTarget;
 use crate::console;
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use compi_protocol::{
-    ClientMessage, PaneId, ScreenMessage, ServerMessage, SessionId, SplitAxis, SurfaceId,
-    SurfaceInfo, SurfaceStatus, TabId, WorkspaceMutation,
+    ClientMessage, LayoutNode, PaneId, ScreenMessage, ServerMessage, SessionId, SplitAxis,
+    SurfaceId, SurfaceInfo, SurfaceStatus, TabId, WorkspaceMutation, WorkspaceSnapshot,
+    WorkspaceTab,
 };
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -108,13 +109,21 @@ fn usage() {
          compi-probe [connection options] tab rename <tab-id> <label>\n  \
          compi-probe [connection options] tab move <session-id> <tab-id> <index>\n  \
          compi-probe [connection options] tab remove <tab-id>\n  \
+         compi-probe [connection options] tab arrange <tab-id> <preset> [--with <tab-id>]... [--main <pane-id>] [--mirror] [--flip]\n  \
+         compi-probe [connection options] tab mirror|flip|restore-arrangement|split-merged <tab-id>\n  \
          compi-probe [connection options] pane split-right|split-down <pane-id> [working-directory]\n  \
+         compi-probe [connection options] pane swap <pane-id> <pane-id>\n  \
          compi-probe [connection options] pane remove <pane-id>\n  \
          compi-probe [connection options] surface attach|inspect|end|restart <surface-id>\n  \
          compi-probe [connection options] soak <seconds>\n  \
          compi-probe [connection options] shutdown\n  \
          compi-probe check-system\n\n\
          Connection options select an isolated instance, an SSH host, or both.\n\
+         Presets: columns, rows, grid, main-side, main-top, equalize, or a named\n\
+         [layout_presets.NAME] from the Compi configuration. --with merges another\n\
+         tab of the same workspace into <tab-id>; split-merged (or restore-arrangement\n\
+         right after a merge) recreates the merged tabs. Arranging only moves and\n\
+         resizes existing panes; no shell is started, restarted, or ended.\n\
          Press Ctrl+] to detach without stopping the shell."
     );
 }
@@ -158,6 +167,12 @@ fn session_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
 }
 
 fn tab_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("arrange" | "mirror" | "flip" | "restore-arrangement" | "split-merged")
+    ) {
+        return arrange_command(target, args);
+    }
     let mut client = target.connect()?;
     let (cols, rows) = console::dimensions();
     let operation = match args.first().map(String::as_str) {
@@ -188,6 +203,9 @@ fn tab_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
 }
 
 fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
+    if args.first().map(String::as_str) == Some("swap") {
+        return arrange_command(target, args);
+    }
     let mut client = target.connect()?;
     let (cols, rows) = console::dimensions();
     let workspace = client.workspace()?;
@@ -256,12 +274,22 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
         },
         _ => return Err("invalid pane command; run compi-probe help".into()),
     };
+    print_receipt(submit(&mut client, &workspace, operation)?)
+}
+
+/// Submit against the snapshot the operation was computed from, so a concurrent
+/// change is reported as a revision conflict instead of being overwritten.
+fn submit(
+    client: &mut DaemonClient,
+    workspace: &WorkspaceSnapshot,
+    operation: WorkspaceMutation,
+) -> Result<compi_protocol::MutationReceipt> {
     let ordinal = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    print_receipt(client.submit_mutation(compi_protocol::MutationRequest {
-        server_id: workspace.server_id,
-        expected_generation: workspace.server_generation,
+    client.submit_mutation(compi_protocol::MutationRequest {
+        server_id: workspace.server_id.clone(),
+        expected_generation: workspace.server_generation.clone(),
         expected_revision: workspace.revision,
         mutation_id: compi_protocol::MutationId::new(format!(
             "probe-{}-{ordinal}",
@@ -269,7 +297,157 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
         )),
         operation,
         launch: None,
-    })?)
+    })
+}
+
+fn arrange_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
+    use crate::arrangement::{self, Builtin, Preset, Transform};
+    let mut client = target.connect()?;
+    let workspace = client.workspace()?;
+    let tabs = || workspace.sessions.iter().flat_map(|session| &session.tabs);
+    let tab_by_id = |id: &str| -> Result<&WorkspaceTab> {
+        tabs()
+            .find(|tab| tab.id.as_str() == id)
+            .ok_or_else(|| format!("tab {id} was not found").into())
+    };
+    let arrange = |tab: &WorkspaceTab, layout: LayoutNode| WorkspaceMutation::ArrangeTab {
+        tab_id: tab.id.clone(),
+        layout,
+    };
+    let operation = match args.first().map(String::as_str) {
+        Some("swap") if args.len() == 3 => {
+            let (a, b) = (PaneId::new(args[1].clone()), PaneId::new(args[2].clone()));
+            let tab = tabs()
+                .find(|tab| {
+                    arrangement::leaves(&tab.layout)
+                        .iter()
+                        .any(|(id, _)| id == &a)
+                })
+                .ok_or_else(|| format!("pane {a} was not found"))?;
+            let layout = arrangement::swap(&tab.layout, &a, &b)
+                .ok_or("swap needs two different panes in the same tab")?;
+            arrange(tab, layout)
+        }
+        // Restore undoes the last change: an arrangement, or else a merge.
+        Some(action @ ("restore-arrangement" | "split-merged")) if args.len() == 2 => {
+            let tab = tab_by_id(&args[1])?;
+            match tab.previous_layout.as_deref() {
+                Some(previous) if action == "restore-arrangement" => {
+                    let layout = arrangement::restore(previous, &tab.layout).ok_or(
+                        "the previous arrangement no longer contains any of the tab's panes",
+                    )?;
+                    arrange(tab, layout)
+                }
+                _ if tab.merge.is_some() => WorkspaceMutation::SplitMergedTabs {
+                    tab_id: tab.id.clone(),
+                },
+                _ => return Err("the tab has no previous arrangement or merged tabs".into()),
+            }
+        }
+        Some(action @ ("mirror" | "flip")) if args.len() == 2 => {
+            let tab = tab_by_id(&args[1])?;
+            let transform = Transform {
+                mirror: action == "mirror",
+                flip: action == "flip",
+            };
+            arrange(
+                tab,
+                arrangement::apply_transform(tab.layout.clone(), transform),
+            )
+        }
+        Some("arrange") if args.len() >= 3 => {
+            let tab = tab_by_id(&args[1])?;
+            let session = workspace
+                .sessions
+                .iter()
+                .find(|session| session.tabs.iter().any(|candidate| candidate.id == tab.id))
+                .expect("the tab was found in a session");
+            let mut transform = Transform::default();
+            let mut main = None;
+            let mut sources = Vec::new();
+            let mut options = args[3..].iter();
+            while let Some(option) = options.next() {
+                match option.as_str() {
+                    "--mirror" => transform.mirror = true,
+                    "--flip" => transform.flip = true,
+                    "--main" if main.is_none() => {
+                        main = Some(PaneId::new(
+                            options.next().ok_or("--main requires a pane ID")?.clone(),
+                        ));
+                    }
+                    "--with" => {
+                        let id = options.next().ok_or("--with requires a tab ID")?;
+                        if id == tab.id.as_str()
+                            || sources.iter().any(|source: &TabId| source.as_str() == id)
+                        {
+                            return Err(
+                                format!("tab {id} is already part of the arrangement").into()
+                            );
+                        }
+                        if !session
+                            .tabs
+                            .iter()
+                            .any(|candidate| candidate.id.as_str() == id)
+                        {
+                            return Err(
+                                format!("tab {id} is not in tab {}'s workspace", tab.id).into()
+                            );
+                        }
+                        sources.push(TabId::new(id.clone()));
+                    }
+                    _ => return Err(format!("unknown arrange option {option:?}").into()),
+                }
+            }
+            // The receiving tab first, then merged tabs in workspace order.
+            let layouts: Vec<&LayoutNode> = std::iter::once(&tab.layout)
+                .chain(
+                    session
+                        .tabs
+                        .iter()
+                        .filter(|candidate| sources.contains(&candidate.id))
+                        .map(|candidate| &candidate.layout),
+                )
+                .collect();
+            let current = arrangement::combine(&layouts).expect("the receiving tab has a layout");
+            if let Some(main) = &main
+                && !arrangement::leaves(&current)
+                    .iter()
+                    .any(|(id, _)| id == main)
+            {
+                return Err(format!("pane {main} is not in the arranged tabs").into());
+            }
+            let layout = match Builtin::parse(&args[2]) {
+                Some(builtin) => arrangement::arrange(
+                    &current,
+                    Preset::Builtin(builtin),
+                    main.as_ref(),
+                    transform,
+                ),
+                None => {
+                    let config = crate::config::load(None, crate::config::FontOverrides::default());
+                    let shape = config.layout_presets.get(&args[2]).ok_or_else(|| {
+                        format!(
+                            "unknown preset {:?}; use a built-in preset or a [layout_presets] name from {}",
+                            args[2],
+                            config.path.display()
+                        )
+                    })?;
+                    arrangement::arrange(&current, Preset::Named(shape), main.as_ref(), transform)
+                }
+            };
+            if sources.is_empty() {
+                arrange(tab, layout)
+            } else {
+                WorkspaceMutation::MergeTabs {
+                    tab_id: tab.id.clone(),
+                    sources,
+                    layout,
+                }
+            }
+        }
+        _ => return Err("invalid arrangement command; run compi-probe help".into()),
+    };
+    print_receipt(submit(&mut client, &workspace, operation)?)
 }
 
 fn surface_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {

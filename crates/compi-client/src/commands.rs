@@ -108,6 +108,16 @@ registry! {
     ResizeSplitDecrease, "resize_split_decrease", "Move divider toward first pane", Some("cmd-alt-minus"), Some("alt-shift-left");
     ResizeSplitIncrease, "resize_split_increase", "Move divider toward second pane", Some("cmd-alt-equal"), Some("alt-shift-right");
     ResetSplitRatio, "reset_split_ratio", "Equalize focused split", None, None;
+    ArrangePanes, "arrange_panes", "Arrange panes and tabs…", None, None;
+    MirrorArrangement, "mirror_arrangement", "Mirror pane arrangement", None, None;
+    FlipArrangement, "flip_arrangement", "Flip pane arrangement", None, None;
+    RestoreArrangement, "restore_arrangement", "Restore previous pane arrangement", None, None;
+    SplitMergedTabs, "split_merged_tabs", "Split merged tabs back out", None, None;
+    SaveArrangement, "save_arrangement", "Save pane arrangement as preset…", None, None;
+    SwapPaneLeft, "swap_pane_left", "Swap pane left", None, None;
+    SwapPaneRight, "swap_pane_right", "Swap pane right", None, None;
+    SwapPaneUp, "swap_pane_up", "Swap pane up", None, None;
+    SwapPaneDown, "swap_pane_down", "Swap pane down", None, None;
     RemovePane, "remove_pane", "Remove pane…", None, Some("ctrl-shift-w");
     EndSurface, "end_surface", "End terminal…", None, None;
     RestartSurface, "restart_surface", "Restart terminal", None, None;
@@ -229,6 +239,11 @@ pub struct CommandContext {
     pub focus_right: bool,
     pub focus_up: bool,
     pub focus_down: bool,
+    /// Every pane in the selected tab's server tree, floating or tiled.
+    pub arrangement_pane_count: usize,
+    /// The selected tab has a layout to restore or merged tabs to split back out.
+    pub has_previous_arrangement: bool,
+    pub has_merged_tabs: bool,
 }
 
 impl Command {
@@ -240,7 +255,9 @@ impl Command {
             SplitRight | SplitDown | TogglePaneZoom | DetachPane | TogglePaneFloat
             | ToggleFloatingFocus | NextFloatingPane | FocusLeft | FocusRight | FocusUp
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
-            | RemovePane => CommandCategory::Panes,
+            | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
+            | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
+            | SwapPaneDown | RemovePane => CommandCategory::Panes,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
@@ -274,6 +291,24 @@ impl Command {
             ToggleFloatingFocus => {
                 Some("Moves keyboard input between floating panes and this tab's split.")
             }
+            ArrangePanes => Some(
+                "Moves and resizes this tab's panes, or combines other tabs into it; every terminal keeps running.",
+            ),
+            MirrorArrangement | FlipArrangement => {
+                Some("Moves and resizes this tab's panes; every terminal keeps running.")
+            }
+            RestoreArrangement => Some(
+                "Undoes this tab's last arrangement, or splits a fresh merge back into its tabs.",
+            ),
+            SplitMergedTabs => Some(
+                "Moves merged panes back into their original tabs, names, and splits; terminals keep running.",
+            ),
+            SaveArrangement => {
+                Some("Saves this tab's split shape, not its terminals, as a preset.")
+            }
+            SwapPaneLeft | SwapPaneRight | SwapPaneUp | SwapPaneDown => {
+                Some("Exchanges places with the neighboring pane; both terminals keep running.")
+            }
             RemovePane => Some("Stops this terminal and removes its pane."),
             EndSurface => Some("Stops this terminal and its child processes; keeps its contents."),
             RestartSurface => Some("Starts a new process in this terminal."),
@@ -304,6 +339,14 @@ impl Command {
             DetachPane => "detach split pane tab",
             TogglePaneFloat => "floating overlay popup dock undock",
             ToggleFloatingFocus | NextFloatingPane => "floating keyboard cycle",
+            ArrangePanes => {
+                "layout preset grid columns rows main stack equalize mirror flip tabs merge combine join"
+            }
+            MirrorArrangement | FlipArrangement => "layout reverse horizontal vertical",
+            RestoreArrangement => "layout undo previous unmerge",
+            SplitMergedTabs => "unmerge separate tabs layout",
+            SaveArrangement => "layout preset template",
+            SwapPaneLeft | SwapPaneRight | SwapPaneUp | SwapPaneDown => "move exchange layout",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
             _ => "",
@@ -369,6 +412,15 @@ impl Command {
                 | ResizeSplitDecrease
                 | ResizeSplitIncrease
                 | ResetSplitRatio
+                | ArrangePanes
+                | MirrorArrangement
+                | FlipArrangement
+                | RestoreArrangement
+                | SplitMergedTabs
+                | SwapPaneLeft
+                | SwapPaneRight
+                | SwapPaneUp
+                | SwapPaneDown
                 | RemovePane
                 | EndSurface
                 | RestartSurface
@@ -501,6 +553,54 @@ impl Command {
                 } else {
                     (c.pane_floating && c.floating_count == 1)
                         .then_some("No other pane is floating")
+                }
+            }
+            ArrangePanes => {
+                if !c.has_tab {
+                    Some("Select a terminal tab first")
+                } else {
+                    (c.arrangement_pane_count < 2 && c.tab_count < 2).then_some(
+                        "This tab has only one pane and there is no other tab to combine",
+                    )
+                }
+            }
+            MirrorArrangement | FlipArrangement | SaveArrangement => {
+                if !c.has_tab {
+                    Some("Select a terminal tab first")
+                } else {
+                    (c.arrangement_pane_count < 2).then_some("This tab has only one pane")
+                }
+            }
+            RestoreArrangement => {
+                if !c.has_tab {
+                    Some("Select a terminal tab first")
+                } else {
+                    (!c.has_previous_arrangement)
+                        .then_some("This tab has no earlier arrangement to restore")
+                }
+            }
+            SplitMergedTabs => {
+                if !c.has_tab {
+                    Some("Select a terminal tab first")
+                } else {
+                    (!c.has_merged_tabs).then_some("No tabs were merged into this tab")
+                }
+            }
+            SwapPaneLeft | SwapPaneRight | SwapPaneUp | SwapPaneDown => {
+                let available = match self {
+                    SwapPaneLeft => c.focus_left,
+                    SwapPaneRight => c.focus_right,
+                    SwapPaneUp => c.focus_up,
+                    _ => c.focus_down,
+                };
+                if !c.has_pane {
+                    Some("Select a pane first")
+                } else if c.pane_floating {
+                    Some("Dock this pane before swapping it")
+                } else if c.pane_zoomed {
+                    Some("Restore the split layout before swapping panes")
+                } else {
+                    (!available).then_some("No pane in that direction")
                 }
             }
             RemovePane => (!c.has_pane).then_some("Select a pane first"),

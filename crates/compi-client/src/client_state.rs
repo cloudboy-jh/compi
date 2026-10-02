@@ -1264,6 +1264,8 @@ mod tests {
                                     pane_id: PaneId::from(format!("{id}-pane")),
                                     surface_id: SurfaceId::from(format!("{id}-surface")),
                                 },
+                                previous_layout: None,
+                                merge: None,
                             }
                         })
                         .collect(),
@@ -1752,6 +1754,8 @@ mod tests {
                 pane_id: agent.clone(),
                 surface_id: SurfaceId::from("agent-surface"),
             },
+            previous_layout: None,
+            merge: None,
         });
         state.reconcile(Some(&previous), &workspace);
         assert_eq!(state.focused_pane(&workspace), Some(&agent));

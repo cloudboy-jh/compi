@@ -1,6 +1,7 @@
 use super::*;
 use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle};
 use sha2::{Digest, Sha256};
+pub(in crate::gui) mod arrangements;
 pub(super) mod catalog;
 pub(in crate::gui) mod dialogs;
 pub(super) mod media;
@@ -292,6 +293,7 @@ pub(super) enum TextPurpose {
     CreateWorkspace,
     RenameWorkspace(SessionId),
     RenameTab(TabId),
+    SaveArrangement(TabId),
 }
 
 const STALE_TAB_MENU: &str =
@@ -341,6 +343,14 @@ pub(super) enum Overlay {
     },
     Windows,
     Diagnostics,
+    /// Bound to one tab; mirror/flip apply to whichever preset is selected.
+    Arrangements {
+        tab_id: TabId,
+        transform: crate::arrangement::Transform,
+        confirm_delete: Option<String>,
+        /// Other tabs in this workspace to merge into `tab_id`, in tab order.
+        merge: Vec<TabId>,
+    },
 }
 
 pub(super) const MODAL_SCRIM_OPACITY: f32 = 0.72;
@@ -2769,6 +2779,10 @@ impl CompiApp {
             focus_right: neighbor(layout::Direction::Right),
             focus_up: neighbor(layout::Direction::Up),
             focus_down: neighbor(layout::Direction::Down),
+            arrangement_pane_count: tab.map_or(0, |tab| leaf_count(&tab.layout)),
+            has_previous_arrangement: tab
+                .is_some_and(|tab| tab.previous_layout.is_some() || tab.merge.is_some()),
+            has_merged_tabs: tab.is_some_and(|tab| tab.merge.is_some()),
         }
     }
 
@@ -2980,6 +2994,7 @@ impl CompiApp {
                                 | Overlay::TabActions { .. }
                                 | Overlay::TabPaneActions { .. }
                                 | Overlay::HeaderActions { .. }
+                                | Overlay::Arrangements { .. }
                         )
                     ) && key.key_char.is_some()
                         && !key.modifiers.control
@@ -3037,6 +3052,7 @@ impl CompiApp {
                     | Overlay::Settings
                     | Overlay::Confirm { .. }
                     | Overlay::Diagnostics
+                    | Overlay::Arrangements { .. }
             )
         ) {
             return;
@@ -3349,6 +3365,16 @@ impl CompiApp {
                     self.focus_pane(target);
                 }
             }
+            Command::ArrangePanes => self.open_arrangements(),
+            Command::SaveArrangement => self.open_save_arrangement(),
+            Command::MirrorArrangement
+            | Command::FlipArrangement
+            | Command::RestoreArrangement
+            | Command::SplitMergedTabs
+            | Command::SwapPaneLeft
+            | Command::SwapPaneRight
+            | Command::SwapPaneUp
+            | Command::SwapPaneDown => self.run_arrangement_command(command, window),
             Command::RemovePane => {
                 if let Some(pane_id) = pane_id {
                     self.confirm_removal(
@@ -3636,18 +3662,22 @@ impl CompiApp {
                     return;
                 }
                 self.dismiss_overlay();
-                self.mutate(
-                    match purpose {
-                        TextPurpose::CreateWorkspace => WorkspaceMutation::CreateSession { label },
-                        TextPurpose::RenameWorkspace(session_id) => {
-                            WorkspaceMutation::RenameSession { session_id, label }
-                        }
-                        TextPurpose::RenameTab(tab_id) => {
-                            WorkspaceMutation::RenameTab { tab_id, label }
-                        }
-                    },
-                    true,
-                );
+                let operation = match purpose {
+                    TextPurpose::CreateWorkspace => WorkspaceMutation::CreateSession { label },
+                    TextPurpose::RenameWorkspace(session_id) => {
+                        WorkspaceMutation::RenameSession { session_id, label }
+                    }
+                    TextPurpose::RenameTab(tab_id) => {
+                        WorkspaceMutation::RenameTab { tab_id, label }
+                    }
+                    TextPurpose::SaveArrangement(tab_id) => {
+                        self.save_arrangement(&tab_id, &label);
+                        window.focus(&self.focus_handle);
+                        cx.notify();
+                        return;
+                    }
+                };
+                self.mutate(operation, true);
             }
             Overlay::Confirm {
                 operation,
@@ -3702,7 +3732,10 @@ impl CompiApp {
                         self.global_error = Some(reason);
                         return;
                     }
-                    if !matches!(choice.action, ChoiceAction::Pane { .. }) {
+                    if !matches!(
+                        choice.action,
+                        ChoiceAction::Pane { .. } | ChoiceAction::ArrangementTab(_)
+                    ) {
                         self.dismiss_overlay();
                     }
                     if let Some(tab_id) = menu_tab
@@ -3749,6 +3782,22 @@ impl CompiApp {
                                 self.transfer_tab(tab, Some(handle), window, cx);
                             }
                         }
+                        ChoiceAction::Arrangement(choice) => {
+                            if let Overlay::Arrangements {
+                                tab_id,
+                                transform,
+                                merge,
+                                ..
+                            } = &other
+                            {
+                                self.apply_arrangement_choice(
+                                    tab_id, merge, &choice, *transform, window,
+                                );
+                            }
+                        }
+                        ChoiceAction::ArrangementTab(source) => {
+                            self.toggle_arrangement_tab(&source);
+                        }
                     }
                 }
             }
@@ -3763,8 +3812,14 @@ enum ChoiceAction {
     Command(Command),
     Workspace(SessionId),
     Tab(TabId),
-    Pane { tab_id: TabId, pane_id: PaneId },
+    Pane {
+        tab_id: TabId,
+        pane_id: PaneId,
+    },
     Window(AnyWindowHandle),
+    Arrangement(arrangements::ArrangementChoice),
+    /// Toggles whether another tab is merged by the arrangement picker.
+    ArrangementTab(TabId),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaneAction {
@@ -4047,6 +4102,8 @@ impl CompiApp {
                         Command::RenameTab,
                         Command::SplitRight,
                         Command::SplitDown,
+                        Command::ArrangePanes,
+                        Command::RestoreArrangement,
                         Command::MoveTabToNewWindow,
                         Command::DetachTab,
                         Command::RemoveTab,
@@ -4067,6 +4124,8 @@ impl CompiApp {
                         Command::RenameTab => "Rename Tab…",
                         Command::SplitRight => "Split Right",
                         Command::SplitDown => "Split Down",
+                        Command::ArrangePanes => "Arrange…",
+                        Command::RestoreArrangement => "Restore Previous Arrangement",
                         Command::MoveTabToNewWindow => "Move to New Window",
                         Command::DetachTab => "Hide Tab",
                         Command::RemoveTab => "Remove Tab…",
@@ -4193,6 +4252,14 @@ impl CompiApp {
                         }
                     }
                 }
+            }
+            Some(Overlay::Arrangements {
+                tab_id,
+                confirm_delete,
+                merge,
+                ..
+            }) => {
+                choices = self.arrangement_choices(tab_id, merge, confirm_delete.as_deref());
             }
             _ => {}
         }

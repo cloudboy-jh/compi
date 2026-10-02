@@ -256,6 +256,8 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
                 pane_id: PaneId::new(format!("pane-imported-{}", session.id)),
                 surface_id: surface_id.clone(),
             },
+            previous_layout: None,
+            merge: None,
         });
         surfaces.push(SurfaceInfo {
             id: surface_id,
@@ -344,6 +346,7 @@ pub(crate) fn validate(workspace: &StoredWorkspace) -> Result<()> {
     let mut session_ids = HashSet::new();
     let mut tab_ids = HashSet::new();
     let mut pane_ids = HashSet::new();
+    let mut merged_ids = HashSet::new();
     for session in &workspace.sessions {
         if !session_ids.insert(session.id.clone()) {
             return Err("workspace contains duplicate session IDs".into());
@@ -352,8 +355,36 @@ pub(crate) fn validate(workspace: &StoredWorkspace) -> Result<()> {
             if !tab_ids.insert(tab.id.clone()) {
                 return Err("workspace contains duplicate tab IDs".into());
             }
-            validate_layout(&tab.layout, &surface_ids, &mut pane_ids)?;
+            let mut tab_panes = HashSet::new();
+            validate_layout(&tab.layout, &surface_ids, &mut tab_panes)?;
+            if let Some(previous) = &tab.previous_layout {
+                validate_previous_layout(previous, &tab.layout, &mut HashSet::new())?;
+            }
+            if let Some(merge) = &tab.merge {
+                if merge.tabs.is_empty() {
+                    return Err("a merge record must name at least one merged tab".into());
+                }
+                // Each pane belongs to at most one recreated tab or the receiver.
+                let mut recorded = HashSet::new();
+                if let Some(own) = &merge.own_layout {
+                    validate_previous_layout(own, &tab.layout, &mut recorded)?;
+                }
+                for merged in &merge.tabs {
+                    if !merged_ids.insert(merged.id.clone()) {
+                        return Err("workspace records a merged tab ID twice".into());
+                    }
+                    validate_previous_layout(&merged.layout, &tab.layout, &mut recorded)?;
+                }
+            }
+            for pane in tab_panes {
+                if !pane_ids.insert(pane) {
+                    return Err("workspace contains duplicate pane IDs".into());
+                }
+            }
         }
+    }
+    if merged_ids.iter().any(|id| tab_ids.contains(id)) {
+        return Err("a merged tab record reuses a live tab ID".into());
     }
     Ok(())
 }
@@ -391,6 +422,52 @@ fn validate_layout(
         }
     }
     Ok(())
+}
+
+/// A restorable arrangement may only reference this tab's current leaves, each once.
+fn validate_previous_layout(
+    node: &LayoutNode,
+    current: &LayoutNode,
+    panes: &mut std::collections::HashSet<PaneId>,
+) -> Result<()> {
+    match node {
+        LayoutNode::Pane {
+            pane_id,
+            surface_id,
+        } => {
+            if !panes.insert(pane_id.clone()) || !contains_leaf(current, pane_id, surface_id) {
+                return Err(format!(
+                    "previous arrangement references pane {pane_id} outside its tab"
+                )
+                .into());
+            }
+        }
+        LayoutNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            if !ratio.is_finite() || *ratio <= 0.0 || *ratio >= 1.0 {
+                return Err("split ratio must be finite and strictly between zero and one".into());
+            }
+            validate_previous_layout(first, current, panes)?;
+            validate_previous_layout(second, current, panes)?;
+        }
+    }
+    Ok(())
+}
+
+fn contains_leaf(node: &LayoutNode, pane: &PaneId, surface: &SurfaceId) -> bool {
+    match node {
+        LayoutNode::Pane {
+            pane_id,
+            surface_id,
+        } => pane_id == pane && surface_id == surface,
+        LayoutNode::Split { first, second, .. } => {
+            contains_leaf(first, pane, surface) || contains_leaf(second, pane, surface)
+        }
+    }
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -529,6 +606,8 @@ mod tests {
                     pane_id: PaneId::new("pane-1"),
                     surface_id: SurfaceId::new("surface-1"),
                 },
+                previous_layout: None,
+                merge: None,
             }],
         });
         store.commit(&workspace).unwrap();
@@ -637,6 +716,8 @@ mod tests {
                         surface_id: SurfaceId::new("surface-1"),
                     }),
                 },
+                previous_layout: None,
+                merge: None,
             }],
         });
         assert!(validate(&workspace).is_err());

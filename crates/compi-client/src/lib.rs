@@ -1,5 +1,6 @@
 //! Client-side daemon transport, terminal replicas, and interaction logic.
 
+pub mod arrangement;
 pub mod client_state;
 pub mod commands;
 pub mod config;

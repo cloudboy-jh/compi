@@ -1,5 +1,6 @@
 //! Writable TOML schema version 1. Tables: `font`, `appearance`, `layout`,
-//! `keybindings`, `shell`, `environment`, `profiles.<name>`, `limits`, `clipboard`, `updates`.
+//! `layout_presets.<name>`, `keybindings`, `shell`, `environment`, `profiles.<name>`,
+//! `limits`, `clipboard`, `updates`.
 //! `default_profile` selects a named profile over the base shell/environment.
 //! Missing settings retain defaults; invalid independent settings are diagnosed.
 //! GUI writes preserve comments and unrelated keys through an atomic replacement.
@@ -7,7 +8,7 @@
 #[cfg(unix)]
 use std::fs::File;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
@@ -15,10 +16,11 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES};
+use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES, SplitAxis};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    arrangement::{MAX_NAMED_PRESETS, Shape, valid_preset_name},
     font_catalog::{TerminalFontPreset, UiFontPreset},
     theme::{BackgroundEffect, ThemeId},
 };
@@ -217,6 +219,9 @@ pub struct LoadedConfig {
     pub updates: UpdateSettings,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
+    /// Named pane arrangements, shape only, keyed by preset name.
+    #[serde(default)]
+    pub layout_presets: BTreeMap<String, Shape>,
     /// Selected file, or empty when the native configuration directory is unavailable.
     pub path: PathBuf,
 }
@@ -237,6 +242,7 @@ impl Default for LoadedConfig {
             clipboard_policy: ClipboardPolicy::default(),
             updates: UpdateSettings::default(),
             provenance: ConfigProvenance::default(),
+            layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
             path: PathBuf::new(),
         }
@@ -356,6 +362,44 @@ impl LoadedConfig {
         Ok(())
     }
 
+    /// Save or replace a named arrangement without touching other settings.
+    pub fn save_layout_preset(&mut self, name: &str, shape: &Shape) -> Result<(), String> {
+        if !valid_preset_name(name) {
+            return Err(format!(
+                "Preset names must be 1–{} characters without leading/trailing spaces or control characters",
+                crate::arrangement::MAX_PRESET_NAME_CHARS
+            ));
+        }
+        shape.validate().map_err(str::to_owned)?;
+        if !self.layout_presets.contains_key(name) && self.layout_presets.len() >= MAX_NAMED_PRESETS
+        {
+            return Err(format!(
+                "At most {MAX_NAMED_PRESETS} layout presets are supported; delete one first"
+            ));
+        }
+        let shape = rounded_shape(shape);
+        let toml_edit::Value::InlineTable(root) = shape_to_toml(&shape) else {
+            unreachable!("a validated preset has a root split");
+        };
+        update_table(&self.path, "layout_presets", |table| {
+            table.set_implicit(true);
+            table.insert(name, toml_edit::Item::Table(root.into_table()));
+        })?;
+        self.layout_presets.insert(name.to_owned(), shape);
+        Ok(())
+    }
+
+    pub fn remove_layout_preset(&mut self, name: &str) -> Result<(), String> {
+        if !self.layout_presets.contains_key(name) {
+            return Err(format!("Layout preset {name:?} does not exist"));
+        }
+        update_table(&self.path, "layout_presets", |table| {
+            table.remove(name);
+        })?;
+        self.layout_presets.remove(name);
+        Ok(())
+    }
+
     /// Check a same-user forwarded configuration before it reaches native UI or
     /// launch code. A stored launch error is a valid, inspectable configuration;
     /// callers must separately require `launch.as_ref()` when creating work.
@@ -384,6 +428,14 @@ impl LoadedConfig {
             }
             crate::commands::validate_shortcut(shortcut)
                 .map_err(|error| format!("Invalid shortcut for {id}: {error}"))?;
+        }
+        if self.layout_presets.len() > MAX_NAMED_PRESETS
+            || self
+                .layout_presets
+                .iter()
+                .any(|(name, shape)| !valid_preset_name(name) || shape.validate().is_err())
+        {
+            return Err("Forwarded configuration has invalid layout presets".to_owned());
         }
         if let Ok(launch) = &self.launch {
             if launch.scrollback_lines > 100_000 || launch.graphics_bytes > MAX_GRAPHICS_BYTES {
@@ -630,6 +682,104 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
                 "configuration",
             ),
         }
+    }
+}
+
+fn apply_layout_presets(document: &toml::Table, loaded: &mut LoadedConfig) {
+    let Some(presets) = table(document, "layout_presets", loaded) else {
+        return;
+    };
+    for (name, value) in presets {
+        let field = format!("layout_presets.{name}");
+        if loaded.layout_presets.len() >= MAX_NAMED_PRESETS {
+            loaded.diagnostics.push(format!(
+                "Ignoring {field} in configuration ({}): at most {MAX_NAMED_PRESETS} layout presets are supported",
+                loaded.path.display()
+            ));
+            continue;
+        }
+        match shape_from_toml(value)
+            .filter(|shape| valid_preset_name(name) && shape.validate().is_ok())
+        {
+            Some(shape) => {
+                loaded.layout_presets.insert(name.clone(), shape);
+            }
+            None => invalid(
+                loaded,
+                &field,
+                "a 1–64 character name and a split table with split = \"right\" or \"down\", a ratio strictly between 0 and 1, and first/second set to \"pane\" or a nested split, holding 2–16 panes",
+                "configuration",
+            ),
+        }
+    }
+}
+
+fn shape_from_toml(value: &toml::Value) -> Option<Shape> {
+    if value.as_str() == Some("pane") {
+        return Some(Shape::Slot);
+    }
+    let table = value.as_table()?;
+    if table
+        .keys()
+        .any(|key| !matches!(key.as_str(), "split" | "ratio" | "first" | "second"))
+    {
+        return None;
+    }
+    let axis = match table.get("split")?.as_str()? {
+        "right" => SplitAxis::Horizontal,
+        "down" => SplitAxis::Vertical,
+        _ => return None,
+    };
+    Some(Shape::Split {
+        axis,
+        ratio: number(table.get("ratio")?)? as f32,
+        first: Box::new(shape_from_toml(table.get("first")?)?),
+        second: Box::new(shape_from_toml(table.get("second")?)?),
+    })
+}
+
+fn shape_to_toml(shape: &Shape) -> toml_edit::Value {
+    match shape {
+        Shape::Slot => "pane".into(),
+        Shape::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let mut table = toml_edit::InlineTable::new();
+            let split = match axis {
+                SplitAxis::Horizontal => "right",
+                SplitAxis::Vertical => "down",
+            };
+            table.insert("split", split.into());
+            table.insert("ratio", rounded_ratio(*ratio).into());
+            table.insert("first", shape_to_toml(first));
+            table.insert("second", shape_to_toml(second));
+            toml_edit::Value::InlineTable(table)
+        }
+    }
+}
+
+/// Four decimals keep hand-edited files readable; the ratio stays inside (0, 1).
+fn rounded_ratio(ratio: f32) -> f64 {
+    ((f64::from(ratio) * 10_000.0).round() / 10_000.0).clamp(0.0001, 0.9999)
+}
+
+fn rounded_shape(shape: &Shape) -> Shape {
+    match shape {
+        Shape::Slot => Shape::Slot,
+        Shape::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => Shape::Split {
+            axis: *axis,
+            ratio: rounded_ratio(*ratio) as f32,
+            first: Box::new(rounded_shape(first)),
+            second: Box::new(rounded_shape(second)),
+        },
     }
 }
 
@@ -1056,6 +1206,7 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
         return;
     }
     apply_presentation(&document, loaded);
+    apply_layout_presets(&document, loaded);
     apply_launch(&document, loaded);
     if let Some(updates) = table(&document, "updates", loaded) {
         if let Some(value) = updates.get("automatic_checks") {
@@ -1639,6 +1790,69 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("appearance.ui_font"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn layout_presets_parse_round_trip_and_diagnose_invalid_entries() {
+        let loaded = parse(
+            "version = 1\n[layout_presets.dev]\nsplit = 'right'\nratio = 0.6\nfirst = 'pane'\nsecond = { split = 'down', ratio = 0.5, first = 'pane', second = 'pane' }\n[layout_presets.lone]\nsplit = 'right'\nratio = 0.5\nfirst = 'pane'\nsecond = 'pane'\nextra = 1\n[layout_presets.wide]\nsplit = 'down'\nratio = 1\nfirst = 'pane'\nsecond = 'pane'",
+            FontOverrides::default(),
+        );
+        assert_eq!(loaded.layout_presets.len(), 1);
+        assert_eq!(loaded.layout_presets["dev"].slots(), 3);
+        for field in ["layout_presets.lone", "layout_presets.wide"] {
+            assert!(
+                loaded
+                    .diagnostics
+                    .iter()
+                    .any(|message| message.contains(field)),
+                "{field} should be diagnosed"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "compi-preset-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\n# keep me\n[layout]\nsidebar_width = 300\n",
+        )
+        .unwrap();
+        let mut config = load(Some(&path), FontOverrides::default());
+        let shape = Shape::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 2.0 / 3.0,
+            first: Box::new(Shape::Slot),
+            second: Box::new(loaded.layout_presets["dev"].clone()),
+        };
+        config.save_layout_preset("My layout", &shape).unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert!(
+            reloaded.diagnostics.is_empty(),
+            "{:?}",
+            reloaded.diagnostics
+        );
+        assert_eq!(reloaded.sidebar_width, 300.0);
+        assert_eq!(reloaded.layout_presets, config.layout_presets);
+        assert_eq!(reloaded.layout_presets["My layout"].slots(), 4);
+        assert!(fs::read_to_string(&path).unwrap().contains("# keep me"));
+
+        assert!(config.save_layout_preset(" padded", &shape).is_err());
+        assert!(config.save_layout_preset("single", &Shape::Slot).is_err());
+        config.remove_layout_preset("My layout").unwrap();
+        assert!(
+            load(Some(&path), FontOverrides::default())
+                .layout_presets
+                .is_empty()
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -27,8 +27,8 @@ pub use client::{
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Version 14 adds one-shot shell actions to screen deltas.
-pub const PROTOCOL_VERSION: u32 = 14;
+// Version 15 adds tab arrangements and merges that move existing panes in place.
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -482,6 +482,32 @@ pub struct WorkspaceTab {
     pub id: TabId,
     pub label: String,
     pub layout: LayoutNode,
+    /// The tree replaced by the latest `ArrangeTab`, holding only panes that are
+    /// still in this tab. Restoring it is itself an arrangement. A merge clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_layout: Option<Box<LayoutNode>>,
+    /// How to split this tab back into the tabs merged into it, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<Box<TabMerge>>,
+}
+
+/// The pre-merge shape of a merged tab, holding only panes still in that tab.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TabMerge {
+    /// The receiving tab's own tree before its first merge; `None` once none of
+    /// its original panes remain.
+    pub own_layout: Option<LayoutNode>,
+    /// Tabs merged in, in the order they are recreated.
+    pub tabs: Vec<MergedTab>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MergedTab {
+    pub id: TabId,
+    pub label: String,
+    pub layout: LayoutNode,
+    /// Session position before the merge; splitting reinserts at this index.
+    pub index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -596,6 +622,25 @@ pub enum WorkspaceMutation {
         tab_id: TabId,
         path: Vec<bool>,
         ratio: f32,
+    },
+    /// Replace a tab's tree with one holding exactly the same pane/surface leaves.
+    /// No process is launched, restarted, or ended; panes only move and resize.
+    ArrangeTab {
+        tab_id: TabId,
+        layout: LayoutNode,
+    },
+    /// Move every pane of `sources` (same session) into `tab_id`, laid out by
+    /// `layout`, which must hold exactly all of their leaves; the emptied tabs
+    /// are removed. No process is launched, restarted, or ended.
+    MergeTabs {
+        tab_id: TabId,
+        sources: Vec<TabId>,
+        layout: LayoutNode,
+    },
+    /// Recreate the tabs recorded by `MergeTabs` with their IDs, labels, order,
+    /// and inner splits, moving their surviving panes back out of `tab_id`.
+    SplitMergedTabs {
+        tab_id: TabId,
     },
     RemovePane {
         pane_id: PaneId,
@@ -736,6 +781,8 @@ mod tests {
                         pane_id: PaneId::new("pane-1"),
                         surface_id: surface.id.clone(),
                     },
+                    previous_layout: None,
+                    merge: None,
                 }],
             }],
             surfaces: vec![surface.clone()],

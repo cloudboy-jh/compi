@@ -1,9 +1,9 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
-    ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MutationId, MutationReceipt,
-    MutationRequest, PaneId, ProcessLifetimeId, ServerGeneration, SessionId, SplitAxis, SurfaceId,
-    SurfaceInfo, SurfaceStatus, TabId, WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot,
-    WorkspaceTab,
+    ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MergedTab, MutationId,
+    MutationReceipt, MutationRequest, PaneId, ProcessLifetimeId, ServerGeneration, SessionId,
+    SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation,
+    WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -707,6 +707,8 @@ fn apply_mutation(
                         pane_id: pane_id.clone(),
                         surface_id: surface.id.clone(),
                     },
+                    previous_layout: None,
+                    merge: None,
                 }],
             });
             workspace.initialized = true;
@@ -765,6 +767,8 @@ fn apply_mutation(
                     pane_id: pane_id.clone(),
                     surface_id: surface.id.clone(),
                 },
+                previous_layout: None,
+                merge: None,
             });
             affected_sessions.push(session_id.clone());
             affected_tabs.push(tab_id);
@@ -862,6 +866,7 @@ fn apply_mutation(
                 }
                 let detached =
                     extract_pane(&mut tab.layout, pane_id).expect("pane was found in a split tab");
+                forget_pane_history(tab, pane_id);
                 let LayoutNode::Pane { surface_id, .. } = &detached else {
                     unreachable!("only a leaf can be detached");
                 };
@@ -874,6 +879,8 @@ fn apply_mutation(
                         id: new_tab_id.clone(),
                         label: String::new(),
                         layout: detached,
+                        previous_layout: None,
+                        merge: None,
                     },
                 );
                 affected_sessions.push(session.id.clone());
@@ -903,6 +910,177 @@ fn apply_mutation(
             }
             affected_tabs.push(tab_id.clone());
             // Paths are revision-scoped structural addresses, not pane identities.
+            Ok("committed".into())
+        }
+        WorkspaceMutation::ArrangeTab { tab_id, layout } => {
+            let tab = find_tab_mut(&mut workspace.sessions, tab_id)
+                .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
+            if !same_leaves(&[&tab.layout], layout) {
+                return Err(invalid(format!(
+                    "arrangement must contain exactly the panes of tab {tab_id}"
+                )));
+            }
+            if &tab.layout == layout {
+                affected_tabs.push(tab_id.clone());
+                return Ok("unchanged".into());
+            }
+            // Ratios are validated with the whole candidate before commit.
+            let previous = std::mem::replace(&mut tab.layout, layout.clone());
+            tab.previous_layout = Some(Box::new(previous));
+            affected_tabs.push(tab_id.clone());
+            affected_panes.extend(pane_ids(layout));
+            Ok("committed".into())
+        }
+        WorkspaceMutation::MergeTabs {
+            tab_id,
+            sources,
+            layout,
+        } => {
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.tabs.iter().any(|tab| &tab.id == tab_id))
+                .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
+            let mut unique = std::collections::HashSet::new();
+            if sources.is_empty()
+                || sources
+                    .iter()
+                    .any(|source| source == tab_id || !unique.insert(source))
+            {
+                return Err(invalid(
+                    "merge needs one or more distinct tabs other than the receiving tab".into(),
+                ));
+            }
+            let mut source_indices = Vec::with_capacity(sources.len());
+            for source in sources {
+                source_indices.push(
+                    session
+                        .tabs
+                        .iter()
+                        .position(|tab| &tab.id == source)
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "tab {source} is not in the receiving tab's workspace"
+                            ))
+                        })?,
+                );
+            }
+            source_indices.sort_unstable();
+            let target_index = session
+                .tabs
+                .iter()
+                .position(|tab| &tab.id == tab_id)
+                .expect("the session contains the receiving tab");
+            let expected: Vec<_> = std::iter::once(target_index)
+                .chain(source_indices.iter().copied())
+                .map(|index| &session.tabs[index].layout)
+                .collect();
+            if !same_leaves(&expected, layout) {
+                return Err(invalid(
+                    "merged arrangement must contain exactly the panes of the merged tabs".into(),
+                ));
+            }
+            let target = &session.tabs[target_index];
+            let mut merge = target
+                .merge
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| TabMerge {
+                    own_layout: Some(target.layout.clone()),
+                    tabs: Vec::new(),
+                });
+            // A source that was itself a merge contributes its own original
+            // tree and every tab merged into it, so one split restores them all.
+            for &index in &source_indices {
+                let source = &session.tabs[index];
+                let own = match source.merge.as_deref() {
+                    Some(nested) => nested.own_layout.clone(),
+                    None => Some(source.layout.clone()),
+                };
+                if let Some(own) = own {
+                    merge.tabs.push(MergedTab {
+                        id: source.id.clone(),
+                        label: source.label.clone(),
+                        layout: own,
+                        index,
+                    });
+                }
+                if let Some(nested) = source.merge.as_deref() {
+                    merge.tabs.extend(nested.tabs.iter().cloned());
+                }
+            }
+            let source_ids: Vec<TabId> = source_indices
+                .iter()
+                .map(|&index| session.tabs[index].id.clone())
+                .collect();
+            let target = &mut session.tabs[target_index];
+            target.layout = layout.clone();
+            target.previous_layout = None;
+            target.merge = Some(Box::new(merge));
+            session.tabs.retain(|tab| !source_ids.contains(&tab.id));
+            affected_sessions.push(session.id.clone());
+            affected_tabs.push(tab_id.clone());
+            affected_tabs.extend(source_ids);
+            affected_panes.extend(pane_ids(layout));
+            Ok("committed".into())
+        }
+        WorkspaceMutation::SplitMergedTabs { tab_id } => {
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.tabs.iter().any(|tab| &tab.id == tab_id))
+                .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
+            let target_index = session
+                .tabs
+                .iter()
+                .position(|tab| &tab.id == tab_id)
+                .expect("the session contains the receiving tab");
+            let target = &mut session.tabs[target_index];
+            let Some(merge) = target.merge.take() else {
+                return Err(invalid(format!("tab {tab_id} has no merged tabs to split")));
+            };
+            let TabMerge {
+                own_layout,
+                mut tabs,
+            } = *merge;
+            // Records hold only panes still in this tab, so every recorded pane moves.
+            let mut remaining = Some(target.layout.clone());
+            for record in &tabs {
+                for pane in pane_ids(&record.layout) {
+                    affected_panes.push(pane.clone());
+                    remaining = remaining.and_then(|tree| remove_pane(tree, &pane));
+                }
+            }
+            match remaining {
+                Some(remaining) => {
+                    // Without panes added since the merge, return to the original tree.
+                    target.layout = match own_layout {
+                        Some(own) if same_leaves(&[&own], &remaining) => own,
+                        _ => remaining,
+                    };
+                    target.previous_layout = None;
+                }
+                None => {
+                    session.tabs.remove(target_index);
+                }
+            }
+            tabs.sort_by_key(|record| record.index);
+            affected_sessions.push(session.id.clone());
+            affected_tabs.push(tab_id.clone());
+            for record in tabs {
+                let index = record.index.min(session.tabs.len());
+                affected_tabs.push(record.id.clone());
+                session.tabs.insert(
+                    index,
+                    WorkspaceTab {
+                        id: record.id,
+                        label: record.label,
+                        layout: record.layout,
+                        previous_layout: None,
+                        merge: None,
+                    },
+                );
+            }
             Ok("committed".into())
         }
         WorkspaceMutation::EndSurface {
@@ -1367,6 +1545,67 @@ fn collect_surfaces(node: &LayoutNode, output: &mut Vec<SurfaceId>) {
     }
 }
 
+fn collect_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<(&'a PaneId, &'a SurfaceId)>) {
+    match node {
+        LayoutNode::Pane {
+            pane_id,
+            surface_id,
+        } => output.push((pane_id, surface_id)),
+        LayoutNode::Split { first, second, .. } => {
+            collect_leaves(first, output);
+            collect_leaves(second, output);
+        }
+    }
+}
+
+fn pane_ids(node: &LayoutNode) -> Vec<PaneId> {
+    let mut leaves = Vec::new();
+    collect_leaves(node, &mut leaves);
+    leaves.into_iter().map(|(pane, _)| pane.clone()).collect()
+}
+
+/// Whether `proposed` holds each pane/surface leaf of `expected` exactly once
+/// and nothing else, so committing it can only move existing panes.
+fn same_leaves(expected: &[&LayoutNode], proposed: &LayoutNode) -> bool {
+    let mut current = Vec::new();
+    for tree in expected {
+        collect_leaves(tree, &mut current);
+    }
+    let mut candidate = Vec::new();
+    collect_leaves(proposed, &mut candidate);
+    let expected: std::collections::HashSet<_> = current.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    candidate.len() == current.len()
+        && candidate
+            .iter()
+            .all(|leaf| expected.contains(leaf) && seen.insert(*leaf))
+}
+
+/// Keep restore and split-back records limited to panes that remain in the tab.
+/// A restorable tree without any split no longer describes an arrangement.
+fn forget_pane_history(tab: &mut WorkspaceTab, pane_id: &PaneId) {
+    tab.previous_layout = tab
+        .previous_layout
+        .take()
+        .and_then(|previous| remove_pane(*previous, pane_id))
+        .filter(|previous| matches!(previous, LayoutNode::Split { .. }))
+        .map(Box::new);
+    tab.merge = tab.merge.take().and_then(|merge| {
+        let TabMerge { own_layout, tabs } = *merge;
+        let own_layout = own_layout.and_then(|own| remove_pane(own, pane_id));
+        let tabs: Vec<_> = tabs
+            .into_iter()
+            .filter_map(|record| {
+                Some(MergedTab {
+                    layout: remove_pane(record.layout, pane_id)?,
+                    ..record
+                })
+            })
+            .collect();
+        (!tabs.is_empty()).then(|| Box::new(TabMerge { own_layout, tabs }))
+    });
+}
+
 fn surfaces_for_target(
     workspace: &StoredWorkspace,
     target: &RemovalTarget,
@@ -1428,6 +1667,7 @@ fn apply_removal(workspace: &mut StoredWorkspace, target: &RemovalTarget) {
                     && let Some(replacement) = remove_pane(tab.layout.clone(), pane_id)
                 {
                     tab.layout = replacement;
+                    forget_pane_history(tab, pane_id);
                     break;
                 }
             }
@@ -1974,6 +2214,551 @@ mod tests {
             .unwrap_err();
         assert_eq!(refused.code, ErrorCode::InvalidRequest);
         assert_eq!(actor.snapshot().unwrap(), collapsed);
+    }
+
+    #[test]
+    fn arrange_only_permutes_existing_panes_and_keeps_a_restorable_tree() {
+        let (actor, effects) = WorkspaceActor::memory();
+        actor
+            .mutate(request(
+                &actor,
+                "arrange-init",
+                0,
+                WorkspaceMutation::Initialize {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        let initial = actor.snapshot().unwrap();
+        let tab_id = initial.sessions[0].tabs[0].id.clone();
+        let LayoutNode::Pane { pane_id: a, .. } = &initial.sessions[0].tabs[0].layout else {
+            panic!("expected initial leaf");
+        };
+        let split = |id: &str, pane_id: PaneId| {
+            actor
+                .mutate(request(
+                    &actor,
+                    id,
+                    actor.snapshot().unwrap().revision,
+                    WorkspaceMutation::SplitPane {
+                        pane_id,
+                        axis: SplitAxis::Horizontal,
+                        cols: 80,
+                        rows: 24,
+                        working_directory: None,
+                        geometry: compi_protocol::SplitGeometry {
+                            width: 800.0,
+                            height: 480.0,
+                            min_width: 160.0,
+                            min_height: 80.0,
+                            divider: 4.0,
+                        },
+                    },
+                ))
+                .unwrap()
+                .affected_panes[1]
+                .clone()
+        };
+        let b = split("arrange-split-b", a.clone());
+        let c = split("arrange-split-c", b.clone());
+        let mut launched = Vec::new();
+        for _ in 0..3 {
+            let WorkspaceEffect::Launch(surface, _) = effects.recv().unwrap() else {
+                panic!("expected launch");
+            };
+            launched.push(surface);
+        }
+        let before = actor.snapshot().unwrap();
+        let tree = before.sessions[0].tabs[0].layout.clone();
+        let leaf = |pane: &PaneId| {
+            let mut found = Vec::new();
+            collect_leaves(&tree, &mut found);
+            let (pane_id, surface_id) = found.into_iter().find(|(id, _)| *id == pane).unwrap();
+            LayoutNode::Pane {
+                pane_id: pane_id.clone(),
+                surface_id: surface_id.clone(),
+            }
+        };
+        let node = |axis, ratio, first: LayoutNode, second: LayoutNode| LayoutNode::Split {
+            axis,
+            ratio,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        let arrange = |id: &str, revision: u64, layout: LayoutNode| {
+            actor.mutate(request(
+                &actor,
+                id,
+                revision,
+                WorkspaceMutation::ArrangeTab {
+                    tab_id: tab_id.clone(),
+                    layout,
+                },
+            ))
+        };
+
+        // Missing, duplicated, foreign, and mismatched leaves are all refused.
+        let foreign_surface = LayoutNode::Pane {
+            pane_id: c.clone(),
+            surface_id: launched[0].id.clone(),
+        };
+        let unknown = LayoutNode::Pane {
+            pane_id: PaneId::new("pane-unknown"),
+            surface_id: launched[2].id.clone(),
+        };
+        for (id, layout) in [
+            (
+                "arrange-missing",
+                node(SplitAxis::Vertical, 0.5, leaf(a), leaf(&b)),
+            ),
+            (
+                "arrange-duplicate",
+                node(
+                    SplitAxis::Vertical,
+                    0.5,
+                    leaf(a),
+                    node(SplitAxis::Vertical, 0.5, leaf(&b), leaf(&b)),
+                ),
+            ),
+            (
+                "arrange-foreign",
+                node(
+                    SplitAxis::Vertical,
+                    0.5,
+                    leaf(a),
+                    node(SplitAxis::Vertical, 0.5, leaf(&b), foreign_surface),
+                ),
+            ),
+            (
+                "arrange-unknown",
+                node(
+                    SplitAxis::Vertical,
+                    0.5,
+                    leaf(a),
+                    node(SplitAxis::Vertical, 0.5, leaf(&b), unknown),
+                ),
+            ),
+            (
+                "arrange-ratio",
+                node(
+                    SplitAxis::Vertical,
+                    1.0,
+                    leaf(&c),
+                    node(SplitAxis::Horizontal, 0.5, leaf(a), leaf(&b)),
+                ),
+            ),
+        ] {
+            let error = arrange(id, before.revision, layout).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{id}");
+            assert_eq!(actor.snapshot().unwrap(), before, "{id}");
+        }
+
+        let arranged = node(
+            SplitAxis::Vertical,
+            0.4,
+            leaf(&c),
+            node(SplitAxis::Horizontal, 0.5, leaf(a), leaf(&b)),
+        );
+        let receipt = arrange("arrange-apply", before.revision, arranged.clone()).unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(receipt.affected_tabs, vec![tab_id.clone()]);
+        assert_eq!(
+            receipt.affected_panes,
+            vec![c.clone(), a.clone(), b.clone()]
+        );
+        let after = actor.snapshot().unwrap();
+        assert_eq!(after.sessions[0].tabs[0].layout, arranged);
+        assert_eq!(
+            after.sessions[0].tabs[0].previous_layout.as_deref(),
+            Some(&tree)
+        );
+        // Same surfaces and lifetimes; no process was launched or ended.
+        assert_eq!(after.surfaces, before.surfaces);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+
+        // Re-applying the current tree keeps the restorable one.
+        let unchanged = arrange("arrange-same", after.revision, arranged.clone()).unwrap();
+        assert_eq!(unchanged.operation_state, "unchanged");
+        assert_eq!(
+            actor.snapshot().unwrap().sessions[0].tabs[0]
+                .previous_layout
+                .as_deref(),
+            Some(&tree)
+        );
+
+        // Detaching a pane drops it from the restorable tree too.
+        actor
+            .mutate(request(
+                &actor,
+                "arrange-detach",
+                actor.snapshot().unwrap().revision,
+                WorkspaceMutation::DetachPane { pane_id: b.clone() },
+            ))
+            .unwrap();
+        let detached = actor.snapshot().unwrap();
+        let previous = detached.sessions[0].tabs[0]
+            .previous_layout
+            .as_deref()
+            .unwrap();
+        let mut remaining = Vec::new();
+        collect_leaves(previous, &mut remaining);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|(id, _)| (*id).clone())
+                .collect::<Vec<_>>(),
+            vec![a.clone(), c.clone()]
+        );
+        assert!(detached.sessions[0].tabs[1].previous_layout.is_none());
+        crate::workspace_store::validate(&StoredWorkspace {
+            server_id: detached.server_id.clone(),
+            revision: detached.revision,
+            initialized: detached.initialized,
+            sessions: detached.sessions.clone(),
+            surfaces: detached.surfaces.clone(),
+            receipts: vec![],
+            pending_removals: vec![],
+            recovery_message: None,
+        })
+        .unwrap();
+
+        // Removing a live pane holds every mutation, arrangements included,
+        // until cleanup, then forgets a restorable tree that no longer splits.
+        let a_surface = &launched[0];
+        actor
+            .mutate(request(
+                &actor,
+                "arrange-remove",
+                detached.revision,
+                WorkspaceMutation::RemovePane { pane_id: a.clone() },
+            ))
+            .unwrap();
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::End { .. }
+        ));
+        let ending = actor.snapshot().unwrap();
+        let busy = arrange(
+            "arrange-busy",
+            ending.revision,
+            ending.sessions[0].tabs[0].layout.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(busy.code, ErrorCode::Busy);
+        actor.observe(RuntimeObservation::Exited {
+            surface_id: a_surface.id.clone(),
+            process_lifetime_id: a_surface.process_lifetime_id.clone(),
+            exit_code: 0,
+        });
+        let removed = wait_revision(&actor, ending.revision + 1);
+        assert!(matches!(
+            &removed.sessions[0].tabs[0].layout,
+            LayoutNode::Pane { pane_id, .. } if pane_id == &c
+        ));
+        assert!(removed.sessions[0].tabs[0].previous_layout.is_none());
+    }
+
+    #[test]
+    fn merged_tabs_keep_their_shells_and_split_back_into_the_original_tabs() {
+        let (actor, effects) = WorkspaceActor::memory();
+        let mutate = |id: &str, operation: WorkspaceMutation| {
+            actor.mutate(request(
+                &actor,
+                id,
+                actor.snapshot().unwrap().revision,
+                operation,
+            ))
+        };
+        mutate(
+            "merge-init",
+            WorkspaceMutation::Initialize {
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+            },
+        )
+        .unwrap();
+        let session_id = actor.snapshot().unwrap().sessions[0].id.clone();
+        let create = |id: &str, label: &str| {
+            mutate(
+                id,
+                WorkspaceMutation::CreateTab {
+                    session_id: session_id.clone(),
+                    label: label.into(),
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            )
+            .unwrap()
+        };
+        let b_receipt = create("merge-tab-b", "build");
+        let b_split = mutate(
+            "merge-split-b",
+            WorkspaceMutation::SplitPane {
+                pane_id: b_receipt.affected_panes[0].clone(),
+                axis: SplitAxis::Vertical,
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+                geometry: compi_protocol::SplitGeometry {
+                    width: 800.0,
+                    height: 480.0,
+                    min_width: 160.0,
+                    min_height: 80.0,
+                    divider: 4.0,
+                },
+            },
+        )
+        .unwrap();
+        let c_receipt = create("merge-tab-c", "logs");
+        for _ in 0..4 {
+            assert!(matches!(
+                effects.recv().unwrap(),
+                WorkspaceEffect::Launch(_, _)
+            ));
+        }
+        let before = actor.snapshot().unwrap();
+        let tabs = before.sessions[0].tabs.clone();
+        let (a_tab, b_tab, c_tab) = (&tabs[0], &tabs[1], &tabs[2]);
+        let (b, b2, c) = (
+            b_receipt.affected_panes[0].clone(),
+            b_split.affected_panes[1].clone(),
+            c_receipt.affected_panes[0].clone(),
+        );
+        let leaf = |pane: &PaneId| {
+            let tree = tabs
+                .iter()
+                .map(|tab| &tab.layout)
+                .find(|tree| contains_pane(tree, pane))
+                .unwrap();
+            let mut found = Vec::new();
+            collect_leaves(tree, &mut found);
+            let (pane_id, surface_id) = found.into_iter().find(|(id, _)| *id == pane).unwrap();
+            LayoutNode::Pane {
+                pane_id: pane_id.clone(),
+                surface_id: surface_id.clone(),
+            }
+        };
+        let node = |axis, first: LayoutNode, second: LayoutNode| LayoutNode::Split {
+            axis,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        let a = pane_ids(&a_tab.layout)[0].clone();
+        let merged = node(
+            SplitAxis::Horizontal,
+            leaf(&a),
+            node(
+                SplitAxis::Vertical,
+                leaf(&c),
+                node(SplitAxis::Horizontal, leaf(&b), leaf(&b2)),
+            ),
+        );
+        let merge = |id: &str, sources: Vec<TabId>, layout: LayoutNode| {
+            mutate(
+                id,
+                WorkspaceMutation::MergeTabs {
+                    tab_id: a_tab.id.clone(),
+                    sources,
+                    layout,
+                },
+            )
+        };
+
+        // Empty, self, duplicate, cross-workspace, and incomplete merges change nothing.
+        mutate(
+            "merge-other-session",
+            WorkspaceMutation::CreateSession {
+                label: "Other".into(),
+            },
+        )
+        .unwrap();
+        let other_session = actor.snapshot().unwrap().sessions[1].id.clone();
+        let foreign = mutate(
+            "merge-foreign-tab",
+            WorkspaceMutation::CreateTab {
+                session_id: other_session,
+                label: "elsewhere".into(),
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+            },
+        )
+        .unwrap()
+        .affected_tabs[0]
+            .clone();
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::Launch(_, _)
+        ));
+        let ready = actor.snapshot().unwrap();
+        for (id, sources, layout) in [
+            ("merge-none", vec![], merged.clone()),
+            ("merge-self", vec![a_tab.id.clone()], merged.clone()),
+            (
+                "merge-duplicate",
+                vec![b_tab.id.clone(), b_tab.id.clone(), c_tab.id.clone()],
+                merged.clone(),
+            ),
+            (
+                "merge-foreign",
+                vec![b_tab.id.clone(), c_tab.id.clone(), foreign.clone()],
+                merged.clone(),
+            ),
+            (
+                "merge-incomplete",
+                vec![b_tab.id.clone(), c_tab.id.clone()],
+                node(SplitAxis::Horizontal, leaf(&a), leaf(&c)),
+            ),
+        ] {
+            let error = merge(id, sources, layout).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{id}");
+            assert_eq!(actor.snapshot().unwrap(), ready, "{id}");
+        }
+
+        let receipt = merge(
+            "merge-apply",
+            vec![c_tab.id.clone(), b_tab.id.clone()],
+            merged.clone(),
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        let after = actor.snapshot().unwrap();
+        let tab = &after.sessions[0].tabs;
+        assert_eq!(tab.len(), 1);
+        assert_eq!(tab[0].id, a_tab.id);
+        assert_eq!(tab[0].layout, merged);
+        assert!(tab[0].previous_layout.is_none());
+        let record = tab[0].merge.as_deref().unwrap();
+        assert_eq!(record.own_layout.as_ref(), Some(&a_tab.layout));
+        assert_eq!(
+            record
+                .tabs
+                .iter()
+                .map(|tab| (tab.id.clone(), tab.label.as_str(), tab.index))
+                .collect::<Vec<_>>(),
+            vec![
+                (b_tab.id.clone(), "build", 1),
+                (c_tab.id.clone(), "logs", 2)
+            ]
+        );
+        assert_eq!(after.surfaces, ready.surfaces);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+
+        // Arranging the merged tab keeps the split-back record; detaching a
+        // pane removes it from the recorded original tab.
+        mutate(
+            "merge-arrange",
+            WorkspaceMutation::ArrangeTab {
+                tab_id: a_tab.id.clone(),
+                layout: node(
+                    SplitAxis::Vertical,
+                    leaf(&b),
+                    node(
+                        SplitAxis::Vertical,
+                        leaf(&b2),
+                        node(SplitAxis::Vertical, leaf(&c), leaf(&a)),
+                    ),
+                ),
+            },
+        )
+        .unwrap();
+        let detached_tab = mutate(
+            "merge-detach",
+            WorkspaceMutation::DetachPane {
+                pane_id: b2.clone(),
+            },
+        )
+        .unwrap()
+        .affected_tabs[0]
+            .clone();
+        let detached = actor.snapshot().unwrap();
+        let record = detached.sessions[0].tabs[0].merge.as_deref().unwrap();
+        assert_eq!(record.tabs[0].layout, leaf(&b));
+
+        mutate(
+            "merge-split",
+            WorkspaceMutation::SplitMergedTabs {
+                tab_id: a_tab.id.clone(),
+            },
+        )
+        .unwrap();
+        let split = actor.snapshot().unwrap();
+        let restored: Vec<_> = split.sessions[0]
+            .tabs
+            .iter()
+            .map(|tab| (tab.id.clone(), tab.label.clone(), tab.layout.clone()))
+            .collect();
+        assert_eq!(
+            restored,
+            vec![
+                (a_tab.id.clone(), a_tab.label.clone(), a_tab.layout.clone()),
+                (b_tab.id.clone(), "build".into(), leaf(&b)),
+                (c_tab.id.clone(), "logs".into(), c_tab.layout.clone()),
+                (detached_tab, String::new(), leaf(&b2)),
+            ]
+        );
+        assert!(split.sessions[0].tabs.iter().all(|tab| tab.merge.is_none()));
+        assert_eq!(split.surfaces, ready.surfaces);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+        let refused = mutate(
+            "merge-split-again",
+            WorkspaceMutation::SplitMergedTabs {
+                tab_id: a_tab.id.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::InvalidRequest);
+
+        // Merging a merged tab flattens both records, so one split restores all.
+        mutate(
+            "merge-nested-inner",
+            WorkspaceMutation::MergeTabs {
+                tab_id: c_tab.id.clone(),
+                sources: vec![b_tab.id.clone()],
+                layout: node(SplitAxis::Horizontal, leaf(&c), leaf(&b)),
+            },
+        )
+        .unwrap();
+        merge(
+            "merge-nested-outer",
+            vec![c_tab.id.clone()],
+            node(
+                SplitAxis::Vertical,
+                leaf(&a),
+                node(SplitAxis::Horizontal, leaf(&c), leaf(&b)),
+            ),
+        )
+        .unwrap();
+        mutate(
+            "merge-nested-split",
+            WorkspaceMutation::SplitMergedTabs {
+                tab_id: a_tab.id.clone(),
+            },
+        )
+        .unwrap();
+        let nested = actor.snapshot().unwrap();
+        let ids: Vec<_> = nested.sessions[0]
+            .tabs
+            .iter()
+            .map(|tab| tab.id.clone())
+            .collect();
+        assert!(ids.contains(&b_tab.id) && ids.contains(&c_tab.id));
+        let stored = StoredWorkspace {
+            server_id: nested.server_id.clone(),
+            revision: nested.revision,
+            initialized: nested.initialized,
+            sessions: nested.sessions.clone(),
+            surfaces: nested.surfaces.clone(),
+            receipts: vec![],
+            pending_removals: vec![],
+            recovery_message: None,
+        };
+        crate::workspace_store::validate(&stored).unwrap();
     }
 
     #[test]

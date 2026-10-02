@@ -44,7 +44,7 @@ def main():
         command = [str(args.signer.resolve()), 'sign', '--version', version,
                    '--platform', platform, '--artifact', str(artifact.resolve()),
                    '--url', f'https://github.com/{args.repository}/releases/download/{args.tag}/{artifact.name}',
-                   '--output', str(args.distribution.resolve()), '--daemon-protocol', '14',
+                   '--output', str(args.distribution.resolve()), '--daemon-protocol', '15',
                    '--minimum-os', minimum_os, '--notes', str(args.notes.resolve())]
         command.extend(['--qualification', str((args.distribution / f'qualification-{platform}.json').resolve())])
         for daemon in sorted(set(daemons)):

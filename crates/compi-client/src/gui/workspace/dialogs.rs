@@ -292,7 +292,7 @@ impl CompiApp {
             .into_any_element()
     }
 
-    fn render_choice_rows(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_choice_rows(&self, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let choices = self.overlay_choices(cx);
         let mut rows = Vec::new();
@@ -318,6 +318,16 @@ impl CompiApp {
                 ((!choice.detail.is_empty()).then_some(choice.detail), None)
             } else {
                 (None, (!choice.detail.is_empty()).then_some(choice.detail))
+            };
+            // Arrangement layouts only preview on click; double-click, Enter, or
+            // Apply commits them. Clicking a tab to combine toggles it in place,
+            // keeping the previewed layout selected. Other rows act on one click.
+            let in_arrangements = matches!(self.overlay, Some(Overlay::Arrangements { .. }));
+            let preview_only =
+                in_arrangements && matches!(choice.action, ChoiceAction::Arrangement(_));
+            let toggle_tab = match &choice.action {
+                ChoiceAction::ArrangementTab(tab_id) if in_arrangements => Some(tab_id.clone()),
+                _ => None,
             };
             let row = div()
                 .id(("command-choice", index))
@@ -348,12 +358,20 @@ impl CompiApp {
                     &colors,
                 )))
                 .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.overlay_index = index;
-                    this.activate_overlay(window, cx);
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
+                .on_click(
+                    cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        if let Some(tab_id) = &toggle_tab {
+                            this.toggle_arrangement_tab(tab_id);
+                        } else {
+                            this.overlay_index = index;
+                            if !preview_only || event.click_count() >= 2 {
+                                this.activate_overlay(window, cx);
+                            }
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
                 .child(
                     div()
                         .flex()
@@ -729,7 +747,11 @@ impl CompiApp {
         )
     }
 
-    fn render_dialog_header(&self, title: &'static str, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_dialog_header(
+        &self,
+        title: &'static str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let colors = *self.colors();
         div()
             .min_h(px(44.0))
@@ -847,6 +869,9 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if matches!(self.overlay, Some(Overlay::Arrangements { .. })) {
+            return self.handle_arrangement_key(key, cx);
+        }
         if matches!(
             self.overlay,
             Some(Overlay::Confirm { .. } | Overlay::ConfirmDaemonRestart { .. })
@@ -963,6 +988,8 @@ impl CompiApp {
             self.render_text_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Diagnostics)) {
             self.render_diagnostics_dialog(window, cx)
+        } else if matches!(self.overlay, Some(Overlay::Arrangements { .. })) {
+            self.render_arrangement_overlay(window, cx)
         } else {
             self.render_list_overlay(window, cx)
         };

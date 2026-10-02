@@ -106,7 +106,7 @@ Keep the runtime beside the daemon. Launch under a separate instance to avoid th
 
 ## Phase 4 native workspace checks
 
-Use matching protocol 14 client/daemon binaries and an isolated instance. Set `GPUI_FXC_PATH` as described in Tier 1 before building the Windows client. Do not stop an older daemon that owns valuable work merely to try the new client.
+Use matching protocol 15 client/daemon binaries and an isolated instance. Set `GPUI_FXC_PATH` as described in Tier 1 before building the Windows client. Do not stop an older daemon that owns valuable work merely to try the new client.
 
 ```powershell
 cargo test --locked --workspace --all-targets --release -- --test-threads=1
