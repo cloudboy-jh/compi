@@ -42,6 +42,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - Repeat the UI state/size/scale matrix on Mac and verify image paste, file drop, preview, inspector, save, and reconnect behavior.
 - Keep native Linux core CI passing and qualify the Linux graphical client separately; cross-compilation and headless tests are insufficient graphical evidence.
 - Exercise imported multi-variant Zed themes, migrated local themes, scoped appearance inheritance, remembered opacity/blur, material accessibility fallbacks, and split-tab pane actions in the installed Mac bundle. Windows native evidence and schema validation do not qualify Mac rendering or interaction.
+- Qualify floating panes and hairline seams on the native Mac bundle: float/dock from the palette and the tab menu, move/resize tracking, keyboard ownership with physical keys and IME, relaunch restoration, seam crispness at Retina and mixed scales, and a second window attempting to attach a floated surface. Windows/WSL evidence used synthetic window messages, not physical input.
 - Run focused regressions and final workspace/dependency checks after integration. Report unavailable physical-platform checks explicitly.
 
 ## 4. Distribution and process discovery

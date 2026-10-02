@@ -28,6 +28,9 @@ const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_REFERENCES: usize = 16_384;
 const MAX_ID_BYTES: usize = 256;
 const MAX_SAVED_HISTORY_ROWS: usize = 1_048_576;
+/// Bounds a window's floating panes; each still holds one live attachment.
+pub const MAX_FLOATING: usize = 16;
+const MIN_FLOAT_FRACTION: f32 = 0.05;
 
 /// A conservative anchor, not terminal contents. The GUI must compare the exact
 /// identity, dimensions, and full-row fingerprint before applying these values.
@@ -101,6 +104,58 @@ impl WindowAppearanceOverrides {
     }
 }
 
+/// Fractions of the window's terminal area, so placement survives window resizes.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FloatRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl FloatRect {
+    pub const DEFAULT: Self = Self {
+        x: 0.5,
+        y: 0.08,
+        width: 0.46,
+        height: 0.62,
+    };
+
+    /// Offset successive floats so a new one never hides an existing frame exactly.
+    pub fn cascade(index: usize) -> Self {
+        let step = 0.03 * (index % 8) as f32;
+        Self {
+            x: Self::DEFAULT.x - step,
+            y: Self::DEFAULT.y + step,
+            ..Self::DEFAULT
+        }
+    }
+
+    fn sanitized(self) -> Self {
+        if ![self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Self::DEFAULT;
+        }
+        let width = self.width.clamp(MIN_FLOAT_FRACTION, 1.0);
+        let height = self.height.clamp(MIN_FLOAT_FRACTION, 1.0);
+        Self {
+            x: self.x.clamp(0.0, 1.0 - width),
+            y: self.y.clamp(0.0, 1.0 - height),
+            width,
+            height,
+        }
+    }
+}
+
+/// A window-local floating presentation of a pane that stays in its server tab.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FloatingPane {
+    pub pane_id: PaneId,
+    pub rect: FloatRect,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientState {
     pub version: u32,
@@ -119,6 +174,13 @@ pub struct ClientState {
     pub viewports: HashMap<String, SavedViewport>,
     #[serde(default)]
     pub project_history: ProjectHistory,
+    /// Window-local floating panes, back to front. Additive and defaulted, so
+    /// older clients ignore it; the server's split tree never changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub floating: Vec<FloatingPane>,
+    /// Whether the front floating pane owns the keyboard instead of the tiles.
+    #[serde(default)]
+    pub floating_focused: bool,
 }
 
 impl Default for ClientState {
@@ -136,6 +198,8 @@ impl Default for ClientState {
             hidden_tabs: HashSet::new(),
             viewports: HashMap::new(),
             project_history: ProjectHistory::default(),
+            floating: Vec::new(),
+            floating_focused: false,
         }
     }
 }
@@ -183,12 +247,95 @@ impl ClientState {
             })
     }
 
+    /// The keyboard owner: the front floating pane when it has focus, otherwise
+    /// the selected tab's tiled focus.
     pub fn focused_pane<'a>(&self, workspace: &'a WorkspaceSnapshot) -> Option<&'a PaneId> {
+        self.focused_float(workspace)
+            .or_else(|| self.tiled_focus(workspace))
+    }
+
+    /// Focus among the selected tab's tiled panes; floating panes are excluded.
+    pub fn tiled_focus<'a>(&self, workspace: &'a WorkspaceSnapshot) -> Option<&'a PaneId> {
         let tab = self.selected_tab(workspace)?;
         self.focused_panes
             .get(tab.id.as_str())
             .and_then(|id| find_pane(&tab.layout, id))
-            .or_else(|| Some(first_pane(&tab.layout)))
+            .filter(|id| !self.is_floating(id))
+            .or_else(|| first_tiled_pane(&tab.layout, &|id| self.is_floating(id)))
+    }
+
+    pub fn focused_float<'a>(&self, workspace: &'a WorkspaceSnapshot) -> Option<&'a PaneId> {
+        if !self.floating_focused {
+            return None;
+        }
+        locate_pane(workspace, &self.floating.last()?.pane_id).map(|(_, pane)| pane)
+    }
+
+    pub fn is_floating(&self, id: &PaneId) -> bool {
+        self.floating.iter().any(|float| &float.pane_id == id)
+    }
+
+    /// Present an existing pane above this window and give it the keyboard.
+    /// The pane stays in its server tab; no surface is created or restarted.
+    pub fn float_pane(&mut self, workspace: &WorkspaceSnapshot, id: &PaneId) -> bool {
+        if locate_pane(workspace, id).is_none() {
+            return false;
+        }
+        if !self.is_floating(id) {
+            if self.floating.len() >= MAX_FLOATING {
+                return false;
+            }
+            self.floating.push(FloatingPane {
+                pane_id: id.clone(),
+                rect: FloatRect::cascade(self.floating.len()),
+            });
+        }
+        self.raise_float(id)
+    }
+
+    fn raise_float(&mut self, id: &PaneId) -> bool {
+        let Some(index) = self.floating.iter().position(|float| &float.pane_id == id) else {
+            return false;
+        };
+        let float = self.floating.remove(index);
+        self.floating.push(float);
+        self.floating_focused = true;
+        true
+    }
+
+    /// Return a floating pane to its tile wherever the server tree now places it.
+    /// When it owned the keyboard and its tab is selected, its tile keeps focus.
+    pub fn dock_pane(&mut self, workspace: &WorkspaceSnapshot, id: &PaneId) -> bool {
+        let Some(index) = self.floating.iter().position(|float| &float.pane_id == id) else {
+            return false;
+        };
+        let had_keyboard = self.floating_focused && index + 1 == self.floating.len();
+        self.floating.remove(index);
+        if had_keyboard {
+            self.floating_focused = false;
+            if let Some(tab) = self.selected_tab(workspace)
+                && find_pane(&tab.layout, id).is_some()
+            {
+                self.focused_panes.insert(tab.id.to_string(), id.clone());
+            }
+        }
+        if self.floating.is_empty() {
+            self.floating_focused = false;
+        }
+        true
+    }
+
+    pub fn set_float_rect(&mut self, id: &PaneId, rect: FloatRect) -> bool {
+        let Some(float) = self.floating.iter_mut().find(|float| &float.pane_id == id) else {
+            return false;
+        };
+        float.rect = rect.sanitized();
+        true
+    }
+
+    /// Return the keyboard to the selected tab's tiles without docking anything.
+    pub fn focus_tiles(&mut self) {
+        self.floating_focused = false;
     }
 
     /// Prune only in response to an authoritative snapshot, never a disconnect.
@@ -222,6 +369,15 @@ impl ClientState {
             .collect();
         self.viewports
             .retain(|id, _| surfaces.contains(id.as_str()));
+        // A float follows its pane to any tab; it ends with the pane or when its
+        // tab is hidden in this window, which releases the attachment.
+        let mut floated = HashSet::new();
+        let hidden_tabs = &self.hidden_tabs;
+        retain_floats(&mut self.floating, &mut self.floating_focused, |float| {
+            floated.insert(float.pane_id.clone())
+                && locate_pane(authoritative, &float.pane_id)
+                    .is_some_and(|(tab, _)| !hidden_tabs.contains(&tab.id))
+        });
 
         if self
             .selected_session
@@ -349,7 +505,12 @@ impl ClientState {
         }
     }
 
+    /// Floating panes take the keyboard and come to the front; tiled panes must
+    /// belong to the selected tab and return the keyboard to the tiles.
     pub fn focus_pane(&mut self, workspace: &WorkspaceSnapshot, id: &PaneId) -> bool {
+        if self.is_floating(id) {
+            return locate_pane(workspace, id).is_some() && self.raise_float(id);
+        }
         let Some(tab) = self.selected_tab(workspace) else {
             return false;
         };
@@ -357,17 +518,21 @@ impl ClientState {
             return false;
         }
         self.focused_panes.insert(tab.id.to_string(), id.clone());
+        self.floating_focused = false;
         true
     }
 
     pub fn hide_tab(&mut self, workspace: &WorkspaceSnapshot, id: &TabId) -> bool {
-        let Some((session, _)) = locate_tab(workspace, id) else {
+        let Some((session, hidden)) = locate_tab(workspace, id) else {
             return false;
         };
         let was_selected = self
             .tab_in_session(session)
             .is_some_and(|tab| &tab.id == id);
         self.hidden_tabs.insert(id.clone());
+        retain_floats(&mut self.floating, &mut self.floating_focused, |float| {
+            find_pane(&hidden.layout, &float.pane_id).is_none()
+        });
         if was_selected {
             if let Some(next) = self.neighbor_tab(session, None, id) {
                 self.selected_tabs
@@ -415,6 +580,8 @@ impl ClientState {
         self.selected_tabs.clear();
         self.focused_panes.clear();
         self.viewports.clear();
+        self.floating.clear();
+        self.floating_focused = false;
         copy_viewports(&tab.layout, &source.viewports, &mut self.viewports);
         if let Some(pane) = source.focused_panes.get(id.as_str()) {
             self.focused_panes.insert(id.to_string(), pane.clone());
@@ -519,6 +686,20 @@ impl ClientState {
                 + self.hidden_tabs.len()
                 + self.viewports.len();
         changed |= self.project_history.sanitize();
+        let floating = self.floating.clone();
+        let mut floated = HashSet::new();
+        self.floating.retain(|float| {
+            valid_id(float.pane_id.as_str()) && floated.insert(float.pane_id.clone())
+        });
+        let excess = self.floating.len().saturating_sub(MAX_FLOATING);
+        self.floating.drain(..excess);
+        for float in &mut self.floating {
+            float.rect = float.rect.sanitized();
+        }
+        if self.floating.is_empty() {
+            self.floating_focused = false;
+        }
+        changed |= floating != self.floating;
         Ok(changed)
     }
 }
@@ -583,6 +764,42 @@ fn find_pane<'a>(layout: &'a LayoutNode, id: &PaneId) -> Option<&'a PaneId> {
         LayoutNode::Split { first, second, .. } => {
             find_pane(first, id).or_else(|| find_pane(second, id))
         }
+    }
+}
+
+fn first_tiled_pane<'a>(
+    layout: &'a LayoutNode,
+    floating: &impl Fn(&PaneId) -> bool,
+) -> Option<&'a PaneId> {
+    match layout {
+        LayoutNode::Pane { pane_id, .. } => (!floating(pane_id)).then_some(pane_id),
+        LayoutNode::Split { first, second, .. } => {
+            first_tiled_pane(first, floating).or_else(|| first_tiled_pane(second, floating))
+        }
+    }
+}
+
+fn locate_pane<'a>(
+    workspace: &'a WorkspaceSnapshot,
+    id: &PaneId,
+) -> Option<(&'a WorkspaceTab, &'a PaneId)> {
+    workspace
+        .sessions
+        .iter()
+        .flat_map(|session| &session.tabs)
+        .find_map(|tab| find_pane(&tab.layout, id).map(|pane| (tab, pane)))
+}
+
+/// The keyboard leaves the floats when the focused front float is dropped.
+fn retain_floats(
+    floating: &mut Vec<FloatingPane>,
+    floating_focused: &mut bool,
+    keep: impl FnMut(&FloatingPane) -> bool,
+) {
+    let front = floating.last().map(|float| float.pane_id.clone());
+    floating.retain(keep);
+    if floating.last().map(|float| &float.pane_id) != front.as_ref() {
+        *floating_focused = false;
     }
 }
 
@@ -869,6 +1086,10 @@ impl StateSlot {
             || state.focused_panes.len() > MAX_REFERENCES
             || state.hidden_tabs.len() > MAX_REFERENCES
             || state.viewports.len() > MAX_REFERENCES
+            || state.floating.len() > MAX_FLOATING
+            || state.floating.iter().any(|float| {
+                !valid_id(float.pane_id.as_str()) || float.rect.sanitized() != float.rect
+            })
             || state
                 .selected_session
                 .as_ref()
@@ -1479,6 +1700,132 @@ mod tests {
             "replacement"
         );
         assert!(destination.hidden_tabs.contains(&TabId::from("two-a")));
+    }
+
+    #[test]
+    fn floating_owns_keyboard_across_tabs_follows_moves_and_ends_with_pane_or_hide() {
+        let mut workspace = workspace();
+        workspace.sessions[0].tabs[0].layout = LayoutNode::Split {
+            axis: compi_protocol::SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane {
+                pane_id: PaneId::from("one-a-pane"),
+                surface_id: SurfaceId::from("one-a-pane-surface"),
+            }),
+            second: Box::new(LayoutNode::Pane {
+                pane_id: PaneId::from("agent"),
+                surface_id: SurfaceId::from("agent-surface"),
+            }),
+        };
+        let agent = PaneId::from("agent");
+        let mut state = ClientState::default();
+        state.reconcile(None, &workspace);
+        assert!(state.focus_pane(&workspace, &agent));
+        assert!(state.float_pane(&workspace, &agent));
+        assert_eq!(state.focused_pane(&workspace), Some(&agent));
+        // The source tab's tiles exclude the float.
+        assert_eq!(
+            state.tiled_focus(&workspace).unwrap().as_str(),
+            "one-a-pane"
+        );
+        // Working elsewhere keeps the float and its keyboard ownership.
+        assert!(state.select_tab(&workspace, &TabId::from("two-b")));
+        assert_eq!(state.focused_pane(&workspace), Some(&agent));
+        assert!(state.focus_pane(&workspace, &PaneId::from("two-b-pane")));
+        assert_eq!(
+            state.focused_pane(&workspace).unwrap().as_str(),
+            "two-b-pane"
+        );
+        assert!(state.focus_pane(&workspace, &agent));
+        assert_eq!(state.focused_pane(&workspace), Some(&agent));
+
+        // Another client moves the pane to a new tab: the float follows it.
+        let previous = workspace.clone();
+        workspace.sessions[0].tabs[0].layout = LayoutNode::Pane {
+            pane_id: PaneId::from("one-a-pane"),
+            surface_id: SurfaceId::from("one-a-pane-surface"),
+        };
+        workspace.sessions[0].tabs.push(WorkspaceTab {
+            id: TabId::from("moved"),
+            label: "moved".into(),
+            layout: LayoutNode::Pane {
+                pane_id: agent.clone(),
+                surface_id: SurfaceId::from("agent-surface"),
+            },
+        });
+        state.reconcile(Some(&previous), &workspace);
+        assert_eq!(state.focused_pane(&workspace), Some(&agent));
+
+        // Docking returns the keyboard to the tiles of the selected tab.
+        assert!(state.dock_pane(&workspace, &agent));
+        assert!(state.floating.is_empty());
+        assert_eq!(
+            state.focused_pane(&workspace).unwrap().as_str(),
+            "two-b-pane"
+        );
+
+        // Hiding the pane's tab ends its float; so does removing the pane.
+        assert!(state.float_pane(&workspace, &agent));
+        state.hide_tab(&workspace, &TabId::from("moved"));
+        assert!(state.floating.is_empty() && !state.floating_focused);
+        assert!(state.restore_tab(&workspace, &TabId::from("moved")));
+        assert!(state.float_pane(&workspace, &agent));
+        let previous = workspace.clone();
+        workspace.sessions[0].tabs.pop();
+        state.reconcile(Some(&previous), &workspace);
+        assert!(state.floating.is_empty());
+        // The removed tab's neighbor is selected and its tile owns the keyboard.
+        assert_eq!(
+            state.focused_pane(&workspace).unwrap().as_str(),
+            "one-c-pane"
+        );
+    }
+
+    #[test]
+    fn floating_state_is_additive_and_sanitized() {
+        let legacy: ClientState = serde_json::from_value(
+            serde_json::to_value(ClientState::default())
+                .map(|mut value| {
+                    value.as_object_mut().unwrap().remove("floating_focused");
+                    value
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.floating.is_empty() && !legacy.floating_focused);
+        let mut state = ClientState {
+            floating: (0..MAX_FLOATING + 2)
+                .map(|index| FloatingPane {
+                    pane_id: PaneId::from(format!("pane-{index}")),
+                    rect: FloatRect {
+                        x: 0.9,
+                        y: f32::NAN,
+                        width: 2.0,
+                        height: 0.5,
+                    },
+                })
+                .chain(std::iter::once(FloatingPane {
+                    pane_id: PaneId::from("pane-0"),
+                    rect: FloatRect::DEFAULT,
+                }))
+                .collect(),
+            floating_focused: true,
+            ..ClientState::default()
+        };
+        assert!(state.sanitize(&ClientState::default()).unwrap());
+        assert_eq!(state.floating.len(), MAX_FLOATING);
+        // The front-most floats survive truncation; duplicates keep their first entry.
+        assert_eq!(
+            state.floating.last().unwrap().pane_id.as_str(),
+            format!("pane-{}", MAX_FLOATING + 1)
+        );
+        assert!(
+            state
+                .floating
+                .iter()
+                .all(|float| float.rect == FloatRect::DEFAULT)
+        );
+        assert!(!state.sanitize(&ClientState::default()).unwrap());
     }
 
     #[test]

@@ -342,6 +342,103 @@ pub fn node_at_path<'a>(mut node: &'a LayoutNode, path: &[bool]) -> Option<&'a L
     Some(node)
 }
 
+/// Window-local presentation without the omitted (floating) leaves. A split with
+/// one omitted side is replaced by its other side; the saved tree is unchanged.
+/// Returns `None` when every leaf is omitted.
+pub fn without_panes(node: &LayoutNode, omit: &impl Fn(&PaneId) -> bool) -> Option<LayoutNode> {
+    match node {
+        LayoutNode::Pane { pane_id, .. } => (!omit(pane_id)).then(|| node.clone()),
+        LayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => match (without_panes(first, omit), without_panes(second, omit)) {
+            (Some(first), Some(second)) => Some(LayoutNode::Split {
+                axis: *axis,
+                ratio: *ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        },
+    }
+}
+
+/// Translate a split address in `without_panes(tree, omit)` to the saved `tree`,
+/// so ratio mutations always target the server's split.
+pub fn saved_path(
+    tree: &LayoutNode,
+    pruned: &[bool],
+    omit: &impl Fn(&PaneId) -> bool,
+) -> Vec<bool> {
+    let mut node = tree;
+    let mut remaining = pruned;
+    let mut path = Vec::with_capacity(pruned.len());
+    while let LayoutNode::Split { first, second, .. } = node {
+        let branch = match (has_kept_leaf(first, omit), has_kept_leaf(second, omit)) {
+            (true, true) => match remaining.split_first() {
+                Some((branch, rest)) => {
+                    remaining = rest;
+                    *branch
+                }
+                None => break,
+            },
+            (true, false) => false,
+            (false, true) => true,
+            (false, false) => break,
+        };
+        path.push(branch);
+        node = if branch { second } else { first };
+    }
+    path
+}
+
+fn has_kept_leaf(node: &LayoutNode, omit: &impl Fn(&PaneId) -> bool) -> bool {
+    match node {
+        LayoutNode::Pane { pane_id, .. } => !omit(pane_id),
+        LayoutNode::Split { first, second, .. } => {
+            has_kept_leaf(first, omit) || has_kept_leaf(second, omit)
+        }
+    }
+}
+
+/// Place a floating frame from area fractions: at least `minimum` (unless the
+/// area is smaller), fully inside `area`, and aligned to whole logical pixels.
+pub fn float_frame(fraction: Rect, area: Size, minimum: Size) -> Rect {
+    let width = (fraction.width * area.width)
+        .max(minimum.width)
+        .min(area.width)
+        .round();
+    let height = (fraction.height * area.height)
+        .max(minimum.height)
+        .min(area.height)
+        .round();
+    Rect {
+        x: (fraction.x * area.width)
+            .clamp(0.0, (area.width - width).max(0.0))
+            .round(),
+        y: (fraction.y * area.height)
+            .clamp(0.0, (area.height - height).max(0.0))
+            .round(),
+        width,
+        height,
+    }
+}
+
+/// Inverse of `float_frame`, so placement survives window and sidebar resizes.
+pub fn float_fraction(frame: Rect, area: Size) -> Rect {
+    let width = area.width.max(1.0);
+    let height = area.height.max(1.0);
+    Rect {
+        x: frame.x / width,
+        y: frame.y / height,
+        width: frame.width / width,
+        height: frame.height / height,
+    }
+}
+
 fn combine(first: Size, second: Size, axis: SplitAxis, divider: f32) -> Size {
     match axis {
         SplitAxis::Horizontal => Size {
@@ -431,9 +528,12 @@ pub fn compute_layout_with_preview(
         &mut measured,
     );
     let minimum = measured[root].minimum;
+    // Minima are already whole device pixels. When the viewport covers them, the canvas
+    // is exactly the viewport: re-rounding it could add a sub-pixel overflow and a
+    // phantom workspace scrollbar.
     let canvas = Size {
-        width: metrics.ceil(viewport.width.max(minimum.width)),
-        height: metrics.ceil(viewport.height.max(minimum.height)),
+        width: viewport.width.max(minimum.width),
+        height: viewport.height.max(minimum.height),
     };
     let mut output = WorkspaceLayout {
         viewport,
@@ -772,5 +872,133 @@ mod tests {
             compute_layout_with_preview(&tree, layout.viewport, metrics(), Some((&[], 0.7)));
         assert!((preview.dividers[0].effective_ratio - 0.7).abs() < 0.001);
         assert_eq!(preview.dividers[0].saved_ratio, 0.5);
+    }
+
+    #[test]
+    fn floating_leaves_reflow_siblings_and_divider_addresses_target_saved_splits() {
+        // a | (b / (c | d))
+        let tree = split(
+            SplitAxis::Horizontal,
+            0.3,
+            leaf("a"),
+            split(
+                SplitAxis::Vertical,
+                0.4,
+                leaf("b"),
+                split(SplitAxis::Horizontal, 0.6, leaf("c"), leaf("d")),
+            ),
+        );
+        let floating_b = |pane: &PaneId| pane.as_str() == "b";
+        let pruned = without_panes(&tree, &floating_b).unwrap();
+        assert_eq!(
+            pruned,
+            split(
+                SplitAxis::Horizontal,
+                0.3,
+                leaf("a"),
+                split(SplitAxis::Horizontal, 0.6, leaf("c"), leaf("d")),
+            )
+        );
+        let layout = compute_layout(
+            &pruned,
+            Size {
+                width: 1200.0,
+                height: 600.0,
+            },
+            metrics(),
+        );
+        assert!(layout.pane(&"b".into()).is_none());
+        let inner = layout
+            .dividers
+            .iter()
+            .find(|divider| divider.first_leaf.as_str() == "c")
+            .unwrap();
+        assert_eq!(inner.path, vec![true]);
+        let saved = saved_path(&tree, &inner.path, &floating_b);
+        assert_eq!(saved, vec![true, true]);
+        assert_eq!(
+            first_leaf(node_at_path(&tree, &saved).unwrap()).as_str(),
+            "c"
+        );
+        assert_eq!(saved_path(&tree, &[], &floating_b), Vec::<bool>::new());
+
+        // Omitting both sides of a split removes it; the parent's other side remains.
+        let floating_cd = |pane: &PaneId| matches!(pane.as_str(), "c" | "d");
+        assert_eq!(
+            without_panes(&tree, &floating_cd).unwrap(),
+            split(SplitAxis::Horizontal, 0.3, leaf("a"), leaf("b"))
+        );
+        assert_eq!(saved_path(&tree, &[], &floating_cd), Vec::<bool>::new());
+        let floating_a = |pane: &PaneId| pane.as_str() == "a";
+        assert_eq!(saved_path(&tree, &[true], &floating_a), vec![true, true]);
+        assert!(without_panes(&leaf("a"), &floating_a).is_none());
+    }
+
+    #[test]
+    fn float_frames_keep_minimum_size_inside_area_and_round_trip() {
+        let area = Size {
+            width: 1000.0,
+            height: 500.0,
+        };
+        let minimum = Size {
+            width: 300.0,
+            height: 150.0,
+        };
+        let frame = float_frame(
+            Rect {
+                x: 0.9,
+                y: -0.5,
+                width: 0.1,
+                height: 0.5,
+            },
+            area,
+            minimum,
+        );
+        assert_eq!(
+            frame,
+            Rect {
+                x: 700.0,
+                y: 0.0,
+                width: 300.0,
+                height: 250.0,
+            }
+        );
+        assert_eq!(
+            float_frame(float_fraction(frame, area), area, minimum),
+            frame
+        );
+        let tiny = float_frame(
+            float_fraction(frame, area),
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            minimum,
+        );
+        assert_eq!(
+            (tiny.x, tiny.y, tiny.width, tiny.height),
+            (0.0, 0.0, 200.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn unaligned_viewport_that_fits_never_scrolls() {
+        // A sidebar can leave the terminal area off the device grid at 125%.
+        let metrics = LayoutMetrics {
+            scale_factor: 1.25,
+            ..metrics()
+        };
+        let viewport = Size {
+            width: 731.3,
+            height: 600.1,
+        };
+        let layout = compute_layout(
+            &split(SplitAxis::Horizontal, 0.5, leaf("a"), leaf("b")),
+            viewport,
+            metrics,
+        );
+        assert!(!layout.has_overflow());
+        assert!(layout.canvas.width <= layout.viewport.width);
+        assert!(layout.canvas.height <= layout.viewport.height);
     }
 }

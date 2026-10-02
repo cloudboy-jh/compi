@@ -98,6 +98,9 @@ registry! {
     SplitDown, "split_down", "Split down", Some("cmd-shift-d"), Some("alt-shift-minus");
     TogglePaneZoom, "toggle_pane_zoom", "Zoom pane", None, None;
     DetachPane, "detach_pane", "Move pane to new tab", None, None;
+    TogglePaneFloat, "toggle_pane_float", "Float pane", None, None;
+    ToggleFloatingFocus, "toggle_floating_focus", "Switch focus between floating and tiled panes", None, None;
+    NextFloatingPane, "next_floating_pane", "Focus next floating pane", None, None;
     FocusLeft, "focus_left", "Focus pane left", Some("cmd-alt-left"), Some("alt-left");
     FocusRight, "focus_right", "Focus pane right", Some("cmd-alt-right"), Some("alt-right");
     FocusUp, "focus_up", "Focus pane above", Some("cmd-alt-up"), Some("alt-up");
@@ -193,7 +196,13 @@ pub struct CommandContext {
     pub workspace_count: usize,
     pub tab_count: usize,
     pub hidden_tab_count: usize,
+    /// Tiled panes visible in the selected tab; floating panes are excluded.
     pub pane_count: usize,
+    /// Every pane in the focused pane's server tab, floating or tiled.
+    pub tab_pane_count: usize,
+    pub pane_floating: bool,
+    pub floating_count: usize,
+    pub tiled_pane_available: bool,
     pub has_workspace: bool,
     pub has_tab: bool,
     pub has_pane: bool,
@@ -208,9 +217,10 @@ pub struct CommandContext {
     pub daemon_restarting: bool,
     pub remote_target: bool,
     pub other_window_available: bool,
-    /// Revision at which the current command targets/context were captured.
-    pub revision: u64,
-    pub current_revision: u64,
+    /// Workspace hierarchy key (tabs, panes, process lifetimes) when the command's
+    /// targets were captured. Size and status observations do not change it.
+    pub structure: u64,
+    pub current_structure: u64,
     pub split_right_reason: Option<&'static str>,
     pub split_down_reason: Option<&'static str>,
     pub pane_zoomed: bool,
@@ -227,8 +237,9 @@ impl Command {
         match self {
             NewTab | SwitchTab | PreviousTab | NextTab | RenameTab | MoveTabLeft | MoveTabRight
             | RemoveTab | DetachTab | RestoreHiddenTab => CommandCategory::Tabs,
-            SplitRight | SplitDown | TogglePaneZoom | DetachPane | FocusLeft | FocusRight
-            | FocusUp | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
+            SplitRight | SplitDown | TogglePaneZoom | DetachPane | TogglePaneFloat
+            | ToggleFloatingFocus | NextFloatingPane | FocusLeft | FocusRight | FocusUp
+            | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | RemovePane => CommandCategory::Panes,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
@@ -257,6 +268,12 @@ impl Command {
             }
             TogglePaneZoom => Some("Switches between one pane and the full split layout."),
             DetachPane => Some("Moves this pane to its own tab without stopping its terminal."),
+            TogglePaneFloat => Some(
+                "Shows this pane above your tabs without restarting its terminal; Dock returns it to its split.",
+            ),
+            ToggleFloatingFocus => {
+                Some("Moves keyboard input between floating panes and this tab's split.")
+            }
             RemovePane => Some("Stops this terminal and removes its pane."),
             EndSurface => Some("Stops this terminal and its child processes; keeps its contents."),
             RestartSurface => Some("Starts a new process in this terminal."),
@@ -285,6 +302,8 @@ impl Command {
             DetachTab => "hide close keep running",
             RestoreHiddenTab => "reopen unhide",
             DetachPane => "detach split pane tab",
+            TogglePaneFloat => "floating overlay popup dock undock",
+            ToggleFloatingFocus | NextFloatingPane => "floating keyboard cycle",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
             _ => "",
@@ -331,7 +350,7 @@ impl Command {
                 .daemon_restarting
                 .then_some("Wait for the server to restart");
         }
-        if c.revision != c.current_revision {
+        if c.structure != c.current_structure {
             return Some("Workspace changed; select the command again");
         }
         let mutation = matches!(
@@ -414,6 +433,8 @@ impl Command {
             SplitRight | SplitDown => {
                 if !c.has_pane {
                     Some("Select a pane first")
+                } else if c.pane_floating {
+                    Some("Dock this pane before splitting it")
                 } else if self == SplitRight {
                     c.split_right_reason
                 } else {
@@ -432,6 +453,8 @@ impl Command {
             ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio => {
                 if c.pane_zoomed {
                     Some("Restore the split layout before resizing a divider")
+                } else if c.pane_floating {
+                    Some("Dock this pane before resizing its split")
                 } else if !c.has_pane || c.pane_count < 2 {
                     Some("The focused pane has no split")
                 } else {
@@ -441,6 +464,8 @@ impl Command {
             TogglePaneZoom => {
                 if !c.has_pane {
                     Some("Select a pane first")
+                } else if c.pane_floating {
+                    Some("Dock this pane before zooming it")
                 } else if !c.pane_zoomed && c.pane_count < 2 {
                     Some("This tab has only one pane")
                 } else {
@@ -451,7 +476,31 @@ impl Command {
                 if !c.has_pane {
                     Some("Select a pane first")
                 } else {
-                    (c.pane_count < 2).then_some("This tab has only one pane")
+                    (c.tab_pane_count < 2).then_some("This tab has only one pane")
+                }
+            }
+            TogglePaneFloat => {
+                if !c.has_pane {
+                    Some("Select a pane first")
+                } else {
+                    (!c.pane_floating && c.floating_count >= crate::client_state::MAX_FLOATING)
+                        .then_some("Dock a floating pane first")
+                }
+            }
+            ToggleFloatingFocus => {
+                if c.floating_count == 0 {
+                    Some("No pane is floating")
+                } else {
+                    (c.pane_floating && !c.tiled_pane_available)
+                        .then_some("This tab has no tiled pane")
+                }
+            }
+            NextFloatingPane => {
+                if c.floating_count == 0 {
+                    Some("No pane is floating")
+                } else {
+                    (c.pane_floating && c.floating_count == 1)
+                        .then_some("No other pane is floating")
                 }
             }
             RemovePane => (!c.has_pane).then_some("Select a pane first"),
@@ -823,6 +872,8 @@ mod tests {
             tab_count: 2,
             hidden_tab_count: 1,
             pane_count: 2,
+            tab_pane_count: 2,
+            tiled_pane_available: true,
             focus_left: true,
             focus_right: true,
             focus_up: true,
@@ -830,8 +881,8 @@ mod tests {
             terminal_available: true,
             can_paste: true,
             surface_status: Some(SurfaceStatus::Running),
-            revision: 3,
-            current_revision: 3,
+            structure: 3,
+            current_structure: 3,
             ..CommandContext::default()
         }
     }
@@ -1255,11 +1306,11 @@ mod tests {
         context.surface_status = Some(SurfaceStatus::Lost);
         assert!(Command::EndSurface.disabled_reason(&context).is_some());
         assert!(Command::RestartSurface.disabled_reason(&context).is_none());
-        context.current_revision += 1;
+        context.current_structure += 1;
         assert!(Command::RestartSurface.disabled_reason(&context).is_some());
         assert!(Command::DetachTab.disabled_reason(&context).is_some());
         assert!(Command::OpenDiagnostics.disabled_reason(&context).is_none());
-        context.revision = context.current_revision;
+        context.structure = context.current_structure;
         context.split_right_reason = Some("Workspace overflow");
         assert!(Command::SplitRight.disabled_reason(&context).is_some());
         assert!(Command::SplitDown.disabled_reason(&context).is_none());
@@ -1285,6 +1336,51 @@ mod tests {
         context.pane_zoomed = false;
         context.pane_count = 1;
         assert!(Command::TogglePaneZoom.disabled_reason(&context).is_some());
+    }
+
+    #[test]
+    fn floating_pane_blocks_split_mutations_but_keeps_detach_and_keyboard_moves() {
+        let mut context = CommandContext {
+            pane_floating: true,
+            floating_count: 1,
+            // The source tab still has its other pane tiled.
+            pane_count: 1,
+            ..ready()
+        };
+        for command in [
+            Command::SplitRight,
+            Command::SplitDown,
+            Command::TogglePaneZoom,
+            Command::ResizeSplitIncrease,
+        ] {
+            assert!(command.disabled_reason(&context).is_some(), "{command:?}");
+        }
+        assert!(Command::DetachPane.disabled_reason(&context).is_none());
+        assert!(Command::TogglePaneFloat.disabled_reason(&context).is_none());
+        assert!(
+            Command::ToggleFloatingFocus
+                .disabled_reason(&context)
+                .is_none()
+        );
+        assert!(
+            Command::NextFloatingPane
+                .disabled_reason(&context)
+                .is_some()
+        );
+        context.tiled_pane_available = false;
+        assert!(
+            Command::ToggleFloatingFocus
+                .disabled_reason(&context)
+                .is_some()
+        );
+        context.pane_floating = false;
+        context.floating_count = crate::client_state::MAX_FLOATING;
+        assert!(Command::TogglePaneFloat.disabled_reason(&context).is_some());
+        assert!(
+            Command::NextFloatingPane
+                .disabled_reason(&context)
+                .is_none()
+        );
     }
 
     #[test]

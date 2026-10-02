@@ -1,5 +1,5 @@
 use crate::client_state::{
-    ClientState, SavedViewport, StateSlot, WindowAppearanceOverrides, WindowGeometry,
+    ClientState, FloatRect, SavedViewport, StateSlot, WindowAppearanceOverrides, WindowGeometry,
 };
 use crate::commands::{self, Command};
 use crate::config::{AppearanceSettings, FontSettings, LoadedConfig};
@@ -64,7 +64,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, PostMessageW, SW_RESTORE, ShowWindowAsync, WM_NCLBUTTONDOWN,
 };
-use workspace::{DividerDrag, Overlay, TransferSeed, open_compi_window};
+use workspace::{DividerDrag, FloatDrag, FloatLayout, Overlay, TransferSeed, open_compi_window};
 
 const DEFAULT_COLS: i16 = 100;
 const DEFAULT_ROWS: i16 = 30;
@@ -843,7 +843,8 @@ struct CompiApp {
     performance_enabled: Arc<AtomicBool>,
     performance: workspace::performance::PerformanceMonitor,
     performance_notice: Option<String>,
-    overlay_revision: Option<u64>,
+    /// `structure_key` when the open overlay was captured; see `CommandContext::structure`.
+    overlay_structure: Option<u64>,
     pane_zoom: PaneZoomState,
     layout: Option<WorkspaceLayout>,
     divider_drag: Option<DividerDrag>,
@@ -851,6 +852,11 @@ struct CompiApp {
     last_resize: Instant,
     loading_surfaces: bool,
     zoom_layout: Option<WorkspaceLayout>,
+    /// Floating pane geometry in terminal-area coordinates, back to front.
+    float_layouts: Vec<FloatLayout>,
+    /// Terminal area that floating fractions are relative to.
+    float_area: layout::Size,
+    float_drag: Option<FloatDrag>,
     mutation_pending: bool,
     global_error: Option<String>,
     connection_error: Option<String>,
@@ -1358,7 +1364,8 @@ impl Render for HeaderTooltip {
 }
 struct TabTooltip {
     title: Option<String>,
-    panes: Vec<(String, Option<String>)>,
+    /// Name, directory, and whether the pane floats in this window.
+    panes: Vec<(String, Option<String>, bool)>,
     colors: ThemeColors,
 }
 
@@ -1407,65 +1414,79 @@ impl Render for TabTooltip {
                     .id("tab-tooltip-panes")
                     .max_h(px(320.0))
                     .overflow_y_scroll()
-                    .children(
-                        self.panes
-                            .iter()
-                            .enumerate()
-                            .map(|(index, (name, directory))| {
-                                div()
-                                    .when(index > 0, |row| {
-                                        row.mt_1()
-                                            .pt_2()
-                                            .border_t_1()
-                                            .border_color(color(self.colors.border))
-                                    })
-                                    .flex()
-                                    .items_start()
-                                    .gap_2()
-                                    .when(pane_count > 1, |row| {
-                                        row.child(
-                                            div()
-                                                .flex_none()
-                                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                                .text_color(color(modal_text_color(
-                                                    self.colors.muted,
-                                                    &self.colors,
-                                                )))
-                                                .child(format!("{}", index + 1)),
-                                        )
-                                    })
-                                    .child(
+                    .children(self.panes.iter().enumerate().map(
+                        |(index, (name, directory, floating))| {
+                            div()
+                                .when(index > 0, |row| {
+                                    row.mt_1()
+                                        .pt_2()
+                                        .border_t_1()
+                                        .border_color(color(self.colors.border))
+                                })
+                                .flex()
+                                .items_start()
+                                .gap_2()
+                                .when(pane_count > 1, |row| {
+                                    row.child(
                                         div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .child(
+                                            .flex_none()
+                                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                                            .text_color(color(modal_text_color(
+                                                self.colors.muted,
+                                                &self.colors,
+                                            )))
+                                            .child(format!("{}", index + 1)),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .child(name.clone()),
+                                                )
+                                                .when(*floating, |row| {
+                                                    row.child(
+                                                        div()
+                                                            .flex_none()
+                                                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                            .text_color(color(self.colors.accent))
+                                                            .child("Floating"),
+                                                    )
+                                                }),
+                                        )
+                                        .when_some(directory.clone(), |row, directory| {
+                                            row.child(
                                                 div()
                                                     .overflow_hidden()
                                                     .whitespace_nowrap()
                                                     .text_ellipsis()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .child(name.clone()),
+                                                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                    .text_color(color(modal_text_color(
+                                                        self.colors.muted,
+                                                        &self.colors,
+                                                    )))
+                                                    .child(directory),
                                             )
-                                            .when_some(directory.clone(), |row, directory| {
-                                                row.child(
-                                                    div()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                                                        .text_color(color(modal_text_color(
-                                                            self.colors.muted,
-                                                            &self.colors,
-                                                        )))
-                                                        .child(directory),
-                                                )
-                                            }),
-                                    )
-                            }),
-                    ),
+                                        }),
+                                )
+                        },
+                    )),
             )
     }
 }

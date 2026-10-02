@@ -301,16 +301,18 @@ const STALE_TAB_MENU: &str =
 pub(super) enum Overlay {
     Palette,
     PaneActions,
+    /// Tab menus bind their target tab and the workspace `structure_key`, so size and
+    /// status observations never invalidate them; hierarchy changes do.
     TabActions {
         position: Point<Pixels>,
         tab_id: TabId,
-        revision: u64,
+        structure: u64,
     },
     TabPaneActions {
         position: Point<Pixels>,
         tab_id: TabId,
         pane_id: PaneId,
-        revision: u64,
+        structure: u64,
     },
     HeaderActions {
         position: Point<Pixels>,
@@ -459,6 +461,36 @@ pub(super) struct DividerDrag {
     revision: u64,
     index: usize,
     tree: LayoutNode,
+}
+
+/// Height of a floating pane's title strip, above its terminal body.
+const FLOAT_TITLE_HEIGHT: f32 = 28.0;
+const FLOAT_RESIZE_HANDLE: f32 = 6.0;
+/// Transparent drag zone around a one-device-pixel seam (split or sidebar).
+const SEAM_GRAB: f32 = 8.0;
+
+/// A floating pane's frame (title strip included) and terminal body, in
+/// terminal-area coordinates. Floats are outside the scrolled split canvas.
+pub(super) struct FloatLayout {
+    frame: layout::Rect,
+    pane: layout::PaneLayout,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatDragMode {
+    Move,
+    Right,
+    Bottom,
+    Corner,
+}
+
+pub(super) struct FloatDrag {
+    pane_id: PaneId,
+    mode: FloatDragMode,
+    origin: Point<Pixels>,
+    start: layout::Rect,
+    /// Placement before the drag; Escape restores it.
+    before: FloatRect,
 }
 
 pub(super) fn open_compi_window(
@@ -789,7 +821,7 @@ impl CompiApp {
             performance_enabled: performance_enabled.clone(),
             performance: performance::PerformanceMonitor::default(),
             performance_notice: None,
-            overlay_revision: None,
+            overlay_structure: None,
             pane_zoom: PaneZoomState::default(),
             layout: None,
             divider_drag: None,
@@ -797,6 +829,9 @@ impl CompiApp {
             last_resize: Instant::now() - Duration::from_secs(1),
             loading_surfaces: false,
             zoom_layout: None,
+            float_layouts: Vec::new(),
+            float_area: layout::Size::default(),
+            float_drag: None,
             mutation_pending: false,
             global_error: None,
             connection_error: None,
@@ -2106,6 +2141,12 @@ impl CompiApp {
         if let Some(tab) = self.selected_tab() {
             collect_leaves(&tab.layout, &mut leaves);
         }
+        // Floating panes stay attached while another tab or workspace is selected.
+        for float in self.floating_leaves() {
+            if !leaves.iter().any(|(pane, _)| pane == &float.0) {
+                leaves.push(float);
+            }
+        }
         let wanted: HashSet<_> = leaves.iter().map(|(_, surface)| surface.clone()).collect();
         let Some(workspace) = &self.workspace else {
             return;
@@ -2145,9 +2186,15 @@ impl CompiApp {
                 continue;
             };
             let dimensions = self
-                .layout
-                .as_ref()
-                .and_then(|layout| layout.pane(&pane_id))
+                .float_layouts
+                .iter()
+                .find(|float| float.pane.pane_id == pane_id)
+                .map(|float| &float.pane)
+                .or_else(|| {
+                    self.layout
+                        .as_ref()
+                        .and_then(|layout| layout.pane(&pane_id))
+                })
                 .map(|pane| pane.grid_size(metrics))
                 .unwrap_or((self.terminal_cols, self.terminal_rows));
             let existing = self
@@ -2288,12 +2335,13 @@ impl CompiApp {
         {
             self.close_file_tree();
         }
+        let floating = self.state.is_floating(&pane);
         let tab_id = self.selected_tab().map(|tab| tab.id.clone());
         self.report_focus(false);
         if let Some(workspace) = &self.workspace {
             self.state.focus_pane(workspace, &pane);
         }
-        if let Some(tab_id) = &tab_id {
+        if !floating && let Some(tab_id) = &tab_id {
             self.pane_zoom.retarget(tab_id, pane.clone());
         }
         self.focused_view = self
@@ -2302,7 +2350,9 @@ impl CompiApp {
             .find(|view| view.pane_id == pane)
             .map(|view| view.id);
         self.report_focus(self.overlay.is_none());
-        if self.pane_zoomed() {
+        if floating {
+            // Floats sit outside the scrolled split canvas; nothing to reveal.
+        } else if self.pane_zoomed() {
             self.workspace_scroll.set_offset(point(px(0.0), px(0.0)));
         } else if let Some(layout) = &self.layout {
             let offset = self.workspace_scroll.offset();
@@ -2333,6 +2383,30 @@ impl CompiApp {
         self.save_state();
     }
 
+    /// One device pixel, so split and sidebar seams stay crisp at every display scale.
+    fn seam_width(&self) -> f32 {
+        1.0 / positive_scale(self.typography_scale)
+    }
+
+    /// Theme border pulled 40% toward the terminal background: a hairline that
+    /// separates without drawing the eye. Hover and drag still use the full accent.
+    fn seam_color(&self) -> u32 {
+        blend_rgb(
+            self.terminal_theme.terminal().background & 0x00ff_ffff,
+            self.colors().border & 0x00ff_ffff,
+            0.6,
+        )
+    }
+
+    /// Logical width left of the terminal area: the device-aligned sidebar plus its seam.
+    fn sidebar_extent(&self) -> f32 {
+        if !self.sidebar_open {
+            return 0.0;
+        }
+        let scale = positive_scale(self.typography_scale);
+        (self.sidebar_width * scale).round() / scale + self.seam_width()
+    }
+
     fn metrics(&self) -> LayoutMetrics {
         LayoutMetrics {
             cell_width: self.typography.cell_width,
@@ -2340,103 +2414,173 @@ impl CompiApp {
             padding_x: TERMINAL_PADDING,
             padding_y: TERMINAL_PADDING,
             pane_chrome_height: 0.0,
-            divider_thickness: 5.0,
+            divider_thickness: self.seam_width(),
             scale_factor: self.typography_scale,
         }
     }
 
     fn rebuild_layout(&mut self, window: &Window, force: bool) -> bool {
-        let Some(tab_id) = self.selected_tab().map(|tab| tab.id.clone()) else {
-            self.layout = None;
-            self.zoom_layout = None;
-            return false;
-        };
         let (viewport_width, viewport_height) = logical_viewport_dimensions(window);
         let metrics = self.metrics();
         let available = layout::Size {
-            width: (viewport_width
-                - if self.sidebar_open {
-                    self.sidebar_width + 5.0
-                } else {
-                    0.0
-                })
-            .max(1.0),
+            width: (viewport_width - self.sidebar_extent()).max(1.0),
             height: (viewport_height - CHROME_HEIGHT).max(1.0),
         };
-        let mut layout = {
-            let tab = self
-                .selected_tab()
-                .expect("the selected tab was resolved above");
+        self.float_area = available;
+        self.float_layouts = self.compute_float_layouts(available, metrics);
+        // Floating panes leave the selected tab's split for this window only; their
+        // siblings fill the space and divider addresses still target the saved tree.
+        let tiled = self.selected_tab().and_then(|tab| {
             let tree = self.preview_layout.as_ref().unwrap_or(&tab.layout);
-            layout::compute_layout(tree, available, metrics)
-        };
-        if layout.has_overflow() {
-            let tab = self
-                .selected_tab()
-                .expect("the selected tab was resolved above");
-            let tree = self.preview_layout.as_ref().unwrap_or(&tab.layout);
-            layout = layout::compute_layout(
-                tree,
-                layout::Size {
-                    width: (available.width - 8.0).max(1.0),
-                    height: (available.height - 8.0).max(1.0),
-                },
-                metrics,
-            );
-        }
-        let zoom_tree = self
-            .pane_zoom
-            .pane(&tab_id)
-            .and_then(|pane_id| layout.pane(pane_id))
-            .map(|pane| LayoutNode::Pane {
-                pane_id: pane.pane_id.clone(),
-                surface_id: pane.surface_id.clone(),
-            });
-        if self.pane_zoom.pane(&tab_id).is_some() && zoom_tree.is_none() {
-            self.pane_zoom.clear(&tab_id);
-        }
-        let zoom_layout = zoom_tree
-            .as_ref()
-            .map(|tree| layout::compute_layout(tree, available, metrics));
-        let mut needs_frame = false;
-        if force || self.last_resize.elapsed() >= Duration::from_millis(32) {
-            for pane in &layout.panes {
-                let geometry = zoom_layout
-                    .as_ref()
-                    .and_then(|zoom| zoom.pane(&pane.pane_id))
-                    .unwrap_or(pane);
-                let (cols, rows) = geometry.grid_size(metrics);
-                if let Some(view) = self
-                    .surface_views
-                    .iter_mut()
-                    .find(|view| view.pane_id == pane.pane_id)
-                    && (view.cols, view.rows) != (cols, rows)
-                {
-                    view.cols = cols;
-                    view.rows = rows;
-                    view.send(ClientMessage::Resize { cols, rows });
+            let floating = |pane: &PaneId| self.state.is_floating(pane);
+            let pruned = if self
+                .state
+                .floating
+                .iter()
+                .any(|float| layout_contains_pane(tree, &float.pane_id))
+            {
+                std::borrow::Cow::Owned(layout::without_panes(tree, &floating)?)
+            } else {
+                std::borrow::Cow::Borrowed(tree)
+            };
+            let mut layout = layout::compute_layout(&pruned, available, metrics);
+            if layout.has_overflow() {
+                layout = layout::compute_layout(
+                    &pruned,
+                    layout::Size {
+                        width: (available.width - 8.0).max(1.0),
+                        height: (available.height - 8.0).max(1.0),
+                    },
+                    metrics,
+                );
+            }
+            if matches!(pruned, std::borrow::Cow::Owned(_)) {
+                for divider in &mut layout.dividers {
+                    divider.path = layout::saved_path(tree, &divider.path, &floating);
                 }
             }
-            self.last_resize = Instant::now();
-        } else if layout.panes.iter().any(|pane| {
-            let geometry = zoom_layout
-                .as_ref()
-                .and_then(|zoom| zoom.pane(&pane.pane_id))
-                .unwrap_or(pane);
-            self.surface_views.iter().any(|view| {
-                view.pane_id == pane.pane_id
-                    && (view.cols, view.rows) != geometry.grid_size(metrics)
+            Some((tab.id.clone(), layout))
+        });
+        let zoom_layout = tiled.as_ref().and_then(|(tab_id, layout)| {
+            let pane = layout.pane(self.pane_zoom.pane(tab_id)?)?;
+            let tree = LayoutNode::Pane {
+                pane_id: pane.pane_id.clone(),
+                surface_id: pane.surface_id.clone(),
+            };
+            Some(layout::compute_layout(&tree, available, metrics))
+        });
+        if zoom_layout.is_none()
+            && let Some(tab_id) = self.selected_tab().map(|tab| tab.id.clone())
+        {
+            self.pane_zoom.clear(&tab_id);
+        }
+        let resize_due = force || self.last_resize.elapsed() >= Duration::from_millis(32);
+        let mut needs_frame = false;
+        let tiled_panes = tiled.as_ref().map_or(&[][..], |(_, layout)| &layout.panes);
+        let geometries = tiled_panes
+            .iter()
+            .map(|pane| {
+                zoom_layout
+                    .as_ref()
+                    .and_then(|zoom| zoom.pane(&pane.pane_id))
+                    .unwrap_or(pane)
             })
-        }) {
-            needs_frame = true;
+            .chain(self.float_layouts.iter().map(|float| &float.pane));
+        for geometry in geometries {
+            let (cols, rows) = geometry.grid_size(metrics);
+            let Some(view) = self
+                .surface_views
+                .iter_mut()
+                .find(|view| view.pane_id == geometry.pane_id)
+            else {
+                continue;
+            };
+            if (view.cols, view.rows) == (cols, rows) {
+                continue;
+            }
+            if resize_due {
+                view.cols = cols;
+                view.rows = rows;
+                view.send(ClientMessage::Resize { cols, rows });
+            } else {
+                needs_frame = true;
+            }
+        }
+        if resize_due {
+            self.last_resize = Instant::now();
         }
         if let Some(dimensions) = self.focused_view().map(|view| (view.cols, view.rows)) {
             self.terminal_cols = dimensions.0;
             self.terminal_rows = dimensions.1;
         }
-        self.layout = Some(layout);
+        self.layout = tiled.map(|(_, layout)| layout);
         self.zoom_layout = zoom_layout;
         needs_frame
+    }
+
+    /// Floating frames from their saved fractions, never smaller than one minimum
+    /// terminal plus the title strip unless the window itself is smaller.
+    fn compute_float_layouts(
+        &self,
+        area: layout::Size,
+        metrics: LayoutMetrics,
+    ) -> Vec<FloatLayout> {
+        let leaf = metrics.leaf_minimum();
+        let minimum = layout::Size {
+            width: leaf.width,
+            height: leaf.height + FLOAT_TITLE_HEIGHT,
+        };
+        let mut leaves = self.floating_leaves().into_iter();
+        self.state
+            .floating
+            .iter()
+            .filter_map(|float| {
+                let (pane_id, surface_id) = leaves.find(|(pane, _)| pane == &float.pane_id)?;
+                let frame = layout::float_frame(
+                    layout::Rect {
+                        x: float.rect.x,
+                        y: float.rect.y,
+                        width: float.rect.width,
+                        height: float.rect.height,
+                    },
+                    area,
+                    minimum,
+                );
+                let body = layout::Size {
+                    width: frame.width,
+                    height: (frame.height - FLOAT_TITLE_HEIGHT).max(1.0),
+                };
+                let tree = LayoutNode::Pane {
+                    pane_id,
+                    surface_id,
+                };
+                let mut pane = layout::compute_layout(&tree, body, metrics).panes.pop()?;
+                for rect in [&mut pane.rect, &mut pane.canvas] {
+                    rect.x += frame.x;
+                    rect.y += frame.y + FLOAT_TITLE_HEIGHT;
+                }
+                Some(FloatLayout { frame, pane })
+            })
+            .collect()
+    }
+
+    /// Floating panes that still exist anywhere in the workspace, back to front.
+    fn floating_leaves(&self) -> Vec<(PaneId, SurfaceId)> {
+        let Some(workspace) = &self.workspace else {
+            return Vec::new();
+        };
+        self.state
+            .floating
+            .iter()
+            .filter_map(|float| {
+                workspace
+                    .sessions
+                    .iter()
+                    .flat_map(|session| &session.tabs)
+                    .find_map(|tab| pane_surface(&tab.layout, &float.pane_id))
+                    .map(|surface| (float.pane_id.clone(), surface.clone()))
+            })
+            .collect()
     }
 
     pub(super) fn grid_point(&self, position: Point<Pixels>) -> Option<GridPoint> {
@@ -2454,17 +2598,20 @@ impl CompiApp {
             .surface_views
             .iter()
             .find(|view| &view.pane_id == pane_id)?;
-        let pane = self.visible_layout()?.pane(pane_id)?;
-        let offset = self.workspace_scroll.offset();
-        let x = f32::from(position.x)
-            - if self.sidebar_open {
-                self.sidebar_width + 5.0
-            } else {
-                0.0
-            }
-            - pane.canvas.x
-            - f32::from(offset.x);
-        let y = f32::from(position.y) - CHROME_HEIGHT - pane.canvas.y - f32::from(offset.y);
+        // Floating frames are fixed to the terminal area, not the scrolled canvas.
+        let (canvas, offset) = match self
+            .float_layouts
+            .iter()
+            .find(|float| &float.pane.pane_id == pane_id)
+        {
+            Some(float) => (float.pane.canvas, point(px(0.0), px(0.0))),
+            None => (
+                self.visible_layout()?.pane(pane_id)?.canvas,
+                self.workspace_scroll.offset(),
+            ),
+        };
+        let x = f32::from(position.x) - self.sidebar_extent() - canvas.x - f32::from(offset.x);
+        let y = f32::from(position.y) - CHROME_HEIGHT - canvas.y - f32::from(offset.y);
         if !x.is_finite() || !y.is_finite() || view.cols <= 0 || view.rows <= 0 {
             return None;
         }
@@ -2567,6 +2714,20 @@ impl CompiApp {
             tab_count: visible.len(),
             hidden_tab_count: self.state.hidden_tabs.len(),
             pane_count: self.layout.as_ref().map_or(0, |layout| layout.panes.len()),
+            tab_pane_count: pane
+                .and_then(|pane| {
+                    workspace?
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.tabs)
+                        .find(|tab| layout_contains_pane(&tab.layout, pane))
+                })
+                .map_or(0, |tab| leaf_count(&tab.layout)),
+            pane_floating: pane.is_some_and(|pane| self.state.is_floating(pane)),
+            floating_count: self.state.floating.len(),
+            tiled_pane_available: workspace
+                .and_then(|workspace| self.state.tiled_focus(workspace))
+                .is_some(),
             has_workspace: session.is_some(),
             has_tab: tab.is_some(),
             has_pane: pane.is_some(),
@@ -2588,10 +2749,10 @@ impl CompiApp {
             daemon_restarting: self.daemon_restarting,
             remote_target: self.target.is_remote(),
             other_window_available: cx.windows().len() > 1,
-            revision: self
-                .overlay_revision
-                .unwrap_or_else(|| workspace.map_or(0, |workspace| workspace.revision)),
-            current_revision: workspace.map_or(0, |workspace| workspace.revision),
+            structure: self
+                .overlay_structure
+                .unwrap_or_else(|| workspace.map_or(0, structure_key)),
+            current_structure: workspace.map_or(0, structure_key),
             split_right_reason: split_reason(SplitAxis::Horizontal),
             split_down_reason: split_reason(SplitAxis::Vertical),
             pane_zoomed: self.pane_zoomed(),
@@ -2615,7 +2776,7 @@ impl CompiApp {
         self.close_file_tree();
         self.finish_dismiss_overlay();
         self.report_focus(false);
-        self.overlay_revision = self.workspace.as_ref().map(|workspace| workspace.revision);
+        self.overlay_structure = self.workspace.as_ref().map(structure_key);
         self.overlay_return = None;
         self.overlay = Some(overlay);
         self.overlay_index = 0;
@@ -2663,7 +2824,7 @@ impl CompiApp {
         self.ime_text.clear();
         self.ime_marked_range = None;
         self.ime_selected_range = 0..0;
-        self.overlay_revision = None;
+        self.overlay_structure = None;
         self.report_focus(true);
     }
 
@@ -2707,6 +2868,14 @@ impl CompiApp {
         if key.key == "escape" && self.divider_drag.is_some() {
             self.divider_drag = None;
             self.preview_layout = None;
+            self.rebuild_layout(window, true);
+            cx.notify();
+            return true;
+        }
+        if key.key == "escape"
+            && let Some(drag) = self.float_drag.take()
+        {
+            self.state.set_float_rect(&drag.pane_id, drag.before);
             self.rebuild_layout(window, true);
             cx.notify();
             return true;
@@ -3147,6 +3316,39 @@ impl CompiApp {
                     self.mutate(WorkspaceMutation::DetachPane { pane_id }, true);
                 }
             }
+            Command::TogglePaneFloat => {
+                if let Some(pane_id) = pane_id {
+                    if self.state.is_floating(&pane_id) {
+                        self.dock_pane(&pane_id);
+                    } else {
+                        self.float_pane(pane_id);
+                    }
+                }
+            }
+            Command::ToggleFloatingFocus | Command::NextFloatingPane => {
+                let target = self.workspace.as_ref().and_then(|workspace| {
+                    let float_focused = self.state.focused_float(workspace).is_some();
+                    match (command, float_focused) {
+                        (Command::ToggleFloatingFocus, true) => {
+                            self.state.tiled_focus(workspace).cloned()
+                        }
+                        // Raising the back-most float cycles through every float.
+                        (Command::NextFloatingPane, true) => self
+                            .state
+                            .floating
+                            .first()
+                            .map(|float| float.pane_id.clone()),
+                        _ => self
+                            .state
+                            .floating
+                            .last()
+                            .map(|float| float.pane_id.clone()),
+                    }
+                });
+                if let Some(target) = target {
+                    self.focus_pane(target);
+                }
+            }
             Command::RemovePane => {
                 if let Some(pane_id) = pane_id {
                     self.confirm_removal(
@@ -3323,10 +3525,16 @@ impl CompiApp {
         action: PaneAction,
     ) -> Option<&'static str> {
         let Some((count, surface_id)) = self.tab_pane_target(tab_id, pane_id) else {
-            return Some("This terminal is no longer in the selected tab");
+            return Some("This terminal is no longer in this tab");
         };
         match action {
             PaneAction::Detach if count < 2 => Some("The tab has only one pane"),
+            PaneAction::Float
+                if !self.state.is_floating(pane_id)
+                    && self.state.floating.len() >= crate::client_state::MAX_FLOATING =>
+            {
+                Some("Dock a floating pane first")
+            }
             PaneAction::End
                 if self
                     .workspace
@@ -3358,10 +3566,10 @@ impl CompiApp {
             Some(Overlay::TabPaneActions {
                 tab_id: clicked,
                 pane_id: selected,
-                revision,
+                structure,
                 ..
             }) if clicked == &tab_id && selected == &pane_id
-                && self.workspace.as_ref().is_some_and(|workspace| workspace.revision == *revision)
+                && self.workspace.as_ref().is_some_and(|workspace| structure_key(workspace) == *structure)
         );
         if !valid_menu {
             self.dismiss_overlay();
@@ -3372,6 +3580,13 @@ impl CompiApp {
             self.dismiss_overlay();
             match action {
                 PaneAction::Detach => self.mutate(WorkspaceMutation::DetachPane { pane_id }, true),
+                PaneAction::Float => {
+                    if self.state.is_floating(&pane_id) {
+                        self.dock_pane(&pane_id);
+                    } else {
+                        self.float_pane(pane_id);
+                    }
+                }
                 PaneAction::End => {
                     if let Some((_, surface_id)) = self.tab_pane_target(&tab_id, &pane_id)
                         && let Some(surface) = self
@@ -3398,12 +3613,12 @@ impl CompiApp {
         let Some(overlay) = self.overlay.clone() else {
             return;
         };
-        if let Overlay::TabActions { revision, .. } | Overlay::TabPaneActions { revision, .. } =
+        if let Overlay::TabActions { structure, .. } | Overlay::TabPaneActions { structure, .. } =
             &overlay
             && self
                 .workspace
                 .as_ref()
-                .is_none_or(|workspace| workspace.revision != *revision)
+                .is_none_or(|workspace| structure_key(workspace) != *structure)
         {
             self.dismiss_overlay();
             self.global_error = Some(STALE_TAB_MENU.into());
@@ -3471,12 +3686,30 @@ impl CompiApp {
             other => {
                 let choices = self.overlay_choices(cx);
                 if let Some(choice) = choices.get(self.overlay_index).cloned() {
-                    if let Some(reason) = choice.reason {
+                    // A tab menu's command rows act on the clicked tab, which right-click
+                    // does not select; `execute` re-checks enablement after selecting it.
+                    let menu_tab = match (&other, &choice.action) {
+                        (
+                            Overlay::TabActions { tab_id, .. }
+                            | Overlay::TabPaneActions { tab_id, .. },
+                            ChoiceAction::Command(_),
+                        ) => Some(tab_id.clone()),
+                        _ => None,
+                    };
+                    if menu_tab.is_none()
+                        && let Some(reason) = choice.reason
+                    {
                         self.global_error = Some(reason);
                         return;
                     }
                     if !matches!(choice.action, ChoiceAction::Pane { .. }) {
                         self.dismiss_overlay();
+                    }
+                    if let Some(tab_id) = menu_tab
+                        && self.selected_tab().is_none_or(|tab| tab.id != tab_id)
+                    {
+                        self.select_terminal(tab_id, false);
+                        self.rebuild_layout(window, true);
                     }
                     match choice.action {
                         ChoiceAction::Command(command) => self.execute(command, window, cx),
@@ -3490,22 +3723,25 @@ impl CompiApp {
                         ChoiceAction::Tab(id) => self.select_terminal(id, true),
                         ChoiceAction::Pane { tab_id, pane_id } => {
                             if let Overlay::TabActions {
-                                position, revision, ..
+                                position,
+                                structure,
+                                ..
                             }
                             | Overlay::TabPaneActions {
-                                position, revision, ..
+                                position,
+                                structure,
+                                ..
                             } = other
                             {
                                 self.overlay = Some(Overlay::TabPaneActions {
                                     position,
                                     tab_id: tab_id.clone(),
                                     pane_id: pane_id.clone(),
-                                    revision,
+                                    structure,
                                 });
-                                self.overlay_focus = usize::from(
-                                    self.pane_action_reason(&tab_id, &pane_id, PaneAction::Detach)
-                                        .is_some(),
-                                );
+                                self.overlay_focus = self
+                                    .next_pane_action(&tab_id, &pane_id, None, true)
+                                    .unwrap_or(0);
                             }
                         }
                         ChoiceAction::Window(handle) => {
@@ -3533,7 +3769,37 @@ enum ChoiceAction {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaneAction {
     Detach,
+    Float,
     End,
+}
+
+impl PaneAction {
+    /// Bubble order; `overlay_focus` indexes this list.
+    const ALL: [Self; 3] = [Self::Detach, Self::Float, Self::End];
+}
+
+impl CompiApp {
+    /// The next enabled bubble action after `from` (or the first when `None`),
+    /// wrapping in either direction; disabled actions are skipped.
+    fn next_pane_action(
+        &self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        from: Option<usize>,
+        forward: bool,
+    ) -> Option<usize> {
+        let count = PaneAction::ALL.len();
+        (1..=count)
+            .map(|step| match (from, forward) {
+                (None, _) => step - 1,
+                (Some(start), true) => (start + step) % count,
+                (Some(start), false) => (start + count * 2 - step) % count,
+            })
+            .find(|&index| {
+                self.pane_action_reason(tab_id, pane_id, PaneAction::ALL[index])
+                    .is_none()
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -3601,6 +3867,8 @@ struct TabPane {
     pane_id: PaneId,
     title: String,
     directory: Option<String>,
+    /// Floating in this window; shown in the tab's hover card and pane list.
+    floating: bool,
 }
 
 fn tab_caption(custom: &str, panes: &[TabPane]) -> (String, Option<String>) {
@@ -3662,6 +3930,7 @@ impl CompiApp {
                     .or_else(|| directory.as_deref().map(concise_path_title))
                     .unwrap_or_else(|| format!("Terminal {}", index + 1));
                 TabPane {
+                    floating: self.state.is_floating(&pane_id),
                     pane_id,
                     title,
                     directory,
@@ -3733,6 +4002,12 @@ impl CompiApp {
     fn command_label(&self, command: Command) -> &'static str {
         if command == Command::TogglePaneZoom && self.pane_zoomed() {
             "Restore split layout"
+        } else if command == Command::TogglePaneFloat
+            && self
+                .focused_view()
+                .is_some_and(|view| self.state.is_floating(&view.pane_id))
+        {
+            "Dock pane"
         } else {
             command.spec().label
         }
@@ -3765,6 +4040,7 @@ impl CompiApp {
                         Command::SplitRight,
                         Command::SplitDown,
                         Command::TogglePaneZoom,
+                        Command::TogglePaneFloat,
                     ],
                     Some(Overlay::TabActions { .. } | Overlay::TabPaneActions { .. }) => &[
                         Command::NewTab,
@@ -3812,7 +4088,11 @@ impl CompiApp {
                 {
                     for (index, pane) in self.tab_panes(tab).into_iter().enumerate() {
                         choices.push(Choice {
-                            title: format!("{}. {}", index + 1, pane.title),
+                            title: if pane.floating {
+                                format!("{}. {} · Floating", index + 1, pane.title)
+                            } else {
+                                format!("{}. {}", index + 1, pane.title)
+                            },
                             detail: pane.directory.unwrap_or_default(),
                             group: Some("Terminals"),
                             reason: None,
@@ -4318,7 +4598,7 @@ impl CompiApp {
             let tooltip_title = (!tab.label.trim().is_empty()).then(|| tab.label.clone());
             let tooltip_panes = panes
                 .into_iter()
-                .map(|pane| (pane.title, pane.directory))
+                .map(|pane| (pane.title, pane.directory, pane.floating))
                 .collect::<Vec<_>>();
             div()
                 .id(("terminal-tab", index))
@@ -4382,15 +4662,13 @@ impl CompiApp {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        this.select_terminal(context_id.clone(), false);
+                        // The menu targets this tab without switching to it; its pane
+                        // actions (including Float) apply to the clicked tab's panes.
                         this.open_overlay(
                             Overlay::TabActions {
                                 position: event.position,
                                 tab_id: context_id.clone(),
-                                revision: this
-                                    .workspace
-                                    .as_ref()
-                                    .map_or(0, |workspace| workspace.revision),
+                                structure: this.workspace.as_ref().map_or(0, structure_key),
                             },
                             "",
                         );
@@ -4754,13 +5032,13 @@ impl CompiApp {
             }
         }
         div()
-            .w(px(self.sidebar_width + 5.0))
+            .w(px(self.sidebar_extent()))
             .h_full()
             .flex_none()
             .flex()
             .child(
                 div()
-                    .w(px(self.sidebar_width))
+                    .w(px(self.sidebar_extent() - self.seam_width()))
                     .h_full()
                     .flex()
                     .flex_col()
@@ -4818,33 +5096,82 @@ impl CompiApp {
                     ),
             )
             .child(
+                // One device pixel of seam; the transparent grab zone extends into the
+                // sidebar's padding so the seam stays easy to drag.
                 div()
-                    .id("sidebar-divider")
-                    .w(px(5.0))
+                    .w(px(self.seam_width()))
                     .h_full()
-                    .bg(color(colors.border))
-                    .cursor(gpui::CursorStyle::ResizeLeftRight)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            if event.click_count == 2 {
-                                this.sidebar_width = this.config.configured_sidebar_width;
-                                this.state.sidebar_width = this.sidebar_width;
-                                this.save_state();
-                            } else {
-                                this.sidebar_drag = true;
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
+                    .relative()
+                    .bg(color(self.seam_color()))
+                    .child(
+                        div()
+                            .id("sidebar-divider")
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .w(px(SEAM_GRAB))
+                            .group("sidebar-seam")
+                            .cursor(gpui::CursorStyle::ResizeLeftRight)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .w(px(self.seam_width()))
+                                    .when(self.sidebar_drag, |line| line.bg(color(colors.accent)))
+                                    .group_hover("sidebar-seam", move |style| {
+                                        style.bg(color(colors.accent))
+                                    }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    if event.click_count == 2 {
+                                        this.sidebar_width = this.config.configured_sidebar_width;
+                                        this.state.sidebar_width = this.sidebar_width;
+                                        this.save_state();
+                                    } else {
+                                        this.sidebar_drag = true;
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             )
             .into_any_element()
     }
 
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
+        let tiled = self.render_tiled_panes(cx);
+        if self.float_layouts.is_empty() {
+            return tiled;
+        }
+        // Floats sit above the split canvas and below modal overlays.
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            .flex()
+            .child(tiled)
+            .children(
+                self.float_layouts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, float)| self.render_floating_pane(index, float, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_tiled_panes(&self, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let Some(layout) = self.visible_layout() else {
+            if let Some(element) = self.render_floated_tab_placeholder(cx) {
+                return element;
+            }
             return div()
                 .flex_1()
                 .size_full()
@@ -4899,274 +5226,56 @@ impl CompiApp {
                 .into_any_element();
         };
         let panes = layout.panes.iter().enumerate().map(|(index, geometry)| {
-            let pane_id = geometry.pane_id.clone();
-            let tree_active = self
-                .file_tree
-                .as_ref()
-                .is_some_and(|tree| tree.pane_id == pane_id);
-            let focus_id = pane_id.clone();
-            let input_id = pane_id.clone();
-            let scroll_id = pane_id.clone();
-            let move_id = pane_id.clone();
-            let release_id = pane_id.clone();
-            let release_out_id = pane_id.clone();
-            let view = self
-                .surface_views
-                .iter()
-                .find(|view| view.pane_id == pane_id);
-            let focused = view.is_some_and(|view| Some(view.id) == self.focused_view);
-            let drop_view_id = view.map(|view| view.id);
-            let paint = view.and_then(|view| {
-                PaintModel::from_tab(
-                    view,
-                    self.typography.clone(),
-                    self.terminal_theme.clone(),
-                    focused && self.overlay.is_none(),
-                )
-            });
-            let terminal_scroll = view.and_then(|view| {
-                let snapshot = view.mirror.snapshot()?;
-                if snapshot.modes.alternate_screen || snapshot.scrollback.is_empty() {
-                    return None;
-                }
-                let track = (geometry.rect.height - 4.0).max(1.0);
-                let visible = snapshot.cells.len().max(1) as f32;
-                let history = snapshot.scrollback.len() as f32;
-                let thumb = (track * visible / (visible + history)).max(18.0).min(track);
-                let progress =
-                    1.0 - view.scroll_offset.min(snapshot.scrollback.len()) as f32 / history;
-                Some(((track - thumb) * progress, thumb))
-            });
-            let surface = self
-                .workspace
-                .as_ref()
-                .and_then(|workspace| workspace.surface(&geometry.surface_id));
-            let status = surface
-                .map(|surface| match surface.status {
-                    SurfaceStatus::Starting => "Starting",
-                    SurfaceStatus::Running => {
-                        if view.is_some_and(|view| view.transport.is_some()) {
-                            "Running"
-                        } else {
-                            "Unavailable"
-                        }
-                    }
-                    SurfaceStatus::Ending => "Ending…",
-                    SurfaceStatus::Exited => "Exited",
-                    SurfaceStatus::Failed => "Failed",
-                    SurfaceStatus::Lost => "Lost",
-                })
-                .unwrap_or("Removed");
-            let error = view
-                .and_then(|view| view.error.clone().or_else(|| view.image_error.clone()))
-                .or_else(|| surface.and_then(|surface| surface.error.clone()));
-            let input = cx.entity();
-            let input_focus = self.focus_handle.clone();
-            let composition = (focused && self.overlay.is_none() && !self.ime_text.is_empty())
-                .then(|| SharedString::from(self.ime_text.clone()));
-            div()
-                .id(("pane", index))
-                .absolute()
-                .left(px(geometry.rect.x))
-                .top(px(geometry.rect.y))
-                .w(px(geometry.rect.width))
-                .h(px(geometry.rect.height))
-                .bg(material_color(
-                    if tree_active {
-                        colors.background
-                    } else {
-                        self.terminal_theme.terminal().background
-                    },
-                    self.effective_background_opacity(),
-                ))
-                .flex()
-                .flex_col()
-                .on_drop(
-                    cx.listener(move |this, paths: &gpui::ExternalPaths, _, cx| {
-                        if let Some(view_id) = drop_view_id {
-                            this.drop_image_files(paths, view_id, cx);
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, _, _, cx| {
-                        this.focus_pane(focus_id.clone());
-                        this.open_overlay(Overlay::Palette, "");
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                )
-                .when(!matches!(status, "Running"), |pane| {
-                    pane.child(
-                        div()
-                            .flex_none()
-                            .min_h(px(36.0))
-                            .px_2()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_end()
-                            .gap_1()
-                            .border_b_1()
-                            .border_color(color(colors.border))
-                            .bg(color(colors.surface))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(color(if matches!(status, "Failed" | "Lost") {
-                                        colors.error
-                                    } else {
-                                        colors.muted
-                                    }))
-                                    .child(status),
-                            )
-                            .when(status == "Unavailable", |actions| {
-                                actions.child(self.pane_command_button(
-                                    ("retry-pane", index),
-                                    "Retry attachment",
-                                    Command::Reconnect,
-                                    &pane_id,
-                                    cx,
-                                ))
-                            })
-                            .when(matches!(status, "Exited" | "Failed" | "Lost"), |actions| {
-                                actions.child(self.pane_command_button(
-                                    ("restart-pane", index),
-                                    "Restart surface",
-                                    Command::RestartSurface,
-                                    &pane_id,
-                                    cx,
-                                ))
-                            }),
-                    )
-                })
-                .when_some(error, |pane, error| {
-                    pane.child(
-                        div()
-                            .flex_none()
-                            .px_2()
-                            .py_1()
-                            .border_b_1()
-                            .border_color(color(colors.border))
-                            .bg(color(colors.surface))
-                            .text_color(color(colors.error))
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .child(error),
-                    )
-                })
-                .when(!tree_active, |pane| {
-                    pane.child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .p(px(TERMINAL_PADDING))
-                            .relative()
-                            .overflow_hidden()
-                            .cursor(gpui::CursorStyle::IBeam)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    this.focus_pane(input_id.clone());
-                                    this.on_terminal_mouse_down(event, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, event, window, cx| {
-                                    this.on_terminal_mouse_up(event, &release_id, window, cx);
-                                }),
-                            )
-                            .on_mouse_up_out(
-                                MouseButton::Left,
-                                cx.listener(move |this, event, window, cx| {
-                                    this.on_terminal_mouse_up(event, &release_out_id, window, cx);
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(move |this, event, window, cx| {
-                                this.on_terminal_mouse_move(event, &move_id, window, cx);
-                            }))
-                            .on_scroll_wheel(cx.listener(
-                                move |this, event: &ScrollWheelEvent, window, cx| {
-                                    // Wheel input targets the hovered pane without changing keyboard focus.
-                                    let previous = this.focused_view;
-                                    this.focused_view = this
-                                        .surface_views
-                                        .iter()
-                                        .find(|view| view.pane_id == scroll_id)
-                                        .map(|view| view.id);
-                                    this.on_terminal_scroll(event, window, cx);
-                                    this.focused_view = previous;
-                                    cx.stop_propagation();
-                                },
-                            ))
-                            .child(
-                                canvas(
-                                    move |_, _, _| (),
-                                    move |bounds, _, window, cx| {
-                                        if focused {
-                                            window.handle_input(
-                                                &input_focus,
-                                                ElementInputHandler::new(bounds, input.clone()),
-                                                cx,
-                                            );
-                                        }
-                                        if let Some(paint) = paint {
-                                            paint_terminal(bounds, &paint, window);
-                                            if let Some(composition) = composition {
-                                                paint_composition(
-                                                    bounds,
-                                                    paint.cursor,
-                                                    composition,
-                                                    &paint.typography,
-                                                    paint.theme.terminal(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        }
-                                    },
-                                )
-                                .size_full(),
-                            ),
-                    )
-                })
-                .when(tree_active, |pane| pane.child(self.render_file_tree(cx)))
-                .when_some(
-                    terminal_scroll.filter(|_| !tree_active),
-                    |pane, (position, length)| {
-                        pane.child(
-                            div()
-                                .absolute()
-                                .right(px(2.0))
-                                .top(px(2.0 + position))
-                                .w(px(2.0))
-                                .h(px(length))
-                                .rounded_sm()
-                                .bg(color(colors.muted).opacity(0.32)),
-                        )
-                    },
-                )
+            self.render_pane(("pane", index), index, geometry, geometry.rect, cx)
         });
         let dividers = layout.dividers.iter().enumerate().map(|(index, divider)| {
+            let dragging = self
+                .divider_drag
+                .as_ref()
+                .is_some_and(|drag| drag.index == index);
+            let side_by_side = divider.axis == SplitAxis::Horizontal;
+            // The visible seam is one device pixel (`divider.rect`). The transparent grab
+            // zone around it is wider and overlaps only the panes' padding, never text.
+            let zone = if side_by_side {
+                layout::Rect {
+                    x: divider.rect.x + (divider.rect.width - SEAM_GRAB) / 2.0,
+                    width: SEAM_GRAB,
+                    ..divider.rect
+                }
+            } else {
+                layout::Rect {
+                    y: divider.rect.y + (divider.rect.height - SEAM_GRAB) / 2.0,
+                    height: SEAM_GRAB,
+                    ..divider.rect
+                }
+            };
             div()
                 .id(("split-divider", index))
                 .absolute()
-                .left(px(divider.rect.x))
-                .top(px(divider.rect.y))
-                .w(px(divider.rect.width))
-                .h(px(divider.rect.height))
-                .bg(color(colors.border))
-                .hover(move |style| style.bg(color(colors.accent)))
-                .cursor(if divider.axis == SplitAxis::Horizontal {
+                .left(px(zone.x))
+                .top(px(zone.y))
+                .w(px(zone.width))
+                .h(px(zone.height))
+                .group("split-seam")
+                .cursor(if side_by_side {
                     gpui::CursorStyle::ResizeLeftRight
                 } else {
                     gpui::CursorStyle::ResizeUpDown
                 })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(divider.rect.x - zone.x))
+                        .top(px(divider.rect.y - zone.y))
+                        .w(px(divider.rect.width))
+                        .h(px(divider.rect.height))
+                        .bg(color(if dragging {
+                            colors.accent
+                        } else {
+                            self.seam_color()
+                        }))
+                        .group_hover("split-seam", move |style| style.bg(color(colors.accent))),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
@@ -5217,6 +5326,603 @@ impl CompiApp {
                 pane.child(self.render_workspace_scrollbar(false, cx))
             })
             .into_any_element()
+    }
+
+    /// One pane's terminal (or file tree) at `rect` within its parent. Tiled and
+    /// floating presentations share it, so both use the same attached view.
+    fn render_pane(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        index: usize,
+        geometry: &layout::PaneLayout,
+        rect: layout::Rect,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let colors = *self.colors();
+        let pane_id = geometry.pane_id.clone();
+        let tree_active = self
+            .file_tree
+            .as_ref()
+            .is_some_and(|tree| tree.pane_id == pane_id);
+        let focus_id = pane_id.clone();
+        let input_id = pane_id.clone();
+        let scroll_id = pane_id.clone();
+        let move_id = pane_id.clone();
+        let release_id = pane_id.clone();
+        let release_out_id = pane_id.clone();
+        let view = self
+            .surface_views
+            .iter()
+            .find(|view| view.pane_id == pane_id);
+        let focused = view.is_some_and(|view| Some(view.id) == self.focused_view);
+        let drop_view_id = view.map(|view| view.id);
+        let paint = view.and_then(|view| {
+            PaintModel::from_tab(
+                view,
+                self.typography.clone(),
+                self.terminal_theme.clone(),
+                focused && self.overlay.is_none(),
+            )
+        });
+        let terminal_scroll = view.and_then(|view| {
+            let snapshot = view.mirror.snapshot()?;
+            if snapshot.modes.alternate_screen || snapshot.scrollback.is_empty() {
+                return None;
+            }
+            let track = (geometry.rect.height - 4.0).max(1.0);
+            let visible = snapshot.cells.len().max(1) as f32;
+            let history = snapshot.scrollback.len() as f32;
+            let thumb = (track * visible / (visible + history)).max(18.0).min(track);
+            let progress = 1.0 - view.scroll_offset.min(snapshot.scrollback.len()) as f32 / history;
+            Some(((track - thumb) * progress, thumb))
+        });
+        let surface = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.surface(&geometry.surface_id));
+        let status = surface
+            .map(|surface| match surface.status {
+                SurfaceStatus::Starting => "Starting",
+                SurfaceStatus::Running => {
+                    if view.is_some_and(|view| view.transport.is_some()) {
+                        "Running"
+                    } else {
+                        "Unavailable"
+                    }
+                }
+                SurfaceStatus::Ending => "Ending…",
+                SurfaceStatus::Exited => "Exited",
+                SurfaceStatus::Failed => "Failed",
+                SurfaceStatus::Lost => "Lost",
+            })
+            .unwrap_or("Removed");
+        let error = view
+            .and_then(|view| view.error.clone().or_else(|| view.image_error.clone()))
+            .or_else(|| surface.and_then(|surface| surface.error.clone()));
+        let input = cx.entity();
+        let input_focus = self.focus_handle.clone();
+        let composition = (focused && self.overlay.is_none() && !self.ime_text.is_empty())
+            .then(|| SharedString::from(self.ime_text.clone()));
+        div()
+            .id(id)
+            .absolute()
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.width))
+            .h(px(rect.height))
+            .bg(material_color(
+                if tree_active {
+                    colors.background
+                } else {
+                    self.terminal_theme.terminal().background
+                },
+                self.effective_background_opacity(),
+            ))
+            .flex()
+            .flex_col()
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, _, cx| {
+                    if let Some(view_id) = drop_view_id {
+                        this.drop_image_files(paths, view_id, cx);
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.focus_pane(focus_id.clone());
+                    this.open_overlay(Overlay::Palette, "");
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .when(!matches!(status, "Running"), |pane| {
+                pane.child(
+                    div()
+                        .flex_none()
+                        .min_h(px(36.0))
+                        .px_2()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_end()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(color(colors.border))
+                        .bg(color(colors.surface))
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .text_color(color(if matches!(status, "Failed" | "Lost") {
+                                    colors.error
+                                } else {
+                                    colors.muted
+                                }))
+                                .child(status),
+                        )
+                        .when(status == "Unavailable", |actions| {
+                            actions.child(self.pane_command_button(
+                                ("retry-pane", index),
+                                "Retry attachment",
+                                Command::Reconnect,
+                                &pane_id,
+                                cx,
+                            ))
+                        })
+                        .when(matches!(status, "Exited" | "Failed" | "Lost"), |actions| {
+                            actions.child(self.pane_command_button(
+                                ("restart-pane", index),
+                                "Restart surface",
+                                Command::RestartSurface,
+                                &pane_id,
+                                cx,
+                            ))
+                        }),
+                )
+            })
+            .when_some(error, |pane, error| {
+                pane.child(
+                    div()
+                        .flex_none()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(color(colors.border))
+                        .bg(color(colors.surface))
+                        .text_color(color(colors.error))
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .child(error),
+                )
+            })
+            .when(!tree_active, |pane| {
+                pane.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .p(px(TERMINAL_PADDING))
+                        .relative()
+                        .overflow_hidden()
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.focus_pane(input_id.clone());
+                                this.on_terminal_mouse_down(event, window, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, event, window, cx| {
+                                this.on_terminal_mouse_up(event, &release_id, window, cx);
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(move |this, event, window, cx| {
+                                this.on_terminal_mouse_up(event, &release_out_id, window, cx);
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                            this.on_terminal_mouse_move(event, &move_id, window, cx);
+                        }))
+                        .on_scroll_wheel(cx.listener(
+                            move |this, event: &ScrollWheelEvent, window, cx| {
+                                // Wheel input targets the hovered pane without changing keyboard focus.
+                                let previous = this.focused_view;
+                                this.focused_view = this
+                                    .surface_views
+                                    .iter()
+                                    .find(|view| view.pane_id == scroll_id)
+                                    .map(|view| view.id);
+                                this.on_terminal_scroll(event, window, cx);
+                                this.focused_view = previous;
+                                cx.stop_propagation();
+                            },
+                        ))
+                        .child(
+                            canvas(
+                                move |_, _, _| (),
+                                move |bounds, _, window, cx| {
+                                    if focused {
+                                        window.handle_input(
+                                            &input_focus,
+                                            ElementInputHandler::new(bounds, input.clone()),
+                                            cx,
+                                        );
+                                    }
+                                    if let Some(paint) = paint {
+                                        paint_terminal(bounds, &paint, window);
+                                        if let Some(composition) = composition {
+                                            paint_composition(
+                                                bounds,
+                                                paint.cursor,
+                                                composition,
+                                                &paint.typography,
+                                                paint.theme.terminal(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                },
+                            )
+                            .size_full(),
+                        ),
+                )
+            })
+            .when(tree_active, |pane| pane.child(self.render_file_tree(cx)))
+            .when_some(
+                terminal_scroll.filter(|_| !tree_active),
+                |pane, (position, length)| {
+                    pane.child(
+                        div()
+                            .absolute()
+                            .right(px(2.0))
+                            .top(px(2.0 + position))
+                            .w(px(2.0))
+                            .h(px(length))
+                            .rounded_sm()
+                            .bg(color(colors.muted).opacity(0.32)),
+                    )
+                },
+            )
+    }
+
+    /// A floating pane: title strip with explicit keyboard ownership and Dock,
+    /// the shared pane body, and edge/corner resize handles.
+    fn render_floating_pane(
+        &self,
+        index: usize,
+        float: &FloatLayout,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let frame = float.frame;
+        let pane_id = float.pane.pane_id.clone();
+        let focused = self
+            .focused_view()
+            .is_some_and(|view| view.pane_id == pane_id);
+        let (title, tab_label) = self.floating_caption(&pane_id);
+        let body = layout::Rect {
+            x: 0.0,
+            y: FLOAT_TITLE_HEIGHT,
+            width: frame.width,
+            height: (frame.height - FLOAT_TITLE_HEIGHT).max(1.0),
+        };
+        let handle = |id: &'static str, mode: FloatDragMode, rect: layout::Rect| {
+            let pane_id = pane_id.clone();
+            div()
+                .id((id, index))
+                .absolute()
+                .left(px(rect.x))
+                .top(px(rect.y))
+                .w(px(rect.width))
+                .h(px(rect.height))
+                .cursor(match mode {
+                    FloatDragMode::Right => gpui::CursorStyle::ResizeLeftRight,
+                    FloatDragMode::Bottom => gpui::CursorStyle::ResizeUpDown,
+                    _ => gpui::CursorStyle::ResizeUpLeftDownRight,
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.start_float_drag(pane_id.clone(), mode, event.position);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+        };
+        let raise_id = pane_id.clone();
+        let move_id = pane_id.clone();
+        let menu_id = pane_id.clone();
+        div()
+            .id(("floating-frame", index))
+            .absolute()
+            .left(px(frame.x))
+            .top(px(frame.y))
+            .w(px(frame.width))
+            .h(px(frame.height))
+            .occlude()
+            // Occluding blocks the root's move handler while the pointer is over a
+            // float; drags (move/resize, selections) must still see every event.
+            .on_mouse_move(cx.listener(Self::on_workspace_mouse_move))
+            .rounded_md()
+            .shadow_lg()
+            .bg(color(colors.surface))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.focus_pane(raise_id.clone());
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id(("floating-title", index))
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .w(px(frame.width))
+                    .h(px(FLOAT_TITLE_HEIGHT))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_t_md()
+                    .border_b_1()
+                    .border_color(color(colors.border))
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.focus_pane(move_id.clone());
+                            this.start_float_drag(
+                                move_id.clone(),
+                                FloatDragMode::Move,
+                                event.position,
+                            );
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.focus_pane(menu_id.clone());
+                            this.open_overlay(Overlay::Palette, "");
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(color(if focused {
+                                colors.foreground
+                            } else {
+                                colors.muted
+                            }))
+                            .child(match tab_label {
+                                Some(tab) => format!("{title} · {tab}"),
+                                None => title,
+                            }),
+                    )
+                    .when(focused, |strip| {
+                        // Keyboard ownership is explicit: only this pane receives typing.
+                        strip.child(
+                            div()
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .text_color(color(colors.accent))
+                                .child("Keyboard"),
+                        )
+                    })
+                    .child(self.pane_command_button(
+                        ("floating-dock", index),
+                        "Dock",
+                        Command::TogglePaneFloat,
+                        &pane_id,
+                        cx,
+                    )),
+            )
+            .child(
+                self.render_pane(("floating-pane", index), index, &float.pane, body, cx)
+                    .rounded_b_md(),
+            )
+            .child(handle(
+                "floating-resize-right",
+                FloatDragMode::Right,
+                layout::Rect {
+                    x: frame.width - FLOAT_RESIZE_HANDLE,
+                    y: FLOAT_TITLE_HEIGHT,
+                    width: FLOAT_RESIZE_HANDLE,
+                    height: body.height,
+                },
+            ))
+            .child(handle(
+                "floating-resize-bottom",
+                FloatDragMode::Bottom,
+                layout::Rect {
+                    x: 0.0,
+                    y: frame.height - FLOAT_RESIZE_HANDLE,
+                    width: frame.width,
+                    height: FLOAT_RESIZE_HANDLE,
+                },
+            ))
+            .child(handle(
+                "floating-resize-corner",
+                FloatDragMode::Corner,
+                layout::Rect {
+                    x: frame.width - 2.0 * FLOAT_RESIZE_HANDLE,
+                    y: frame.height - 2.0 * FLOAT_RESIZE_HANDLE,
+                    width: 2.0 * FLOAT_RESIZE_HANDLE,
+                    height: 2.0 * FLOAT_RESIZE_HANDLE,
+                },
+            ))
+            .child(
+                // Drawn last so the focus outline is never covered; it has no hitbox.
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color(if focused {
+                        colors.accent
+                    } else {
+                        colors.border
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The floating pane's title, plus its tab's label when that tab is not selected.
+    fn floating_caption(&self, pane: &PaneId) -> (String, Option<String>) {
+        let Some(tab) = self.workspace.as_ref().and_then(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .flat_map(|session| &session.tabs)
+                .find(|tab| layout_contains_pane(&tab.layout, pane))
+        }) else {
+            return ("Terminal".into(), None);
+        };
+        let title = self
+            .tab_panes(tab)
+            .into_iter()
+            .find(|item| &item.pane_id == pane)
+            .map_or_else(|| "Terminal".into(), |item| item.title);
+        let selected = self
+            .selected_tab()
+            .is_some_and(|selected| selected.id == tab.id);
+        // Unnamed tabs have no useful label; the pane title already identifies them.
+        let label = tab.label.trim();
+        (
+            title,
+            (!selected && !label.is_empty()).then(|| label.to_owned()),
+        )
+    }
+
+    /// The selected tab's panes are all floating: keep the tab, explain where
+    /// its terminals are, and offer Dock rather than an empty-workspace state.
+    fn render_floated_tab_placeholder(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let tab = self.selected_tab()?;
+        let mut leaves = Vec::new();
+        collect_leaves(&tab.layout, &mut leaves);
+        if !leaves.iter().any(|(pane, _)| self.state.is_floating(pane)) {
+            return None;
+        }
+        let colors = *self.colors();
+        Some(
+            div()
+                .flex_1()
+                .size_full()
+                .min_w_0()
+                .p_4()
+                .flex()
+                .flex_col()
+                // Top-left stays clear of floats, which open on the right by default.
+                .items_start()
+                .gap_3()
+                .bg(material_color(
+                    colors.background,
+                    self.effective_background_opacity(),
+                ))
+                .child(
+                    div()
+                        .text_color(color(colors.muted))
+                        .child("This tab's terminal is floating. Its process keeps running."),
+                )
+                .children(
+                    leaves
+                        .iter()
+                        .filter(|(pane, _)| self.state.is_floating(pane))
+                        .enumerate()
+                        .map(|(index, (pane, _))| {
+                            self.pane_command_button(
+                                ("dock-floated-tab", index),
+                                "Dock pane",
+                                Command::TogglePaneFloat,
+                                pane,
+                                cx,
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn start_float_drag(&mut self, pane_id: PaneId, mode: FloatDragMode, origin: Point<Pixels>) {
+        let Some(float) = self
+            .float_layouts
+            .iter()
+            .find(|float| float.pane.pane_id == pane_id)
+        else {
+            return;
+        };
+        let Some(before) = self
+            .state
+            .floating
+            .iter()
+            .find(|float| float.pane_id == pane_id)
+            .map(|float| float.rect)
+        else {
+            return;
+        };
+        self.float_drag = Some(FloatDrag {
+            pane_id,
+            mode,
+            origin,
+            start: float.frame,
+            before,
+        });
+    }
+
+    /// Preview a move/resize locally; the next render's `rebuild_layout` coalesces
+    /// the PTY resize, and the placement is saved on release.
+    fn update_float_drag(&mut self, position: Point<Pixels>) {
+        let Some(drag) = &self.float_drag else {
+            return;
+        };
+        let dx = f32::from(position.x - drag.origin.x);
+        let dy = f32::from(position.y - drag.origin.y);
+        let area = self.float_area;
+        let leaf = self.metrics().leaf_minimum();
+        let mut frame = drag.start;
+        if drag.mode == FloatDragMode::Move {
+            // Moving never resizes the terminal; the frame stays inside the area.
+            frame.x = (frame.x + dx).clamp(0.0, (area.width - frame.width).max(0.0));
+            frame.y = (frame.y + dy).clamp(0.0, (area.height - frame.height).max(0.0));
+        } else {
+            if matches!(drag.mode, FloatDragMode::Right | FloatDragMode::Corner) {
+                frame.width = (frame.width + dx).max(leaf.width).min(area.width - frame.x);
+            }
+            if matches!(drag.mode, FloatDragMode::Bottom | FloatDragMode::Corner) {
+                frame.height = (frame.height + dy)
+                    .max(leaf.height + FLOAT_TITLE_HEIGHT)
+                    .min(area.height - frame.y);
+            }
+        }
+        let fraction = layout::float_fraction(frame, self.float_area);
+        let pane_id = drag.pane_id.clone();
+        self.state.set_float_rect(
+            &pane_id,
+            FloatRect {
+                x: fraction.x,
+                y: fraction.y,
+                width: fraction.width,
+                height: fraction.height,
+            },
+        );
     }
 
     fn render_workspace_scrollbar(&self, horizontal: bool, cx: &Context<Self>) -> AnyElement {
@@ -5293,12 +5999,7 @@ impl CompiApp {
             return;
         };
         let old = self.workspace_scroll.offset();
-        let x = f32::from(position.x)
-            - if self.sidebar_open {
-                self.sidebar_width + 5.0
-            } else {
-                0.0
-            };
+        let x = f32::from(position.x) - self.sidebar_extent();
         let y = f32::from(position.y) - CHROME_HEIGHT;
         let offset = if horizontal {
             point(
@@ -5337,6 +6038,12 @@ impl CompiApp {
             self.on_terminal_mouse_move(event, &pane_id, window, cx);
             return;
         }
+        if self.float_drag.is_some() {
+            self.update_float_drag(event.position);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if let Some(horizontal) = self.workspace_scroll_drag {
             self.scroll_workspace_to(event.position, horizontal);
             cx.stop_propagation();
@@ -5358,12 +6065,7 @@ impl CompiApp {
                 let divider = &layout.dividers[drag.index];
                 let offset = self.workspace_scroll.offset();
                 let position = layout::Point {
-                    x: f32::from(event.position.x - offset.x)
-                        - if self.sidebar_open {
-                            self.sidebar_width + 5.0
-                        } else {
-                            0.0
-                        },
+                    x: f32::from(event.position.x - offset.x) - self.sidebar_extent(),
                     y: f32::from(event.position.y - offset.y) - CHROME_HEIGHT,
                 };
                 let ratio = divider.ratio_at(position);
@@ -5414,6 +6116,12 @@ impl CompiApp {
             .map(|view| view.pane_id.clone())
         {
             self.on_terminal_mouse_up(event, &pane_id, window, cx);
+            cx.notify();
+            return;
+        }
+        if self.float_drag.take().is_some() {
+            self.save_state();
+            self.rebuild_layout(window, true);
             cx.notify();
             return;
         }
@@ -6047,6 +6755,11 @@ impl SurfaceView {
 
 impl CompiApp {
     fn reap_retired_views(&mut self) {
+        let floating: HashSet<_> = self
+            .floating_leaves()
+            .into_iter()
+            .map(|(_, surface)| surface)
+            .collect();
         let tab = self
             .workspace
             .as_ref()
@@ -6054,7 +6767,127 @@ impl CompiApp {
         self.surface_views.retain(|view| {
             !view.closed.load(Ordering::Acquire)
                 || tab.is_some_and(|tab| contains_surface(&tab.layout, &view.surface_id))
+                || floating.contains(&view.surface_id)
         });
+    }
+
+    /// Present a pane above the window, reusing its attached view; never a new
+    /// surface or a second attachment. The split tree on the server is unchanged.
+    /// A pane from a tab that is not shown attaches here, as the same surface.
+    fn float_pane(&mut self, pane: PaneId) {
+        if self.workspace.is_none() {
+            return;
+        }
+        self.report_focus(false);
+        let floated = self
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| self.state.float_pane(workspace, &pane));
+        if !floated {
+            self.report_focus(self.overlay.is_none());
+            self.global_error = Some("This pane can no longer float".into());
+            return;
+        }
+        self.divider_drag = None;
+        self.preview_layout = None;
+        self.sync_visible_views();
+        self.report_focus(self.overlay.is_none());
+        self.save_state();
+    }
+
+    /// Dock is presentation only: the pane returns to its current tile and its
+    /// process keeps running. A view no longer visible releases its attachment.
+    fn dock_pane(&mut self, pane: &PaneId) {
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
+        if !self.state.dock_pane(workspace, pane) {
+            return;
+        }
+        if self
+            .float_drag
+            .as_ref()
+            .is_some_and(|drag| &drag.pane_id == pane)
+        {
+            self.float_drag = None;
+        }
+        self.report_focus(false);
+        self.sync_visible_views();
+        self.report_focus(self.overlay.is_none());
+        self.save_state();
+    }
+}
+
+/// Identity of what menus and the palette target: server, hierarchy, labels, pane
+/// leaves, and process lifetimes. Size, status, and split-ratio observations advance
+/// the server revision but leave this unchanged, so they never stale an open menu.
+fn structure_key(workspace: &WorkspaceSnapshot) -> u64 {
+    fn layout(node: &LayoutNode, hasher: &mut DefaultHasher) {
+        match node {
+            LayoutNode::Pane {
+                pane_id,
+                surface_id,
+            } => {
+                0_u8.hash(hasher);
+                pane_id.as_str().hash(hasher);
+                surface_id.as_str().hash(hasher);
+            }
+            LayoutNode::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                1_u8.hash(hasher);
+                (*axis == SplitAxis::Horizontal).hash(hasher);
+                layout(first, hasher);
+                layout(second, hasher);
+            }
+        }
+    }
+    let mut hasher = DefaultHasher::new();
+    workspace.server_id.as_str().hash(&mut hasher);
+    workspace.server_generation.as_str().hash(&mut hasher);
+    for session in &workspace.sessions {
+        session.id.as_str().hash(&mut hasher);
+        session.label.hash(&mut hasher);
+        for tab in &session.tabs {
+            tab.id.as_str().hash(&mut hasher);
+            tab.label.hash(&mut hasher);
+            layout(&tab.layout, &mut hasher);
+        }
+    }
+    for surface in &workspace.surfaces {
+        surface.id.as_str().hash(&mut hasher);
+        surface.process_lifetime_id.as_str().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn positive_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+fn leaf_count(tree: &LayoutNode) -> usize {
+    match tree {
+        LayoutNode::Pane { .. } => 1,
+        LayoutNode::Split { first, second, .. } => leaf_count(first) + leaf_count(second),
+    }
+}
+
+fn pane_surface<'a>(tree: &'a LayoutNode, pane: &PaneId) -> Option<&'a SurfaceId> {
+    match tree {
+        LayoutNode::Pane {
+            pane_id,
+            surface_id,
+        } => (pane_id == pane).then_some(surface_id),
+        LayoutNode::Split { first, second, .. } => {
+            pane_surface(first, pane).or_else(|| pane_surface(second, pane))
+        }
     }
 }
 
@@ -6336,6 +7169,7 @@ mod tests {
                 pane_id: PaneId::new(format!("pane-{index}")),
                 title: title.into(),
                 directory: None,
+                floating: false,
             })
             .collect();
         assert_eq!(tab_caption("", &panes[..1]), ("shell".into(), None));
