@@ -446,37 +446,42 @@ pub fn connect_or_start(instance: Option<&str>) -> Result<DaemonClient> {
             compi_protocol::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
             Ok(client)
         }
-        Err(error)
-            if compi_protocol::ConnectionFailure::kind(error.as_ref())
-                == compi_protocol::ConnectionFailureKind::Absent =>
-        {
+        Err(_) => {
             compi_protocol::perf::set_startup_kind("cold");
             start_daemon(instance)?;
             let client = DaemonClient::connect(instance, Duration::from_secs(5))?;
             compi_protocol::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
             Ok(client)
         }
-        Err(error) => Err(error),
     }
 }
 
-/// Restart only the generation and live work previously presented for consent.
-pub fn restart_daemon(
-    instance: Option<&str>,
-    consent: &compi_protocol::LifecycleConsent,
-) -> Result<DaemonClient> {
-    DaemonClient::conditional_stop(instance, consent, Duration::from_secs(15))?;
+/// Stop the current daemon, wait for its endpoint to disappear, then start and
+/// reconnect to a fresh generation. Callers must confirm destructive live-work
+/// impact before entering this function.
+pub fn restart_daemon(instance: Option<&str>) -> Result<DaemonClient> {
+    let mut client = match DaemonClient::connect(instance, Duration::from_secs(2)) {
+        Ok(client) => client,
+        Err(_) => {
+            start_daemon(instance)?;
+            return DaemonClient::connect(instance, Duration::from_secs(5));
+        }
+    };
+    client.shutdown_daemon()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while DaemonClient::connect(instance, Duration::from_millis(50)).is_ok() {
+        if Instant::now() >= deadline {
+            return Err("daemon did not stop before restart timeout".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     start_daemon(instance)?;
     DaemonClient::connect(instance, Duration::from_secs(5))
 }
 
 fn start_daemon(instance: Option<&str>) -> Result<()> {
-    match DaemonClient::connect(instance, Duration::ZERO) {
-        Ok(_) => return Ok(()),
-        Err(error)
-            if compi_protocol::ConnectionFailure::kind(error.as_ref())
-                == compi_protocol::ConnectionFailureKind::Absent => {}
-        Err(error) => return Err(error),
+    if DaemonClient::connect(instance, Duration::ZERO).is_ok() {
+        return Ok(());
     }
 
     #[cfg(windows)]
@@ -484,12 +489,8 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
         activate_daemon_task()?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            match DaemonClient::connect(None, Duration::from_millis(100)) {
-                Ok(_) => return Ok(()),
-                Err(error)
-                    if compi_protocol::ConnectionFailure::kind(error.as_ref())
-                        == compi_protocol::ConnectionFailureKind::Absent => {}
-                Err(error) => return Err(error),
+            if DaemonClient::connect(None, Duration::from_millis(100)).is_ok() {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(
@@ -546,20 +547,14 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match DaemonClient::connect(instance, Duration::from_millis(100)) {
-            Ok(_) => {
-                #[cfg(unix)]
-                thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                #[cfg(windows)]
-                drop(child);
-                return Ok(());
-            }
-            Err(error)
-                if compi_protocol::ConnectionFailure::kind(error.as_ref())
-                    == compi_protocol::ConnectionFailureKind::Absent => {}
-            Err(error) => return Err(error),
+        if DaemonClient::connect(instance, Duration::from_millis(100)).is_ok() {
+            #[cfg(unix)]
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            #[cfg(windows)]
+            drop(child);
+            return Ok(());
         }
         if let Some(status) = child.try_wait()? {
             return Err(format!(

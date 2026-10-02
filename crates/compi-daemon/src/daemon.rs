@@ -74,19 +74,9 @@ impl Drop for ImageUpload {
 }
 
 pub fn relay_stdio(instance: Option<&str>) -> Result<()> {
-    relay_stdio_mode(instance, false)
-}
-
-pub fn relay_stdio_existing(instance: Option<&str>) -> Result<()> {
-    relay_stdio_mode(instance, true)
-}
-
-fn relay_stdio_mode(instance: Option<&str>, existing_only: bool) -> Result<()> {
     #[cfg(windows)]
     prevent_stdio_inheritance()?;
-    if !existing_only {
-        ensure_daemon(instance)?;
-    }
+    ensure_daemon(instance)?;
     let names = identity::instance_names(instance)?;
     let connection = Arc::new(pipe::connect(&names.pipe, Duration::from_secs(2))?);
     let writer = connection.clone();
@@ -148,7 +138,7 @@ fn prevent_stdio_inheritance() -> Result<()> {
 }
 
 fn ensure_daemon(instance: Option<&str>) -> Result<()> {
-    if compi_protocol::DaemonClient::endpoint_available(instance, Duration::from_millis(100))? {
+    if compi_protocol::DaemonClient::connect(instance, Duration::from_millis(100)).is_ok() {
         return Ok(());
     }
 
@@ -187,7 +177,7 @@ fn ensure_daemon(instance: Option<&str>) -> Result<()> {
     let mut child = command.spawn()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if compi_protocol::DaemonClient::endpoint_available(instance, Duration::from_millis(100))? {
+        if compi_protocol::DaemonClient::connect(instance, Duration::from_millis(100)).is_ok() {
             #[cfg(unix)]
             thread::spawn(move || {
                 let _ = child.wait();
@@ -544,13 +534,12 @@ fn serve(
             if let Err(error) = handle_connection(
                 connection,
                 sink.clone(),
-                handler_manager.clone(),
+                handler_manager,
                 handler_stopping,
                 &wake_pipe,
             ) {
                 eprintln!("compi-daemon: connection {connection_id}: {error}");
             }
-            handler_manager.unregister_client(connection_id);
             sink.disconnect();
             if let Ok(mut connections) = handler_connections.lock() {
                 connections.remove(&connection_id);
@@ -592,57 +581,38 @@ fn handle_connection(
     wake_pipe: &str,
 ) -> Result<()> {
     let mut reader = pipe::PipeReader::default();
-    let hello = loop {
-        let Some(first) = read_next(&mut reader, &connection, &stopping)? else {
-            return Ok(());
-        };
-        if first.kind != CONTROL_FRAME {
+    let Some(first) = read_next(&mut reader, &connection, &stopping)? else {
+        return Ok(());
+    };
+    if first.kind != CONTROL_FRAME {
+        send_error_sync(
+            &sink,
+            None,
+            ErrorCode::InvalidRequest,
+            "first frame must be a hello control message",
+        );
+        return Ok(());
+    }
+    let hello = match decode_client(&first.payload) {
+        Ok(hello) => hello,
+        Err(error) => {
             send_error_sync(
                 &sink,
                 None,
                 ErrorCode::InvalidRequest,
-                "first frame must be lifecycle or hello control",
+                &format!("invalid hello payload: {error}"),
             );
             return Ok(());
         }
-        let request = match decode_client(&first.payload) {
-            Ok(request) => request,
-            Err(error) => {
-                send_error_sync(
-                    &sink,
-                    None,
-                    ErrorCode::InvalidRequest,
-                    &format!("invalid control payload: {error}"),
-                );
-                return Ok(());
-            }
-        };
-        if process_lifecycle(
-            &request.message,
-            request.request_id,
-            &sink,
-            &manager,
-            &stopping,
-            wake_pipe,
-        )? {
-            if stopping.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            continue;
-        }
-        if matches!(request.message, ClientMessage::Hello { .. }) {
-            break request;
-        }
-        send_error_sync(
-            &sink,
-            Some(request.request_id),
-            ErrorCode::InvalidRequest,
-            "full workspace requests require hello",
-        );
-        return Ok(());
     };
     let ClientMessage::Hello { protocol_version } = hello.message else {
-        unreachable!()
+        send_error_sync(
+            &sink,
+            Some(hello.request_id),
+            ErrorCode::InvalidRequest,
+            "first control message must be hello",
+        );
+        return Ok(());
     };
     if protocol_version != PROTOCOL_VERSION {
         send_error_sync(
@@ -655,7 +625,6 @@ fn handle_connection(
         );
         return Ok(());
     }
-    manager.register_client(sink.id(), &stopping)?;
     sink.send_control(&ServerControl {
         request_id: Some(hello.request_id),
         message: ServerMessage::Hello {
@@ -704,16 +673,6 @@ fn handle_connection(
                 continue;
             }
 
-            if process_lifecycle(
-                &request.message,
-                request.request_id,
-                &sink,
-                &manager,
-                &stopping,
-                wake_pipe,
-            )? {
-                continue;
-            }
             let request_id = request.request_id;
             let target = request.target;
             match request.message {
@@ -1024,82 +983,16 @@ fn handle_connection(
                     let _ = pipe::connect(wake_pipe, Duration::from_millis(250));
                     break;
                 }
-                ClientMessage::GetLifecycleStatus { .. }
-                | ClientMessage::ConditionalStop { .. } => unreachable!(),
                 ClientMessage::Hello { .. } => unreachable!(),
             }
         }
         Ok(())
     })();
 
-    manager.unregister_client(sink.id());
     if let Some(session) = attached {
         session.detach_connection(sink.id());
     }
     result
-}
-
-fn process_lifecycle(
-    message: &ClientMessage,
-    request_id: u64,
-    sink: &ConnectionSink,
-    manager: &SurfaceManager,
-    stopping: &Arc<AtomicBool>,
-    wake_pipe: &str,
-) -> Result<bool> {
-    let version = match message {
-        ClientMessage::GetLifecycleStatus { lifecycle_version }
-        | ClientMessage::ConditionalStop {
-            lifecycle_version, ..
-        } => *lifecycle_version,
-        _ => return Ok(false),
-    };
-    if version != compi_protocol::LIFECYCLE_VERSION {
-        send_error_sync(
-            sink,
-            Some(request_id),
-            ErrorCode::IncompatibleProtocol,
-            "unsupported lifecycle contract version",
-        );
-        return Ok(true);
-    }
-    match message {
-        ClientMessage::GetLifecycleStatus { .. } => {
-            sink.send_control_sync(&ServerControl {
-                request_id: Some(request_id),
-                message: ServerMessage::LifecycleStatus {
-                    status: manager.lifecycle_status()?,
-                },
-            })?;
-        }
-        ClientMessage::ConditionalStop { consent, .. } => {
-            match manager.conditional_stop(consent.clone(), stopping.clone()) {
-                Ok(()) => {
-                    let acknowledgement = sink.send_control_sync(&ServerControl {
-                        request_id: Some(request_id),
-                        message: ServerMessage::DaemonStopping,
-                    });
-                    // Wake the accept loop even if the consenting client vanished.
-                    let _ = pipe::connect(wake_pipe, Duration::from_millis(250));
-                    acknowledgement?;
-                }
-                Err(error) => {
-                    if let Some(error) = error.downcast_ref::<crate::workspace::ActorError>() {
-                        send_error_sync(sink, Some(request_id), error.code, &error.message);
-                    } else {
-                        send_error_sync(
-                            sink,
-                            Some(request_id),
-                            ErrorCode::Internal,
-                            &error.to_string(),
-                        );
-                    }
-                }
-            }
-        }
-        _ => unreachable!(),
-    }
-    Ok(true)
 }
 
 fn directory_distribution(

@@ -1,22 +1,7 @@
 use super::catalog::CatalogTarget;
 use super::*;
 
-const SETTINGS_NAV_ITEMS: usize = SettingsSection::ALL.len();
-
-#[derive(Clone, Copy)]
-enum UpdateAction {
-    Preference(crate::config::AutomaticUpdateChecks),
-    Check,
-    Download,
-    Cancel,
-    Review,
-    Install,
-    Defer,
-    Retry,
-    Reinstall,
-    RestorePrior,
-    RecoveryLog,
-}
+const SETTINGS_NAV_ITEMS: usize = 6;
 
 #[derive(Clone, Copy)]
 enum SettingsAction {
@@ -42,7 +27,6 @@ enum SettingsAction {
     Reconnect,
     OpenDiagnostics,
     RestartDaemon,
-    Update(UpdateAction),
 }
 
 #[derive(Clone, Copy)]
@@ -83,7 +67,6 @@ impl CompiApp {
             SettingsSection::Terminal => self.font_choice_count() + 5,
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
-            SettingsSection::Updates => 13,
             SettingsSection::Advanced => 8,
         }
     }
@@ -131,24 +114,6 @@ impl CompiApp {
                 2 => Some(SettingsAction::CopyPerformance),
                 _ => None,
             },
-            SettingsSection::Updates => [
-                UpdateAction::Preference(crate::config::AutomaticUpdateChecks::Never),
-                UpdateAction::Preference(crate::config::AutomaticUpdateChecks::OnLaunch),
-                UpdateAction::Preference(crate::config::AutomaticUpdateChecks::Daily),
-                UpdateAction::Check,
-                UpdateAction::Download,
-                UpdateAction::Cancel,
-                UpdateAction::Review,
-                UpdateAction::Install,
-                UpdateAction::Defer,
-                UpdateAction::Retry,
-                UpdateAction::Reinstall,
-                UpdateAction::RestorePrior,
-                UpdateAction::RecoveryLog,
-            ]
-            .get(offset)
-            .copied()
-            .map(SettingsAction::Update),
             SettingsSection::Advanced => match offset {
                 0 => Some(SettingsAction::Scope(SettingsScope::Global)),
                 1 => Some(SettingsAction::Scope(SettingsScope::Window)),
@@ -378,44 +343,6 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         match action {
-            SettingsAction::Update(action) => {
-                let snapshot = self.updates.snapshot();
-                if let Some(reason) = update_action_reason(action, &snapshot) {
-                    self.global_error = Some(reason);
-                } else {
-                    match action {
-                        UpdateAction::Preference(preference) => {
-                            self.updates.preference(self.config.clone(), preference)
-                        }
-                        UpdateAction::Check => self.updates.check(),
-                        UpdateAction::Download => self.updates.download(),
-                        UpdateAction::Cancel => self.updates.cancel(),
-                        UpdateAction::Review => self.updates.review(),
-                        UpdateAction::Install => self.updates.install(),
-                        UpdateAction::Defer => self.updates.defer(),
-                        UpdateAction::Reinstall => self.updates.reinstall(),
-                        UpdateAction::RestorePrior => self.updates.restore_prior(),
-                        UpdateAction::RecoveryLog => {
-                            if let Some(path) = &snapshot.recovery_journal
-                                && let Err(error) = open_local_path(path)
-                            {
-                                self.global_error = Some(error);
-                            }
-                        }
-                        UpdateAction::Retry => {
-                            if snapshot.recovery_available {
-                                self.updates.reinstall();
-                            } else if snapshot.prepared.is_some() {
-                                self.updates.review();
-                            } else if snapshot.release.is_some() {
-                                self.updates.download();
-                            } else {
-                                self.updates.check();
-                            }
-                        }
-                    }
-                }
-            }
             SettingsAction::Scope(scope) => self.settings_scope = scope,
             SettingsAction::BrowseThemes(target) => {
                 self.open_theme_catalog_target(self.settings_scope, target)
@@ -1190,7 +1117,6 @@ impl CompiApp {
             SettingsSection::Terminal => self.render_terminal_settings(compact, cx),
             SettingsSection::Keyboard => self.render_keyboard_settings(compact, cx),
             SettingsSection::Performance => self.render_performance_section(cx),
-            SettingsSection::Updates => self.render_update_settings(compact, cx),
             SettingsSection::Advanced => self.render_advanced_settings(compact, cx),
         }
     }
@@ -1377,344 +1303,6 @@ impl CompiApp {
                 compact,
             ))
             .into_any_element()
-    }
-    fn render_update_button(
-        &self,
-        label: &'static str,
-        action: UpdateAction,
-        offset: usize,
-        snapshot: &crate::updates::UpdateSnapshot,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let reason = update_action_reason(action, snapshot);
-        let enabled = reason.is_none();
-        let focused = self.overlay_focus == self.settings_content_focus(offset);
-        let colors = *self.colors();
-        let active = matches!(action, UpdateAction::Preference(value) if value == snapshot.preferences.automatic_checks);
-        let primary = matches!(action, UpdateAction::Install);
-        let destructive = primary
-            && snapshot.daemons.iter().any(|daemon| {
-                daemon.managed
-                    && daemon
-                        .status
-                        .as_ref()
-                        .is_ok_and(|status| snapshot.requires_daemon_restart(status))
-            });
-        let background = if active || primary {
-            blend_rgb(colors.surface, colors.accent, 0.12)
-        } else {
-            blend_rgb(colors.surface, colors.foreground, 0.04)
-        };
-        div()
-            .id(("update-action", offset))
-            .relative()
-            .min_h(px(32.0))
-            .px_3()
-            .flex_none()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(if focused || active {
-                colors.accent
-            } else {
-                colors.border
-            }))
-            .bg(color(background))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(UI_BODY_TEXT_SIZE))
-            .font_weight(if active || primary {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::MEDIUM
-            })
-            .text_color(color(ui_text_color(
-                if !enabled {
-                    colors.muted
-                } else if destructive {
-                    colors.error
-                } else {
-                    colors.foreground
-                },
-                background,
-            )))
-            .when(enabled, |button| {
-                button.hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-            })
-            .tooltip(move |_, cx| {
-                let reason = reason.clone();
-                cx.new(move |_| HeaderTooltip {
-                    title: label.into(),
-                    reason,
-                    colors,
-                })
-                .into()
-            })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.overlay_focus = this.settings_content_focus(offset);
-                if enabled {
-                    this.activate_settings_action(SettingsAction::Update(action), window, cx);
-                }
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .child(label)
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
-    }
-
-    fn render_update_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
-        let snapshot = self.updates.snapshot();
-        let colors = *self.colors();
-        let available = snapshot
-            .available_release
-            .as_ref()
-            .or(snapshot.release.as_ref())
-            .map(|release| release.manifest.version.as_str())
-            .unwrap_or(if snapshot.last_check_unix.is_some() {
-                "None identified"
-            } else {
-                "Not checked"
-            });
-        let automatic = div()
-            .flex()
-            .flex_wrap()
-            .gap_2()
-            .children(
-                crate::config::AutomaticUpdateChecks::ALL
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, preference)| {
-                        self.render_update_button(
-                            preference.label(),
-                            UpdateAction::Preference(preference),
-                            index,
-                            &snapshot,
-                            cx,
-                        )
-                    }),
-            )
-            .into_any_element();
-        let check_detail = match snapshot.last_check_unix {
-            Some(timestamp) => {
-                let elapsed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    .saturating_sub(timestamp);
-                format!(
-                    "{} · {} minutes ago (Unix {})",
-                    snapshot.last_check_result.as_deref().unwrap_or("Checked"),
-                    elapsed / 60,
-                    timestamp
-                )
-            }
-            None => "No update check yet.".into(),
-        };
-        let actions = div()
-            .flex()
-            .flex_wrap()
-            .gap_2()
-            .child(self.render_update_button("Download", UpdateAction::Download, 4, &snapshot, cx))
-            .child(self.render_update_button("Cancel", UpdateAction::Cancel, 5, &snapshot, cx))
-            .child(self.render_update_button(
-                "Review affected work",
-                UpdateAction::Review,
-                6,
-                &snapshot,
-                cx,
-            ))
-            .child(self.render_update_button("Defer", UpdateAction::Defer, 8, &snapshot, cx))
-            .child(self.render_update_button("Retry", UpdateAction::Retry, 9, &snapshot, cx));
-        let mut content = div().min_w_0().flex().flex_col().gap_3()
-            .child(self.settings_heading("Updates"))
-            .child(self.settings_row("Client", format!("Current {} · Available {available}", env!("CARGO_PKG_VERSION")), self.render_update_button("Check now", UpdateAction::Check, 3, &snapshot, cx), compact))
-            .child(div().text_size(px(UI_SMALL_TEXT_SIZE)).text_color(color(modal_text_color(colors.muted, &colors))).child(check_detail))
-            .child(self.settings_row("Automatic checks", "Checks only. Downloads, installation, and restarts always require your action.".into(), automatic, true))
-            .child(actions);
-        if let Some(progress) = &snapshot.progress {
-            let detail = match progress.total {
-                Some(total) if total > 0 => format!(
-                    "{:?} · {} / {} bytes · {:.0}%",
-                    progress.phase,
-                    progress.completed,
-                    total,
-                    (progress.completed as f64 / total as f64 * 100.0).min(100.0)
-                ),
-                _ => format!("{:?}", progress.phase),
-            };
-            content = content.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(detail)
-                    .child(progress.message.clone()),
-            );
-            if let Some(total) = progress.total.filter(|total| *total > 0) {
-                content = content.child(
-                    div()
-                        .h(px(4.0))
-                        .rounded_full()
-                        .bg(color(colors.border))
-                        .child(div().h(px(4.0)).rounded_full().bg(color(colors.accent)).w(
-                            gpui::relative(
-                                (progress.completed as f32 / total as f32).clamp(0.0, 1.0),
-                            ),
-                        )),
-                );
-            }
-        }
-        if let Some(error) = &snapshot.error {
-            content = content.child(
-                div()
-                    .text_color(color(modal_text_color(colors.error, &colors)))
-                    .child(error.clone()),
-            );
-        }
-        if snapshot.deferred {
-            content = content
-                .child("Deferred. Verified staged files are retained; terminals keep running.");
-        }
-        if let Some(prepared) = &snapshot.prepared {
-            content = content.child(format!("Verified staged client {}. Install and restart applies this version; Download explicitly replaces it with the available release.", prepared.version));
-        }
-        if !snapshot.release_notes.is_empty() {
-            content = content
-                .child(self.settings_subheading("Release notes"))
-                .child(
-                    div()
-                        .min_w_0()
-                        .child(SharedString::new(snapshot.release_notes.clone())),
-                );
-        }
-        content = content.child(self.settings_subheading("Connected daemons"));
-        if snapshot.daemons.is_empty() {
-            content = content.child("Choose Review affected work to inspect local instances, detached terminals, remote targets, and all GUI hosts.");
-        }
-        for daemon in &snapshot.daemons {
-            let detail = match &daemon.status {
-                Ok(status) => format!(
-                    "{} · instance {} · daemon {} · protocol {} · generation {} · revision {} · {} attached clients · {} live surfaces{}",
-                    if daemon.target.is_remote() {
-                        "Remote"
-                    } else {
-                        "Local"
-                    },
-                    status.instance.as_deref().unwrap_or("default"),
-                    status.product_version,
-                    status.protocol_version,
-                    status.server_generation,
-                    status.workspace_revision,
-                    status.connected_clients.len(),
-                    status.live_surfaces.len(),
-                    if snapshot.requires_daemon_restart(status) {
-                        " · daemon restart required"
-                    } else {
-                        " · keeps running"
-                    },
-                ),
-                Err(error) => format!("Cannot inspect daemon: {error}"),
-            };
-            content = content.child(div().min_w_0().child(detail));
-            if let Ok(status) = &daemon.status
-                && snapshot.consent_reviewed
-                && snapshot.requires_daemon_restart(status)
-            {
-                content = content.children(status.live_surfaces.iter().map(|surface| {
-                    div().text_size(px(UI_SMALL_TEXT_SIZE)).child(format!(
-                        "{} · lifetime {} · {:?}",
-                        surface.surface_id, surface.process_lifetime_id, surface.status
-                    ))
-                }));
-            }
-        }
-        content = content.child(div().text_size(px(UI_SMALL_TEXT_SIZE)).child(format!(
-                "Affected GUI processes: {}",
-                snapshot
-                    .host_process_ids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        let restart = if snapshot.daemons.iter().any(|daemon| {
-            daemon.managed
-                && daemon
-                    .status
-                    .as_ref()
-                    .is_ok_and(|status| snapshot.requires_daemon_restart(status))
-        }) {
-            format!(
-                "Installing restarts {} GUI hosts and stops the listed local daemons. Every listed live terminal ends and becomes Lost. It is not resumed automatically. Remote hosts are never updated. No operating-system restart is requested.",
-                snapshot.host_process_ids.len()
-            )
-        } else {
-            format!(
-                "Installing restarts {} GUI hosts. Qualified daemons and terminal process lifetimes keep running. A newer daemon can be restarted deliberately later. No operating-system restart is requested.",
-                snapshot.host_process_ids.len()
-            )
-        };
-        content = content.child(self.settings_row(
-            "Install and restart",
-            restart,
-            self.render_update_button(
-                if snapshot.daemons.iter().any(|daemon| {
-                    daemon.managed
-                        && daemon
-                            .status
-                            .as_ref()
-                            .is_ok_and(|status| snapshot.requires_daemon_restart(status))
-                }) {
-                    "Stop listed work and install"
-                } else {
-                    "Install and restart client"
-                },
-                UpdateAction::Install,
-                7,
-                &snapshot,
-                cx,
-            ),
-            true,
-        ));
-        if let Some(reason) = snapshot.install_blocker() {
-            content = content.child(
-                div()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .text_color(color(modal_text_color(colors.muted, &colors)))
-                    .child(reason),
-            );
-        }
-        if snapshot.recovery_journal.is_some() {
-            content = content.child(self.settings_subheading("Recovery")).child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(self.render_update_button(
-                        "Reinstall verified package",
-                        UpdateAction::Reinstall,
-                        10,
-                        &snapshot,
-                        cx,
-                    ))
-                    .child(self.render_update_button(
-                        "Restore prior selection",
-                        UpdateAction::RestorePrior,
-                        11,
-                        &snapshot,
-                        cx,
-                    ))
-                    .child(self.render_update_button(
-                        "Open recovery journal",
-                        UpdateAction::RecoveryLog,
-                        12,
-                        &snapshot,
-                        cx,
-                    )),
-            );
-        }
-        content.into_any_element()
     }
 
     fn render_advanced_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
@@ -2199,52 +1787,5 @@ impl CompiApp {
             )
             .child(panel)
             .into_any_element()
-    }
-}
-
-fn update_action_reason(
-    action: UpdateAction,
-    snapshot: &crate::updates::UpdateSnapshot,
-) -> Option<String> {
-    if matches!(action, UpdateAction::Cancel) {
-        return if snapshot.busy
-            && !matches!(
-                snapshot.progress.as_ref().map(|progress| progress.phase),
-                Some(
-                    compi_update::UpdatePhase::Activating | compi_update::UpdatePhase::Relaunching
-                )
-            ) {
-            None
-        } else {
-            Some("No cancellable update operation is running.".into())
-        };
-    }
-    if snapshot.busy {
-        return Some("Wait for this update operation, or cancel it first.".into());
-    }
-    match action {
-        UpdateAction::Review if snapshot.prepared.is_none() => {
-            Some("Download and verify before reviewing installation.".into())
-        }
-        UpdateAction::Download if snapshot.release.is_none() => {
-            Some("Check for an available release first.".into())
-        }
-        UpdateAction::Install if !snapshot.consent_reviewed => {
-            Some("Review affected work before installing.".into())
-        }
-        UpdateAction::Install => snapshot.install_blocker(),
-        UpdateAction::Defer if snapshot.prepared.is_none() => {
-            Some("No verified download is staged.".into())
-        }
-        UpdateAction::Retry if snapshot.error.is_none() => {
-            Some("There is no failed update operation to retry.".into())
-        }
-        UpdateAction::Reinstall | UpdateAction::RestorePrior if !snapshot.recovery_available => {
-            Some("No rolled-back update requires recovery.".into())
-        }
-        UpdateAction::RecoveryLog if snapshot.recovery_journal.is_none() => {
-            Some("No update recovery journal is available.".into())
-        }
-        _ => None,
     }
 }

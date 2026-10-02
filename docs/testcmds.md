@@ -10,10 +10,10 @@ Record Windows build, WSL distribution and version, display scale, monitor refre
 
 ## Phase 1 dependency and compatibility checks
 
-The four workspace crates can be tested together on macOS, Linux, or Windows. On Windows, first run `pwsh -File tools/prepare-conpty.ps1` and verify the default WSL2 guest with `wsl.exe --exec /bin/bash -lc true`; otherwise integration tests may be skipped or fail before exercising a shell:
+The three product crates can be tested together on macOS, Linux, or Windows. On Windows, first run `pwsh -File tools/prepare-conpty.ps1` and verify the default WSL2 guest with `wsl.exe --exec /bin/bash -lc true`; otherwise integration tests may be skipped or fail before exercising a shell:
 
 ```text
-cargo test --locked --workspace --all-targets -- --test-threads=1
+cargo test --locked -p compi-protocol -p compi-daemon -p compi-client
 cargo test --locked -p compi-daemon --test terminal_compatibility
 ```
 
@@ -28,25 +28,6 @@ cargo test --locked -p compi-daemon --test daemon_integration -- --test-threads=
 
 The daemon build does not require GPUI or `GPUI_FXC_PATH`. A failed WSL readiness check is missing runtime coverage, not a reason to count skipped daemon tests as passing. The Windows integration cases run one at a time on shared WSL2 runners: simultaneous guest startups have returned `0xffffffff` without diagnostic output, even though individual tests run. The commands in Tier 1 below require a working default WSL distribution for the full integration suite.
 The 16 MiB output-backpressure case allows two minutes for shell output to complete on a debug CI runner; ordinary control-path waits remain 30 seconds.
-
-### Installer and in-app update qualification
-
-The bootstrapper is a separate Cargo workspace. Run its behavioral library tests with `cargo test --locked --manifest-path installer/bootstrapper/Cargo.toml --lib -- --test-threads=1`; testing its embedded-MSI binary additionally requires the generated `installer/bootstrapper/payload/Compi.msi`. The packaging script creates and removes that build input.
-
-Use `tools/smoke-windows-distribution.ps1` only in a disposable Windows account/runner: it exercises real MSI registration, task management, repair and removal, and refuses an existing developer install. Pass `-PreviousMsi` to add the legacy migration; `python tools/extract-legacy-msi.py <Compi-0.1.2-Setup.exe> <out.msi>` recovers the hash-pinned MSI embedded in the published v0.1.2 wrapper. `tools/smoke-macos-bundle.sh` requires a native Apple Silicon Mac; set `COMPI_SMOKE_LEGACY_APP_ZIP` to the published v0.1.2 app ZIP to add the drag-replace migration. Neither cross-compilation nor library tests qualify installation/uninstallation.
-
-`python tools/qualify-update-cycle.py --qualification <receipt> --signer <compi-release-metadata> --commit <sha> --repository <owner/repo>` runs the whole cycle below on the native runner: it creates a disposable key, builds B (this commit) and C (one patch higher), signs C, runs the platform smoke and records the evidence in the official receipt. The release signer refuses receipts without the installer scenarios and this cycle for the released commit.
-
-For a genuine compatible B→C cycle, build both versioned packages with the same disposable verification key and sign C's complete artifact metadata with B's exact daemon version qualified. Compile the development-only `compi-probe` and `compi-update-smoke` examples from B. Point the cycle script only at an extracted disposable B root carrying the smoke ownership receipt, never the live installation:
-
-```text
-python tools/smoke-update-cycle.py --root B_ROOT --artifact C_FULL_PACKAGE --metadata C_SIGNED_METADATA --probe B_PROBE --driver B_UPDATE_SMOKE --evidence EVIDENCE_DIRECTORY
-```
-
-The script launches the real GUI and shell, imports a managed custom theme, checks signature/hash rejection and cancellation, injects a missing restore handoff, requires a real old-build rollback attachment, then requires a real C attachment to the original B daemon. It verifies shell PID/cwd/environment/output continuity, workspace/surface/process-lifetime identity, logical launch selection, and retained config/theme/external-source bytes. It creates only isolated profiles and shuts down only its named instance.
-
-Record artifact/metadata hashes, actual readiness receipts and native images. Also qualify multiple windows, incompatible-update consent, interrupted downloads, permissions/disk-full failures, actual MSI cancellation/rollback, default keep-data uninstall/reinstall, explicit managed-data removal, and macOS bundle/quarantine/Gatekeeper paths separately. Do not infer those results from the compatible single-window cycle.
-
 
 ## Phase 2 native Unix and Mac checks
 

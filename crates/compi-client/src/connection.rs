@@ -1,6 +1,8 @@
 use crate::{DaemonClient, Result, probe};
 use sha2::{Digest, Sha256};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionTarget {
@@ -41,35 +43,24 @@ impl ConnectionTarget {
         }
     }
 
-    pub fn lifecycle_status(&self) -> Result<compi_protocol::LifecycleStatus> {
+    pub fn restart_daemon(&self) -> Result<DaemonClient> {
         match self {
-            Self::Local { instance } => DaemonClient::lifecycle_status(instance.as_deref()),
-            Self::Ssh { endpoint, instance } => {
-                let mut inspect = endpoint.command_mode(instance.as_deref(), true);
-                DaemonClient::lifecycle_command(&mut inspect)
-            }
-        }
-    }
-
-    pub fn restart_daemon(
-        &self,
-        consent: &compi_protocol::LifecycleConsent,
-    ) -> Result<DaemonClient> {
-        match self {
-            Self::Local { instance } => probe::restart_daemon(instance.as_deref(), consent),
-            Self::Ssh { .. } => Err("Remote daemon restart is not performed by the local updater; stop it deliberately on its host".into()),
-        }
-    }
-
-    pub fn launch_options(&self) -> (Option<String>, Option<String>) {
-        match self {
-            Self::Local { instance } => (instance.clone(), None),
-            Self::Ssh { endpoint, instance } => {
-                let connect = match endpoint.port {
-                    Some(port) => format!("{}:{port}", endpoint.destination),
-                    None => endpoint.destination.clone(),
-                };
-                (instance.clone(), Some(connect))
+            Self::Local { instance } => probe::restart_daemon(instance.as_deref()),
+            Self::Ssh { .. } => {
+                if let Ok(mut client) = self.connect() {
+                    client.shutdown_daemon()?;
+                }
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match self.connect() {
+                        Ok(client) => return Ok(client),
+                        Err(error) if Instant::now() < deadline => {
+                            drop(error);
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
     }
@@ -135,10 +126,6 @@ impl SshEndpoint {
     }
 
     fn command(&self, instance: Option<&str>) -> Command {
-        self.command_mode(instance, false)
-    }
-
-    fn command_mode(&self, instance: Option<&str>, existing_only: bool) -> Command {
         let mut command = Command::new("ssh");
         command
             .arg("-T")
@@ -150,11 +137,7 @@ impl SshEndpoint {
             command.arg("-p").arg(port.to_string());
         }
         command.arg("--").arg(&self.destination);
-        let mut remote = String::from(if existing_only {
-            "compi-daemon --server-stdio-existing"
-        } else {
-            "compi-daemon --server-stdio"
-        });
+        let mut remote = String::from("compi-daemon --server-stdio");
         if let Some(instance) = instance {
             remote.push_str(" --instance ");
             remote.push_str(instance);

@@ -15,7 +15,7 @@ use compi_protocol::{
     SurfaceStatus, TerminalFrame, TerminalIdentity, TerminalTarget, WorkingDirectory,
     WorkspaceSnapshot, encode_server, encode_terminal_frame,
 };
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -47,10 +47,6 @@ static NEXT_ATTACHMENT: AtomicU64 = AtomicU64::new(1);
 pub struct SurfaceManager {
     surfaces: Arc<Mutex<HashMap<SurfaceId, Arc<Surface>>>>,
     actor: WorkspaceActor,
-    instance: Option<String>,
-    daemon_executable: std::result::Result<String, String>,
-    lifecycle_clients: Mutex<BTreeSet<u64>>,
-    runtime_stopping: Arc<Mutex<bool>>,
 }
 
 pub struct Surface {
@@ -162,25 +158,15 @@ impl SurfaceManager {
 
     pub fn persistent(instance: Option<&str>) -> Result<Self> {
         let (actor, effects) = WorkspaceActor::persistent(instance)?;
-        let mut manager = Self::with_actor(actor, effects);
-        manager.instance = instance.map(str::to_owned);
-        Ok(manager)
+        Ok(Self::with_actor(actor, effects))
     }
 
     fn with_actor(actor: WorkspaceActor, effects: Receiver<WorkspaceEffect>) -> Self {
         let surfaces = Arc::new(Mutex::new(HashMap::<SurfaceId, Arc<Surface>>::new()));
         let worker_surfaces = surfaces.clone();
         let worker_actor = actor.clone();
-        let runtime_stopping = Arc::new(Mutex::new(false));
-        let worker_stopping = runtime_stopping.clone();
         thread::spawn(move || {
             while let Ok(effect) = effects.recv() {
-                let Ok(stopped) = worker_stopping.lock() else {
-                    return;
-                };
-                if *stopped {
-                    continue;
-                }
                 match effect {
                     WorkspaceEffect::Launch(info, context) => {
                         if let Ok(registry) = worker_surfaces.lock()
@@ -248,101 +234,11 @@ impl SurfaceManager {
                 }
             }
         });
-        let daemon_executable = std::env::current_exe()
-            .and_then(|path| path.canonicalize())
-            .and_then(|path| {
-                path.into_os_string().into_string().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "daemon executable path is not UTF-8",
-                    )
-                })
-            })
-            .map_err(|error| error.to_string());
-        Self {
-            surfaces,
-            actor,
-            instance: None,
-            daemon_executable,
-            lifecycle_clients: Mutex::new(BTreeSet::new()),
-            runtime_stopping,
-        }
+        Self { surfaces, actor }
     }
 
     pub fn actor(&self) -> &WorkspaceActor {
         &self.actor
-    }
-
-    pub fn register_client(&self, id: u64, stopping: &AtomicBool) -> Result<()> {
-        let mut clients = self
-            .lifecycle_clients
-            .lock()
-            .map_err(|_| "lifecycle registry lock poisoned")?;
-        if stopping.load(Ordering::Acquire) {
-            return Err("daemon is stopping".into());
-        }
-        clients.insert(id);
-        Ok(())
-    }
-
-    pub fn unregister_client(&self, id: u64) {
-        if let Ok(mut clients) = self.lifecycle_clients.lock() {
-            clients.remove(&id);
-        }
-    }
-
-    pub fn lifecycle_status(&self) -> Result<compi_protocol::LifecycleStatus> {
-        let clients = self
-            .lifecycle_clients
-            .lock()
-            .map_err(|_| "lifecycle registry lock poisoned")?;
-        let snapshot = self.actor.snapshot()?;
-        Ok(compi_protocol::LifecycleStatus {
-            lifecycle_version: compi_protocol::LIFECYCLE_VERSION,
-            product_version: env!("CARGO_PKG_VERSION").into(),
-            protocol_version: compi_protocol::PROTOCOL_VERSION,
-            daemon_pid: std::process::id(),
-            supervisor_pid: std::env::var("COMPI_SUPERVISOR_PID")
-                .ok()
-                .and_then(|pid| pid.parse().ok()),
-            daemon_executable: self
-                .daemon_executable
-                .as_ref()
-                .map_err(|error| format!("cannot attribute daemon executable: {error}"))?
-                .clone(),
-            live_surfaces: compi_protocol::live_surface_inventory(&snapshot),
-            server_id: snapshot.server_id,
-            server_generation: snapshot.server_generation,
-            instance: self.instance.clone(),
-            workspace_revision: snapshot.revision,
-            connected_clients: clients.iter().copied().collect(),
-        })
-    }
-
-    pub fn conditional_stop(
-        &self,
-        consent: compi_protocol::LifecycleConsent,
-        stopping: Arc<AtomicBool>,
-    ) -> Result<()> {
-        // Hold admission lock through actor validation and the stopping transition.
-        // A newly connected client cannot slip between consent and shutdown.
-        let clients = self
-            .lifecycle_clients
-            .lock()
-            .map_err(|_| "lifecycle registry lock poisoned")?;
-        if !clients
-            .iter()
-            .copied()
-            .eq(consent.connected_clients.iter().copied())
-        {
-            return Err(Box::new(ActorError {
-                code: ErrorCode::RevisionConflict,
-                message: "connected clients changed; review shutdown consent again".into(),
-                current_revision: None,
-            }));
-        }
-        self.actor.conditional_stop(consent, stopping)?;
-        Ok(())
     }
 
     pub fn snapshot(&self) -> std::result::Result<WorkspaceSnapshot, ActorError> {
@@ -412,9 +308,6 @@ impl SurfaceManager {
     }
 
     pub fn shutdown_all(&self, _reason: &str) {
-        if let Ok(mut stopped) = self.runtime_stopping.lock() {
-            *stopped = true;
-        }
         let surfaces: Vec<_> = self
             .surfaces
             .lock()

@@ -15,9 +15,6 @@ struct Arguments {
     theme: Option<String>,
     sidebar_width: Option<f32>,
     diagnostics: Vec<String>,
-    update_restore: Option<PathBuf>,
-    update_receipt: Option<PathBuf>,
-    update_receipt_token: Option<String>,
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -32,9 +29,6 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
     let mut line_height = None;
     let mut theme = None;
     let mut sidebar_width = None;
-    let mut update_restore = None;
-    let mut update_receipt = None;
-    let mut update_receipt_token = None;
     while let Some(argument) = args.next() {
         let setting = match argument.as_str() {
             "--instance" => &mut instance,
@@ -46,9 +40,6 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
             "--line-height" => &mut line_height,
             "--theme" => &mut theme,
             "--sidebar-width" => &mut sidebar_width,
-            "--update-restore" => &mut update_restore,
-            "--update-receipt" => &mut update_receipt,
-            "--update-receipt-token" => &mut update_receipt_token,
             _ if !argument.starts_with('-') && working_directory.is_none() => {
                 working_directory = Some(argument);
                 continue;
@@ -62,29 +53,6 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
             args.next()
                 .filter(|value| !value.is_empty() && !value.starts_with("--"))
                 .ok_or_else(|| format!("{argument} requires a value"))?,
-        );
-    }
-    if update_restore.is_some()
-        && (working_directory.is_some()
-            || instance.is_some()
-            || connect.is_some()
-            || config.is_some()
-            || family.is_some()
-            || size.is_some()
-            || line_height.is_some()
-            || theme.is_some()
-            || sidebar_width.is_some())
-    {
-        return Err(
-            "--update-restore uses only the retained handoff; launch overrides are not allowed"
-                .into(),
-        );
-    }
-    if update_restore.is_some() != update_receipt.is_some()
-        || update_receipt.is_some() != update_receipt_token.is_some()
-    {
-        return Err(
-            "update restore requires both --update-receipt and --update-receipt-token".into(),
         );
     }
     let mut diagnostics = Vec::new();
@@ -114,27 +82,12 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
         theme,
         sidebar_width,
         diagnostics,
-        update_restore: update_restore.map(PathBuf::from),
-        update_receipt: update_receipt.map(PathBuf::from),
-        update_receipt_token,
     })
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 fn main() {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    if let [mode, root, version] = raw.as_slice()
-        && mode == "--stop-idle-update-daemons"
-    {
-        if let Err(error) =
-            compi_client::updates::stop_idle_update_daemons(std::path::Path::new(root), version)
-        {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    let args = match parse_arguments(raw) {
+    let args = match parse_arguments(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(error) => {
             eprintln!(
@@ -143,39 +96,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Some(path) = &args.update_restore {
-        let result = (|| -> compi_client::Result<()> {
-            let session = compi_client::update_restore::RestoreSession::open(path)?;
-            let first = &session.windows()[0];
-            let host_instance = first.target.state_instance();
-            let request = compi_client::window_host::LaunchRequest::restore(
-                path.clone(),
-                first.config.clone(),
-            );
-            match compi_client::window_host::acquire(host_instance.as_deref(), request)? {
-                compi_client::window_host::HostAcquisition::Forwarded => {
-                    return Err("update restore must never forward into an old host".into());
-                }
-                compi_client::window_host::HostAcquisition::Host(mut host, _) => {
-                    compi_client::updates::set_readiness_receipt(
-                        args.update_receipt.clone().unwrap(),
-                        args.update_receipt_token.clone().unwrap(),
-                    );
-                    let receiver = host.take_receiver();
-                    compi_client::gui::run_restore(session, Some(receiver));
-                    drop(host);
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            eprintln!(
-                "Could not restore updated Compi: {error}. The handoff is retained for recovery."
-            );
-            std::process::exit(1);
-        }
-        return;
-    }
     let target = match compi_client::connection::ConnectionTarget::from_options(
         args.instance.clone(),
         args.connect.clone(),
@@ -288,41 +208,5 @@ mod tests {
             "dark-glass"
         );
         assert_eq!(config.configured_sidebar_width, 240.0);
-    }
-
-    #[test]
-    fn update_restore_rejects_startup_replay_and_missing_receipt() {
-        let restore = [
-            "--update-restore",
-            "handoff.json",
-            "--update-receipt",
-            "receipt.json",
-            "--update-receipt-token",
-            "private-token",
-        ];
-        for overrides in [
-            vec!["--working-directory", "/project"],
-            vec!["--instance", "other"],
-            vec!["--connect", "other-host"],
-            vec!["--config", "other.toml"],
-            vec!["--theme", "dracula"],
-        ] {
-            assert!(
-                parse_arguments(restore.into_iter().chain(overrides).map(str::to_owned)).is_err()
-            );
-        }
-        assert!(parse_arguments(["--update-restore", "handoff.json"].map(str::to_owned)).is_err());
-        assert!(
-            parse_arguments(
-                [
-                    "--update-receipt",
-                    "receipt.json",
-                    "--update-receipt-token",
-                    "private-token"
-                ]
-                .map(str::to_owned)
-            )
-            .is_err()
-        );
     }
 }

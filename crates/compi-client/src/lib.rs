@@ -23,9 +23,6 @@ mod theme_migration;
 pub mod theme_store;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod typography;
-#[cfg(any(windows, target_os = "macos"))]
-pub mod update_restore;
-pub mod updates;
 pub mod viewport;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod window_host;

@@ -8,13 +8,11 @@ default-run = "compi"
 
 [dependencies]
 compi-protocol = { path = "../compi-protocol" }
-compi-update = { path = "../compi-update" }
 serde.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 toml_edit = "0.22"
-parking_lot = "0.12"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

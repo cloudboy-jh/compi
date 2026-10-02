@@ -20,121 +20,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_MUTATION: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(windows)]
-struct ProcessExit(std::os::windows::io::OwnedHandle);
-#[cfg(unix)]
-struct ProcessExit(u32);
-
-impl ProcessExit {
-    fn open(pid: u32) -> Result<Self> {
-        if pid == 0 || pid == std::process::id() {
-            return Err(
-                "cannot wait for an invalid or current process as an external daemon".into(),
-            );
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::FromRawHandle;
-            use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
-            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid)? };
-            Ok(Self(unsafe {
-                std::os::windows::io::OwnedHandle::from_raw_handle(handle.0)
-            }))
-        }
-        #[cfg(unix)]
-        {
-            Ok(Self(pid))
-        }
-    }
-
-    fn wait(&self, deadline: Instant) -> Result<()> {
-        loop {
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::AsRawHandle;
-                use windows::Win32::{
-                    Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
-                    System::Threading::WaitForSingleObject,
-                };
-                match unsafe { WaitForSingleObject(HANDLE(self.0.as_raw_handle()), 0) } {
-                    WAIT_OBJECT_0 => return Ok(()),
-                    WAIT_TIMEOUT => {}
-                    _ => return Err(std::io::Error::last_os_error().into()),
-                }
-            }
-            #[cfg(unix)]
-            {
-                if unsafe { libc::kill(self.0 as i32, 0) } == -1 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::ESRCH) {
-                        return Ok(());
-                    }
-                    return Err(error.into());
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err("daemon or supervisor did not exit after acknowledged shutdown".into());
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionFailureKind {
-    Absent,
-    Incompatible,
-    Unauthorized,
-    Transport,
-}
-
-#[derive(Debug)]
-pub struct ConnectionFailure {
-    pub kind: ConnectionFailureKind,
-    pub message: String,
-}
-
-impl std::fmt::Display for ConnectionFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ConnectionFailure {}
-
-impl ConnectionFailure {
-    pub fn kind(error: &(dyn std::error::Error + Send + Sync + 'static)) -> ConnectionFailureKind {
-        error
-            .downcast_ref::<Self>()
-            .map_or(ConnectionFailureKind::Transport, |error| error.kind)
-    }
-
-    fn transport(error: crate::Error) -> crate::Error {
-        let mut kind = ConnectionFailureKind::Transport;
-        if let Some(io) = error.downcast_ref::<std::io::Error>() {
-            kind = match io.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                    ConnectionFailureKind::Absent
-                }
-                std::io::ErrorKind::PermissionDenied => ConnectionFailureKind::Unauthorized,
-                _ => ConnectionFailureKind::Transport,
-            };
-        }
-        #[cfg(windows)]
-        if let Some(win) = error.downcast_ref::<windows::core::Error>() {
-            kind = match win.code().0 as u32 & 0xffff {
-                2 | 3 => ConnectionFailureKind::Absent,
-                5 => ConnectionFailureKind::Unauthorized,
-                _ => ConnectionFailureKind::Transport,
-            };
-        }
-        Box::new(Self {
-            kind,
-            message: error.to_string(),
-        })
-    }
-}
-
 #[derive(Debug)]
 pub struct DaemonError {
     pub code: ErrorCode,
@@ -293,7 +178,7 @@ impl DaemonClient {
     }
 
     pub fn connect_to(pipe_name: &str, timeout: Duration) -> Result<Self> {
-        let connection = pipe::connect(pipe_name, timeout).map_err(ConnectionFailure::transport)?;
+        let connection = pipe::connect(pipe_name, timeout)?;
         Self::handshake(Self::from_parts(connection, 1))
     }
 
@@ -308,223 +193,26 @@ impl DaemonClient {
     }
 
     fn handshake(mut client: Self) -> Result<Self> {
-        let response = client.request_bounded(
-            ClientMessage::Hello {
-                protocol_version: PROTOCOL_VERSION,
-            },
-            Duration::from_secs(15),
-        );
-        if matches!(&response, Ok(ServerMessage::Hello { protocol_version }) if *protocol_version == PROTOCOL_VERSION)
-        {
-            return Ok(client);
-        }
-        let mut kind = match &response {
-            Ok(ServerMessage::Hello { .. })
-            | Ok(ServerMessage::Error {
-                code: ErrorCode::IncompatibleProtocol,
-                ..
-            }) => ConnectionFailureKind::Incompatible,
-            Err(error)
-                if error
-                    .downcast_ref::<DaemonError>()
-                    .is_some_and(|error| error.code == ErrorCode::IncompatibleProtocol) =>
+        let result: std::result::Result<(), String> = match client.request(ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        }) {
+            Ok(ServerMessage::Hello { protocol_version })
+                if protocol_version == PROTOCOL_VERSION =>
             {
-                ConnectionFailureKind::Incompatible
+                return Ok(client);
             }
-            _ => ConnectionFailureKind::Transport,
-        };
-        let mut message = match response {
-            Ok(message) => format!("daemon rejected hello: {message:?}"),
-            Err(error) => error.to_string(),
+            Ok(ServerMessage::Error { code, message, .. }) => {
+                Err(format!("daemon rejected protocol ({code:?}): {message}"))
+            }
+            Ok(message) => Err(format!("unexpected daemon hello response: {message:?}")),
+            Err(error) => Err(error.to_string()),
         };
         let diagnostics = client.connection.diagnostics();
-        if diagnostics.contains("Permission denied")
-            || diagnostics.contains("Authentication failed")
-        {
-            kind = ConnectionFailureKind::Unauthorized;
-        }
-        if !diagnostics.is_empty() {
-            message.push_str(": ");
-            message.push_str(&diagnostics);
-        }
-        Err(Box::new(ConnectionFailure { kind, message }))
-    }
-
-    pub fn endpoint_available(instance: Option<&str>, timeout: Duration) -> Result<bool> {
-        let names = identity::instance_names(instance)?;
-        match pipe::connect(&names.pipe, timeout).map_err(ConnectionFailure::transport) {
-            Ok(_) => Ok(true),
-            Err(error)
-                if ConnectionFailure::kind(error.as_ref()) == ConnectionFailureKind::Absent =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Inspect an existing authenticated endpoint without Hello or daemon startup.
-    pub fn lifecycle_status(instance: Option<&str>) -> Result<crate::LifecycleStatus> {
-        let names = identity::instance_names(instance)?;
-        let connection = pipe::connect(&names.pipe, Duration::from_secs(2))
-            .map_err(ConnectionFailure::transport)?;
-        Self::from_parts(connection, 1).lifecycle()
-    }
-
-    #[cfg(windows)]
-    fn reject_supervisor_backoff() -> Result<()> {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::{
-            Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
-            System::Threading::WaitForSingleObject,
-        };
-        let marker = crate::paths::data_dir()?.join("supervisor.pid");
-        let pid = match std::fs::read_to_string(marker) {
-            Ok(marker) => {
-                let marker: serde_json::Value = serde_json::from_str(&marker)?;
-                u32::try_from(
-                    marker
-                        .get("pid")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or("invalid supervisor presence record; inspect or repair Compi")?,
-                )?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let process = match ProcessExit::open(pid) {
-            Ok(process) => process,
-            Err(error)
-                if error
-                    .downcast_ref::<windows::core::Error>()
-                    .is_some_and(|error| error.code().0 as u32 & 0xffff == 87) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        match unsafe { WaitForSingleObject(HANDLE(process.0.as_raw_handle()), 0) } {
-            WAIT_OBJECT_0 => Ok(()),
-            WAIT_TIMEOUT => Err("Compi supervisor is starting or in recovery backoff; wait for its daemon to become inspectable before updating".into()),
-            _ => Err(std::io::Error::last_os_error().into()),
-        }
-    }
-
-    pub fn local_lifecycle_statuses() -> Result<Vec<crate::LifecycleStatus>> {
-        let mut instances = std::collections::BTreeSet::new();
-        instances.insert(None);
-        let directory = crate::paths::data_dir()?;
-        match std::fs::read_dir(directory) {
-            Ok(entries) => {
-                for entry in entries {
-                    let name = entry?.file_name().to_string_lossy().into_owned();
-                    if let Some(instance) = name
-                        .strip_prefix("workspace-")
-                        .and_then(|name| name.strip_suffix("-v1.json"))
-                    {
-                        identity::instance_names(Some(instance))?;
-                        instances.insert(Some(instance.to_owned()));
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let mut statuses = Vec::new();
-        for instance in instances {
-            match Self::lifecycle_status(instance.as_deref()) {
-                Ok(status) => {
-                    if !statuses.iter().any(|existing: &crate::LifecycleStatus| {
-                        existing.server_generation == status.server_generation
-                    }) {
-                        statuses.push(status);
-                    }
-                }
-                Err(error)
-                    if ConnectionFailure::kind(error.as_ref()) == ConnectionFailureKind::Absent => {
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        #[cfg(windows)]
-        if !statuses.iter().any(|status| status.instance.is_none()) {
-            Self::reject_supervisor_backoff()?;
-        }
-        Ok(statuses)
-    }
-
-    pub fn local_lifecycle_statuses_for_install(
-        root: &std::path::Path,
-    ) -> Result<Vec<crate::LifecycleStatus>> {
-        crate::lifecycle_inventory::for_install(root)
-    }
-
-    pub fn lifecycle_command(command: &mut Command) -> Result<crate::LifecycleStatus> {
-        let child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        Self::from_io(ClientIo::command(child)?, 1).lifecycle()
-    }
-
-    pub fn lifecycle(&mut self) -> Result<crate::LifecycleStatus> {
-        match self.request_bounded(ClientMessage::GetLifecycleStatus { lifecycle_version: crate::LIFECYCLE_VERSION }, Duration::from_secs(5))? {
-            ServerMessage::LifecycleStatus { status } if status.lifecycle_version == crate::LIFECYCLE_VERSION => Ok(status),
-            message => Err(format!("daemon lifecycle inspection unavailable; deliberately stop the old application before migration: {message:?}").into()),
-        }
-    }
-
-    /// Consent must be the snapshot presented to the user, not a new snapshot.
-    pub fn conditional_stop(
-        instance: Option<&str>,
-        consent: &crate::LifecycleConsent,
-        timeout: Duration,
-    ) -> Result<()> {
-        let names = identity::instance_names(instance)?;
-        let connection = pipe::connect(&names.pipe, Duration::from_secs(2))
-            .map_err(ConnectionFailure::transport)?;
-        let mut client = Self::from_parts(connection, 1);
-        let status = client.lifecycle()?;
-        if status.server_id != consent.server_id
-            || status.server_generation != consent.server_generation
-        {
-            return Err("daemon generation changed; review shutdown consent again".into());
-        }
-        let daemon_exit = ProcessExit::open(status.daemon_pid)?;
-        let supervisor_exit = status.supervisor_pid.map(ProcessExit::open).transpose()?;
-        match client.request_bounded(
-            ClientMessage::ConditionalStop {
-                lifecycle_version: crate::LIFECYCLE_VERSION,
-                consent: consent.clone(),
-            },
-            timeout,
-        )? {
-            ServerMessage::DaemonStopping => {}
-            message => return Err(unexpected_response(message)),
-        }
-        let exit_deadline = Instant::now() + timeout;
-        daemon_exit.wait(exit_deadline)?;
-        if let Some(supervisor_exit) = supervisor_exit {
-            supervisor_exit.wait(exit_deadline)?;
-        }
-        drop(client);
-        let deadline = Instant::now() + timeout;
-        loop {
-            match pipe::connect(&names.pipe, Duration::from_millis(25)) {
-                Ok(connection) => drop(connection),
-                Err(error) => {
-                    let error = ConnectionFailure::transport(error);
-                    if ConnectionFailure::kind(error.as_ref()) == ConnectionFailureKind::Absent {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err("daemon acknowledged stop but its endpoint did not disappear".into());
-            }
-            std::thread::sleep(Duration::from_millis(25));
+        let error = result.unwrap_err();
+        if diagnostics.is_empty() {
+            Err(error.into())
+        } else {
+            Err(format!("{error}: {diagnostics}").into())
         }
     }
 
@@ -773,8 +461,6 @@ impl DaemonClient {
         }
     }
 
-    /// Explicit destructive CLI intent only. Installers and GUI consent flows
-    /// must use conditional_stop instead.
     pub fn shutdown_daemon(&mut self) -> Result<()> {
         match self.request(ClientMessage::ShutdownDaemon)? {
             ServerMessage::DaemonStopping => Ok(()),
@@ -805,48 +491,6 @@ impl DaemonClient {
         })?;
         frame::write(&mut self.connection.writer(), CONTROL_FRAME, &payload)?;
         Ok(request_id)
-    }
-
-    fn request_bounded(
-        &mut self,
-        message: ClientMessage,
-        timeout: Duration,
-    ) -> Result<ServerMessage> {
-        let request_id = self.send(message)?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.poll_event()? {
-                Some(ServerEvent::Control {
-                    request_id: Some(response_id),
-                    message,
-                }) if response_id == request_id => {
-                    if let ServerMessage::Error {
-                        code,
-                        message,
-                        current_revision,
-                    } = message
-                    {
-                        return Err(Box::new(DaemonError {
-                            code,
-                            message,
-                            current_revision,
-                        }));
-                    }
-                    return Ok(message);
-                }
-                Some(ServerEvent::Screen(message)) => self.queue_screen(message),
-                Some(_) => {}
-                None => {
-                    if Instant::now() >= deadline {
-                        return Err(Box::new(ConnectionFailure {
-                            kind: ConnectionFailureKind::Transport,
-                            message: "daemon control response timed out".into(),
-                        }));
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-        }
     }
 
     pub fn request(&mut self, message: ClientMessage) -> Result<ServerMessage> {
@@ -1089,104 +733,12 @@ fn unexpected_response(message: ServerMessage) -> crate::Error {
     }
 }
 
-#[cfg(test)]
-mod connection_classification_tests {
-    use super::*;
-
-    #[test]
-    fn only_endpoint_absence_permits_startup() {
-        for (kind, expected) in [
-            (std::io::ErrorKind::NotFound, ConnectionFailureKind::Absent),
-            (
-                std::io::ErrorKind::ConnectionRefused,
-                ConnectionFailureKind::Absent,
-            ),
-            (
-                std::io::ErrorKind::PermissionDenied,
-                ConnectionFailureKind::Unauthorized,
-            ),
-            (
-                std::io::ErrorKind::TimedOut,
-                ConnectionFailureKind::Transport,
-            ),
-            (
-                std::io::ErrorKind::WouldBlock,
-                ConnectionFailureKind::Transport,
-            ),
-            (
-                std::io::ErrorKind::BrokenPipe,
-                ConnectionFailureKind::Transport,
-            ),
-        ] {
-            let error = ConnectionFailure::transport(std::io::Error::from(kind).into());
-            assert_eq!(ConnectionFailure::kind(error.as_ref()), expected);
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn busy_named_pipe_and_access_denied_never_mean_absent() {
-        for (code, expected) in [
-            (231, ConnectionFailureKind::Transport),
-            (5, ConnectionFailureKind::Unauthorized),
-            (2, ConnectionFailureKind::Absent),
-        ] {
-            let error =
-                windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code));
-            assert_eq!(
-                ConnectionFailure::kind(ConnectionFailure::transport(error.into()).as_ref()),
-                expected
-            );
-        }
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
-
-    #[test]
-    fn incompatible_hello_is_not_connection_absence() {
-        let (receiver, mut sender) = UnixStream::pair().unwrap();
-        let server = std::thread::spawn(move || {
-            frame::read(&mut sender).unwrap().unwrap();
-            let payload = crate::encode_server(&crate::ServerControl {
-                request_id: Some(1),
-                message: ServerMessage::Error {
-                    code: ErrorCode::IncompatibleProtocol,
-                    message: "different full-workspace protocol".into(),
-                    current_revision: None,
-                },
-            })
-            .unwrap();
-            frame::write(&mut sender, CONTROL_FRAME, &payload).unwrap();
-        });
-        let client = DaemonClient::from_parts(File::from(OwnedFd::from(receiver)), 1);
-        let error = DaemonClient::handshake(client).err().unwrap();
-        assert_eq!(
-            ConnectionFailure::kind(error.as_ref()),
-            ConnectionFailureKind::Incompatible
-        );
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn broken_hello_connection_is_transport_failure_not_absence() {
-        let (receiver, mut sender) = UnixStream::pair().unwrap();
-        let server = std::thread::spawn(move || {
-            frame::read(&mut sender).unwrap().unwrap();
-        });
-        let client = DaemonClient::from_parts(File::from(OwnedFd::from(receiver)), 1);
-        let error = DaemonClient::handshake(client).err().unwrap();
-        assert_eq!(
-            ConnectionFailure::kind(error.as_ref()),
-            ConnectionFailureKind::Transport
-        );
-        server.join().unwrap();
-    }
 
     #[test]
     fn blocking_read_preserves_frames_buffered_by_polling() {
