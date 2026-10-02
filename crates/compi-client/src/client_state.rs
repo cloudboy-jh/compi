@@ -604,6 +604,10 @@ impl StateSlot {
         server_id: &ServerId,
         defaults: &ClientState,
     ) -> Result<Self> {
+        Self::claim_in(&Self::root(instance, server_id)?, defaults)
+    }
+
+    fn root(instance: Option<&str>, server_id: &ServerId) -> Result<PathBuf> {
         // Match the transport's instance validation and distinguish Windows' unnamed instance.
         if let Some(instance) = instance
             && (instance.is_empty()
@@ -636,7 +640,7 @@ impl StateSlot {
             }
             root.push(name);
         }
-        Self::claim_in(&root, defaults)
+        Ok(root)
     }
 
     fn claim_in(root: &Path, defaults: &ClientState) -> Result<Self> {
@@ -710,6 +714,71 @@ impl StateSlot {
             }
         }
         Err("could not claim an exclusive client state slot".into())
+    }
+
+    /// Update recovery claims the previous slot, never a first-free replacement.
+    /// A future schema or missing state is an error, not permission to reset it.
+    pub fn claim_exact(
+        instance: Option<&str>,
+        server_id: &ServerId,
+        defaults: &ClientState,
+        id: &str,
+    ) -> Result<Self> {
+        let root = Self::root(instance, server_id)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match Self::claim_exact_in(&root, defaults, id) {
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn claim_exact_in(root: &Path, defaults: &ClientState, id: &str) -> Result<Self> {
+        if !valid_slot_id(id) {
+            return Err("invalid exact client state slot".into());
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(format!("{id}.lock")))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "The previous window still owns this state slot; retry update recovery.",
+                )
+                .into());
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let path = root.join(format!("{id}.json"));
+        let file = File::open(&path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_STATE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err("client state exceeds one MiB".into());
+        }
+        let mut state: ClientState = serde_json::from_slice(&bytes)?;
+        // Strict restore does not quarantine or rewrite incompatible durable data.
+        let changed = state.sanitize(defaults)?;
+        Ok(Self {
+            persisted: (!changed).then(|| state.clone()),
+            state,
+            diagnostics: Vec::new(),
+            id: id.to_owned(),
+            path,
+            _lock: lock,
+            last_save_failed: false,
+        })
     }
 
     pub fn id(&self) -> &str {
@@ -847,6 +916,15 @@ impl StateSlot {
     }
 }
 
+pub fn valid_slot_id(id: &str) -> bool {
+    id == "primary"
+        || id.strip_prefix("aux-").is_some_and(|digits| {
+            digits.len() == 20
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+                && digits.parse::<u64>().is_ok_and(|ordinal| ordinal > 0)
+        })
+}
+
 fn open_lock(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -874,7 +952,7 @@ fn quarantine(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
     fs::rename(temporary, destination)?;
     if let Some(parent) = destination.parent() {
         File::open(parent)?.sync_all()?;
@@ -883,7 +961,7 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
         Win32::Storage::FileSystem::{
@@ -1401,5 +1479,61 @@ mod tests {
             "replacement"
         );
         assert!(destination.hidden_tabs.contains(&TabId::from("two-a")));
+    }
+
+    #[test]
+    fn exact_restore_cannot_steal_locked_slots_or_fall_back() {
+        let directory = Directory::new();
+        let primary = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        let mut auxiliary = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        auxiliary.state.font_zoom = 1.75;
+        auxiliary.save().unwrap();
+        let id = auxiliary.id().to_owned();
+        let occupied = StateSlot::claim_exact_in(&directory.0, &ClientState::default(), &id);
+        assert!(
+            occupied
+                .err()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        drop(auxiliary);
+        let restored =
+            StateSlot::claim_exact_in(&directory.0, &ClientState::default(), &id).unwrap();
+        assert_eq!(restored.id(), id);
+        assert_eq!(restored.state.font_zoom, 1.75);
+        assert!(
+            StateSlot::claim_exact_in(&directory.0, &ClientState::default(), primary.id()).is_err()
+        );
+        assert!(
+            StateSlot::claim_exact_in(&directory.0, &ClientState::default(), "../primary").is_err()
+        );
+        assert!(
+            StateSlot::claim_exact_in(
+                &directory.0,
+                &ClientState::default(),
+                "aux-00000000000000000099"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_restore_preserves_future_schema_for_rollback() {
+        let directory = Directory::new();
+        let slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        let path = slot.path.clone();
+        drop(slot);
+        let state = ClientState {
+            version: CLIENT_STATE_VERSION + 1,
+            ..ClientState::default()
+        };
+        let original = serde_json::to_vec(&state).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(
+            StateSlot::claim_exact_in(&directory.0, &ClientState::default(), "primary").is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("corrupt-0.json").exists());
     }
 }

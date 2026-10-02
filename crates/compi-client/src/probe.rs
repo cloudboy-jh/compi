@@ -23,10 +23,17 @@ pub fn run() -> Result<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
     let mut instance = None;
     let mut connect = None;
+    // Observation must never race a GUI into starting a daemon itself.
+    let mut existing = false;
     loop {
         let destination = match args.first().map(String::as_str) {
             Some("--instance") => &mut instance,
             Some("--connect") => &mut connect,
+            Some("--existing") => {
+                args.remove(0);
+                existing = true;
+                continue;
+            }
             _ => break,
         };
         let option = args.remove(0);
@@ -39,6 +46,21 @@ pub fn run() -> Result<()> {
         *destination = Some(args.remove(0));
     }
     let target = ConnectionTarget::from_options(instance, connect)?;
+    if existing {
+        return match args.first().map(String::as_str) {
+            Some("workspace") if args.len() == 1 => {
+                let mut client = match &target {
+                    ConnectionTarget::Local { instance } => {
+                        DaemonClient::connect(instance.as_deref(), Duration::from_secs(2))?
+                    }
+                    _ => target.connect()?,
+                };
+                println!("{}", serde_json::to_string_pretty(&client.workspace()?)?);
+                Ok(())
+            }
+            _ => Err("--existing supports only the workspace command".into()),
+        };
+    }
 
     match args.first().map(String::as_str) {
         None => start(&target, None),
@@ -446,42 +468,37 @@ pub fn connect_or_start(instance: Option<&str>) -> Result<DaemonClient> {
             compi_protocol::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
             Ok(client)
         }
-        Err(_) => {
+        Err(error)
+            if compi_protocol::ConnectionFailure::kind(error.as_ref())
+                == compi_protocol::ConnectionFailureKind::Absent =>
+        {
             compi_protocol::perf::set_startup_kind("cold");
             start_daemon(instance)?;
             let client = DaemonClient::connect(instance, Duration::from_secs(5))?;
             compi_protocol::perf::log_startup_metric("daemon_connection_ms", started_at.elapsed());
             Ok(client)
         }
+        Err(error) => Err(error),
     }
 }
 
-/// Stop the current daemon, wait for its endpoint to disappear, then start and
-/// reconnect to a fresh generation. Callers must confirm destructive live-work
-/// impact before entering this function.
-pub fn restart_daemon(instance: Option<&str>) -> Result<DaemonClient> {
-    let mut client = match DaemonClient::connect(instance, Duration::from_secs(2)) {
-        Ok(client) => client,
-        Err(_) => {
-            start_daemon(instance)?;
-            return DaemonClient::connect(instance, Duration::from_secs(5));
-        }
-    };
-    client.shutdown_daemon()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while DaemonClient::connect(instance, Duration::from_millis(50)).is_ok() {
-        if Instant::now() >= deadline {
-            return Err("daemon did not stop before restart timeout".into());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+/// Restart only the generation and live work previously presented for consent.
+pub fn restart_daemon(
+    instance: Option<&str>,
+    consent: &compi_protocol::LifecycleConsent,
+) -> Result<DaemonClient> {
+    DaemonClient::conditional_stop(instance, consent, Duration::from_secs(15))?;
     start_daemon(instance)?;
     DaemonClient::connect(instance, Duration::from_secs(5))
 }
 
 fn start_daemon(instance: Option<&str>) -> Result<()> {
-    if DaemonClient::connect(instance, Duration::ZERO).is_ok() {
-        return Ok(());
+    match DaemonClient::connect(instance, Duration::ZERO) {
+        Ok(_) => return Ok(()),
+        Err(error)
+            if compi_protocol::ConnectionFailure::kind(error.as_ref())
+                == compi_protocol::ConnectionFailureKind::Absent => {}
+        Err(error) => return Err(error),
     }
 
     #[cfg(windows)]
@@ -489,8 +506,12 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
         activate_daemon_task()?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if DaemonClient::connect(None, Duration::from_millis(100)).is_ok() {
-                return Ok(());
+            match DaemonClient::connect(None, Duration::from_millis(100)) {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if compi_protocol::ConnectionFailure::kind(error.as_ref())
+                        == compi_protocol::ConnectionFailureKind::Absent => {}
+                Err(error) => return Err(error),
             }
             if Instant::now() >= deadline {
                 return Err(
@@ -547,14 +568,20 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if DaemonClient::connect(instance, Duration::from_millis(100)).is_ok() {
-            #[cfg(unix)]
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            #[cfg(windows)]
-            drop(child);
-            return Ok(());
+        match DaemonClient::connect(instance, Duration::from_millis(100)) {
+            Ok(_) => {
+                #[cfg(unix)]
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                #[cfg(windows)]
+                drop(child);
+                return Ok(());
+            }
+            Err(error)
+                if compi_protocol::ConnectionFailure::kind(error.as_ref())
+                    == compi_protocol::ConnectionFailureKind::Absent => {}
+            Err(error) => return Err(error),
         }
         if let Some(status) = child.try_wait()? {
             return Err(format!(
