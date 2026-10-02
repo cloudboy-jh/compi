@@ -1,5 +1,5 @@
 //! Writable TOML schema version 1. Tables: `font`, `appearance`, `layout`,
-//! `keybindings`, `shell`, `environment`, `profiles.<name>`, `limits`, `clipboard`.
+//! `keybindings`, `shell`, `environment`, `profiles.<name>`, `limits`, `clipboard`, `updates`.
 //! `default_profile` selects a named profile over the base shell/environment.
 //! Missing settings retain defaults; invalid independent settings are diagnosed.
 //! GUI writes preserve comments and unrelated keys through an atomic replacement.
@@ -12,6 +12,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
 };
 
 use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES};
@@ -157,6 +158,44 @@ pub struct FontOverrides {
     pub line_height: Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticUpdateChecks {
+    Never,
+    OnLaunch,
+    #[default]
+    Daily,
+}
+
+impl AutomaticUpdateChecks {
+    pub const ALL: [Self; 3] = [Self::Never, Self::OnLaunch, Self::Daily];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Never",
+            Self::OnLaunch => "On launch",
+            Self::Daily => "Daily",
+        }
+    }
+
+    const fn value(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnLaunch => "on_launch",
+            Self::Daily => "daily",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    pub automatic_checks: AutomaticUpdateChecks,
+    pub last_check_unix: Option<u64>,
+}
+
+static CONFIG_WRITES: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoadedConfig {
     pub font: FontSettings,
@@ -174,6 +213,8 @@ pub struct LoadedConfig {
     /// A bad explicit launch selection remains an error, not a default shell.
     pub launch: Result<LaunchContext, String>,
     pub clipboard_policy: ClipboardPolicy,
+    #[serde(default)]
+    pub updates: UpdateSettings,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Selected file, or empty when the native configuration directory is unavailable.
@@ -194,6 +235,7 @@ impl Default for LoadedConfig {
             keybindings: HashMap::new(),
             launch: Ok(LaunchContext::default()),
             clipboard_policy: ClipboardPolicy::default(),
+            updates: UpdateSettings::default(),
             provenance: ConfigProvenance::default(),
             diagnostics: Vec::new(),
             path: PathBuf::new(),
@@ -202,6 +244,25 @@ impl Default for LoadedConfig {
 }
 
 impl LoadedConfig {
+    pub fn save_update_settings(&mut self, updates: UpdateSettings) -> Result<(), String> {
+        update_table(&self.path, "updates", |table| {
+            set_table_value(
+                table,
+                "automatic_checks",
+                updates.automatic_checks.value().into(),
+            );
+            if let Some(timestamp) = updates.last_check_unix {
+                set_table_value(
+                    table,
+                    "last_check_unix",
+                    (timestamp.min(i64::MAX as u64) as i64).into(),
+                );
+            }
+        })?;
+        self.updates = updates;
+        Ok(())
+    }
+
     /// Invocation overrides never replace the configured defaults used to seed
     /// a new slot or reset existing client state.
     pub fn apply_presentation_overrides(
@@ -818,6 +879,27 @@ fn update_table(
     if path.as_os_str().is_empty() {
         return Err("No configuration path could be resolved; see Diagnostics".to_owned());
     }
+    let _serialized = CONFIG_WRITES
+        .lock()
+        .map_err(|_| "Configuration write lock is unavailable".to_owned())?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
+    }
+    let lock_path = path.with_extension("toml.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("Cannot lock {}: {error}", path.display()))?;
+    lock_file
+        .lock()
+        .map_err(|error| format!("Cannot lock {}: {error}", path.display()))?;
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "version = 1\n".to_owned(),
@@ -975,6 +1057,34 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
     }
     apply_presentation(&document, loaded);
     apply_launch(&document, loaded);
+    if let Some(updates) = table(&document, "updates", loaded) {
+        if let Some(value) = updates.get("automatic_checks") {
+            match value.as_str() {
+                Some("never") => loaded.updates.automatic_checks = AutomaticUpdateChecks::Never,
+                Some("on_launch") => {
+                    loaded.updates.automatic_checks = AutomaticUpdateChecks::OnLaunch
+                }
+                Some("daily") => loaded.updates.automatic_checks = AutomaticUpdateChecks::Daily,
+                _ => invalid(
+                    loaded,
+                    "updates.automatic_checks",
+                    "never, on_launch, or daily",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = updates.get("last_check_unix") {
+            match value.as_integer().filter(|value| *value >= 0) {
+                Some(value) => loaded.updates.last_check_unix = Some(value as u64),
+                None => invalid(
+                    loaded,
+                    "updates.last_check_unix",
+                    "a nonnegative Unix timestamp",
+                    "configuration",
+                ),
+            }
+        }
+    }
     let Some(font) = document.get("font") else {
         return;
     };
@@ -1587,5 +1697,53 @@ mod tests {
             config_path(None, "linux", xdg).unwrap(),
             PathBuf::from("xdg/compi/config.toml")
         );
+    }
+
+    #[test]
+    fn concurrent_update_and_appearance_writes_preserve_both_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-update-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n# keep me\n[future]\nanswer = 42\n").unwrap();
+        let mut updates = load(Some(&path), FontOverrides::default());
+        let mut appearance = updates.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let first = barrier.clone();
+            scope.spawn(move || {
+                first.wait();
+                updates
+                    .save_update_settings(UpdateSettings {
+                        automatic_checks: AutomaticUpdateChecks::Never,
+                        last_check_unix: Some(1234),
+                    })
+                    .unwrap();
+            });
+            scope.spawn(move || {
+                barrier.wait();
+                appearance.save_ui_font(UiFontPreset::Inter).unwrap();
+            });
+        });
+        let loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(
+            loaded.updates.automatic_checks,
+            AutomaticUpdateChecks::Never
+        );
+        assert_eq!(loaded.updates.last_check_unix, Some(1234));
+        assert_eq!(loaded.ui_font, UiFontPreset::Inter);
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"));
+        assert_eq!(
+            saved.parse::<toml::Table>().unwrap()["future"]["answer"].as_integer(),
+            Some(42)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

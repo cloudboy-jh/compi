@@ -9,6 +9,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -93,6 +97,11 @@ impl std::error::Error for ActorError {}
 
 enum ActorCommand {
     Snapshot(SyncSender<WorkspaceSnapshot>),
+    ConditionalStop(
+        compi_protocol::LifecycleConsent,
+        Arc<AtomicBool>,
+        SyncSender<std::result::Result<(), ActorError>>,
+    ),
     Mutate(
         MutationRequest,
         SyncSender<std::result::Result<MutationReceipt, ActorError>>,
@@ -130,6 +139,7 @@ struct ActorState {
     pending: Option<PendingCommit>,
     read_only_error: Option<String>,
     next_ordinal: u64,
+    stopping: bool,
 }
 
 impl WorkspaceActor {
@@ -177,6 +187,18 @@ impl WorkspaceActor {
         let (reply, receive) = mpsc::sync_channel(1);
         self.sender
             .try_send(ActorCommand::Mutate(mutation, reply))
+            .map_err(queue_error)?;
+        receive.recv().map_err(disconnected)?
+    }
+
+    pub fn conditional_stop(
+        &self,
+        consent: compi_protocol::LifecycleConsent,
+        stopping: Arc<AtomicBool>,
+    ) -> std::result::Result<(), ActorError> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(ActorCommand::ConditionalStop(consent, stopping, reply))
             .map_err(queue_error)?;
         receive.recv().map_err(disconnected)?
     }
@@ -231,6 +253,7 @@ fn run_actor(
         pending: None,
         read_only_error: None,
         next_ordinal: 1,
+        stopping: false,
     };
 
     loop {
@@ -272,16 +295,26 @@ fn run_actor(
 }
 
 fn is_commit_command(command: &ActorCommand) -> bool {
-    matches!(command, ActorCommand::Mutate(..) | ActorCommand::Observe(_))
+    matches!(
+        command,
+        ActorCommand::Mutate(..) | ActorCommand::Observe(_) | ActorCommand::ConditionalStop(..)
+    )
 }
 
 fn reject_busy(command: ActorCommand, revision: u64) {
-    if let ActorCommand::Mutate(_, reply) = command {
-        let _ = reply.send(Err(ActorError::new(
-            ErrorCode::Busy,
-            "workspace mutation queue is full",
-            Some(revision),
-        )));
+    let error = ActorError::new(
+        ErrorCode::Busy,
+        "workspace mutation queue is full",
+        Some(revision),
+    );
+    match command {
+        ActorCommand::Mutate(_, reply) => {
+            let _ = reply.send(Err(error));
+        }
+        ActorCommand::ConditionalStop(_, _, reply) => {
+            let _ = reply.send(Err(error));
+        }
+        _ => {}
     }
 }
 
@@ -291,6 +324,39 @@ fn process_command(
     persist_sender: &SyncSender<PersistJob>,
 ) -> bool {
     match command {
+        ActorCommand::ConditionalStop(consent, stopping, reply) => {
+            let snapshot = state.workspace.snapshot(state.generation.clone());
+            let result = if consent.server_id != snapshot.server_id
+                || consent.server_generation != snapshot.server_generation
+            {
+                Err(ActorError::new(
+                    ErrorCode::StaleGeneration,
+                    "daemon generation changed; review live work again",
+                    Some(snapshot.revision),
+                ))
+            } else if consent.workspace_revision != snapshot.revision
+                || consent.live_surfaces != compi_protocol::live_surface_inventory(&snapshot)
+            {
+                Err(ActorError::new(
+                    ErrorCode::RevisionConflict,
+                    "live work changed; review shutdown consent again",
+                    Some(snapshot.revision),
+                ))
+            } else if state.stopping {
+                Err(ActorError::new(
+                    ErrorCode::Busy,
+                    "daemon is already stopping",
+                    Some(snapshot.revision),
+                ))
+            } else {
+                // Serialized with all mutations and pending commits. No later command
+                // can create work after the inventory has been accepted.
+                state.stopping = true;
+                stopping.store(true, Ordering::Release);
+                Ok(())
+            };
+            let _ = reply.send(result);
+        }
         ActorCommand::Snapshot(reply) => {
             let _ = reply.send(state.workspace.snapshot(state.generation.clone()));
         }
@@ -305,6 +371,14 @@ fn process_command(
         }
         ActorCommand::Subscribe(subscriber) => state.subscribers.push(subscriber),
         ActorCommand::Mutate(request, reply) => {
+            if state.stopping {
+                let _ = reply.send(Err(ActorError::new(
+                    ErrorCode::Busy,
+                    "daemon is stopping",
+                    Some(state.workspace.revision),
+                )));
+                return false;
+            }
             if let Some(error) = state.read_only_error.as_ref() {
                 let _ = reply.send(Err(ActorError::new(
                     ErrorCode::PersistenceUnavailable,
@@ -1492,6 +1566,79 @@ fn disconnected(_: mpsc::RecvError) -> ActorError {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    fn lifecycle_consent(actor: &WorkspaceActor) -> compi_protocol::LifecycleConsent {
+        let snapshot = actor.snapshot().unwrap();
+        compi_protocol::LifecycleConsent {
+            live_surfaces: compi_protocol::live_surface_inventory(&snapshot),
+            server_id: snapshot.server_id,
+            server_generation: snapshot.server_generation,
+            workspace_revision: snapshot.revision,
+            connected_clients: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shutdown_consent_rejects_new_work_and_freezes_mutations_only_after_acceptance() {
+        let (actor, _effects) = WorkspaceActor::memory();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stale = lifecycle_consent(&actor);
+        actor
+            .mutate(request(
+                &actor,
+                "initialize",
+                0,
+                WorkspaceMutation::Initialize {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            actor
+                .conditional_stop(stale, stopping.clone())
+                .unwrap_err()
+                .code,
+            ErrorCode::RevisionConflict
+        );
+        assert!(!stopping.load(Ordering::Acquire));
+        let current = lifecycle_consent(&actor);
+        let mut omitted_work = current.clone();
+        omitted_work.live_surfaces.clear();
+        assert_eq!(
+            actor
+                .conditional_stop(omitted_work, stopping.clone())
+                .unwrap_err()
+                .code,
+            ErrorCode::RevisionConflict
+        );
+        let mut old_generation = current.clone();
+        old_generation.server_generation = ServerGeneration::from("old-generation");
+        assert_eq!(
+            actor
+                .conditional_stop(old_generation, stopping.clone())
+                .unwrap_err()
+                .code,
+            ErrorCode::StaleGeneration
+        );
+        assert!(!stopping.load(Ordering::Acquire));
+        actor.conditional_stop(current, stopping.clone()).unwrap();
+        assert!(stopping.load(Ordering::Acquire));
+        let revision = actor.snapshot().unwrap().revision;
+        let error = actor
+            .mutate(request(
+                &actor,
+                "after-stop",
+                revision,
+                WorkspaceMutation::CreateSession {
+                    label: "Must not be created".into(),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Busy);
+        assert_eq!(actor.snapshot().unwrap().revision, revision);
+    }
 
     fn request(
         actor: &WorkspaceActor,

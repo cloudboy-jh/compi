@@ -2,17 +2,20 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  COMPI_UPDATE_PUBLIC_KEY: ${{ vars.COMPI_UPDATE_PUBLIC_KEY }}
+  COMPI_UPDATE_REPOSITORY: ${{ github.repository }}
+
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,19 +50,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Formatting failed' }
           cargo clippy --locked --workspace --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
-          # One hosted WSL2 guest backs every daemon integration test.
-          cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -- --test-threads=1
+          cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -p compi-update -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
           python tools/check-dependencies.py --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Dependency boundaries failed' }
-      - name: Import optional Windows signing certificate
+      - name: Import Windows signing certificate
         shell: pwsh
         env:
           SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
           SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           if (-not $env:SIGNING_PFX_BASE64 -and -not $env:SIGNING_PFX_PASSWORD) {
-            Write-Host 'No signing credentials configured; building unsigned artifacts'
+            Write-Host 'No publisher credentials configured; Windows artifacts will be unsigned'
             exit 0
           }
           if (-not $env:SIGNING_PFX_BASE64 -or -not $env:SIGNING_PFX_PASSWORD) {
@@ -71,9 +73,8 @@ jobs:
             $password = ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force
             $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
             if (-not $certificate.Thumbprint) { throw 'Signing certificate import failed' }
-            "COMPI_SIGNING_THUMBPRINT=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
-          finally {
+            "COMPI_SIGNING_THUMBPRINT=$($certificate.Thumbprint)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          } finally {
             Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
           }
       - name: Build Windows distribution
@@ -81,11 +82,33 @@ jobs:
         env:
           EXPECTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          .\tools\build-installer.ps1 -SigningCertificateThumbprint $env:COMPI_SIGNING_THUMBPRINT -ExpectedTag $env:EXPECTED_TAG
+          $officialRelease = [bool]$env:EXPECTED_TAG
+          .\tools\build-installer.ps1 -SigningCertificateThumbprint $env:COMPI_SIGNING_THUMBPRINT -ExpectedTag $env:EXPECTED_TAG -RequireUpdateKey:$officialRelease
           Rename-Item target/distribution/SHA256SUMS.txt SHA256SUMS-Windows-x64.txt
-      - name: Verify installed and portable artifacts
+      - name: Extract published v0.1.2 MSI for legacy migration
         shell: pwsh
-        run: .\tools\smoke-windows-distribution.ps1 -Install
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.1.2 --repo $env:GITHUB_REPOSITORY --pattern Compi-0.1.2-Setup.exe --dir target/legacy-a
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download legacy v0.1.2 setup' }
+          python tools/extract-legacy-msi.py target/legacy-a/Compi-0.1.2-Setup.exe target/legacy-a/Compi-0.1.2.msi
+          if ($LASTEXITCODE -ne 0) { throw 'Legacy MSI extraction failed' }
+      - name: Verify installed, legacy-migrated and portable artifacts
+        shell: pwsh
+        run: .\tools\smoke-windows-distribution.ps1 -Install -PreviousMsi target/legacy-a/Compi-0.1.2.msi
+      - name: Qualify in-app update cycle with a disposable key
+        shell: pwsh
+        run: |
+          python tools/qualify-update-cycle.py --qualification target/distribution/qualification-windows-x86_64.json --signer target/installer/product/release/compi-release-metadata.exe --commit $env:GITHUB_SHA --repository $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Update-cycle qualification failed' }
+      - name: Remove imported publisher certificate
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:COMPI_SIGNING_THUMBPRINT) {
+            Remove-Item "Cert:\CurrentUser\My\$env:COMPI_SIGNING_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+          }
       - name: Preserve Windows packaging diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -93,8 +116,7 @@ jobs:
           name: windows-packaging-diagnostics
           path: target/distribution-smoke/
           if-no-files-found: ignore
-      - name: Upload Windows distribution
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: distribution-Windows-x64
           path: target/distribution/*
@@ -102,38 +124,91 @@ jobs:
 
   macos:
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target/macos-release/product
+      - name: Configure Developer ID and notarization
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_NOTARY_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          names = ['CERTIFICATE', 'CERTIFICATE_PASSWORD', 'SIGNING_IDENTITY', 'APPLE_ID', 'APPLE_TEAM_ID', 'APPLE_PASSWORD']
+          configured = [bool(os.environ.get(name)) for name in names]
+          if any(configured) and not all(configured):
+              raise SystemExit('Configure all six Developer ID/notarization secrets, or none')
+          if all(configured):
+              import base64
+              from pathlib import Path
+              Path(os.environ['RUNNER_TEMP'], 'compi-signing.p12').write_bytes(base64.b64decode(os.environ['CERTIFICATE'], validate=True))
+          PY
+          if [[ -z "$CERTIFICATE" ]]; then
+            echo 'No Developer ID credentials configured; macOS artifacts will be ad-hoc signed and not notarized'
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/compi-signing.keychain-db"
+          password=$(openssl rand -hex 32)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/compi-signing.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          xcrun notarytool store-credentials compi-release --keychain "$keychain" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD"
+          printf 'COMPI_MACOS_SIGNING_IDENTITY=%s\nCOMPI_MACOS_NOTARY_PROFILE=compi-release\nCOMPI_MACOS_NOTARY_KEYCHAIN=%s\n' "$SIGNING_IDENTITY" "$keychain" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/compi-signing.p12"
       - name: Build macOS distribution
         env:
           EXPECTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-        run: |
-          if [[ -n "$EXPECTED_TAG" ]]; then
-            bash tools/build-macos.sh --expected-tag "$EXPECTED_TAG"
-          else
-            bash tools/build-macos.sh
-          fi
-          mv target/distribution/SHA256SUMS.txt target/distribution/SHA256SUMS-macOS-arm64.txt
-      - name: Verify copied macOS bundle
         shell: bash
         run: |
-          MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release --target aarch64-apple-darwin --target-dir target/macos-release/product -p compi-client --example compi-probe
-          mkdir -p target/distribution-smoke
-          bash tools/smoke-macos-bundle.sh target/distribution/Compi-*-macOS-arm64.dmg target/macos-release/product/aarch64-apple-darwin/release/examples/compi-probe 2>&1 | tee target/distribution-smoke/macos-bundle.log
+          arguments=()
+          if [[ -n "$EXPECTED_TAG" ]]; then arguments+=(--expected-tag "$EXPECTED_TAG" --require-update-key); fi
+          bash tools/build-macos.sh "${arguments[@]}"
+          mv target/distribution/SHA256SUMS.txt target/distribution/SHA256SUMS-macOS-arm64.txt
+      - name: Verify copied and legacy-replaced macOS bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release --target aarch64-apple-darwin --target-dir target/macos-release/product -p compi-client --example compi-probe --example compi-update-smoke
+          mkdir -p target/distribution-smoke target/legacy-a
+          gh release download v0.1.2 --repo "$GITHUB_REPOSITORY" --pattern Compi-0.1.2-macOS-arm64.app.zip --dir target/legacy-a
+          shasum -a 256 -c <<< "009707ef9b024c444a8b116ebf9743e1012227644494f71ebdf709fb2442245b  target/legacy-a/Compi-0.1.2-macOS-arm64.app.zip"
+          COMPI_SMOKE_LEGACY_APP_ZIP="$PWD/target/legacy-a/Compi-0.1.2-macOS-arm64.app.zip" bash tools/smoke-macos-bundle.sh target/distribution/Compi-*-macOS-arm64.dmg target/macos-release/product/aarch64-apple-darwin/release/examples/compi-probe 2>&1 | tee target/distribution-smoke/macos-bundle.log
+      - name: Qualify in-app update cycle with a disposable key
+        shell: bash
+        run: python3 tools/qualify-update-cycle.py --qualification target/distribution/qualification-macos-aarch64.json --signer target/macos-release/product/aarch64-apple-darwin/release/compi-release-metadata --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"
+      - name: Remove signing keychain
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/compi-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/compi-signing.p12"
       - name: Preserve macOS packaging diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: macos-packaging-diagnostics
-          path: target/distribution-smoke/
+          path: |
+            target/distribution-smoke/
+            target/update-qualification/distribution-smoke/
           if-no-files-found: ignore
-      - name: Upload macOS distribution
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: distribution-macOS-arm64
           path: target/distribution/*
@@ -146,6 +221,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with:
           pattern: distribution-*
@@ -157,7 +234,21 @@ jobs:
           cat SHA256SUMS-Windows-x64.txt SHA256SUMS-macOS-arm64.txt > SHA256SUMS.txt
           sha256sum --check SHA256SUMS.txt
           rm SHA256SUMS-Windows-x64.txt SHA256SUMS-macOS-arm64.txt
-      - name: Create draft GitHub release
+      - name: Sign verified native release metadata
+        env:
+          COMPI_UPDATE_SIGNING_KEY: ${{ secrets.COMPI_UPDATE_SIGNING_KEY }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          test -n "$COMPI_UPDATE_PUBLIC_KEY" || { echo 'Missing public verification key repository variable'; exit 1; }
+          test -n "$COMPI_UPDATE_SIGNING_KEY" || { echo 'Missing private metadata signing key secret'; exit 1; }
+          cargo build --locked --release -p compi-update --bin compi-release-metadata
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$RELEASE_TAG" --jq .body > "$RUNNER_TEMP/release-notes.txt"
+          python3 tools/sign-release-metadata.py --distribution distribution --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --signer target/release/compi-release-metadata --notes "$RUNNER_TEMP/release-notes.txt" --commit "$GITHUB_SHA"
+          cd distribution
+          sha256sum compi-update-*.json >> SHA256SUMS.txt
+      - name: Create draft GitHub release for deliberate human publication
         uses: softprops/action-gh-release@v2
         with:
           draft: true

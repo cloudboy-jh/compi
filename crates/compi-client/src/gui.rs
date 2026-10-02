@@ -99,6 +99,38 @@ pub fn run(
     config: LoadedConfig,
     launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
 ) {
+    run_application(
+        target,
+        initial_working_directory,
+        config,
+        launch_requests,
+        None,
+    );
+}
+
+pub fn run_restore(
+    session: Arc<crate::update_restore::RestoreSession>,
+    launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
+) {
+    let Some(first) = session.windows().first() else {
+        return;
+    };
+    run_application(
+        first.target.clone(),
+        None,
+        first.config.clone(),
+        launch_requests,
+        Some(session),
+    );
+}
+
+fn run_application(
+    target: ConnectionTarget,
+    initial_working_directory: Option<String>,
+    config: LoadedConfig,
+    launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
+    restore: Option<Arc<crate::update_restore::RestoreSession>>,
+) {
     let empty_measurement = perf::empty_window_enabled();
     Application::new().run(move |cx: &mut App| {
         let mut config = config;
@@ -109,6 +141,10 @@ pub fn run(
         }
         let opened = if empty_measurement {
             open_empty_measurement_window(cx)
+        } else if let Some(session) = &restore {
+            session.windows().iter().try_for_each(|saved| {
+                workspace::open_restore_window(saved.clone(), session.clone(), cx).map(|_| ())
+            })
         } else {
             open_compi_window(target.clone(), initial_working_directory, config, None, cx)
                 .map(|_| ())
@@ -132,14 +168,25 @@ pub fn run(
                         };
                         let target = target.clone();
                         let _ = cx.update(|cx| {
-                            if let Err(error) = open_compi_window(
-                                target,
-                                request.initial_working_directory,
-                                request.config,
-                                None,
-                                cx,
-                            ) {
-                                eprintln!("Could not open Compi window: {error}");
+                            let result = match request.mode {
+                                crate::window_host::LaunchMode::Ordinary => open_compi_window(
+                                    target, request.initial_working_directory, request.config, None, cx,
+                                ).map(|_| ()),
+                                crate::window_host::LaunchMode::Restore { .. } => {
+                                    Err("Update restore must claim a new exclusive GUI host, not an existing process".into())
+                                }
+                                crate::window_host::LaunchMode::PrepareUpdate { handoff, rollback_handoff, expected_version } => {
+                                    workspace::prepare_update_handoff(&handoff, &rollback_handoff, &expected_version, cx)
+                                }
+                                crate::window_host::LaunchMode::ReleaseForUpdate { handoff } => {
+                                    workspace::release_for_update(&handoff, cx)
+                                }
+                                crate::window_host::LaunchMode::UnprepareUpdate { handoff } => {
+                                    workspace::abort_update(&handoff, cx)
+                                }
+                            };
+                            if let Err(error) = result {
+                                eprintln!("Compi launch/update request failed: {error}");
                             }
                         });
                     }
@@ -448,6 +495,7 @@ impl SurfaceView {
     }
 }
 enum UiEvent {
+    LifecycleLoaded(Result<compi_protocol::LifecycleStatus, String>),
     StateSaveFinished,
     ThemeLibraryReloaded {
         library: ThemeLibrary,
@@ -687,16 +735,18 @@ enum SettingsSection {
     Terminal,
     Keyboard,
     Performance,
+    Updates,
     Advanced,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Appearance,
         Self::Interface,
         Self::Terminal,
         Self::Keyboard,
         Self::Performance,
+        Self::Updates,
         Self::Advanced,
     ];
 
@@ -707,6 +757,7 @@ impl SettingsSection {
             Self::Terminal => "Terminal",
             Self::Keyboard => "Keyboard",
             Self::Performance => "Performance",
+            Self::Updates => "Updates",
             Self::Advanced => "Advanced",
         }
     }
@@ -715,6 +766,11 @@ impl SettingsSection {
 struct CompiApp {
     started_at: Instant,
     target: ConnectionTarget,
+    updates: Arc<crate::updates::UpdateService>,
+    update_quiesced: Arc<AtomicBool>,
+    update_connection_guard: Arc<Mutex<()>>,
+    restore_session: Option<Arc<crate::update_restore::RestoreSession>>,
+    restore_ready: bool,
     initial_working_directory: Option<String>,
     first_snapshot_logged: bool,
     ready_probe_marker: Option<String>,
@@ -2711,6 +2767,8 @@ struct WorkerLifecycle {
     stop: Arc<AtomicBool>,
     previous_closed: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    update_quiesced: Arc<AtomicBool>,
+    connection_guard: Arc<Mutex<()>>,
 }
 
 fn spawn_tab_worker(
@@ -2726,6 +2784,8 @@ fn spawn_tab_worker(
         stop,
         previous_closed,
         closed,
+        update_quiesced,
+        connection_guard,
     } = lifecycle;
     thread::spawn(move || {
         while !previous_closed.load(Ordering::Acquire) {
@@ -2739,6 +2799,17 @@ fn spawn_tab_worker(
             closed.store(true, Ordering::Release);
             return;
         }
+        let connection = {
+            let _guard = match connection_guard.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            if update_quiesced.load(Ordering::Acquire) {
+                closed.store(true, Ordering::Release);
+                return;
+            }
+            connection_target.connect()
+        };
         let result = run_tab_connection(
             tab_id,
             &surface_id,
@@ -2746,7 +2817,7 @@ fn spawn_tab_worker(
             rows,
             stop.clone(),
             &sender,
-            &connection_target,
+            connection,
         );
         closed.store(true, Ordering::Release);
         if stop.load(Ordering::Acquire) {
@@ -2767,9 +2838,9 @@ fn run_tab_connection(
     rows: i16,
     stop: Arc<AtomicBool>,
     sender: &UiEventSender,
-    connection_target: &ConnectionTarget,
+    connection: crate::Result<DaemonClient>,
 ) -> crate::Result<()> {
-    let mut client = connection_target.connect()?;
+    let mut client = connection?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let workspace = client.workspace()?;

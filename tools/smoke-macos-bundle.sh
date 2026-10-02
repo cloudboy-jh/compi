@@ -3,9 +3,9 @@ set -euo pipefail
 
 # The development probe is deliberately external to the distributable bundle.
 # Requires the logged-in desktop session and Python 3 provided by macos-14.
-# Usage: bash tools/smoke-macos-bundle.sh <artifact.dmg> <compi-probe>
-if (($# != 2)); then
-    printf 'Usage: bash tools/smoke-macos-bundle.sh <artifact.dmg> <compi-probe>\n' >&2
+# Usage: bash tools/smoke-macos-bundle.sh <artifact.dmg> <compi-probe> [<new.app.zip> <signed-metadata.json>]
+if (($# != 2 && $# != 4)); then
+    printf 'Usage: bash tools/smoke-macos-bundle.sh <artifact.dmg> <compi-probe> [<new.app.zip> <signed-metadata.json>]\n' >&2
     exit 2
 fi
 if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
@@ -13,13 +13,16 @@ if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
     exit 1
 fi
 
+export COMPI_SMOKE_CYCLE_SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/smoke-update-cycle.py"
 python3 - "$@" <<'PYTHON'
 import ctypes
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
 import signal
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -33,6 +36,8 @@ def run(*args, **kwargs):
 
 dmg = Path(sys.argv[1]).resolve(strict=True)
 probe = Path(sys.argv[2]).resolve(strict=True)
+update_artifact = Path(sys.argv[3]).resolve(strict=True) if len(sys.argv) == 5 else None
+update_metadata = Path(sys.argv[4]).resolve(strict=True) if len(sys.argv) == 5 else None
 if not os.access(probe, os.X_OK):
     raise SystemExit(f"Probe is not executable: {probe}")
 # A short private runtime path also stays below the Unix socket path limit.
@@ -53,6 +58,9 @@ environment.update({
     "HOME": str(root / "home"),
     "SHELL": "/bin/bash",
 })
+sentinel = root / "data" / "preservation-sentinel.txt"
+sentinel.write_text(uuid.uuid4().hex)
+sentinel_bytes = sentinel.read_bytes()
 # Match the executable's actual kernel path, not a process-name substring.
 # A unique copied bundle makes every process at these two paths test-owned.
 libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
@@ -87,8 +95,8 @@ def stop_owned(executable):
         time.sleep(0.1)
 
 
-def workspace():
-    result = run(str(probe), "--instance", instance, "workspace", env=environment)
+def workspace(target=None):
+    result = run(str(probe), "--instance", target or instance, "workspace", env=environment)
     return json.loads(result.stdout)
 
 
@@ -106,8 +114,8 @@ def wait_for(description, condition):
     raise RuntimeError(f"Timed out waiting for {description}; last error: {last_error}")
 
 
-def attached_workspace():
-    snapshot = workspace()
+def attached_workspace(target=None):
+    snapshot = workspace(target)
     if (snapshot["initialized"] and snapshot["sessions"]
             and any(surface["status"] == "running" and surface["attached"]
                     for surface in snapshot["surfaces"])
@@ -116,14 +124,14 @@ def attached_workspace():
     return None
 
 
-def launch():
+def launch(target=None):
     arguments = ["/usr/bin/open", "-n", "--arch", "arm64", "-a", str(app),
                  "--stdout", str(log), "--stderr", str(log)]
     for name in ("COMPI_DATA_DIR", "COMPI_RUNTIME_DIR", "HOME", "SHELL"):
         arguments.extend(["--env", f"{name}={environment[name]}"])
     # Do not pass --working-directory on reconnect: that intentionally opens
     # another terminal instead of restoring the existing surface.
-    arguments.extend(["--args", "--instance", instance])
+    arguments.extend(["--args", "--instance", target or instance])
     run(*arguments, env=environment)
 
 
@@ -136,11 +144,28 @@ try:
     if not (mount / "Applications").is_symlink() or os.readlink(mount / "Applications") != "/Applications":
         raise RuntimeError("DMG lacks the /Applications installation symlink")
     app.parent.mkdir()
+    scenarios = ["dmg-copy-launch-reconnect"]
+    legacy_zip = os.environ.get("COMPI_SMOKE_LEGACY_APP_ZIP")
+    legacy_workspace = None
+    if legacy_zip:
+        # Drag-replace migration: an older copied bundle runs and persists data first.
+        legacy_instance = "legacy-" + uuid.uuid4().hex[:19]
+        run("/usr/bin/ditto", "-x", "-k", legacy_zip, str(app.parent))
+        legacy_version = plistlib.loads((app / "Contents/Info.plist").read_bytes())["CFBundleShortVersionString"]
+        launch(legacy_instance)
+        wait_for(f"legacy {legacy_version} GUI, daemon and attached running PTY",
+                 lambda: attached_workspace(legacy_instance))
+        stop_owned(gui)
+        stop_owned(daemon)
+        legacy_workspace = root / "data" / f"workspace-{legacy_instance}-v1.json"
+        legacy_bytes = legacy_workspace.read_bytes()
+        shutil.rmtree(app)
     run("/usr/bin/ditto", str(mount / "Compi.app"), str(app))
     run("/usr/bin/hdiutil", "detach", str(mount))
     mounted = False
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
-    for executable in (gui, daemon):
+    helper = str(app / "Contents/MacOS/compi-update-worker")
+    for executable in (gui, daemon, helper):
         if not os.access(executable, os.X_OK):
             raise RuntimeError(f"Copied bundle lost executable permission: {executable}")
         if run("/usr/bin/lipo", "-archs", executable).stdout.strip() != "arm64":
@@ -173,6 +198,45 @@ try:
             or owned_pids(daemon) != [daemon_pid] or restored != running):
         raise RuntimeError("Reconnect did not preserve the daemon and terminal process lifetimes")
     print("Reconnected copied-bundle workspace:", json.dumps(after), flush=True)
+    version = plistlib.loads((app / "Contents/Info.plist").read_bytes())["CFBundleShortVersionString"]
+    full_payload = dmg.parent / f"Compi-{version}-macOS-arm64.app.zip"
+    with full_payload.open("rb") as stream:
+        payload_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+    if sentinel.read_bytes() != sentinel_bytes:
+        raise RuntimeError("Copied-bundle lifecycle changed managed data")
+    if legacy_workspace:
+        if legacy_workspace.read_bytes() != legacy_bytes:
+            raise RuntimeError("Bundle replacement changed the legacy workspace data")
+        scenarios.append("legacy-bundle-replacement")
+    update_cycle = None
+    if update_artifact:
+        driver = probe.parent / "compi-update-smoke"
+        if not driver.is_file():
+            raise RuntimeError("Build compi-client --example compi-update-smoke for real GUI handoff qualification")
+        (app.parent / f".{app.name}.compi-smoke-owned.json").write_text(
+            json.dumps({"root": str(app.resolve()), "nonce": uuid.uuid4().hex, "artifact_sha256": payload_hash}))
+        stop_owned(gui)
+        run(str(probe), "--instance", instance, "shutdown", env=environment)
+        wait_for("old smoke daemon shutdown", lambda: not owned_pids(daemon))
+        cycle = Path(os.environ["COMPI_SMOKE_CYCLE_SCRIPT"])
+        cycle_evidence = dmg.parent.parent / "distribution-smoke" / f"update-cycle-macos-{uuid.uuid4().hex[:12]}"
+        subprocess.run([sys.executable, str(cycle), "--root", str(app),
+                        "--artifact", str(update_artifact), "--metadata", str(update_metadata),
+                        "--probe", str(probe), "--driver", str(driver),
+                        "--evidence", str(cycle_evidence)],
+                       env=environment, check=True, timeout=300)
+        runs = list(cycle_evidence.glob("cycle-*/evidence.json"))
+        if len(runs) != 1:
+            raise RuntimeError("Successful update smoke must produce exactly one evidence file")
+        update_cycle = json.loads(runs[0].read_text())
+    qualification = {
+        "schema": 1, "platform": "macos-aarch64", "version": version,
+        "daemon_protocol": 14, "qualified_daemons": [version],
+        "artifact_sha256": payload_hash, "installer_scenarios": scenarios,
+    }
+    if update_cycle:
+        qualification["update_cycle"] = update_cycle
+    (dmg.parent / "qualification-macos-aarch64.json").write_text(json.dumps(qualification, indent=2) + "\n")
     succeeded = True
 finally:
     # Never use killall, a bundle identifier, or the user's default instance.
@@ -199,7 +263,10 @@ finally:
     if cleanup_errors:
         # Preserve the owned files if anything might still be using them.
         raise RuntimeError(f"Smoke cleanup failed; retained {root}: {cleanup_errors}")
-    shutil.rmtree(root)
+    if succeeded:
+        shutil.rmtree(root)
+    else:
+        print(f"Failure retained disposable root and prior usable bundle: {root}", file=sys.stderr)
 
 print("PASS: DMG copy launched through LaunchServices, discovered its bundled daemon, "
       "and reconnected to the same running terminal; all test-owned processes stopped.")

@@ -8,6 +8,156 @@ pub(in crate::gui) mod performance;
 pub(in crate::gui) mod settings;
 pub(super) mod tree;
 mod tree_ui;
+static PREPARED_HANDOFF: LazyLock<Mutex<Option<std::path::PathBuf>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+pub(super) fn prepare_update_handoff(
+    path: &std::path::Path,
+    rollback_path: &std::path::Path,
+    version: &str,
+    cx: &mut App,
+) -> crate::Result<()> {
+    if PREPARED_HANDOFF
+        .lock()
+        .map_err(|_| "Update handoff lock unavailable")?
+        .as_deref()
+        .is_some_and(|prepared| prepared != path)
+    {
+        return Err("Another update attempt already owns this GUI host".into());
+    }
+    let mut windows = Vec::new();
+    let mut connection_guards = Vec::new();
+    let result = (|| -> crate::Result<()> {
+        for handle in cx.windows() {
+            if let Some(typed) = handle.downcast::<CompiApp>() {
+                let saved = typed.update(cx, |this, window, _| -> crate::Result<_> {
+                    if this.mutation_pending || this.daemon_restarting {
+                        return Err("Wait for the current workspace change or daemon restart before installing".into());
+                    }
+                    this.remember_geometry(window);
+                    this.flush_state();
+                    if let Some(error) = this.state_save_error.lock().ok().and_then(|error| error.clone()) {
+                        return Err(error.into());
+                    }
+                    let workspace = this.workspace.as_ref().ok_or("Cannot restore a window without an authoritative workspace")?;
+                    this.update_quiesced.store(true, Ordering::Release);
+                    let mut config = this.config.clone();
+                    if !config.path.is_absolute() {
+                        if config.path.as_os_str().is_empty() { return Err("Cannot retain an unavailable configuration path".into()); }
+                        config.path = std::env::current_dir()?.join(&config.path);
+                    }
+                    Ok((crate::update_restore::RestoreWindow {
+                        slot_id: this.slot_id.clone(), server_id: workspace.server_id.clone(),
+                        target: this.target.clone(), config,
+                    }, this.update_connection_guard.clone()))
+                })??;
+                windows.push(saved.0);
+                connection_guards.push(saved.1);
+            }
+        }
+        if windows.is_empty() {
+            return Err("No Compi windows can be handed off".into());
+        }
+        let path = path.to_owned();
+        let rollback_path = rollback_path.to_owned();
+        let version = version.to_owned();
+        *PREPARED_HANDOFF
+            .lock()
+            .map_err(|_| "Update handoff lock unavailable")? = Some(path.clone());
+        thread::spawn(move || {
+            let result = (|| -> crate::Result<()> {
+                // Wait off-thread for any control-only reconnect already in flight.
+                let _drained = connection_guards
+                    .iter()
+                    .map(|guard| {
+                        guard
+                            .lock()
+                            .map_err(|_| "Update connection barrier unavailable")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let selected = PREPARED_HANDOFF
+                    .lock()
+                    .map_err(|_| "Update handoff lock unavailable")?;
+                if selected.as_deref() != Some(path.as_path()) {
+                    return Ok(());
+                }
+                for window in &mut windows {
+                    window.config.updates = crate::config::load(
+                        Some(&window.config.path),
+                        crate::config::FontOverrides::default(),
+                    )
+                    .updates;
+                }
+                crate::update_restore::Handoff::create(
+                    &rollback_path,
+                    env!("CARGO_PKG_VERSION"),
+                    windows.clone(),
+                )?;
+                crate::update_restore::Handoff::create(&path, &version, windows)
+            })();
+            if let Err(error) = result {
+                eprintln!("Cannot save update handoff: {error}");
+            }
+        });
+        Ok(())
+    })();
+    if result.is_err() {
+        for handle in cx.windows() {
+            if let Some(typed) = handle.downcast::<CompiApp>() {
+                let _ = typed.update(cx, |this, _, _| {
+                    this.update_quiesced.store(false, Ordering::Release)
+                });
+            }
+        }
+    }
+    result
+}
+
+pub(super) fn release_for_update(path: &std::path::Path, cx: &mut App) -> crate::Result<()> {
+    if PREPARED_HANDOFF
+        .lock()
+        .map_err(|_| "Update handoff lock unavailable")?
+        .as_deref()
+        != Some(path)
+    {
+        return Err("Update release does not match the prepared handoff".into());
+    }
+    for handle in cx.windows() {
+        if let Some(typed) = handle.downcast::<CompiApp>() {
+            typed.update(cx, |this, _, _| {
+                this.update_quiesced.store(true, Ordering::Release);
+                for view in &mut this.surface_views {
+                    view.stop.store(true, Ordering::Release);
+                    if let Some(transport) = view.transport.take() {
+                        transport.close();
+                    }
+                }
+                this.flush_state();
+            })?;
+        }
+    }
+    cx.quit();
+    Ok(())
+}
+
+pub(super) fn abort_update(path: &std::path::Path, cx: &mut App) -> crate::Result<()> {
+    let mut prepared = PREPARED_HANDOFF
+        .lock()
+        .map_err(|_| "Update handoff lock unavailable")?;
+    if prepared.as_deref() == Some(path) {
+        *prepared = None;
+        for handle in cx.windows() {
+            if let Some(typed) = handle.downcast::<CompiApp>() {
+                typed.update(cx, |this, _, cx| {
+                    this.update_quiesced.store(false, Ordering::Release);
+                    this.sync_visible_views();
+                    cx.notify();
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub(super) struct TransferSeed {
@@ -182,6 +332,7 @@ pub(super) enum Overlay {
     ConfirmDaemonRestart {
         details: String,
         revision: u64,
+        consent: compi_protocol::LifecycleConsent,
     },
     Tabs {
         hidden_only: bool,
@@ -317,10 +468,50 @@ pub(super) fn open_compi_window(
     transferred_seed: Option<TransferSeed>,
     cx: &mut App,
 ) -> crate::Result<WindowHandle<CompiApp>> {
+    open_window_mode(
+        target,
+        initial_working_directory,
+        config,
+        transferred_seed,
+        None,
+        cx,
+    )
+}
+
+pub(super) fn open_restore_window(
+    saved: crate::update_restore::RestoreWindow,
+    session: Arc<crate::update_restore::RestoreSession>,
+    cx: &mut App,
+) -> crate::Result<WindowHandle<CompiApp>> {
+    open_window_mode(
+        saved.target.clone(),
+        None,
+        saved.config.clone(),
+        None,
+        Some((saved, session)),
+        cx,
+    )
+}
+
+fn open_window_mode(
+    target: ConnectionTarget,
+    initial_working_directory: Option<String>,
+    config: LoadedConfig,
+    transferred_seed: Option<TransferSeed>,
+    restored: Option<(
+        crate::update_restore::RestoreWindow,
+        Arc<crate::update_restore::RestoreSession>,
+    )>,
+    cx: &mut App,
+) -> crate::Result<WindowHandle<CompiApp>> {
     let started_at = Instant::now();
     let mut client = target.connect()?;
     let mut snapshot = client.workspace()?;
-    let target_sessions = perf::target_session_count();
+    let target_sessions = if restored.is_some() {
+        0
+    } else {
+        perf::target_session_count()
+    };
     while snapshot.surfaces.len() < target_sessions {
         client.create_surface(DEFAULT_COLS, DEFAULT_ROWS, None)?;
         snapshot = client.workspace()?;
@@ -330,7 +521,16 @@ pub(super) fn open_compi_window(
         ..ClientState::default()
     };
     let state_instance = target.state_instance();
-    let mut slot = StateSlot::claim(state_instance.as_deref(), &snapshot.server_id, &defaults)?;
+    let mut slot = if let Some((saved, _)) = &restored {
+        StateSlot::claim_exact(
+            state_instance.as_deref(),
+            &saved.server_id,
+            &defaults,
+            &saved.slot_id,
+        )?
+    } else {
+        StateSlot::claim(state_instance.as_deref(), &snapshot.server_id, &defaults)?
+    };
     slot.state.reconcile(None, &snapshot);
     if let Some(seed) = &transferred_seed
         && !slot
@@ -398,6 +598,7 @@ pub(super) fn open_compi_window(
                     slot,
                     snapshot,
                     transferred_seed,
+                    restored.map(|(_, session)| session),
                     window,
                     cx,
                 )
@@ -457,6 +658,7 @@ impl CompiApp {
         slot: StateSlot,
         snapshot: WorkspaceSnapshot,
         transferred_seed: Option<TransferSeed>,
+        restore_session: Option<Arc<crate::update_restore::RestoreSession>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -505,12 +707,19 @@ impl CompiApp {
         }
         let global_warning = diagnostic_warning(&appearance_diagnostics, &typography.diagnostics);
         let performance_enabled = Arc::new(AtomicBool::new(state.show_fps));
+        let updates = crate::updates::shared(&config, &target);
+        let attach_only = restore_session.is_some();
         let mut this = Self {
             started_at,
             target,
+            updates,
+            update_quiesced: Arc::new(AtomicBool::new(false)),
+            update_connection_guard: Arc::new(Mutex::new(())),
+            restore_session,
+            restore_ready: false,
             initial_working_directory,
             first_snapshot_logged: false,
-            ready_probe_marker: perf::ready_probe_enabled()
+            ready_probe_marker: (!attach_only && perf::ready_probe_enabled())
                 .then(|| format!("COMPI_READY_{}", std::process::id())),
             ready_probe_sent_at: None,
             ready_probe_render_pending: false,
@@ -640,6 +849,29 @@ impl CompiApp {
                 cx.notify();
             }));
         cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                if weak
+                    .update(cx, |this, cx| {
+                        if this.restore_session.is_some() && !this.restore_ready {
+                            this.acknowledge_update_restore();
+                            cx.notify();
+                        } else if matches!(this.overlay, Some(Overlay::Settings))
+                            && this.settings_section == SettingsSection::Updates
+                        {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |weak, cx| {
             while let Ok(first) = rx.recv().await {
                 let started = Instant::now();
                 if weak
@@ -689,6 +921,8 @@ impl CompiApp {
         let performance_enabled = this.performance_enabled.clone();
         let mut polling_theme_library = this.theme_library.clone();
         let alive = cx.entity().downgrade();
+        let quiesced = this.update_quiesced.clone();
+        let connection_guard = this.update_connection_guard.clone();
         cx.spawn(async move |_, cx| {
             let mut appearance_stamp = fs::metadata(&appearance_path)
                 .ok()
@@ -701,6 +935,9 @@ impl CompiApp {
                 if alive.upgrade().is_none() {
                     break;
                 }
+                if quiesced.load(Ordering::Acquire) {
+                    continue;
+                }
                 let sender = sender.clone();
                 let target = target.clone();
                 let appearance_path = appearance_path.clone();
@@ -708,9 +945,17 @@ impl CompiApp {
                 library_ticks = (library_ticks + 1) % 12;
                 let reload_library = library_ticks == 0;
                 let collect_performance = performance_enabled.load(Ordering::Acquire);
+                let quiesced = quiesced.clone();
+                let connection_guard = connection_guard.clone();
                 (appearance_stamp, polling_theme_library) = cx
                     .background_executor()
                     .spawn(async move {
+                        let _guard = connection_guard
+                            .lock()
+                            .expect("Update connection barrier poisoned");
+                        if quiesced.load(Ordering::Acquire) {
+                            return (previous_stamp, polling_theme_library);
+                        }
                         match target.connect() {
                             Ok(mut client) => {
                                 sender.send(UiEvent::SurfacesLoaded(
@@ -767,10 +1012,11 @@ impl CompiApp {
             }
         })
         .detach();
-        if !this
-            .workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace.initialized)
+        if this.restore_session.is_none()
+            && !this
+                .workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.initialized)
         {
             let working_directory = this.initial_working_directory.take();
             this.mutate(
@@ -781,10 +1027,58 @@ impl CompiApp {
                 },
                 true,
             );
-        } else if let Some(cwd) = this.initial_working_directory.take() {
+        } else if this.restore_session.is_none()
+            && let Some(cwd) = this.initial_working_directory.take()
+        {
             this.create_terminal(Some(cwd));
         }
         this
+    }
+    fn acknowledge_update_restore(&mut self) {
+        if self.restore_ready {
+            return;
+        }
+        let Some(session) = &self.restore_session else {
+            return;
+        };
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
+        let mut selected = Vec::new();
+        if let Some(tab) = self.selected_tab() {
+            collect_leaves(&tab.layout, &mut selected);
+        }
+        let attached = selected.iter().all(|(_, id)| {
+            workspace.surface(id).is_some_and(|surface| {
+                !matches!(
+                    surface.status,
+                    SurfaceStatus::Starting | SurfaceStatus::Running
+                ) || self.surface_views.iter().any(|view| {
+                    &view.surface_id == id
+                        && view.lifetime == surface.process_lifetime_id
+                        && view.transport.is_some()
+                        && view.mirror.snapshot().is_some()
+                        && matches!(view.state, ConnectionState::Attached)
+                })
+            })
+        });
+        if !attached {
+            return;
+        }
+        let result = session.mark_ready(&self.slot_id).and_then(|all_ready| {
+            if all_ready {
+                let (path, token) = crate::updates::readiness_receipt()
+                    .ok_or("Update restore has no private readiness receipt")?;
+                session.publish_readiness(&path, &token)?;
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => self.restore_ready = true,
+            Err(error) => {
+                self.global_error = Some(format!("Cannot acknowledge update restore: {error}"))
+            }
+        }
     }
 
     fn colors(&self) -> &ThemeColors {
@@ -1074,66 +1368,59 @@ impl CompiApp {
     }
 
     fn refresh_surfaces(&mut self, _: bool) {
+        if self.update_quiesced.load(Ordering::Acquire) {
+            return;
+        }
         if self.loading_surfaces {
             return;
         }
         self.loading_surfaces = true;
         let sender = self.event_tx.clone();
         let target = self.target.clone();
+        let quiesced = self.update_quiesced.clone();
+        let connection_guard = self.update_connection_guard.clone();
         thread::spawn(move || {
-            let result = target
-                .connect()
+            let connection = {
+                let _guard = connection_guard
+                    .lock()
+                    .expect("Update connection barrier poisoned");
+                if quiesced.load(Ordering::Acquire) {
+                    return;
+                }
+                target.connect()
+            };
+            let result = connection
                 .and_then(|mut client| client.workspace())
                 .map_err(|error| error.to_string());
             sender.send(UiEvent::SurfacesLoaded(result));
         });
     }
 
-    fn begin_daemon_restart(&mut self) {
+    fn begin_daemon_restart(&mut self, consent: compi_protocol::LifecycleConsent) {
+        if self.update_quiesced.load(Ordering::Acquire) {
+            return;
+        }
         if self.daemon_restarting {
             return;
         }
         self.daemon_restarting = true;
         self.loading_surfaces = true;
         self.global_error = None;
-        for view in &mut self.surface_views {
-            view.stop.store(true, Ordering::Release);
-            if let Some(transport) = view.transport.take() {
-                transport.close();
-            }
-        }
         let sender = self.event_tx.clone();
         let target = self.target.clone();
         thread::spawn(move || {
             let result = target
-                .restart_daemon()
+                .restart_daemon(&consent)
                 .and_then(|mut client| client.workspace())
                 .map_err(|error| error.to_string());
             sender.send(UiEvent::DaemonRestarted(result));
         });
     }
 
-    fn live_surface_details(&self) -> (usize, String) {
-        let surfaces = self
-            .workspace
-            .iter()
-            .flat_map(|workspace| &workspace.surfaces)
-            .filter(|surface| {
-                matches!(
-                    surface.status,
-                    SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
-                )
-            })
-            .collect::<Vec<_>>();
-        let details = surfaces
-            .iter()
-            .map(|surface| format!("• {}", surface.id))
-            .collect::<Vec<_>>()
-            .join("\n");
-        (surfaces.len(), details)
-    }
-
     fn mutate(&mut self, operation: WorkspaceMutation, select_created: bool) {
+        if self.update_quiesced.load(Ordering::Acquire) {
+            return;
+        }
         if self.mutation_pending {
             self.global_error = Some("A workspace change is still pending".into());
             return;
@@ -1369,6 +1656,39 @@ impl CompiApp {
             }
         }
         match event {
+            UiEvent::LifecycleLoaded(result) => match result {
+                Ok(status) => {
+                    let details = format!(
+                        "Restarting daemon {} (protocol {}) ends {} live surfaces and affects {} attached clients in instance {}.\n\n{}\n\nTerminals are not resumed automatically.",
+                        status.product_version,
+                        status.protocol_version,
+                        status.live_surfaces.len(),
+                        status.connected_clients.len(),
+                        status.instance.as_deref().unwrap_or("default"),
+                        status
+                            .live_surfaces
+                            .iter()
+                            .map(|surface| format!(
+                                "{} · lifetime {}",
+                                surface.surface_id, surface.process_lifetime_id
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    self.open_overlay(
+                        Overlay::ConfirmDaemonRestart {
+                            details,
+                            revision: status.workspace_revision,
+                            consent: status.consent(),
+                        },
+                        "",
+                    );
+                }
+                Err(error) => {
+                    self.global_error = Some(format!("Cannot safely restart daemon: {error}"))
+                }
+            },
+            UiEvent::SurfacesLoaded(_) if self.update_quiesced.load(Ordering::Acquire) => {}
             UiEvent::StateSaveFinished => {}
             UiEvent::ThemeLibraryReloaded {
                 library,
@@ -1778,6 +2098,9 @@ impl CompiApp {
     }
 
     fn sync_visible_views(&mut self) {
+        if self.update_quiesced.load(Ordering::Acquire) {
+            return;
+        }
         self.capture_viewports();
         let mut leaves = Vec::new();
         if let Some(tab) = self.selected_tab() {
@@ -1907,6 +2230,8 @@ impl CompiApp {
                         stop: view.stop.clone(),
                         previous_closed,
                         closed: view.closed.clone(),
+                        update_quiesced: self.update_quiesced.clone(),
+                        connection_guard: self.update_connection_guard.clone(),
                     },
                 );
             }
@@ -2261,6 +2586,7 @@ impl CompiApp {
             mutation_pending: self.mutation_pending,
             transfer_in_progress: self.transferred_seed.is_some(),
             daemon_restarting: self.daemon_restarting,
+            remote_target: self.target.is_remote(),
             other_window_available: cx.windows().len() > 1,
             revision: self
                 .overlay_revision
@@ -2906,6 +3232,11 @@ impl CompiApp {
                 self.open_overlay(Overlay::QuickAppearance, "");
             }
             Command::OpenSettings => self.open_overlay(Overlay::Settings, ""),
+            Command::CheckForUpdates => {
+                self.settings_section = SettingsSection::Updates;
+                self.open_overlay(Overlay::Settings, "");
+                self.updates.check();
+            }
             Command::OpenThemeCatalog => self.open_theme_catalog(SettingsScope::Global),
             Command::OpenConfiguration => {
                 let path = self.config.path.clone();
@@ -2956,24 +3287,13 @@ impl CompiApp {
                 self.refresh_surfaces(false);
             }
             Command::RestartDaemon => {
-                let (count, surfaces) = self.live_surface_details();
-                if count == 0 {
-                    self.begin_daemon_restart();
-                } else {
-                    self.open_overlay(
-                        Overlay::ConfirmDaemonRestart {
-                            details: format!(
-                                "Restarting now ends {count} live surface{} and all processes inside them:\n\n{surfaces}",
-                                if count == 1 { "" } else { "s" }
-                            ),
-                            revision: self
-                                .workspace
-                                .as_ref()
-                                .map_or(0, |workspace| workspace.revision),
-                        },
-                        "",
-                    );
-                }
+                let target = self.target.clone();
+                let sender = self.event_tx.clone();
+                thread::spawn(move || {
+                    sender.send(UiEvent::LifecycleLoaded(
+                        target.lifecycle_status().map_err(|error| error.to_string()),
+                    ));
+                });
             }
             Command::OpenDiagnostics => self.open_overlay(Overlay::Diagnostics, ""),
             Command::Quit => cx.quit(),
@@ -3130,7 +3450,9 @@ impl CompiApp {
                 self.dismiss_overlay();
                 self.mutate(operation, false);
             }
-            Overlay::ConfirmDaemonRestart { revision, .. } => {
+            Overlay::ConfirmDaemonRestart {
+                revision, consent, ..
+            } => {
                 if self
                     .workspace
                     .as_ref()
@@ -3143,7 +3465,7 @@ impl CompiApp {
                     return;
                 }
                 self.dismiss_overlay();
-                self.begin_daemon_restart();
+                self.begin_daemon_restart(consent);
             }
             Overlay::Diagnostics => self.dismiss_overlay(),
             other => {

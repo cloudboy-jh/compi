@@ -3,8 +3,9 @@ use crate::config::LoadedConfig;
 use compi_protocol::{Result, identity};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,18 +15,41 @@ use std::{
     time::{Duration, Instant},
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", deny_unknown_fields)]
+pub enum LaunchMode {
+    #[default]
+    Ordinary,
+    Restore {
+        handoff: PathBuf,
+    },
+    PrepareUpdate {
+        handoff: PathBuf,
+        rollback_handoff: PathBuf,
+        expected_version: String,
+    },
+    ReleaseForUpdate {
+        handoff: PathBuf,
+    },
+    UnprepareUpdate {
+        handoff: PathBuf,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchRequest {
     pub initial_working_directory: Option<String>,
     pub config: LoadedConfig,
+    #[serde(default)]
+    pub mode: LaunchMode,
     #[serde(skip)]
     _permit: Option<QueuePermit>,
 }
@@ -35,11 +59,24 @@ impl LaunchRequest {
         Self {
             initial_working_directory,
             config,
+            mode: LaunchMode::Ordinary,
+            _permit: None,
+        }
+    }
+
+    pub fn restore(handoff: PathBuf, config: LoadedConfig) -> Self {
+        Self {
+            initial_working_directory: None,
+            config,
+            mode: LaunchMode::Restore { handoff },
             _permit: None,
         }
     }
 
     fn validate(&self) -> Result<()> {
+        if !matches!(self.mode, LaunchMode::Ordinary) && self.initial_working_directory.is_some() {
+            return Err("update handoff requests cannot replay a working directory".into());
+        }
         if self
             .initial_working_directory
             .as_ref()
@@ -65,6 +102,8 @@ struct Envelope {
     version: u32,
     instance: String,
     launch: LaunchRequest,
+    expected_host_pid: Option<u32>,
+    expected_installation: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +127,7 @@ pub struct WindowHost {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     _lock: platform::HostLock,
+    _registration: HostRegistration,
 }
 
 impl WindowHost {
@@ -113,6 +153,7 @@ impl Drop for WindowHost {
 /// Once connected, a failed handshake is never retried: delivery may be ambiguous.
 pub fn acquire(instance: Option<&str>, request: LaunchRequest) -> Result<HostAcquisition> {
     request.validate()?;
+    let state_instance = instance.map(str::to_owned);
     let names = identity::instance_names(instance)?;
     let endpoint = format!("{}.gui", names.pipe);
     let lock_name = format!("{}.gui", names.mutex);
@@ -121,15 +162,32 @@ pub fn acquire(instance: Option<&str>, request: LaunchRequest) -> Result<HostAcq
         version: VERSION,
         instance: instance.clone(),
         launch: request,
+        expected_host_pid: None,
+        expected_installation: None,
     };
     let payload = serde_json::to_vec(&envelope)?;
     if payload.len() > MAX_FRAME {
         return Err("window launch request exceeds 256 KiB".into());
     }
     let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let restore = matches!(envelope.launch.mode, LaunchMode::Restore { .. });
+    let deadline = if restore {
+        Instant::now() + Duration::from_secs(15)
+    } else {
+        deadline
+    };
+    // Serialize ordinary host registration with activation. Worker-owned restore
+    // launches must bypass this guard while proving the activated build is ready.
     loop {
+        let operation_guard = if restore {
+            None
+        } else {
+            compi_update::guard_client_launch()?
+        };
         if let Some(lock) = platform::HostLock::try_acquire(&lock_name)? {
             let listener = platform::Listener::bind(&endpoint)?;
+            let registration = HostRegistration::create(state_instance.clone())?;
+            drop(operation_guard);
             let (sender, receiver) = mpsc::channel();
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = stop.clone();
@@ -144,11 +202,13 @@ pub fn acquire(instance: Option<&str>, request: LaunchRequest) -> Result<HostAcq
                     stop,
                     worker: Some(worker),
                     _lock: lock,
+                    _registration: registration,
                 },
                 Box::new(envelope.launch),
             ));
         }
-        if let Some(mut connection) = platform::connect(&endpoint)? {
+        drop(operation_guard);
+        if !restore && let Some(mut connection) = platform::connect(&endpoint)? {
             let stop = AtomicBool::new(false);
             let deadline = Instant::now() + REQUEST_TIMEOUT;
             match receive::<Reply>(&mut connection, deadline, &stop)? {
@@ -169,7 +229,7 @@ pub fn acquire(instance: Option<&str>, request: LaunchRequest) -> Result<HostAcq
         }
         if Instant::now() >= deadline {
             return Err(
-                "GUI host owns this instance but did not become ready within five seconds".into(),
+                "GUI host still owns this instance; update restore must wait for its release. No request was sent into the old GUI.".into(),
             );
         }
         thread::sleep(POLL);
@@ -199,6 +259,22 @@ fn serve(
                         return Err("launch protocol or instance does not match this host".into());
                     }
                     envelope.launch.validate()?;
+                    if matches!(envelope.launch.mode, LaunchMode::Restore { .. }) {
+                        return Err(
+                            "update restoration cannot be forwarded into an existing GUI host"
+                                .into(),
+                        );
+                    }
+                    if !matches!(envelope.launch.mode, LaunchMode::Ordinary)
+                        && (envelope.expected_host_pid != Some(std::process::id())
+                            || envelope.expected_installation.as_ref()
+                                != Some(&registry_installation()?))
+                    {
+                        return Err(
+                            "update handoff addresses a different GUI process or installation"
+                                .into(),
+                        );
+                    }
                     if pending.load(Ordering::Acquire) >= MAX_PENDING {
                         return Err("window launch queue is full".into());
                     }
@@ -237,6 +313,186 @@ fn serve(
             }
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateHost {
+    pub pid: u32,
+    pub instance: Option<String>,
+    installation: PathBuf,
+    pub executable: PathBuf,
+    pub product_version: String,
+    launch_protocol: u32,
+}
+
+struct HostRegistration {
+    path: PathBuf,
+    _lock: File,
+}
+
+fn registry_root() -> Result<PathBuf> {
+    Ok(compi_protocol::paths::data_dir()?.join("update-gui-hosts-v1"))
+}
+
+fn registry_installation() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // Ownership registration must not prohibit ordinary development/DMG launches.
+        // Update activation separately enforces writable installed bundle policy.
+        let executable = std::env::current_exe()?.canonicalize()?;
+        Ok(executable
+            .ancestors()
+            .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+            .unwrap_or_else(|| executable.parent().unwrap_or(&executable))
+            .to_owned())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(compi_update::InstallTarget::detect()?.root)
+    }
+}
+
+fn registration_lock(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+impl HostRegistration {
+    fn create(instance: Option<String>) -> Result<Self> {
+        let root = registry_root()?;
+        fs::create_dir_all(&root)?;
+        let pid = std::process::id();
+        let path = root.join(format!("{pid}.json"));
+        let lock = registration_lock(&path.with_extension("lock"))?;
+        lock.try_lock()
+            .map_err(|error| format!("Cannot register GUI update ownership: {error}"))?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let host = UpdateHost {
+            pid,
+            instance,
+            installation: registry_installation()?,
+            executable,
+            product_version: env!("CARGO_PKG_VERSION").to_owned(),
+            launch_protocol: VERSION,
+        };
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(&serde_json::to_vec(&host)?)?;
+        file.sync_all()?;
+        Ok(Self { path, _lock: lock })
+    }
+}
+
+impl Drop for HostRegistration {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Inventory every live GUI host using this installation, including older payloads.
+pub fn update_hosts() -> Result<Vec<UpdateHost>> {
+    let installation = registry_installation()?;
+    let root = registry_root()?;
+    fs::create_dir_all(&root)?;
+    let mut hosts = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let lock = registration_lock(&path.with_extension("lock"))?;
+        match lock.try_lock() {
+            Ok(()) => continue,
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let bytes = fs::read(&path)?;
+        if bytes.len() > 16 * 1024 {
+            return Err("GUI update registry exceeds its bound".into());
+        }
+        let host: UpdateHost = serde_json::from_slice(&bytes)?;
+        if host.installation == installation {
+            if host.launch_protocol != VERSION {
+                return Err("Another GUI build using this installation cannot participate in update handoff; close it deliberately first.".into());
+            }
+            identity::instance_names(host.instance.as_deref())?;
+            hosts.push(host);
+        }
+    }
+    hosts.sort_by_key(|host| host.pid);
+    Ok(hosts)
+}
+
+fn request_update(host: &UpdateHost, mode: LaunchMode) -> Result<()> {
+    if host.installation != registry_installation()? || host.launch_protocol != VERSION {
+        return Err("Update request belongs to another installation or GUI generation".into());
+    }
+    let names = identity::instance_names(host.instance.as_deref())?;
+    let endpoint = format!("{}.gui", names.pipe);
+    let mut connection =
+        platform::connect(&endpoint)?.ok_or("GUI host exited before update handoff")?;
+    let stop = AtomicBool::new(false);
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    match receive::<Reply>(&mut connection, deadline, &stop)? {
+        Reply::Ready { version: VERSION } => {}
+        _ => return Err("GUI host cannot safely participate in update handoff".into()),
+    }
+    let mut request = LaunchRequest::new(None, LoadedConfig::default());
+    request.mode = mode;
+    send(
+        &mut connection,
+        &Envelope {
+            version: VERSION,
+            instance: names.pipe,
+            launch: request,
+            expected_host_pid: Some(host.pid),
+            expected_installation: Some(host.installation.clone()),
+        },
+        deadline,
+        &stop,
+    )?;
+    let reply = receive::<Reply>(&mut connection, deadline, &stop)?;
+    let _ = write_all(&mut connection, &[1], deadline, &stop);
+    match reply {
+        Reply::Accepted => Ok(()),
+        Reply::Rejected { message } => Err(message.into()),
+        _ => Err("Unexpected GUI update handoff response".into()),
+    }
+}
+
+pub fn request_update_prepare(
+    host: &UpdateHost,
+    handoff: PathBuf,
+    rollback_handoff: PathBuf,
+    expected_version: String,
+) -> Result<()> {
+    request_update(
+        host,
+        LaunchMode::PrepareUpdate {
+            handoff,
+            rollback_handoff,
+            expected_version,
+        },
+    )
+}
+pub fn request_update_release(host: &UpdateHost, handoff: PathBuf) -> Result<()> {
+    request_update(host, LaunchMode::ReleaseForUpdate { handoff })
+}
+pub fn request_update_abort(host: &UpdateHost, handoff: PathBuf) -> Result<()> {
+    request_update(host, LaunchMode::UnprepareUpdate { handoff })
 }
 
 fn send<T: Serialize>(

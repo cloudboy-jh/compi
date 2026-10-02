@@ -1,6 +1,6 @@
 [package]
 name = "compi-setup"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 publish = false
 
@@ -9,7 +9,13 @@ publish = false
 [target.'cfg(windows)'.dependencies]
 compi-client = { path = "../../crates/compi-client" }
 compi-protocol = { path = "../../crates/compi-protocol" }
+compi-update = { path = "../../crates/compi-update" }
 async-channel = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
 gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
 windows = { version = "0.62.2", features = [
     "Wdk_System_SystemServices",

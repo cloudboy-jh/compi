@@ -122,6 +122,7 @@ registry! {
     OpenQuickAppearance, "open_quick_appearance", "Open Quick Appearance", None, None;
     OpenThemeCatalog, "open_theme_catalog", "Browse theme catalog", None, None;
     OpenSettings, "open_settings", "Open Settings", Some("cmd-,"), Some("ctrl-,");
+    CheckForUpdates, "check_for_updates", "Check for Updates", None, None;
     OpenConfiguration, "open_configuration", "Open configuration file", None, None;
     ResetClientLayout, "reset_client_layout", "Reset window layout", None, None;
     Reconnect, "reconnect", "Reconnect window", None, None;
@@ -205,6 +206,7 @@ pub struct CommandContext {
     pub mutation_pending: bool,
     pub transfer_in_progress: bool,
     pub daemon_restarting: bool,
+    pub remote_target: bool,
     pub other_window_available: bool,
     /// Revision at which the current command targets/context were captured.
     pub revision: u64,
@@ -236,9 +238,8 @@ impl Command {
                 CommandCategory::Window
             }
             OpenQuickAppearance | OpenSettings | OpenThemeCatalog => CommandCategory::Appearance,
-            OpenPalette | OpenConfiguration | RestartDaemon | OpenDiagnostics | Quit => {
-                CommandCategory::System
-            }
+            OpenPalette | OpenConfiguration | CheckForUpdates | RestartDaemon | OpenDiagnostics
+            | Quit => CommandCategory::System,
         }
     }
 
@@ -275,6 +276,7 @@ impl Command {
             OpenQuickAppearance => "theme opacity transparency clear blur",
             OpenThemeCatalog => "themes catalog colors schemes light dark favorites",
             OpenSettings => "preferences configuration appearance terminal keyboard daemon",
+            CheckForUpdates => "update upgrade release version download install",
             OpenConfiguration => "toml edit file",
             RestartDaemon => "server reboot",
             Reconnect => "server attach retry",
@@ -307,6 +309,7 @@ impl Command {
                 | OpenQuickAppearance
                 | OpenThemeCatalog
                 | OpenSettings
+                | CheckForUpdates
                 | OpenConfiguration
                 | ResetClientLayout
                 | Reconnect
@@ -317,6 +320,11 @@ impl Command {
             return None;
         }
         if self == RestartDaemon {
+            if c.remote_target {
+                return Some(
+                    "Restart the remote daemon deliberately on its host; Compi never deploys or restarts it through local update controls",
+                );
+            }
             return c
                 .daemon_restarting
                 .then_some("Wait for the server to restart");
@@ -791,6 +799,17 @@ fn is_modifier(part: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_restart_controls_do_not_offer_remote_shutdown() {
+        let context = CommandContext {
+            remote_target: true,
+            ..ready()
+        };
+        assert!(Command::RestartDaemon.disabled_reason(&context).is_some());
+        assert!(Command::Reconnect.disabled_reason(&context).is_none());
+        assert!(Command::CheckForUpdates.disabled_reason(&context).is_none());
+    }
 
     fn ready() -> CommandContext {
         CommandContext {

@@ -4,6 +4,7 @@ members = [
     "crates/compi-protocol",
     "crates/compi-daemon",
     "crates/compi-client",
+    "crates/compi-update",
 ]
 default-members = [
     "crates/compi-protocol",
@@ -13,7 +14,7 @@ default-members = [
 exclude = ["installer/bootstrapper"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "MIT"
 publish = false

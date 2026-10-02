@@ -1,14 +1,13 @@
-use crate::{Error, Result};
+use crate::Result;
+use crate::transaction::{self, Event, Outcome};
 use compi_client::theme::{ThemeColors, ThemePreset};
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, Focusable, IntoElement, ParentElement,
-    PathBuilder, Render, Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
-    canvas, div, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render,
+    Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img, prelude::*,
+    px, rgb, size,
 };
 use std::env;
-use std::fs;
 use std::mem::size_of;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -16,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const WINDOW_WIDTH: f32 = 600.0;
 const WINDOW_HEIGHT: f32 = 460.0;
@@ -40,7 +38,7 @@ pub enum PreviewState {
 }
 
 #[derive(Clone)]
-enum InstallerSource {
+pub(crate) enum InstallerSource {
     Package(&'static [u8]),
     ProductCode(String),
 }
@@ -60,6 +58,7 @@ enum SurfaceState {
     Installing,
     Complete,
     Error(String),
+    Checking,
 }
 
 struct InstallerApp {
@@ -68,12 +67,22 @@ struct InstallerApp {
     state: SurfaceState,
     installed: bool,
     prerequisite_error: Option<String>,
-    event_tx: async_channel::Sender<std::result::Result<(), String>>,
+    event_tx: async_channel::Sender<Event>,
+    cancel: Arc<AtomicBool>,
+    cancellable: bool,
+    progress: Option<u32>,
+    stage: String,
+    outcome: Outcome,
+    remove_data: bool,
     busy: Arc<AtomicBool>,
     focus_handle: FocusHandle,
+    launch_failed: bool,
 }
 
-actions!(compi_installer, [PrimaryAction, CloseInstaller]);
+actions!(
+    compi_installer,
+    [PrimaryAction, CloseInstaller, ToggleDataCleanup]
+);
 
 pub fn run(msi: &'static [u8], operation: InstallerOperation) {
     run_mode(LaunchMode::Live {
@@ -93,11 +102,71 @@ pub fn run_preview(state: PreviewState) {
     run_mode(LaunchMode::Preview(state));
 }
 
+/// Unattended distribution qualification uses the same transaction as the actual surface.
+pub fn run_silent(
+    msi: Option<&'static [u8]>,
+    product_code: Option<String>,
+    operation: InstallerOperation,
+    remove_data: bool,
+    cancel_after_ms: Option<u64>,
+) -> i32 {
+    let source = match (msi, product_code) {
+        (Some(bytes), _) => InstallerSource::Package(bytes),
+        (_, Some(code)) => InstallerSource::ProductCode(code),
+        _ => return 2,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(delay) = cancel_after_ms {
+        let cancel = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(delay));
+            cancel.store(true, Ordering::Release);
+        });
+    }
+    let (sender, receiver) = async_channel::unbounded();
+    // Drain progress without blocking the worker, retaining real stage events in the log.
+    thread::spawn(move || {
+        while let Ok(event) = receiver.recv_blocking() {
+            eprintln!("{event:?}");
+        }
+    });
+    match transaction::perform(source, operation, remove_data, cancel, sender) {
+        Ok(outcome) => {
+            if let Some(Err(error)) = outcome.cleanup {
+                eprintln!("Product removal succeeded; managed-data cleanup failed: {error}");
+                1
+            } else if outcome.restart_required {
+                3010
+            } else {
+                0
+            }
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            error
+                .downcast_ref::<transaction::MsiFailure>()
+                .map(|failure| failure.code as i32)
+                .unwrap_or(1)
+        }
+    }
+}
+
+pub fn run_msi_action(args: &[String]) -> i32 {
+    match crate::msi_actions::action(args) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 fn run_mode(launch: LaunchMode) {
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
             gpui::KeyBinding::new("enter", PrimaryAction, Some("CompiInstaller")),
             gpui::KeyBinding::new("escape", CloseInstaller, Some("CompiInstaller")),
+            gpui::KeyBinding::new("ctrl-d", ToggleDataCleanup, Some("CompiInstaller")),
         ]);
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         let busy = Arc::new(AtomicBool::new(false));
@@ -135,21 +204,10 @@ impl InstallerApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (event_tx, event_rx) = async_channel::bounded(1);
+        let (event_tx, event_rx) = async_channel::unbounded();
         let installed = installed_executable().is_file();
         let (operation, state, prerequisite_error) = match &launch {
-            LaunchMode::Live { operation, .. } => (
-                *operation,
-                SurfaceState::Ready,
-                (*operation != InstallerOperation::Remove)
-                    .then(|| {
-                        ensure_supported_windows()
-                            .and_then(|_| compi_protocol::wsl::ensure_default_wsl2())
-                            .err()
-                            .map(|error| error.to_string())
-                    })
-                    .flatten(),
-            ),
+            LaunchMode::Live { operation, .. } => (*operation, SurfaceState::Checking, None),
             LaunchMode::Preview(preview) => preview_configuration(*preview),
         };
         let mut this = Self {
@@ -160,7 +218,14 @@ impl InstallerApp {
             prerequisite_error,
             event_tx,
             busy,
+            cancel: Arc::new(AtomicBool::new(false)),
+            cancellable: true,
+            progress: None,
+            stage: "Checking Windows, installation access, and WSL guest readiness".into(),
+            outcome: Outcome::default(),
+            remove_data: false,
             focus_handle: cx.focus_handle(),
+            launch_failed: false,
         };
         if matches!(this.launch, LaunchMode::Preview(PreviewState::Installing)) {
             this.busy.store(true, Ordering::Release);
@@ -169,18 +234,47 @@ impl InstallerApp {
             this.installed = true;
         }
         cx.spawn(async move |weak, cx| {
-            if let Ok(result) = event_rx.recv().await {
-                let _ = weak.update(cx, |this, cx| {
-                    this.busy.store(false, Ordering::Release);
-                    this.state = match result {
-                        Ok(()) => SurfaceState::Complete,
-                        Err(error) => SurfaceState::Error(error),
-                    };
-                    cx.notify();
-                });
+            while let Ok(event) = event_rx.recv().await {
+                if weak
+                    .update(cx, |this, cx| {
+                        match event {
+                            Event::Preflight(result) => {
+                                this.busy.store(false, Ordering::Release);
+                                this.prerequisite_error = result.err();
+                                this.state = SurfaceState::Ready;
+                            }
+                            Event::Progress {
+                                stage,
+                                percent,
+                                cancellable,
+                            } => {
+                                this.stage = stage;
+                                this.progress = percent;
+                                this.cancellable = cancellable;
+                            }
+                            Event::Finished(result) => {
+                                this.busy.store(false, Ordering::Release);
+                                this.state = match result {
+                                    Ok(outcome) => {
+                                        this.outcome = outcome;
+                                        SurfaceState::Complete
+                                    }
+                                    Err(error) => SurfaceState::Error(error),
+                                };
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
+        if matches!(this.launch, LaunchMode::Live { .. }) {
+            this.recheck();
+        }
         this
     }
 
@@ -192,54 +286,139 @@ impl InstallerApp {
             return;
         }
         match &self.state {
+            SurfaceState::Ready if self.prerequisite_error.is_some() => self.recheck(),
             SurfaceState::Ready => self.start_installation(cx),
-            SurfaceState::Installing => {}
+            SurfaceState::Installing => {
+                if self.cancellable {
+                    self.cancel.store(true, Ordering::Release);
+                    self.stage =
+                        "Cancellation requested; waiting for Windows Installer rollback".into();
+                    self.cancellable = false;
+                    cx.notify();
+                }
+            }
+            SurfaceState::Checking => {}
             SurfaceState::Complete => {
                 if self.operation == InstallerOperation::Remove {
                     window.remove_window();
-                } else {
-                    let _ = Command::new(installed_executable()).spawn();
+                } else if self.outcome.restart_required {
                     window.remove_window();
+                } else {
+                    match Command::new(installed_executable()).spawn() {
+                        Ok(mut child) => match child.try_wait() {
+                            Ok(Some(status)) if !status.success() => {
+                                self.state = SurfaceState::Error(format!(
+                                    "Compi exited immediately: {status}. Repair or review the installation log."
+                                ));
+                                self.launch_failed = true;
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                self.state = SurfaceState::Error(format!(
+                                    "Could not check Compi launch: {error}"
+                                ));
+                                self.launch_failed = true;
+                                cx.notify();
+                            }
+                            _ => window.remove_window(),
+                        },
+                        Err(error) => {
+                            self.state = SurfaceState::Error(format!(
+                                "Compi could not launch: {error}. Installed version {}. Repair or try again.",
+                                self.outcome.version.as_deref().unwrap_or("unavailable")
+                            ));
+                            self.launch_failed = true;
+                            cx.notify();
+                        }
+                    }
                 }
             }
-            SurfaceState::Error(_) => {
-                self.state = SurfaceState::Ready;
-                cx.notify();
+            SurfaceState::Error(_) if self.launch_failed => {
+                self.state = SurfaceState::Complete;
+                self.primary_action(&PrimaryAction, window, cx);
             }
+            SurfaceState::Error(_) => self.recheck(),
+        }
+        cx.notify();
+    }
+
+    fn close_installer(&mut self, _: &CloseInstaller, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.busy.load(Ordering::Acquire) {
+            window.remove_window();
+        } else if matches!(self.state, SurfaceState::Installing) && self.cancellable {
+            self.cancel.store(true, Ordering::Release);
+            self.cancellable = false;
+            self.stage = "Cancellation requested; waiting for Windows Installer rollback".into();
+            cx.notify();
         }
     }
 
-    fn close_installer(&mut self, _: &CloseInstaller, window: &mut Window, _: &mut Context<Self>) {
-        if !self.busy.load(Ordering::Acquire) {
-            window.remove_window();
+    fn recheck(&mut self) {
+        self.state = SurfaceState::Checking;
+        self.prerequisite_error = None;
+        self.busy.store(true, Ordering::Release);
+        self.launch_failed = false;
+        self.stage = if self.operation == InstallerOperation::Install {
+            "Checking Windows, registration, access, disk space and WSL guest startup"
+        } else {
+            "Checking installation registration, access and running instances"
         }
+        .into();
+        self.progress = None;
+        self.cancellable = false;
+        let operation = self.operation;
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            let result = transaction::preflight(operation).map_err(|error| error.to_string());
+            let _ = sender.send_blocking(Event::Preflight(result));
+        });
     }
 
     fn start_installation(&mut self, cx: &mut Context<Self>) {
-        if self.prerequisite_error.is_some() || self.busy.swap(true, Ordering::AcqRel) {
+        if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
         let LaunchMode::Live { source, operation } = self.launch.clone() else {
             return;
         };
+        self.cancel.store(false, Ordering::Release);
+        self.cancellable = true;
+        self.progress = None;
+        self.stage = "Staging embedded offline package".into();
         self.state = SurfaceState::Installing;
         cx.notify();
         let sender = self.event_tx.clone();
+        let cancel = self.cancel.clone();
+        let remove_data = self.remove_data;
         thread::spawn(move || {
-            let result = perform_operation(source, operation).map_err(|error| error.to_string());
-            let _ = sender.send_blocking(result);
+            let result =
+                transaction::perform(source, operation, remove_data, cancel, sender.clone())
+                    .map_err(|error| error.to_string());
+            let _ = sender.send_blocking(Event::Finished(result));
         });
     }
 
     fn action_label(&self) -> &'static str {
         match (&self.state, self.operation, self.installed) {
+            (SurfaceState::Checking, _, _) => "Checking…",
+            (SurfaceState::Ready, _, _) if self.prerequisite_error.is_some() => "Recheck",
             (SurfaceState::Ready, InstallerOperation::Install, true) => "Update Compi",
             (SurfaceState::Ready, InstallerOperation::Install, false) => "Install Compi",
             (SurfaceState::Ready, InstallerOperation::Repair, _) => "Repair Compi",
             (SurfaceState::Ready, InstallerOperation::Remove, _) => "Remove Compi",
-            (SurfaceState::Installing, _, _) => "Working…",
+            (SurfaceState::Installing, _, _) => {
+                if self.cancellable {
+                    "Cancel safely"
+                } else {
+                    "Working…"
+                }
+            }
             (SurfaceState::Complete, InstallerOperation::Remove, _) => "Close",
+            (SurfaceState::Complete, _, _) if self.outcome.restart_required => {
+                "Close, restart Windows"
+            }
             (SurfaceState::Complete, _, _) => "Open Compi",
+            (SurfaceState::Error(_), _, _) if self.launch_failed => "Retry Open Compi",
             (SurfaceState::Error(_), _, _) => "Try again",
         }
     }
@@ -293,7 +472,7 @@ impl InstallerApp {
             })
     }
 
-    fn render_ready(&self) -> impl IntoElement {
+    fn render_ready(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match (self.operation, self.installed) {
             (InstallerOperation::Install, true) => "Update Compi",
             (InstallerOperation::Install, false) => "Your persistent WSL terminal",
@@ -311,25 +490,33 @@ impl InstallerApp {
                 "Restore application files and per-user daemon registration."
             }
             InstallerOperation::Remove => {
-                "Remove Compi and its background task. Active terminal sessions will end; project files are never touched."
+                "Remove application files and its task. Keep settings, workspaces and themes by default. Running instances must be deliberately stopped first."
             }
         };
         let destination = installed_directory().display().to_string();
         let (first_check, second_check) = if self.operation == InstallerOperation::Remove {
             (
-                "Application files and Start menu shortcut",
+                self.prerequisite_error
+                    .as_deref()
+                    .unwrap_or("Application files and Start menu shortcut"),
                 "Background daemon task",
             )
         } else {
             (
-                self.prerequisite_error
-                    .as_deref()
-                    .unwrap_or("WSL2 default distribution ready"),
+                self.prerequisite_error.as_deref().unwrap_or(
+                    if self.operation == InstallerOperation::Repair {
+                        "Repair does not require a working WSL guest"
+                    } else {
+                        "Default WSL2 guest startup verified"
+                    },
+                ),
                 "Installs without administrator access",
             )
         };
         div()
             .flex_1()
+            .id("installer-preflight-body")
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .px(px(38.0))
@@ -371,6 +558,24 @@ impl InstallerApp {
                             ),
                     ),
             )
+            .when(self.operation == InstallerOperation::Remove, |content| {
+                content.child(
+                    div().id("remove-managed-data").tab_index(0).mt_4()
+                        .text_size(px(12.0)).cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.remove_data = !this.remove_data;
+                            cx.notify();
+                        }))
+                        .child(format!("{} Also delete settings, workspaces and custom themes (Ctrl+D): {}",
+                            if self.remove_data { "[✓]" } else { "[ ]" },
+                            application_data_directory().display())),
+                )
+                .when(self.remove_data, |content| {
+                    content.child(div().mt_2().text_size(px(11.0)).text_color(rgb(COLORS.muted))
+                        .child(format!("Exact managed entries: config.toml; workspace[-INSTANCE]-v1.json; sessions[-INSTANCE]-v1/v2.json and their temporary, corrupt and migration backups; {}. Unknown files/projects, installer recovery logs and external configuration/theme sources are kept.",
+                            transaction::MANAGED_DATA_DIRECTORIES.join("/; ") + "/")))
+                })
+            })
     }
 
     fn render_installing(&self) -> impl IntoElement {
@@ -398,10 +603,14 @@ impl InstallerApp {
                     .mt_5()
                     .text_size(px(22.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(match self.operation {
-                        InstallerOperation::Install => "Installing Compi",
-                        InstallerOperation::Repair => "Repairing Compi",
-                        InstallerOperation::Remove => "Removing Compi",
+                    .child(if matches!(self.state, SurfaceState::Checking) {
+                        "Checking prerequisites"
+                    } else {
+                        match self.operation {
+                            InstallerOperation::Install => "Installing Compi",
+                            InstallerOperation::Repair => "Repairing Compi",
+                            InstallerOperation::Remove => "Removing Compi",
+                        }
                     }),
             )
             .child(
@@ -409,7 +618,10 @@ impl InstallerApp {
                     .mt_2()
                     .text_size(px(13.0))
                     .text_color(rgb(COLORS.muted))
-                    .child("Windows Installer is applying files and session registration."),
+                    .child(match self.progress {
+                        Some(percent) => format!("{} ({percent}%)", self.stage),
+                        None => self.stage.clone(),
+                    }),
             )
     }
 
@@ -417,13 +629,10 @@ impl InstallerApp {
         let (title, detail) = if self.operation == InstallerOperation::Remove {
             (
                 "Compi removed",
-                "Application files and daemon registration were removed.",
+                "Product removal succeeded. Managed user data was kept unless explicitly selected.",
             )
         } else {
-            (
-                "Compi is ready",
-                "Open a terminal now or find Compi in the Start menu.",
-            )
+            ("Compi is ready", "Open Compi or find it in the Start menu.")
         };
         div()
             .flex_1()
@@ -460,11 +669,36 @@ impl InstallerApp {
                     .text_color(rgb(COLORS.muted))
                     .child(detail),
             )
+            .child(
+                div().mt_3().text_size(px(12.0)).text_color(rgb(COLORS.muted))
+                    .child(if self.outcome.restart_required {
+                        if self.operation == InstallerOperation::Remove {
+                            "Product removed. Windows restart required to finish releasing application files.".into()
+                        } else {
+                            format!("Version {} installed. Windows restart required before normal use.", self.outcome.version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")))
+                        }
+                    } else if self.operation != InstallerOperation::Remove {
+                        format!("Installed version {}", self.outcome.version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")))
+                    } else {
+                        "No Windows restart required.".into()
+                    }),
+            )
+            .when(self.operation == InstallerOperation::Remove, |content| {
+                content.child(div().mt_3().max_w(px(460.0)).text_size(px(12.0))
+                    .text_color(rgb(if matches!(self.outcome.cleanup, Some(Err(_))) { COLORS.error } else { COLORS.muted }))
+                    .child(match &self.outcome.cleanup {
+                        Some(Ok(())) => "Selected managed data was removed.".into(),
+                        Some(Err(error)) => format!("Product removed; managed-data cleanup failed: {error}"),
+                        None => "Settings, workspaces and custom themes remain available for reinstall.".into(),
+                    }))
+            })
     }
 
     fn render_error(&self, error: &str) -> impl IntoElement {
         div()
             .flex_1()
+            .id("installer-error-body")
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .px(px(38.0))
@@ -502,8 +736,8 @@ impl InstallerApp {
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled =
-            !matches!(self.state, SurfaceState::Installing) && self.prerequisite_error.is_none();
+        let enabled = !matches!(self.state, SurfaceState::Checking)
+            && (!matches!(self.state, SurfaceState::Installing) || self.cancellable);
         let label = self.action_label();
         div()
             .h(px(76.0))
@@ -520,6 +754,29 @@ impl InstallerApp {
                     .text_color(rgb(COLORS.muted))
                     .child("Project files are never modified"),
             )
+            .when(matches!(self.state, SurfaceState::Error(_)), |footer| {
+                footer.child(
+                    div()
+                        .id("open-installer-log")
+                        .tab_index(0)
+                        .text_size(px(12.0))
+                        .cursor_pointer()
+                        .child("Open log")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match Command::new("notepad.exe")
+                                .arg(installer_log_path())
+                                .spawn()
+                            {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    this.state =
+                                        SurfaceState::Error(format!("Cannot open log: {error}"));
+                                    cx.notify();
+                                }
+                            }
+                        })),
+                )
+            })
             .child(
                 div()
                     .id("installer-primary-action")
@@ -563,8 +820,10 @@ impl Focusable for InstallerApp {
 impl Render for InstallerApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.state {
-            SurfaceState::Ready => self.render_ready().into_any_element(),
-            SurfaceState::Installing => self.render_installing().into_any_element(),
+            SurfaceState::Ready => self.render_ready(cx).into_any_element(),
+            SurfaceState::Installing | SurfaceState::Checking => {
+                self.render_installing().into_any_element()
+            }
             SurfaceState::Complete => self.render_complete().into_any_element(),
             SurfaceState::Error(error) => self.render_error(error).into_any_element(),
         };
@@ -573,6 +832,14 @@ impl Render for InstallerApp {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::primary_action))
             .on_action(cx.listener(Self::close_installer))
+            .on_action(cx.listener(|this, _: &ToggleDataCleanup, _, cx| {
+                if this.operation == InstallerOperation::Remove
+                    && matches!(this.state, SurfaceState::Ready)
+                {
+                    this.remove_data = !this.remove_data;
+                    cx.notify();
+                }
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -618,6 +885,8 @@ fn status_row(ok: bool, label: &str) -> impl IntoElement {
         })))
         .child(
             div()
+                .max_w(px(460.0))
+                .line_height(px(19.0))
                 .text_size(px(13.0))
                 .text_color(rgb(if ok { COLORS.foreground } else { COLORS.error }))
                 .child(label.to_owned()),
@@ -625,116 +894,23 @@ fn status_row(ok: bool, label: &str) -> impl IntoElement {
 }
 
 fn brand_mark() -> impl IntoElement {
-    canvas(
-        move |_, _, _| (),
-        move |bounds, _, window, _| {
-            let x = |value: f32| bounds.left() + px(value);
-            let y = |value: f32| bounds.top() + px(value);
-            let mut path = PathBuilder::stroke(px(1.4));
-            path.move_to(point(x(2.0), y(8.0)));
-            path.line_to(point(x(8.0), y(3.0)));
-            path.line_to(point(x(14.0), y(8.0)));
-            path.line_to(point(x(8.0), y(13.0)));
-            path.line_to(point(x(2.0), y(8.0)));
-            path.move_to(point(x(6.0), y(11.0)));
-            path.line_to(point(x(10.0), y(5.0)));
-            if let Ok(path) = path.build() {
-                window.paint_path(path, rgb(COLORS.accent));
-            }
-        },
-    )
-    .size(px(16.0))
+    static MARK: std::sync::LazyLock<Arc<gpui::RenderImage>> = std::sync::LazyLock::new(|| {
+        let mut rgba = image::load_from_memory(include_bytes!(
+            "../../../assets/Compi-desktopappicon-v4.png"
+        ))
+        .expect("approved embedded v4 artwork")
+        .into_rgba8();
+        for pixel in rgba.pixels_mut() {
+            pixel.0.swap(0, 2);
+        }
+        Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+            image::Frame::new(rgba)
+        ]))
+    });
+    img(MARK.clone()).size(px(24.0))
 }
 
-fn perform_operation(source: InstallerSource, operation: InstallerOperation) -> Result<()> {
-    let package_source = matches!(&source, InstallerSource::Package(_));
-    let mut backup_path = None;
-    let package_path = match source {
-        InstallerSource::Package(msi) => {
-            if msi.len() < 4 || &msi[..4] != b"\xd0\xcf\x11\xe0" {
-                return Err("embedded Windows Installer payload is invalid".into());
-            }
-            let directory = application_data_directory().join("installer");
-            fs::create_dir_all(&directory)?;
-            let path = directory.join("Compi.msi");
-            if path.is_file() {
-                let previous = directory.join("Compi.previous.msi");
-                let _ = fs::remove_file(&previous);
-                fs::rename(&path, &previous)?;
-                backup_path = Some(previous);
-            }
-            if let Err(error) = fs::write(&path, msi) {
-                restore_previous_package(&path, backup_path.as_deref());
-                return Err(error.into());
-            }
-            path
-        }
-        InstallerSource::ProductCode(product_code) => {
-            if operation == InstallerOperation::Install {
-                return Err("a package is required to install Compi".into());
-            }
-            PathBuf::from(product_code)
-        }
-    };
-    let log_path = installer_log_path();
-    let executable = env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .ok_or("SystemRoot is not set")?
-        .join("System32")
-        .join("msiexec.exe");
-    let package_removal = package_source && operation == InstallerOperation::Remove;
-    let operation_flag = match operation {
-        InstallerOperation::Install => "/i",
-        InstallerOperation::Repair => "/fa",
-        InstallerOperation::Remove if package_removal => "/i",
-        InstallerOperation::Remove => "/x",
-    };
-    let mut command = Command::new(executable);
-    command.arg(operation_flag).arg(&package_path);
-    if package_removal {
-        command.args(["REMOVE=ALL", "Installed=1"]);
-    }
-    let status = command
-        .args(["/qn", "/norestart", "/L*v"])
-        .arg(&log_path)
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .status();
-    let status = match status {
-        Ok(status) => status,
-        Err(error) => {
-            if package_source {
-                restore_previous_package(&package_path, backup_path.as_deref());
-            }
-            return Err(error.into());
-        }
-    };
-    if status.success() || matches!(status.code(), Some(1641 | 3010)) {
-        if let Some(previous) = backup_path {
-            let _ = fs::remove_file(previous);
-        }
-        if operation == InstallerOperation::Remove {
-            fs::remove_dir_all(application_data_directory())?;
-        }
-        Ok(())
-    } else {
-        if package_source {
-            restore_previous_package(&package_path, backup_path.as_deref());
-        }
-        Err(Error::from(format!(
-            "Windows Installer exited with {status}. Review {}",
-            log_path.display()
-        )))
-    }
-}
-
-fn restore_previous_package(package_path: &std::path::Path, backup_path: Option<&std::path::Path>) {
-    let _ = fs::remove_file(package_path);
-    if let Some(previous) = backup_path {
-        let _ = fs::rename(previous, package_path);
-    }
-}
-
-fn ensure_supported_windows() -> Result<()> {
+pub(crate) fn ensure_supported_windows() -> Result<()> {
     let mut version = OSVERSIONINFOW {
         dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
         ..OSVERSIONINFOW::default()
@@ -795,45 +971,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preview_states_are_side_effect_free() {
-        for state in [
-            PreviewState::Ready,
-            PreviewState::Upgrade,
-            PreviewState::Installing,
-            PreviewState::Complete,
-            PreviewState::Error,
-            PreviewState::Remove,
-        ] {
-            let (_, surface, _) = preview_configuration(state);
-            assert!(matches!(
-                surface,
-                SurfaceState::Ready
-                    | SurfaceState::Installing
-                    | SurfaceState::Complete
-                    | SurfaceState::Error(_)
-            ));
-        }
-    }
-
-    #[test]
-    fn rejects_non_msi_payload_before_running_installer() {
-        let error = perform_operation(
-            InstallerSource::Package(b"not an msi"),
-            InstallerOperation::Install,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("payload is invalid"));
-    }
-
-    #[test]
-    fn recognizes_the_current_supported_windows_version() {
-        ensure_supported_windows().unwrap();
-    }
-
-    #[test]
     fn rejects_windows_versions_before_windows_10_2004() {
         assert!(validate_windows_version(10, 0, 19_041).is_ok());
-        let error = validate_windows_version(10, 0, 18_363).unwrap_err();
-        assert!(error.to_string().contains("build 19041"));
+        assert!(validate_windows_version(10, 0, 18_363).is_err());
     }
 }

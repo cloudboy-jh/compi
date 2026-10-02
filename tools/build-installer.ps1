@@ -4,7 +4,8 @@ param(
     [string]$SigningCertificateThumbprint,
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
     [string]$ExpectedTag,
-    [switch]$RequireSigning
+    [switch]$RequireSigning,
+    [switch]$RequireUpdateKey
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +27,17 @@ if ($ExpectedTag -and $ExpectedTag -ne "v$version") {
 }
 if ($RequireSigning -and -not $SigningCertificateThumbprint) {
     throw 'A signing certificate thumbprint is required for this release build'
+}
+if ($RequireUpdateKey -and -not $env:COMPI_UPDATE_PUBLIC_KEY) {
+    throw 'Trusted public updates require COMPI_UPDATE_PUBLIC_KEY at compile time'
+}
+if (-not $env:COMPI_UPDATE_PUBLIC_KEY) {
+    Write-Warning 'Dogfood build: public updater disabled (no verification key configured)'
+}
+if ($env:COMPI_UPDATE_PUBLIC_KEY) {
+    try { $updateKey = [Convert]::FromBase64String($env:COMPI_UPDATE_PUBLIC_KEY) }
+    catch { throw 'COMPI_UPDATE_PUBLIC_KEY must be valid base64' }
+    if ($updateKey.Length -ne 32) { throw 'COMPI_UPDATE_PUBLIC_KEY must encode a 32-byte Ed25519 public key' }
 }
 $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
 $signTool = $null
@@ -60,6 +72,20 @@ function Assert-FileVersion {
     }
 }
 
+function Get-PayloadComponentGuid {
+    param([Parameter(Mandatory)] [string]$Name)
+
+    # A component GUID must change when its versioned installation directory changes.
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("compi/payload/$script:version/$Name"))
+        return [guid]::new([byte[]]$hash[0..15]).ToString('B').ToUpperInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
 $installerRoot = Join-Path $projectRoot 'target\installer'
 $productTarget = Join-Path $installerRoot 'product'
 $productBin = Join-Path $productTarget 'release'
@@ -74,6 +100,11 @@ $setupName = "Compi-$version-Setup.exe"
 $setupDestination = Join-Path $OutputDirectory $setupName
 $portableName = "Compi-$version-Windows-x64.zip"
 $portableDestination = Join-Path $OutputDirectory $portableName
+$updateName = "Compi-$version-Windows-x64-update.zip"
+$updateDestination = Join-Path $OutputDirectory $updateName
+$launcherSource = Join-Path $productBin 'compi-launcher.exe'
+$helperSource = Join-Path $productBin 'compi-update-worker.exe'
+$portableStaging = Join-Path $installerRoot ('portable-' + [guid]::NewGuid().ToString('N'))
 
 if (-not $env:GPUI_FXC_PATH) {
     $fxc = Get-ChildItem -Path $sdkRoot -Filter fxc.exe -File -Recurse |
@@ -94,10 +125,12 @@ try {
 
     & (Join-Path $PSScriptRoot 'prepare-conpty.ps1') -Architecture x64
 
-    & cargo build --locked --release -p compi-client -p compi-daemon --bins --target-dir $productTarget
+    & cargo build --locked --release -p compi-client -p compi-daemon -p compi-update --bins --target-dir $productTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi product binaries' }
     Assert-FileVersion (Join-Path $productBin 'compi.exe')
     Assert-FileVersion (Join-Path $productBin 'compi-daemon.exe')
+    Assert-FileVersion $launcherSource
+    Assert-FileVersion $helperSource
     foreach ($runtimeFile in @('conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt')) {
         if (-not (Test-Path -LiteralPath (Join-Path $productBin $runtimeFile) -PathType Leaf)) {
             throw "Missing bundled runtime '$runtimeFile' in '$productBin'. Rerun tools/prepare-conpty.ps1 and rebuild the daemon before packaging."
@@ -105,6 +138,8 @@ try {
     }
     Invoke-SignArtifact (Join-Path $productBin 'compi.exe')
     Invoke-SignArtifact (Join-Path $productBin 'compi-daemon.exe')
+    Invoke-SignArtifact $launcherSource
+    Invoke-SignArtifact $helperSource
     & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $maintenanceTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build the installed Compi maintenance surface' }
     Assert-FileVersion $maintenanceSource
@@ -116,6 +151,15 @@ try {
         -d "BinDir=$productBin" `
         -d "ProjectDir=$projectRoot" `
         -d "MaintenanceExe=$maintenanceSource" `
+        -d "LauncherExe=$launcherSource" `
+        -d "HelperExe=$helperSource" `
+        -d "PayloadClientGuid=$(Get-PayloadComponentGuid 'Client')" `
+        -d "PayloadDaemonGuid=$(Get-PayloadComponentGuid 'Daemon')" `
+        -d "PayloadWorkerGuid=$(Get-PayloadComponentGuid 'Worker')" `
+        -d "PayloadConptyGuid=$(Get-PayloadComponentGuid 'Conpty')" `
+        -d "PayloadOpenConsoleGuid=$(Get-PayloadComponentGuid 'OpenConsole')" `
+        -d "PayloadConptyLicenseGuid=$(Get-PayloadComponentGuid 'ConptyLicense')" `
+        -d "PayloadLicenseGuid=$(Get-PayloadComponentGuid 'License')" `
         -o $msiPath
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi.msi' }
 
@@ -131,20 +175,28 @@ try {
 
     Copy-Item -Force $setupSource $setupDestination
 
-    if (Test-Path $portableDestination) {
-        Remove-Item -Force $portableDestination
+    New-Item -ItemType Directory -Force -Path $portableStaging | Out-Null
+    $versionDirectory = Join-Path $portableStaging "versions\$version"
+    New-Item -ItemType Directory -Force -Path $versionDirectory | Out-Null
+    foreach ($file in @('compi.exe', 'compi-daemon.exe', 'compi-update-worker.exe', 'conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt')) {
+        Copy-Item -LiteralPath (Join-Path $productBin $file) -Destination $versionDirectory
     }
-    Compress-Archive -Path @(
-        (Join-Path $productBin 'compi.exe'),
-        (Join-Path $productBin 'compi-daemon.exe'),
-        (Join-Path $productBin 'conpty.dll'),
-        (Join-Path $productBin 'OpenConsole.exe'),
-        (Join-Path $productBin 'ConPTY-LICENSE.txt'),
-        (Join-Path $projectRoot 'LICENSE')
-    ) -DestinationPath $portableDestination
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $versionDirectory
+    Copy-Item -LiteralPath $launcherSource -Destination (Join-Path $portableStaging 'compi.exe')
+    Copy-Item -LiteralPath $helperSource -Destination $portableStaging
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $portableStaging
+    [System.IO.File]::WriteAllText((Join-Path $portableStaging 'selection.json'),
+        (@{schema = 1; version = $version; task_version = $version} | ConvertTo-Json -Compress),
+        [System.Text.UTF8Encoding]::new($false))
+    # The updater consumes the complete payload, not the stable launch wrapper.
+    foreach ($destination in @($portableDestination, $updateDestination)) {
+        if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }
+    }
+    Compress-Archive -Path (Join-Path $portableStaging '*') -DestinationPath $portableDestination
+    Compress-Archive -Path (Join-Path $versionDirectory '*') -DestinationPath $updateDestination
 
     $checksumPath = Join-Path $OutputDirectory 'SHA256SUMS.txt'
-    $checksums = foreach ($artifact in @($setupDestination, $portableDestination)) {
+    $checksums = foreach ($artifact in @($setupDestination, $portableDestination, $updateDestination)) {
         $sha256 = [System.Security.Cryptography.SHA256]::Create()
         $stream = [System.IO.File]::OpenRead($artifact)
         try {
@@ -165,9 +217,11 @@ try {
 
     Write-Host "Setup: $setupDestination"
     Write-Host "Portable: $portableDestination"
+    Write-Host "Update payload: $updateDestination"
     Write-Host "Checksums: $checksumPath"
 }
 finally {
     Pop-Location
     Remove-Item -Force -ErrorAction SilentlyContinue $payloadPath
+    if (Test-Path -LiteralPath $portableStaging) { Remove-Item -LiteralPath $portableStaging -Recurse -Force }
 }

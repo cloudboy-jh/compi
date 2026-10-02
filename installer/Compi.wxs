@@ -8,25 +8,26 @@
     Compressed="yes">
 
     <SummaryInformation Description="Compi persistent WSL terminal" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Compi is already installed." />
+    <MajorUpgrade Schedule="afterInstallExecute" DowngradeErrorMessage="A newer version of Compi is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="CompiIcon" SourceFile="$(var.ProjectDir)\assets\Compi-desktopappicon-v4.ico" />
     <Property Id="ARPPRODUCTICON" Value="CompiIcon" />
     <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <Property Id="REBOOT" Value="ReallySuppress" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Compi">
           <Component Id="ProductFiles" Guid="{6CCA75E9-042A-408A-9F8F-4CF30DE24843}">
-            <File Id="CompiExe" Source="$(var.BinDir)\compi.exe" />
-            <File Id="DaemonExe" Source="$(var.BinDir)\compi-daemon.exe" />
+            <File Id="CompiExe" Source="$(var.LauncherExe)" Name="compi.exe" />
+            <File Id="UpdateWorkerExe" Name="compi-update-worker.exe" Source="$(var.HelperExe)" />
             <File Id="MaintenanceExe" Name="Compi-Setup.exe" Source="$(var.MaintenanceExe)" />
-            <File Id="ConptyDll" Source="$(var.BinDir)\conpty.dll" />
-            <File Id="OpenConsoleExe" Source="$(var.BinDir)\OpenConsole.exe" />
-            <File Id="ConptyLicense" Source="$(var.BinDir)\ConPTY-LICENSE.txt" />
             <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
             <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+            <RemoveFolder Id="RemovePayloadFolder" Directory="PayloadFolder" On="uninstall" />
+            <RemoveFolder Id="RemoveVersionsFolder" Directory="VersionsFolder" On="uninstall" />
+            <RemoveRegistryKey Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Action="removeOnUninstall" />
             <RegistryValue
               Root="HKCU"
               Key="Software\Compi"
@@ -45,6 +46,40 @@
             <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="NoRepair" Type="integer" Value="0" />
             <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="WindowsInstaller" Type="integer" Value="0" />
           </Component>
+          <Directory Id="VersionsFolder" Name="versions">
+            <Directory Id="PayloadFolder" Name="$(var.Version)">
+              <!-- Running older generations remain runnable across upgrade and rollback.
+                   The guarded product removal action deletes only this managed payload tree. -->
+              <Component Id="PayloadClient" Guid="$(var.PayloadClientGuid)" Permanent="yes">
+                <File Id="PayloadClientExe" Source="$(var.BinDir)\compi.exe" />
+                <RegistryValue Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Name="Client" Type="integer" Value="1" KeyPath="yes" />
+              </Component>
+              <Component Id="PayloadDaemon" Guid="$(var.PayloadDaemonGuid)" Permanent="yes">
+                <File Id="DaemonExe" Source="$(var.BinDir)\compi-daemon.exe" />
+                <RegistryValue Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Name="Daemon" Type="integer" Value="1" KeyPath="yes" />
+              </Component>
+              <Component Id="PayloadWorker" Guid="$(var.PayloadWorkerGuid)" Permanent="yes">
+                <File Id="PayloadWorkerExe" Source="$(var.HelperExe)" />
+                <RegistryValue Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Name="Worker" Type="integer" Value="1" KeyPath="yes" />
+              </Component>
+              <Component Id="PayloadConpty" Guid="$(var.PayloadConptyGuid)" Permanent="yes">
+                <File Id="ConptyDll" Source="$(var.BinDir)\conpty.dll" />
+                <RegistryValue Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Name="Conpty" Type="integer" Value="1" KeyPath="yes" />
+              </Component>
+              <Component Id="PayloadOpenConsole" Guid="$(var.PayloadOpenConsoleGuid)" Permanent="yes">
+                <File Id="OpenConsoleExe" Source="$(var.BinDir)\OpenConsole.exe" />
+                <RegistryValue Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Name="OpenConsole" Type="integer" Value="1" KeyPath="yes" />
+              </Component>
+              <Component Id="PayloadConptyLicense" Guid="$(var.PayloadConptyLicenseGuid)" Permanent="yes">
+                <File Id="ConptyLicense" Source="$(var.BinDir)\ConPTY-LICENSE.txt" />
+                <RegistryValue Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Name="ConptyLicense" Type="integer" Value="1" KeyPath="yes" />
+              </Component>
+              <Component Id="PayloadLicense" Guid="$(var.PayloadLicenseGuid)" Permanent="yes">
+                <File Id="ProductLicense" Source="$(var.ProjectDir)\LICENSE" />
+                <RegistryValue Root="HKCU" Key="Software\Compi\Payloads\$(var.Version)" Name="License" Type="integer" Value="1" KeyPath="yes" />
+              </Component>
+            </Directory>
+          </Directory>
         </Directory>
       </Directory>
     </StandardDirectory>
@@ -72,59 +107,48 @@
 
     <Feature Id="MainFeature" Title="Compi" Level="1">
       <ComponentRef Id="ProductFiles" />
+      <ComponentRef Id="PayloadClient" />
+      <ComponentRef Id="PayloadDaemon" />
+      <ComponentRef Id="PayloadWorker" />
+      <ComponentRef Id="PayloadConpty" />
+      <ComponentRef Id="PayloadOpenConsole" />
+      <ComponentRef Id="PayloadConptyLicense" />
+      <ComponentRef Id="PayloadLicense" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
 
-    <CustomAction
-      Id="StopCompiDaemon"
-      FileRef="DaemonExe"
-      ExeCommand="--shutdown"
-      Execute="deferred"
-      Impersonate="yes"
-      Return="check" />
-    <CustomAction
-      Id="WriteCompiTaskXml"
-      FileRef="DaemonExe"
-      ExeCommand="--write-task-xml &quot;[INSTALLFOLDER]daemon-task.xml&quot; &quot;[UserSID]&quot;"
-      Execute="deferred"
-      Impersonate="yes"
-      Return="check" />
-    <CustomAction
-      Id="RemoveCompiTask"
-      Directory="SystemFolder"
-      ExeCommand="schtasks.exe /Delete /TN &quot;Compi Daemon&quot; /F"
-      Execute="deferred"
-      Impersonate="yes"
-      Return="ignore" />
-    <CustomAction
-      Id="RegisterCompiTask"
-      Directory="SystemFolder"
-      ExeCommand="schtasks.exe /Create /TN &quot;Compi Daemon&quot; /XML &quot;[INSTALLFOLDER]daemon-task.xml&quot; /F"
-      Execute="deferred"
-      Impersonate="yes"
-      Return="check" />
-    <CustomAction
-      Id="RollbackCompiTask"
-      Directory="SystemFolder"
-      ExeCommand="schtasks.exe /Delete /TN &quot;Compi Daemon&quot; /F"
-      Execute="rollback"
-      Impersonate="yes"
-      Return="ignore" />
-    <CustomAction
-      Id="CleanupCompiTaskXml"
-      FileRef="DaemonExe"
-      ExeCommand="--remove-task-xml &quot;[INSTALLFOLDER]daemon-task.xml&quot;"
-      Execute="deferred"
-      Impersonate="yes"
-      Return="ignore" />
-
+    <Binary Id="MaintenanceActions" SourceFile="$(var.MaintenanceExe)" />
+    <!-- Both raw MSI and Setup enforce this before the old MSI can execute removal.
+         Unknown legacy live work is deferred, never implicitly ended. -->
+    <CustomAction Id="GuardInstall" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-guard-install &quot;[INSTALLFOLDER].&quot; &quot;$(var.Version)&quot;" Execute="immediate" Return="check" />
+    <CustomAction Id="GuardRemove" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-guard-remove &quot;[INSTALLFOLDER].&quot;" Execute="immediate" Return="check" />
+    <CustomAction Id="GuardLegacyRemoval" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-guard-install &quot;[INSTALLFOLDER].&quot; &quot;$(var.Version)&quot;" Execute="immediate" Return="check" />
+    <CustomAction Id="SnapshotCompiRegistration" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-snapshot &quot;[INSTALLFOLDER].&quot; &quot;[COMPI_WRAPPER_ROOT]&quot;" Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="RollbackCompiRegistration" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-rollback &quot;[INSTALLFOLDER].&quot; &quot;[COMPI_WRAPPER_ROOT]&quot;" Execute="rollback" Impersonate="yes" Return="check" />
+    <CustomAction Id="ActivateCompiPayload" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-activate &quot;[INSTALLFOLDER].&quot; &quot;$(var.Version)&quot; &quot;[UserSID]&quot; &quot;[COMPI_WRAPPER_ROOT]&quot;"
+      Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="RemoveCompiTask" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-remove-task &quot;[INSTALLFOLDER].&quot; &quot;[COMPI_WRAPPER_ROOT]&quot;" Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="CleanupCompiPayload" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-clean-product &quot;[INSTALLFOLDER].&quot; &quot;[COMPI_WRAPPER_ROOT]&quot;" Execute="commit" Impersonate="yes" Return="check" />
+    <CustomAction Id="CompleteCompiTransaction" BinaryRef="MaintenanceActions"
+      ExeCommand="--msi-complete &quot;[INSTALLFOLDER].&quot; &quot;[COMPI_WRAPPER_ROOT]&quot;" Execute="commit" Impersonate="yes" Return="check" />
     <InstallExecuteSequence>
-      <Custom Action="StopCompiDaemon" Before="RemoveCompiTask" Condition="REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="RemoveCompiTask" Before="CleanupCompiTaskXml" Condition="REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="CleanupCompiTaskXml" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="WriteCompiTaskXml" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="RollbackCompiTask" After="WriteCompiTaskXml" Condition="NOT REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="RegisterCompiTask" After="RollbackCompiTask" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="GuardInstall" Before="InstallInitialize" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="GuardRemove" Before="InstallInitialize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RollbackCompiRegistration" After="InstallInitialize" Condition="NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="SnapshotCompiRegistration" After="RollbackCompiRegistration" Condition="NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="GuardLegacyRemoval" Before="RemoveExistingProducts" Condition="WIX_UPGRADE_DETECTED" />
+      <Custom Action="RemoveCompiTask" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="CleanupCompiPayload" After="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="ActivateCompiPayload" After="RemoveExistingProducts" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="CompleteCompiTransaction" After="ActivateCompiPayload" Condition="NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

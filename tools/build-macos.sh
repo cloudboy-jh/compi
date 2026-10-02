@@ -2,10 +2,13 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: bash tools/build-macos.sh [--expected-tag v<workspace-version>]\n'
+    printf 'Usage: bash tools/build-macos.sh [--expected-tag v<workspace-version>] [--require-signing] [--require-update-key] [--output DIR]\n'
 }
 
 expected_tag=''
+require_signing=false
+require_update_key=false
+output=''
 while (($#)); do
     case "$1" in
         --expected-tag)
@@ -16,6 +19,16 @@ while (($#)); do
             expected_tag=$2
             shift 2
             ;;
+        --output)
+            if (($# < 2)) || [[ -z "$2" ]]; then
+                printf '%s\n' '--output requires a directory' >&2
+                exit 2
+            fi
+            output=$2
+            shift 2
+            ;;
+        --require-signing) require_signing=true; shift ;;
+        --require-update-key) require_update_key=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -48,13 +61,44 @@ if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
     exit 1
 fi
 
+signing_identity=${COMPI_MACOS_SIGNING_IDENTITY:-}
+notary_profile=${COMPI_MACOS_NOTARY_PROFILE:-}
+notary_arguments=(--keychain-profile "$notary_profile")
+if [[ -n "${COMPI_MACOS_NOTARY_KEYCHAIN:-}" ]]; then
+    notary_arguments+=(--keychain "$COMPI_MACOS_NOTARY_KEYCHAIN")
+fi
+if [[ -n "$signing_identity" && -z "$notary_profile" ]] || [[ -z "$signing_identity" && -n "$notary_profile" ]]; then
+    printf 'Configure both COMPI_MACOS_SIGNING_IDENTITY and COMPI_MACOS_NOTARY_PROFILE, or neither.\n' >&2
+    exit 1
+fi
+if $require_signing && [[ -z "$signing_identity" ]]; then
+    printf 'This signed build requires Developer ID signing and a notarytool keychain profile.\n' >&2
+    exit 1
+fi
+if $require_update_key && [[ -z "${COMPI_UPDATE_PUBLIC_KEY:-}" ]]; then
+    printf 'Trusted public updates require COMPI_UPDATE_PUBLIC_KEY at compile time.\n' >&2
+    exit 1
+fi
+if [[ -z "${COMPI_UPDATE_PUBLIC_KEY:-}" ]]; then
+    printf 'Dogfood build: public updater disabled (no verification key configured).\n' >&2
+fi
+if [[ -n "${COMPI_UPDATE_PUBLIC_KEY:-}" ]]; then
+    python3 - <<'PYTHON'
+import base64
+import os
+key = base64.b64decode(os.environ["COMPI_UPDATE_PUBLIC_KEY"], validate=True)
+if len(key) != 32:
+    raise SystemExit("COMPI_UPDATE_PUBLIC_KEY must encode a 32-byte Ed25519 public key")
+PYTHON
+fi
+
 # GPUI 0.2.2 build.rs targets 10.15.7 for Metal, not the entire app.
 # The repository's native client build lane is macos-14; use that evidenced
 # baseline rather than claiming unqualified compatibility with macOS 11-13.
 export MACOSX_DEPLOYMENT_TARGET=14.0
 target=aarch64-apple-darwin
 build_root="$project_root/target/macos-release"
-output="$project_root/target/distribution"
+output=${output:-"$project_root/target/distribution"}
 mkdir -p "$build_root" "$output"
 staging=$(mktemp -d "$build_root/staging.XXXXXX")
 cleanup() {
@@ -67,13 +111,13 @@ trap 'exit 143' TERM
 
 cd "$project_root"
 cargo build --locked --release --target "$target" --target-dir "$build_root/product" \
-    -p compi-client -p compi-daemon --bins
+    -p compi-client -p compi-daemon -p compi-update --bins
 
 app="$staging/image/Compi.app"
 macos="$app/Contents/MacOS"
 resources="$app/Contents/Resources"
 mkdir -p "$macos" "$resources"
-for executable in compi compi-daemon; do
+for executable in compi compi-daemon compi-update-worker; do
     source="$build_root/product/$target/release/$executable"
     [[ -x "$source" ]] || { printf 'Missing executable: %s\n' "$source" >&2; exit 1; }
     [[ $(lipo -archs "$source") == arm64 ]] || { printf 'Not ARM64: %s\n' "$source" >&2; exit 1; }
@@ -118,19 +162,44 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$app/Contents/Info.plist"
 
-# Sign nested code first, then seal the finished bundle. This is ad-hoc signing
-# for executable integrity, NOT Developer ID signing or Gatekeeper approval.
-codesign --force --sign - --timestamp=none "$macos/compi-daemon"
-codesign --force --sign - --timestamp=none "$app"
+# Seal every nested executable before the bundle. Developer ID uses hardened runtime
+# and secure timestamps; ad-hoc signatures do not establish Gatekeeper trust.
+if [[ -n "$signing_identity" ]]; then
+    for executable in "$macos/"*; do
+        codesign --force --options runtime --timestamp --sign "$signing_identity" "$executable"
+    done
+    codesign --force --options runtime --timestamp --sign "$signing_identity" "$app"
+else
+    printf 'Ad-hoc signatures; not notarized or Gatekeeper-qualified.\n' >&2
+    for executable in "$macos/"*; do
+        codesign --force --sign - --timestamp=none "$executable"
+    done
+    codesign --force --sign - --timestamp=none "$app"
+fi
 codesign --verify --deep --strict --verbose=2 "$app"
 
 zip_name="Compi-$version-macOS-arm64.app.zip"
 dmg_name="Compi-$version-macOS-arm64.dmg"
+if [[ -n "$signing_identity" ]]; then
+    # Submit the complete bundle, staple it, then regenerate the shipped ZIP.
+    ditto -c -k --sequesterRsrc --keepParent "$app" "$staging/notarization.zip"
+    xcrun notarytool submit "$staging/notarization.zip" "${notary_arguments[@]}" --wait
+    xcrun stapler staple "$app"
+    xcrun stapler validate "$app"
+    spctl --assess --type execute --verbose=4 "$app"
+fi
 ditto -c -k --sequesterRsrc --keepParent "$app" "$staging/$zip_name"
 ln -s /Applications "$staging/image/Applications"
 hdiutil create -volname "Compi $version" -srcfolder "$staging/image" \
     -format UDZO -fs HFS+ "$staging/$dmg_name"
 hdiutil verify "$staging/$dmg_name"
+if [[ -n "$signing_identity" ]]; then
+    codesign --force --timestamp --sign "$signing_identity" "$staging/$dmg_name"
+    xcrun notarytool submit "$staging/$dmg_name" "${notary_arguments[@]}" --wait
+    xcrun stapler staple "$staging/$dmg_name"
+    xcrun stapler validate "$staging/$dmg_name"
+    spctl --assess --type open --context context:primary-signature --verbose=4 "$staging/$dmg_name"
+fi
 (
     cd "$staging"
     shasum -a 256 "$zip_name" "$dmg_name" > SHA256SUMS.txt

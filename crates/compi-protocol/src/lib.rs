@@ -3,6 +3,7 @@ mod client;
 pub mod frame;
 #[cfg_attr(unix, path = "identity_unix.rs")]
 pub mod identity;
+mod lifecycle_inventory;
 pub mod paths;
 pub mod perf;
 pub mod pipe;
@@ -19,7 +20,9 @@ pub use screen::{
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub use client::{ClientIo, DaemonClient, DaemonError, ServerEvent};
+pub use client::{
+    ClientIo, ConnectionFailure, ConnectionFailureKind, DaemonClient, DaemonError, ServerEvent,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -108,6 +111,73 @@ pub struct TerminalTarget {
     pub identity: TerminalIdentity,
 }
 
+/// Versioned separately from the exact full-workspace protocol.
+pub const LIFECYCLE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveSurface {
+    pub surface_id: SurfaceId,
+    pub process_lifetime_id: ProcessLifetimeId,
+    pub status: SurfaceStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleStatus {
+    pub lifecycle_version: u32,
+    pub product_version: String,
+    pub protocol_version: u32,
+    pub daemon_pid: u32,
+    pub supervisor_pid: Option<u32>,
+    pub daemon_executable: String,
+    pub server_id: ServerId,
+    pub server_generation: ServerGeneration,
+    pub instance: Option<String>,
+    pub workspace_revision: u64,
+    pub connected_clients: Vec<u64>,
+    pub live_surfaces: Vec<LiveSurface>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleConsent {
+    pub server_id: ServerId,
+    pub server_generation: ServerGeneration,
+    pub workspace_revision: u64,
+    pub connected_clients: Vec<u64>,
+    pub live_surfaces: Vec<LiveSurface>,
+}
+
+impl LifecycleStatus {
+    pub fn consent(&self) -> LifecycleConsent {
+        LifecycleConsent {
+            server_id: self.server_id.clone(),
+            server_generation: self.server_generation.clone(),
+            workspace_revision: self.workspace_revision,
+            connected_clients: self.connected_clients.clone(),
+            live_surfaces: self.live_surfaces.clone(),
+        }
+    }
+}
+
+pub fn live_surface_inventory(workspace: &WorkspaceSnapshot) -> Vec<LiveSurface> {
+    let mut live: Vec<_> = workspace
+        .surfaces
+        .iter()
+        .filter(|surface| {
+            matches!(
+                surface.status,
+                SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
+            )
+        })
+        .map(|surface| LiveSurface {
+            surface_id: surface.id.clone(),
+            process_lifetime_id: surface.process_lifetime_id.clone(),
+            status: surface.status,
+        })
+        .collect();
+    live.sort_by(|a, b| a.surface_id.cmp(&b.surface_id));
+    live
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClientControl {
     pub request_id: u64,
@@ -122,6 +192,13 @@ pub struct ClientControl {
 pub enum ClientMessage {
     Hello {
         protocol_version: u32,
+    },
+    GetLifecycleStatus {
+        lifecycle_version: u32,
+    },
+    ConditionalStop {
+        lifecycle_version: u32,
+        consent: LifecycleConsent,
     },
     GetRuntimeMetrics,
     GetWorkspace,
@@ -186,6 +263,9 @@ pub struct ServerControl {
 pub enum ServerMessage {
     Hello {
         protocol_version: u32,
+    },
+    LifecycleStatus {
+        status: LifecycleStatus,
     },
     RuntimeMetrics {
         metrics: RuntimeMetrics,
