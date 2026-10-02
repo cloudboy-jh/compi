@@ -144,6 +144,33 @@ pub fn read_available(file: &File, buffer: &mut [u8]) -> Result<Option<usize>> {
             );
         }
         let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTSOCK) {
+            // SSH stdio is a pipe, not a Unix socket. Poll before read so the
+            // same bounded control path works for both authenticated transports.
+            let mut poll = libc::pollfd {
+                fd: file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+            if ready == 0 {
+                return Ok(None);
+            }
+            if ready < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            let read =
+                unsafe { libc::read(file.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read > 0 {
+                return Ok(Some(read as usize));
+            }
+            if read == 0 {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "stdio transport closed").into(),
+                );
+            }
+            return Err(io::Error::last_os_error().into());
+        }
         match error.kind() {
             io::ErrorKind::WouldBlock => return Ok(None),
             io::ErrorKind::Interrupted => {}
@@ -449,7 +476,11 @@ fn check_peer(stream: &std::os::unix::net::UnixStream) -> Result<()> {
         credentials.uid
     };
     if uid != unsafe { libc::geteuid() } {
-        return Err("local connection peer is not the current user".into());
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "local connection peer is not the current user",
+        )
+        .into());
     }
     Ok(())
 }
@@ -476,6 +507,28 @@ mod tests {
     use std::io::Write;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn ssh_stdio_pipe_polling_is_nonblocking_and_preserves_fragmented_frames() {
+        use std::os::fd::FromRawFd;
+        let mut descriptors = [0; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let receiver = File::from(unsafe { OwnedFd::from_raw_fd(descriptors[0]) });
+        let mut sender = File::from(unsafe { OwnedFd::from_raw_fd(descriptors[1]) });
+        let mut reader = PipeReader::default();
+        assert!(reader.poll(&receiver).unwrap().is_none());
+        sender.write_all(&[3, 0, 0, 0, 1, b'a']).unwrap();
+        assert!(reader.poll(&receiver).unwrap().is_none());
+        sender.write_all(b"bc").unwrap();
+        let frame = reader.poll(&receiver).unwrap().unwrap();
+        assert_eq!((frame.kind, frame.payload), (1, b"abc".to_vec()));
+        drop(sender);
+        let error = reader.poll(&receiver).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
 
     #[test]
     fn fragmented_frames_remain_ordered_and_peer_close_is_reported() {

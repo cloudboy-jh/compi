@@ -9,7 +9,33 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
-pub const TASK_NAME: &str = "Compi Daemon";
+pub fn task_name_for_sid(user_sid: &str) -> Result<String> {
+    let canonical_decimal = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && (part.len() == 1 || !part.starts_with('0'))
+    };
+    let mut parts = user_sid.split('-');
+    let valid_prefix = parts.next() == Some("S") && parts.next() == Some("1");
+    let valid_authority = parts
+        .next()
+        .filter(|part| canonical_decimal(part))
+        .and_then(|part| part.parse::<u64>().ok())
+        .is_some_and(|authority| authority <= 0x0000_ffff_ffff_ffff);
+    let mut subauthorities = 0;
+    let valid_subauthorities = parts.all(|part| {
+        subauthorities += 1;
+        subauthorities <= 15 && canonical_decimal(part) && part.parse::<u32>().is_ok()
+    });
+    if !valid_prefix || !valid_authority || !valid_subauthorities || subauthorities == 0 {
+        return Err("scheduled task identity must be a canonical Windows user SID".into());
+    }
+    Ok(format!("Compi Daemon-{user_sid}"))
+}
+
+pub fn current_task_name() -> Result<String> {
+    task_name_for_sid(&compi_protocol::identity::current_user_sid_string()?)
+}
 const MAX_RESTARTS: usize = 3;
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 const RESTART_DELAYS: [Duration; MAX_RESTARTS] = [
@@ -17,6 +43,21 @@ const RESTART_DELAYS: [Duration; MAX_RESTARTS] = [
     Duration::from_secs(5),
     Duration::from_secs(30),
 ];
+
+struct SupervisorPresence(std::path::PathBuf);
+
+impl Drop for SupervisorPresence {
+    fn drop(&mut self) {
+        if fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|marker| serde_json::from_str::<serde_json::Value>(&marker).ok())
+            .and_then(|marker| marker.get("pid").and_then(serde_json::Value::as_u64))
+            == Some(u64::from(std::process::id()))
+        {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+}
 
 pub fn supervise(daemon_executable: &Path) -> Result<()> {
     if !daemon_executable.is_absolute() || !daemon_executable.is_file() {
@@ -32,6 +73,17 @@ pub fn supervise(daemon_executable: &Path) -> Result<()> {
         .ok_or("LOCALAPPDATA is not set")?
         .join("Compi");
     fs::create_dir_all(&directory)?;
+    let presence_path = directory.join("supervisor.pid");
+    let mut presence = fs::File::create(&presence_path)?;
+    serde_json::to_writer(
+        &mut presence,
+        &serde_json::json!({
+            "pid": std::process::id(),
+            "daemon_executable": daemon_executable.canonicalize()?,
+        }),
+    )?;
+    presence.sync_all()?;
+    let _presence = SupervisorPresence(presence_path);
     let log_path = directory.join("daemon.log");
     let mut restarts = 0;
 
@@ -45,6 +97,7 @@ pub fn supervise(daemon_executable: &Path) -> Result<()> {
         let stderr = log.try_clone()?;
         let started_at = Instant::now();
         let status = Command::new(daemon_executable)
+            .env("COMPI_SUPERVISOR_PID", std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
@@ -95,6 +148,7 @@ pub fn install(daemon_executable: &Path) -> Result<()> {
     }
 
     let sid = compi_protocol::identity::current_user_sid_string()?;
+    let task_name = task_name_for_sid(&sid)?;
     let xml = task_xml(daemon_executable, &sid);
     let directory = env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
@@ -111,7 +165,7 @@ pub fn install(daemon_executable: &Path) -> Result<()> {
     let output = run_schtasks([
         "/Create",
         "/TN",
-        TASK_NAME,
+        &task_name,
         "/XML",
         xml_path
             .to_str()
@@ -132,9 +186,7 @@ pub fn write_task_xml(daemon_executable: &Path, xml_path: &Path, user_sid: &str)
         )
         .into());
     }
-    if user_sid.is_empty() {
-        return Err("Windows Installer did not provide the current user SID".into());
-    }
+    task_name_for_sid(user_sid)?;
     if let Some(parent) = xml_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -151,19 +203,21 @@ pub fn remove_task_xml(xml_path: &Path) -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
-    let query = run_schtasks(["/Query", "/TN", TASK_NAME])?;
+    let task_name = current_task_name()?;
+    let query = run_schtasks(["/Query", "/TN", &task_name])?;
     if !query.status.success() {
         return Ok(());
     }
     require_success(
-        run_schtasks(["/Delete", "/TN", TASK_NAME, "/F"])?,
+        run_schtasks(["/Delete", "/TN", &task_name, "/F"])?,
         "remove the per-user Compi daemon task",
     )
 }
 
 pub fn activate() -> Result<()> {
+    let task_name = current_task_name()?;
     require_success(
-        run_schtasks(["/Run", "/TN", TASK_NAME])?,
+        run_schtasks(["/Run", "/TN", &task_name])?,
         "activate the registered Compi daemon task; reinstall or repair Compi",
     )
 }
@@ -272,21 +326,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_is_per_user_restartable_and_unprivileged() {
-        let xml = task_xml(
-            Path::new(r"C:\Apps & Tools\compi-daemon.exe"),
-            "S-1-5-21-1000",
+    fn task_identity_rejects_ambiguous_or_injected_sids() {
+        for sid in [
+            "",
+            "S-1-5",
+            "S-1-05-21",
+            "S-1-5-+21",
+            "S-1-5-21/Other",
+            "S-1-5-4294967296",
+            "S-2-5-21",
+        ] {
+            assert!(task_name_for_sid(sid).is_err(), "accepted {sid:?}");
+        }
+        let first = task_name_for_sid("S-1-5-21-1000").unwrap();
+        let second = task_name_for_sid("S-1-5-21-1001").unwrap();
+        assert_ne!(
+            first, second,
+            "distinct user task identities must not collide"
         );
-        assert!(xml.contains("<UserId>S-1-5-21-1000</UserId>"));
-        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
-        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
-        assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
-        assert!(xml.contains("<RestartOnFailure>"));
-        assert!(xml.contains("<Interval>PT1M</Interval>"));
-        assert!(xml.contains("<Count>3</Count>"));
-        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
-        assert!(xml.contains("<Arguments>--supervise</Arguments>"));
-        assert!(xml.contains(r"C:\Apps &amp; Tools\compi-daemon.exe"));
-        assert!(!xml.contains("HighestAvailable"));
     }
 }

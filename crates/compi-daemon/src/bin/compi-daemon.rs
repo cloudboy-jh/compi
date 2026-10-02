@@ -22,6 +22,12 @@ fn run() -> compi_daemon::Result<()> {
         {
             compi_daemon::daemon::relay_stdio(Some(instance))
         }
+        [flag] if flag == "--server-stdio-existing" => compi_daemon::daemon::relay_stdio_existing(None),
+        [flag, instance_flag, instance]
+            if flag == "--server-stdio-existing" && instance_flag == "--instance" && !instance.is_empty() =>
+        {
+            compi_daemon::daemon::relay_stdio_existing(Some(instance))
+        }
         [flag] if flag == "--check-system" => compi_daemon::launch::check_system(),
         [flag] if flag == "--shutdown" => shutdown_daemon(),
         #[cfg(windows)]
@@ -31,7 +37,7 @@ fn run() -> compi_daemon::Result<()> {
         #[cfg(windows)]
         [flag] if flag == "--install-task" => {
             compi_daemon::supervisor::install(&std::env::current_exe()?)?;
-            println!("registered {}", compi_daemon::supervisor::TASK_NAME);
+            println!("registered {}", compi_daemon::supervisor::current_task_name()?);
             Ok(())
         }
         #[cfg(windows)]
@@ -49,7 +55,7 @@ fn run() -> compi_daemon::Result<()> {
         #[cfg(windows)]
         [flag] if flag == "--uninstall-task" => {
             compi_daemon::supervisor::uninstall()?;
-            println!("removed {}", compi_daemon::supervisor::TASK_NAME);
+            println!("removed {}", compi_daemon::supervisor::current_task_name()?);
             Ok(())
         }
         #[cfg(windows)]
@@ -73,12 +79,19 @@ fn shutdown_daemon() -> compi_daemon::Result<()> {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let Ok(mut client) = DaemonClient::connect(None, Duration::from_millis(250)) else {
-        return Ok(());
+    let mut client = match DaemonClient::connect(None, Duration::from_millis(250)) {
+        Ok(client) => client,
+        Err(error)
+            if compi_protocol::ConnectionFailure::kind(error.as_ref())
+                == compi_protocol::ConnectionFailureKind::Absent =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
     };
     client.shutdown_daemon()?;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while DaemonClient::connect(None, Duration::from_millis(100)).is_ok() {
+    while DaemonClient::endpoint_available(None, Duration::from_millis(100))? {
         if Instant::now() >= deadline {
             return Err("daemon did not stop within ten seconds".into());
         }
