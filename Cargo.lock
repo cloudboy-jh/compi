@@ -834,6 +834,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "compi-dev"
+version = "0.1.3"
+dependencies = [
+ "compi-protocol",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "compi-protocol"
 version = "0.1.3"
 dependencies = [

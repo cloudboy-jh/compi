@@ -5,6 +5,7 @@ members = [
     "crates/compi-daemon",
     "crates/compi-client",
     "crates/compi-update",
+    "tools/compi-dev",
 ]
 default-members = [
     "crates/compi-protocol",

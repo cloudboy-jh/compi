@@ -1,0 +1,3 @@
+[alias]
+# Source development loop for the native client; see README "Develop Compi".
+dev = "run --quiet --locked -p compi-dev --"

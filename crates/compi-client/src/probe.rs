@@ -703,12 +703,6 @@ fn start_daemon(instance: Option<&str>) -> Result<()> {
 
     let executable = daemon_executable()?;
 
-    #[cfg(windows)]
-    let directory = env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .ok_or("LOCALAPPDATA is not set")?
-        .join("Compi");
-    #[cfg(unix)]
     let directory = compi_protocol::paths::data_dir()?;
     fs::create_dir_all(&directory)?;
     let suffix = instance.map(|name| format!("-{name}")).unwrap_or_default();

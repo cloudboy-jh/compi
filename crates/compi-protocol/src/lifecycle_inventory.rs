@@ -11,6 +11,28 @@ struct ProcessRecord {
     supervisor: bool,
 }
 
+/// A `compi-daemon` process owned by the current user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDaemonProcess {
+    pub pid: u32,
+    pub executable: PathBuf,
+    /// The `--instance` it was launched with; `None` is the default instance.
+    pub instance: Option<String>,
+}
+
+/// Every `compi-daemon` process owned by the current user, from any installation or
+/// build directory. Development tooling uses this to find stray source previews.
+pub fn local_daemon_processes() -> Result<Vec<LocalDaemonProcess>> {
+    Ok(processes()?
+        .into_iter()
+        .map(|record| LocalDaemonProcess {
+            pid: record.pid,
+            executable: record.executable,
+            instance: record.instance,
+        })
+        .collect())
+}
+
 fn scoped_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err("installation attribution requires an absolute path".into());

@@ -1,0 +1,25 @@
+[package]
+name = "compi-dev"
+description = "Compi's source development loop, run as `cargo dev`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+compi-protocol = { path = "../../crates/compi-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

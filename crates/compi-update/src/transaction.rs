@@ -1503,10 +1503,13 @@ pub fn guard_client_launch() -> Result<Option<OperationLock>> {
 }
 fn registry_directory() -> Result<PathBuf> {
     #[cfg(windows)]
-    let data = PathBuf::from(
-        std::env::var_os("LOCALAPPDATA").ok_or_else(|| err("LOCALAPPDATA is not set"))?,
-    )
-    .join("Compi");
+    let data = match std::env::var_os("COMPI_DATA_DIR") {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(
+            std::env::var_os("LOCALAPPDATA").ok_or_else(|| err("LOCALAPPDATA is not set"))?,
+        )
+        .join("Compi"),
+    };
     #[cfg(target_os = "macos")]
     let data = std::env::var_os("COMPI_DATA_DIR")
         .map(PathBuf::from)
