@@ -778,7 +778,7 @@ impl CompiApp {
                             ))
                             .child(self.inspector_button(
                                 "image-save",
-                                "Save…",
+                                "Save",
                                 cx,
                                 Self::save_inspector_image,
                             ))

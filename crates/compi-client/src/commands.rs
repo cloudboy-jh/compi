@@ -77,18 +77,18 @@ macro_rules! registry {
 
 registry! {
     OpenPalette, "open_palette", "Open command palette", Some("cmd-shift-p"), Some("ctrl-shift-p");
-    CreateWorkspace, "create_workspace", "New workspace…", Some("cmd-alt-n"), Some("ctrl-shift-alt-n");
+    CreateWorkspace, "create_workspace", "New workspace", Some("cmd-alt-n"), Some("ctrl-shift-alt-n");
     SwitchWorkspace, "switch_workspace", "Switch workspace", None, None;
-    RenameWorkspace, "rename_workspace", "Rename workspace…", None, None;
-    RemoveWorkspace, "remove_workspace", "Remove workspace…", None, None;
+    RenameWorkspace, "rename_workspace", "Rename workspace", None, None;
+    RemoveWorkspace, "remove_workspace", "Remove workspace", None, None;
     NewTab, "new_tab", "New terminal tab", Some("cmd-t"), Some("ctrl-t");
     SwitchTab, "switch_tab", "Switch terminal tab", None, None;
     PreviousTab, "previous_tab", "Previous terminal tab", Some("cmd-shift-left"), Some("ctrl-shift-tab");
     NextTab, "next_tab", "Next terminal tab", Some("cmd-shift-right"), Some("ctrl-tab");
-    RenameTab, "rename_tab", "Rename terminal tab…", None, None;
+    RenameTab, "rename_tab", "Rename terminal tab", None, None;
     MoveTabLeft, "move_tab_left", "Move terminal tab left", Some("cmd-alt-shift-left"), Some("ctrl-shift-alt-left");
     MoveTabRight, "move_tab_right", "Move terminal tab right", Some("cmd-alt-shift-right"), Some("ctrl-shift-alt-right");
-    RemoveTab, "remove_tab", "Remove terminal tab…", None, None;
+    RemoveTab, "remove_tab", "Remove terminal tab", None, None;
     DetachTab, "detach_tab", "Hide terminal tab", Some("cmd-w"), Some("ctrl-w");
     RestoreHiddenTab, "restore_hidden_tab", "Restore hidden terminal tab", Some("cmd-shift-t"), Some("ctrl-shift-t");
     NewWindow, "new_window", "New window", Some("cmd-n"), Some("ctrl-shift-n");
@@ -108,18 +108,18 @@ registry! {
     ResizeSplitDecrease, "resize_split_decrease", "Move divider toward first pane", Some("cmd-alt-minus"), Some("alt-shift-left");
     ResizeSplitIncrease, "resize_split_increase", "Move divider toward second pane", Some("cmd-alt-equal"), Some("alt-shift-right");
     ResetSplitRatio, "reset_split_ratio", "Equalize focused split", None, None;
-    ArrangePanes, "arrange_panes", "Arrange panes and tabs…", None, None;
+    ArrangePanes, "arrange_panes", "Arrange panes and tabs", None, None;
     MirrorArrangement, "mirror_arrangement", "Mirror pane arrangement", None, None;
     FlipArrangement, "flip_arrangement", "Flip pane arrangement", None, None;
     RestoreArrangement, "restore_arrangement", "Restore previous pane arrangement", None, None;
     SplitMergedTabs, "split_merged_tabs", "Split merged tabs back out", None, None;
-    SaveArrangement, "save_arrangement", "Save pane arrangement as preset…", None, None;
+    SaveArrangement, "save_arrangement", "Save pane arrangement as preset", None, None;
     SwapPaneLeft, "swap_pane_left", "Swap pane left", None, None;
     SwapPaneRight, "swap_pane_right", "Swap pane right", None, None;
     SwapPaneUp, "swap_pane_up", "Swap pane up", None, None;
     SwapPaneDown, "swap_pane_down", "Swap pane down", None, None;
-    RemovePane, "remove_pane", "Remove pane…", None, Some("ctrl-shift-w");
-    EndSurface, "end_surface", "End terminal…", None, None;
+    RemovePane, "remove_pane", "Remove pane", None, Some("ctrl-shift-w");
+    EndSurface, "end_surface", "End terminal", None, None;
     RestartSurface, "restart_surface", "Restart terminal", None, None;
     ToggleSidebar, "toggle_sidebar", "Toggle workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");
     ResetSidebarWidth, "reset_sidebar_width", "Reset sidebar width", None, None;
@@ -128,7 +128,7 @@ registry! {
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
     BrowseFiles, "browse_files", "Browse files in terminal pane", Some("cmd-shift-e"), Some("ctrl-shift-e");
-    JumpProject, "jump_project", "Jump to project directory…", None, None;
+    JumpProject, "jump_project", "Jump to project directory", None, None;
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
     ZoomReset, "zoom_reset", "Reset font size", Some("cmd-0"), Some("ctrl-0");
@@ -140,7 +140,7 @@ registry! {
     OpenConfiguration, "open_configuration", "Open configuration file", None, None;
     ResetClientLayout, "reset_client_layout", "Reset window layout", None, None;
     Reconnect, "reconnect", "Reconnect window", None, None;
-    RestartDaemon, "restart_daemon", "Restart daemon…", None, None;
+    RestartDaemon, "restart_daemon", "Restart daemon", None, None;
     OpenDiagnostics, "open_diagnostics", "Open diagnostics", None, None;
     Quit, "quit", "Quit Compi", Some("cmd-q"), Some("ctrl-shift-q");
 }

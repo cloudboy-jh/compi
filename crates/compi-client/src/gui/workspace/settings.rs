@@ -1803,7 +1803,7 @@ impl CompiApp {
                         cx,
                     ))
                     .child(self.settings_control_button(
-                        "Choose override…",
+                        "Choose override",
                         SettingsAction::BrowseThemes(CatalogTarget::Terminal),
                         3,
                         false,
@@ -1875,7 +1875,7 @@ impl CompiApp {
                             if live_processes == 0 {
                                 "Restart"
                             } else {
-                                "Review restart…"
+                                "Review restart"
                             },
                             SettingsAction::RestartDaemon,
                             7,

@@ -4138,15 +4138,15 @@ impl CompiApp {
                 for &command in commands {
                     let title = match command {
                         Command::NewTab => "New Tab",
-                        Command::CreateWorkspace => "New Workspace…",
-                        Command::RenameTab => "Rename Tab…",
+                        Command::CreateWorkspace => "New Workspace",
+                        Command::RenameTab => "Rename Tab",
                         Command::SplitRight => "Split Right",
                         Command::SplitDown => "Split Down",
-                        Command::ArrangePanes => "Arrange…",
+                        Command::ArrangePanes => "Arrange",
                         Command::RestoreArrangement => "Restore Previous Arrangement",
                         Command::MoveTabToNewWindow => "Move to New Window",
                         Command::DetachTab => "Hide Tab",
-                        Command::RemoveTab => "Remove Tab…",
+                        Command::RemoveTab => "Remove Tab",
                         Command::ToggleSidebar => "Toggle Sidebar",
                         _ => self.command_label(command),
                     };

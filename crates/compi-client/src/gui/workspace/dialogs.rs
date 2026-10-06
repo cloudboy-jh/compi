@@ -217,7 +217,7 @@ impl CompiApp {
                 PaneAction::Detach => "Detach",
                 PaneAction::Float if floating => "Dock",
                 PaneAction::Float => "Float",
-                PaneAction::End => "End…",
+                PaneAction::End => "End",
             };
             let destructive = action == PaneAction::End;
             let button = div()

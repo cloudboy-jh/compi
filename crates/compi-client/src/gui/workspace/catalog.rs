@@ -1081,7 +1081,7 @@ impl CompiApp {
                                 cx.notify();
                             }))
                     })
-                    .child("Change…"),
+                    .child("Change"),
             )
             .into_any_element()
     }
@@ -1547,12 +1547,12 @@ impl CompiApp {
                             .child(div().flex_1().min_w_0())
                             .child(self.catalog_action_button(
                                 "import-theme",
-                                "Import…",
+                                "Import",
                                 5,
                                 false,
                                 cx,
                             ))
-                            .child(self.catalog_action_button("theme-menu", "More…", 6, false, cx)),
+                            .child(self.catalog_action_button("theme-menu", "More", 6, false, cx)),
                     )
                     .when(catalog.menu_open, |panel| {
                         panel.child(
@@ -1578,7 +1578,7 @@ impl CompiApp {
                                 ))
                                 .child(self.catalog_action_button(
                                     "export-theme",
-                                    "Export selected…",
+                                    "Export selected",
                                     11,
                                     false,
                                     cx,
@@ -1588,7 +1588,7 @@ impl CompiApp {
                                     if catalog.remove_mode {
                                         "Back to themes"
                                     } else {
-                                        "Remove local…"
+                                        "Remove local"
                                     },
                                     12,
                                     true,
