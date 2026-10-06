@@ -1018,7 +1018,10 @@ impl CompiApp {
             .child(
                 div()
                     .min_w_0()
-                    .when(!compact, |label| label.flex_1())
+                    // Basis auto, not `flex_1`'s zero basis: with a zero basis Taffy sizes
+                    // the row as if every character wrapped, which leaves blank scroll space
+                    // below rows nested deeper in a column (the shell prompt group).
+                    .when(!compact, |label| label.flex_auto())
                     .flex()
                     .flex_col()
                     .gap_1()
