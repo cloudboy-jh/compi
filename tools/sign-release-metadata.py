@@ -33,7 +33,7 @@ def main():
         if (qualification.get('schema') != 1 or qualification.get('platform') != platform
                 or qualification.get('version') != version
                 or qualification.get('artifact_sha256') != digest
-                or qualification.get('daemon_protocol') != 14):
+                or qualification.get('daemon_protocol') != 16):
             raise SystemExit(f'Native qualification does not match {filename}')
         daemons = qualification.get('qualified_daemons')
         if not isinstance(daemons, list) or not daemons or any(
@@ -44,7 +44,7 @@ def main():
         command = [str(args.signer.resolve()), 'sign', '--version', version,
                    '--platform', platform, '--artifact', str(artifact.resolve()),
                    '--url', f'https://github.com/{args.repository}/releases/download/{args.tag}/{artifact.name}',
-                   '--output', str(args.distribution.resolve()), '--daemon-protocol', '15',
+                   '--output', str(args.distribution.resolve()), '--daemon-protocol', '16',
                    '--minimum-os', minimum_os, '--notes', str(args.notes.resolve())]
         command.extend(['--qualification', str((args.distribution / f'qualification-{platform}.json').resolve())])
         for daemon in sorted(set(daemons)):

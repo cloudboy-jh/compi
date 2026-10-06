@@ -3,6 +3,7 @@ pub mod conpty;
 pub mod daemon;
 pub mod file_tree;
 pub mod launch;
+mod prompt;
 pub mod pty;
 pub mod screen;
 mod shell_integration;

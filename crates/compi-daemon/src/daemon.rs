@@ -836,6 +836,28 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, message),
                     }
                 }
+                ClientMessage::Prompt {
+                    distribution,
+                    request,
+                } => {
+                    let result = if target.is_some() {
+                        Err((
+                            ErrorCode::InvalidRequest,
+                            "prompt settings do not accept an attachment target".to_owned(),
+                        ))
+                    } else {
+                        crate::prompt::handle(distribution, *request)
+                    };
+                    match result {
+                        Ok(response) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::Prompt {
+                                response: Box::new(response),
+                            },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::Mutate { mutation } => match manager.mutate(mutation) {
                     Ok(receipt) => {
                         send_workspace_events(&sink, &mut workspace_events, &manager)?;

@@ -13,6 +13,15 @@ Compi installs its bundled Bash/Zsh shell integration into the shell's home dire
 
 On Windows/WSL2, the tree can browse a shell directory linked into a mounted Windows drive. If the WSL share cannot follow the link, Compi resolves that directory in WSL and retries through its Windows path.
 
+## Shell prompt
+
+**Settings → Terminal → Shell prompt** (or “Prompt settings” in the palette) styles the prompt your shells already draw with [Oh My Posh](https://ohmyposh.dev) or [Starship](https://starship.rs). Compi does not install either one, has no prompt of its own, and uses each style exactly as the provider defines it. It works where your shells run: the local account, the WSL2 distribution you pick, or the SSH host.
+
+- **Details** shows where Compi is looking, your login shell, provider paths, startup-file lines that already set up a prompt, and any warning, such as an Oh My Posh installed only on Windows that cannot draw a WSL prompt. Bash and Zsh are supported. Fish, PowerShell, and custom launch profiles are not.
+- **Pick a style:** every style is listed with its real prompt rendered under its name: your current configuration first, then the provider default, Oh My Posh themes, or Starship presets. Browsing changes nothing, and the prompt is independent of the terminal theme and layout.
+- **Apply:** click a style and choose **Apply** in the dropdown under it, or **Cancel**. Compi shells use the style without any edit to your startup files; new ones start with it and running ones switch at their next prompt. **Also use outside Compi** additionally adds a marked `# >>> compi prompt >>>` block to the end of your login shell's `~/.bashrc` or `~/.zshrc`; the dropdown then shows that file's diff first. Nothing else in the file changes, and shells outside Compi need a new shell.
+- **Back up, restore, turn off:** each change backs up the managed files to `~/.compi/prompt/backups`. **History** restores any of the last 20 backups and **Turn off** removes every prompt Compi manages, each confirmed in the same dropdown. Your own provider configuration is copied, never edited.
+
 ## Remote connections
 
 Compi starts its sibling server automatically, and relaunching with the same instance name reconnects to that workspace. Use `--working-directory PATH` when you intentionally want new work to start in a specific directory.

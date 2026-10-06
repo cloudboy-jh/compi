@@ -2,13 +2,21 @@ use crate::Result;
 use std::ffi::OsString;
 
 const BRIDGE: &str = include_str!("../../../assets/compi-shell.sh");
-const BASH_FUNCTIONS: [&str; 4] = [
+const BASH_FUNCTIONS: [&str; 12] = [
     "compi",
     "_compi_choose_directory",
     "_compi_report_cwd",
     "_compi_prompt_cwd",
+    "_compi_prompt_ble_hook",
+    "_compi_prompt_sync",
+    "_compi_prompt_startup",
+    "_compi_prompt_snapshot",
+    "_compi_prompt_restore",
+    "_compi_prompt_status",
+    "_compi_prompt_rerun",
+    "_compi_install_prompt_hook",
 ];
-const EXPORT_FUNCTIONS: &str = r#"if [[ $1 == compi-installed ]]; then set -- "$HOME/.compi/shell/compi-shell.sh"; fi; . "$1" || exit; export -f compi _compi_choose_directory _compi_report_cwd _compi_prompt_cwd || exit; for name in compi _compi_choose_directory _compi_report_cwd _compi_prompt_cwd; do printenv "BASH_FUNC_${name}%%" || exit; printf '\0'; done"#;
+const EXPORT_FUNCTIONS: &str = r#"if [[ $1 == compi-installed ]]; then set -- "$HOME/.compi/shell/compi-shell.sh"; fi; . "$1" || exit; names='compi _compi_choose_directory _compi_report_cwd _compi_prompt_cwd _compi_prompt_ble_hook _compi_prompt_sync _compi_prompt_startup _compi_prompt_snapshot _compi_prompt_restore _compi_prompt_status _compi_prompt_rerun _compi_install_prompt_hook'; export -f $names || exit; for name in $names; do printenv "BASH_FUNC_${name}%%" || exit; printf '\0'; done"#;
 
 #[cfg(unix)]
 pub(crate) fn shell_name(executable: &str) -> Option<&'static str> {
@@ -153,6 +161,7 @@ fn shell_files() -> [(&'static str, &'static str); 6] {
             "bashrc",
             r#". "$HOME/.compi/shell/compi-shell.sh"
 [[ ! -f $HOME/.bashrc ]] || . "$HOME/.bashrc"
+! _compi_prompt_startup || . "$HOME/.compi/prompt/compi.bash"
 _compi_enable_prompt_cwd
 "#,
         ),
@@ -185,6 +194,7 @@ ZDOTDIR=$_compi_shell_dir
 [[ ! -f $_compi_user_zdotdir/.zshrc ]] || source "$_compi_user_zdotdir/.zshrc"
 _compi_zdotdir_set=${+ZDOTDIR}
 _compi_user_zdotdir=${ZDOTDIR:-$HOME}
+! _compi_prompt_startup || source "$HOME/.compi/prompt/compi.zsh"
 _compi_enable_prompt_cwd
 if [[ -o login ]]; then
     ZDOTDIR=$_compi_shell_dir

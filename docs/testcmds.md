@@ -106,7 +106,7 @@ Keep the runtime beside the daemon. Launch under a separate instance to avoid th
 
 ## Phase 4 native workspace checks
 
-Use matching protocol 15 client/daemon binaries and an isolated instance. Set `GPUI_FXC_PATH` as described in Tier 1 before building the Windows client. Do not stop an older daemon that owns valuable work merely to try the new client.
+Use matching protocol 16 client/daemon binaries and an isolated instance. Set `GPUI_FXC_PATH` as described in Tier 1 before building the Windows client. Do not stop an older daemon that owns valuable work merely to try the new client.
 
 ```powershell
 cargo test --locked --workspace --all-targets --release -- --test-threads=1
@@ -160,6 +160,14 @@ cargo build --locked --release --workspace --bins
 ```
 
 Required result: every command exits zero. The release directory contains `compi.exe` and `compi-daemon.exe` (and the prepared ConPTY runtime on Windows); it does not contain `compi-probe.exe`, which is a development example under `release\examples` when built separately.
+
+Prompt settings also have a Unix PTY harness for the Bash/Zsh bridge. It needs `python3`, `bash`, and optionally `zsh`, and runs inside WSL on Windows; it uses a temporary `HOME`, so applied prompt settings in the real home do not affect it:
+
+```sh
+python3 tools/test-compi-shell.py
+```
+
+`cargo test -p compi-daemon --lib prompt` runs detection, batched style previews (including missing styles and the batch limit), apply, stale-token rejection, the login-shell block added and removed through *Also use outside Compi*, restore, and turn-off against stub `oh-my-posh`/`starship` executables in a temporary home inside the real target (WSL on Windows).
 
 ## Tier 2: scripted terminal and performance checks
 
@@ -271,6 +279,7 @@ The approximate 376 ms warm first-window, 544 ms warm ready-for-input, 153 ms in
 | Kitty graphics | Test raw RGBA, PNG, JPEG, chunking, compression, placement, clipping, resize, deletion, and reattach. | Image decode never stalls input; placement and deletion are correct; decoded memory is released after deletion. |
 | Display behavior | Repeat window and text checks on normal, maximized, narrow, mixed-DPI, and multi-monitor layouts. | No clipped controls, unreadable text, stale scale, or broken hit targets. |
 | Soak | For 30 minutes, alternate sustained output, typing, scrolling, tab switches, image display/deletion, detach, and reattach. | No crash, input loss, UI stall, cross-session state, or unbounded CPU, memory, GPU-memory, or handle growth. |
+| Shell prompt | With Oh My Posh or Starship installed in the target, open **Settings → Terminal → Shell prompt**. Scroll the style list; click a style and choose **Apply** in the dropdown under it, run `false` in an open Compi Bash pane (with and without ble.sh), then **Turn off** → **Turn off**. Click another style with **Also use outside Compi** on and cancel it (also try Escape); then apply it in a disposable account, open a shell outside Compi, apply again without it, and restore a backup from **History** → **Restore**. | Every row renders its style's prompt without changing the theme or files. One dropdown at a time opens under the clicked control with no file list unless `~/.zshrc`/`~/.bashrc` changes, whose diff it shows; clicking the current style with an unchanged scope opens none. Running Compi shells switch at their next prompt with the exit status correct, and return to the user's own prompt on turn-off without errors. Cancel leaves `~/.zshrc`/`~/.bashrc` byte-identical; applying outside adds only the marked block shown in the diff; applying without it removes the block; restore brings back only that block. |
 
 ## Destructive cleanup
 

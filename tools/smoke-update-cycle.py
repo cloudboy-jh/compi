@@ -53,7 +53,7 @@ def main():
         daemon_path = payload / 'compi-daemon'
     signed = json.loads(args.metadata.read_text())
     candidate = json.loads(base64.b64decode(signed['payload'], validate=True))
-    if candidate['platform'] != platform or current not in candidate['qualified_daemon_versions'] or candidate['daemon_protocol'] != 14:
+    if candidate['platform'] != platform or current not in candidate['qualified_daemon_versions'] or candidate['daemon_protocol'] != 16:
         parser.error('Compatible cycle requires signed native qualification of the running B daemon')
     if tuple(map(int, candidate['version'].split('.'))) <= tuple(map(int, current.split('.'))):
         parser.error('C must be genuinely newer than B')

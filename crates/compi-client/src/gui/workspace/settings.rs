@@ -43,6 +43,7 @@ enum SettingsAction {
     OpenDiagnostics,
     RestartDaemon,
     Update(UpdateAction),
+    Prompt(super::prompt::PromptAction),
 }
 
 #[derive(Clone, Copy)]
@@ -80,7 +81,7 @@ impl CompiApp {
         match self.settings_section {
             SettingsSection::Appearance => self.appearance_action_count(),
             SettingsSection::Interface => self.font_choice_count() + 3,
-            SettingsSection::Terminal => self.font_choice_count() + 5,
+            SettingsSection::Terminal => self.prompt_offset_base() + self.prompt_actions().len(),
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
             SettingsSection::Updates => 13,
@@ -117,6 +118,11 @@ impl CompiApp {
                     }
                     (SettingsSection::Terminal, 2) => Some(SettingsAction::Zoom(Command::ZoomIn)),
                     (SettingsSection::Terminal, 3) => Some(SettingsAction::OpenConfiguration),
+                    (SettingsSection::Terminal, index) => self
+                        .prompt_actions()
+                        .get(index - 4)
+                        .copied()
+                        .map(SettingsAction::Prompt),
                     _ => None,
                 }
             }
@@ -183,6 +189,36 @@ impl CompiApp {
         self.overlay_focus = self.overlay_focus.min(base + count.saturating_sub(1));
     }
 
+    /// Terminal-section offset of the shell prompt group's first control.
+    pub(super) fn prompt_offset_base(&self) -> usize {
+        self.font_choice_count() + 5
+    }
+
+    pub(super) fn prompt_toggle(
+        &self,
+        enabled: bool,
+        action: super::prompt::PromptAction,
+        index: usize,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        self.render_settings_toggle(
+            enabled,
+            SettingsAction::Prompt(action),
+            self.prompt_offset_base() + index,
+            true,
+            cx,
+        )
+    }
+
+    fn select_settings_section(&mut self, section: SettingsSection) {
+        self.settings_font_picker = None;
+        self.settings_section = section;
+        self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+        if section == SettingsSection::Terminal {
+            self.enter_prompt_settings();
+        }
+    }
+
     fn toggle_settings_font_picker(&mut self) {
         self.settings_scroll_to_focus = true;
         if self.font_picker_open() {
@@ -219,6 +255,13 @@ impl CompiApp {
             return false;
         }
         if key.key == "escape" {
+            if full
+                && self.settings_section == SettingsSection::Terminal
+                && self.close_prompt_dropdown()
+            {
+                cx.notify();
+                return true;
+            }
             if full && self.font_picker_open() {
                 self.settings_font_picker = None;
                 self.overlay_focus = SETTINGS_NAV_ITEMS;
@@ -238,6 +281,18 @@ impl CompiApp {
         } else {
             self.appearance_action(offset)
         };
+        if full
+            && matches!(
+                action,
+                Some(SettingsAction::Prompt(super::prompt::PromptAction::Styles))
+            )
+            && matches!(key.key.as_str(), "up" | "down" | "home" | "end")
+        {
+            self.move_prompt_style(key.key.as_str());
+            self.settings_scroll_to_focus = true;
+            cx.notify();
+            return true;
+        }
         if full
             && self.font_picker_open()
             && self.overlay_focus >= base
@@ -288,10 +343,8 @@ impl CompiApp {
                 } else {
                     (self.overlay_focus + 1) % SETTINGS_NAV_ITEMS
                 };
-                self.settings_font_picker = None;
                 self.overlay_focus = next;
-                self.settings_section = SettingsSection::ALL[next];
-                self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+                self.select_settings_section(SettingsSection::ALL[next]);
             }
             "left" | "right"
                 if matches!(action, Some(SettingsAction::Opacity(_)))
@@ -321,9 +374,7 @@ impl CompiApp {
             }
             "enter" | "space" => {
                 if full && self.overlay_focus < SETTINGS_NAV_ITEMS {
-                    self.settings_font_picker = None;
-                    self.settings_section = SettingsSection::ALL[self.overlay_focus];
-                    self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+                    self.select_settings_section(SettingsSection::ALL[self.overlay_focus]);
                 } else if let Some(action) = action {
                     self.activate_settings_action(action, window, cx);
                 }
@@ -464,6 +515,7 @@ impl CompiApp {
             SettingsAction::Reconnect => self.execute(Command::Reconnect, window, cx),
             SettingsAction::OpenDiagnostics => self.execute(Command::OpenDiagnostics, window, cx),
             SettingsAction::RestartDaemon => self.execute(Command::RestartDaemon, window, cx),
+            SettingsAction::Prompt(action) => self.activate_prompt_action(action),
             SettingsAction::OpenSettings => {
                 self.settings_font_picker = None;
                 self.open_overlay(Overlay::Settings, "");
@@ -570,7 +622,7 @@ impl CompiApp {
     fn settings_button(
         &self,
         id: impl Into<gpui::ElementId>,
-        label: &'static str,
+        label: impl Into<SharedString>,
         focused: bool,
         tone: SettingsButtonTone,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -630,14 +682,14 @@ impl CompiApp {
             .hover(move |style| style.bg(color(hover)).cursor_pointer())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(on_click)
-            .child(label)
+            .child(Into::<SharedString>::into(label))
             .into_any_element()
     }
 
     pub(super) fn settings_action_button(
         &self,
         id: impl Into<gpui::ElementId>,
-        label: &'static str,
+        label: impl Into<SharedString>,
         focused: bool,
         destructive: bool,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -658,7 +710,7 @@ impl CompiApp {
     pub(super) fn settings_primary_button(
         &self,
         id: impl Into<gpui::ElementId>,
-        label: &'static str,
+        label: impl Into<SharedString>,
         focused: bool,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
@@ -668,7 +720,7 @@ impl CompiApp {
     pub(super) fn settings_segment_button(
         &self,
         id: impl Into<gpui::ElementId>,
-        label: &'static str,
+        label: impl Into<SharedString>,
         active: bool,
         focused: bool,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -722,7 +774,7 @@ impl CompiApp {
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(on_click)
-            .child(label)
+            .child(Into::<SharedString>::into(label))
             .into_any_element()
     }
 
@@ -812,10 +864,8 @@ impl CompiApp {
                     })
                     .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_section = section;
-                        this.settings_font_picker = None;
                         this.overlay_focus = index;
-                        this.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+                        this.select_settings_section(section);
                         cx.stop_propagation();
                         cx.notify();
                     }))
@@ -948,7 +998,7 @@ impl CompiApp {
             .into_any_element()
     }
 
-    fn settings_row(
+    pub(super) fn settings_row(
         &self,
         label: &'static str,
         detail: String,
@@ -1339,6 +1389,7 @@ impl CompiApp {
                 ),
                 compact,
             ))
+            .child(self.render_prompt_group(compact, cx))
             .into_any_element()
     }
 

@@ -571,6 +571,21 @@ impl DaemonClient {
         }
     }
 
+    /// Detect, preview or apply prompt settings in the daemon's shell environment.
+    pub fn prompt(
+        &mut self,
+        distribution: Option<String>,
+        request: crate::prompt::PromptRequest,
+    ) -> Result<crate::prompt::PromptResponse> {
+        match self.request(ClientMessage::Prompt {
+            distribution,
+            request: Box::new(request),
+        })? {
+            ServerMessage::Prompt { response } => Ok(*response),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     pub fn upload_image(&mut self, name: &str, bytes: &[u8]) -> Result<String> {
         if bytes.is_empty() || bytes.len() > MAX_IMAGE_UPLOAD_BYTES {
             return Err(format!(

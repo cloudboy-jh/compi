@@ -11,6 +11,7 @@ Compi is a native terminal workspace for Windows and macOS.
 - Shells keep running when you close the window.
 - Workspaces, tabs, and split panes.
 - Floating terminals and layout presets.
+- Shell prompt styles from Oh My Posh or Starship.
 - Remote connections over SSH.
 - Themes, fonts, and appearance settings.
 

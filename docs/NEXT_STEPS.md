@@ -30,7 +30,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 
 ### Remaining protocol and persistence contracts
 
-- Protocol 15 rejects mismatched versions but does not negotiate capabilities or server identity/generation in `Hello`. Implement the explicit handshake required by [the wire contract](Spec.md#wire-contract) before treating that acceptance gate as complete.
+- Protocol 16 rejects mismatched versions but does not negotiate capabilities or server identity/generation in `Hello`. Implement the explicit handshake required by [the wire contract](Spec.md#wire-contract) before treating that acceptance gate as complete.
 - Snapshots and deltas carry bounded scrollback, but there is no on-demand history paging or history epoch for reconnect and selection anchors. Implement and verify the stronger [replication contract](Spec.md#replication), including eviction/reflow behavior; current identity/sequence/geometry/content checks are not equivalent.
 - Exercise durable workspace mutations and lifecycle recovery with fault injection at commit boundaries across supported hosts. Existing actor, receipt, migration, and quarantine coverage is not exhaustive.
 
@@ -45,6 +45,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - Qualify floating panes and hairline seams on the native Mac bundle: float/dock from the palette and the tab menu, move/resize tracking, keyboard ownership with physical keys and IME, relaunch restoration, seam crispness at Retina and mixed scales, and a second window attempting to attach a floated surface. Windows/WSL evidence used synthetic window messages, not physical input.
 - Qualify pane arrangements on the native Mac bundle: the Arrange panes and tabs picker with physical M/F/Delete keys, combining tabs and splitting them back out, swap/mirror/flip/restore, saving and editing `[layout_presets]`, and applying while a pane floats or the tab is zoomed. Windows/WSL evidence used synthetic input.
 - Qualify `cargo dev` on a native Mac: the staged `Compi Dev.app` launch, readiness detection, SIGTERM swap (at most the last ~160 ms of window state may be lost), shell persistence across swaps, Ctrl+C and terminal close leaving the dev daemon running, and `cargo dev --stop`. Only Windows was exercised.
+- Qualify shell prompt settings on a native Mac and one real SSH host: login Zsh startup and live reload through the ZDOTDIR wrappers, login-shell scope in `~/.zshrc`, BSD userland file writes (`mktemp`, `dd`, `wc`), and `dscl` login-shell detection. Also exercise Starship (presets, `STARSHIP_CONFIG`, its ble.sh integration) on any host; only Oh My Posh in WSL Bash/Zsh was exercised.
 - Run focused regressions and final workspace/dependency checks after integration. Report unavailable physical-platform checks explicitly.
 
 ## 4. Distribution and process discovery

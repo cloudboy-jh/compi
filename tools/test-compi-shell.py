@@ -110,6 +110,10 @@ def exercise_prompt(shell, target, root, array_hook=False):
 def main():
     with tempfile.TemporaryDirectory(prefix="compi shell ") as temp:
         root = Path(temp)
+        # Prompt settings in the real home must not load into these shells.
+        home = root / "home"
+        home.mkdir()
+        os.environ["HOME"] = str(home)
         target = root / "folder with space π\n"
         target.mkdir()
         nested = root / "nested"

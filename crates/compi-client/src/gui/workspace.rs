@@ -6,6 +6,7 @@ pub(super) mod catalog;
 pub(in crate::gui) mod dialogs;
 pub(super) mod media;
 pub(in crate::gui) mod performance;
+pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod settings;
 pub(super) mod tree;
 mod tree_ui;
@@ -828,6 +829,7 @@ impl CompiApp {
             settings_font_picker: None,
             settings_scroll_bounds: None,
             settings_scroll_to_focus: false,
+            prompt_settings: prompt::PromptSettingsState::default(),
             performance_enabled: performance_enabled.clone(),
             performance: performance::PerformanceMonitor::default(),
             performance_notice: None,
@@ -1792,6 +1794,11 @@ impl CompiApp {
             } => {
                 self.tree_searched(pane_id, request, result);
             }
+            UiEvent::PromptResponded {
+                job,
+                request,
+                result,
+            } => self.prompt_responded(job, request, result),
             UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.connection_error = None;
                 self.accept_workspace(workspace);
@@ -2808,6 +2815,11 @@ impl CompiApp {
         self.ime_marked_range = None;
         let end = text.encode_utf16().count();
         self.ime_selected_range = end..end;
+        if matches!(self.overlay, Some(Overlay::Settings))
+            && self.settings_section == SettingsSection::Terminal
+        {
+            self.enter_prompt_settings();
+        }
     }
 
     fn dismiss_overlay(&mut self) {
@@ -3464,6 +3476,12 @@ impl CompiApp {
                 self.settings_section = SettingsSection::Updates;
                 self.open_overlay(Overlay::Settings, "");
                 self.updates.check();
+            }
+            Command::OpenPromptSettings => {
+                self.settings_section = SettingsSection::Terminal;
+                self.settings_font_picker = None;
+                self.open_overlay(Overlay::Settings, "");
+                self.focus_prompt_group();
             }
             Command::OpenThemeCatalog => self.open_theme_catalog(SettingsScope::Global),
             Command::OpenConfiguration => {

@@ -17,6 +17,7 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 vte.workspace = true
 portable-pty = "0.9"
+parking_lot = "0.12"
 
 [dev-dependencies]
 compi-client = { path = "../compi-client" }

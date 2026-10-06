@@ -135,6 +135,7 @@ registry! {
     OpenQuickAppearance, "open_quick_appearance", "Open Quick Appearance", None, None;
     OpenThemeCatalog, "open_theme_catalog", "Browse theme catalog", None, None;
     OpenSettings, "open_settings", "Open Settings", Some("cmd-,"), Some("ctrl-,");
+    OpenPromptSettings, "open_prompt_settings", "Prompt settings", None, None;
     CheckForUpdates, "check_for_updates", "Check for Updates", None, None;
     OpenConfiguration, "open_configuration", "Open configuration file", None, None;
     ResetClientLayout, "reset_client_layout", "Reset window layout", None, None;
@@ -265,7 +266,9 @@ impl Command {
             NewWindow | MoveTabToNewWindow | MoveTabToWindow | ResetClientLayout | Reconnect => {
                 CommandCategory::Window
             }
-            OpenQuickAppearance | OpenSettings | OpenThemeCatalog => CommandCategory::Appearance,
+            OpenQuickAppearance | OpenSettings | OpenPromptSettings | OpenThemeCatalog => {
+                CommandCategory::Appearance
+            }
             OpenPalette | OpenConfiguration | CheckForUpdates | RestartDaemon | OpenDiagnostics
             | Quit => CommandCategory::System,
         }
@@ -330,6 +333,7 @@ impl Command {
             OpenQuickAppearance => "theme opacity transparency clear blur",
             OpenThemeCatalog => "themes catalog colors schemes light dark favorites",
             OpenSettings => "preferences configuration appearance terminal keyboard daemon",
+            OpenPromptSettings => "shell prompt oh my posh starship ps1 theme bash zsh",
             CheckForUpdates => "update upgrade release version download install",
             OpenConfiguration => "toml edit file",
             RestartDaemon => "server reboot",
@@ -373,6 +377,7 @@ impl Command {
                 | OpenQuickAppearance
                 | OpenThemeCatalog
                 | OpenSettings
+                | OpenPromptSettings
                 | CheckForUpdates
                 | OpenConfiguration
                 | ResetClientLayout

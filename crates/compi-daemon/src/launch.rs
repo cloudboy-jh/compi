@@ -134,6 +134,16 @@ fn validate_executable(executable: &std::ffi::OsStr) -> Result<()> {
     Ok(())
 }
 
+/// The shell an automatic launch starts, for prompt-settings detection.
+#[cfg(unix)]
+pub(crate) fn default_shell() -> String {
+    std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .or_else(|| user_defaults().ok().map(|(shell, _)| shell))
+        .map(|shell| shell.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 #[cfg(unix)]
 fn user_defaults() -> Result<(OsString, PathBuf)> {
     use std::ffi::CStr;

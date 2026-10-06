@@ -198,6 +198,36 @@ pub fn directory_distribution(requested_distribution: Option<&str>) -> Result<St
     Ok(distribution.name)
 }
 
+/// Installed WSL2 distributions that can host shells, in `wsl --list` order.
+/// Docker Desktop's internal distributions are not user shells.
+pub fn wsl2_distributions() -> Result<Vec<String>> {
+    let output = run_wsl(["--list", "--verbose"])?;
+    if !output.status.success() {
+        let error = decode_wsl_output(&output.stderr);
+        return Err(format!("could not inspect WSL distributions: {}", error.trim()).into());
+    }
+    Ok(parse_wsl2_distributions(&decode_wsl_output(&output.stdout)))
+}
+
+fn parse_wsl2_distributions(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line
+                .trim_start()
+                .trim_start_matches('*')
+                .split_whitespace()
+                .collect();
+            if fields.len() < 3 || fields[fields.len() - 1] != "2" {
+                return None;
+            }
+            let name = fields[..fields.len() - 2].join(" ");
+            (!name.starts_with("docker-desktop")).then_some(name)
+        })
+        .collect()
+}
+
 fn native_default_distribution() -> Option<Result<DefaultDistribution>> {
     #[link(name = "advapi32")]
     unsafe extern "system" {

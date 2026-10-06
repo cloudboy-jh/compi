@@ -531,6 +531,11 @@ enum UiEvent {
         request: u64,
         result: Result<Vec<compi_protocol::SearchEntry>, String>,
     },
+    PromptResponded {
+        job: workspace::prompt::PromptJob,
+        request: u64,
+        result: Result<compi_protocol::prompt::PromptResponse, String>,
+    },
     DaemonRestarted(Result<compi_protocol::WorkspaceSnapshot, String>),
     MutationFinished {
         result: Result<(WorkspaceSnapshot, compi_protocol::MutationReceipt), String>,
@@ -840,6 +845,7 @@ struct CompiApp {
     pub(in crate::gui) settings_font_picker: Option<SettingsSection>,
     pub(in crate::gui) settings_scroll_bounds: Option<Bounds<Pixels>>,
     pub(in crate::gui) settings_scroll_to_focus: bool,
+    prompt_settings: workspace::prompt::PromptSettingsState,
     performance_enabled: Arc<AtomicBool>,
     performance: workspace::performance::PerformanceMonitor,
     performance_notice: Option<String>,

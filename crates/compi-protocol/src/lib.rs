@@ -7,6 +7,7 @@ mod lifecycle_inventory;
 pub mod paths;
 pub mod perf;
 pub mod pipe;
+pub mod prompt;
 mod screen;
 #[cfg(windows)]
 pub mod wsl;
@@ -28,8 +29,8 @@ pub use lifecycle_inventory::{LocalDaemonProcess, local_daemon_processes};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Version 15 adds tab arrangements and merges that move existing panes in place.
-pub const PROTOCOL_VERSION: u32 = 15;
+// Version 16 adds shell prompt detection, preview and managed application.
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -248,6 +249,12 @@ pub enum ClientMessage {
     FinishImageUpload {
         upload_id: UploadId,
     },
+    /// Prompt settings in the target environment. `distribution` selects a WSL2
+    /// distribution on Windows and must be absent elsewhere.
+    Prompt {
+        distribution: Option<String>,
+        request: Box<prompt::PromptRequest>,
+    },
     ShutdownDaemon,
 }
 
@@ -317,6 +324,9 @@ pub enum ServerMessage {
         path: String,
     },
     DaemonStopping,
+    Prompt {
+        response: Box<prompt::PromptResponse>,
+    },
     SurfaceExited {
         identity: TerminalIdentity,
         exit_code: u32,
