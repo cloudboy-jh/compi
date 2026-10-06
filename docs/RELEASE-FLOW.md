@@ -52,18 +52,16 @@ Publisher signing/notarization and signed updater metadata are separate concerns
 
 `docs/release-notes.md` is the one source. The client embeds it at build time and shows it only when its heading matches the client version: once as the **What's new** card in the sidebar after an update (an accent dot on the sidebar button until the sidebar is opened; the card until its × is clicked), and always under **What's new in <version>** in **Settings → Updates**. The workflow signs it into the update metadata, which the update dialog shows before installing, and uses it as the draft GitHub release body. Editing only the GitHub description afterward changes neither the app nor the updater, so write final notes before tagging.
 
-## Next batch: v0.1.4
+## Latest release: v0.1.4
 
-Prepared on `main` (version 0.1.4, notes in `docs/release-notes.md`); not tagged or released yet.
+Published 2026-10-06 as the stable latest release from tag `v0.1.4` (`6f3a386`); notes from `docs/release-notes.md`.
 
 - Floating terminals.
 - Layout presets, arrangement preview/apply, mirror/flip, swap, and restore.
 - Combining tabs and splitting them back out.
 - Shell prompt settings (Oh My Posh/Starship) and the one-time What's new card.
-- Related workspace polish actually present at the chosen cutoff.
-- Developer-note mention of `cargo dev`, which is not packaged as an end-user feature.
 
-Protocol 16 (v0.1.3 shipped 14), so updating from 0.1.3 restarts the daemon and ends running shells. Recheck the latest release before tagging.
+Protocol 16 (v0.1.3 shipped 14), so updating from 0.1.3 restarts the daemon and ends running shells. The draft's publish step stopped silently after one upload on the first run (`softprops/action-gh-release@v2`, now forced onto Node 24); deleting the partial draft and rerunning the publish job succeeded. Read back: 10 assets, signed metadata with version 0.1.4, protocol 16, qualified daemon 0.1.4, and the full notes; the Windows update package hash matched. Not yet exercised: the in-app update from an installed 0.1.3, and the macOS app on a native Mac.
 
 ## References
 
