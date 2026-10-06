@@ -18,6 +18,14 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Check release notes match the tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          heading=$(head -n 1 docs/release-notes.md | tr -d '\r')
+          test "$heading" = "# ${RELEASE_TAG#v}" || { echo "docs/release-notes.md must start with '# ${RELEASE_TAG#v}', found '$heading'"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -215,20 +223,18 @@ jobs:
         env:
           COMPI_UPDATE_SIGNING_KEY: ${{ secrets.COMPI_UPDATE_SIGNING_KEY }}
           RELEASE_TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           test -n "$COMPI_UPDATE_PUBLIC_KEY" || { echo 'Missing public verification key repository variable'; exit 1; }
           test -n "$COMPI_UPDATE_SIGNING_KEY" || { echo 'Missing private metadata signing key secret'; exit 1; }
           cargo build --locked --release -p compi-update --bin compi-release-metadata
-          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$RELEASE_TAG" --jq .body > "$RUNNER_TEMP/release-notes.txt"
-          python3 tools/sign-release-metadata.py --distribution distribution --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --signer target/release/compi-release-metadata --notes "$RUNNER_TEMP/release-notes.txt"
+          python3 tools/sign-release-metadata.py --distribution distribution --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --signer target/release/compi-release-metadata --notes docs/release-notes.md
           cd distribution
           sha256sum compi-update-*.json >> SHA256SUMS.txt
       - name: Create draft GitHub release for deliberate human publication
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          generate_release_notes: true
+          body_path: docs/release-notes.md
           fail_on_unmatched_files: true
           files: distribution/*

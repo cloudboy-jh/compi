@@ -20,7 +20,7 @@ Build locally with `pwsh -File tools/build-installer.ps1` on Windows or `bash to
 
 ### Updates and data retention
 
-Open **Settings → Updates** or run **Check for Updates** from the command palette. Automatic checks are **Never**, **On launch**, or **Daily** (default); they never download, install, close windows, or restart a daemon silently. The surface shows client/daemon versions, signed notes, byte progress, affected work, deferral, and recovery actions.
+Open **Settings → Updates** or run **Check for Updates** from the command palette. Automatic checks are **Never**, **On launch**, or **Daily** (default); they never download, install, close windows, or restart a daemon silently. The surface shows client/daemon versions, signed notes, byte progress, affected work, deferral, and recovery actions. After an update, the new version's notes appear once as a **What's new** card in the sidebar and stay under **What's new in <version>** in **Settings → Updates**; fresh installs skip the card.
 
 Compatible activation relaunches clients into their exact saved views while retaining the existing daemon and shell lifetimes. A required local daemon restart needs explicit current-work consent and ends its shells; remote daemons are never restarted by the local updater. If the new build then fails to attach, rollback stops the replacement daemon it started only while that daemon is idle; otherwise rollback waits and reports which shells to close. Legacy 0.1.2 migration requires a deliberate old-install stop because its MSI removal hook cannot preserve live work.
 

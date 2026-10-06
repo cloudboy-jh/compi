@@ -10,6 +10,7 @@ pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod settings;
 pub(super) mod tree;
 mod tree_ui;
+mod whats_new;
 static PREPARED_HANDOFF: LazyLock<Mutex<Option<std::path::PathBuf>>> =
     LazyLock::new(|| Mutex::new(None));
 
@@ -782,6 +783,8 @@ impl CompiApp {
             workspace_scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
             sidebar_open: false,
+            whats_new_expanded: false,
+            settings_whats_new_expanded: false,
             sidebar_width,
             sidebar_drag: false,
             workspace_scroll_drag: None,
@@ -3419,7 +3422,12 @@ impl CompiApp {
                     );
                 }
             }
-            Command::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
+            Command::ToggleSidebar => {
+                self.sidebar_open = !self.sidebar_open;
+                if self.sidebar_open {
+                    self.clear_whats_new_dot(window, cx);
+                }
+            }
             Command::ResetSidebarWidth => {
                 self.sidebar_width = self.config.configured_sidebar_width;
                 self.state.sidebar_width = self.sidebar_width;
@@ -4883,7 +4891,18 @@ impl CompiApp {
                         Command::ToggleSidebar,
                         self.sidebar_open,
                         cx,
-                    )),
+                    ))
+                    .when(self.whats_new_dot(), |slot| {
+                        slot.child(
+                            div()
+                                .absolute()
+                                .top(px(9.0))
+                                .right(px(9.0))
+                                .size(px(6.0))
+                                .rounded_full()
+                                .bg(color(colors.accent)),
+                        )
+                    }),
             )
             .when(
                 self.drag_position
@@ -5152,6 +5171,7 @@ impl CompiApp {
                             .track_scroll(&self.sidebar_scroll)
                             .children(rows),
                     )
+                    .children(self.render_whats_new_card(cx))
                     .child(
                         div()
                             .p_2()

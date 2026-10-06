@@ -18,6 +18,25 @@ enum UpdateAction {
     RecoveryLog,
 }
 
+/// Content offsets 0.. of the Updates section; What's new controls follow.
+const UPDATE_ACTIONS: [UpdateAction; 13] = [
+    UpdateAction::Preference(crate::config::AutomaticUpdateChecks::Never),
+    UpdateAction::Preference(crate::config::AutomaticUpdateChecks::OnLaunch),
+    UpdateAction::Preference(crate::config::AutomaticUpdateChecks::Daily),
+    UpdateAction::Check,
+    UpdateAction::Download,
+    UpdateAction::Cancel,
+    UpdateAction::Review,
+    UpdateAction::Install,
+    UpdateAction::Defer,
+    UpdateAction::Retry,
+    UpdateAction::Reinstall,
+    UpdateAction::RestorePrior,
+    UpdateAction::RecoveryLog,
+];
+const WHATS_NEW_MORE_OFFSET: usize = UPDATE_ACTIONS.len();
+const RELEASE_NOTES_OFFSET: usize = UPDATE_ACTIONS.len() + 1;
+
 #[derive(Clone, Copy)]
 enum SettingsAction {
     Scope(SettingsScope),
@@ -43,6 +62,8 @@ enum SettingsAction {
     OpenDiagnostics,
     RestartDaemon,
     Update(UpdateAction),
+    ToggleWhatsNew,
+    OpenReleaseNotes,
     Prompt(super::prompt::PromptAction),
 }
 
@@ -84,7 +105,9 @@ impl CompiApp {
             SettingsSection::Terminal => self.prompt_offset_base() + self.prompt_actions().len(),
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
-            SettingsSection::Updates => 13,
+            SettingsSection::Updates => {
+                UPDATE_ACTIONS.len() + crate::release_notes::current().map_or(0, |_| 2)
+            }
             SettingsSection::Advanced => 8,
         }
     }
@@ -137,24 +160,17 @@ impl CompiApp {
                 2 => Some(SettingsAction::CopyPerformance),
                 _ => None,
             },
-            SettingsSection::Updates => [
-                UpdateAction::Preference(crate::config::AutomaticUpdateChecks::Never),
-                UpdateAction::Preference(crate::config::AutomaticUpdateChecks::OnLaunch),
-                UpdateAction::Preference(crate::config::AutomaticUpdateChecks::Daily),
-                UpdateAction::Check,
-                UpdateAction::Download,
-                UpdateAction::Cancel,
-                UpdateAction::Review,
-                UpdateAction::Install,
-                UpdateAction::Defer,
-                UpdateAction::Retry,
-                UpdateAction::Reinstall,
-                UpdateAction::RestorePrior,
-                UpdateAction::RecoveryLog,
-            ]
-            .get(offset)
-            .copied()
-            .map(SettingsAction::Update),
+            SettingsSection::Updates => {
+                let notes = crate::release_notes::current().is_some();
+                match offset {
+                    WHATS_NEW_MORE_OFFSET if notes => Some(SettingsAction::ToggleWhatsNew),
+                    RELEASE_NOTES_OFFSET if notes => Some(SettingsAction::OpenReleaseNotes),
+                    _ => UPDATE_ACTIONS
+                        .get(offset)
+                        .copied()
+                        .map(SettingsAction::Update),
+                }
+            }
             SettingsSection::Advanced => match offset {
                 0 => Some(SettingsAction::Scope(SettingsScope::Global)),
                 1 => Some(SettingsAction::Scope(SettingsScope::Window)),
@@ -468,6 +484,14 @@ impl CompiApp {
                 }
             }
             SettingsAction::Scope(scope) => self.settings_scope = scope,
+            SettingsAction::ToggleWhatsNew => {
+                self.settings_whats_new_expanded = !self.settings_whats_new_expanded
+            }
+            SettingsAction::OpenReleaseNotes => {
+                if let Some(notes) = crate::release_notes::current() {
+                    self.open_release_notes(notes);
+                }
+            }
             SettingsAction::BrowseThemes(target) => {
                 self.open_theme_catalog_target(self.settings_scope, target)
             }
@@ -608,7 +632,7 @@ impl CompiApp {
             .into_any_element()
     }
 
-    pub(super) fn settings_subheading(&self, label: &'static str) -> AnyElement {
+    pub(super) fn settings_subheading(&self, label: &str) -> AnyElement {
         let colors = *self.colors();
         div()
             .pb_1()
@@ -1633,14 +1657,41 @@ impl CompiApp {
         if let Some(prepared) = &snapshot.prepared {
             content = content.child(format!("Verified staged client {}. Install and restart applies this version; Download explicitly replaces it with the available release.", prepared.version));
         }
-        if !snapshot.release_notes.is_empty() {
+        if let Some(notes) = crate::release_notes::current() {
+            let expanded = self.settings_whats_new_expanded;
+            let more = self.settings_control_button(
+                if expanded { "Less" } else { "More" },
+                SettingsAction::ToggleWhatsNew,
+                WHATS_NEW_MORE_OFFSET,
+                false,
+                cx,
+            );
+            let link = self.settings_control_button(
+                "Release notes",
+                SettingsAction::OpenReleaseNotes,
+                RELEASE_NOTES_OFFSET,
+                false,
+                cx,
+            );
             content = content
-                .child(self.settings_subheading("Release notes"))
-                .child(
-                    div()
-                        .min_w_0()
-                        .child(SharedString::new(snapshot.release_notes.clone())),
-                );
+                .child(self.settings_subheading(&format!("What's new in {}", notes.version)))
+                .child(self.render_release_notes_view(notes, expanded, more, link));
+        }
+        if !snapshot.release_notes.is_empty() {
+            let candidate = snapshot
+                .available_release
+                .as_ref()
+                .or(snapshot.release.as_ref())
+                .map(|release| release.manifest.version.as_str());
+            let label = match candidate {
+                Some(version) => format!("{version} · Release notes"),
+                None => "Release notes".to_owned(),
+            };
+            content = content.child(self.settings_subheading(&label)).child(
+                div()
+                    .min_w_0()
+                    .child(SharedString::new(snapshot.release_notes.clone())),
+            );
         }
         content = content.child(self.settings_subheading("Connected daemons"));
         if snapshot.daemons.is_empty() {

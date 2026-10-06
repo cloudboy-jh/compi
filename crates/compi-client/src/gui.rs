@@ -131,6 +131,8 @@ fn run_application(
     launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
     restore: Option<Arc<crate::update_restore::RestoreSession>>,
 ) {
+    // Before any window claims (and so writes) its state slot.
+    crate::release_notes::initialize();
     let empty_measurement = perf::empty_window_enabled();
     Application::new().run(move |cx: &mut App| {
         let mut config = config;
@@ -797,6 +799,8 @@ struct CompiApp {
     workspace_scroll: ScrollHandle,
     sidebar_scroll: ScrollHandle,
     sidebar_open: bool,
+    whats_new_expanded: bool,
+    settings_whats_new_expanded: bool,
     sidebar_width: f32,
     sidebar_drag: bool,
     workspace_scroll_drag: Option<bool>,
