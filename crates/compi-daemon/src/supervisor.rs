@@ -60,6 +60,14 @@ impl Drop for SupervisorPresence {
 }
 
 pub fn supervise(daemon_executable: &Path) -> Result<()> {
+    // The logon task starts this console program in the user's session, which
+    // gives it a console window. Closing that window killed the supervisor
+    // (0xC000013A) while its daemon kept running, and the updater then refused
+    // to touch the orphaned daemon. Detach so the window closes and nothing can
+    // close it under us; all output goes to daemon.log, and the daemon itself
+    // runs with CREATE_NO_WINDOW.
+    // SAFETY: FreeConsole takes no arguments; failing just means there was no console.
+    let _ = unsafe { windows::Win32::System::Console::FreeConsole() };
     if !daemon_executable.is_absolute() || !daemon_executable.is_file() {
         return Err(format!(
             "daemon executable does not exist at {}",

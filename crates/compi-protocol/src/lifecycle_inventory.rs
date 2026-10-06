@@ -438,15 +438,11 @@ fn attributed_status(
         }
         return Err("target installation has a competing or recovering daemon process; wait for it to exit before updating".into());
     }
-    if let Some(pid) = status.supervisor_pid
-        && !owners
-            .iter()
-            .any(|owner| owner.pid == pid && owner.supervisor)
-    {
-        return Err(
-            "cannot match target supervisor lifecycle identity to an observed OS process".into(),
-        );
-    }
+    // A recorded supervisor that no longer runs left its daemon unsupervised:
+    // nothing can restart it behind the update. (A supervisor killed by closing
+    // its console window used to block updates here forever.) A live process
+    // holding that PID without being this installation's supervisor was already
+    // rejected as a competitor above.
     Ok(true)
 }
 
@@ -824,7 +820,20 @@ mod tests {
         assert!(roots.executable_root(&nested.executable).unwrap().is_none());
         let mut supervised = cached;
         supervised.supervisor_pid = Some(13);
-        assert!(attributed_status(&roots, &[&observed], Some("work"), &supervised).is_err());
+        assert!(
+            attributed_status(&roots, &[&observed], Some("work"), &supervised).unwrap(),
+            "an exited supervisor leaves an unsupervised daemon that can be updated"
+        );
+        let mut supervisor = daemon(13, &retained);
+        supervisor.supervisor = true;
+        assert!(
+            attributed_status(&roots, &[&observed, &supervisor], Some("work"), &supervised)
+                .unwrap()
+        );
+        let impostor = daemon(13, &retained);
+        assert!(
+            attributed_status(&roots, &[&observed, &impostor], Some("work"), &supervised).is_err()
+        );
     }
 
     #[test]
