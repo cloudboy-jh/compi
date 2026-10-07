@@ -53,11 +53,15 @@ Publisher signing/notarization and signed updater metadata are separate concerns
 
 `docs/release-notes.md` is the one source. The client embeds it at build time and shows it only when its heading matches the client version: once as the **What's new** card in the sidebar after an update (an accent dot on the sidebar button until the sidebar is opened; the card until its × is clicked), and always under **What's new in <version>** in **Settings → Updates**. The workflow signs it into the update metadata, which the update dialog shows before installing, and uses it as the draft GitHub release body. Editing only the GitHub description afterward changes neither the app nor the updater, so write final notes before tagging.
 
-## Latest release: v0.1.5
+## Latest release: v0.1.6
+
+Published 2026-10-07 as the stable latest release from tag `v0.1.6` (`208c712`). New Updates page, Setup's repair doctor (`--repair`, also reached through in-app **Repair Compi**), Setup upgrading installs stuck on 0.1.3, plain Setup errors, task owner compared by SID, and Remove working from any Setup build. Read back: 12 assets including stable `Compi-Setup.exe` and the signed `compi-setup-windows-x86_64.json`, whose hash matches both Setup files; update metadata version 0.1.6, protocol 16, qualified daemon 0.1.6, so updating from 0.1.5 restarts the daemon. Checked on Windows before tagging: Setup over the published 0.1.5 with a live shell kept the 0.1.5 daemon and shell, and the 0.1.6 app attached to it. Not yet exercised: the in-app update from 0.1.5 against this release, and in-app Repair Compi.
+
+## Previous release: v0.1.5
 
 Fix release for the update blocker found right after v0.1.4: on Windows, closing the console window of the sign-in task's supervisor killed it while its daemon kept running, and the 0.1.3 updater then refused to inspect that daemon ("cannot match target supervisor lifecycle identity"). v0.1.5 detaches the supervisor from its console and treats an exited supervisor as an unsupervised daemon. Installs still on 0.1.3 run their own old check, so the notes give the one-time `--shutdown` command to unstick them.
 
-## Previous release: v0.1.4
+## Older release: v0.1.4
 
 Published 2026-10-06 as the stable latest release from tag `v0.1.4` (`6f3a386`); notes from `docs/release-notes.md`.
 
