@@ -460,7 +460,8 @@ fn processes() -> Result<Vec<ProcessRecord>> {
     // Constant script, no shell interpolation of paths, instances, or user input.
     // CIM's kernel process identity plus GetOwnerSid limits legacy attribution
     // to the same user as the authenticated named-pipe endpoint.
-    const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $rows=@(Get-CimInstance Win32_Process -Filter "Name='compi-daemon.exe'" | ForEach-Object { $owner=Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid; if ($owner.Sid -eq $env:COMPI_LIFECYCLE_USER_SID) { if (!$_.ExecutablePath -or !$_.CommandLine) { throw 'Cannot attribute owned daemon process executable or arguments' }; [pscustomobject]@{pid=$_.ProcessId;executable=$_.ExecutablePath;command_line=$_.CommandLine} } }); ConvertTo-Json -InputObject $rows -Compress"#;
+    // try/catch reports only the exception message, never a formatted PowerShell error record.
+    const SCRIPT: &str = r#"try { $ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $rows=@(Get-CimInstance Win32_Process -Filter "Name='compi-daemon.exe'" | ForEach-Object { $owner=Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid; if ($owner.Sid -eq $env:COMPI_LIFECYCLE_USER_SID) { if (!$_.ExecutablePath -or !$_.CommandLine) { throw 'Cannot attribute owned daemon process executable or arguments' }; [pscustomobject]@{pid=$_.ProcessId;executable=$_.ExecutablePath;command_line=$_.CommandLine} } }); ConvertTo-Json -InputObject $rows -Compress } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"#;
     let output = Command::new("powershell.exe")
         .args([
             "-NoLogo",

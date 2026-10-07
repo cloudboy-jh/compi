@@ -80,6 +80,21 @@ impl ProcessExit {
     }
 }
 
+/// Whether opening a process failed because no process has that ID any more.
+fn process_gone(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    #[cfg(windows)]
+    {
+        error
+            .downcast_ref::<windows::core::Error>()
+            .is_some_and(|error| error.code().0 as u32 & 0xffff == 87)
+    }
+    #[cfg(unix)]
+    {
+        let _ = error;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionFailureKind {
     Absent,
@@ -394,13 +409,7 @@ impl DaemonClient {
         };
         let process = match ProcessExit::open(pid) {
             Ok(process) => process,
-            Err(error)
-                if error
-                    .downcast_ref::<windows::core::Error>()
-                    .is_some_and(|error| error.code().0 as u32 & 0xffff == 87) =>
-            {
-                return Ok(());
-            }
+            Err(error) if process_gone(error.as_ref()) => return Ok(()),
             Err(error) => return Err(error),
         };
         match unsafe { WaitForSingleObject(HANDLE(process.0.as_raw_handle()), 0) } {
@@ -492,7 +501,14 @@ impl DaemonClient {
             return Err("daemon generation changed; review shutdown consent again".into());
         }
         let daemon_exit = ProcessExit::open(status.daemon_pid)?;
-        let supervisor_exit = status.supervisor_pid.map(ProcessExit::open).transpose()?;
+        // A supervisor that already exited (its console was closed) left this daemon
+        // unsupervised; there is nothing to wait for, and failing here stranded it.
+        let supervisor_exit = match status.supervisor_pid.map(ProcessExit::open) {
+            Some(Ok(exit)) => Some(exit),
+            Some(Err(error)) if process_gone(error.as_ref()) => None,
+            Some(Err(error)) => return Err(error),
+            None => None,
+        };
         match client.request_bounded(
             ClientMessage::ConditionalStop {
                 lifecycle_version: crate::LIFECYCLE_VERSION,
