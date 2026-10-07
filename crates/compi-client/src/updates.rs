@@ -1511,6 +1511,7 @@ mod tests {
     }
 
     /// A local daemon the staged release must restart, running `shells` live shells.
+    #[cfg(any(windows, target_os = "macos"))]
     fn ending(shells: usize) -> DaemonUpdateStatus {
         let mut status = daemon();
         status.protocol_version = 15;
