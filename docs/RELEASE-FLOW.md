@@ -32,6 +32,7 @@ At inspected upstream `5aff8fa51a2f70be9cd2c1896f80b451aa4dac74`:
 - A `v*` tag triggers the Release workflow. Build scripts check the expected tag against the workspace version.
 - Windows and macOS packages are built and smoke-checked; the publish job depends on both jobs.
 - Checksums are combined/verified and native release metadata is signed with `docs/release-notes.md` as its notes. The Windows job fails first if that file's heading does not match the tag.
+- The Windows job also publishes the Setup as stable-named `Compi-Setup.exe` (in `SHA256SUMS.txt`) with its own signed `compi-setup-<platform>.json`. In-app **Repair Compi** downloads it from the latest release, so check both are on the draft.
 - The workflow creates a draft GitHub release for deliberate publication.
 - Manual workflow dispatch produces build artifacts, not a public release.
 - The updater requests GitHub's latest release and rejects drafts/prereleases. Pushing commits or a tag alone does not make an update available.
