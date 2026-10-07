@@ -244,7 +244,7 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
             Some(
                 session
                     .error
-                    .unwrap_or_else(|| "surface was owned by a previous daemon".into()),
+                    .unwrap_or_else(|| "This shell ended when Compi restarted.".into()),
             )
         } else {
             session.error
@@ -315,7 +315,7 @@ fn recover_lost_surfaces(workspace: &mut StoredWorkspace) {
             surface.status = SurfaceStatus::Lost;
             surface.attached = false;
             surface.exit_code = None;
-            surface.error = Some("surface was owned by a previous daemon".into());
+            surface.error = Some("This shell ended when Compi restarted.".into());
             changed = true;
         }
     }

@@ -160,40 +160,35 @@ pub struct FontOverrides {
     pub line_height: Option<f32>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutomaticUpdateChecks {
-    Never,
-    OnLaunch,
-    #[default]
-    Daily,
-}
-
-impl AutomaticUpdateChecks {
-    pub const ALL: [Self; 3] = [Self::Never, Self::OnLaunch, Self::Daily];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Never => "Never",
-            Self::OnLaunch => "On launch",
-            Self::Daily => "Daily",
-        }
-    }
-
-    const fn value(self) -> &'static str {
-        match self {
-            Self::Never => "never",
-            Self::OnLaunch => "on_launch",
-            Self::Daily => "daily",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdateSettings {
-    pub automatic_checks: AutomaticUpdateChecks,
+    /// Checks on launch when a day has passed, then daily while running.
+    pub check_for_updates: bool,
+    /// Downloads and verifies an available update after a check; never installs it.
+    pub download_updates_automatically: bool,
     pub last_check_unix: Option<u64>,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_for_updates: true,
+            download_updates_automatically: false,
+            last_check_unix: None,
+        }
+    }
+}
+
+/// Pre-0.1.6 `automatic_checks` value; replaced by `check_for_updates`.
+const LEGACY_UPDATE_CHECKS: &str = "automatic_checks";
+
+fn legacy_update_checks(value: &toml::Value) -> Option<bool> {
+    match value.as_str()? {
+        "never" => Some(false),
+        "on_launch" | "on-launch" | "daily" => Some(true),
+        _ => None,
+    }
 }
 
 static CONFIG_WRITES: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -252,10 +247,23 @@ impl Default for LoadedConfig {
 impl LoadedConfig {
     pub fn save_update_settings(&mut self, updates: UpdateSettings) -> Result<(), String> {
         update_table(&self.path, "updates", |table| {
+            // The new key takes over the legacy line and its comments.
+            if let Some((legacy_key, legacy)) = table.remove_entry(LEGACY_UPDATE_CHECKS)
+                && !table.contains_key("check_for_updates")
+            {
+                let mut key = toml_edit::Key::new("check_for_updates");
+                *key.leaf_decor_mut() = legacy_key.leaf_decor().clone();
+                let mut value = toml_edit::Value::from(updates.check_for_updates);
+                if let Some(previous) = legacy.as_value() {
+                    *value.decor_mut() = previous.decor().clone();
+                }
+                table.insert_formatted(&key, toml_edit::Item::Value(value));
+            }
+            set_table_value(table, "check_for_updates", updates.check_for_updates.into());
             set_table_value(
                 table,
-                "automatic_checks",
-                updates.automatic_checks.value().into(),
+                "download_updates_automatically",
+                updates.download_updates_automatically.into(),
             );
             if let Some(timestamp) = updates.last_check_unix {
                 set_table_value(
@@ -1209,17 +1217,34 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
     apply_layout_presets(&document, loaded);
     apply_launch(&document, loaded);
     if let Some(updates) = table(&document, "updates", loaded) {
-        if let Some(value) = updates.get("automatic_checks") {
-            match value.as_str() {
-                Some("never") => loaded.updates.automatic_checks = AutomaticUpdateChecks::Never,
-                Some("on_launch") => {
-                    loaded.updates.automatic_checks = AutomaticUpdateChecks::OnLaunch
-                }
-                Some("daily") => loaded.updates.automatic_checks = AutomaticUpdateChecks::Daily,
-                _ => invalid(
+        if let Some(value) = updates.get("check_for_updates") {
+            match value.as_bool() {
+                Some(enabled) => loaded.updates.check_for_updates = enabled,
+                None => invalid(
+                    loaded,
+                    "updates.check_for_updates",
+                    "true or false",
+                    "configuration",
+                ),
+            }
+        } else if let Some(value) = updates.get(LEGACY_UPDATE_CHECKS) {
+            match legacy_update_checks(value) {
+                Some(enabled) => loaded.updates.check_for_updates = enabled,
+                None => invalid(
                     loaded,
                     "updates.automatic_checks",
                     "never, on_launch, or daily",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = updates.get("download_updates_automatically") {
+            match value.as_bool() {
+                Some(enabled) => loaded.updates.download_updates_automatically = enabled,
+                None => invalid(
+                    loaded,
+                    "updates.download_updates_automatically",
+                    "true or false",
                     "configuration",
                 ),
             }
@@ -1935,7 +1960,8 @@ mod tests {
                 first.wait();
                 updates
                     .save_update_settings(UpdateSettings {
-                        automatic_checks: AutomaticUpdateChecks::Never,
+                        check_for_updates: false,
+                        download_updates_automatically: true,
                         last_check_unix: Some(1234),
                     })
                     .unwrap();
@@ -1946,10 +1972,8 @@ mod tests {
             });
         });
         let loaded = load(Some(&path), FontOverrides::default());
-        assert_eq!(
-            loaded.updates.automatic_checks,
-            AutomaticUpdateChecks::Never
-        );
+        assert!(!loaded.updates.check_for_updates);
+        assert!(loaded.updates.download_updates_automatically);
         assert_eq!(loaded.updates.last_check_unix, Some(1234));
         assert_eq!(loaded.ui_font, UiFontPreset::Inter);
         let saved = fs::read_to_string(&path).unwrap();
@@ -1958,6 +1982,61 @@ mod tests {
             saved.parse::<toml::Table>().unwrap()["future"]["answer"].as_integer(),
             Some(42)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_settings_migrate_legacy_checks_and_default_when_missing() {
+        let defaults = parse("version = 1\n", FontOverrides::default());
+        assert_eq!(defaults.updates, UpdateSettings::default());
+        assert!(defaults.updates.check_for_updates);
+        assert!(!defaults.updates.download_updates_automatically);
+        for (legacy, expected) in [("never", false), ("on_launch", true), ("daily", true)] {
+            let loaded = parse(
+                &format!("version = 1\n[updates]\nautomatic_checks = '{legacy}'\n"),
+                FontOverrides::default(),
+            );
+            assert_eq!(loaded.updates.check_for_updates, expected, "{legacy}");
+            assert!(!loaded.updates.download_updates_automatically);
+            assert!(loaded.diagnostics.is_empty(), "{legacy}");
+        }
+        // The new key wins over a stale legacy key.
+        let both = parse(
+            "version = 1\n[updates]\nautomatic_checks = 'never'\ncheck_for_updates = true\n",
+            FontOverrides::default(),
+        );
+        assert!(both.updates.check_for_updates);
+    }
+
+    #[test]
+    fn saving_update_settings_replaces_legacy_key_and_keeps_its_comment() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-update-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\n[updates]\n# how often\nautomatic_checks = \"never\"\n",
+        )
+        .unwrap();
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert!(!loaded.updates.check_for_updates);
+        loaded.save_update_settings(loaded.updates.clone()).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("automatic_checks"), "{saved}");
+        assert!(
+            saved.contains("# how often\ncheck_for_updates = false"),
+            "{saved}"
+        );
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert!(!reloaded.updates.check_for_updates);
+        assert!(!reloaded.updates.download_updates_automatically);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -801,6 +801,11 @@ struct CompiApp {
     sidebar_open: bool,
     whats_new_expanded: bool,
     settings_whats_new_expanded: bool,
+    settings_update_notes_expanded: bool,
+    settings_update_advanced: bool,
+    /// A verified update is ready and the user has not opened Settings → Updates since.
+    update_dot: bool,
+    updates_page_open: bool,
     sidebar_width: f32,
     sidebar_drag: bool,
     workspace_scroll_drag: Option<bool>,

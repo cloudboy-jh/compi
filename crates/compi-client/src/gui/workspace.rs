@@ -785,6 +785,10 @@ impl CompiApp {
             sidebar_open: false,
             whats_new_expanded: false,
             settings_whats_new_expanded: false,
+            settings_update_notes_expanded: false,
+            settings_update_advanced: false,
+            update_dot: false,
+            updates_page_open: false,
             sidebar_width,
             sidebar_drag: false,
             workspace_scroll_drag: None,
@@ -908,10 +912,8 @@ impl CompiApp {
                         if this.restore_session.is_some() && !this.restore_ready {
                             this.acknowledge_update_restore();
                             cx.notify();
-                        } else if matches!(this.overlay, Some(Overlay::Settings))
-                            && this.settings_section == SettingsSection::Updates
-                        {
-                            cx.notify();
+                        } else {
+                            this.poll_updates(cx);
                         }
                     })
                     .is_err()
@@ -4064,7 +4066,7 @@ impl CompiApp {
                     SurfaceStatus::Ending => "Ending",
                     SurfaceStatus::Exited => "Exited",
                     SurfaceStatus::Failed => "Failed",
-                    SurfaceStatus::Lost => "Lost",
+                    SurfaceStatus::Lost => "Ended",
                 };
                 if !statuses.contains(&label) {
                     statuses.push(label);
@@ -4892,7 +4894,7 @@ impl CompiApp {
                         self.sidebar_open,
                         cx,
                     ))
-                    .when(self.whats_new_dot(), |slot| {
+                    .when(self.whats_new_dot() || self.update_dot, |slot| {
                         slot.child(
                             div()
                                 .absolute()
@@ -5498,7 +5500,7 @@ impl CompiApp {
                 SurfaceStatus::Ending => "Ending…",
                 SurfaceStatus::Exited => "Exited",
                 SurfaceStatus::Failed => "Failed",
-                SurfaceStatus::Lost => "Lost",
+                SurfaceStatus::Lost => "Ended",
             })
             .unwrap_or("Removed");
         let error = view
@@ -5561,7 +5563,7 @@ impl CompiApp {
                                 .px_2()
                                 .py_1()
                                 .text_size(px(UI_SMALL_TEXT_SIZE))
-                                .text_color(color(if matches!(status, "Failed" | "Lost") {
+                                .text_color(color(if matches!(status, "Failed" | "Ended") {
                                     colors.error
                                 } else {
                                     colors.muted
@@ -5577,10 +5579,10 @@ impl CompiApp {
                                 cx,
                             ))
                         })
-                        .when(matches!(status, "Exited" | "Failed" | "Lost"), |actions| {
+                        .when(matches!(status, "Exited" | "Failed" | "Ended"), |actions| {
                             actions.child(self.pane_command_button(
                                 ("restart-pane", index),
-                                "Restart surface",
+                                "Restart shell",
                                 Command::RestartSurface,
                                 &pane_id,
                                 cx,

@@ -14,7 +14,7 @@ const CONFIG_TEMPLATE: &str = "\
 version = 1
 
 [updates]
-automatic_checks = \"never\"
+check_for_updates = false
 ";
 
 pub struct Layout {
@@ -229,7 +229,7 @@ mod tests {
         let seeded = std::fs::read_to_string(&layout.config).unwrap();
         // The client refuses launches from an unversioned config.
         assert!(seeded.lines().any(|line| line == "version = 1"));
-        assert!(seeded.contains("automatic_checks = \"never\""));
+        assert!(seeded.contains("check_for_updates = false"));
 
         std::fs::write(&layout.config, "[appearance]\ntheme = \"one-light\"\n").unwrap();
         layout.prepare().unwrap();
