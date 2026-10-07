@@ -526,8 +526,12 @@ fn task_powershell(script: &str) -> Result<std::process::Output> {
     let executable =
         PathBuf::from(std::env::var_os("SystemRoot").ok_or_else(|| err("SystemRoot is not set"))?)
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    // try/catch reports only the exception message, never a formatted PowerShell error record.
+    let script = format!(
+        "try {{ {script} }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
+    );
     let output = Command::new(executable)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x08000000)
         .output()?;
     if !output.status.success() {
@@ -568,8 +572,15 @@ $ErrorActionPreference='Stop'
 $id=[Security.Principal.WindowsIdentity]::GetCurrent()
 $name='Compi Daemon-'+$id.User.Value
 $allowed=@({paths})
+# Windows reports a task's principal as a SID, DOMAIN\user, or a bare user name
+# ("johns"); compare the resolved SID so the account's own task is never "foreign".
 function Assert-Owner($owner, $commands) {{
-    if ($owner -ne $id.User.Value -and $owner -ne $id.Name) {{ throw 'Task belongs to another Windows account' }}
+    $ownerSid=$owner
+    if ($owner -notlike 'S-1-*') {{
+        try {{ $ownerSid=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }} catch {{ $ownerSid=$null }}
+    }}
+    $mine=($ownerSid -eq $id.User.Value) -or ($owner -eq $id.Name) -or ($owner -eq ($id.Name -split '\\')[-1])
+    if (-not $mine) {{ throw 'Task belongs to another Windows account' }}
     if (@($commands).Count -ne 1) {{ throw 'Task does not have exactly one owned daemon action' }}
     foreach ($command in $commands) {{
         $path=[IO.Path]::GetFullPath($command.Trim('"'))
@@ -1678,6 +1689,7 @@ mod tests {
                     size: 1,
                     sha256: "00".repeat(32),
                 },
+                setup: None,
             },
             signed: SignedManifest {
                 payload: String::new(),

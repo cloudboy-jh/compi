@@ -75,7 +75,7 @@ def main():
     for filename in ('config.toml', 'external-project.txt'):
         path = (data if filename != 'external-project.txt' else profile) / filename
         content = ('# smoke data retention ' + uuid.uuid4().hex
-                   + '\nversion = 1\n[updates]\nautomatic_checks = "never"\n') if filename == 'config.toml' else uuid.uuid4().hex
+                   + '\nversion = 1\n[updates]\ncheck_for_updates = false\n') if filename == 'config.toml' else uuid.uuid4().hex
         path.write_text(content)
         sentinels[path] = path.read_bytes()
     driver = payload / ('compi-update-smoke.exe' if windows else 'compi-update-smoke')

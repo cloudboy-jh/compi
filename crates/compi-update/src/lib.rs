@@ -99,6 +99,15 @@ pub struct Artifact {
     pub size: u64,
     pub sha256: String,
 }
+/// Signed Windows Setup for the same release. Published only in `compi-setup-<platform>.json`:
+/// clients through 0.1.5 deny unknown manifest fields, so the update manifest never carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetupArtifact {
+    pub url: String,
+    pub size: u64,
+    pub sha256: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseManifest {
@@ -112,6 +121,8 @@ pub struct ReleaseManifest {
     pub qualified_daemon_versions: Vec<String>,
     pub minimum_persistence: u32,
     pub artifact: Artifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupArtifact>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,6 +177,18 @@ const MAX_ARTIFACT: u64 = 4 * 1024 * 1024 * 1024;
 /// Update-qualified presentation format; changing it requires an explicit reversible migration.
 pub const SUPPORTED_PERSISTENCE_VERSION: u32 = 5;
 pub fn verify_manifest(bytes: &[u8], config: &ReleaseConfig) -> Result<AvailableRelease> {
+    let release = verify_signed(bytes, config)?;
+    let version = semver::Version::parse(&release.manifest.version)
+        .map_err(|_| err("Invalid update version"))?;
+    let current = semver::Version::parse(&config.current_version)
+        .map_err(|_| err("Invalid current version"))?;
+    if version <= current {
+        return Err(err("Stable update is stale, a prerelease, or a downgrade"));
+    }
+    Ok(release)
+}
+/// Authenticity and shape only; repair may legitimately fetch the release already installed.
+fn verify_signed(bytes: &[u8], config: &ReleaseConfig) -> Result<AvailableRelease> {
     if bytes.len() as u64 > MAX_METADATA {
         return Err(err("Update metadata exceeds size limit"));
     }
@@ -188,9 +211,7 @@ pub fn verify_manifest(bytes: &[u8], config: &ReleaseConfig) -> Result<Available
     }
     let version =
         semver::Version::parse(&manifest.version).map_err(|_| err("Invalid update version"))?;
-    let current = semver::Version::parse(&config.current_version)
-        .map_err(|_| err("Invalid current version"))?;
-    if !version.pre.is_empty() || version <= current {
+    if !version.pre.is_empty() {
         return Err(err("Stable update is stale, a prerelease, or a downgrade"));
     }
     validate_manifest(&manifest)?;
@@ -209,6 +230,16 @@ pub(crate) fn validate_manifest(m: &ReleaseManifest) -> Result<()> {
         return Err(err("Invalid artifact size or SHA-256"));
     }
     trusted_asset_url(&m.artifact.url)?;
+    if let Some(setup) = &m.setup {
+        if setup.size == 0
+            || setup.size > MAX_ARTIFACT
+            || setup.sha256.len() != 64
+            || !setup.sha256.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(err("Invalid Setup size or SHA-256"));
+        }
+        trusted_asset_url(&setup.url)?;
+    }
     validate_minimum_os(m)?;
     if m.minimum_persistence != SUPPORTED_PERSISTENCE_VERSION {
         return Err(err(
@@ -335,22 +366,10 @@ impl UpdateManager {
         {
             return Err(err("Invalid GitHub release repository"));
         }
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(concat!("Compi/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.url().scheme() != "https" {
-                    attempt.error("Non-HTTPS update redirect")
-                } else if attempt.previous().len() > 10 {
-                    attempt.error("Too many redirects")
-                } else {
-                    attempt.follow()
-                }
-            }))
-            .build()
-            .map_err(|e| err(e.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client: http_client()?,
+        })
     }
     pub fn check(
         &mut self,
@@ -364,6 +383,46 @@ impl UpdateManager {
             None,
             "Checking latest published stable release",
         ));
+        let Some((release, tagged)) = self.latest_published(cancel)? else {
+            return Ok(None);
+        };
+        let current = semver::Version::parse(&self.config.current_version)
+            .map_err(|_| err("Current version is invalid"))?;
+        if tagged <= current {
+            return Ok(None);
+        }
+        let name = format!("compi-update-{}.json", self.config.platform);
+        let bytes = self.signed_asset(&release, &name, cancel)?.ok_or_else(|| {
+            err("Published release has no signed update metadata for this platform")
+        })?;
+        let available = verify_manifest(&bytes, &self.config)?;
+        self.check_published_identity(&available, &tagged)?;
+        Ok(Some(available))
+    }
+    /// The latest published stable release with its signed Windows Setup, even when it is the
+    /// version already running: repair must always be able to obtain current maintenance code.
+    pub fn latest_setup_release(&mut self, cancel: &Cancellation) -> Result<AvailableRelease> {
+        cancel.check()?;
+        let (release, tagged) = self
+            .latest_published(cancel)?
+            .ok_or_else(|| err("No Compi release is published yet"))?;
+        let name = format!("compi-setup-{}.json", self.config.platform);
+        let bytes = self
+            .signed_asset(&release, &name, cancel)?
+            .ok_or_else(|| err("The latest release has no repair tool for this platform"))?;
+        let available = verify_signed(&bytes, &self.config)?;
+        self.check_published_identity(&available, &tagged)?;
+        if available.manifest.setup.is_none() {
+            return Err(err(
+                "The latest release has no repair tool for this platform",
+            ));
+        }
+        Ok(available)
+    }
+    fn latest_published(
+        &self,
+        cancel: &Cancellation,
+    ) -> Result<Option<(GithubRelease, semver::Version)>> {
         let url = format!(
             "https://api.github.com/repos/{}/releases/latest",
             self.config.repository
@@ -383,41 +442,41 @@ impl UpdateManager {
         }
         let tagged = semver::Version::parse(release.tag_name.trim_start_matches('v'))
             .map_err(|_| err("Release tag is not a semantic version"))?;
-        let current = semver::Version::parse(&self.config.current_version)
-            .map_err(|_| err("Current version is invalid"))?;
-        if tagged <= current {
+        Ok(Some((release, tagged)))
+    }
+    fn signed_asset(
+        &self,
+        release: &GithubRelease,
+        name: &str,
+        cancel: &Cancellation,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(asset) = release.assets.iter().find(|asset| asset.name == name) else {
             return Ok(None);
-        }
-        let name = format!("compi-update-{}.json", self.config.platform);
-        let asset = release
-            .assets
-            .iter()
-            .find(|asset| asset.name == name)
-            .ok_or_else(|| {
-                err("Published release has no signed update metadata for this platform")
-            })?;
+        };
         trusted_asset_url(&asset.browser_download_url)?;
-        let bytes = bounded_response(
+        bounded_response(
             self.client
                 .get(&asset.browser_download_url)
                 .send()
                 .map_err(|e| err(e.to_string()))?,
             MAX_METADATA,
             cancel,
-        )?;
-        let available = verify_manifest(&bytes, &self.config)?;
-        if semver::Version::parse(&available.manifest.version).ok() != Some(tagged) {
+        )
+        .map(Some)
+    }
+    fn check_published_identity(
+        &self,
+        available: &AvailableRelease,
+        tagged: &semver::Version,
+    ) -> Result<()> {
+        if semver::Version::parse(&available.manifest.version)
+            .ok()
+            .as_ref()
+            != Some(tagged)
+        {
             return Err(err("Signed version does not match published release tag"));
         }
-        if !available.manifest.artifact.url.starts_with(&format!(
-            "https://github.com/{}/releases/download/",
-            self.config.repository
-        )) {
-            return Err(err(
-                "Signed artifact is not owned by configured release repository",
-            ));
-        }
-        Ok(Some(available))
+        check_release_owner(&available.manifest, &self.config.repository)
     }
     pub fn prepare(
         &mut self,
@@ -442,60 +501,19 @@ impl UpdateManager {
         fs::create_dir(&owned)?;
         let result = (|| {
             let download = owned.join("package.zip");
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&download)?;
-            let mut response = self
-                .client
-                .get(&release.manifest.artifact.url)
-                .send()
-                .map_err(|e| err(e.to_string()))?
-                .error_for_status()
-                .map_err(|e| err(e.to_string()))?;
-            if response
-                .content_length()
-                .is_some_and(|n| n != release.manifest.artifact.size)
-            {
-                return Err(err("Artifact content length differs from signed metadata"));
-            }
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 65536];
-            let mut completed = 0;
-            loop {
-                cancel.check()?;
-                let n = response.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                completed += n as u64;
-                if completed > release.manifest.artifact.size {
-                    return Err(err("Artifact exceeds signed size"));
-                }
-                file.write_all(&buffer[..n])?;
-                hash.update(&buffer[..n]);
-                progress(event(
-                    UpdatePhase::Downloading,
-                    completed,
-                    Some(release.manifest.artifact.size),
-                    "Downloading verified full package",
-                ));
-            }
-            file.sync_all()?;
-            drop(file);
-            cancel.check()?;
-            progress(event(
-                UpdatePhase::Verifying,
-                completed,
-                Some(completed),
-                "Verifying SHA-256",
-            ));
-            if completed != release.manifest.artifact.size
-                || format!("{:x}", hash.finalize())
-                    != release.manifest.artifact.sha256.to_ascii_lowercase()
-            {
-                return Err(err("Update package digest or size mismatch"));
-            }
+            let artifact = &release.manifest.artifact;
+            let completed = download_verified(
+                &self.client,
+                Download {
+                    url: &artifact.url,
+                    size: artifact.size,
+                    sha256: &artifact.sha256,
+                    path: &download,
+                    message: "Downloading verified full package",
+                },
+                cancel,
+                &mut progress,
+            )?;
             let payload = owned.join("payload");
             archive::extract(&download, &payload, cancel, &mut progress)?;
             validate_payload(target, &payload)?;
@@ -538,6 +556,156 @@ impl UpdateManager {
     ) -> Result<std::process::Child> {
         launch_worker(prepared, request)
     }
+}
+fn http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("Compi/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.url().scheme() != "https" {
+                attempt.error("Non-HTTPS update redirect")
+            } else if attempt.previous().len() > 10 {
+                attempt.error("Too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|e| err(e.to_string()))
+}
+fn check_release_owner(manifest: &ReleaseManifest, repository: &str) -> Result<()> {
+    let owned = format!("https://github.com/{repository}/releases/download/");
+    if !manifest.artifact.url.starts_with(&owned)
+        || manifest
+            .setup
+            .as_ref()
+            .is_some_and(|setup| !setup.url.starts_with(&owned))
+    {
+        return Err(err(
+            "Signed artifact is not owned by configured release repository",
+        ));
+    }
+    Ok(())
+}
+struct Download<'a> {
+    url: &'a str,
+    size: u64,
+    sha256: &'a str,
+    path: &'a Path,
+    message: &'static str,
+}
+/// Streams a signed asset to a new file and returns its verified length.
+fn download_verified(
+    client: &reqwest::blocking::Client,
+    download: Download<'_>,
+    cancel: &Cancellation,
+    progress: &mut impl FnMut(UpdateEvent),
+) -> Result<u64> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(download.path)?;
+    let mut response = client
+        .get(download.url)
+        .send()
+        .map_err(|e| err(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| err(e.to_string()))?;
+    if response
+        .content_length()
+        .is_some_and(|n| n != download.size)
+    {
+        return Err(err("Artifact content length differs from signed metadata"));
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    let mut completed = 0;
+    loop {
+        cancel.check()?;
+        let n = response.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        completed += n as u64;
+        if completed > download.size {
+            return Err(err("Artifact exceeds signed size"));
+        }
+        file.write_all(&buffer[..n])?;
+        hash.update(&buffer[..n]);
+        progress(event(
+            UpdatePhase::Downloading,
+            completed,
+            Some(download.size),
+            download.message,
+        ));
+    }
+    file.sync_all()?;
+    drop(file);
+    cancel.check()?;
+    progress(event(
+        UpdatePhase::Verifying,
+        completed,
+        Some(completed),
+        "Verifying SHA-256",
+    ));
+    if completed != download.size
+        || format!("{:x}", hash.finalize()) != download.sha256.to_ascii_lowercase()
+    {
+        return Err(err(
+            "Downloaded file does not match its signed size or SHA-256",
+        ));
+    }
+    Ok(completed)
+}
+/// Downloads the Setup named in a signed release into `destination` (a directory) and
+/// returns its path. The release is re-verified against the compiled publisher key, so a
+/// deserialized or edited `AvailableRelease` cannot substitute another executable.
+pub fn download_verified_setup(
+    release: &AvailableRelease,
+    destination: &Path,
+    cancel: &Cancellation,
+    mut progress: impl FnMut(UpdateEvent),
+) -> Result<PathBuf> {
+    let config = ReleaseConfig::compiled()?;
+    let envelope = SignedManifest {
+        payload: STANDARD.encode(&release.manifest_bytes),
+        signature: release.signature.clone(),
+    };
+    let release = verify_signed(&serde_json::to_vec(&envelope)?, &config)?;
+    check_release_owner(&release.manifest, &config.repository)?;
+    let setup = release
+        .manifest
+        .setup
+        .as_ref()
+        .ok_or_else(|| err("This release has no repair tool for this platform"))?;
+    fs::create_dir_all(destination)?;
+    let path = destination.join(format!("Compi-{}-Setup.exe", release.manifest.version));
+    let partial = path.with_extension("partial");
+    if partial.exists() {
+        fs::remove_file(&partial)?;
+    }
+    let result = download_verified(
+        &http_client()?,
+        Download {
+            url: &setup.url,
+            size: setup.size,
+            sha256: &setup.sha256,
+            path: &partial,
+            message: "Downloading repair tool",
+        },
+        cancel,
+        &mut progress,
+    );
+    if let Err(error) = result {
+        let _ = fs::remove_file(&partial);
+        return Err(error);
+    }
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    fs::rename(&partial, &path)?;
+    Ok(path)
 }
 fn bounded_response(
     response: reqwest::blocking::Response,
@@ -598,6 +766,7 @@ mod tests {
                 size: 1,
                 sha256: "00".repeat(32),
             },
+            setup: None,
         };
         (config, manifest, key)
     }
@@ -630,6 +799,53 @@ mod tests {
         assert!(verify_manifest(&envelope(&manifest, &key), &config).is_err());
         manifest.version = "1.1.0-beta.1".into();
         assert!(verify_manifest(&envelope(&manifest, &key), &config).is_err());
+    }
+    #[test]
+    fn setup_is_optional_and_never_emitted_into_update_manifests() {
+        let (config, mut manifest, key) = signed();
+        // Update metadata stays byte-compatible with clients that deny unknown fields.
+        let legacy = serde_json::to_value(&manifest).unwrap();
+        assert!(legacy.get("setup").is_none());
+        let parsed: ReleaseManifest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.setup, None);
+        manifest.setup = Some(SetupArtifact {
+            url: "https://github.com/cloudboy-jh/compi/releases/download/v1.1.0/Compi-Setup.exe"
+                .into(),
+            size: 42,
+            sha256: "ab".repeat(32),
+        });
+        let release = verify_manifest(&envelope(&manifest, &key), &config).unwrap();
+        assert_eq!(release.manifest.setup, manifest.setup);
+        check_release_owner(&release.manifest, &config.repository).unwrap();
+    }
+    #[test]
+    fn setup_must_be_well_formed_and_owned_by_the_release_repository() {
+        let (config, mut manifest, key) = signed();
+        manifest.setup = Some(SetupArtifact {
+            url: "https://github.com/cloudboy-jh/compi/releases/download/v1.1.0/Compi-Setup.exe"
+                .into(),
+            size: 42,
+            sha256: "not-a-digest".into(),
+        });
+        assert!(verify_manifest(&envelope(&manifest, &key), &config).is_err());
+        manifest.setup = Some(SetupArtifact {
+            url: "https://github.com/someone-else/compi/releases/download/v1.1.0/Setup.exe".into(),
+            size: 42,
+            sha256: "ab".repeat(32),
+        });
+        let release = verify_manifest(&envelope(&manifest, &key), &config).unwrap();
+        assert!(check_release_owner(&release.manifest, &config.repository).is_err());
+    }
+    #[test]
+    fn repair_accepts_the_running_release_but_updates_require_a_newer_one() {
+        let (mut config, manifest, key) = signed();
+        config.current_version = manifest.version.clone();
+        let bytes = envelope(&manifest, &key);
+        assert!(verify_manifest(&bytes, &config).is_err());
+        assert_eq!(
+            verify_signed(&bytes, &config).unwrap().manifest.version,
+            "1.1.0"
+        );
     }
     #[test]
     fn cancellation_preserves_selected_payload() {

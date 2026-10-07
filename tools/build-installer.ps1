@@ -174,6 +174,9 @@ try {
     Invoke-SignArtifact $setupSource
 
     Copy-Item -Force $setupSource $setupDestination
+    # releases/latest/download/Compi-Setup.exe always names the newest Setup; same bytes.
+    $stableSetupDestination = Join-Path $OutputDirectory 'Compi-Setup.exe'
+    Copy-Item -Force $setupDestination $stableSetupDestination
 
     New-Item -ItemType Directory -Force -Path $portableStaging | Out-Null
     $versionDirectory = Join-Path $portableStaging "versions\$version"
@@ -196,7 +199,7 @@ try {
     Compress-Archive -Path (Join-Path $versionDirectory '*') -DestinationPath $updateDestination
 
     $checksumPath = Join-Path $OutputDirectory 'SHA256SUMS.txt'
-    $checksums = foreach ($artifact in @($setupDestination, $portableDestination, $updateDestination)) {
+    $checksums = foreach ($artifact in @($setupDestination, $stableSetupDestination, $portableDestination, $updateDestination)) {
         $sha256 = [System.Security.Cryptography.SHA256]::Create()
         $stream = [System.IO.File]::OpenRead($artifact)
         try {

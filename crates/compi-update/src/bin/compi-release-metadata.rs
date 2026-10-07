@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use zeroize::Zeroize;
 fn value(args: &[String], name: &str) -> Result<String> {
@@ -64,7 +64,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if !args.first().is_some_and(|s| s == "sign") {
-        return Err(Error("Usage: compi-release-metadata sign --version V --platform PLATFORM --artifact ZIP --url HTTPS_URL --output DIR --daemon-protocol N [--notes FILE] [--minimum-os N] [--qualified-daemon V ...] [--qualification FILE] [--key-file FILE]; keygen --private-key FILE".into()));
+        return Err(Error("Usage: compi-release-metadata sign --version V --platform PLATFORM --artifact ZIP --url HTTPS_URL --output DIR --daemon-protocol N [--notes FILE] [--minimum-os N] [--qualified-daemon V ...] [--qualification FILE] [--setup SETUP_EXE --setup-url HTTPS_URL] [--key-file FILE]; keygen --private-key FILE".into()));
     }
     let mut encoded = if let Some(path) = optional(&args, "--key-file") {
         let metadata = fs::metadata(&path)?;
@@ -115,22 +115,7 @@ fn run() -> Result<()> {
     if !matches!(platform.as_str(), "windows-x86_64" | "macos-aarch64") {
         return Err(Error("Unsupported release platform".into()));
     }
-    let artifact = PathBuf::from(value(&args, "--artifact")?);
-    let mut file = File::open(&artifact)?;
-    let size = file.metadata()?.len();
-    if size == 0 || size > 4 * 1024 * 1024 * 1024 {
-        return Err(Error("Artifact size outside update bounds".into()));
-    }
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-    }
-    let sha256 = format!("{:x}", hash.finalize());
+    let (size, sha256) = digest(&PathBuf::from(value(&args, "--artifact")?))?;
     let protocol = value(&args, "--daemon-protocol")?
         .parse::<u32>()
         .map_err(|_| Error("Invalid daemon protocol".into()))?;
@@ -183,14 +168,19 @@ fn run() -> Result<()> {
             "14".into()
         }
     });
-    let url = value(&args, "--url")?;
-    let parsed_url = reqwest::Url::parse(&url).map_err(|_| Error("Invalid artifact URL".into()))?;
-    if parsed_url.scheme() != "https" || parsed_url.host_str() != Some("github.com") {
-        return Err(Error(
-            "Artifact URL must be a GitHub HTTPS release asset".into(),
-        ));
-    }
-    let manifest = ReleaseManifest {
+    let url = github_asset_url(&value(&args, "--url")?)?;
+    let setup = match optional(&args, "--setup") {
+        Some(path) => {
+            if platform != "windows-x86_64" {
+                return Err(Error("Only Windows releases publish a Setup".into()));
+            }
+            let (size, sha256) = digest(&PathBuf::from(path))?;
+            let url = github_asset_url(&value(&args, "--setup-url")?)?;
+            Some(SetupArtifact { url, size, sha256 })
+        }
+        None => None,
+    };
+    let mut manifest = ReleaseManifest {
         schema: 1,
         product: "compi".into(),
         version,
@@ -201,8 +191,58 @@ fn run() -> Result<()> {
         qualified_daemon_versions: qualified,
         minimum_persistence: SUPPORTED_PERSISTENCE_VERSION,
         artifact: Artifact { url, size, sha256 },
+        setup: None,
     };
-    let payload = serde_json::to_vec(&manifest)?;
+    let output = PathBuf::from(value(&args, "--output")?);
+    fs::create_dir_all(&output)?;
+    // Clients through 0.1.5 deny unknown manifest fields, so the update manifest never names
+    // the Setup; repair reads the Setup from its own signed manifest.
+    write_signed(
+        &signing,
+        &manifest,
+        &output.join(format!("compi-update-{platform}.json")),
+    )?;
+    if let Some(setup) = setup {
+        manifest.setup = Some(setup);
+        write_signed(
+            &signing,
+            &manifest,
+            &output.join(format!("compi-setup-{platform}.json")),
+        )?;
+    }
+    Ok(())
+}
+fn digest(path: &Path) -> Result<(u64, String)> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if size == 0 || size > 4 * 1024 * 1024 * 1024 {
+        return Err(Error(format!(
+            "{} size outside update bounds",
+            path.display()
+        )));
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok((size, format!("{:x}", hash.finalize())))
+}
+fn github_asset_url(url: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| Error("Invalid artifact URL".into()))?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+        return Err(Error(
+            "Artifact URL must be a GitHub HTTPS release asset".into(),
+        ));
+    }
+    Ok(url.to_owned())
+}
+fn write_signed(signing: &SigningKey, manifest: &ReleaseManifest, path: &Path) -> Result<()> {
+    let payload = serde_json::to_vec(manifest)?;
     let envelope = SignedManifest {
         signature: STANDARD.encode(signing.sign(&payload).to_bytes()),
         payload: STANDARD.encode(payload),
@@ -211,10 +251,7 @@ fn run() -> Result<()> {
     if bytes.len() > 256 * 1024 {
         return Err(Error("Signed metadata exceeds consumer bound".into()));
     }
-    let output = PathBuf::from(value(&args, "--output")?);
-    fs::create_dir_all(&output)?;
-    let path = output.join(format!("compi-update-{platform}.json"));
-    let mut file = File::create(&path)?;
+    let mut file = File::create(path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     println!("{}", path.display());

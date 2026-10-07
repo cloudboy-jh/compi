@@ -228,9 +228,12 @@ jobs:
           test -n "$COMPI_UPDATE_PUBLIC_KEY" || { echo 'Missing public verification key repository variable'; exit 1; }
           test -n "$COMPI_UPDATE_SIGNING_KEY" || { echo 'Missing private metadata signing key secret'; exit 1; }
           cargo build --locked --release -p compi-update --bin compi-release-metadata
+          # releases/latest/download/Compi-Setup.exe must be the very Setup this release signs.
+          cmp distribution/Compi-Setup.exe "distribution/Compi-${RELEASE_TAG#v}-Setup.exe"
           python3 tools/sign-release-metadata.py --distribution distribution --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --signer target/release/compi-release-metadata --notes docs/release-notes.md
           cd distribution
-          sha256sum compi-update-*.json >> SHA256SUMS.txt
+          test -f compi-setup-windows-x86_64.json || { echo 'Missing signed Setup metadata'; exit 1; }
+          sha256sum compi-update-*.json compi-setup-*.json >> SHA256SUMS.txt
       - name: Create draft GitHub release for deliberate human publication
         uses: softprops/action-gh-release@v2
         with:

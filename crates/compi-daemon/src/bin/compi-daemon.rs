@@ -30,6 +30,11 @@ fn run() -> compi_daemon::Result<()> {
         }
         [flag] if flag == "--check-system" => compi_daemon::launch::check_system(),
         [flag] if flag == "--shutdown" => shutdown_daemon(),
+        // Lets Setup's repair tool learn which clients this generation can serve.
+        [flag] if flag == "--protocol-version" => {
+            println!("{}", compi_protocol::PROTOCOL_VERSION);
+            Ok(())
+        }
         #[cfg(windows)]
         [flag] if flag == "--supervise" => {
             compi_daemon::supervisor::supervise(&std::env::current_exe()?)
@@ -62,12 +67,12 @@ fn run() -> compi_daemon::Result<()> {
         [flag] if flag == "--activate-task" => compi_daemon::supervisor::activate(),
         #[cfg(unix)]
         _ => Err(
-            "usage: compi-daemon [--instance <name> | --server-stdio [--instance <name>] | --check-system | --shutdown]"
+            "usage: compi-daemon [--instance <name> | --server-stdio [--instance <name>] | --check-system | --shutdown | --protocol-version]"
                 .into(),
         ),
         #[cfg(windows)]
         _ => Err(
-            "usage: compi-daemon [--instance <name> | --server-stdio [--instance <name>] | --check-system | --shutdown | --supervise | --install-task | --uninstall-task | --activate-task | --write-task-xml <path> <user-sid> | --remove-task-xml <path>]"
+            "usage: compi-daemon [--instance <name> | --server-stdio [--instance <name>] | --check-system | --shutdown | --protocol-version | --supervise | --install-task | --uninstall-task | --activate-task | --write-task-xml <path> <user-sid> | --remove-task-xml <path>]"
                 .into(),
         ),
     }

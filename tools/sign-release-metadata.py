@@ -49,6 +49,13 @@ def main():
         command.extend(['--qualification', str((args.distribution / f'qualification-{platform}.json').resolve())])
         for daemon in sorted(set(daemons)):
             command.extend(['--qualified-daemon', daemon])
+        if platform == 'windows-x86_64':
+            # Signed separately into compi-setup-<platform>.json; repair downloads this Setup.
+            setup = args.distribution / f'Compi-{version}-Setup.exe'
+            if not setup.is_file():
+                raise SystemExit(f'Missing Windows Setup {setup.name}')
+            command.extend(['--setup', str(setup.resolve()), '--setup-url',
+                            f'https://github.com/{args.repository}/releases/download/{args.tag}/{setup.name}'])
         subprocess.run(command, check=True)
 
 
