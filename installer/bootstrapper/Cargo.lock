@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "compi-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-channel 2.5.0",
  "base64",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "compi-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bincode",
  "libc",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "compi-setup"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-channel 2.5.0",
  "compi-client",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "compi-update"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "ed25519-dalek",

@@ -7,10 +7,13 @@ fn main() {
     let state = match std::env::args().nth(1).as_deref() {
         None | Some("ready") => PreviewState::Ready,
         Some("upgrade") => PreviewState::Upgrade,
+        Some("consent") => PreviewState::Consent,
         Some("installing") => PreviewState::Installing,
         Some("complete") => PreviewState::Complete,
         Some("error") => PreviewState::Error,
         Some("remove") => PreviewState::Remove,
+        Some("doctor") => PreviewState::Doctor,
+        Some("healthy") => PreviewState::Healthy,
         Some(_) => std::process::exit(2),
     };
     compi_setup::installer::run_preview(state);

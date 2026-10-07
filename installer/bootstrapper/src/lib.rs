@@ -1,7 +1,13 @@
 #[cfg(windows)]
+mod doctor;
+#[cfg(windows)]
 pub mod installer;
 #[cfg(windows)]
+mod machine;
+#[cfg(windows)]
 mod msi_actions;
+#[cfg(windows)]
+mod plain;
 #[cfg(windows)]
 mod transaction;
 

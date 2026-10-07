@@ -1,10 +1,13 @@
 use crate::Result;
-use crate::transaction::{self, Event, Outcome};
+use crate::doctor::{self, Finding, Fix};
+use crate::machine::{self, Daemon, Inspection};
+use crate::plain;
+use crate::transaction::{self, Event, Outcome, Readiness};
 use compi_client::theme::{ThemeColors, ThemePreset};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img, prelude::*,
-    px, rgb, size,
+    SharedString, Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div,
+    img, prelude::*, px, rgb, size,
 };
 use std::env;
 use std::mem::size_of;
@@ -17,12 +20,15 @@ use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 
 const WINDOW_WIDTH: f32 = 600.0;
-const WINDOW_HEIGHT: f32 = 460.0;
+const WINDOW_HEIGHT: f32 = 500.0;
 const COLORS: &ThemeColors = ThemePreset::DarkGlass.colors();
+/// Shells listed by name before "and N more".
+const LISTED_SHELLS: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallerOperation {
     Install,
+    /// Opens the doctor; its "Reinstall files" runs Windows Installer repair.
     Repair,
     Remove,
 }
@@ -31,10 +37,13 @@ pub enum InstallerOperation {
 pub enum PreviewState {
     Ready,
     Upgrade,
+    Consent,
     Installing,
     Complete,
     Error,
     Remove,
+    Doctor,
+    Healthy,
 }
 
 #[derive(Clone)]
@@ -54,19 +63,25 @@ enum LaunchMode {
 
 #[derive(Clone)]
 enum SurfaceState {
+    Checking,
     Ready,
     Installing,
     Complete,
     Error(String),
-    Checking,
+    Doctor { fix_error: Option<String> },
+    Fixing(String),
 }
 
 struct InstallerApp {
     launch: LaunchMode,
     operation: InstallerOperation,
     state: SurfaceState,
-    installed: bool,
-    prerequisite_error: Option<String>,
+    readiness: Readiness,
+    inspection: Option<Inspection>,
+    /// The failure happened after changes started, not while checking.
+    attempted: bool,
+    /// "Fix all" reinstalls files after its other fixes.
+    pending_reinstall: bool,
     event_tx: async_channel::Sender<Event>,
     cancel: Arc<AtomicBool>,
     cancellable: bool,
@@ -103,6 +118,7 @@ pub fn run_preview(state: PreviewState) {
 }
 
 /// Unattended distribution qualification uses the same transaction as the actual surface.
+/// It never ends shells: that needs the window's explicit consent.
 pub fn run_silent(
     msi: Option<&'static [u8]>,
     product_code: Option<String>,
@@ -114,6 +130,20 @@ pub fn run_silent(
         (Some(bytes), _) => InstallerSource::Package(bytes),
         (_, Some(code)) => InstallerSource::ProductCode(code),
         _ => return 2,
+    };
+    let approved = match transaction::preflight(operation) {
+        Ok(readiness) if readiness.plan.needs_consent() => {
+            eprintln!(
+                "This would end {} open shells; run Setup without --silent to approve.",
+                readiness.plan.shells.len()
+            );
+            return 1;
+        }
+        Ok(readiness) => readiness.daemons,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
     };
     let cancel = Arc::new(AtomicBool::new(false));
     if let Some(delay) = cancel_after_ms {
@@ -130,7 +160,7 @@ pub fn run_silent(
             eprintln!("{event:?}");
         }
     });
-    match transaction::perform(source, operation, remove_data, cancel, sender) {
+    match transaction::perform(source, operation, remove_data, &approved, cancel, sender) {
         Ok(outcome) => {
             if let Some(Err(error)) = outcome.cleanup {
                 eprintln!("Product removal succeeded; managed-data cleanup failed: {error}");
@@ -155,10 +185,21 @@ pub fn run_msi_action(args: &[String]) -> i32 {
     match crate::msi_actions::action(args) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("{error}");
+            transaction::log(&format!(
+                "{}: {error}",
+                args.first().map_or("", String::as_str)
+            ));
+            eprintln!("{}", plain::short(&error.to_string()));
             1
         }
     }
+}
+
+/// Logs the full error and returns the one sentence the window shows.
+fn shown(error: &crate::Error, log: &std::path::Path) -> String {
+    let detail = error.to_string();
+    plain::log(log, &format!("Error: {detail}"));
+    plain::short(&detail)
 }
 
 fn run_mode(launch: LaunchMode) {
@@ -197,6 +238,62 @@ fn run_mode(launch: LaunchMode) {
     });
 }
 
+fn shells_word(count: usize) -> &'static str {
+    if count == 1 { "shell" } else { "shells" }
+}
+
+/// "api · server, web, and 3 more".
+fn shell_list(shells: &[String]) -> String {
+    let mut listed = shells
+        .iter()
+        .take(LISTED_SHELLS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if shells.len() > LISTED_SHELLS {
+        listed.push_str(&format!(", and {} more", shells.len() - LISTED_SHELLS));
+    }
+    listed
+}
+
+fn fix_label(finding: &Finding) -> Option<String> {
+    let shells = finding.shells().len();
+    let action = match finding.fix()? {
+        Fix::Reinstall => "reinstall",
+        _ => "fix",
+    };
+    Some(if shells == 0 {
+        let mut label = action.to_owned();
+        label[..1].make_ascii_uppercase();
+        label
+    } else {
+        format!("End {shells} {} and {action}", shells_word(shells))
+    })
+}
+
+/// Fixes "Fix all" applies, in order, without duplicates.
+fn all_fixes(findings: &[Finding]) -> Vec<Fix> {
+    let mut fixes: Vec<Fix> = Vec::new();
+    for fix in findings.iter().filter_map(Finding::fix) {
+        if !fixes.contains(&fix) {
+            fixes.push(fix);
+        }
+    }
+    fixes
+}
+
+fn shells_of_fixes(findings: &[Finding]) -> Vec<String> {
+    let mut shells: Vec<String> = Vec::new();
+    for finding in findings.iter().filter(|finding| finding.fix().is_some()) {
+        for shell in finding.shells() {
+            if !shells.contains(shell) {
+                shells.push(shell.clone());
+            }
+        }
+    }
+    shells
+}
+
 impl InstallerApp {
     fn new(
         launch: LaunchMode,
@@ -205,23 +302,29 @@ impl InstallerApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let (event_tx, event_rx) = async_channel::unbounded();
-        let installed = installed_executable().is_file();
-        let (operation, state, prerequisite_error) = match &launch {
-            LaunchMode::Live { operation, .. } => (*operation, SurfaceState::Checking, None),
+        let (operation, state, readiness, inspection) = match &launch {
+            LaunchMode::Live { operation, .. } => (
+                *operation,
+                SurfaceState::Checking,
+                Readiness::default(),
+                None,
+            ),
             LaunchMode::Preview(preview) => preview_configuration(*preview),
         };
         let mut this = Self {
             launch,
             operation,
             state,
-            installed,
-            prerequisite_error,
+            readiness,
+            inspection,
+            attempted: false,
+            pending_reinstall: false,
             event_tx,
             busy,
             cancel: Arc::new(AtomicBool::new(false)),
             cancellable: true,
             progress: None,
-            stage: "Checking Windows, installation access, and WSL guest readiness".into(),
+            stage: String::new(),
             outcome: Outcome::default(),
             remove_data: false,
             focus_handle: cx.focus_handle(),
@@ -229,40 +332,14 @@ impl InstallerApp {
         };
         if matches!(this.launch, LaunchMode::Preview(PreviewState::Installing)) {
             this.busy.store(true, Ordering::Release);
-        }
-        if matches!(this.launch, LaunchMode::Preview(PreviewState::Upgrade)) {
-            this.installed = true;
+            this.stage = "Copying files".into();
+            this.progress = Some(42);
         }
         cx.spawn(async move |weak, cx| {
             while let Ok(event) = event_rx.recv().await {
                 if weak
                     .update(cx, |this, cx| {
-                        match event {
-                            Event::Preflight(result) => {
-                                this.busy.store(false, Ordering::Release);
-                                this.prerequisite_error = result.err();
-                                this.state = SurfaceState::Ready;
-                            }
-                            Event::Progress {
-                                stage,
-                                percent,
-                                cancellable,
-                            } => {
-                                this.stage = stage;
-                                this.progress = percent;
-                                this.cancellable = cancellable;
-                            }
-                            Event::Finished(result) => {
-                                this.busy.store(false, Ordering::Release);
-                                this.state = match result {
-                                    Ok(outcome) => {
-                                        this.outcome = outcome;
-                                        SurfaceState::Complete
-                                    }
-                                    Err(error) => SurfaceState::Error(error),
-                                };
-                            }
-                        }
+                        this.handle(event, cx);
                         cx.notify();
                     })
                     .is_err()
@@ -278,68 +355,139 @@ impl InstallerApp {
         this
     }
 
-    fn primary_action(&mut self, _: &PrimaryAction, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle(&mut self, event: Event, cx: &mut Context<Self>) {
+        match event {
+            Event::Preflight(result) => {
+                self.busy.store(false, Ordering::Release);
+                match result {
+                    Ok(readiness) => {
+                        self.readiness = readiness;
+                        self.state = SurfaceState::Ready;
+                    }
+                    Err(error) => {
+                        self.attempted = false;
+                        self.state = SurfaceState::Error(error);
+                    }
+                }
+            }
+            Event::Progress {
+                stage,
+                percent,
+                cancellable,
+            } => {
+                self.stage = stage;
+                self.progress = percent;
+                self.cancellable = cancellable;
+            }
+            Event::Finished(result) => {
+                self.busy.store(false, Ordering::Release);
+                self.state = match result {
+                    Ok(outcome) => {
+                        self.outcome = outcome;
+                        SurfaceState::Complete
+                    }
+                    Err(error) => {
+                        self.attempted = true;
+                        SurfaceState::Error(error)
+                    }
+                };
+            }
+            Event::Inspected {
+                inspection,
+                fix_error,
+            } => {
+                self.busy.store(false, Ordering::Release);
+                match inspection {
+                    Ok(inspection) => {
+                        let reinstall = std::mem::take(&mut self.pending_reinstall)
+                            && fix_error.is_none()
+                            && !doctor::reinstall_plan(&daemon_facts(&inspection.daemons))
+                                .needs_consent();
+                        self.inspection = Some(inspection);
+                        self.state = SurfaceState::Doctor { fix_error };
+                        if reinstall {
+                            self.start_reinstall(cx);
+                        }
+                    }
+                    Err(error) => {
+                        self.attempted = false;
+                        self.state = SurfaceState::Error(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keyboard Enter. It never ends shells: that takes a click on a button listing them.
+    fn primary_key(&mut self, _: &PrimaryAction, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.state {
+            SurfaceState::Ready if self.readiness.plan.needs_consent() => {}
+            SurfaceState::Doctor { .. } => window.remove_window(),
+            _ => self.primary_action(window, cx),
+        }
+    }
+
+    fn primary_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.launch, LaunchMode::Preview(_)) {
-            if matches!(self.state, SurfaceState::Complete) {
+            if matches!(
+                self.state,
+                SurfaceState::Complete | SurfaceState::Doctor { .. }
+            ) {
                 window.remove_window();
             }
             return;
         }
         match &self.state {
-            SurfaceState::Ready if self.prerequisite_error.is_some() => self.recheck(),
-            SurfaceState::Ready => self.start_installation(cx),
+            SurfaceState::Ready => {
+                let approved = self.readiness.daemons.clone();
+                self.start_installation(self.operation, approved, cx)
+            }
             SurfaceState::Installing => {
                 if self.cancellable {
                     self.cancel.store(true, Ordering::Release);
-                    self.stage =
-                        "Cancellation requested; waiting for Windows Installer rollback".into();
+                    self.stage = "Cancelling".into();
                     self.cancellable = false;
                     cx.notify();
                 }
             }
-            SurfaceState::Checking => {}
-            SurfaceState::Complete => {
-                if self.operation == InstallerOperation::Remove {
-                    window.remove_window();
-                } else if self.outcome.restart_required {
-                    window.remove_window();
-                } else {
-                    match Command::new(installed_executable()).spawn() {
-                        Ok(mut child) => match child.try_wait() {
-                            Ok(Some(status)) if !status.success() => {
-                                self.state = SurfaceState::Error(format!(
-                                    "Compi exited immediately: {status}. Repair or review the installation log."
-                                ));
-                                self.launch_failed = true;
-                                cx.notify();
-                            }
-                            Err(error) => {
-                                self.state = SurfaceState::Error(format!(
-                                    "Could not check Compi launch: {error}"
-                                ));
-                                self.launch_failed = true;
-                                cx.notify();
-                            }
-                            _ => window.remove_window(),
-                        },
-                        Err(error) => {
-                            self.state = SurfaceState::Error(format!(
-                                "Compi could not launch: {error}. Installed version {}. Repair or try again.",
-                                self.outcome.version.as_deref().unwrap_or("unavailable")
-                            ));
-                            self.launch_failed = true;
-                            cx.notify();
-                        }
-                    }
-                }
-            }
+            SurfaceState::Checking | SurfaceState::Fixing(_) => {}
+            SurfaceState::Doctor { .. } => self.fix_all(cx),
+            SurfaceState::Complete => self.finish(window, cx),
             SurfaceState::Error(_) if self.launch_failed => {
                 self.state = SurfaceState::Complete;
-                self.primary_action(&PrimaryAction, window, cx);
+                self.finish(window, cx);
             }
             SurfaceState::Error(_) => self.recheck(),
         }
         cx.notify();
+    }
+
+    fn finish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation == InstallerOperation::Remove || self.outcome.restart_required {
+            window.remove_window();
+            return;
+        }
+        let failure = match Command::new(installed_executable()).spawn() {
+            Ok(mut child) => match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    Some(format!("Compi closed right after starting ({status})"))
+                }
+                Err(error) => Some(error.to_string()),
+                _ => None,
+            },
+            Err(error) => Some(error.to_string()),
+        };
+        match failure {
+            None => window.remove_window(),
+            Some(detail) => {
+                transaction::log(&format!("Opening Compi failed: {detail}"));
+                self.state = SurfaceState::Error(
+                    "Compi didn't open. Try again, or run Setup's repair.".into(),
+                );
+                self.launch_failed = true;
+                cx.notify();
+            }
+        }
     }
 
     fn close_installer(&mut self, _: &CloseInstaller, window: &mut Window, cx: &mut Context<Self>) {
@@ -348,78 +496,202 @@ impl InstallerApp {
         } else if matches!(self.state, SurfaceState::Installing) && self.cancellable {
             self.cancel.store(true, Ordering::Release);
             self.cancellable = false;
-            self.stage = "Cancellation requested; waiting for Windows Installer rollback".into();
+            self.stage = "Cancelling".into();
             cx.notify();
         }
     }
 
     fn recheck(&mut self) {
+        if self.operation == InstallerOperation::Repair {
+            self.run_doctor(Vec::new(), None);
+            return;
+        }
         self.state = SurfaceState::Checking;
-        self.prerequisite_error = None;
         self.busy.store(true, Ordering::Release);
         self.launch_failed = false;
-        self.stage = if self.operation == InstallerOperation::Install {
-            "Checking Windows, registration, access, disk space and WSL guest startup"
-        } else {
-            "Checking installation registration, access and running instances"
-        }
-        .into();
+        self.stage = "Checking your PC".into();
         self.progress = None;
         self.cancellable = false;
         let operation = self.operation;
         let sender = self.event_tx.clone();
         thread::spawn(move || {
-            let result = transaction::preflight(operation).map_err(|error| error.to_string());
+            let log = transaction::log_path().unwrap_or_default();
+            let result = transaction::preflight(operation).map_err(|error| shown(&error, &log));
             let _ = sender.send_blocking(Event::Preflight(result));
         });
     }
 
-    fn start_installation(&mut self, cx: &mut Context<Self>) {
+    /// Applies `fixes` (none = just check), then checks again.
+    fn run_doctor(&mut self, fixes: Vec<Fix>, title: Option<String>) {
+        self.busy.store(true, Ordering::Release);
+        self.launch_failed = false;
+        self.state = match title {
+            Some(title) => SurfaceState::Fixing(title),
+            None => SurfaceState::Checking,
+        };
+        let inspection = self.inspection.clone();
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            let log = machine::doctor_log();
+            let mut fix_error = None;
+            if let Some(inspection) = &inspection {
+                for fix in fixes.iter().filter(|fix| **fix != Fix::Reinstall) {
+                    if let Err(error) = machine::apply(fix, inspection) {
+                        fix_error = Some(shown(&error, &log));
+                        break;
+                    }
+                }
+            }
+            let inspection = machine::inspect().map_err(|error| shown(&error, &log));
+            let _ = sender.send_blocking(Event::Inspected {
+                inspection,
+                fix_error,
+            });
+        });
+    }
+
+    fn fix_one(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(finding) = self
+            .inspection
+            .as_ref()
+            .and_then(|inspection| inspection.findings.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        match finding.fix() {
+            Some(Fix::Reinstall) => self.start_reinstall(cx),
+            Some(fix) => self.run_doctor(vec![fix], Some(finding.title())),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    fn fix_all(&mut self, cx: &mut Context<Self>) {
+        let Some(inspection) = &self.inspection else {
+            return;
+        };
+        let fixes = all_fixes(&inspection.findings);
+        if fixes.is_empty() {
+            return;
+        }
+        if fixes == [Fix::Reinstall] {
+            self.start_reinstall(cx);
+            return;
+        }
+        self.pending_reinstall = fixes.contains(&Fix::Reinstall);
+        self.run_doctor(fixes, Some("Fixing Compi".into()));
+    }
+
+    fn start_reinstall(&mut self, cx: &mut Context<Self>) {
+        let approved = self
+            .inspection
+            .as_ref()
+            .map(|inspection| inspection.daemons.clone())
+            .unwrap_or_default();
+        self.start_installation(InstallerOperation::Repair, approved, cx);
+    }
+
+    fn start_installation(
+        &mut self,
+        operation: InstallerOperation,
+        approved: Vec<Daemon>,
+        cx: &mut Context<Self>,
+    ) {
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
-        let LaunchMode::Live { source, operation } = self.launch.clone() else {
+        let LaunchMode::Live { source, .. } = self.launch.clone() else {
+            self.busy.store(false, Ordering::Release);
             return;
         };
         self.cancel.store(false, Ordering::Release);
         self.cancellable = true;
         self.progress = None;
-        self.stage = "Staging embedded offline package".into();
+        self.stage = "Getting ready".into();
         self.state = SurfaceState::Installing;
         cx.notify();
         let sender = self.event_tx.clone();
         let cancel = self.cancel.clone();
         let remove_data = self.remove_data;
         thread::spawn(move || {
-            let result =
-                transaction::perform(source, operation, remove_data, cancel, sender.clone())
-                    .map_err(|error| error.to_string());
+            let log = transaction::log_path().unwrap_or_default();
+            let result = transaction::perform(
+                source,
+                operation,
+                remove_data,
+                &approved,
+                cancel,
+                sender.clone(),
+            )
+            .map_err(|error| shown(&error, &log));
             let _ = sender.send_blocking(Event::Finished(result));
         });
     }
 
-    fn action_label(&self) -> &'static str {
-        match (&self.state, self.operation, self.installed) {
-            (SurfaceState::Checking, _, _) => "Checking…",
-            (SurfaceState::Ready, _, _) if self.prerequisite_error.is_some() => "Recheck",
-            (SurfaceState::Ready, InstallerOperation::Install, true) => "Update Compi",
-            (SurfaceState::Ready, InstallerOperation::Install, false) => "Install Compi",
-            (SurfaceState::Ready, InstallerOperation::Repair, _) => "Repair Compi",
-            (SurfaceState::Ready, InstallerOperation::Remove, _) => "Remove Compi",
-            (SurfaceState::Installing, _, _) => {
-                if self.cancellable {
-                    "Cancel safely"
+    fn package_size(&self) -> Option<u64> {
+        match &self.launch {
+            LaunchMode::Live {
+                source: InstallerSource::Package(bytes),
+                ..
+            } => Some(bytes.len() as u64),
+            LaunchMode::Preview(_) => Some(43 * 1024 * 1024),
+            _ => None,
+        }
+    }
+
+    fn action_label(&self) -> String {
+        let installed = self.readiness.installed.is_some();
+        match (&self.state, self.operation) {
+            (SurfaceState::Checking | SurfaceState::Fixing(_), _) => "Checking…".into(),
+            (SurfaceState::Ready, operation) if self.readiness.plan.needs_consent() => {
+                match operation {
+                    InstallerOperation::Install => "End shells and update",
+                    InstallerOperation::Repair => "End shells and reinstall",
+                    InstallerOperation::Remove => "End shells and remove",
+                }
+                .into()
+            }
+            (SurfaceState::Ready, InstallerOperation::Install) if installed => {
+                "Update Compi".into()
+            }
+            (SurfaceState::Ready, InstallerOperation::Install) => "Install Compi".into(),
+            (SurfaceState::Ready, InstallerOperation::Repair) => "Reinstall files".into(),
+            (SurfaceState::Ready, InstallerOperation::Remove) => "Remove Compi".into(),
+            (SurfaceState::Installing, _) if self.cancellable => "Cancel".into(),
+            (SurfaceState::Installing, _) => "Working…".into(),
+            (SurfaceState::Complete, InstallerOperation::Remove) => "Close".into(),
+            (SurfaceState::Complete, _) if self.outcome.restart_required => "Close".into(),
+            (SurfaceState::Complete, _) => "Open Compi".into(),
+            (SurfaceState::Error(_), _) if self.launch_failed => "Open Compi".into(),
+            (SurfaceState::Error(_), _) => "Try again".into(),
+            (SurfaceState::Doctor { .. }, _) => {
+                let findings = self.findings();
+                if all_fixes(findings).is_empty() {
+                    "Done".into()
                 } else {
-                    "Working…"
+                    let shells = shells_of_fixes(findings).len();
+                    if shells == 0 {
+                        "Fix all".into()
+                    } else {
+                        format!("End {shells} {} and fix all", shells_word(shells))
+                    }
                 }
             }
-            (SurfaceState::Complete, InstallerOperation::Remove, _) => "Close",
-            (SurfaceState::Complete, _, _) if self.outcome.restart_required => {
-                "Close, restart Windows"
-            }
-            (SurfaceState::Complete, _, _) => "Open Compi",
-            (SurfaceState::Error(_), _, _) if self.launch_failed => "Retry Open Compi",
-            (SurfaceState::Error(_), _, _) => "Try again",
+        }
+    }
+
+    fn findings(&self) -> &[Finding] {
+        self.inspection
+            .as_ref()
+            .map_or(&[], |inspection| inspection.findings.as_slice())
+    }
+
+    fn log_path(&self) -> PathBuf {
+        if self.operation == InstallerOperation::Repair {
+            machine::doctor_log()
+        } else {
+            installer_log_path()
         }
     }
 
@@ -473,49 +745,41 @@ impl InstallerApp {
     }
 
     fn render_ready(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = match (self.operation, self.installed) {
-            (InstallerOperation::Install, true) => "Update Compi",
-            (InstallerOperation::Install, false) => "Your persistent WSL terminal",
-            (InstallerOperation::Repair, _) => "Repair Compi",
-            (InstallerOperation::Remove, _) => "Remove Compi",
+        let version = env!("CARGO_PKG_VERSION");
+        let (title, description) = match (self.operation, &self.readiness.installed) {
+            (InstallerOperation::Install, Some(installed)) if installed == version => (
+                "Reinstall Compi".to_owned(),
+                format!("Version {version} is already installed."),
+            ),
+            (InstallerOperation::Install, Some(installed)) => (
+                "Update Compi".to_owned(),
+                format!("Version {installed} → {version}"),
+            ),
+            (InstallerOperation::Install, None) => (
+                "Install Compi".to_owned(),
+                "A terminal for WSL. Your shells keep running when you close the window."
+                    .to_owned(),
+            ),
+            (InstallerOperation::Repair, _) => (
+                "Reinstall files".to_owned(),
+                "Replaces Compi's program files. Your settings and workspaces are kept.".to_owned(),
+            ),
+            (InstallerOperation::Remove, _) => (
+                "Remove Compi".to_owned(),
+                "Your settings and workspaces are kept unless you choose to delete them."
+                    .to_owned(),
+            ),
         };
-        let description = match self.operation {
-            InstallerOperation::Install if self.installed => {
-                "Install the latest build without changing your projects or terminal history."
+        let plan = &self.readiness.plan;
+        let detail = match (self.operation, self.package_size()) {
+            (InstallerOperation::Install, Some(bytes)) => {
+                Some(format!("Compi {version} · {}", plain::megabytes(bytes)))
             }
-            InstallerOperation::Install => {
-                "Native Windows glass for Bash sessions that keep running when the window closes."
-            }
-            InstallerOperation::Repair => {
-                "Restore application files and per-user daemon registration."
-            }
-            InstallerOperation::Remove => {
-                "Remove application files and its task. Keep settings, workspaces and themes by default. Running instances must be deliberately stopped first."
-            }
-        };
-        let destination = installed_directory().display().to_string();
-        let (first_check, second_check) = if self.operation == InstallerOperation::Remove {
-            (
-                self.prerequisite_error
-                    .as_deref()
-                    .unwrap_or("Application files and Start menu shortcut"),
-                "Background daemon task",
-            )
-        } else {
-            (
-                self.prerequisite_error.as_deref().unwrap_or(
-                    if self.operation == InstallerOperation::Repair {
-                        "Repair does not require a working WSL guest"
-                    } else {
-                        "Default WSL2 guest startup verified"
-                    },
-                ),
-                "Installs without administrator access",
-            )
+            _ => None,
         };
         div()
             .flex_1()
-            .id("installer-preflight-body")
+            .id("installer-ready-body")
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -530,55 +794,110 @@ impl InstallerApp {
             .child(
                 div()
                     .mt_2()
-                    .max_w(px(470.0))
-                    .text_size(px(14.0))
-                    .line_height(px(21.0))
+                    .max_w(px(500.0))
+                    .text_size(px(15.0))
+                    .line_height(px(22.0))
                     .text_color(rgb(COLORS.muted))
                     .child(description),
             )
-            .child(
-                div()
-                    .mt_6()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(status_row(self.prerequisite_error.is_none(), first_check))
-                    .child(status_row(true, second_check))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().w(px(8.0)).h(px(8.0)))
-                            .child(
+            .when_some(detail, |content, detail| {
+                content.child(
+                    div()
+                        .mt_4()
+                        .text_size(px(13.0))
+                        .text_color(rgb(COLORS.muted))
+                        .child(detail),
+                )
+            })
+            .when(plan.needs_consent(), |content| {
+                let count = plan.shells.len();
+                let verb = match self.operation {
+                    InstallerOperation::Install => "Updating",
+                    InstallerOperation::Repair => "Reinstalling",
+                    InstallerOperation::Remove => "Removing Compi",
+                };
+                content.child(
+                    div()
+                        .mt_5()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(COLORS.error))
+                                .child(format!("{verb} ends {count} {}:", shells_word(count))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .line_height(px(21.0))
+                                .child(shell_list(&plan.shells)),
+                        )
+                        .when(self.operation == InstallerOperation::Install, |content| {
+                            content.child(
                                 div()
-                                    .text_size(px(12.0))
+                                    .mt_1()
+                                    .text_size(px(13.0))
                                     .text_color(rgb(COLORS.muted))
-                                    .child(destination),
-                            ),
-                    ),
+                                    .child("They run an older version this update can't keep."),
+                            )
+                        }),
+                )
+            })
+            .when(
+                !plan.needs_consent() && plan.restarts_service(),
+                |content| {
+                    content.child(div().mt_5().text_size(px(14.0)).child(
+                        if self.operation == InstallerOperation::Remove {
+                            "Compi's background service will stop."
+                        } else {
+                            "Compi's background service will restart."
+                        },
+                    ))
+                },
             )
             .when(self.operation == InstallerOperation::Remove, |content| {
                 content.child(
-                    div().id("remove-managed-data").tab_index(0).mt_4()
-                        .text_size(px(12.0)).cursor_pointer()
+                    div()
+                        .id("remove-managed-data")
+                        .tab_index(0)
+                        .mt_5()
+                        .text_size(px(14.0))
+                        .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.remove_data = !this.remove_data;
                             cx.notify();
                         }))
-                        .child(format!("{} Also delete settings, workspaces and custom themes (Ctrl+D): {}",
-                            if self.remove_data { "[✓]" } else { "[ ]" },
-                            application_data_directory().display())),
+                        .child(format!(
+                            "{}  Also delete settings and workspaces",
+                            if self.remove_data { "☑" } else { "☐" }
+                        )),
                 )
-                .when(self.remove_data, |content| {
-                    content.child(div().mt_2().text_size(px(11.0)).text_color(rgb(COLORS.muted))
-                        .child(format!("Exact managed entries: config.toml; workspace[-INSTANCE]-v1.json; sessions[-INSTANCE]-v1/v2.json and their temporary, corrupt and migration backups; {}. Unknown files/projects, installer recovery logs and external configuration/theme sources are kept.",
-                            transaction::MANAGED_DATA_DIRECTORIES.join("/; ") + "/")))
-                })
             })
     }
 
-    fn render_installing(&self) -> impl IntoElement {
+    fn render_progress(&self) -> impl IntoElement {
+        let (title, line) = match &self.state {
+            SurfaceState::Checking if self.operation == InstallerOperation::Repair => {
+                ("Checking Compi…".to_owned(), String::new())
+            }
+            SurfaceState::Checking => ("Checking your PC…".to_owned(), String::new()),
+            SurfaceState::Fixing(title) => (format!("{title}…"), String::new()),
+            _ => (
+                match self.operation {
+                    InstallerOperation::Install => "Installing Compi",
+                    InstallerOperation::Repair => "Reinstalling files",
+                    InstallerOperation::Remove => "Removing Compi",
+                }
+                .to_owned(),
+                match self.progress {
+                    Some(percent) => format!("{} · {percent}%", self.stage),
+                    None => self.stage.clone(),
+                },
+            ),
+        };
         div()
             .flex_1()
             .flex()
@@ -603,36 +922,36 @@ impl InstallerApp {
                     .mt_5()
                     .text_size(px(22.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(if matches!(self.state, SurfaceState::Checking) {
-                        "Checking prerequisites"
-                    } else {
-                        match self.operation {
-                            InstallerOperation::Install => "Installing Compi",
-                            InstallerOperation::Repair => "Repairing Compi",
-                            InstallerOperation::Remove => "Removing Compi",
-                        }
-                    }),
+                    .child(title),
             )
-            .child(
-                div()
-                    .mt_2()
-                    .text_size(px(13.0))
-                    .text_color(rgb(COLORS.muted))
-                    .child(match self.progress {
-                        Some(percent) => format!("{} ({percent}%)", self.stage),
-                        None => self.stage.clone(),
-                    }),
-            )
+            .when(!line.is_empty(), |content| {
+                content.child(
+                    div()
+                        .mt_2()
+                        .text_size(px(14.0))
+                        .text_color(rgb(COLORS.muted))
+                        .child(line),
+                )
+            })
     }
 
     fn render_complete(&self) -> impl IntoElement {
-        let (title, detail) = if self.operation == InstallerOperation::Remove {
-            (
+        let version = self
+            .outcome
+            .version
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        let (title, detail) = match self.operation {
+            InstallerOperation::Remove => (
                 "Compi removed",
-                "Product removal succeeded. Managed user data was kept unless explicitly selected.",
-            )
-        } else {
-            ("Compi is ready", "Open Compi or find it in the Start menu.")
+                match &self.outcome.cleanup {
+                    Some(Ok(())) => "Your settings and workspaces were deleted.".to_owned(),
+                    Some(Err(error)) => error.clone(),
+                    None => "Your settings and workspaces were kept.".to_owned(),
+                },
+            ),
+            InstallerOperation::Repair => ("Compi is repaired", format!("Version {version}")),
+            InstallerOperation::Install => ("Compi is ready", format!("Version {version}")),
         };
         div()
             .flex_1()
@@ -665,32 +984,18 @@ impl InstallerApp {
             .child(
                 div()
                     .mt_2()
-                    .text_size(px(13.0))
+                    .max_w(px(460.0))
+                    .text_size(px(14.0))
                     .text_color(rgb(COLORS.muted))
                     .child(detail),
             )
-            .child(
-                div().mt_3().text_size(px(12.0)).text_color(rgb(COLORS.muted))
-                    .child(if self.outcome.restart_required {
-                        if self.operation == InstallerOperation::Remove {
-                            "Product removed. Windows restart required to finish releasing application files.".into()
-                        } else {
-                            format!("Version {} installed. Windows restart required before normal use.", self.outcome.version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")))
-                        }
-                    } else if self.operation != InstallerOperation::Remove {
-                        format!("Installed version {}", self.outcome.version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")))
-                    } else {
-                        "No Windows restart required.".into()
-                    }),
-            )
-            .when(self.operation == InstallerOperation::Remove, |content| {
-                content.child(div().mt_3().max_w(px(460.0)).text_size(px(12.0))
-                    .text_color(rgb(if matches!(self.outcome.cleanup, Some(Err(_))) { COLORS.error } else { COLORS.muted }))
-                    .child(match &self.outcome.cleanup {
-                        Some(Ok(())) => "Selected managed data was removed.".into(),
-                        Some(Err(error)) => format!("Product removed; managed-data cleanup failed: {error}"),
-                        None => "Settings, workspaces and custom themes remain available for reinstall.".into(),
-                    }))
+            .when(self.outcome.restart_required, |content| {
+                content.child(
+                    div()
+                        .mt_3()
+                        .text_size(px(14.0))
+                        .child("Restart Windows to finish."),
+                )
             })
     }
 
@@ -705,40 +1010,181 @@ impl InstallerApp {
             .pt(px(46.0))
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(COLORS.error))
-                    .child("INSTALLATION STOPPED"),
-            )
-            .child(
-                div()
-                    .mt_3()
                     .text_size(px(24.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Setup could not finish"),
+                    .child(if self.attempted {
+                        "Setup couldn't finish"
+                    } else {
+                        "Setup can't continue yet"
+                    }),
             )
             .child(
                 div()
                     .mt_3()
-                    .max_w(px(480.0))
-                    .text_size(px(13.0))
-                    .line_height(px(20.0))
-                    .text_color(rgb(COLORS.muted))
+                    .max_w(px(500.0))
+                    .text_size(px(15.0))
+                    .line_height(px(22.0))
                     .child(error.to_owned()),
-            )
-            .child(
-                div()
-                    .mt_5()
-                    .text_size(px(12.0))
-                    .text_color(rgb(COLORS.muted))
-                    .child(format!("Detailed log: {}", installer_log_path().display())),
             )
     }
 
+    fn render_doctor(&self, fix_error: Option<&str>, cx: &mut Context<Self>) -> impl IntoElement {
+        let findings = self.findings();
+        let healthy = findings.is_empty();
+        let reinstall_shells: Vec<String> = self
+            .inspection
+            .as_ref()
+            .map(|inspection| doctor::reinstall_plan(&daemon_facts(&inspection.daemons)).shells)
+            .unwrap_or_default();
+        let mut body = div()
+            .flex_1()
+            .id("doctor-body")
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .px(px(38.0))
+            .pt(px(28.0))
+            .pb(px(16.0))
+            .child(
+                div()
+                    .text_size(px(24.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(if healthy {
+                        "No problems found".to_owned()
+                    } else if findings.len() == 1 {
+                        "Compi has 1 problem".to_owned()
+                    } else {
+                        format!("Compi has {} problems", findings.len())
+                    }),
+            );
+        if let Some(error) = fix_error {
+            body = body.child(
+                div()
+                    .mt_3()
+                    .text_size(px(14.0))
+                    .line_height(px(20.0))
+                    .text_color(rgb(COLORS.error))
+                    .child(format!("Couldn't fix it: {error}")),
+            );
+        }
+        if healthy {
+            body = body
+                .child(
+                    div()
+                        .mt_2()
+                        .text_size(px(15.0))
+                        .text_color(rgb(COLORS.muted))
+                        .child("Compi is set up correctly."),
+                )
+                .when(!reinstall_shells.is_empty(), |body| {
+                    body.child(
+                        div()
+                            .mt_5()
+                            .text_size(px(13.0))
+                            .line_height(px(19.0))
+                            .text_color(rgb(COLORS.muted))
+                            .child(format!(
+                                "Reinstalling files ends {} {}: {}",
+                                reinstall_shells.len(),
+                                shells_word(reinstall_shells.len()),
+                                shell_list(&reinstall_shells)
+                            )),
+                    )
+                });
+            return body;
+        }
+        for (index, finding) in findings.iter().enumerate() {
+            let label = fix_label(finding);
+            let shells = finding.shells();
+            body =
+                body.child(
+                    div()
+                        .mt_4()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(COLORS.border))
+                        .bg(rgb(COLORS.surface))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(15.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(finding.title()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .line_height(px(19.0))
+                                        .text_color(rgb(COLORS.muted))
+                                        .child(finding.explanation()),
+                                )
+                                .when_some(finding.command(), |row, command| {
+                                    row.child(
+                                        div()
+                                            .mt_1()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(rgb(COLORS.background))
+                                            .font_family("Cascadia Mono")
+                                            .text_size(px(13.0))
+                                            .child(command),
+                                    )
+                                })
+                                .when(!shells.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .line_height(px(19.0))
+                                            .text_color(rgb(COLORS.error))
+                                            .child(format!("Ends: {}", shell_list(shells))),
+                                    )
+                                }),
+                        )
+                        .when_some(label, |row, label| {
+                            row.child(button(("doctor-fix", index), label, false).on_click(
+                                cx.listener(move |this, _, _, cx| this.fix_one(index, cx)),
+                            ))
+                        }),
+                );
+        }
+        body
+    }
+
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled = !matches!(self.state, SurfaceState::Checking)
+        let enabled = !matches!(self.state, SurfaceState::Checking | SurfaceState::Fixing(_))
             && (!matches!(self.state, SurfaceState::Installing) || self.cancellable);
         let label = self.action_label();
+        let doctor = matches!(self.state, SurfaceState::Doctor { .. });
+        let healthy = doctor && self.findings().is_empty();
+        let fixable = doctor && !all_fixes(self.findings()).is_empty();
+        let show_log = doctor || matches!(self.state, SurfaceState::Error(_));
+        let reinstall_label = {
+            let shells = self
+                .inspection
+                .as_ref()
+                .map(|inspection| {
+                    doctor::reinstall_plan(&daemon_facts(&inspection.daemons))
+                        .shells
+                        .len()
+                })
+                .unwrap_or(0);
+            if shells == 0 {
+                "Reinstall files".to_owned()
+            } else {
+                format!("End {shells} {} and reinstall", shells_word(shells))
+            }
+        };
         div()
             .h(px(76.0))
             .flex_none()
@@ -748,67 +1194,119 @@ impl InstallerApp {
             .px(px(38.0))
             .border_t_1()
             .border_color(rgb(COLORS.border))
-            .child(
+            .child(if show_log {
                 div()
-                    .text_size(px(11.0))
+                    .id("open-installer-log")
+                    .tab_index(0)
+                    .text_size(px(13.0))
                     .text_color(rgb(COLORS.muted))
-                    .child("Project files are never modified"),
-            )
-            .when(matches!(self.state, SurfaceState::Error(_)), |footer| {
-                footer.child(
-                    div()
-                        .id("open-installer-log")
-                        .tab_index(0)
-                        .text_size(px(12.0))
-                        .cursor_pointer()
-                        .child("Open log")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            match Command::new("notepad.exe")
-                                .arg(installer_log_path())
-                                .spawn()
-                            {
-                                Ok(_) => {}
-                                Err(error) => {
-                                    this.state =
-                                        SurfaceState::Error(format!("Cannot open log: {error}"));
-                                    cx.notify();
-                                }
-                            }
-                        })),
-                )
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgb(COLORS.foreground)))
+                    .child("Open log")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Err(error) = Command::new("notepad.exe").arg(this.log_path()).spawn()
+                        {
+                            transaction::log(&format!("Opening the log failed: {error}"));
+                            this.state = SurfaceState::Error("The log couldn't be opened.".into());
+                            cx.notify();
+                        }
+                    }))
+                    .into_any_element()
+            } else {
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLORS.muted))
+                    .child("Your projects are never touched")
+                    .into_any_element()
             })
             .child(
                 div()
-                    .id("installer-primary-action")
-                    .tab_index(0)
-                    .min_w(px(142.0))
-                    .h(px(38.0))
-                    .px_4()
-                    .rounded_md()
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .bg(if enabled {
-                        rgb(COLORS.accent)
-                    } else {
-                        rgb(COLORS.border)
+                    .gap_3()
+                    .when(healthy, |buttons| {
+                        buttons.child(button("doctor-reinstall", reinstall_label, false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.start_reinstall(cx);
+                                cx.notify();
+                            }),
+                        ))
                     })
-                    .text_color(if enabled {
-                        rgb(COLORS.background)
-                    } else {
-                        rgb(COLORS.muted)
+                    .when(fixable, |buttons| {
+                        buttons.child(
+                            button("doctor-done", "Done".to_owned(), false)
+                                .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+                        )
                     })
-                    .when(enabled, |button| {
-                        button
-                            .hover(|style| style.bg(rgb(0xcbea2f)).cursor_pointer())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.primary_action(&PrimaryAction, window, cx)
-                            }))
+                    .when(doctor && !healthy && !fixable, |buttons| {
+                        buttons.child(
+                            button("doctor-recheck", "Check again".to_owned(), false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.run_doctor(Vec::new(), None);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
                     })
-                    .child(label),
+                    .child({
+                        let primary = button("installer-primary-action", label, true);
+                        if !enabled {
+                            primary
+                                .bg(rgb(COLORS.border))
+                                .text_color(rgb(COLORS.muted))
+                                .into_any_element()
+                        } else if doctor && !fixable {
+                            primary
+                                .on_click(cx.listener(|_, _, window, _| window.remove_window()))
+                                .into_any_element()
+                        } else {
+                            primary
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.primary_action(window, cx)
+                                }))
+                                .into_any_element()
+                        }
+                    }),
             )
     }
+}
+
+fn daemon_facts(daemons: &[Daemon]) -> Vec<doctor::RunningDaemon> {
+    daemons.iter().map(|daemon| daemon.fact.clone()).collect()
+}
+
+fn button(
+    id: impl Into<gpui::ElementId>,
+    label: String,
+    primary: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .tab_index(0)
+        .flex_none()
+        .min_w(px(if primary { 142.0 } else { 96.0 }))
+        .h(px(38.0))
+        .px_4()
+        .rounded_md()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(14.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .when(primary, |button| {
+            button
+                .bg(rgb(COLORS.accent))
+                .text_color(rgb(COLORS.background))
+                .hover(|style| style.bg(rgb(0xcbea2f)))
+        })
+        .when(!primary, |button| {
+            button
+                .border_1()
+                .border_color(rgb(COLORS.border))
+                .hover(|style| style.bg(rgb(COLORS.surface)))
+        })
+        .child(SharedString::from(label))
 }
 
 impl Focusable for InstallerApp {
@@ -821,16 +1319,21 @@ impl Render for InstallerApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.state {
             SurfaceState::Ready => self.render_ready(cx).into_any_element(),
-            SurfaceState::Installing | SurfaceState::Checking => {
-                self.render_installing().into_any_element()
+            SurfaceState::Installing | SurfaceState::Checking | SurfaceState::Fixing(_) => {
+                self.render_progress().into_any_element()
             }
             SurfaceState::Complete => self.render_complete().into_any_element(),
             SurfaceState::Error(error) => self.render_error(error).into_any_element(),
+            SurfaceState::Doctor { fix_error } => {
+                let fix_error = fix_error.clone();
+                self.render_doctor(fix_error.as_deref(), cx)
+                    .into_any_element()
+            }
         };
         div()
             .key_context("CompiInstaller")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::primary_action))
+            .on_action(cx.listener(Self::primary_key))
             .on_action(cx.listener(Self::close_installer))
             .on_action(cx.listener(|this, _: &ToggleDataCleanup, _, cx| {
                 if this.operation == InstallerOperation::Remove
@@ -844,7 +1347,7 @@ impl Render for InstallerApp {
             .flex()
             .flex_col()
             .font_family("Segoe UI Variable")
-            .text_size(px(13.0))
+            .text_size(px(14.0))
             .text_color(rgb(COLORS.foreground))
             .bg(rgb(COLORS.background))
             .child(self.render_header())
@@ -855,42 +1358,103 @@ impl Render for InstallerApp {
 
 fn preview_configuration(
     preview: PreviewState,
-) -> (InstallerOperation, SurfaceState, Option<String>) {
+) -> (
+    InstallerOperation,
+    SurfaceState,
+    Readiness,
+    Option<Inspection>,
+) {
+    let installed = |version: &str| Readiness {
+        installed: Some(version.into()),
+        ..Readiness::default()
+    };
     match preview {
-        PreviewState::Ready | PreviewState::Upgrade => {
-            (InstallerOperation::Install, SurfaceState::Ready, None)
-        }
-        PreviewState::Installing => (InstallerOperation::Install, SurfaceState::Installing, None),
-        PreviewState::Complete => (InstallerOperation::Install, SurfaceState::Complete, None),
+        PreviewState::Ready => (
+            InstallerOperation::Install,
+            SurfaceState::Ready,
+            Readiness::default(),
+            None,
+        ),
+        PreviewState::Upgrade => (
+            InstallerOperation::Install,
+            SurfaceState::Ready,
+            Readiness {
+                plan: doctor::UpgradePlan {
+                    stop: vec![None],
+                    ..Default::default()
+                },
+                ..installed("0.1.3")
+            },
+            None,
+        ),
+        PreviewState::Consent => (
+            InstallerOperation::Install,
+            SurfaceState::Ready,
+            Readiness {
+                plan: doctor::UpgradePlan {
+                    stop: vec![None],
+                    shells: vec!["api · server (2)".into(), "web".into(), "Shell".into()],
+                    ..Default::default()
+                },
+                ..installed("0.1.3")
+            },
+            None,
+        ),
+        PreviewState::Installing => (
+            InstallerOperation::Install,
+            SurfaceState::Installing,
+            Readiness::default(),
+            None,
+        ),
+        PreviewState::Complete => (
+            InstallerOperation::Install,
+            SurfaceState::Complete,
+            Readiness::default(),
+            None,
+        ),
         PreviewState::Error => (
             InstallerOperation::Install,
             SurfaceState::Error(
-                "The package could not be applied. No application files were changed.".into(),
+                "Windows Installer couldn't finish. Nothing was changed. Try again.".into(),
             ),
+            Readiness::default(),
             None,
         ),
-        PreviewState::Remove => (InstallerOperation::Remove, SurfaceState::Ready, None),
+        PreviewState::Remove => (
+            InstallerOperation::Remove,
+            SurfaceState::Ready,
+            Readiness::default(),
+            None,
+        ),
+        PreviewState::Doctor | PreviewState::Healthy => {
+            let findings = if preview == PreviewState::Doctor {
+                vec![
+                    Finding::DaemonIncompatible {
+                        instance: None,
+                        shells: vec!["api · server".into(), "web".into()],
+                    },
+                    Finding::TaskWrongVersion {
+                        selected: env!("CARGO_PKG_VERSION").into(),
+                    },
+                    Finding::Leftovers,
+                    Finding::Wsl(doctor::WslFact::NotWsl2 {
+                        name: "Ubuntu".into(),
+                    }),
+                ]
+            } else {
+                Vec::new()
+            };
+            (
+                InstallerOperation::Repair,
+                SurfaceState::Doctor { fix_error: None },
+                Readiness::default(),
+                Some(Inspection {
+                    daemons: Vec::new(),
+                    findings,
+                }),
+            )
+        }
     }
-}
-
-fn status_row(ok: bool, label: &str) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_3()
-        .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(if ok {
-            COLORS.accent
-        } else {
-            COLORS.error
-        })))
-        .child(
-            div()
-                .max_w(px(460.0))
-                .line_height(px(19.0))
-                .text_size(px(13.0))
-                .text_color(rgb(if ok { COLORS.foreground } else { COLORS.error }))
-                .child(label.to_owned()),
-        )
 }
 
 fn brand_mark() -> impl IntoElement {
@@ -918,7 +1482,7 @@ pub(crate) fn ensure_supported_windows() -> Result<()> {
     let status = unsafe { RtlGetVersion(&mut version) };
     if status.0 < 0 {
         return Err(
-            format!("could not determine the Windows version (NTSTATUS {status:?})").into(),
+            "Setup couldn't read the Windows version. Restart Windows, then try again.".into(),
         );
     }
     validate_windows_version(
@@ -928,42 +1492,25 @@ pub(crate) fn ensure_supported_windows() -> Result<()> {
     )
 }
 
-fn validate_windows_version(major: u32, minor: u32, build: u32) -> Result<()> {
+fn validate_windows_version(major: u32, _minor: u32, build: u32) -> Result<()> {
     if major > 10 || (major == 10 && build >= 19_041) {
         Ok(())
     } else {
-        Err(format!(
-            "Compi requires Windows 10 version 2004 (build 19041) or newer; this system reports {major}.{minor}.{build}"
-        )
-        .into())
+        Err("Compi needs Windows 10 version 2004 or newer. Update Windows, then try again.".into())
     }
 }
 
-fn application_data_directory() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join("Compi")
-}
-
-fn installed_directory() -> PathBuf {
+fn installed_executable() -> PathBuf {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_default()
         .join("Programs")
         .join("Compi")
-}
-
-fn installed_executable() -> PathBuf {
-    installed_directory().join("compi.exe")
+        .join("compi.exe")
 }
 
 fn installer_log_path() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join("Compi")
-        .join("installer.log")
+    transaction::log_path().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -974,5 +1521,26 @@ mod tests {
     fn rejects_windows_versions_before_windows_10_2004() {
         assert!(validate_windows_version(10, 0, 19_041).is_ok());
         assert!(validate_windows_version(10, 0, 18_363).is_err());
+    }
+
+    #[test]
+    fn consent_labels_count_the_shells_they_end() {
+        let finding = Finding::DaemonIncompatible {
+            instance: None,
+            shells: vec!["api".into()],
+        };
+        assert_eq!(fix_label(&finding).as_deref(), Some("End 1 shell and fix"));
+        assert_eq!(
+            fix_label(&Finding::PayloadDamaged {
+                missing: vec!["conpty.dll"],
+                shells: vec!["a".into(), "b".into()],
+            })
+            .as_deref(),
+            Some("End 2 shells and reinstall")
+        );
+        assert_eq!(fix_label(&Finding::Leftovers).as_deref(), Some("Fix"));
+        assert_eq!(fix_label(&Finding::TaskOtherInstallation), None);
+        let many: Vec<String> = (1..=8).map(|n| format!("s{n}")).collect();
+        assert_eq!(shell_list(&many), "s1, s2, s3, s4, s5, s6, and 2 more");
     }
 }

@@ -1,5 +1,5 @@
 use crate::installer::InstallerOperation;
-use crate::{Result, transaction};
+use crate::{Result, doctor, machine, transaction};
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
 use std::{
@@ -16,21 +16,6 @@ struct Snapshot {
 }
 fn snapshot_path(root: &Path) -> PathBuf {
     root.join(".compi-update/msi-snapshot.json")
-}
-fn checked(command: &mut Command) -> Result<()> {
-    let output = command.creation_flags(0x08000000).output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "{}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(())
-}
-fn task_name() -> Result<String> {
-    transaction::task_name()
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let next = path.with_extension("next");
@@ -136,11 +121,11 @@ fn begin_raw_lock(root: &Path) -> Result<()> {
         "$ErrorActionPreference='Stop'; $self=Get-CimInstance Win32_Process -Filter 'ProcessId={process_id}'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$self.ParentProcessId); if ($p.Name -ne 'msiexec.exe') {{ throw 'The lock owner must be Windows Installer' }}; $p.ProcessId"
     ))?;
     if !output.status.success() {
-        return Err(format!(
-            "Cannot establish Windows Installer transaction lifetime: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+        transaction::log(&format!(
+            "Lock owner check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+        return Err("Windows Installer didn't start this step. Run Compi Setup instead.".into());
     }
     let parent: u32 = String::from_utf8(output.stdout)?.trim().parse()?;
     let stamp = std::time::SystemTime::now()
@@ -174,11 +159,18 @@ fn begin_raw_lock(root: &Path) -> Result<()> {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
-            return Err(format!("Installation lock keeper failed: {status}").into());
+            transaction::log(&format!("Lock keeper exited early: {status}"));
+            return Err(
+                "Another Compi update or repair is running. Wait for it to finish, then try again."
+                    .into(),
+            );
         }
         if started.elapsed() > std::time::Duration::from_secs(10) {
             fs::remove_file(&release)?;
-            return Err("Timed out acquiring the shared installer/update lock; another operation may be active".into());
+            return Err(
+                "Another Compi update or repair is running. Wait for it to finish, then try again."
+                    .into(),
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -215,11 +207,55 @@ fn release_raw_lock(root: &Path) -> Result<()> {
     let started = std::time::Instant::now();
     while raw_lock_alive(root)? {
         if started.elapsed() > std::time::Duration::from_secs(10) {
-            return Err("Installation completed but lock-keeper exit is pending; wait for Windows Installer to exit before retrying".into());
+            return Err(
+                "Windows Installer is still finishing. Wait a moment before running Setup again."
+                    .into(),
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     fs::remove_file(path)?;
+    Ok(())
+}
+
+/// `msi-lock-<pid>-<nanos>` folders under `.compi-update`.
+fn lock_folders(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root.join(".compi-update")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("msi-lock-"))
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty()
+                            && suffix.bytes().all(|c| c.is_ascii_digit() || c == b'-')
+                    })
+        })
+        .collect()
+}
+/// Lock receipts and keeper folders left by a Windows Installer run that has ended.
+pub(crate) fn stale_lock_receipts(root: &Path) -> bool {
+    !raw_lock_alive(root).unwrap_or(true)
+        && (raw_lock_path(root).is_file() || !lock_folders(root).is_empty())
+}
+/// Caller owns the installation operation lock, so no keeper can be starting.
+pub(crate) fn clear_stale_lock_receipts(root: &Path) -> Result<()> {
+    if raw_lock_alive(root)? {
+        return Ok(());
+    }
+    let receipt = raw_lock_path(root);
+    if receipt.is_file() {
+        fs::remove_file(receipt)?;
+    }
+    for folder in lock_folders(root) {
+        transaction::clean_managed_data(&folder)?;
+    }
     Ok(())
 }
 
@@ -231,9 +267,12 @@ fn clean_legacy_product(root: &Path) -> Result<()> {
     let statuses = compi_protocol::DaemonClient::local_lifecycle_statuses_for_install(root)?;
     if statuses
         .iter()
-        .any(|status| PathBuf::from(&status.daemon_executable) == daemon)
+        .any(|status| Path::new(&status.daemon_executable) == daemon)
     {
-        return Err("The obsolete root payload is still used by an old daemon. It was retained; stop that instance deliberately before removing those application files".into());
+        return Err(
+            "An older Compi is still running. Quit it from its window, then run Setup again."
+                .into(),
+        );
     }
     transaction::remove_owned_legacy_task(root)?;
     for name in [
@@ -296,9 +335,23 @@ pub(crate) fn action(args: &[String]) -> Result<()> {
     match mode.as_str() {
         "--msi-guard-install" => {
             transaction::guard_version(&root, args.get(2).ok_or("Missing candidate version")?)?;
-            transaction::guard(&root, InstallerOperation::Install)
+            let statuses = transaction::guard(&root, InstallerOperation::Install)?;
+            // Setup stops an incompatible daemon with consent before Windows Installer
+            // runs; a bare MSI can only stop idle ones, so open shells block it here.
+            let daemons: Vec<_> = machine::describe(&root, statuses)
+                .into_iter()
+                .map(|daemon| daemon.fact)
+                .collect();
+            if doctor::upgrade_plan(compi_protocol::PROTOCOL_VERSION, None, false, &daemons)
+                .needs_consent()
+            {
+                return Err("Compi has open shells on an older version. Run Compi Setup to update, or close those shells first.".into());
+            }
+            Ok(())
         }
-        "--msi-guard-remove" => transaction::guard(&root, InstallerOperation::Remove),
+        "--msi-guard-remove" => {
+            transaction::refuse_running(&transaction::guard(&root, InstallerOperation::Remove)?)
+        }
         "--msi-snapshot" => {
             fs::create_dir_all(root.join(".compi-update"))?;
             let old_snapshot = snapshot_path(&root);
@@ -317,12 +370,15 @@ pub(crate) fn action(args: &[String]) -> Result<()> {
             };
             write_json(&snapshot_path(&root), &snapshot)?;
             if snapshot.selection.is_none() && snapshot.legacy_task.is_some() {
-                checked(Command::new("schtasks.exe").args([
-                    "/Change",
-                    "/TN",
-                    "Compi Daemon",
-                    "/DISABLE",
-                ]))?;
+                machine::run_checked(
+                    Command::new("schtasks.exe").args([
+                        "/Change",
+                        "/TN",
+                        "Compi Daemon",
+                        "/DISABLE",
+                    ]),
+                    "pause the old background task",
+                )?;
                 transaction::guard(&root, InstallerOperation::Install)?;
             }
             Ok(())
@@ -331,39 +387,39 @@ pub(crate) fn action(args: &[String]) -> Result<()> {
             let version = args.get(2).ok_or("Missing version")?;
             let sid = args.get(3).ok_or("Missing user SID")?;
             if *sid != compi_protocol::identity::current_user_sid_string()? {
-                return Err(
-                    "MSI user identity does not match the authenticated signed-in account".into(),
-                );
+                return Err("Windows Installer is running as a different account. Run Compi Setup from your own account.".into());
             }
             let snapshot: Snapshot = serde_json::from_slice(&fs::read(snapshot_path(&root))?)?;
-            let task_version = snapshot
-                .selection
-                .as_ref()
-                .map(|s| s.task_version.as_str())
-                .unwrap_or(version);
-            let daemon = root
-                .join("versions")
-                .join(task_version)
-                .join("compi-daemon.exe");
-            let xml = root.join(".compi-update/daemon-task.xml");
             transaction::guard_task_ownership(&root)?;
-            // Preserve a running supervisor's registered generation on compatible upgrades.
-            // Merely replacing an existing task definition can disturb the scheduler's state.
-            if snapshot.selection.is_none() || snapshot.task.is_none() {
-                checked(
-                    Command::new(daemon)
-                        .args(["--write-task-xml"])
-                        .arg(&xml)
-                        .arg(sid),
-                )?;
-                checked(
-                    Command::new("schtasks.exe")
-                        .args(["/Create", "/TN", &task_name()?, "/XML"])
-                        .arg(&xml)
-                        .arg("/F"),
-                )?;
+            let daemons = machine::describe(
+                &root,
+                compi_protocol::DaemonClient::local_lifecycle_statuses_for_install(&root)?,
+            );
+            let facts: Vec<_> = daemons.iter().map(|daemon| daemon.fact.clone()).collect();
+            // A compatible running daemon keeps its registered generation: replacing the
+            // definition of a running task can disturb the scheduler's state. Otherwise the
+            // task moves to this version, so the next start serves this client.
+            let plan = doctor::upgrade_plan(
+                compi_protocol::PROTOCOL_VERSION,
+                snapshot
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.task_version.as_str()),
+                snapshot.task.is_some(),
+                &facts,
+            );
+            if plan.needs_consent() {
+                return Err("Compi has open shells on an older version. Run Compi Setup to update, or close those shells first.".into());
             }
-            compi_update::activate_msi_payload_locked(&root, version, task_version)?;
+            machine::stop_instances(&plan.stop, &daemons)?;
+            let task_version = match &plan.keep_task {
+                Some(kept) => kept.clone(),
+                None => {
+                    machine::register_task(&root, version)?;
+                    version.clone()
+                }
+            };
+            compi_update::activate_msi_payload_locked(&root, version, &task_version)?;
             Ok(())
         }
         "--msi-rollback" => {
@@ -397,21 +453,24 @@ pub(crate) fn action(args: &[String]) -> Result<()> {
             }
         }
         "--msi-remove-task" => {
-            transaction::guard(&root, InstallerOperation::Remove)?;
+            transaction::refuse_running(&transaction::guard(&root, InstallerOperation::Remove)?)?;
             transaction::guard_task_ownership(&root)?;
             let result = transaction::task_snapshot()?;
             if result.is_some() {
-                checked(Command::new("schtasks.exe").args([
-                    "/Delete",
-                    "/TN",
-                    &task_name()?,
-                    "/F",
-                ]))?;
+                machine::run_checked(
+                    Command::new("schtasks.exe").args([
+                        "/Delete",
+                        "/TN",
+                        &transaction::task_name()?,
+                        "/F",
+                    ]),
+                    "remove the background service",
+                )?;
             }
             Ok(())
         }
         "--msi-clean-product" => {
-            transaction::guard(&root, InstallerOperation::Remove)?;
+            transaction::refuse_running(&transaction::guard(&root, InstallerOperation::Remove)?)?;
             let versions = root.join("versions");
             if versions.is_dir() {
                 transaction::clean_managed_data(&versions)?;

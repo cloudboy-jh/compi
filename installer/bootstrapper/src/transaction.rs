@@ -1,5 +1,8 @@
 use super::installer::{InstallerOperation, InstallerSource};
-use crate::{Error, Result};
+use crate::doctor::{self, UpgradePlan};
+use crate::machine::{self, Daemon};
+use crate::{Error, Result, plain};
+use compi_protocol::LifecycleStatus;
 use compi_update::{OperationLock, read_selection};
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
@@ -33,15 +36,28 @@ pub(crate) struct Outcome {
     pub version: Option<String>,
     pub cleanup: Option<std::result::Result<(), String>>,
 }
+/// What Setup found before changing anything, shown to the user for approval.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Readiness {
+    /// The version this installation runs now.
+    pub installed: Option<String>,
+    pub plan: UpgradePlan,
+    /// Snapshots the user approves; stopping presents them back to each daemon.
+    pub daemons: Vec<Daemon>,
+}
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
-    Preflight(std::result::Result<(), String>),
+    Preflight(std::result::Result<Readiness, String>),
     Progress {
         stage: String,
         percent: Option<u32>,
         cancellable: bool,
     },
     Finished(std::result::Result<Outcome, String>),
+    Inspected {
+        inspection: std::result::Result<machine::Inspection, String>,
+        fix_error: Option<String>,
+    },
 }
 #[derive(Serialize, Deserialize)]
 struct Journal {
@@ -57,32 +73,76 @@ struct Journal {
 }
 
 pub(crate) fn root() -> Result<PathBuf> {
-    let base = env::var_os("LOCALAPPDATA")
-        .ok_or("LOCALAPPDATA is unavailable; use your signed-in Windows profile")?;
+    let base = env::var_os("LOCALAPPDATA").ok_or(
+        "Windows didn't provide your local app data folder. Sign in with your own account.",
+    )?;
     Ok(PathBuf::from(base).join("Programs").join("Compi"))
 }
 pub(crate) fn data_root() -> Result<PathBuf> {
-    Ok(
-        PathBuf::from(env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?)
-            .join("Compi"),
+    Ok(PathBuf::from(
+        env::var_os("LOCALAPPDATA").ok_or("Windows didn't provide your local app data folder.")?,
     )
+    .join("Compi"))
 }
 pub(crate) fn log_path() -> Result<PathBuf> {
     Ok(data_root()?.join("installer.log"))
 }
+/// Windows Installer's own record of the latest run (UTF-16, rewritten each run). Kept apart
+/// from installer.log: mixing its UTF-16 output with Setup's UTF-8 lines made both unreadable.
+fn msi_log_path() -> Result<PathBuf> {
+    Ok(data_root()?.join("installer-msi.log"))
+}
+/// Full detail for installer.log; the window shows only `plain::short`.
+pub(crate) fn log(text: &str) {
+    // Unit tests exercise failure paths; they must not write to this account's real log.
+    if cfg!(test) {
+        return;
+    }
+    if let Ok(path) = log_path() {
+        // Setups up to 0.1.6 appended Windows Installer's UTF-16 output here; start that
+        // garbled file over so the log opens as plain text.
+        let mut head = [0u8; 2];
+        if fs::File::open(&path)
+            .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
+            .is_ok()
+            && head == *b"\xff\xfe"
+        {
+            let _ = fs::remove_file(&path);
+        }
+        plain::log(&path, text);
+    }
+}
+/// Runs a script whose failures reach stderr as the bare exception message, never a
+/// formatted PowerShell error record ("At line:1 char:408 … CategoryInfo …").
 pub(crate) fn powershell(script: &str) -> Result<std::process::Output> {
     let exe = PathBuf::from(env::var_os("SystemRoot").ok_or("SystemRoot is unavailable")?)
         .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let script = format!("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); {script}");
+    let script = format!(
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); try {{ {script} }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
+    );
     Ok(Command::new(exe)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x08000000)
         .output()?)
 }
+/// The script's own message on failure, logged with `context`.
+fn script_error(context: &str, output: &std::process::Output) -> Error {
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    log(&format!("{context}: {message}"));
+    if message.is_empty() {
+        context.into()
+    } else {
+        message.into()
+    }
+}
+/// Defines `Test-Mine $owner`: Windows reports a task principal as a SID, DOMAIN\user or a
+/// bare user name ("johns"); all of them name this account when they resolve to its SID.
+pub(crate) const TEST_MINE: &str = r"$id=[Security.Principal.WindowsIdentity]::GetCurrent(); function Test-Mine($owner) { $sid=$owner; if ($owner -notlike 'S-1-*') { try { $sid=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $sid=$null } }; ($sid -eq $id.User.Value) -or ($owner -eq $id.Name) -or ($owner -eq ($id.Name -split '\\')[-1]) };";
 
 /// Inventory executable paths, not names alone: every named instance under this installation
-/// is included, while another portable/installed Compi remains untouched.
-pub(crate) fn guard(root: &Path, operation: InstallerOperation) -> Result<()> {
+/// is included, while another portable/installed Compi remains untouched. Returns this
+/// installation's running daemons.
+pub(crate) fn guard(root: &Path, operation: InstallerOperation) -> Result<Vec<LifecycleStatus>> {
     let legacy = !root.join("selection.json").is_file() && root.join("compi-daemon.exe").is_file();
     if legacy
         && compi_protocol::DaemonClient::endpoint_available(
@@ -90,77 +150,128 @@ pub(crate) fn guard(root: &Path, operation: InstallerOperation) -> Result<()> {
             std::time::Duration::from_millis(250),
         )?
     {
-        return Err("Legacy migration is deferred: the old MSI removal hook addresses the default daemon even when it belongs to another installation. Let that instance's owner deliberately stop it before migration, or keep using the old install. Setup will not stop unrelated work.".into());
+        // The old MSI's removal hook addresses the default daemon even when it belongs to
+        // another installation, so this migration never stops it on the user's behalf.
+        return Err(
+            "An older Compi is still running. Quit it from its window, then run Setup again."
+                .into(),
+        );
     }
     if operation == InstallerOperation::Install || root.join("Compi-Setup.exe").is_file() {
         guard_task_ownership(root)?;
     }
-    let statuses = compi_protocol::DaemonClient::local_lifecycle_statuses_for_install(root)
-        .map_err(|error| Error::from(format!("Cannot safely query this installation's named instances: {error}. Deliberately stop them before retrying; their shells will end. For the legacy default instance, run this installation's `compi-daemon.exe --shutdown` and let its supervisor exit. Stop named instances through the old app's explicit stop action, or deliberately end only their owned daemon PID in Task Manager. Close their windows, then Recheck. Setup never performs that stop or ends unrelated work.")))?;
-    if operation != InstallerOperation::Install && !statuses.is_empty() {
-        let work = statuses
-            .iter()
-            .map(|status| {
-                format!(
-                    "{}: {} attached clients, {} live surfaces",
-                    status.instance.as_deref().unwrap_or("default"),
-                    status.connected_clients.len(),
-                    status.live_surfaces.len()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(format!("This installation still has active daemon instances:\n{work}\nDeliberately stop each local instance in Compi (this ends shells), close its windows, then Recheck. Other installations are not stopped.").into());
-    }
+    let statuses = compi_protocol::DaemonClient::local_lifecycle_statuses_for_install(root)?;
     if operation == InstallerOperation::Install && !legacy {
-        return Ok(());
+        return Ok(statuses);
     }
+    // Repair and removal replace or delete files that open windows run from. Setup stops
+    // this installation's daemons itself, with consent, so only windows block it here.
+    let names = if legacy {
+        "@('compi.exe','compi-daemon.exe','compi-update-worker.exe')"
+    } else {
+        "@('compi.exe','compi-update-worker.exe')"
+    };
     let escaped = root.to_string_lossy().replace('\'', "''");
     let current = std::process::id();
     let script = format!(
-        "$ErrorActionPreference='Stop'; $root=[IO.Path]::GetFullPath('{escaped}').TrimEnd('\\')+'\\'; Get-CimInstance Win32_Process | Where-Object {{ $_.Name -in @('compi.exe','compi-daemon.exe','compi-update-worker.exe') -and $_.ProcessId -ne {current} }} | ForEach-Object {{ if (-not $_.ExecutablePath) {{ throw ('Cannot account for process '+$_.ProcessId) }}; if ($_.ExecutablePath.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) {{ Write-Output ($_.Name+' PID '+$_.ProcessId+' '+$_.CommandLine) }} }}"
+        "$ErrorActionPreference='Stop'; $root=[IO.Path]::GetFullPath('{escaped}').TrimEnd('\\')+'\\'; Get-CimInstance Win32_Process | Where-Object {{ $_.Name -in {names} -and $_.ProcessId -ne {current} }} | ForEach-Object {{ if (-not $_.ExecutablePath) {{ throw 'Windows hid a running Compi process from Setup.' }}; if ($_.ExecutablePath.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) {{ Write-Output ($_.Name+' PID '+$_.ProcessId+' '+$_.CommandLine) }} }}"
     );
     let result = powershell(&script)?;
     if !result.status.success() {
-        return Err(format!("Cannot safely account for active Compi instances: {}. Stop Compi deliberately and recheck; no process was terminated.", String::from_utf8_lossy(&result.stderr)).into());
+        return Err(script_error(
+            "Running Compi processes could not be listed",
+            &result,
+        ));
     }
     let active = String::from_utf8_lossy(&result.stdout);
     if !active.trim().is_empty() {
-        return Err(format!("Compi still owns running work:\n{active}\nIn the existing Compi app, deliberately stop each listed local instance (this ends its shells), close its windows, then recheck. Legacy releases cannot provide safe lifecycle consent. Setup will not stop or force-kill them.").into());
+        log(&format!("Running Compi processes:\n{active}"));
+        return Err(if legacy {
+            "An older Compi is still running. Quit it from its window, then run Setup again."
+        } else {
+            "Compi is still open. Close it, then try again."
+        }
+        .into());
     }
-    Ok(())
+    Ok(statuses)
+}
+
+/// Windows Installer cannot ask for consent: running daemons block a bare MSI removal.
+pub(crate) fn refuse_running(statuses: &[LifecycleStatus]) -> Result<()> {
+    if statuses.is_empty() {
+        return Ok(());
+    }
+    let shells: usize = statuses
+        .iter()
+        .map(|status| status.live_surfaces.len())
+        .sum();
+    log(&format!(
+        "Removal blocked by {} running daemon(s)",
+        statuses.len()
+    ));
+    Err(if shells == 0 {
+        "Compi's background service is still running. Use Compi Setup to remove Compi.".to_owned()
+    } else {
+        format!("Compi still has {shells} open shells. Use Compi Setup to remove Compi.")
+    }
+    .into())
 }
 
 pub(crate) fn guard_version(root: &Path, candidate: &str) -> Result<()> {
-    if let Some(selected) = read_selection(root)? {
-        if semver::Version::parse(candidate)? < semver::Version::parse(&selected.version)? {
-            return Err(format!("This setup contains Compi {candidate}, but this installation selects newer version {}. Obtain setup for that version or newer, or use Compi Updates. Repair with an older MSI would downgrade the selected payload, so no mutation was started.", selected.version).into());
-        }
+    if let Some(selected) = read_selection(root)?
+        && semver::Version::parse(candidate)? < semver::Version::parse(&selected.version)?
+    {
+        return Err(format!(
+            "This Setup has Compi {candidate}, but {} is installed. Download the latest Setup.",
+            selected.version
+        )
+        .into());
     }
     Ok(())
 }
-pub(crate) fn preflight(operation: InstallerOperation) -> Result<()> {
+/// Checks everything Setup needs and decides what happens to running daemons. Changes nothing.
+pub(crate) fn preflight(operation: InstallerOperation) -> Result<Readiness> {
     super::installer::ensure_supported_windows()?;
     let root = root()?;
     if operation != InstallerOperation::Remove {
         guard_version(&root, env!("CARGO_PKG_VERSION"))?;
     }
-    guard(&root, operation)?;
-    fs::create_dir_all(&root).map_err(|error| Error::from(format!(
-        "Cannot prepare the installation folder: {error}. Check that the destination is a folder, not a file, and your account has write access, then Recheck."
-    )))?;
+    let statuses = guard(&root, operation)?;
+    let daemons = machine::describe(&root, statuses);
+    let facts: Vec<_> = daemons.iter().map(|daemon| daemon.fact.clone()).collect();
+    let selection = read_selection(&root).ok().flatten();
+    let plan = match operation {
+        InstallerOperation::Install => doctor::upgrade_plan(
+            compi_protocol::PROTOCOL_VERSION,
+            selection
+                .as_ref()
+                .map(|selection| selection.task_version.as_str()),
+            task_snapshot()?.is_some(),
+            &facts,
+        ),
+        InstallerOperation::Repair | InstallerOperation::Remove => doctor::reinstall_plan(&facts),
+    };
+    let readiness = Readiness {
+        installed: selection.map(|selection| selection.version),
+        plan,
+        daemons,
+    };
+    fs::create_dir_all(&root).map_err(|error| {
+        log(&format!("Cannot create {}: {error}", root.display()));
+        Error::from("Setup can't create Compi's folder. Check you can write to your user folder, then try again.")
+    })?;
     let probe = root.join(format!(".write-check-{}", std::process::id()));
-    fs::write(&probe, b"access check").map_err(|error| Error::from(format!(
-        "Cannot write to the installation folder: {error}. Check free disk space and your account's write permissions, then Recheck."
-    )))?;
-    fs::remove_file(&probe).map_err(|error| Error::from(format!(
-        "Cannot remove the installation access-check file: {error}. Check your account's delete permissions for this folder, then Recheck."
-    )))?;
+    fs::write(&probe, b"access check")
+        .and_then(|()| fs::remove_file(&probe))
+        .map_err(|error| {
+            log(&format!("Write check in {} failed: {error}", root.display()));
+            Error::from("Setup can't write to Compi's folder. Check free space and permissions, then try again.")
+        })?;
     if operation != InstallerOperation::Install {
-        return Ok(());
+        return Ok(readiness);
     }
     if !cfg!(target_arch = "x86_64") {
-        return Err("This installer requires Windows x64; Windows ARM64 is not supported".into());
+        return Err("Compi needs 64-bit Windows on an Intel or AMD processor.".into());
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -185,9 +296,28 @@ pub(crate) fn preflight(operation: InstallerOperation) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     if available < 300 * 1024 * 1024 {
-        return Err("Compi setup needs at least 300 MiB free on the installation drive for payload staging and rollback. Free space, then Recheck.".into());
+        return Err(format!(
+            "Setup needs 300 MB free, but only {} is free. Free some space, then try again.",
+            plain::megabytes(available)
+        )
+        .into());
     }
-    compi_protocol::wsl::ensure_default_wsl2().map_err(|error| Error::from(format!("{error}\nInstall WSL with `wsl --install`, list distributions with `wsl --list --verbose`, select one with `wsl --set-default NAME`, or convert it with `wsl --set-version NAME 2`. Reboot if Windows requests it, then Recheck.")))?;
+    let wsl = machine::wsl_fact();
+    if wsl != doctor::WslFact::Ready {
+        let finding = doctor::Finding::Wsl(wsl);
+        return Err(format!(
+            "{}. {} {}",
+            finding.title(),
+            finding.explanation(),
+            finding.command().unwrap_or_default()
+        )
+        .into());
+    }
+    Ok(readiness)
+}
+
+/// Whether the default WSL2 guest starts within 30 seconds.
+pub(crate) fn wsl_guest_starts() -> Result<bool> {
     let wsl = PathBuf::from(env::var_os("SystemRoot").ok_or("SystemRoot is unavailable")?)
         .join("System32/wsl.exe");
     let mut guest = Command::new(wsl)
@@ -204,16 +334,17 @@ pub(crate) fn preflight(operation: InstallerOperation) -> Result<()> {
     let started = std::time::Instant::now();
     loop {
         if let Some(status) = guest.try_wait()? {
-            if status.success() {
-                return Ok(());
+            if !status.success() {
+                log(&format!("WSL guest probe exited with {status}"));
             }
-            return Err(format!("The default WSL2 guest did not start successfully ({status}). Open `wsl` in Windows Terminal and finish its first-run setup or repair the guest, then Recheck.").into());
+            return Ok(status.success());
         }
         if started.elapsed() > std::time::Duration::from_secs(30) {
             // Only the prerequisite probe is terminated, never an MSI, daemon, or guest distribution.
             guest.kill()?;
             guest.wait()?;
-            return Err("The default WSL2 guest did not respond within 30 seconds. Open `wsl` in Windows Terminal, resolve its startup prompt/error, then Recheck.".into());
+            log("WSL guest probe did not finish within 30 seconds");
+            return Ok(false);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -234,11 +365,10 @@ fn task_snapshot_named(name: &str) -> Result<Option<String>> {
         "$ErrorActionPreference='Stop'; $t=Get-ScheduledTask -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{name}' -and $_.TaskPath -eq '\\' }}; if ($t) {{ Export-ScheduledTask -TaskName '{name}' -TaskPath '\\' }}"
     ))?;
     if !result.status.success() {
-        return Err(format!(
-            "Cannot back up daemon task: {}",
-            String::from_utf8_lossy(&result.stderr)
-        )
-        .into());
+        return Err(script_error(
+            "Task Scheduler didn't answer. Restart Windows, then try again.",
+            &result,
+        ));
     }
     let xml = String::from_utf8(result.stdout)?.trim().to_owned();
     Ok((!xml.is_empty()).then_some(xml))
@@ -250,22 +380,22 @@ pub(crate) fn legacy_task_snapshot(root: &Path) -> Result<Option<String>> {
     guard_task_named(root, "Compi Daemon", true)?;
     task_snapshot_named("Compi Daemon")
 }
+fn schtasks(args: &[String], what: &str) -> Result<()> {
+    machine::run_checked(Command::new("schtasks.exe").args(args), what)
+}
 pub(crate) fn remove_owned_legacy_task(root: &Path) -> Result<()> {
     if legacy_task_snapshot(root)?.is_none() {
         return Ok(());
     }
-    let output = Command::new("schtasks.exe")
-        .args(["/Delete", "/TN", "Compi Daemon", "/F"])
-        .creation_flags(0x08000000)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "Could not remove the inactive, owned legacy task: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(())
+    schtasks(
+        &[
+            "/Delete".into(),
+            "/TN".into(),
+            "Compi Daemon".into(),
+            "/F".into(),
+        ],
+        "remove the old background task",
+    )
 }
 pub(crate) fn restore_task(xml: Option<&str>, attempt: &Path) -> Result<()> {
     restore_task_named(xml, attempt, &task_name()?)
@@ -296,18 +426,11 @@ fn restore_task_named(xml: Option<&str>, attempt: &Path, name: &str) -> Result<(
     } else {
         vec!["/Delete".into(), "/TN".into(), name.into(), "/F".into()]
     };
-    let output = Command::new("schtasks.exe")
-        .args(args)
-        .creation_flags(0x08000000)
-        .output()?;
-    if !output.status.success() && (xml.is_some() || task_snapshot_named(name)?.is_some()) {
-        return Err(format!(
-            "Task rollback failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+    let result = schtasks(&args, "restore the background task");
+    if result.is_err() && xml.is_none() && task_snapshot_named(name)?.is_none() {
+        return Ok(());
     }
-    Ok(())
+    result
 }
 pub(crate) fn guard_task_ownership(root: &Path) -> Result<()> {
     guard_task_named(root, &task_name()?, false)?;
@@ -322,20 +445,19 @@ fn guard_task_named(root: &Path, name: &str, inactive: bool) -> Result<()> {
     let escaped = root.to_string_lossy().replace('\'', "''");
     let name = name.replace('\'', "''");
     let inactive_check = if inactive {
-        "if ($t.State -notin @('Ready','Disabled')) { throw 'The legacy task is running or queued. Deliberately run the old installed compi-daemon.exe --shutdown (ends default-instance shells), wait for its supervisor to exit, and close its windows before migration.' }"
+        "if ($t.State -notin @('Ready','Disabled')) { throw 'An older Compi is still running. Quit it from its window, then run Setup again.' }"
     } else {
         ""
     };
     let script = format!(
-        "$ErrorActionPreference='Stop'; $t=Get-ScheduledTask -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{name}' -and $_.TaskPath -eq '\\' }}; if ($t) {{ $id=[Security.Principal.WindowsIdentity]::GetCurrent(); $owner=$t.Principal.UserId; if ($owner -ne $id.User.Value -and $owner -ne $id.Name) {{ throw ('The task {name} belongs to another Windows account: '+$owner+'. Ask its owner to migrate/remove that legacy registration safely; it was not changed.') }}; $root=[IO.Path]::GetFullPath('{escaped}').TrimEnd('\\')+'\\'; foreach ($a in $t.Actions) {{ if (-not $a.Execute -or -not $a.Execute.Trim('\"').StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) {{ throw 'The daemon task belongs to another installation. Its registration was not changed.' }} }}; {inactive_check} }}"
+        "$ErrorActionPreference='Stop'; {TEST_MINE} $t=Get-ScheduledTask -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{name}' -and $_.TaskPath -eq '\\' }}; if ($t) {{ if (-not (Test-Mine $t.Principal.UserId)) {{ throw 'Compi''s background task belongs to another Windows account. Sign in as that account to change it.' }}; $root=[IO.Path]::GetFullPath('{escaped}').TrimEnd('\\')+'\\'; foreach ($a in $t.Actions) {{ if (-not $a.Execute -or -not $a.Execute.Trim('\"').StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) {{ throw 'Compi''s background task belongs to another copy of Compi. Remove that copy, then try again.' }} }}; {inactive_check} }}"
     );
     let output = powershell(&script)?;
     if !output.status.success() {
-        return Err(format!(
-            "Cannot safely change daemon task registration: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+        return Err(script_error(
+            "Task Scheduler didn't answer. Restart Windows, then try again.",
+            &output,
+        ));
     }
     Ok(())
 }
@@ -428,7 +550,8 @@ fn recover_initial_install(
 ) -> Result<()> {
     let selected = read_selection(root)?;
     if journal.initial_install == Some(false) || journal.legacy_task_xml.is_some() {
-        return Err("Interrupted legacy installation has no verified prior payload. Its recovery journal was retained; repair the prior Windows Installer product before retrying migration.".into());
+        log("Recovery: interrupted legacy migration has no verified prior payload; journal kept");
+        return Err("An earlier Setup was interrupted and can't be undone automatically. Remove Compi in Settings > Apps, then install again.".into());
     }
     if journal.initial_install != Some(true) {
         // A committed, runnable native registration can establish the new layout even for
@@ -440,15 +563,21 @@ fn recover_initial_install(
                 && journal.task_xml.is_none()
         });
         if !verified {
-            return Err("Interrupted installation predates the initial-install receipt and has no verified current native payload. Recovery cannot distinguish first-install rollback from a lost legacy install; its journal and user data were retained.".into());
+            log(
+                "Recovery: journal predates the initial-install receipt and no verified native payload exists; journal kept",
+            );
+            return Err("An earlier Setup was interrupted and can't be undone automatically. Remove Compi in Settings > Apps, then install again.".into());
         }
     }
-    if let Some(selection) = &selected {
-        if registered_version != Some(selection.version.as_str())
-            || !selected_payload_is_runnable(root, selection)
-        {
-            return Err("Interrupted installation has a selection that does not match a runnable registered MSI payload. Its selection and recovery journal were retained; Windows Installer must finish recovery before retrying.".into());
-        }
+    if let Some(selection) = &selected
+        && (registered_version != Some(selection.version.as_str())
+            || !selected_payload_is_runnable(root, selection))
+    {
+        log("Recovery: selection does not match a runnable registered MSI payload; journal kept");
+        return Err(
+            "An earlier Setup was interrupted. Restart Windows so it can finish, then try again."
+                .into(),
+        );
     }
     // Do not replay pre-install task XML or remove a selection: MSI may have committed
     // successfully before Setup died. The next transaction still performs real repair/install.
@@ -456,7 +585,8 @@ fn recover_initial_install(
     persist(journal_path, journal)
 }
 
-fn recover(root: &Path, installer: &Path) -> Result<()> {
+/// Caller owns the installation operation lock.
+pub(crate) fn recover(root: &Path, installer: &Path) -> Result<()> {
     let _msi = MsiRecoveryGuard::acquire()?;
     for entry in fs::read_dir(installer)? {
         let attempt = entry?.path();
@@ -467,17 +597,26 @@ fn recover(root: &Path, installer: &Path) -> Result<()> {
         let mut journal: Journal = serde_json::from_slice(&fs::read(&path)?)?;
         match journal.stage.as_str() {
             "applying" | "rolling-back" | "rollback-incomplete" => {
-                let registered_version = owned_installed_product_version(root)?;
+                let registered_version =
+                    owned_installed_product(root)?.map(|installed| installed.version);
                 guard_task_ownership(root)?;
                 if journal.previous_selection.is_none() && !root.join("compi-daemon.exe").is_file()
                 {
-                    recover_initial_install(root, &mut journal, &path, registered_version.as_deref())?;
+                    recover_initial_install(
+                        root,
+                        &mut journal,
+                        &path,
+                        registered_version.as_deref(),
+                    )?;
                     continue;
                 } else {
-                    if let Some(previous) = &journal.previous_selection {
-                        if !selected_payload_is_runnable(root, previous) {
-                            return Err("Interrupted upgrade's prior runnable payload is unavailable. Its selection, task, journal and user data were retained; no stale rollback was applied.".into());
-                        }
+                    if let Some(previous) = &journal.previous_selection
+                        && !selected_payload_is_runnable(root, previous)
+                    {
+                        log(
+                            "Recovery: prior payload of the interrupted upgrade is missing; journal kept",
+                        );
+                        return Err("An earlier update was interrupted and the previous version is missing. Remove Compi in Settings > Apps, then install again.".into());
                     }
                     restore_task(journal.task_xml.as_deref(), &attempt)?;
                     if let Some(xml) = journal.legacy_task_xml.as_deref() {
@@ -503,25 +642,46 @@ fn recover(root: &Path, installer: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Applies the operation. `approved` holds the daemon snapshots the user saw: any daemon
+/// the plan stops must be among them, and stops only if its shells are still as shown.
 pub(crate) fn perform(
     source: InstallerSource,
     operation: InstallerOperation,
     remove_data: bool,
+    approved: &[Daemon],
     cancel: Arc<AtomicBool>,
     sender: async_channel::Sender<Event>,
 ) -> Result<Outcome> {
-    if let InstallerSource::Package(bytes) = &source {
-        if !bytes.starts_with(b"\xd0\xcf\x11\xe0") {
-            return Err("embedded Windows Installer payload is invalid".into());
-        }
+    log(&format!(
+        "Compi Setup {}: {operation:?} started",
+        env!("CARGO_PKG_VERSION")
+    ));
+    if let InstallerSource::Package(bytes) = &source
+        && !bytes.starts_with(b"\xd0\xcf\x11\xe0")
+    {
+        log("Embedded Windows Installer package is not a compound file");
+        return Err("This Setup file is damaged. Download it again.".into());
     }
-    preflight(operation)?;
+    let readiness = preflight(operation)?;
     let root = root()?;
     let _lock = OperationLock::acquire(&root)?;
     let installer = data_root()?.join("installer");
     fs::create_dir_all(&installer)?;
     recover(&root, &installer)?;
     let previous_selection = read_selection(&root)?;
+    // Removing always targets the registered product: each Setup build carries its own
+    // product code, and Windows Installer refuses to remove a package it never installed.
+    let source = match source {
+        InstallerSource::Package(_) if operation == InstallerOperation::Remove => {
+            let installed = owned_installed_product(&root)?.ok_or("Compi isn't installed.")?;
+            log(&format!(
+                "Removing installed Compi {} through its registered product",
+                installed.version
+            ));
+            InstallerSource::ProductCode(installed.code)
+        }
+        source => source,
+    };
     let product_code = match &source {
         InstallerSource::ProductCode(code) => Some(code.clone()),
         _ => None,
@@ -549,7 +709,7 @@ pub(crate) fn perform(
         initial_install: Some(
             previous_selection.is_none()
                 && !root.join("compi-daemon.exe").is_file()
-                && owned_installed_product_version(&root)?.is_none(),
+                && owned_installed_product(&root)?.is_none(),
         ),
     };
     let package = match source {
@@ -572,12 +732,38 @@ pub(crate) fn perform(
         persist(&journal_path, &journal)?;
         return Err(MsiFailure {
             code: 1602,
-            message: "Cancelled before applying files. No product files were changed.".into(),
+            message: plain::installer_code(1602).into(),
         }
         .into());
     }
+    // Old daemons go before Windows Installer runs: it must not register a task generation
+    // that a still-running incompatible daemon would keep serving.
+    let stopped_default = readiness.plan.stop.contains(&None);
+    if readiness.plan.restarts_service() {
+        let _ = sender.send_blocking(Event::Progress {
+            stage: "Stopping Compi's background service".into(),
+            percent: None,
+            cancellable: false,
+        });
+        log(&format!(
+            "Stopping {} daemon instance(s) ending {} shell(s)",
+            readiness.plan.stop.len(),
+            readiness.plan.shells.len()
+        ));
+        if let Err(error) = machine::stop_instances(&readiness.plan.stop, approved) {
+            journal.stage = "cancelled-before-apply".into();
+            persist(&journal_path, &journal)?;
+            restart_service(stopped_default);
+            return Err(error);
+        }
+    }
     let _ = sender.send_blocking(Event::Progress {
-        stage: "Applying Windows Installer transaction".into(),
+        stage: match operation {
+            InstallerOperation::Install => "Installing",
+            InstallerOperation::Repair => "Reinstalling files",
+            InstallerOperation::Remove => "Removing",
+        }
+        .into(),
         percent: None,
         cancellable: true,
     });
@@ -598,6 +784,7 @@ pub(crate) fn perform(
         Err(error) => {
             journal.stage = "failed-before-apply".into();
             persist(&journal_path, &journal)?;
+            restart_service(stopped_default);
             return Err(error);
         }
     };
@@ -605,7 +792,7 @@ pub(crate) fn perform(
         journal.stage = "rolling-back".into();
         persist(&journal_path, &journal)?;
         let _ = sender.send_blocking(Event::Progress {
-            stage: "Waiting for rollback".into(),
+            stage: "Undoing changes".into(),
             percent: None,
             cancellable: false,
         });
@@ -617,10 +804,10 @@ pub(crate) fn perform(
             if let Err(error) = restore_task(journal.task_xml.as_deref(), &attempt) {
                 failures.push(error.to_string());
             }
-            if let Some(xml) = journal.legacy_task_xml.as_deref() {
-                if let Err(error) = restore_legacy_task(xml, &attempt, &root) {
-                    failures.push(error.to_string());
-                }
+            if let Some(xml) = journal.legacy_task_xml.as_deref()
+                && let Err(error) = restore_legacy_task(xml, &attempt, &root)
+            {
+                failures.push(error.to_string());
             }
             if let Err(error) = compi_update::restore_selection(&root, previous_selection.as_ref())
             {
@@ -634,56 +821,86 @@ pub(crate) fn perform(
         }
         .into();
         persist(&journal_path, &journal)?;
-        let reason = if code == 1602 {
-            "Cancelled. Windows Installer completed rollback".to_owned()
-        } else {
-            format!("Windows Installer failed with code {code}")
-        };
+        restart_service(stopped_default);
+        log(&format!(
+            "Windows Installer returned {code}. Rollback problems: {}. Recovery journal: {}",
+            if failures.is_empty() {
+                "none".to_owned()
+            } else {
+                failures.join("; ")
+            },
+            journal_path.display()
+        ));
         return Err(MsiFailure {
             code,
-            message: format!(
-                "{reason}. {}\nLog: {}\nRecovery journal: {}",
-                failures.join("; "),
-                log_path()?.display(),
-                journal_path.display()
-            ),
+            message: if failures.is_empty() {
+                plain::installer_code(code).into()
+            } else {
+                "Windows Installer couldn't finish, and Setup couldn't undo every change. Run Setup again to finish undoing it.".into()
+            },
         }
         .into());
     }
-    if let Some(staged) = &journal.package {
-        if operation != InstallerOperation::Remove {
-            let next = installer.join(format!("Compi.{id}.next.msi"));
-            fs::copy(staged, &next)?;
-            atomic_replace(&next, &cache)?;
-        }
+    if let Some(staged) = &journal.package
+        && operation != InstallerOperation::Remove
+    {
+        let next = installer.join(format!("Compi.{id}.next.msi"));
+        fs::copy(staged, &next)?;
+        atomic_replace(&next, &cache)?;
     }
     journal.stage = "complete".into();
     persist(&journal_path, &journal)?;
+    if operation != InstallerOperation::Remove {
+        // The stopped service comes back on the version Windows Installer just registered.
+        restart_service(stopped_default);
+    }
     let version = if operation == InstallerOperation::Remove {
         None
     } else {
-        Some(match product_code {
+        match product_code {
             Some(code) => installed_product_version(&code)
-                .unwrap_or_else(|error| format!("unavailable ({error})")),
-            None => env!("CARGO_PKG_VERSION").to_owned(),
-        })
+                .inspect_err(|error| log(&format!("Installed version unavailable: {error}")))
+                .ok(),
+            None => Some(env!("CARGO_PKG_VERSION").to_owned()),
+        }
     };
     let mut outcome = Outcome {
         restart_required: code != 0,
         cleanup: None,
         version,
     };
+    if operation == InstallerOperation::Remove {
+        // Update journals, staging and worker copies under the program folder belong
+        // to the removed product, not to the user's settings. Release the operation
+        // lock (it lives in that folder) before deleting it.
+        drop(_lock);
+        if let Err(error) = clean_managed_data(&root.join(".compi-update")) {
+            log(&format!(
+                "Could not remove {}: {error}",
+                root.join(".compi-update").display()
+            ));
+        }
+        let _ = fs::remove_dir(&root);
+    }
     if operation == InstallerOperation::Remove && remove_data {
         // The managed directory is exact. Never traverse directory junctions/symlinks.
         outcome.cleanup = Some((|| {
             let active = powershell("$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('compi.exe','compi-daemon.exe') } | ForEach-Object { Write-Output ($_.Name+' PID '+$_.ProcessId) }")?;
             if !active.status.success() || !active.stdout.is_empty() {
-                return Err(Error::from("Product removed, but managed-data cleanup was deferred because another Compi installation/instance may still use this profile. Stop it deliberately before manually removing the displayed managed path."));
+                log(&format!("Data cleanup deferred; running: {}", String::from_utf8_lossy(&active.stdout)));
+                return Err(Error::from("Another copy of Compi is running, so your settings were kept. Delete them later from the folder below."));
             }
             clean_profile_data(&data_root()?)
-        })().map_err(|error: Error| error.to_string()));
+        })().map_err(|error: Error| plain::short(&error.to_string())));
     }
     Ok(outcome)
+}
+
+/// Starts the default daemon's task again after Setup stopped it.
+fn restart_service(stopped_default: bool) {
+    if stopped_default && let Err(error) = machine::run_task() {
+        log(&format!("Background service did not start: {error}"));
+    }
 }
 
 fn check_owned_tree(path: &Path) -> Result<()> {
@@ -882,11 +1099,11 @@ unsafe extern "system" fn msi_callback(context: *const c_void, message: u32, rec
     if matches!(kind, 0x0a000000 | 0x0b000000 | 0x08000000) {
         let _ = context.sender.try_send(Event::Progress {
             stage: if context.backward {
-                "Rolling back"
+                "Undoing changes"
             } else if !context.cancellable {
-                "Committing, cancellation unavailable"
+                "Finishing"
             } else {
-                "Applying application files and registration"
+                "Copying files"
             }
             .into(),
             percent: (context.total != 0).then(|| {
@@ -923,10 +1140,13 @@ fn installed_product_property(product: &str, property: &str) -> Result<String> {
         )
     };
     if !matches!(code, 0 | 234) || count > 32768 {
-        return Err(format!(
-            "Windows Installer could not report product registration (code {code})"
-        )
-        .into());
+        log(&format!(
+            "MsiGetProductInfo({property:?}) size query returned {code}"
+        ));
+        return Err(
+            "Windows Installer didn't report Compi's version. Restart Windows, then try again."
+                .into(),
+        );
     }
     let mut value = vec![0u16; count as usize + 1];
     count += 1;
@@ -939,44 +1159,66 @@ fn installed_product_property(product: &str, property: &str) -> Result<String> {
         )
     };
     if code != 0 {
-        return Err(format!("Windows Installer registration query failed (code {code})").into());
+        log(&format!("MsiGetProductInfo returned {code}"));
+        return Err(
+            "Windows Installer didn't report Compi's version. Restart Windows, then try again."
+                .into(),
+        );
     }
     Ok(String::from_utf16(&value[..count as usize])?)
 }
 
-fn owned_installed_product_version(root: &Path) -> Result<Option<String>> {
-    let upgrade = wide(std::ffi::OsStr::new("{26B5FE7A-FDC6-4083-BEBD-947B3872311E}"));
+struct InstalledProduct {
+    code: String,
+    version: String,
+}
+
+fn owned_installed_product(root: &Path) -> Result<Option<InstalledProduct>> {
+    let upgrade = wide(std::ffi::OsStr::new(
+        "{26B5FE7A-FDC6-4083-BEBD-947B3872311E}",
+    ));
     let mut product = [0u16; 39];
     let code = unsafe { MsiEnumRelatedProductsW(upgrade.as_ptr(), 0, 0, product.as_mut_ptr()) };
     if code == 259 {
         return Ok(None);
     }
     if code != 0 {
-        return Err(format!("Cannot inventory native Compi MSI registration (code {code})").into());
+        log(&format!("MsiEnumRelatedProducts returned {code}"));
+        return Err("Windows Installer didn't list Compi. Restart Windows, then try again.".into());
     }
     if unsafe { MsiQueryProductStateW(product.as_ptr()) } != 5 {
-        return Err("Compi MSI registration is not fully installed for this Windows account. Let Windows Installer finish recovery before retrying.".into());
+        return Err("Windows Installer is still finishing an earlier Compi change. Restart Windows, then try again.".into());
     }
-    let end = product.iter().position(|value| *value == 0).ok_or("Invalid MSI product code")?;
+    let end = product
+        .iter()
+        .position(|value| *value == 0)
+        .ok_or("Invalid MSI product code")?;
     let product_code = String::from_utf16(&product[..end])?;
     if installed_product_property(&product_code, "AssignmentType")? != "0" {
-        return Err("Compi MSI registration belongs to a machine-wide installation, not this user's managed installation. It was not changed.".into());
+        return Err("Compi is installed for all users on this PC. Remove that copy from Settings > Apps first.".into());
     }
     let mut other = [0u16; 39];
     let code = unsafe { MsiEnumRelatedProductsW(upgrade.as_ptr(), 0, 1, other.as_mut_ptr()) };
     if code != 259 {
-        return Err("Compi MSI registration is ambiguous or still recovering an upgrade. No recovery state was changed.".into());
+        return Err("Windows lists more than one Compi. Restart Windows, then try again.".into());
     }
     // This MSI publishes its location/maintenance ownership in its per-user ARP entry,
     // rather than setting ARPINSTALLLOCATION on Windows Installer's hidden entry.
     let escaped = root.to_string_lossy().replace('\'', "''");
     let output = powershell(&format!(
-        "$ErrorActionPreference='Stop'; $r=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Compi'; $root=[IO.Path]::GetFullPath('{escaped}').TrimEnd('\\'); if (-not $r.InstallLocation -or [IO.Path]::GetFullPath($r.InstallLocation).TrimEnd('\\') -ne $root) {{ throw 'Native Compi registration belongs to another installation' }}; $expected='\"'+$root+'\\Compi-Setup.exe\" --repair \"{product_code}\"'; if ($r.ModifyPath -ne $expected) {{ throw 'Native Compi maintenance ownership does not match its MSI product code' }}"
+        "$ErrorActionPreference='Stop'; $r=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Compi'; $root=[IO.Path]::GetFullPath('{escaped}').TrimEnd('\\'); if (-not $r.InstallLocation -or [IO.Path]::GetFullPath($r.InstallLocation).TrimEnd('\\') -ne $root) {{ throw 'Windows registers Compi in another folder. Remove that copy from Settings > Apps first.' }}; $expected='\"'+$root+'\\Compi-Setup.exe\" --repair \"{product_code}\"'; if ($r.ModifyPath -ne $expected) {{ throw 'Compi''s Windows registration is damaged. Remove Compi from Settings > Apps, then install again.' }}"
     ))?;
     if !output.status.success() {
-        return Err(format!("Cannot verify native Compi installation ownership: {}", String::from_utf8_lossy(&output.stderr)).into());
+        return Err(script_error(
+            "Compi's Windows registration could not be read",
+            &output,
+        ));
     }
-    Ok(Some(installed_product_version(&product_code)?))
+    let version = installed_product_version(&product_code)?;
+    Ok(Some(InstalledProduct {
+        code: product_code,
+        version,
+    }))
 }
 fn run_msi(
     package: &Path,
@@ -986,11 +1228,18 @@ fn run_msi(
     sender: &async_channel::Sender<Event>,
 ) -> Result<u32> {
     fs::create_dir_all(data_root()?)?;
-    let log = wide(log_path()?.as_os_str());
+    let log_file = wide(msi_log_path()?.as_os_str());
     let package = wide(package.as_os_str());
+    // A newer Setup "repairs" an older install by upgrading it: REINSTALL applies only to
+    // the product version already installed.
+    let reinstall = operation == InstallerOperation::Repair
+        && (!is_package
+            || owned_installed_product(&root()?)?
+                .is_some_and(|installed| installed.version == env!("CARGO_PKG_VERSION")));
     let operation_properties = match operation {
         InstallerOperation::Install => "",
-        InstallerOperation::Repair => "REINSTALL=ALL REINSTALLMODE=amus",
+        InstallerOperation::Repair if reinstall => "REINSTALL=ALL REINSTALLMODE=amus",
+        InstallerOperation::Repair => "",
         InstallerOperation::Remove => "REMOVE=ALL",
     };
     let properties = format!(
@@ -1009,9 +1258,14 @@ fn run_msi(
     };
     unsafe {
         MsiSetInternalUI(2, std::ptr::null_mut()); // INSTALLUILEVEL_NONE
-        let log_code = MsiEnableLogW(0x3fff, log.as_ptr(), 2);
+        // Everything but the verbose/debug channels (which dump every product on the PC);
+        // 2 = flush each line, no append flag so each run replaces the previous record.
+        let log_code = MsiEnableLogW(0x0fff, log_file.as_ptr(), 2);
         if log_code != 0 {
-            return Err(format!("Cannot open MSI log (code {log_code})").into());
+            return Err(
+                "Windows Installer couldn't write its log. Check free space, then try again."
+                    .into(),
+            );
         }
         let registered = MsiSetExternalUIRecord(
             Some(msi_callback),
@@ -1020,10 +1274,8 @@ fn run_msi(
             std::ptr::null_mut(),
         );
         if registered != 0 {
-            return Err(format!(
-                "Cannot register Windows Installer progress/cancellation (code {registered})"
-            )
-            .into());
+            log(&format!("MsiSetExternalUIRecord returned {registered}"));
+            return Err("Windows Installer didn't start. Restart Windows, then try again.".into());
         }
         let code = if is_package {
             MsiInstallProductW(package.as_ptr(), properties.as_ptr())
@@ -1054,7 +1306,10 @@ mod tests {
             let root = env::temp_dir().join(format!(
                 "compi-initial-recovery-{}-{}",
                 std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             fs::create_dir_all(&root).unwrap();
             Self(root)

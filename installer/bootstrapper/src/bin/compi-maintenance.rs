@@ -10,10 +10,10 @@ fn main() {
         .is_some_and(|mode| mode.starts_with("--msi-"))
     {
         let code = compi_setup::installer::run_msi_action(&arguments);
-        if arguments.first().map(String::as_str) == Some("--msi-lock-worker") {
-            if let Ok(path) = std::env::current_exe() {
-                schedule_self_delete(&path);
-            }
+        if arguments.first().map(String::as_str) == Some("--msi-lock-worker")
+            && let Ok(path) = std::env::current_exe()
+        {
+            schedule_self_delete(&path);
         }
         std::process::exit(code);
     }
@@ -57,10 +57,10 @@ fn main() {
             remove_data,
             cancel_after,
         );
-        if mode == Some("--remove-worker") {
-            if let Ok(path) = std::env::current_exe() {
-                schedule_self_delete(&path);
-            }
+        if mode == Some("--remove-worker")
+            && let Ok(path) = std::env::current_exe()
+        {
+            schedule_self_delete(&path);
         }
         std::process::exit(code);
     }
