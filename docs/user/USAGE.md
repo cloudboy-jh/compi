@@ -34,4 +34,4 @@ compi --connect dev@example.com:2222
 
 The headless diagnostic client accepts the same `--connect` and optional `--instance` options. For example, `compi-probe --connect dev@example.com workspace` prints the remote hierarchy and lifecycle state, while its session, tab, pane, surface, soak, and shutdown commands operate through the same protocol. `compi-probe tab arrange <tab-id> <preset> [--with <tab-id>]... [--main <pane-id>] [--mirror] [--flip]`, `tab mirror|flip|restore-arrangement|split-merged <tab-id>`, and `pane swap <pane-id> <pane-id>` rearrange existing panes in place; each `--with` merges another tab of the same workspace into `<tab-id>`. Presets are the built-in IDs (`columns`, `rows`, `grid`, `main-side`, `main-top`, `equalize`) or a `[layout_presets]` name from the local configuration. The remote host must provide `compi-daemon` on `PATH`.
 
-[Back to README](../README.md)
+[Back to README](../../README.md)

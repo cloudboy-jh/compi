@@ -342,7 +342,7 @@ mod tests {
         workspace.write("crates/compi-client/src/gui.rs", "fn a() {}");
         workspace.write("target/debug/compi.exe", "binary");
         workspace.write("crates/compi-client/target/debug/x", "binary");
-        workspace.write("docs/Spec.md", "doc");
+        workspace.write("docs/dev/Spec.md", "doc");
 
         assert!(tree.refresh().paths.is_empty());
         assert_eq!(tree.fingerprints(), before);

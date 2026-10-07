@@ -119,7 +119,7 @@ mod tests {
             "crates/compi-client/src/4913",
             "crates/compi-client/README.md",
             "assets/compi-readme.png",
-            "docs/Spec.md",
+            "docs/dev/Spec.md",
             "tools/build-installer.ps1",
         ] {
             assert!(classify(path).is_empty(), "{path}");

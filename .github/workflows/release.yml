@@ -24,8 +24,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          heading=$(head -n 1 docs/release-notes.md | tr -d '\r')
-          test "$heading" = "# ${RELEASE_TAG#v}" || { echo "docs/release-notes.md must start with '# ${RELEASE_TAG#v}', found '$heading'"; exit 1; }
+          heading=$(head -n 1 docs/user/release-notes.md | tr -d '\r')
+          test "$heading" = "# ${RELEASE_TAG#v}" || { echo "docs/user/release-notes.md must start with '# ${RELEASE_TAG#v}', found '$heading'"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -230,7 +230,7 @@ jobs:
           cargo build --locked --release -p compi-update --bin compi-release-metadata
           # releases/latest/download/Compi-Setup.exe must be the very Setup this release signs.
           cmp distribution/Compi-Setup.exe "distribution/Compi-${RELEASE_TAG#v}-Setup.exe"
-          python3 tools/sign-release-metadata.py --distribution distribution --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --signer target/release/compi-release-metadata --notes docs/release-notes.md
+          python3 tools/sign-release-metadata.py --distribution distribution --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --signer target/release/compi-release-metadata --notes docs/user/release-notes.md
           cd distribution
           test -f compi-setup-windows-x86_64.json || { echo 'Missing signed Setup metadata'; exit 1; }
           sha256sum compi-update-*.json compi-setup-*.json >> SHA256SUMS.txt
@@ -238,6 +238,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          body_path: docs/release-notes.md
+          body_path: docs/user/release-notes.md
           fail_on_unmatched_files: true
           files: distribution/*

@@ -1,4 +1,6 @@
-# Distribution
+# Packaging and distribution
+
+For installation, repair, updates, and data retention, see the [user guide](../user/INSTALLATION.md).
 
 The **Release** workflow builds Windows x64 and Apple Silicon macOS 14+ artifacts:
 
@@ -20,17 +22,11 @@ Official tag builds require the updater verification key and signed release meta
 
 Build locally with `pwsh -File tools/build-installer.ps1` on Windows or `bash tools/build-macos.sh` on an ARM64 Mac. Both accept an expected version tag (`-ExpectedTag` / `--expected-tag`). Official update-key enforcement uses `-RequireUpdateKey` / `--require-update-key`. For deliberately publisher-signed builds, also use `-RequireSigning` or `--require-signing` with `COMPI_MACOS_SIGNING_IDENTITY` and a `COMPI_MACOS_NOTARY_PROFILE` configured through `notarytool`.
 
-### Updates and data retention
-
-Open **Settings → Updates** or run **Check for Updates** from the command palette. **Check for updates** is one switch, on by default; **Download updates automatically** is off by default, so nothing downloads until you click **Download**. Nothing installs, closes windows or restarts a daemon without a click. The page shows one status line and one button for the next step, sizes in MB, the notes for the available and running versions, and a dot on the sidebar button when an update is ready. After an update, the new version's notes appear once as a **What's new** card in the sidebar; fresh installs skip the card. **Advanced** holds **Repair Compi** and **Open update log** (`.compi-update/update.log` in the install folder).
-
-**Repair:** `Compi-Setup.exe --repair` lists problems with the install (program files, unfinished updates, the background task and daemon, WSL) and fixes them one at a time or all together. It logs to `%LOCALAPPDATA%\Compi\doctor.log`. Setup's other runs log to `installer.log` there, and Windows Installer's record of the latest run goes to `installer-msi.log`. Remove always removes the registered install, whichever Setup build runs it.
+### Update activation
 
 Compatible activation relaunches clients into their exact saved views while retaining the existing daemon and shell lifetimes. A required local daemon restart needs explicit current-work consent and ends its shells; remote daemons are never restarted by the local updater. If the new build then fails to attach, rollback stops the replacement daemon it started only while that daemon is idle; otherwise rollback waits and reports which shells to close. Legacy 0.1.2 migration requires a deliberate old-install stop because its MSI removal hook cannot preserve live work.
 
 Windows uses `versions/<version>` plus `selection.json`; keep old payloads while their daemon/supervisor still runs. macOS updates replace the complete writable app bundle, not an app on a mounted DMG. Failed activation retains a prior version and recovery journal; success requires a real new-build attachment receipt.
-
-Upgrade, repair, rollback, and default uninstall preserve workspaces, settings, and custom themes. Maintenance offers a separate unchecked managed-data removal choice. External projects/configuration/theme sources and WSL distributions are not removed.
 
 ### Release trust configuration
 
@@ -40,4 +36,4 @@ Optional Windows CI secrets: `WINDOWS_SIGNING_CERTIFICATE_BASE64`, `WINDOWS_SIGN
 
 Current implementation evidence and outstanding native/MSI/production-trust gates are recorded in [Completed work](COMPLETED.md). Local test signatures do not establish production OS trust.
 
-[Back to README](../README.md)
+[Back to README](../../README.md)

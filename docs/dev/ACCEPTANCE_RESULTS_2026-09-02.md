@@ -145,7 +145,7 @@ The per-user installer was built and exercised under a non-elevated Windows toke
 - Rebuilt the titlebar, adaptive tabs, vector icons, session palette, and native drag targets.
 - Added `compi.exe --instance <name>` for safe isolated GUI acceptance runs.
 - Added opt-in process-separated resource logging, empty-window sampling, cold/warm connection labels, a rendered ready-for-input probe, GPU-memory collection, and the repeatable release measurement harness.
-- Replaced `docs/testcmds.md` with the tiered canonical acceptance matrix.
+- Replaced `docs/dev/testcmds.md` with the tiered canonical acceptance matrix.
 - Added atomic `%LOCALAPPDATA%\Compi\sessions-v1.json` metadata, malformed-manifest quarantine, bounded dead-record retention, and startup conversion of unrecoverable active records to `dead`.
 - Added explicit dead-session reporting in the probe and GUI switcher; dead rows retain the daemon-loss reason and reject attachment.
 - Added integration coverage for unexpected and intentional daemon restart, malformed metadata, controlling-client races, and bounded daemon handles across repeated kill cycles.

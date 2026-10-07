@@ -30,6 +30,6 @@ terminal_opacity = 0.7 # remembered background opacity, not text opacity
 family = "JetBrains Mono"
 ```
 
-Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono. Custom installed families remain supported through `font.family`. Bundled font notices and SIL Open Font License 1.1 text are in [`crates/compi-client/fonts/ATTRIBUTION.txt`](../crates/compi-client/fonts/ATTRIBUTION.txt).
+Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono. Custom installed families remain supported through `font.family`. Bundled font notices and SIL Open Font License 1.1 text are in [`crates/compi-client/fonts/ATTRIBUTION.txt`](../../crates/compi-client/fonts/ATTRIBUTION.txt).
 
-[Back to README](../README.md)
+[Back to README](../../README.md)

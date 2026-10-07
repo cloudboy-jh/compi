@@ -133,7 +133,7 @@ macOS-specific: advertised minimum and current supported OS, DMG and ZIP, actual
 
 Use existing behavioral regression suites for compatibility, lifecycle, persistence, and attachment. Add permanent tests only for real edge cases introduced here: retry terminal events, trust rejection, consent races, journal recovery, and one-time attach-only restoration. Tests and cross-compilation do not replace packaged native execution or visual proof.
 
-After integration and smoke proof, update `README.md`, scoped sections of `docs/testcmds.md`, and `docs/COMPLETED.md` with exact versions/artifact hashes, host details, observed outcomes, and any unavailable platform/signing gate. Do not mark the vault checkboxes complete until their native acceptance evidence exists.
+After integration and smoke proof, update `README.md`, scoped sections of `docs/dev/testcmds.md`, and `docs/dev/COMPLETED.md` with exact versions/artifact hashes, host details, observed outcomes, and any unavailable platform/signing gate. Do not mark the vault checkboxes complete until their native acceptance evidence exists.
 
 ## Coverage of the requested checklist
 

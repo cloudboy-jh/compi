@@ -14,7 +14,7 @@ Build → commit → choose a useful batch → package and check → publish →
 ## Release checklist
 
 1. **Choose the cutoff.** Select the exact commit and included changes. Everything in that snapshot ships; no routine cherry-picking or release branch is required.
-2. **Write the notes.** Rewrite [`docs/release-notes.md`](release-notes.md): first line `# <version>`, then 3–5 one-line summary bullets, then `##` sections with short user-facing changes, fixes, platform limitations, and whether updating requires ending running shells. Do not paste a commit log or claim unfinished features.
+2. **Write the notes.** Rewrite [`docs/user/release-notes.md`](../user/release-notes.md): first line `# <version>`, then 3–5 one-line summary bullets, then `##` sections with short user-facing changes, fixes, platform limitations, and whether updating requires ending running shells. Do not paste a commit log or claim unfinished features.
 3. **Set the version.** Update the root workspace version and lockfile consistently. Check any packaging/version references required by the existing scripts.
 4. **Check the source.** Run the existing relevant formatting, lint, tests, and CI. Keep verification bounded to the changed behavior and existing release requirements; no new blanket qualification matrix.
 5. **Commit and tag.** With explicit authorization, commit release preparation and tag that exact commit as `v<workspace-version>`. Push the tag to trigger the Release workflow. Never move an already published tag to different source.
@@ -31,7 +31,7 @@ At inspected upstream `5aff8fa51a2f70be9cd2c1896f80b451aa4dac74`:
 
 - A `v*` tag triggers the Release workflow. Build scripts check the expected tag against the workspace version.
 - Windows and macOS packages are built and smoke-checked; the publish job depends on both jobs.
-- Checksums are combined/verified and native release metadata is signed with `docs/release-notes.md` as its notes. The Windows job fails first if that file's heading does not match the tag.
+- Checksums are combined/verified and native release metadata is signed with `docs/user/release-notes.md` as its notes. The Windows job fails first if that file's heading does not match the tag.
 - The Windows job also publishes the Setup as stable-named `Compi-Setup.exe` (in `SHA256SUMS.txt`) with its own signed `compi-setup-<platform>.json`. In-app **Repair Compi** downloads it from the latest release, so check both are on the draft.
 - The workflow creates a draft GitHub release for deliberate publication.
 - Manual workflow dispatch produces build artifacts, not a public release.
@@ -51,7 +51,7 @@ Publisher signing/notarization and signed updater metadata are separate concerns
 
 ## Release notes
 
-`docs/release-notes.md` is the one source. The client embeds it at build time and shows it only when its heading matches the client version: once as the **What's new** card in the sidebar after an update (an accent dot on the sidebar button until the sidebar is opened; the card until its × is clicked), and always under **What's new in <version>** in **Settings → Updates**. The workflow signs it into the update metadata, which the update dialog shows before installing, and uses it as the draft GitHub release body. Editing only the GitHub description afterward changes neither the app nor the updater, so write final notes before tagging.
+`docs/user/release-notes.md` is the one source. The client embeds it at build time and shows it only when its heading matches the client version: once as the **What's new** card in the sidebar after an update (an accent dot on the sidebar button until the sidebar is opened; the card until its × is clicked), and always under **What's new in <version>** in **Settings → Updates**. The workflow signs it into the update metadata, which the update dialog shows before installing, and uses it as the draft GitHub release body. Editing only the GitHub description afterward changes neither the app nor the updater, so write final notes before tagging.
 
 ## Latest release: v0.1.6
 
@@ -63,7 +63,7 @@ Fix release for the update blocker found right after v0.1.4: on Windows, closing
 
 ## Older release: v0.1.4
 
-Published 2026-10-06 as the stable latest release from tag `v0.1.4` (`6f3a386`); notes from `docs/release-notes.md`.
+Published 2026-10-06 as the stable latest release from tag `v0.1.4` (`6f3a386`); notes from `docs/user/release-notes.md`.
 
 - Floating terminals.
 - Layout presets, arrangement preview/apply, mirror/flip, swap, and restore.
@@ -76,10 +76,10 @@ Protocol 16 (v0.1.3 shipped 14), so updating from 0.1.3 restarts the daemon and 
 
 - Repository: https://github.com/cloudboy-jh/compi
 - Release workflow: `.github/workflows/release.yml`, especially tag triggers and lines 194–234 in the inspected revision.
-- Distribution guide: `docs/DISTRIBUTION.md`.
+- Distribution guide: `docs/dev/DISTRIBUTION.md`.
 - Stable discovery: `crates/compi-update/src/lib.rs:368–382`.
 - Displayed signed notes: `crates/compi-client/src/updates.rs:803–806`.
-- Native/source evidence: `docs/COMPLETED.md` and `docs/NEXT_STEPS.md`.
+- Native/source evidence: `docs/dev/COMPLETED.md` and `docs/dev/NEXT_STEPS.md`.
 - [[feat and bugs]] · [[dev tricks]] · [[Test Cmds]]
 
 This note records the agreed release approach and inspected implementation. It does not create a tag, publish a release, or claim a new native update test.

@@ -10,7 +10,7 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::sync::LazyLock;
 
-const SOURCE: &str = include_str!("../../../docs/release-notes.md");
+const SOURCE: &str = include_str!("../../../docs/user/release-notes.md");
 const STATE_FILE: &str = "release-notes.json";
 const MAX_STATE_BYTES: u64 = 4096;
 
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn shipped_notes_parse_for_this_version() {
         let notes = parse(SOURCE, env!("CARGO_PKG_VERSION"))
-            .expect("docs/release-notes.md must start with `# <workspace version>` and use only headings and bullets");
+            .expect("docs/user/release-notes.md must start with `# <workspace version>` and use only headings and bullets");
         assert!(!notes.summary.is_empty());
     }
 

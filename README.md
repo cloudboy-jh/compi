@@ -40,7 +40,7 @@ Then start the isolated development preview:
 cargo dev
 ```
 
-Client edits rebuild and relaunch the preview while its shells keep running. Explicit daemon restarts end dev shells. See the [development guide](docs/DEVELOPMENT.md) for controls and cleanup scope.
+Client edits rebuild and relaunch the preview while its shells keep running. Explicit daemon restarts end dev shells. See the [development guide](docs/dev/DEVELOPMENT.md) for controls and cleanup scope.
 
 Run tests:
 
@@ -50,13 +50,23 @@ cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -p compi-d
 
 ## Documentation
 
-- [Usage and SSH](docs/USAGE.md)
-- [Appearance and configuration](docs/CONFIGURATION.md)
-- [Development](docs/DEVELOPMENT.md)
-- [Distribution and updates](docs/DISTRIBUTION.md)
-- [Architecture and specification](docs/Spec.md)
-- [Next steps](docs/NEXT_STEPS.md) and [verification history](docs/COMPLETED.md)
-- [Terminal test recipes](docs/testcmds.md)
+### User guides
+
+- [Installation, updates, and repair](docs/user/INSTALLATION.md)
+- [Usage and SSH](docs/user/USAGE.md)
+- [Appearance and configuration](docs/user/CONFIGURATION.md)
+- [Release notes](docs/user/release-notes.md)
+
+### Developer notes
+
+- [Development](docs/dev/DEVELOPMENT.md)
+- [Packaging and distribution](docs/dev/DISTRIBUTION.md)
+- [Release flow](docs/dev/RELEASE-FLOW.md)
+- [Architecture and specification](docs/dev/Spec.md)
+- [Next steps](docs/dev/NEXT_STEPS.md) and [verification history](docs/dev/COMPLETED.md)
+- [Terminal test recipes](docs/dev/testcmds.md)
+- [Installer and updates plan](docs/dev/INSTALLER_UPDATES_PLAN.md)
+- [Historical acceptance results](docs/dev/ACCEPTANCE_RESULTS_2026-09-02.md)
 
 ## License
 

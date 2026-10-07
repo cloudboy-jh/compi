@@ -32,4 +32,4 @@ On Windows, prepare ConPTY first (above). The dev daemon is started outside Carg
 
 The project allows one dev instance per checkout (see `AGENTS.md`). On start and on `--stop`, `cargo dev` stops every other Compi daemon or preview running from this checkout's target directory, such as hand-launched `--instance` previews, and prints what it stopped. Their shells end. The installed Compi and anything outside the target directory are never touched.
 
-[Back to README](../README.md)
+[Back to README](../../README.md)
