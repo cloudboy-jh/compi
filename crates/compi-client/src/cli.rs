@@ -4,6 +4,7 @@ mod capture;
 mod changes;
 mod help;
 mod targets;
+#[cfg(any(windows, target_os = "macos"))]
 mod update;
 
 use crate::{DaemonClient, Result, arrangement, config, connection::ConnectionTarget};
@@ -407,7 +408,14 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         ));
     }
     if command == "update" {
+        #[cfg(any(windows, target_os = "macos"))]
         return update::run(options);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return Err(CliError::new(
+            1,
+            "updates_unavailable",
+            "compi update installs into the Windows and macOS app; update this server through its package or build",
+        ));
     }
     if command == "changes" {
         return Ok(changes::run());
