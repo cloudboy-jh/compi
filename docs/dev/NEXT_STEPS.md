@@ -14,7 +14,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 ### Appearance and theme follow-through
 
 - Treat Compi Neutral, simplified Theme/Advanced terminal colors, independent transparency/blur controls, and the standard Zed JSON catalog cutover as completed. Preserve Current-first ordering, favorites, scoped preview/apply/cancel, protected variant removal, and program-supplied terminal colors; change them only for demonstrated defects.
-- Wire `compi theme install <file.json>` in the separate CLI session to the existing headless `ThemeLibrary::import_file` installation path. UI import, CLI installation, and direct-directory discovery must use the same validator, stable identities, and application library. WSL installation must target the Windows application's library, not a separate Linux daemon directory; installing must not apply, publish, or restart shells.
+- Public `compi theme install FILE.json` is implemented through the existing headless validator/library, including cwd-correct WSL installation into the Windows application library. It does not apply, publish, or restart shells.
 - Exercise an unmodified downloaded Zed family through the finished Bash/WSL command, observe all variants in the native catalog, apply explicitly, and export. Exported JSON already passes the published schema; load it in a real Zed application to qualify interoperability beyond schema validation.
 - Qualify Clear/Blurred and solid fallback on native macOS and with reduced-transparency settings. Compare Compi Neutral side by side with the Tern reference on light, dark, and busy desktops; low opacity cannot guarantee arbitrary-wallpaper contrast.
 - Repeat catalog, settings, alternate-font, and tab-menu interactions across real display scales and mixed-DPI transitions. Cover keyboard/pointer selection, tooltip suppression, disabled lone-pane Detach, confirmed End, and workspace-revision invalidation without replacing shell processes.
@@ -30,7 +30,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 
 ### Remaining protocol and persistence contracts
 
-- Protocol 16 rejects mismatched versions but does not negotiate capabilities or server identity/generation in `Hello`. Implement the explicit handshake required by [the wire contract](Spec.md#wire-contract) before treating that acceptance gate as complete.
+- Protocol 18 rejects mismatched versions but does not negotiate capabilities or server identity/generation in `Hello`. Implement the explicit handshake required by [the wire contract](Spec.md#wire-contract) before treating that acceptance gate as complete.
 - Snapshots and deltas carry bounded scrollback, but there is no on-demand history paging or history epoch for reconnect and selection anchors. Implement and verify the stronger [replication contract](Spec.md#replication), including eviction/reflow behavior; current identity/sequence/geometry/content checks are not equivalent.
 - Exercise durable workspace mutations and lifecycle recovery with fault injection at commit boundaries across supported hosts. Existing actor, receipt, migration, and quarantine coverage is not exhaustive.
 

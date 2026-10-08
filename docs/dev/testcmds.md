@@ -106,7 +106,7 @@ Keep the runtime beside the daemon. Launch under a separate instance to avoid th
 
 ## Phase 4 native workspace checks
 
-Use matching protocol 16 client/daemon binaries and an isolated instance. Set `GPUI_FXC_PATH` as described in Tier 1 before building the Windows client. Do not stop an older daemon that owns valuable work merely to try the new client.
+Use matching protocol 18 client/daemon binaries and an isolated instance. Set `GPUI_FXC_PATH` as described in Tier 1 before building the Windows client. Do not stop an older daemon that owns valuable work merely to try the new client.
 
 ```powershell
 cargo test --locked --workspace --all-targets --release -- --test-threads=1
@@ -127,6 +127,9 @@ First launch creates one shell; later windows/relaunches do not repair hidden or
    - With RGBA background/surface tokens, verify readable opaque catalog samples and controls. Disable transparency: even a zero-alpha main/terminal background must render its solid RGB. Enable transparency over an owned light/dark backdrop: theme alpha must compose with opacity. Output explicit and inverse RGB backgrounds equal to the palette background, plus indexed 16–255/truecolor output; matching explicit backgrounds must stay opaque over glass. Only Default and ANSI 0–15 follow palette changes, and appearance/material edits must not replace process lifetimes.
 7. Open **Settings → Performance**. Confirm live client/daemon CPU, memory, OS-resource and surface values; display refresh; render timing; and bounded renderer-cache occupancy. Enable the FPS overlay, close Settings, and verify the window-level badge stays clear of chrome. Reopen Settings, rebuild the renderer, and verify caches repopulate while a shell marker and PID survive. Copy diagnostics and confirm the clipboard includes rendering, resources, surfaces, and cache sections. Run **Reconnect window** separately and confirm the marker and process survive.
 8. Restart an idle isolated daemon without confirmation. With live work, verify the review names every affected surface, Escape preserves the same responsive shell, and **End work and restart daemon** leaves truthful lost surfaces that can be explicitly restarted.
+   - Open tabs and splits, including a deliberately delayed shell profile. No Starting bar, text, spinner, delayed indicator, or reserved space may appear; compare the terminal grid before and after first output.
+   - Exercise exit 0/nonzero, a real launch failure, reconnect, and a two-window attachment conflict in tiled, narrow, floating, and tree views. Recovery is one compact pane-local overlay; final output and meaningful tab names survive. Details explains the actual state; ended shells never suggest waiting for another window.
+   - F6 enters the focused pane's recovery controls; Tab/Shift+Tab chooses actions, Enter/Space activates, and Escape returns focus/closes details. Those keys must not reach the shell. Clicking recovery in another pane must not change typing focus. Restart changes only the explicitly selected lifetime; Retry attachment never takes control from the current owner.
 9. Select text in a static terminal workload, close, and reopen at the same geometry. Selection/scroll anchors restore only from the identical authoritative baseline. Changed output, lifetime, generation, or geometry invalidates uncertain anchors. The sidebar starts closed regardless of its previous visibility.
 10. Flood one pane with `yes` while typing/navigating another. End a surface with an owned background child, inspect its final output, restart explicitly, and remove a pane/tab/workspace with the appropriate confirmation.
 11. In an isolated state directory, exercise slot contention and failed atomic state writes. Failed window transfer retains the source; failed preference saving remains visibly unsaved without disabling the live presentation; a later successful save clears that warning.
@@ -236,6 +239,7 @@ Instrumentation writes:
 - `%LOCALAPPDATA%\Compi\daemon-resource-<pid>.log`: six-second daemon private bytes, working set, handles, and surface count (under the `sessions` field);
 - `%LOCALAPPDATA%\Compi\client-perf.log`: frame-interval and terminal-paint distributions under active output.
 - `%LOCALAPPDATA%\Compi\latency-<pid>.log`: correlated input IDs at GPUI receipt, client queue/send, daemon receipt, PTY output, terminal-state sequence, and the next presented frame.
+- `%LOCALAPPDATA%\Compi\surface-startup-<pid>.log`: opt-in `COMPI_PERF_LOG=1` stages correlated by surface and process lifetime: daemon request/launch/PTY/first output and client connection/attachment/first nonempty screen/first rendered frame. Elapsed time is stage-local to each process; use the correlation IDs and timestamps when comparing daemon and client records.
 
 Set `COMPI_PERF_EMPTY_WINDOW=1` with `COMPI_PERF_LOG=1` to measure a blank GPUI window without connecting to a daemon. Set `COMPI_PERF_READY_PROBE=1` only against an isolated measurement session; it sends a deterministic `printf` command and measures both launch-to-rendered-marker and input-to-rendered-marker time.
 
