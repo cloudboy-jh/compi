@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::launch::LaunchDescription;
-use std::ffi::{CStr, OsStr, c_void};
+use std::ffi::{CStr, OsStr, OsString, c_void};
 use std::fs::{File, OpenOptions};
 use std::iter::once;
 use std::mem::{size_of, size_of_val};
@@ -407,7 +407,19 @@ fn launch_parameters(launch: &LaunchDescription) -> Result<LaunchParameters> {
     }
     command.push(0);
     let mut environment = std::collections::BTreeMap::new();
-    for (key, value) in std::env::vars_os().chain(launch.env.iter().cloned()) {
+    let default_path = if launch
+        .env
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+    {
+        None
+    } else {
+        compi_protocol::wsl::launch_path().map(|path| (OsString::from("PATH"), path.to_owned()))
+    };
+    for (key, value) in std::env::vars_os()
+        .chain(default_path)
+        .chain(launch.env.iter().cloned())
+    {
         environment.insert(key.to_string_lossy().to_uppercase(), (key, value));
     }
     let mut block = Vec::new();

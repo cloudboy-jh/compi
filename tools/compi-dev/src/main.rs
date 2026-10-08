@@ -10,6 +10,11 @@ While running: ⏎ reopens a closed preview, r⏎ restarts the dev daemon with t
 current sources (ends dev shells), q⏎ or Ctrl+C quits and leaves the daemon running.";
 
 fn main() {
+    #[cfg(windows)]
+    if let Some(path) = compi_protocol::wsl::launch_path() {
+        // Bootstrap runs before the dev runner starts its watcher or workers.
+        unsafe { std::env::set_var("PATH", path) };
+    }
     let mut options = compi_dev::Options { stop: false };
     for argument in std::env::args().skip(1) {
         match argument.as_str() {

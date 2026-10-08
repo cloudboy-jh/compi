@@ -1,6 +1,26 @@
 # Source in interactive Bash or Zsh: . /path/to/compi/assets/compi-shell.sh
 # Only tree/z/jump are intercepted; other compi commands retain their normal CLI behavior.
 
+# Initialize after user startup files, including login Bash's imported functions.
+_compi_cli_init() {
+    [[ -z ${_compi_cli_ready-} ]] || return 0
+    if [[ -n ${COMPI_CLI_WINDOWS-} ]]; then
+        COMPI_CLI=$(command wslpath -u "$COMPI_CLI_WINDOWS") || return 1
+        if [[ -n ${COMPI_CLI_DATA_DIR_WINDOWS-} ]]; then
+            COMPI_DATA_DIR=$(command wslpath -u "$COMPI_CLI_DATA_DIR_WINDOWS") || return 1
+            export COMPI_DATA_DIR
+        fi
+        export WSLENV="${WSLENV:+$WSLENV:}COMPI_INSTANCE:COMPI_SURFACE_ID:WSL_DISTRO_NAME:COMPI_DATA_DIR/p:COMPI_SHELL_CWD"
+    fi
+    [[ -n ${COMPI_CLI-} ]] || return 0
+    export COMPI_CLI
+    case ":$PATH:" in
+        *":$HOME/.compi/shell:"*) ;;
+        *) export PATH="$HOME/.compi/shell:$PATH" ;;
+    esac
+    _compi_cli_ready=1
+}
+
 _compi_report_cwd() {
     local LC_ALL=C uri='' char escaped index
     for ((index = 0; index < ${#PWD}; index++)); do
@@ -25,8 +45,18 @@ _compi_report_cwd() {
 # after it, so a prompt's exit-status segment stays correct.
 _compi_prompt_cwd() {
     local compi_status=$?
-    # ble.sh runs PROMPT_COMMAND outside the user's prompt state; its hooks sync.
-    [[ -n ${BLE_VERSION-} ]] || _compi_prompt_sync "$compi_status"
+    _compi_cli_init
+    if [[ -z ${_compi_pid_reported-} ]] && [[ -t 0 || -t 1 || -t 2 ]]; then
+        printf '\033]777;compi;pid;%s\a' "$$" > /dev/tty && _compi_pid_reported=1
+    fi
+    if [[ -n ${ZSH_VERSION-} ]]; then
+        _compi_prompt_sync "$compi_status"
+    elif [[ -z ${BLE_VERSION-} && -z ${_compi_prompt_native_dispatching-} &&
+            ${PROMPT_COMMAND-} != _compi_prompt_native_dispatch ]]; then
+        # Imported login hooks have no rc wrapper; bootstrap their dispatcher.
+        _compi_prompt_sync "$compi_status"
+        _compi_install_prompt_hook
+    fi
     if [[ -t 0 || -t 1 || -t 2 ]] && [[ ${_compi_last_reported_cwd-} != "$PWD" ]]; then
         _compi_report_cwd
     fi
@@ -38,6 +68,58 @@ _compi_prompt_ble_hook() {
     local compi_status=$? _compi_prompt_ble_context=1
     _compi_prompt_sync "$compi_status"
     return "$compi_status"
+}
+
+# PRECMD runs before ble.sh evaluates PROMPT_COMMAND, including after a reload.
+_compi_prompt_ble_precmd() {
+    local compi_status=$? _compi_prompt_ble_context=1
+    _compi_prompt_sync "$compi_status" precmd
+    return "$compi_status"
+}
+
+# Restore the user's global command value, including sparse array indices.
+_compi_prompt_command_restore() {
+    local declaration=${1-} attributes
+    unset PROMPT_COMMAND
+    [[ -n $declaration ]] || return 0
+    if (( BASH_VERSINFO[0] > 4 ||
+          (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )); then
+        eval "${declaration/#declare /declare -g }"
+    else
+        # Bash 3.2 has no declare -g; assignments inside functions stay global.
+        attributes=${declaration%% PROMPT_COMMAND*}
+        attributes=${attributes#declare -}
+        [[ $attributes != *a* ]] || PROMPT_COMMAND=()
+        case $declaration in
+            *" PROMPT_COMMAND="*) eval "PROMPT_COMMAND${declaration#* PROMPT_COMMAND}" ;;
+        esac
+        [[ $attributes != *x* ]] || export PROMPT_COMMAND
+    fi
+}
+
+# Native Bash parses scalar PROMPT_COMMAND before running any of it. Dispatch
+# the selected hooks ourselves so reloads never run both old and new providers.
+_compi_prompt_native_dispatch() {
+    local compi_status=$? compi_lastarg=$_ compi_pipeline=( "${PIPESTATUS[@]}" )
+    local _compi_prompt_native_dispatching=1 hook compi_context='' compi_pipe
+    # Bash restores the original context for every array entry. A real status
+    # pipeline is needed only for multi-command PIPESTATUS, never normal prompts.
+    if (( ${#compi_pipeline[@]} > 1 )); then
+        for compi_pipe in "${compi_pipeline[@]}"; do
+            compi_context+=" | (builtin exit $compi_pipe)"
+        done
+        compi_context=${compi_context:3}
+    fi
+    _compi_prompt_command_restore "${_compi_native_prompt_command-}"
+    _compi_prompt_sync "$compi_status" native
+    for hook in "${PROMPT_COMMAND[@]}"; do
+        _compi_prompt_status "$compi_status" "$compi_lastarg"
+        eval "$compi_context"$'\n'"$hook"
+    done
+    _compi_prompt_status "$compi_status"
+    _compi_prompt_cwd
+    _compi_prompt_native_dispatching=
+    _compi_install_prompt_hook
 }
 
 # Prompt settings write ~/.compi/prompt/compi.{bash,zsh} for Compi shells. When
@@ -53,7 +135,7 @@ _compi_prompt_sync() {
         if _compi_prompt_startup; then
             . "$HOME/.compi/prompt/compi.$shell"
             _compi_install_prompt_hook
-            _compi_prompt_rerun "$1"
+            [[ ${2-} == precmd || ${2-} == native ]] || _compi_prompt_rerun "$1"
         fi
         return 0
     fi
@@ -63,7 +145,7 @@ _compi_prompt_sync() {
     _compi_prompt_restore
     [[ ! -f $HOME/.compi/prompt/live.$shell ]] || . "$HOME/.compi/prompt/live.$shell"
     _compi_install_prompt_hook
-    _compi_prompt_rerun "$1"
+    [[ ${2-} == precmd || ${2-} == native ]] || _compi_prompt_rerun "$1"
 }
 
 # Startup wrappers call this after the user's rc and, when it succeeds, source
@@ -96,11 +178,15 @@ _compi_ble_attach() {
     [[ ${BASH_ALIASES[ble-attach]-} != _compi_ble_attach ]] || unalias ble-attach
     if [[ -z ${_ble_attached-} ]]; then
         local _compi_prompt_ble_context=1
+        if [[ ${PROMPT_COMMAND-} == _compi_prompt_native_dispatch ]]; then
+            _compi_prompt_command_restore "${_compi_native_prompt_command-}"
+            unset _compi_native_prompt_command _compi_native_prompt_attributes
+            unset _compi_native_prompt_values _compi_native_prompt_indices
+        fi
         if _compi_prompt_startup; then
             . "$HOME/.compi/prompt/compi.bash"
-            _compi_install_prompt_hook
-            _compi_prompt_rerun 0
         fi
+        _compi_install_prompt_hook
     fi
     ble-attach "$@"
 }
@@ -144,9 +230,7 @@ _compi_prompt_restore() {
         eval "$_compi_saved_provider"
     else
         PS0=$_compi_saved_ps0 PS1=$_compi_saved_ps1 PS2=$_compi_saved_ps2
-        unset PROMPT_COMMAND
-        [[ -z $_compi_saved_prompt_command ]] ||
-            eval "${_compi_saved_prompt_command/#declare /declare -g }"
+        _compi_prompt_command_restore "${_compi_saved_prompt_command-}"
         if [[ $(trap -p DEBUG) != "$_compi_saved_debug" ]]; then
             if [[ -n $_compi_saved_debug ]]; then eval "$_compi_saved_debug"; else trap - DEBUG; fi
         fi
@@ -186,12 +270,41 @@ _compi_prompt_rerun() {
     return 0
 }
 
-# Keep the cwd hook last, so prompt providers capture the command's exit status
-# first and a reload never runs an old provider hook after the new one. Array
-# entries keep their indices; ble.sh tracks its own entry by index.
+# ble.sh keeps the cwd hook last and preserves array indices it tracks. Native
+# Bash uses a dispatcher that selects the provider before executing user hooks.
 _compi_install_prompt_hook() {
     if [[ -n ${ZSH_VERSION-} ]]; then
         precmd_functions=( ${precmd_functions:#_compi_prompt_cwd} _compi_prompt_cwd )
+        return 0
+    fi
+    if [[ -z ${BLE_VERSION-} ]]; then
+        [[ -z ${_compi_prompt_native_dispatching-} ]] || return 0
+        [[ ${PROMPT_COMMAND-} != _compi_prompt_native_dispatch ]] || return 0
+        local index position=0 unchanged='' attributes=''
+        if (( BASH_VERSINFO[0] > 4 ||
+              (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+            attributes=${PROMPT_COMMAND@a}
+            if [[ $attributes == "${_compi_native_prompt_attributes-}" &&
+                  ${#PROMPT_COMMAND[@]} == ${#_compi_native_prompt_values[@]} ]]; then
+                unchanged=1
+                for index in "${!PROMPT_COMMAND[@]}"; do
+                    if [[ $index != "${_compi_native_prompt_indices[position]}" ||
+                          ${PROMPT_COMMAND[index]} != "${_compi_native_prompt_values[position]}" ]]; then
+                        unchanged=''
+                        break
+                    fi
+                    ((position += 1))
+                done
+            fi
+        fi
+        if [[ -z $unchanged ]]; then
+            _compi_native_prompt_command=$(declare -p PROMPT_COMMAND 2>/dev/null)
+            _compi_native_prompt_attributes=$attributes
+            _compi_native_prompt_values=( "${PROMPT_COMMAND[@]}" )
+            _compi_native_prompt_indices=( "${!PROMPT_COMMAND[@]}" )
+        fi
+        unset PROMPT_COMMAND
+        PROMPT_COMMAND=_compi_prompt_native_dispatch
         return 0
     fi
     case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
@@ -214,15 +327,15 @@ _compi_install_prompt_hook() {
             ;;
     esac
     if [[ -n ${BLE_VERSION-} ]]; then
-        blehook ATTACH!=_compi_prompt_ble_hook
-        blehook PRECMD!=_compi_prompt_ble_hook
+        blehook ATTACH!=_compi_prompt_ble_hook PRECMD!=_compi_prompt_ble_precmd
     fi
 }
 
 # Called after the user's shell rc, so existing prompt hooks are preserved.
 _compi_enable_prompt_cwd() {
     case $- in *i*) ;; *) return 0 ;; esac
-    [[ -z ${BASH_VERSION-} || ${BASH_ALIASES[ble-attach]-} != _compi_ble_attach ]] ||
+    [[ -z ${BASH_VERSION-} || -z ${BLE_VERSION-} ||
+       ${BASH_ALIASES[ble-attach]-} != _compi_ble_attach ]] ||
         unalias ble-attach
     _compi_install_prompt_hook
     _compi_prompt_cwd
@@ -297,14 +410,58 @@ _compi_choose_directory() {
     _compi_report_cwd
 }
 
+# From a WSL terminal, Windows starts the GUI-subsystem CLI without any console of its
+# own: its output would lose carriage returns and it could never read an answer. Run it
+# on pipes instead: its output reaches the terminal through cat, typed lines reach it
+# only while it runs, and Ctrl-C ends it. COMPI_CLI_TERMINAL tells it a person is there.
+_compi_windows_cli() {
+    local directory result
+    directory=$(command mktemp -d "${TMPDIR:-/tmp}/compi-cli.XXXXXXXX") || return 1
+    command mkfifo -m 600 "$directory/in" "$directory/out" || {
+        command rm -rf -- "$directory"
+        return 1
+    }
+    (
+        while IFS= read -r line; do printf '%s\n' "$line"; done < /dev/tty > "$directory/in" &
+        feeder=$!
+        command cat < "$directory/out" &
+        relay=$!
+        WSLENV="${WSLENV:+$WSLENV:}COMPI_CLI_TERMINAL" COMPI_CLI_TERMINAL=1 \
+            command "$COMPI_CLI" "$@" < "$directory/in" > "$directory/out" 2>&1 &
+        cli=$!
+        trap 'kill "$cli" 2> /dev/null' INT
+        wait "$cli"
+        result=$?
+        # A trapped Ctrl-C interrupts wait; collect the CLI's actual end.
+        kill -0 "$cli" 2> /dev/null && { wait "$cli"; result=130; }
+        kill "$feeder" 2> /dev/null
+        wait "$feeder" 2> /dev/null
+        wait "$relay"
+        exit "$result"
+    )
+    result=$?
+    command rm -rf -- "$directory"
+    return "$result"
+}
+
 compi() {
+    _compi_cli_init || return 1
     if (( $# == 1 )); then
         case "$1" in
             tree) _compi_choose_directory tree; return $? ;;
             z|jump) _compi_choose_directory jump; return $? ;;
         esac
     fi
-    command compi "$@"
+    if [[ -n ${COMPI_CLI-} ]]; then
+        export COMPI_SHELL_CWD="$PWD"
+        if [[ -n ${COMPI_CLI_WINDOWS-} && -t 0 && -t 1 && -t 2 ]]; then
+            _compi_windows_cli "$@"
+        else
+            command "$COMPI_CLI" "$@"
+        fi
+    else
+        command compi "$@"
+    fi
 }
 
 # See _compi_ble_attach; the startup wrappers source this file before the rc.

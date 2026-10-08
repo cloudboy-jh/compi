@@ -94,6 +94,32 @@ pub fn log_input_latency_stage(id: u64, stage: &str, sequence: Option<u64>) {
     append_line(&format!("latency-{}.log", std::process::id()), &line);
 }
 
+/// Log a caller-bounded lifecycle stage, correlated across daemon and client.
+pub fn log_surface_startup_stage(
+    surface_id: &crate::SurfaceId,
+    process_lifetime_id: &crate::ProcessLifetimeId,
+    stage: &str,
+    elapsed: Duration,
+) {
+    if !enabled() {
+        return;
+    }
+    let line = format!(
+        "timestamp_us={} sample={} pid={} surface={} lifetime={} stage={} elapsed_us={}",
+        now_us(),
+        sample_id(),
+        std::process::id(),
+        surface_id,
+        process_lifetime_id,
+        stage,
+        elapsed.as_micros(),
+    );
+    append_line(
+        &format!("surface-startup-{}.log", std::process::id()),
+        &line,
+    );
+}
+
 #[cfg(windows)]
 pub fn log_resource_sample(process_kind: &str, workload: &str, session_count: usize) {
     if !enabled() {

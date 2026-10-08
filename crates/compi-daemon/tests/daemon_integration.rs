@@ -129,7 +129,7 @@ impl Drop for DaemonGuard {
 fn directory_rpc_uses_surface_wsl_namespace() {
     let mut daemon = DaemonGuard::start();
     let launch = compi_protocol::wsl::resolve_launch(Some("/tmp"), None).unwrap();
-    let distribution = launch.distribution.unwrap();
+    let distribution = launch.distribution;
     let name = format!("compi-tree-{}-{}", std::process::id(), daemon.instance);
     let root = format!("/tmp/{name}");
     let host_directory = PathBuf::from(r"\\wsl.localhost")
@@ -139,6 +139,59 @@ fn directory_rpc_uses_surface_wsl_namespace() {
     fs::create_dir(&host_directory).unwrap();
     fs::create_dir(host_directory.join("source")).unwrap();
     fs::write(host_directory.join("source").join("needle.rs"), b"from WSL").unwrap();
+    fs::create_dir_all(host_directory.join("a").join("b")).unwrap();
+    let literal_backslash = format!("{root}/a\\b");
+    assert!(
+        compi_protocol::wsl::resolve_launch(Some(&literal_backslash), Some(&distribution)).is_err(),
+        "a Linux backslash must not resolve to an existing nested Windows path"
+    );
+    let trailing_dot = format!("{root}/source.");
+    assert!(
+        compi_protocol::wsl::resolve_launch(Some(&trailing_dot), Some(&distribution)).is_err(),
+        "Windows trailing-dot normalization must not validate a different Linux directory"
+    );
+    let unicode_directory = format!("{root}/a漢");
+    fs::create_dir(host_directory.join("a漢")).unwrap();
+    assert_eq!(
+        compi_protocol::wsl::resolve_launch(Some(&unicode_directory), Some(&distribution))
+            .unwrap()
+            .directory,
+        unicode_directory
+    );
+    assert!(
+        Command::new(r"C:\Windows\System32\wsl.exe")
+            .args([
+                "--distribution",
+                &distribution,
+                "--exec",
+                "mkdir",
+                "--",
+                &literal_backslash,
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        compi_protocol::wsl::resolve_launch(Some(&literal_backslash), Some(&distribution))
+            .unwrap()
+            .directory,
+        literal_backslash
+    );
+    assert!(
+        Command::new(r"C:\Windows\System32\wsl.exe")
+            .args([
+                "--distribution",
+                &distribution,
+                "--exec",
+                "rmdir",
+                "--",
+                &literal_backslash,
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
     let windows_directory = std::env::temp_dir().join(&name);
     fs::create_dir(&windows_directory).unwrap();
     fs::write(
@@ -611,9 +664,7 @@ fn repeated_surface_cycles_release_daemon_process_handles() {
     let instance = daemon.instance.clone();
     let mut control = daemon.client();
     let mut cycle_client = daemon.client();
-    let baseline = process_handle_count(daemon.child.id());
-
-    for _ in 0..12 {
+    let mut cycle = || {
         let session = control.create_surface(80, 24, None).unwrap();
         cycle_client.attach_surface(&session, 80, 24).unwrap();
         cycle_client
@@ -643,6 +694,13 @@ fn repeated_surface_cycles_release_daemon_process_handles() {
             );
             thread::sleep(POLL_INTERVAL);
         }
+    };
+    // The first launch creates long-lived state once (the WSL bridge and Windows command
+    // index caches, runtime workers); only growth across later cycles is a leak.
+    cycle();
+    let baseline = process_handle_count(daemon.child.id());
+    for _ in 0..12 {
+        cycle();
     }
     for _ in 0..20 {
         let mut transient = daemon.client();

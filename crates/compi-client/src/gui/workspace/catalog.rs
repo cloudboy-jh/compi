@@ -538,6 +538,7 @@ impl CompiApp {
         appearance: AppearanceSettings,
         favorites: Vec<ThemeId>,
         ui_font: UiFontPreset,
+        density: crate::theme::WorkspaceDensity,
         terminal_font_family: String,
         window: &mut Window,
     ) {
@@ -545,6 +546,7 @@ impl CompiApp {
         if self.config.configured_appearance == appearance
             && self.config.theme_favorites == favorites
             && self.config.ui_font == ui_font
+            && self.config.density == density
             && !terminal_font_changed
         {
             return;
@@ -553,6 +555,10 @@ impl CompiApp {
         self.config.theme_favorites = favorites;
         self.config.ui_font = ui_font;
         self.ui_font = crate::font_catalog::resolve_ui_font(ui_font, window.text_system());
+        if self.config.density != density {
+            self.config.density = density;
+            self.rebuild_layout(window, true);
+        }
         if terminal_font_changed {
             self.config.configured_font.family = terminal_font_family.clone();
             if self.config.provenance.font_family != crate::config::ValueSource::CommandLine {
@@ -612,6 +618,7 @@ impl CompiApp {
                         self.config.configured_appearance.clone(),
                         self.config.theme_favorites.clone(),
                         self.config.ui_font,
+                        self.config.density,
                         self.config.configured_font.family.clone(),
                         target_window,
                     );

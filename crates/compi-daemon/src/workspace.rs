@@ -1,9 +1,9 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
-    ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MergedTab, MutationId,
-    MutationReceipt, MutationRequest, PaneId, ProcessLifetimeId, ServerGeneration, SessionId,
-    SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation,
-    WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
+    ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES, MergedTab,
+    MutationId, MutationReceipt, MutationRequest, PaneId, PlannedLayoutNode, ProcessLifetimeId,
+    ServerGeneration, SessionId, SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabId, TabMerge,
+    WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -29,6 +29,9 @@ pub struct WorkspaceActor {
 #[derive(Debug, Clone)]
 pub enum WorkspaceEffect {
     Launch(SurfaceInfo, Option<Box<compi_protocol::LaunchContext>>),
+    /// One transaction's effects occupy one bounded queue slot. The worker
+    /// processes them in order while the actor remains available for feedback.
+    Batch(Vec<WorkspaceEffect>),
     End {
         surface_id: SurfaceId,
         process_lifetime_id: ProcessLifetimeId,
@@ -62,6 +65,12 @@ pub enum RuntimeObservation {
         surface_id: SurfaceId,
         process_lifetime_id: ProcessLifetimeId,
         error: String,
+    },
+    /// The shell reported a new current directory (OSC 7).
+    Directory {
+        surface_id: SurfaceId,
+        process_lifetime_id: ProcessLifetimeId,
+        directory: String,
     },
 }
 
@@ -137,6 +146,7 @@ struct ActorState {
     subscribers: Vec<SyncSender<WorkspaceEvent>>,
     queued: VecDeque<ActorCommand>,
     pending: Option<PendingCommit>,
+    deferred_effect: Option<WorkspaceEffect>,
     read_only_error: Option<String>,
     next_ordinal: u64,
     stopping: bool,
@@ -251,12 +261,14 @@ fn run_actor(
         subscribers: Vec::new(),
         queued: VecDeque::new(),
         pending: None,
+        deferred_effect: None,
         read_only_error: None,
         next_ordinal: 1,
         stopping: false,
     };
 
     loop {
+        flush_deferred_effect(&mut state);
         match completion_receiver.try_recv() {
             Ok(completion) => finish_commit(&mut state, completion),
             Err(TryRecvError::Disconnected) => {
@@ -342,6 +354,12 @@ fn process_command(
                     "live work changed; review shutdown consent again",
                     Some(snapshot.revision),
                 ))
+            } else if state.deferred_effect.is_some() {
+                Err(ActorError::new(
+                    ErrorCode::Busy,
+                    "workspace runtime effects are awaiting dispatch",
+                    Some(snapshot.revision),
+                ))
             } else if state.stopping {
                 Err(ActorError::new(
                     ErrorCode::Busy,
@@ -416,49 +434,68 @@ fn process_command(
                 let _ = reply.send(result);
                 return false;
             }
+            if state.deferred_effect.is_some() {
+                let _ = reply.send(Err(ActorError::new(
+                    ErrorCode::Busy,
+                    "workspace runtime effects are awaiting dispatch",
+                    Some(state.workspace.revision),
+                )));
+                return false;
+            }
+            let next_ordinal = state.next_ordinal;
             match prepare_mutation(state, &request, fingerprint) {
                 Ok(mut pending) => {
                     pending.reply = Some(reply);
-                    let mut launch_failed = false;
+                    let mut launches = Vec::new();
                     for effect in std::mem::take(&mut pending.effects) {
                         let WorkspaceEffect::Launch(info, _) = &effect else {
                             pending.effects.push(effect);
                             continue;
                         };
-                        if state.effect_sender.send(effect.clone()).is_err() {
-                            launch_failed = true;
-                            break;
-                        }
                         pending
                             .prelaunched
                             .push((info.id.clone(), info.process_lifetime_id.clone()));
+                        launches.push(effect);
                     }
-                    if launch_failed {
-                        for (surface_id, process_lifetime_id) in pending.prelaunched {
-                            let _ = state.effect_sender.send(WorkspaceEffect::End {
-                                surface_id,
-                                process_lifetime_id,
-                            });
-                        }
+                    if let Some(effect) = effect_batch(launches)
+                        && let Err(error) = state.effect_sender.try_send(effect)
+                    {
+                        // An atomic queue handoff failed; none of these launches can run.
+                        state.next_ordinal = next_ordinal;
+                        pending.prelaunched.clear();
+                        let (code, message) = match error {
+                            TrySendError::Full(_) => {
+                                (ErrorCode::Busy, "workspace runtime effect queue is full")
+                            }
+                            TrySendError::Disconnected(_) => {
+                                state.read_only_error =
+                                    Some("workspace runtime effect worker stopped".into());
+                                (
+                                    ErrorCode::PersistenceUnavailable,
+                                    "workspace runtime effect worker stopped",
+                                )
+                            }
+                        };
                         let _ = pending.reply.take().unwrap().send(Err(ActorError::new(
-                            ErrorCode::PersistenceUnavailable,
-                            "workspace runtime effect worker stopped",
+                            code,
+                            message,
                             Some(state.workspace.revision),
                         )));
-                        state.read_only_error =
-                            Some("workspace runtime effect worker stopped".into());
                     } else if persist_sender
                         .send(PersistJob {
                             candidate: pending.candidate.clone(),
                         })
                         .is_err()
                     {
-                        for (surface_id, process_lifetime_id) in pending.prelaunched {
-                            let _ = state.effect_sender.send(WorkspaceEffect::End {
+                        let cleanup = pending
+                            .prelaunched
+                            .into_iter()
+                            .map(|(surface_id, process_lifetime_id)| WorkspaceEffect::End {
                                 surface_id,
                                 process_lifetime_id,
-                            });
-                        }
+                            })
+                            .collect();
+                        defer_effects(state, cleanup);
                         let _ = pending.reply.take().unwrap().send(Err(ActorError::new(
                             ErrorCode::PersistenceUnavailable,
                             "workspace persistence worker stopped",
@@ -515,23 +552,21 @@ fn finish_commit(state: &mut ActorState, completion: PersistResult) {
                     .try_send(WorkspaceEvent::Revision(revision))
                     .is_ok()
             });
-            for effect in pending.effects {
-                if state.effect_sender.send(effect).is_err() {
-                    state.read_only_error = Some("workspace runtime effect worker stopped".into());
-                    break;
-                }
-            }
+            defer_effects(state, pending.effects);
             if let (Some(reply), Some(receipt)) = (pending.reply, pending.receipt) {
                 let _ = reply.send(Ok(receipt));
             }
         }
         Err(error) => {
-            for (surface_id, process_lifetime_id) in pending.prelaunched {
-                let _ = state.effect_sender.send(WorkspaceEffect::End {
+            let cleanup = pending
+                .prelaunched
+                .into_iter()
+                .map(|(surface_id, process_lifetime_id)| WorkspaceEffect::End {
                     surface_id,
                     process_lifetime_id,
-                });
-            }
+                })
+                .collect();
+            defer_effects(state, cleanup);
             let message = format!("workspace persistence is unavailable: {error}");
             state.read_only_error = Some(message.clone());
             if let Some(reply) = pending.reply {
@@ -541,6 +576,43 @@ fn finish_commit(state: &mut ActorState, completion: PersistResult) {
                     Some(state.workspace.revision),
                 )));
             }
+        }
+    }
+}
+
+fn effect_batch(mut effects: Vec<WorkspaceEffect>) -> Option<WorkspaceEffect> {
+    match effects.len() {
+        0 => None,
+        1 => effects.pop(),
+        _ => Some(WorkspaceEffect::Batch(effects)),
+    }
+}
+
+fn defer_effects(state: &mut ActorState, effects: Vec<WorkspaceEffect>) {
+    let Some(effect) = effect_batch(effects) else {
+        return;
+    };
+    match state.effect_sender.try_send(effect) {
+        Ok(()) => {}
+        Err(TrySendError::Full(effect)) => {
+            debug_assert!(state.deferred_effect.is_none());
+            state.deferred_effect = Some(effect);
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            state.read_only_error = Some("workspace runtime effect worker stopped".into());
+        }
+    }
+}
+
+fn flush_deferred_effect(state: &mut ActorState) {
+    let Some(effect) = state.deferred_effect.take() else {
+        return;
+    };
+    match state.effect_sender.try_send(effect) {
+        Ok(()) => {}
+        Err(TrySendError::Full(effect)) => state.deferred_effect = Some(effect),
+        Err(TrySendError::Disconnected(_)) => {
+            state.read_only_error = Some("workspace runtime effect worker stopped".into());
         }
     }
 }
@@ -590,6 +662,7 @@ fn prepare_mutation(
     let mut affected_panes = Vec::new();
     let mut affected_surfaces = Vec::new();
     let mut effects = Vec::new();
+    let mut next_ordinal = state.next_ordinal;
     if let Some(context) = &request.launch {
         validate_launch_context(context).map_err(|message| {
             ActorError::new(
@@ -603,6 +676,7 @@ fn prepare_mutation(
             WorkspaceMutation::Initialize { .. }
                 | WorkspaceMutation::CreateTab { .. }
                 | WorkspaceMutation::SplitPane { .. }
+                | WorkspaceMutation::GrowTab { .. }
                 | WorkspaceMutation::RestartSurface { .. }
         ) {
             return Err(ActorError::new(
@@ -615,7 +689,7 @@ fn prepare_mutation(
     let operation_state = apply_mutation(
         &mut candidate,
         &request.operation,
-        &mut state.next_ordinal,
+        &mut next_ordinal,
         &mut affected_sessions,
         &mut affected_tabs,
         &mut affected_panes,
@@ -660,6 +734,7 @@ fn prepare_mutation(
             Some(state.workspace.revision),
         )
     })?;
+    state.next_ordinal = next_ordinal;
     Ok(PendingCommit {
         candidate,
         receipt: Some(receipt),
@@ -848,6 +923,61 @@ fn apply_mutation(
             effects.push(WorkspaceEffect::Launch(surface.clone(), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
+        }
+        WorkspaceMutation::GrowTab {
+            tab_id,
+            layout,
+            working_directory,
+        } => {
+            let (session_index, tab_index) = workspace
+                .sessions
+                .iter()
+                .enumerate()
+                .find_map(|(session_index, session)| {
+                    session
+                        .tabs
+                        .iter()
+                        .position(|tab| &tab.id == tab_id)
+                        .map(|tab_index| (session_index, tab_index))
+                })
+                .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
+            let tab = &workspace.sessions[session_index].tabs[tab_index];
+            let mut leaves = Vec::new();
+            collect_leaves(&tab.layout, &mut leaves);
+            let existing: std::collections::HashMap<_, _> = leaves.into_iter().collect();
+            let extent = tab_cell_extent(&tab.layout, &workspace.surfaces).map_err(invalid)?;
+            let mut seen = HashSet::new();
+            let mut count = 0;
+            validate_growth_plan(layout, extent, &existing, &mut seen, &mut count, 0)
+                .map_err(invalid)?;
+            if seen.len() != existing.len() {
+                return Err(invalid(
+                    "split never deletes existing panes; include every pane exactly once".into(),
+                ));
+            }
+            let mut created = Vec::with_capacity(count - existing.len());
+            let proposed = materialize_growth_plan(
+                layout,
+                extent,
+                &existing,
+                working_directory,
+                ordinal,
+                &mut created,
+            );
+            affected_sessions.push(workspace.sessions[session_index].id.clone());
+            affected_tabs.push(tab_id.clone());
+            affected_panes.extend(pane_ids(&proposed));
+            collect_surfaces(&proposed, affected_surfaces);
+            let tab = &mut workspace.sessions[session_index].tabs[tab_index];
+            if tab.layout != proposed {
+                tab.previous_layout = Some(Box::new(std::mem::replace(&mut tab.layout, proposed)));
+            }
+            let starting = !created.is_empty();
+            for surface in created {
+                effects.push(WorkspaceEffect::Launch(surface.clone(), None));
+                workspace.surfaces.push(surface);
+            }
+            Ok(if starting { "starting" } else { "committed" }.into())
         }
         WorkspaceMutation::DetachPane { pane_id } => {
             for session in &mut workspace.sessions {
@@ -1138,6 +1268,13 @@ fn apply_mutation(
                     Some(workspace.revision),
                 ));
             }
+            // A shell lost to a daemon restart resumes where the user last was, if that
+            // directory still exists; ended or failed shells restart from their recorded
+            // launch.
+            let resume = (surface.status == SurfaceStatus::Lost)
+                .then(|| workspace.last_directories.get(surface_id).cloned())
+                .flatten()
+                .filter(|directory| resume_directory_exists(surface, directory));
             surface.process_lifetime_id = ProcessLifetimeId::new(allocate("lifetime", ordinal));
             surface.status = SurfaceStatus::Starting;
             surface.attached = false;
@@ -1145,7 +1282,11 @@ fn apply_mutation(
             surface.rows = *rows;
             surface.exit_code = None;
             surface.error = None;
-            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
+            let mut launch = surface.clone();
+            if resume.is_some() {
+                launch.launch.working_directory = resume;
+            }
+            effects.push(WorkspaceEffect::Launch(launch, None));
             affected_surfaces.push(surface_id.clone());
             Ok("starting".into())
         }
@@ -1173,6 +1314,32 @@ fn apply_mutation(
             affected_surfaces,
             effects,
         ),
+    }
+}
+
+/// Whether a shell's last reported directory still exists where it ran. A WSL shell's
+/// path is checked through its distribution's share; without a recorded distribution it
+/// cannot be checked, and the launch itself reports a missing directory.
+fn resume_directory_exists(surface: &SurfaceInfo, directory: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(distribution) = surface
+            .working_directory
+            .as_ref()
+            .map(|directory| directory.distribution.as_str())
+        else {
+            return true;
+        };
+        let share = format!(
+            r"\\wsl.localhost\{distribution}{}",
+            directory.replace('/', "\\")
+        );
+        std::fs::metadata(share).is_ok_and(|metadata| metadata.is_dir())
+    }
+    #[cfg(unix)]
+    {
+        let _ = surface;
+        std::path::Path::new(directory).is_dir()
     }
 }
 
@@ -1272,6 +1439,11 @@ fn apply_observation(
             surface_id,
             process_lifetime_id,
             ..
+        }
+        | RuntimeObservation::Directory {
+            surface_id,
+            process_lifetime_id,
+            ..
         } => (surface_id, process_lifetime_id),
     };
     let surface = candidate
@@ -1311,6 +1483,15 @@ fn apply_observation(
         RuntimeObservation::EndFailed { error, .. } => {
             surface.status = SurfaceStatus::Ending;
             surface.error = Some(error);
+        }
+        RuntimeObservation::Directory { directory, .. } => {
+            // Clients never see this, so no revision bump and no refresh for them.
+            let id = surface.id.clone();
+            if candidate.last_directories.get(&id) == Some(&directory) {
+                return None;
+            }
+            candidate.last_directories.insert(id, directory);
+            return Some(candidate);
         }
     }
     let completed: Vec<_> = candidate
@@ -1417,6 +1598,164 @@ fn set_split_ratio(mut node: &mut LayoutNode, path: &[bool], ratio: f32) -> bool
         true
     } else {
         false
+    }
+}
+
+/// Infer a conservative tab rectangle from current measured terminal cell sizes.
+/// Cap split-axis sums by both children's ratio-implied extents: a child awaiting
+/// resize after an earlier split must not overstate the tab's available space.
+fn tab_cell_extent(node: &LayoutNode, surfaces: &[SurfaceInfo]) -> Result<(i32, i32), String> {
+    match node {
+        LayoutNode::Pane { surface_id, .. } => {
+            let surface = surfaces
+                .iter()
+                .find(|surface| &surface.id == surface_id)
+                .ok_or_else(|| format!("pane surface {surface_id} was not found"))?;
+            Ok((i32::from(surface.cols), i32::from(surface.rows)))
+        }
+        LayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let (a_cols, a_rows) = tab_cell_extent(first, surfaces)?;
+            let (b_cols, b_rows) = tab_cell_extent(second, surfaces)?;
+            // For N usable cells, a=floor(N*r) and b=ceil(N*(1-r)).
+            // Their inverse upper bounds must include the fractional cell lost
+            // by the first child; otherwise valid layouts shrink on every reuse.
+            let combined = |a: i32, b: i32| {
+                (a + b + 1)
+                    .min((f64::from(a + 1) / f64::from(*ratio)).ceil() as i32)
+                    .min(
+                        ((f64::from(b) / (1.0 - f64::from(*ratio))).floor() as i32)
+                            .saturating_add(1),
+                    )
+            };
+            Ok(match axis {
+                SplitAxis::Horizontal => (combined(a_cols, b_cols), a_rows.min(b_rows)),
+                SplitAxis::Vertical => (a_cols.min(b_cols), combined(a_rows, b_rows)),
+            })
+        }
+    }
+}
+
+fn split_cell_extent(extent: (i32, i32), axis: SplitAxis, ratio: f32) -> ((i32, i32), (i32, i32)) {
+    let (cols, rows) = extent;
+    match axis {
+        SplitAxis::Horizontal => {
+            let first = ((cols - 1) as f64 * f64::from(ratio)).floor() as i32;
+            ((first, rows), (cols - 1 - first, rows))
+        }
+        SplitAxis::Vertical => {
+            let first = ((rows - 1) as f64 * f64::from(ratio)).floor() as i32;
+            ((cols, first), (cols, rows - 1 - first))
+        }
+    }
+}
+
+fn validate_growth_plan<'a>(
+    plan: &'a PlannedLayoutNode,
+    extent: (i32, i32),
+    existing: &std::collections::HashMap<&PaneId, &SurfaceId>,
+    seen: &mut HashSet<&'a PaneId>,
+    count: &mut usize,
+    depth: usize,
+) -> Result<(), String> {
+    if depth >= MAX_TAB_PANES {
+        return Err("tab layout exceeds the pane count/depth limit".into());
+    }
+    match plan {
+        PlannedLayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            if !ratio.is_finite() || *ratio <= 0.0 || *ratio >= 1.0 {
+                return Err("split ratios must be finite and strictly between zero and one".into());
+            }
+            let (a, b) = split_cell_extent(extent, *axis, *ratio);
+            validate_growth_plan(first, a, existing, seen, count, depth + 1)?;
+            validate_growth_plan(second, b, existing, seen, count, depth + 1)
+        }
+        PlannedLayoutNode::ExistingPane { .. } | PlannedLayoutNode::NewPane => {
+            *count += 1;
+            if *count > MAX_TAB_PANES {
+                return Err(format!("a tab can hold at most {MAX_TAB_PANES} panes"));
+            }
+            if let PlannedLayoutNode::ExistingPane { pane_id } = plan
+                && (!existing.contains_key(pane_id) || !seen.insert(pane_id))
+            {
+                return Err("growth layout must include each existing pane exactly once".into());
+            }
+            if !(20..=1_000).contains(&extent.0) || !(4..=1_000).contains(&extent.1) {
+                return Err(
+                    "layout cannot fit minimum 20-column by 4-row panes; enlarge the tab first"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn materialize_growth_plan(
+    plan: &PlannedLayoutNode,
+    extent: (i32, i32),
+    existing: &std::collections::HashMap<&PaneId, &SurfaceId>,
+    working_directory: &Option<String>,
+    ordinal: &mut u64,
+    created: &mut Vec<SurfaceInfo>,
+) -> LayoutNode {
+    match plan {
+        PlannedLayoutNode::ExistingPane { pane_id } => LayoutNode::Pane {
+            pane_id: pane_id.clone(),
+            surface_id: (*existing[pane_id]).clone(),
+        },
+        PlannedLayoutNode::NewPane => {
+            let pane_id = PaneId::new(allocate("pane", ordinal));
+            let surface = new_surface(
+                extent.0 as i16,
+                extent.1 as i16,
+                working_directory.clone(),
+                ordinal,
+            );
+            let surface_id = surface.id.clone();
+            created.push(surface);
+            LayoutNode::Pane {
+                pane_id,
+                surface_id,
+            }
+        }
+        PlannedLayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let (a, b) = split_cell_extent(extent, *axis, *ratio);
+            LayoutNode::Split {
+                axis: *axis,
+                ratio: *ratio,
+                first: Box::new(materialize_growth_plan(
+                    first,
+                    a,
+                    existing,
+                    working_directory,
+                    ordinal,
+                    created,
+                )),
+                second: Box::new(materialize_growth_plan(
+                    second,
+                    b,
+                    existing,
+                    working_directory,
+                    ordinal,
+                    created,
+                )),
+            }
+        }
     }
 }
 
@@ -1728,6 +2067,9 @@ fn prune_unreferenced_surfaces(workspace: &mut StoredWorkspace) {
     workspace
         .surfaces
         .retain(|surface| referenced.contains(&surface.id));
+    workspace
+        .last_directories
+        .retain(|surface, _| referenced.contains(surface));
 }
 
 fn verify_lifetime(
@@ -1967,6 +2309,533 @@ mod tests {
         assert_eq!(actor.snapshot().unwrap().sessions.len(), 1);
     }
 
+    fn growth_fixture(
+        cols: i16,
+        rows: i16,
+    ) -> (WorkspaceActor, Receiver<WorkspaceEffect>, WorkspaceSnapshot) {
+        let (actor, effects) = WorkspaceActor::memory();
+        actor
+            .mutate(request(
+                &actor,
+                "growth-init",
+                0,
+                WorkspaceMutation::Initialize {
+                    cols,
+                    rows,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::Launch(_, _)
+        ));
+        let snapshot = actor.snapshot().unwrap();
+        (actor, effects, snapshot)
+    }
+
+    fn receive_launches(effects: &Receiver<WorkspaceEffect>, expected: usize) -> Vec<SurfaceInfo> {
+        let mut pending = VecDeque::new();
+        let mut launched = Vec::with_capacity(expected);
+        while launched.len() < expected {
+            match pending
+                .pop_front()
+                .unwrap_or_else(|| effects.recv().unwrap())
+            {
+                WorkspaceEffect::Batch(batch) => pending.extend(batch),
+                WorkspaceEffect::Launch(surface, _) => launched.push(surface),
+                WorkspaceEffect::End { .. } => panic!("growth must only launch missing panes"),
+            }
+        }
+        assert!(
+            pending.is_empty(),
+            "growth launched more shells than requested"
+        );
+        launched
+    }
+
+    fn balanced_growth_plan(
+        count: usize,
+        axis: SplitAxis,
+        existing: &mut impl Iterator<Item = PaneId>,
+    ) -> PlannedLayoutNode {
+        if count == 1 {
+            return existing
+                .next()
+                .map_or(PlannedLayoutNode::NewPane, |pane_id| {
+                    PlannedLayoutNode::ExistingPane { pane_id }
+                });
+        }
+        let first_count = count / 2;
+        let next_axis = match axis {
+            SplitAxis::Horizontal => SplitAxis::Vertical,
+            SplitAxis::Vertical => SplitAxis::Horizontal,
+        };
+        PlannedLayoutNode::Split {
+            axis,
+            ratio: first_count as f32 / count as f32,
+            first: Box::new(balanced_growth_plan(first_count, next_axis, existing)),
+            second: Box::new(balanced_growth_plan(
+                count - first_count,
+                next_axis,
+                existing,
+            )),
+        }
+    }
+
+    fn growth_operation(snapshot: &WorkspaceSnapshot, count: usize) -> WorkspaceMutation {
+        let tab = &snapshot.sessions[0].tabs[0];
+        WorkspaceMutation::GrowTab {
+            tab_id: tab.id.clone(),
+            layout: balanced_growth_plan(
+                count,
+                SplitAxis::Vertical,
+                &mut pane_ids(&tab.layout).into_iter(),
+            ),
+            working_directory: Some("/preserved-launch-directory".into()),
+        }
+    }
+
+    fn columns(count: usize, panes: &mut impl Iterator<Item = PaneId>) -> PlannedLayoutNode {
+        let first = panes.next().map_or(PlannedLayoutNode::NewPane, |pane_id| {
+            PlannedLayoutNode::ExistingPane { pane_id }
+        });
+        if count == 1 {
+            return first;
+        }
+        PlannedLayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 1.0 / count as f32,
+            first: Box::new(first),
+            second: Box::new(columns(count - 1, panes)),
+        }
+    }
+
+    #[test]
+    fn atomic_growth_full_effect_queue_returns_busy_without_partial_workspace_or_launches() {
+        let (actor, effects, initial) = growth_fixture(1000, 1000);
+        for index in 0..EFFECT_QUEUE {
+            let snapshot = actor.snapshot().unwrap();
+            actor
+                .mutate(request(
+                    &actor,
+                    &format!("fill-effect-queue-{index}"),
+                    snapshot.revision,
+                    WorkspaceMutation::CreateTab {
+                        session_id: initial.sessions[0].id.clone(),
+                        label: String::new(),
+                        cols: 1000,
+                        rows: 1000,
+                        working_directory: None,
+                    },
+                ))
+                .unwrap();
+        }
+        let before = actor.snapshot().unwrap();
+        let mutation = request(
+            &actor,
+            "grow-queue-full",
+            before.revision,
+            growth_operation(&before, 100),
+        );
+        assert_eq!(
+            actor.mutate(mutation.clone()).unwrap_err().code,
+            ErrorCode::Busy
+        );
+        assert_eq!(actor.snapshot().unwrap(), before);
+        assert!(
+            actor
+                .outcome(mutation.mutation_id.clone())
+                .unwrap()
+                .is_none()
+        );
+        let queued = receive_launches(&effects, EFFECT_QUEUE);
+        assert!(
+            queued
+                .iter()
+                .all(|surface| before.surface(&surface.id) == Some(surface))
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+        let receipt = actor.mutate(mutation).unwrap();
+        let created = receive_launches(&effects, 99);
+        assert_eq!(receipt.revision, before.revision + 1);
+        assert_eq!(receipt.affected_panes.len(), 100);
+        assert!(created.iter().all(|surface| {
+            before.surface(&surface.id).is_none() && receipt.affected_surfaces.contains(&surface.id)
+        }));
+    }
+
+    #[test]
+    fn atomic_growth_above_effect_queue_capacity_keeps_runtime_feedback_live() {
+        let (actor, effects, initial) = growth_fixture(1000, 1000);
+        let worker_actor = actor.clone();
+        let worker = thread::spawn(move || {
+            let mut pending = VecDeque::new();
+            let mut launched = Vec::new();
+            for _ in 0..99 {
+                let surface = loop {
+                    let effect = pending.pop_front().unwrap_or_else(|| {
+                        effects
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("growth dispatch stalled")
+                    });
+                    match effect {
+                        WorkspaceEffect::Batch(batch) => pending.extend(batch),
+                        WorkspaceEffect::Launch(surface, _) => break surface,
+                        WorkspaceEffect::End { .. } => panic!("unexpected cleanup"),
+                    }
+                };
+                // Surface::spawn asks for a snapshot and reports Running. Both
+                // callbacks must work while the transaction dispatches its batch.
+                worker_actor.snapshot().unwrap();
+                worker_actor.observe(RuntimeObservation::Running {
+                    surface_id: surface.id.clone(),
+                    process_lifetime_id: surface.process_lifetime_id.clone(),
+                    working_directory: None,
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let snapshot = worker_actor.snapshot().unwrap();
+                    if snapshot
+                        .surface(&surface.id)
+                        .is_some_and(|info| info.status == SurfaceStatus::Running)
+                    {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "runtime observation stalled");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                launched.push(surface.id);
+            }
+            launched
+        });
+        let mutation = request(
+            &actor,
+            "grow-hundred",
+            initial.revision,
+            growth_operation(&initial, 100),
+        );
+        let mutation_actor = actor.clone();
+        let (reply, receive) = mpsc::sync_channel(1);
+        let mutation_worker = thread::spawn(move || {
+            reply.send(mutation_actor.mutate(mutation)).unwrap();
+        });
+        let receipt = receive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("growth blocked the actor on runtime feedback")
+            .unwrap();
+        mutation_worker.join().unwrap();
+        let launched = worker.join().unwrap();
+        let final_snapshot = actor.snapshot().unwrap();
+        assert_eq!(receipt.revision, initial.revision + 1);
+        assert_eq!(receipt.affected_panes.len(), 100);
+        assert_eq!(receipt.affected_surfaces.len(), 100);
+        assert_eq!(final_snapshot.surfaces.len(), 100);
+        assert!(launched.into_iter().all(|id| {
+            receipt.affected_surfaces.contains(&id)
+                && final_snapshot
+                    .surface(&id)
+                    .is_some_and(|surface| surface.status == SurfaceStatus::Running)
+        }));
+        assert_eq!(
+            final_snapshot.surface(&initial.surfaces[0].id),
+            Some(&initial.surfaces[0])
+        );
+    }
+
+    #[test]
+    fn atomic_growth_reports_all_ids_in_one_revision_and_preserves_existing_processes() {
+        let (actor, effects, initial) = growth_fixture(80, 24);
+        let receipt = actor
+            .mutate(request(
+                &actor,
+                "grow-four",
+                initial.revision,
+                growth_operation(&initial, 4),
+            ))
+            .unwrap();
+        let four = actor.snapshot().unwrap();
+        assert_eq!(receipt.revision, initial.revision + 1);
+        assert_eq!(four.revision, receipt.revision);
+        assert_eq!(
+            receipt.affected_sessions,
+            vec![initial.sessions[0].id.clone()]
+        );
+        assert_eq!(
+            receipt.affected_tabs,
+            vec![initial.sessions[0].tabs[0].id.clone()]
+        );
+        assert_eq!(
+            receipt.affected_panes,
+            pane_ids(&four.sessions[0].tabs[0].layout)
+        );
+        assert_eq!(receipt.affected_panes.len(), 4);
+        assert_eq!(four.surfaces.len(), 4);
+        assert_eq!(
+            four.surface(&initial.surfaces[0].id),
+            Some(&initial.surfaces[0])
+        );
+        let mut launched = HashSet::new();
+        for surface in receive_launches(&effects, 3) {
+            assert_eq!(
+                surface.launch.working_directory.as_deref(),
+                Some("/preserved-launch-directory")
+            );
+            assert!(receipt.affected_surfaces.contains(&surface.id));
+            assert_eq!(four.surface(&surface.id), Some(&surface));
+            assert!(launched.insert(surface.id));
+        }
+        assert_eq!(
+            receipt.affected_surfaces.iter().collect::<HashSet<_>>(),
+            four.surfaces.iter().map(|surface| &surface.id).collect()
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+
+        let next = actor
+            .mutate(request(
+                &actor,
+                "grow-six",
+                four.revision,
+                growth_operation(&four, 6),
+            ))
+            .unwrap();
+        let six = actor.snapshot().unwrap();
+        assert_eq!(six.revision, four.revision + 1);
+        assert_eq!(next.affected_panes.len(), 6);
+        for surface in &four.surfaces {
+            assert_eq!(six.surface(&surface.id), Some(surface));
+        }
+        let mut old_leaves = Vec::new();
+        let mut new_leaves = Vec::new();
+        collect_leaves(&four.sessions[0].tabs[0].layout, &mut old_leaves);
+        collect_leaves(&six.sessions[0].tabs[0].layout, &mut new_leaves);
+        assert!(
+            old_leaves
+                .into_iter()
+                .all(|leaf| new_leaves.contains(&leaf))
+        );
+        for surface in receive_launches(&effects, 2) {
+            assert!(four.surface(&surface.id).is_none());
+        }
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn atomic_growth_preflights_late_layout_and_geometry_errors_without_launching() {
+        let (actor, effects, initial) = growth_fixture(80, 24);
+        let mut invalid = growth_operation(&initial, 4);
+        let WorkspaceMutation::GrowTab {
+            layout: PlannedLayoutNode::Split { second, .. },
+            ..
+        } = &mut invalid
+        else {
+            unreachable!();
+        };
+        let PlannedLayoutNode::Split { ratio, .. } = &mut **second else {
+            unreachable!();
+        };
+        *ratio = 0.0;
+        assert_eq!(
+            actor
+                .mutate(request(&actor, "grow-bad-ratio", initial.revision, invalid))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(actor.snapshot().unwrap(), initial);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            actor
+                .outcome(MutationId::from("grow-bad-ratio"))
+                .unwrap()
+                .is_none()
+        );
+
+        let too_small = WorkspaceMutation::GrowTab {
+            tab_id: initial.sessions[0].tabs[0].id.clone(),
+            layout: PlannedLayoutNode::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.1,
+                first: Box::new(PlannedLayoutNode::NewPane),
+                second: Box::new(PlannedLayoutNode::ExistingPane {
+                    pane_id: pane_ids(&initial.sessions[0].tabs[0].layout)[0].clone(),
+                }),
+            },
+            working_directory: None,
+        };
+        assert_eq!(
+            actor
+                .mutate(request(
+                    &actor,
+                    "grow-too-small",
+                    initial.revision,
+                    too_small
+                ))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(actor.snapshot().unwrap(), initial);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn atomic_growth_refuses_excess_and_never_removes_existing_panes() {
+        let (actor, effects, initial) = growth_fixture(1000, 1000);
+        let error = actor
+            .mutate(request(
+                &actor,
+                "grow-excess",
+                initial.revision,
+                growth_operation(&initial, MAX_TAB_PANES * 2),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("at most"));
+        assert_eq!(actor.snapshot().unwrap(), initial);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+        let remove_existing = WorkspaceMutation::GrowTab {
+            tab_id: initial.sessions[0].tabs[0].id.clone(),
+            layout: PlannedLayoutNode::NewPane,
+            working_directory: None,
+        };
+        assert_eq!(
+            actor
+                .mutate(request(
+                    &actor,
+                    "grow-omits-existing",
+                    initial.revision,
+                    remove_existing
+                ))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(actor.snapshot().unwrap(), initial);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn atomic_growth_does_not_treat_unresized_original_pane_as_extra_tab_space() {
+        let (actor, effects, initial) = growth_fixture(80, 24);
+        let operation = |snapshot: &WorkspaceSnapshot, count| WorkspaceMutation::GrowTab {
+            tab_id: snapshot.sessions[0].tabs[0].id.clone(),
+            layout: columns(
+                count,
+                &mut pane_ids(&snapshot.sessions[0].tabs[0].layout).into_iter(),
+            ),
+            working_directory: None,
+        };
+        actor
+            .mutate(request(
+                &actor,
+                "grow-two-unresized",
+                initial.revision,
+                operation(&initial, 2),
+            ))
+            .unwrap();
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::Launch(_, _)
+        ));
+        let before = actor.snapshot().unwrap();
+        // No resize observation has arrived for the original 80-column pane.
+        assert_eq!(before.surface(&initial.surfaces[0].id).unwrap().cols, 80);
+        assert_eq!(
+            actor
+                .mutate(request(
+                    &actor,
+                    "grow-four-unresized",
+                    before.revision,
+                    operation(&before, 4),
+                ))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(actor.snapshot().unwrap(), before);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn atomic_growth_retains_valid_rounded_three_column_layout_after_measured_resizes() {
+        let (actor, effects, initial) = growth_fixture(63, 24);
+        let operation = |snapshot: &WorkspaceSnapshot| WorkspaceMutation::GrowTab {
+            tab_id: snapshot.sessions[0].tabs[0].id.clone(),
+            layout: columns(
+                3,
+                &mut pane_ids(&snapshot.sessions[0].tabs[0].layout).into_iter(),
+            ),
+            working_directory: None,
+        };
+        actor
+            .mutate(request(
+                &actor,
+                "rounded-columns",
+                initial.revision,
+                operation(&initial),
+            ))
+            .unwrap();
+        let launched = receive_launches(&effects, 2);
+        assert_eq!(
+            launched
+                .iter()
+                .map(|surface| surface.cols)
+                .collect::<Vec<_>>(),
+            vec![20, 21]
+        );
+        let created = actor.snapshot().unwrap();
+        actor.observe(RuntimeObservation::Resized {
+            surface_id: initial.surfaces[0].id.clone(),
+            process_lifetime_id: initial.surfaces[0].process_lifetime_id.clone(),
+            cols: 20,
+            rows: 24,
+        });
+        let measured = wait_revision(&actor, created.revision + 1);
+        let receipt = actor
+            .mutate(request(
+                &actor,
+                "rounded-columns-again",
+                measured.revision,
+                operation(&measured),
+            ))
+            .unwrap();
+        let repeated = actor.snapshot().unwrap();
+        assert_eq!(receipt.revision, measured.revision + 1);
+        assert_eq!(repeated.sessions, measured.sessions);
+        assert_eq!(repeated.surfaces, measured.surfaces);
+        assert_eq!(
+            receipt.affected_panes,
+            pane_ids(&measured.sessions[0].tabs[0].layout)
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn atomic_growth_stale_revision_has_no_shell_or_workspace_effects() {
+        let (actor, effects, initial) = growth_fixture(80, 24);
+        assert_eq!(
+            actor
+                .mutate(request(
+                    &actor,
+                    "grow-stale",
+                    initial.revision - 1,
+                    growth_operation(&initial, 4),
+                ))
+                .unwrap_err()
+                .code,
+            ErrorCode::RevisionConflict
+        );
+        assert_eq!(actor.snapshot().unwrap(), initial);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            actor
+                .outcome(MutationId::from("grow-stale"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn split_creates_complete_tree_before_launch_effect() {
         let (actor, effects) = WorkspaceActor::memory();
@@ -2168,6 +3037,7 @@ mod tests {
             receipts: vec![receipt],
             pending_removals: vec![],
             recovery_message: after.recovery_message.clone(),
+            last_directories: Default::default(),
         };
         let path = std::env::temp_dir().join(format!(
             "compi-detach-{}-{}.json",
@@ -2421,6 +3291,7 @@ mod tests {
             receipts: vec![],
             pending_removals: vec![],
             recovery_message: None,
+            last_directories: Default::default(),
         })
         .unwrap();
 
@@ -2757,6 +3628,7 @@ mod tests {
             receipts: vec![],
             pending_removals: vec![],
             recovery_message: None,
+            last_directories: Default::default(),
         };
         crate::workspace_store::validate(&stored).unwrap();
     }
@@ -2820,6 +3692,129 @@ mod tests {
                 .status,
             SurfaceStatus::Starting
         );
+    }
+
+    #[test]
+    fn lost_shell_restarts_in_its_last_reported_directory() {
+        let path = std::env::temp_dir().join(format!(
+            "compi-last-directory-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        let (store, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let (actor, effects) = WorkspaceActor::start(store, workspace);
+        actor
+            .mutate(request(
+                &actor,
+                "initialize",
+                0,
+                WorkspaceMutation::Initialize {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        let WorkspaceEffect::Launch(surface, _) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        let observe_directory = |directory: &str| {
+            actor.observe(RuntimeObservation::Directory {
+                surface_id: surface.id.clone(),
+                process_lifetime_id: surface.process_lifetime_id.clone(),
+                directory: directory.into(),
+            });
+        };
+        // An existing directory, so the resume check passes on every platform.
+        let project = std::env::temp_dir().to_string_lossy().into_owned();
+        let revision = actor.snapshot().unwrap().revision;
+        observe_directory("/home/me/first");
+        observe_directory(&project);
+        thread::sleep(Duration::from_millis(50));
+        // Directory changes are saved without a client-visible revision.
+        assert_eq!(actor.snapshot().unwrap().revision, revision);
+        drop(actor);
+        drop(effects);
+        thread::sleep(Duration::from_millis(50));
+
+        // Restarting the daemon loses the shell; restarting it resumes in /home/me/project.
+        let (store, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.surfaces[0].status, SurfaceStatus::Lost);
+        let (actor, effects) = WorkspaceActor::start(store, reopened);
+        let lost = actor.snapshot().unwrap();
+        actor
+            .mutate(request(
+                &actor,
+                "restart-lost",
+                lost.revision,
+                WorkspaceMutation::RestartSurface {
+                    surface_id: surface.id.clone(),
+                    expected_lifetime: surface.process_lifetime_id.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            ))
+            .unwrap();
+        let launched = loop {
+            match effects.recv().unwrap() {
+                WorkspaceEffect::Launch(launched, _) => break launched,
+                WorkspaceEffect::Batch(batch) => {
+                    if let Some(WorkspaceEffect::Launch(launched, _)) = batch.into_iter().next() {
+                        break launched;
+                    }
+                }
+                WorkspaceEffect::End { .. } => panic!("restart must not end anything"),
+            }
+        };
+        assert_eq!(
+            launched.launch.working_directory.as_deref(),
+            Some(project.as_str())
+        );
+        // The recorded launch is where this shell now started.
+        assert_eq!(
+            actor
+                .snapshot()
+                .unwrap()
+                .surface(&surface.id)
+                .unwrap()
+                .launch
+                .working_directory
+                .as_deref(),
+            Some(project.as_str())
+        );
+        drop(actor);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_missing_last_directory_is_not_resumed() {
+        let mut surface = SurfaceInfo {
+            id: SurfaceId::new("surface-1"),
+            process_lifetime_id: ProcessLifetimeId::new("lifetime-1"),
+            status: SurfaceStatus::Lost,
+            attached: false,
+            cols: 80,
+            rows: 24,
+            created_at_ms: 1,
+            exit_code: None,
+            error: None,
+            launch: LaunchRequest {
+                working_directory: None,
+                profile: None,
+            },
+            working_directory: None,
+        };
+        let missing = format!("/compi-missing-{}-{}", std::process::id(), now_ms());
+        if cfg!(windows) {
+            // Windows checks a WSL shell's path through its distribution's share.
+            surface.working_directory = Some(compi_protocol::WorkingDirectory {
+                requested: "/".into(),
+                resolved_wsl_path: "/".into(),
+                distribution: format!("compi-no-such-distribution-{}", std::process::id()),
+                warning: None,
+            });
+        }
+        assert!(!resume_directory_exists(&surface, &missing));
     }
 
     #[test]

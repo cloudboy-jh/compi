@@ -1,10 +1,9 @@
 //! Tab arrangements: built-in and named presets, mirror/flip, swap, and restore.
 //!
-//! Every function returns a tree holding exactly the input tree's leaves, so the
-//! result can be committed with `ArrangeTab` without launching, restarting, or
-//! ending a process. Panes fill slots in reading order (depth first).
+//! Arrangements preserve existing leaves; growth plans add actor-assigned slots
+//! for one atomic transaction. Panes fill slots in reading order (depth first).
 use crate::layout::Rect;
-use compi_protocol::{LayoutNode, PaneId, SplitAxis, SurfaceId};
+use compi_protocol::{LayoutNode, PaneId, PlannedLayoutNode, SplitAxis, SurfaceId};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_NAMED_PRESETS: usize = 32;
@@ -203,6 +202,51 @@ pub fn arrange(
         }
     };
     apply_transform(arranged, transform)
+}
+
+/// Propose a complete arrangement with new slots, without allocating identities
+/// or changing any existing pane. The actor validates and commits the whole plan.
+pub fn plan_growth(current: &LayoutNode, preset: Preset<'_>, total: usize) -> PlannedLayoutNode {
+    fn collect_panes<'a>(node: &'a LayoutNode, panes: &mut Vec<&'a PaneId>) {
+        match node {
+            LayoutNode::Pane { pane_id, .. } => panes.push(pane_id),
+            LayoutNode::Split { first, second, .. } => {
+                collect_panes(first, panes);
+                collect_panes(second, panes);
+            }
+        }
+    }
+    fn fill_plan<'a>(
+        shape: &Shape,
+        panes: &mut impl Iterator<Item = &'a PaneId>,
+    ) -> PlannedLayoutNode {
+        match shape {
+            Shape::Slot => panes.next().map_or(PlannedLayoutNode::NewPane, |pane_id| {
+                PlannedLayoutNode::ExistingPane {
+                    pane_id: pane_id.clone(),
+                }
+            }),
+            Shape::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => PlannedLayoutNode::Split {
+                axis: *axis,
+                ratio: *ratio,
+                first: Box::new(fill_plan(first, panes)),
+                second: Box::new(fill_plan(second, panes)),
+            },
+        }
+    }
+    let shape = match preset {
+        Preset::Builtin(Builtin::Equalize) => equalize_shape(&fit(Shape::of(current), total)),
+        Preset::Builtin(builtin) => builtin_shape(builtin, total),
+        Preset::Named(shape) => fit(shape.clone(), total),
+    };
+    let mut panes = Vec::with_capacity(total);
+    collect_panes(current, &mut panes);
+    fill_plan(&shape, &mut panes.into_iter())
 }
 
 /// Several tabs' trees side by side with equal widths, each keeping its own
@@ -529,6 +573,38 @@ fn equalize(layout: &LayoutNode) -> LayoutNode {
                 ratio: a as f32 / (a + b) as f32,
                 first: Box::new(equalize(first)),
                 second: Box::new(equalize(second)),
+            }
+        }
+    }
+}
+
+fn equalize_shape(shape: &Shape) -> Shape {
+    fn span(shape: &Shape, along: SplitAxis) -> usize {
+        match shape {
+            Shape::Split {
+                axis,
+                first,
+                second,
+                ..
+            } if *axis == along => span(first, along) + span(second, along),
+            _ => 1,
+        }
+    }
+    match shape {
+        Shape::Slot => Shape::Slot,
+        Shape::Split {
+            axis,
+            first,
+            second,
+            ..
+        } => {
+            let a = span(first, *axis);
+            let b = span(second, *axis);
+            Shape::Split {
+                axis: *axis,
+                ratio: a as f32 / (a + b) as f32,
+                first: Box::new(equalize_shape(first)),
+                second: Box::new(equalize_shape(second)),
             }
         }
     }

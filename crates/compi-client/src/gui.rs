@@ -17,6 +17,8 @@ use compi_protocol::{
     WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
 mod brand;
+mod lifecycle;
+use lifecycle::PaneError;
 mod workspace;
 use crate::typography::TerminalTypography;
 use crate::viewport::{
@@ -170,6 +172,7 @@ fn run_application(
                         };
                         let target = target.clone();
                         let _ = cx.update(|cx| {
+                            let completion = request.completion;
                             let result = match request.mode {
                                 crate::window_host::LaunchMode::Ordinary => open_compi_window(
                                     target, request.initial_working_directory, request.config, None, cx,
@@ -185,6 +188,18 @@ fn run_application(
                                 }
                                 crate::window_host::LaunchMode::UnprepareUpdate { handoff } => {
                                     workspace::abort_update(&handoff, cx)
+                                }
+                                crate::window_host::LaunchMode::InstallUpdate { version, consented, outcome } => {
+                                    crate::updates::install_for_command(version, consented, outcome)
+                                        .map_err(Into::into)
+                                }
+                                crate::window_host::LaunchMode::Control { request } => {
+                                    if let Some(completion) = completion {
+                                        workspace::presentation::dispatch(request, completion, cx);
+                                        Ok(())
+                                    } else {
+                                        Err("GUI control request has no completion channel".into())
+                                    }
                                 }
                             };
                             if let Err(error) = result {
@@ -241,6 +256,7 @@ enum ConnectionState {
     Connecting,
     Attached,
     Reconnecting,
+    Disconnected,
     Exited(u32),
     Failed,
 }
@@ -279,7 +295,12 @@ struct SurfaceView {
     closed: Arc<AtomicBool>,
     mirror: ScreenMirror,
     state: ConnectionState,
-    error: Option<String>,
+    error: Option<PaneError>,
+    final_attachment_attempted: bool,
+    runtime_unavailable: bool,
+    diagnostic_started_at: Option<Instant>,
+    diagnostic_screen_logged: bool,
+    diagnostic_frame_logged: bool,
     transport: Option<TabTransport>,
     scroll_offset: usize,
     selection: Option<Selection>,
@@ -312,8 +333,10 @@ impl SurfaceView {
             return;
         };
         if let Err(error) = transport.send(message) {
-            self.error = Some(error.to_string());
-            self.state = ConnectionState::Reconnecting;
+            self.error = Some(PaneError::from_error(error.as_ref()));
+            if !matches!(self.state, ConnectionState::Exited(_)) {
+                self.state = ConnectionState::Reconnecting;
+            }
         }
     }
 
@@ -507,6 +530,7 @@ enum UiEvent {
         appearance: AppearanceSettings,
         favorites: Vec<ThemeId>,
         ui_font: UiFontPreset,
+        density: crate::theme::WorkspaceDensity,
         terminal_font_family: String,
         diagnostics: Vec<String>,
     },
@@ -564,7 +588,7 @@ enum UiEvent {
     PerformanceSample(Result<workspace::performance::PerformanceSample, String>),
     TabDisconnected {
         tab_id: u64,
-        error: String,
+        error: PaneError,
     },
 }
 #[derive(Clone)]
@@ -792,6 +816,7 @@ struct CompiApp {
     ime_selected_range: Range<usize>,
     surface_views: Vec<SurfaceView>,
     surface_names: HashMap<SurfaceId, (compi_protocol::ProcessLifetimeId, String, Option<String>)>,
+    metadata: workspace::metadata::MetadataUi,
     focused_view: Option<u64>,
     file_tree: Option<workspace::tree::FileTree>,
     tree_scroll: ScrollHandle,
@@ -829,7 +854,13 @@ struct CompiApp {
     theme_library: ThemeLibrary,
     ui_font: UiFontPreset,
     theme_catalog: Option<workspace::catalog::CatalogState>,
-    pending_appearance_reload: Option<(AppearanceSettings, Vec<ThemeId>, UiFontPreset, String)>,
+    pending_appearance_reload: Option<(
+        AppearanceSettings,
+        Vec<ThemeId>,
+        UiFontPreset,
+        crate::theme::WorkspaceDensity,
+        String,
+    )>,
     pending_image_inputs: HashSet<u64>,
     image_previews: VecDeque<workspace::media::ImagePreview>,
     image_inspector: Option<workspace::media::InspectorState>,
@@ -873,6 +904,9 @@ struct CompiApp {
     float_area: layout::Size,
     float_drag: Option<FloatDrag>,
     mutation_pending: bool,
+    /// The last lost shell this window restarted automatically, and when; retried only
+    /// after a pause if the restart did not take effect.
+    lost_restart: Option<(compi_protocol::ProcessLifetimeId, Instant)>,
     global_error: Option<String>,
     connection_error: Option<String>,
     font_settings: FontSettings,
@@ -1375,134 +1409,6 @@ impl Render for HeaderTooltip {
                         .child(reason),
                 )
             })
-    }
-}
-struct TabTooltip {
-    title: Option<String>,
-    /// Name, directory, and whether the pane floats in this window.
-    panes: Vec<(String, Option<String>, bool)>,
-    colors: ThemeColors,
-}
-
-impl Render for TabTooltip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let pane_count = self.panes.len();
-        let header = self
-            .title
-            .clone()
-            .or_else(|| (pane_count > 1).then(|| format!("{pane_count} terminals")));
-        let count_header = self.title.is_none();
-        div()
-            .w(px(if pane_count == 1 { 240.0 } else { 284.0 }))
-            .px_3()
-            .py_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(self.colors.border))
-            .bg(color(self.colors.surface))
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .text_color(color(modal_text_color(
-                self.colors.foreground,
-                &self.colors,
-            )))
-            .when_some(header, |tooltip, header| {
-                tooltip.child(
-                    div()
-                        .pb_1()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(color(modal_text_color(
-                            if count_header {
-                                self.colors.muted
-                            } else {
-                                self.colors.foreground
-                            },
-                            &self.colors,
-                        )))
-                        .child(header),
-                )
-            })
-            .child(
-                div()
-                    .id("tab-tooltip-panes")
-                    .max_h(px(320.0))
-                    .overflow_y_scroll()
-                    .children(self.panes.iter().enumerate().map(
-                        |(index, (name, directory, floating))| {
-                            div()
-                                .when(index > 0, |row| {
-                                    row.mt_1()
-                                        .pt_2()
-                                        .border_t_1()
-                                        .border_color(color(self.colors.border))
-                                })
-                                .flex()
-                                .items_start()
-                                .gap_2()
-                                .when(pane_count > 1, |row| {
-                                    row.child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                                            .text_color(color(modal_text_color(
-                                                self.colors.muted,
-                                                &self.colors,
-                                            )))
-                                            .child(format!("{}", index + 1)),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .flex_1()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .child(name.clone()),
-                                                )
-                                                .when(*floating, |row| {
-                                                    row.child(
-                                                        div()
-                                                            .flex_none()
-                                                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                                                            .text_color(color(self.colors.accent))
-                                                            .child("Floating"),
-                                                    )
-                                                }),
-                                        )
-                                        .when_some(directory.clone(), |row, directory| {
-                                            row.child(
-                                                div()
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                                                    .text_color(color(modal_text_color(
-                                                        self.colors.muted,
-                                                        &self.colors,
-                                                    )))
-                                                    .child(directory),
-                                            )
-                                        }),
-                                )
-                        },
-                    )),
-            )
     }
 }
 
@@ -2805,6 +2711,8 @@ struct WorkerLifecycle {
     closed: Arc<AtomicBool>,
     update_quiesced: Arc<AtomicBool>,
     connection_guard: Arc<Mutex<()>>,
+    lifetime: compi_protocol::ProcessLifetimeId,
+    diagnostic_started_at: Option<Instant>,
 }
 
 fn spawn_tab_worker(
@@ -2822,6 +2730,8 @@ fn spawn_tab_worker(
         closed,
         update_quiesced,
         connection_guard,
+        lifetime,
+        diagnostic_started_at,
     } = lifecycle;
     thread::spawn(move || {
         while !previous_closed.load(Ordering::Acquire) {
@@ -2846,14 +2756,26 @@ fn spawn_tab_worker(
             }
             connection_target.connect()
         };
+        if let Some(started_at) = diagnostic_started_at {
+            perf::log_surface_startup_stage(
+                &surface_id,
+                &lifetime,
+                if connection.is_ok() {
+                    "client_connected"
+                } else {
+                    "client_connect_failed"
+                },
+                started_at.elapsed(),
+            );
+        }
         let result = run_tab_connection(
             tab_id,
             &surface_id,
-            cols,
-            rows,
+            (cols, rows),
             stop.clone(),
             &sender,
             connection,
+            diagnostic_started_at.map(|started| (started, &lifetime)),
         );
         closed.store(true, Ordering::Release);
         if stop.load(Ordering::Acquire) {
@@ -2861,8 +2783,11 @@ fn spawn_tab_worker(
         }
         let error = result
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "Daemon connection closed".into());
+            .map(|error| PaneError::from_error(error.as_ref()))
+            .unwrap_or_else(|| PaneError {
+                code: None,
+                message: "Daemon connection closed".into(),
+            });
         let _ = sender.send(UiEvent::TabDisconnected { tab_id, error });
     });
 }
@@ -2870,11 +2795,11 @@ fn spawn_tab_worker(
 fn run_tab_connection(
     tab_id: u64,
     surface_id: &SurfaceId,
-    cols: i16,
-    rows: i16,
+    size: (i16, i16),
     stop: Arc<AtomicBool>,
     sender: &UiEventSender,
     connection: crate::Result<DaemonClient>,
+    startup: Option<(Instant, &compi_protocol::ProcessLifetimeId)>,
 ) -> crate::Result<()> {
     let mut client = connection?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2892,7 +2817,7 @@ fn run_tab_connection(
             });
             return Ok(());
         };
-        if surface.status == SurfaceStatus::Lost {
+        if matches!(surface.status, SurfaceStatus::Lost | SurfaceStatus::Failed) {
             stop.store(true, Ordering::Release);
             let _ = sender.send(UiEvent::TabControl {
                 tab_id,
@@ -2909,7 +2834,7 @@ fn run_tab_connection(
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        match client.attach_surface(&surface, cols, rows) {
+        match client.attach_surface(&surface, size.0, size.1) {
             Ok(()) => break,
             Err(error)
                 if surface.status == SurfaceStatus::Starting
@@ -2928,6 +2853,14 @@ fn run_tab_connection(
             }
             Err(error) => return Err(error),
         }
+    }
+    if let Some((started_at, lifetime)) = startup {
+        perf::log_surface_startup_stage(
+            surface_id,
+            lifetime,
+            "client_attached",
+            started_at.elapsed(),
+        );
     }
     while let Some(message) = client.take_pending_screen() {
         let _ = sender.send(UiEvent::TabScreen { tab_id, message });

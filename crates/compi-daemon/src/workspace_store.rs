@@ -5,6 +5,7 @@ use compi_protocol::{
     WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -39,6 +40,10 @@ pub struct StoredWorkspace {
     #[serde(default)]
     pub pending_removals: Vec<PendingRemoval>,
     pub recovery_message: Option<String>,
+    /// The directory each shell last reported (OSC 7), so a shell lost when the daemon
+    /// restarts comes back where the user was. Daemon-internal; never sent to clients.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_directories: BTreeMap<SurfaceId, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -123,6 +128,9 @@ impl WorkspaceStore {
                 Ok(manifest) if manifest.format_version == FORMAT_VERSION => {
                     validate(&manifest.workspace)?;
                     let mut workspace = manifest.workspace;
+                    // A recovery message reports what one daemon start found. It is shown
+                    // during that run and must not reappear on every later start.
+                    workspace.recovery_message = None;
                     recover_lost_surfaces(&mut workspace);
                     store.commit(&workspace)?;
                     Ok((store, workspace))
@@ -209,6 +217,7 @@ impl StoredWorkspace {
             surfaces: Vec::new(),
             receipts: Vec::new(),
             recovery_message: None,
+            last_directories: BTreeMap::new(),
         }
     }
 
@@ -302,6 +311,7 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
             "Imported legacy terminal metadata; backup retained at {}",
             backup.display()
         )),
+        last_directories: BTreeMap::new(),
     }
 }
 
@@ -320,9 +330,12 @@ fn recover_lost_surfaces(workspace: &mut StoredWorkspace) {
         }
     }
     if !workspace.pending_removals.is_empty() {
+        // The removal never committed, so its tab, pane or workspace is still present.
         workspace.pending_removals.clear();
-        workspace.recovery_message =
-            Some("Interrupted workspace removal was retained for explicit recovery".into());
+        workspace.recovery_message = Some(
+            "Compi restarted before a close finished, so the tab was kept. Close it again if you no longer need it."
+                .into(),
+        );
         changed = true;
     }
     if changed {
@@ -614,6 +627,29 @@ mod tests {
         let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
         assert_eq!(reopened.surfaces[0].status, SurfaceStatus::Lost);
         assert!(!reopened.surfaces[0].attached);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_message_shows_for_one_daemon_start_only() {
+        let path = test_path("recovery-once");
+        let (store, mut workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        workspace.recovery_message = Some("from an earlier start".into());
+        workspace.pending_removals.push(PendingRemoval {
+            target: RemovalTarget::Tab {
+                tab_id: TabId::new("tab-1"),
+            },
+            surfaces: Vec::new(),
+        });
+        store.commit(&workspace).unwrap();
+        let (_, interrupted) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let message = interrupted
+            .recovery_message
+            .expect("the interruption is reported");
+        assert_ne!(message, "from an earlier start");
+        assert!(interrupted.pending_removals.is_empty());
+        let (_, later) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(later.recovery_message, None);
         let _ = fs::remove_file(path);
     }
 

@@ -716,6 +716,7 @@ fn handle_connection(
             }
             let request_id = request.request_id;
             let target = request.target;
+            let console_attach = matches!(&request.message, ClientMessage::AttachConsole { .. });
             match request.message {
                 ClientMessage::GetWorkspace => match manager.snapshot() {
                     Ok(workspace) => sink.send_control(&ServerControl {
@@ -724,6 +725,90 @@ fn handle_connection(
                     })?,
                     Err(error) => send_actor_error(&sink, request_id, &error),
                 },
+                ClientMessage::ObserveSurface {
+                    surface_id,
+                    expected_lifetime,
+                    scrollback,
+                } => {
+                    let Some(surface) = manager.get(&surface_id) else {
+                        send_unavailable_surface(&sink, request_id, &manager, &surface_id);
+                        continue;
+                    };
+                    if let Err(error) =
+                        surface.observe(&sink, request_id, &expected_lifetime, scrollback)
+                    {
+                        send_surface_error(&sink, request_id, &error);
+                    }
+                }
+                ClientMessage::SendSurfaceInput {
+                    surface_id,
+                    expected_lifetime,
+                    data,
+                } => {
+                    let Some(surface) = manager.get(&surface_id) else {
+                        send_unavailable_surface(&sink, request_id, &manager, &surface_id);
+                        continue;
+                    };
+                    match surface.send_explicit_input(&expected_lifetime, &data) {
+                        Ok(()) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::InputAccepted,
+                        })?,
+                        Err(error) => send_surface_error(&sink, request_id, &error),
+                    }
+                }
+                ClientMessage::DetachSurface {
+                    surface_id,
+                    expected_lifetime,
+                } => {
+                    let Some(surface) = manager.get(&surface_id) else {
+                        send_unavailable_surface(&sink, request_id, &manager, &surface_id);
+                        continue;
+                    };
+                    match surface.detach_console(&expected_lifetime) {
+                        Ok(()) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::Detached { surface_id },
+                        })?,
+                        Err(error) => send_surface_error(&sink, request_id, &error),
+                    }
+                }
+                ClientMessage::GetSurfaceMetadata {
+                    surface_id,
+                    expected_lifetime,
+                } => {
+                    let Some(surface) = manager.get(&surface_id) else {
+                        let workspace = manager.snapshot()?;
+                        if let Some(recorded) = workspace
+                            .surfaces
+                            .iter()
+                            .find(|surface| surface.id == surface_id)
+                        {
+                            if recorded.process_lifetime_id != expected_lifetime {
+                                send_surface_error(&sink, request_id, &SurfaceError::StaleLifetime);
+                            } else {
+                                sink.send_control(&ServerControl {
+                                    request_id: Some(request_id),
+                                    message: ServerMessage::SurfaceMetadata {
+                                        metadata: Box::new(crate::metadata::unavailable(recorded)),
+                                    },
+                                })?;
+                            }
+                        } else {
+                            send_unavailable_surface(&sink, request_id, &manager, &surface_id);
+                        }
+                        continue;
+                    };
+                    match surface.metadata(&expected_lifetime) {
+                        Ok(metadata) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::SurfaceMetadata {
+                                metadata: Box::new(metadata),
+                            },
+                        })?,
+                        Err(error) => send_surface_error(&sink, request_id, &error),
+                    }
+                }
                 ClientMessage::GetRuntimeMetrics => match manager.snapshot() {
                     Ok(workspace) => {
                         let live_surfaces = workspace
@@ -882,6 +967,12 @@ fn handle_connection(
                     expected_lifetime,
                     cols,
                     rows,
+                }
+                | ClientMessage::AttachConsole {
+                    surface_id,
+                    expected_lifetime,
+                    cols,
+                    rows,
                 } => {
                     if attached.is_some() {
                         send_error(
@@ -896,7 +987,14 @@ fn handle_connection(
                         send_unavailable_surface(&sink, request_id, &manager, &surface_id);
                         continue;
                     };
-                    match surface.attach(sink.clone(), request_id, &expected_lifetime, cols, rows) {
+                    match surface.attach(
+                        sink.clone(),
+                        request_id,
+                        &expected_lifetime,
+                        cols,
+                        rows,
+                        console_attach,
+                    ) {
                         Ok(()) => attached = Some(surface),
                         Err(error) => send_surface_error(&sink, request_id, &error),
                     }

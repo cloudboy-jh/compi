@@ -125,6 +125,9 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
 #[cfg(any(windows, target_os = "macos"))]
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(exit) = compi_client::cli::dispatch(&raw) {
+        std::process::exit(exit);
+    }
     if let [mode, root, version] = raw.as_slice()
         && mode == "--stop-idle-update-daemons"
     {
@@ -214,6 +217,10 @@ fn main() {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn main() {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(exit) = compi_client::cli::dispatch(&raw) {
+        std::process::exit(exit);
+    }
     eprintln!(
         "The Compi native application runs on Windows and macOS; use compi-probe for headless Unix sessions"
     );

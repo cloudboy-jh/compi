@@ -244,6 +244,15 @@ pub fn connect(name: &str, timeout: Duration) -> Result<File> {
     }
 }
 
+/// Whether a daemon endpoint is listening now, without waiting for one to
+/// appear. Busy endpoints exist; only a missing pipe is absent.
+#[cfg(windows)]
+pub fn exists(name: &str) -> bool {
+    let name = wide(name);
+    unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), 1) }.as_bool()
+        || io::Error::last_os_error().raw_os_error() != Some(ERROR_FILE_NOT_FOUND.0 as i32)
+}
+
 #[cfg(windows)]
 pub fn flush(file: &File) -> Result<()> {
     unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle()))? };
@@ -352,6 +361,19 @@ pub fn connect(name: &str, timeout: Duration) -> Result<File> {
                 thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+}
+
+/// Whether a daemon endpoint is listening now, without waiting for one to
+/// appear. A missing or refusing socket (left by a stopped daemon) is absent.
+#[cfg(unix)]
+pub fn exists(name: &str) -> bool {
+    match open_unix_nonblocking(name, Duration::ZERO) {
+        Ok(_) => true,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ),
     }
 }
 

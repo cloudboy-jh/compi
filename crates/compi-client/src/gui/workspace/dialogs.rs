@@ -719,7 +719,53 @@ impl CompiApp {
                                     .text_color(color(modal_text_color(colors.error, &colors)))
                                     .child(error),
                             )
-                        }),
+                        })
+                        .when_some(self.connection_error.clone(), |body, error| {
+                            body.child(
+                                div()
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.error, &colors)))
+                                    .child(error),
+                            )
+                        })
+                        .children(self.surface_views.iter().filter_map(|view| {
+                            let details = self.pane_diagnostics(view);
+                            let metadata = self.pane_metadata(&view.surface_id);
+                            if details.is_empty() && metadata.is_none() {
+                                return None;
+                            }
+                            Some(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        self.settings_subheading(&format!("Pane {}", view.pane_id)),
+                                    )
+                                    .when(!details.is_empty(), |pane| {
+                                        pane.child(
+                                            div()
+                                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                                .text_color(color(modal_text_color(
+                                                    colors.error,
+                                                    &colors,
+                                                )))
+                                                .child(details),
+                                        )
+                                    })
+                                    .when_some(metadata, |pane, metadata| {
+                                        pane.child(
+                                            div()
+                                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                                .text_color(color(modal_text_color(
+                                                    colors.muted,
+                                                    &colors,
+                                                )))
+                                                .child(crate::metadata::details(metadata)),
+                                        )
+                                    }),
+                            )
+                        })),
                 )
                 .child(
                     div()

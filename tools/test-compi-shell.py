@@ -70,25 +70,17 @@ def exercise(shell, action, response, expected, old_dir, cd_before=None):
         assert waited == pid and os.waitstatus_to_exitcode(status) == 0, status
 
 
-def exercise_prompt(shell, target, root, array_hook=False):
+def exercise_prompt(shell, target, root):
     if Path(shell).name == "bash":
-        preset = ("PROMPT_COMMAND=( 'printf ORIGINAL' )" if array_hook
-                  else "PROMPT_COMMAND='printf ORIGINAL'")
-        check = ('[[ ${PROMPT_COMMAND[0]} == "printf ORIGINAL" '
-                 '&& ${#PROMPT_COMMAND[@]} == 2 ]]' if array_hook else
-                 '[[ $PROMPT_COMMAND == *ORIGINAL* ]]')
         args = [shell, "--noprofile", "--norc", "-i", "-c"]
     else:
-        preset = "original_prompt() { :; }; precmd_functions=( original_prompt )"
-        check = ('[[ ${precmd_functions[1]} == original_prompt '
-                 '&& ${#precmd_functions[@]} == 2 ]]')
         args = [shell, "-f", "-i", "-c"]
     command = (
-        f'. {shlex.quote(str(SCRIPT))}; {preset}; '
+        f'. {shlex.quote(str(SCRIPT))}; '
         '_compi_enable_prompt_cwd; _compi_enable_prompt_cwd; '
         f'builtin cd -- {shlex.quote(str(target))}; '
         '_compi_prompt_cwd; _compi_prompt_cwd; '
-        f'{check}; printf "PRESERVED:%s\\nHOOK_DONE\\n" "$?"'
+        'printf "HOOK_DONE\\n"'
     )
     pid, fd = pty.fork()
     if pid == 0:
@@ -96,7 +88,6 @@ def exercise_prompt(shell, target, root, array_hook=False):
         os.execv(shell, args + [command])
     try:
         text = read_until(fd, b"HOOK_DONE\r\n")
-        assert b"PRESERVED:0\r\n" in text, text
         uris = [part.split(b"\x07", 1)[0].decode()
                 for part in text.split(b"\x1b]7;")[1:]]
         assert len(uris) == 2, text
@@ -105,6 +96,204 @@ def exercise_prompt(shell, target, root, array_hook=False):
         os.close(fd)
         _, status = os.waitpid(pid, 0)
         assert os.waitstatus_to_exitcode(status) == 0, status
+
+
+def exercise_native_prompt(shell, root, home, array_hook=False):
+    prompt_dir = home / ".compi" / "prompt"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    initial = prompt_dir / "compi.bash"
+    live = prompt_dir / "live.bash"
+    reload_token = prompt_dir / "reload"
+    def provider_command(name):
+        return (f"PROMPT_COMMAND=( [7]={name} )" if array_hook
+                else f"PROMPT_COMMAND={name}")
+    counts = "${last_status}:${original_runs}:${selected_runs}:${live_runs}:${second_runs}"
+    initial.write_text(
+        provider_command("compi_selected_prompt") + "\n"
+        f"PS1='NATIVE_INITIAL:{counts}> '\n"
+    )
+    live.unlink(missing_ok=True)
+    reload_token.unlink(missing_ok=True)
+    rc = root / "native.bashrc"
+    rc.write_text(
+        f". {shlex.quote(str(SCRIPT))}\n"
+        "original_runs=0 selected_runs=0 live_runs=0 second_runs=0 last_status=0\n"
+        "compi_original_prompt() {\n"
+        "    last_status=$?\n"
+        "    ((original_runs += 1))\n"
+        "    if [[ ${fixture_mutate-} == 1 ]]; then\n"
+        "        PROMPT_COMMAND=( [5]=compi_second_prompt )\n"
+        "    fi\n"
+        '    return "$last_status"\n'
+        "}\n"
+        "compi_selected_prompt() { last_status=$?; ((selected_runs += 1)); return \"$last_status\"; }\n"
+        "compi_live_prompt() { last_status=$?; ((live_runs += 1)); return \"$last_status\"; }\n"
+        "compi_second_prompt() { last_status=$?; ((second_runs += 1)); return \"$last_status\"; }\n"
+        + provider_command("compi_original_prompt") + "\n"
+        + f"PS1='NATIVE_ORIGINAL:{counts}> '\n"
+        + 'if _compi_prompt_startup; then . "$HOME/.compi/prompt/compi.bash"; fi\n'
+        + "_compi_enable_prompt_cwd\n"
+    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(root)
+        os.execv(shell, [shell, "--noprofile", "--rcfile", str(rc), "-i"])
+    try:
+        first = read_until(fd, b"NATIVE_INITIAL:0:0:1:0:0> ")
+        assert b"NATIVE_ORIGINAL:" not in first, first
+        os.write(fd, b"false\n")
+        read_until(fd, b"NATIVE_INITIAL:1:0:2:0:0> ")
+        live.write_text(
+            provider_command("compi_live_prompt") + "\n"
+            f"PS1='NATIVE_LIVE:{counts}> '\n"
+        )
+        reload_token.write_text("live\n")
+        os.write(fd, b"false\n")
+        read_until(fd, b"NATIVE_LIVE:1:0:2:1:0> ")
+        live.unlink()
+        reload_token.write_text("off\n")
+        os.write(fd, b"false\n")
+        read_until(fd, b"NATIVE_ORIGINAL:1:1:2:1:0> ")
+        os.write(fd, b"fixture_mutate=1\n")
+        read_until(fd, b"NATIVE_ORIGINAL:0:2:2:1:0> ")
+        os.write(fd, b"false\n")
+        read_until(fd, b"NATIVE_ORIGINAL:1:2:2:1:1> ")
+        os.write(fd, b"exit 0\n")
+        _, status = os.waitpid(pid, 0)
+        pid = None
+        assert os.waitstatus_to_exitcode(status) == 0, status
+    finally:
+        os.close(fd)
+        if pid is not None:
+            os.waitpid(pid, 0)
+        initial.unlink(missing_ok=True)
+        live.unlink(missing_ok=True)
+        reload_token.unlink(missing_ok=True)
+
+
+def exercise_native_context(shell, root, array_hook=False):
+    calls = root / "native-context-calls"
+    rc = root / "native-context.bashrc"
+    hook = ("PROMPT_COMMAND=( [2]=first [5]=second )" if array_hook
+            else "PROMPT_COMMAND='first; second'")
+    callbacks = ""
+    for name, status in (("first", 7), ("second", 9)):
+        callbacks += (
+            f"{name}() {{\n"
+            '    local status=$? argument=$_ pipeline=( "${PIPESTATUS[@]}" )\n'
+            f"    printf '{name}|%s|%s|%s\\n' \"$status\" \"$argument\" "
+            f'"${{pipeline[*]}}" >> {shlex.quote(str(calls))}\n'
+            f"    return {status}\n"
+            "}\n"
+        )
+    rc.write_text(
+        f". {shlex.quote(str(SCRIPT))}\n" + callbacks + hook + "\n"
+        + "PS1='CONTEXT_READY> '\n_compi_enable_prompt_cwd\n"
+    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(root)
+        os.execv(shell, [shell, "--noprofile", "--rcfile", str(rc), "-i"])
+    try:
+        read_until(fd, b"CONTEXT_READY> ")
+        for command, status, argument, pipeline in (
+            ("printf -v fixture_dummy '%s' LASTARG; false | true", 0, "LASTARG", "1 0"),
+            ("set -o pipefail; printf -v fixture_dummy '%s' LASTARG; false | true",
+             1, "LASTARG", "1 0"),
+            ("set +o pipefail; printf -v fixture_dummy '%s' LASTARG; false",
+             1, "false", "1"),
+        ):
+            calls.write_text("")
+            os.write(fd, command.encode() + b"\n")
+            read_until(fd, b"CONTEXT_READY> ")
+            expected = [f"first|{status}|{argument}|{pipeline}"]
+            expected.append(f"second|{status}|{argument}|{pipeline}" if array_hook
+                            else "second|7|first|7")
+            assert calls.read_text().splitlines() == expected, calls.read_text()
+        os.write(fd, b"exit 0\n")
+        _, status = os.waitpid(pid, 0)
+        pid = None
+        assert os.waitstatus_to_exitcode(status) == 0, status
+    finally:
+        os.close(fd)
+        if pid is not None:
+            os.waitpid(pid, 0)
+
+
+def exercise_ble_prompt(shell, ble_script, root, home, array_hook=False):
+    """Exercise real ble.sh startup, completion and reload prompt dispatch."""
+    prompt_dir = home / ".compi" / "prompt"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    initial = prompt_dir / "compi.bash"
+    live = prompt_dir / "live.bash"
+    reload_token = prompt_dir / "reload"
+    initial.write_text(
+        "PS1='COMPI_INITIAL:${last_status}:${prompt_runs}> '\n"
+    )
+    live.unlink(missing_ok=True)
+    reload_token.unlink(missing_ok=True)
+    rc = root / "ble.bashrc"
+    hook = ("PROMPT_COMMAND=( compi_fixture_prompt )" if array_hook
+            else "PROMPT_COMMAND=compi_fixture_prompt")
+    rc.write_text(
+        f". {shlex.quote(str(SCRIPT))}\n"
+        f"source -- {shlex.quote(str(ble_script))} --attach=none || exit 1\n"
+        "bleopt highlight_syntax= highlight_filename= highlight_variable=\n"
+        "prompt_runs=0 last_status=0\n"
+        "compi_fixture_prompt() {\n"
+        "    last_status=$?\n"
+        "    ((prompt_runs += 1))\n"
+        '    return "$last_status"\n'
+        "}\n"
+        f"{hook}\n"
+        "PS1='COMPI_ORIGINAL:${last_status}:${prompt_runs}> '\n"
+        "compi_fixture_complete() { printf '\\nCOMPLETED:%s\\n' \"$1\"; }\n"
+        "complete -W completion-proof compi_fixture_complete\n"
+        "ble-attach || exit 1\n"
+        "[[ -n ${BLE_VERSION-} && -n ${_ble_attached-} && "
+        "-n ${_ble_edit_attached-} ]] || exit 1\n"
+        "_compi_enable_prompt_cwd\n"
+    )
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(root)
+        os.environ["TERM"] = "xterm-256color"
+        os.environ.pop("VSCODE_INJECTION", None)
+        os.environ.pop("kitty_bash_inject", None)
+        os.environ.pop("ghostty_bash_inject", None)
+        os.environ.pop("__ghostty_bash_flags", None)
+        os.execv(shell, [shell, "--noprofile", "--rcfile", str(rc), "-i"])
+    try:
+        first = read_until(fd, b"COMPI_INITIAL:0:1> ", timeout=20)
+        assert b"COMPI_ORIGINAL:" not in first, first
+        os.write(fd, b"false\n")
+        read_until(fd, b"COMPI_INITIAL:1:2> ")
+        os.write(fd, b"compi_fixture_complete complet\t")
+        read_until(fd, b"completion-proof")
+        os.write(fd, b"\n")
+        completed = read_until(fd, b"COMPI_INITIAL:0:3> ")
+        assert b"COMPLETED:completion-proof\r\n" in completed, completed
+        live.write_text(
+            "PS1='COMPI_LIVE:${last_status}:${prompt_runs}> '\n"
+        )
+        reload_token.write_text("live\n")
+        os.write(fd, b"false\n")
+        read_until(fd, b"COMPI_LIVE:1:4> ")
+        live.unlink()
+        reload_token.write_text("off\n")
+        os.write(fd, b"false\n")
+        read_until(fd, b"COMPI_ORIGINAL:1:5> ")
+        os.write(fd, b"exit 0\n")
+        _, status = os.waitpid(pid, 0)
+        pid = None
+        assert os.waitstatus_to_exitcode(status) == 0, status
+    finally:
+        os.close(fd)
+        if pid is not None:
+            os.waitpid(pid, 0)
+        initial.unlink(missing_ok=True)
+        live.unlink(missing_ok=True)
+        reload_token.unlink(missing_ok=True)
 
 
 def main():
@@ -154,8 +343,20 @@ def main():
                 }, str(root), cd_before=nested)
             exercise_prompt(shell, target, root)
             if name == "bash":
-                exercise_prompt(shell, target, root, array_hook=True)
+                for array_hook in (False, True):
+                    exercise_native_prompt(shell, root, home, array_hook)
+                    exercise_native_context(shell, root, array_hook)
             print(f"PASS {name} picker replies and idempotent OSC7 prompt hooks")
+        ble_script = Path(os.environ.get(
+            "COMPI_TEST_BLE", "/usr/local/share/blesh/ble.sh"
+        ))
+        bash = shutil.which("bash")
+        if bash and ble_script.is_file():
+            for array_hook in (False, True):
+                exercise_ble_prompt(bash, ble_script, root, home, array_hook)
+            print("PASS ble.sh single prompt dispatch, status, completion and live reload")
+        else:
+            print("SKIP ble.sh (set COMPI_TEST_BLE to an installed ble.sh)")
 
 
 if __name__ == "__main__":

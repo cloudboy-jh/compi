@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
 #[cfg(windows)]
@@ -71,6 +71,11 @@ pub struct Surface {
     pending_cleanup: Mutex<Option<PtySession>>,
     actor: WorkspaceActor,
     working_directory: Option<WorkingDirectory>,
+    metadata: crate::metadata::MetadataCache,
+    shell_executable: Option<String>,
+    distribution: Option<String>,
+    #[cfg(unix)]
+    metadata_fd: std::fs::File,
 }
 
 struct SurfaceRuntime {
@@ -82,6 +87,7 @@ struct SurfaceRuntime {
     terminal: TerminalState,
     client: Option<(ConnectionSink, AttachmentId)>,
     client_ready: bool,
+    client_console: bool,
 }
 
 struct PendingLatency {
@@ -123,6 +129,7 @@ struct Outgoing {
 pub enum SurfaceError {
     AlreadyAttached,
     NotAttached,
+    NoConsole,
     Unavailable,
     StaleLifetime,
     Internal(String),
@@ -133,6 +140,7 @@ impl SurfaceError {
         match self {
             Self::AlreadyAttached => ErrorCode::AlreadyAttached,
             Self::NotAttached => ErrorCode::NotAttached,
+            Self::NoConsole => ErrorCode::NotAttached,
             Self::Unavailable => ErrorCode::SurfaceUnavailable,
             Self::StaleLifetime => ErrorCode::StaleLifetime,
             Self::Internal(_) => ErrorCode::Internal,
@@ -145,6 +153,10 @@ impl fmt::Display for SurfaceError {
         match self {
             Self::AlreadyAttached => write!(formatter, "surface already has a controlling client"),
             Self::NotAttached => write!(formatter, "connection is not attached to this surface"),
+            Self::NoConsole => write!(
+                formatter,
+                "pane has no CLI console attachment; GUI attachments are never released by detach"
+            ),
             Self::Unavailable => write!(formatter, "surface is not running"),
             Self::StaleLifetime => write!(formatter, "surface process lifetime changed"),
             Self::Internal(message) => formatter.write_str(message),
@@ -157,24 +169,28 @@ impl std::error::Error for SurfaceError {}
 impl SurfaceManager {
     pub fn new() -> Self {
         let (actor, effects) = WorkspaceActor::memory();
-        Self::with_actor(actor, effects)
+        Self::with_actor(actor, effects, None)
     }
 
     pub fn persistent(instance: Option<&str>) -> Result<Self> {
         let (actor, effects) = WorkspaceActor::persistent(instance)?;
-        let mut manager = Self::with_actor(actor, effects);
-        manager.instance = instance.map(str::to_owned);
-        Ok(manager)
+        Ok(Self::with_actor(actor, effects, instance))
     }
 
-    fn with_actor(actor: WorkspaceActor, effects: Receiver<WorkspaceEffect>) -> Self {
+    fn with_actor(
+        actor: WorkspaceActor,
+        effects: Receiver<WorkspaceEffect>,
+        instance: Option<&str>,
+    ) -> Self {
         let surfaces = Arc::new(Mutex::new(HashMap::<SurfaceId, Arc<Surface>>::new()));
         let worker_surfaces = surfaces.clone();
         let worker_actor = actor.clone();
         let runtime_stopping = Arc::new(Mutex::new(false));
         let worker_stopping = runtime_stopping.clone();
+        let worker_instance = instance.map(str::to_owned);
         thread::spawn(move || {
-            while let Ok(effect) = effects.recv() {
+            let mut pending_effects = VecDeque::new();
+            while let Some(effect) = pending_effects.pop_front().or_else(|| effects.recv().ok()) {
                 let Ok(stopped) = worker_stopping.lock() else {
                     return;
                 };
@@ -182,7 +198,25 @@ impl SurfaceManager {
                     continue;
                 }
                 match effect {
+                    WorkspaceEffect::Batch(batch) => {
+                        if pending_effects.is_empty() {
+                            pending_effects = batch.into();
+                        } else {
+                            for effect in batch.into_iter().rev() {
+                                pending_effects.push_front(effect);
+                            }
+                        }
+                    }
                     WorkspaceEffect::Launch(info, context) => {
+                        let startup_started = compi_protocol::perf::enabled().then(Instant::now);
+                        if let Some(started) = startup_started {
+                            compi_protocol::perf::log_surface_startup_stage(
+                                &info.id,
+                                &info.process_lifetime_id,
+                                "request",
+                                started.elapsed(),
+                            );
+                        }
                         if let Ok(registry) = worker_surfaces.lock()
                             && let Some(previous) = registry.get(&info.id)
                         {
@@ -192,6 +226,14 @@ impl SurfaceManager {
                         {
                             Ok(launch) => launch,
                             Err(error) => {
+                                if let Some(started) = startup_started {
+                                    compi_protocol::perf::log_surface_startup_stage(
+                                        &info.id,
+                                        &info.process_lifetime_id,
+                                        "resolve_failed",
+                                        started.elapsed(),
+                                    );
+                                }
                                 worker_actor.observe(RuntimeObservation::Failed {
                                     surface_id: info.id,
                                     process_lifetime_id: info.process_lifetime_id,
@@ -200,10 +242,24 @@ impl SurfaceManager {
                                 continue;
                             }
                         };
+                        if let Some(started) = startup_started {
+                            compi_protocol::perf::log_surface_startup_stage(
+                                &info.id,
+                                &info.process_lifetime_id,
+                                "launch_resolved",
+                                started.elapsed(),
+                            );
+                        }
                         let surface_id = info.id.clone();
                         let lifetime = info.process_lifetime_id.clone();
-                        match Surface::spawn(info, launch, context.as_deref(), worker_actor.clone())
-                        {
+                        match Surface::spawn(
+                            info,
+                            launch,
+                            context.as_deref(),
+                            worker_actor.clone(),
+                            worker_instance.as_deref(),
+                            startup_started,
+                        ) {
                             Ok(surface) => {
                                 if let Ok(mut registry) = worker_surfaces.lock()
                                     && let Some(previous) =
@@ -212,11 +268,21 @@ impl SurfaceManager {
                                     previous.join();
                                 }
                             }
-                            Err(error) => worker_actor.observe(RuntimeObservation::Failed {
-                                surface_id,
-                                process_lifetime_id: lifetime,
-                                error: error.to_string(),
-                            }),
+                            Err(error) => {
+                                if let Some(started) = startup_started {
+                                    compi_protocol::perf::log_surface_startup_stage(
+                                        &surface_id,
+                                        &lifetime,
+                                        "spawn_failed",
+                                        started.elapsed(),
+                                    );
+                                }
+                                worker_actor.observe(RuntimeObservation::Failed {
+                                    surface_id,
+                                    process_lifetime_id: lifetime,
+                                    error: error.to_string(),
+                                });
+                            }
                         }
                     }
                     WorkspaceEffect::End {
@@ -262,7 +328,7 @@ impl SurfaceManager {
         Self {
             surfaces,
             actor,
-            instance: None,
+            instance: instance.map(str::to_owned),
             daemon_executable,
             lifecycle_clients: Mutex::new(BTreeSet::new()),
             runtime_stopping,
@@ -354,8 +420,11 @@ impl SurfaceManager {
                 .map(|surface| (&surface.id, &surface.process_lifetime_id))
                 .collect();
             surfaces.retain(|id, surface| {
-                // A runtime may have been published after this snapshot was captured.
-                let current = surface.created_revision > snapshot.revision
+                // A runtime may have been published after this snapshot was
+                // captured. Launches start before their commit is persisted, so
+                // a runtime created while that commit is pending records the
+                // previous revision: equal revisions are therefore still current.
+                let current = surface.created_revision >= snapshot.revision
                     || lifetimes
                         .get(id)
                         .is_some_and(|lifetime| **lifetime == surface.process_lifetime_id);
@@ -438,11 +507,103 @@ impl Default for SurfaceManager {
 impl Surface {
     fn spawn(
         info: SurfaceInfo,
-        launch: LaunchDescription,
+        mut launch: LaunchDescription,
         context: Option<&compi_protocol::LaunchContext>,
         actor: WorkspaceActor,
+        instance: Option<&str>,
+        startup_started: Option<Instant>,
     ) -> Result<Arc<Self>> {
+        #[cfg(unix)]
+        let shell_executable = launch.executable.to_str().map(str::to_owned);
+        #[cfg(windows)]
+        let shell_executable = Some(
+            info.launch
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.executable.as_deref())
+                .unwrap_or("/bin/bash")
+                .to_owned(),
+        );
+        #[cfg(unix)]
+        let distribution = None;
+        #[cfg(windows)]
+        let distribution = Some(
+            launch
+                .argv
+                .windows(2)
+                .find(|args| args[0] == "--distribution")
+                .and_then(|args| args[1].to_str())
+                .ok_or("WSL launch has no resolved distribution")?
+                .to_owned(),
+        );
+        let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) {
+            "compi.exe"
+        } else {
+            "compi"
+        });
+        let environment = [
+            ("COMPI_SURFACE_ID", info.id.as_str().to_owned()),
+            ("COMPI_INSTANCE", instance.unwrap_or("").to_owned()),
+            (
+                if cfg!(windows) {
+                    "COMPI_CLI_WINDOWS"
+                } else {
+                    "COMPI_CLI"
+                },
+                cli.to_string_lossy().into_owned(),
+            ),
+            (
+                if cfg!(windows) {
+                    "COMPI_CLI_DATA_DIR_WINDOWS"
+                } else {
+                    "COMPI_DATA_DIR"
+                },
+                compi_protocol::paths::data_dir()?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ];
+        #[cfg(unix)]
+        launch.env.extend(
+            environment
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+        #[cfg(windows)]
+        {
+            let exec = launch
+                .argv
+                .iter()
+                .position(|arg| arg == "--exec")
+                .ok_or("WSL launch has no executable boundary")?
+                + 1;
+            let mut prefix: Vec<std::ffi::OsString> = vec!["/usr/bin/env".into()];
+            prefix.extend(
+                environment
+                    .into_iter()
+                    .map(|(key, value)| format!("{key}={value}").into()),
+            );
+            launch.argv.splice(exec..exec, prefix);
+        }
+        if let Some(started) = startup_started {
+            compi_protocol::perf::log_surface_startup_stage(
+                &info.id,
+                &info.process_lifetime_id,
+                "pty_spawn",
+                started.elapsed(),
+            );
+        }
         let mut pty = PtySession::spawn(&launch, info.cols, info.rows)?;
+        if let Some(started) = startup_started {
+            compi_protocol::perf::log_surface_startup_stage(
+                &info.id,
+                &info.process_lifetime_id,
+                "pty_spawned",
+                started.elapsed(),
+            );
+        }
+        #[cfg(unix)]
+        let metadata_fd = pty.metadata_fd()?;
         let (input, mut output) = pty.take_io()?;
         let (command_sender, command_receiver) = sync_channel(64);
         let trace = match TerminalTraceRecorder::from_env(
@@ -495,6 +656,7 @@ impl Surface {
                 terminal,
                 client: None,
                 client_ready: false,
+                client_console: false,
             }),
             input: Mutex::new(Some(input)),
             trace: Mutex::new(trace),
@@ -505,11 +667,19 @@ impl Surface {
             pending_cleanup: Mutex::new(None),
             actor,
             working_directory: launch.metadata,
+            metadata: crate::metadata::MetadataCache::default(),
+            shell_executable,
+            distribution,
+            #[cfg(unix)]
+            metadata_fd,
         });
 
         let output_surface = surface.clone();
         let output_thread = thread::spawn(move || {
             let mut buffer = [0_u8; TRANSPORT_CHUNK];
+            let mut first_output_started = startup_started;
+            // The directory last reported to the workspace, so only changes are sent.
+            let mut reported_directory: Option<String> = None;
             loop {
                 let read = match output.read(&mut buffer) {
                     Ok(0) => break,
@@ -517,6 +687,14 @@ impl Surface {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
+                if let Some(started) = first_output_started.take() {
+                    compi_protocol::perf::log_surface_startup_stage(
+                        &output_surface.id,
+                        &output_surface.process_lifetime_id,
+                        "first_output",
+                        started.elapsed(),
+                    );
+                }
                 if compi_protocol::perf::enabled()
                     && let Ok(mut pending) = output_surface.pending_latency.lock()
                 {
@@ -533,11 +711,16 @@ impl Surface {
                     }
                 }
                 output_surface.record_trace_output(&buffer[..read]);
-                let (sink, mut delta, replies) = {
+                let (sink, mut delta, replies, directory) = {
                     let Ok(mut state) = output_surface.state.lock() else {
                         break;
                     };
                     let (delta, replies) = state.terminal.advance(&buffer[..read]);
+                    let directory = state
+                        .terminal
+                        .current_directory()
+                        .filter(|current| reported_directory.as_deref() != Some(*current))
+                        .map(str::to_owned);
                     (
                         state
                             .client
@@ -546,8 +729,17 @@ impl Surface {
                             .map(|(sink, _)| sink.clone()),
                         delta,
                         replies,
+                        directory,
                     )
                 };
+                if let Some(directory) = directory {
+                    reported_directory = Some(directory.clone());
+                    output_surface.actor.observe(RuntimeObservation::Directory {
+                        surface_id: output_surface.id.clone(),
+                        process_lifetime_id: output_surface.process_lifetime_id.clone(),
+                        directory,
+                    });
+                }
                 if let Some(delta) = delta.as_mut()
                     && let Ok(mut pending) = output_surface.pending_latency.lock()
                 {
@@ -838,6 +1030,7 @@ impl Surface {
         expected_lifetime: &ProcessLifetimeId,
         cols: i16,
         rows: i16,
+        console: bool,
     ) -> std::result::Result<(), SurfaceError> {
         validate_dimensions(cols, rows)
             .map_err(|error| SurfaceError::Internal(error.to_string()))?;
@@ -875,6 +1068,7 @@ impl Surface {
             }
             state.client = Some((sink.clone(), attachment_id.clone()));
             state.client_ready = false;
+            state.client_console = console;
         }
         let result = (|| -> std::result::Result<(), SurfaceError> {
             // Reserve control without publishing deltas, size the PTY/grid, then
@@ -955,6 +1149,133 @@ impl Surface {
             },
         })
         .map_err(|error| SurfaceError::Internal(error.to_string()))
+    }
+
+    fn validate_lifetime(
+        &self,
+        expected: &ProcessLifetimeId,
+    ) -> std::result::Result<(), SurfaceError> {
+        if self.retired.load(Ordering::Acquire) || expected != &self.process_lifetime_id {
+            Err(SurfaceError::StaleLifetime)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn metadata(
+        &self,
+        expected: &ProcessLifetimeId,
+    ) -> std::result::Result<compi_protocol::metadata::PaneMetadata, SurfaceError> {
+        use compi_protocol::metadata::{EnvironmentIdentity, EnvironmentKind, MetadataField};
+        let input = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+            self.validate_lifetime(expected)?;
+            #[cfg(unix)]
+            let foreground_pgid = {
+                use std::os::fd::AsRawFd;
+                let group = unsafe { libc::tcgetpgrp(self.metadata_fd.as_raw_fd()) };
+                (group > 0).then_some(group as u32)
+            };
+            #[cfg(windows)]
+            let foreground_pgid = None;
+            crate::metadata::MetadataInput {
+                surface_id: self.id.clone(),
+                process_lifetime_id: self.process_lifetime_id.clone(),
+                title: state.terminal.title().to_owned(),
+                current_directory: state.terminal.current_directory().map(str::to_owned),
+                shell_pid: state.terminal.shell_pid(),
+                shell_executable: self.shell_executable.clone(),
+                foreground_pgid,
+                environment: EnvironmentIdentity {
+                    kind: if cfg!(windows) {
+                        EnvironmentKind::Wsl
+                    } else {
+                        EnvironmentKind::Unix
+                    },
+                    hostname: MetadataField::unavailable("environment not yet queried"),
+                    distribution: self.distribution.clone(),
+                },
+                cols: state.cols as u16,
+                rows: state.rows as u16,
+                running: state.status == SurfaceStatus::Running,
+            }
+        };
+        Ok(self.metadata.get(input))
+    }
+
+    /// A one-shot observer receives a baseline, not a controller attachment.
+    pub fn observe(
+        &self,
+        sink: &ConnectionSink,
+        request_id: u64,
+        expected: &ProcessLifetimeId,
+        scrollback: bool,
+    ) -> std::result::Result<(), SurfaceError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+        self.validate_lifetime(expected)?;
+        let snapshot = crate::screen::snapshot(state.terminal.text_snapshot(scrollback));
+        sink.send_control(&ServerControl {
+            request_id: Some(request_id),
+            message: ServerMessage::SurfaceObserved {
+                identity: self.identity.clone(),
+                sequence: snapshot.sequence,
+            },
+        })
+        .and_then(|_| {
+            sink.send_screen_recovery(&TerminalFrame {
+                identity: self.identity.clone(),
+                message: ScreenMessage::Snapshot { snapshot },
+            })
+        })
+        .map_err(|error| SurfaceError::Internal(error.to_string()))
+    }
+
+    pub fn detach_console(
+        &self,
+        expected: &ProcessLifetimeId,
+    ) -> std::result::Result<(), SurfaceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+        self.validate_lifetime(expected)?;
+        if !state.client_console {
+            return Err(SurfaceError::NoConsole);
+        }
+        let (sink, _) = state.client.take().ok_or(SurfaceError::NoConsole)?;
+        state.client_ready = false;
+        state.client_console = false;
+        sink.send_control(&ServerControl {
+            request_id: None,
+            message: ServerMessage::Detached {
+                surface_id: self.id.clone(),
+            },
+        })
+        .map_err(|error| SurfaceError::Internal(error.to_string()))
+    }
+
+    pub fn send_explicit_input(
+        &self,
+        expected: &ProcessLifetimeId,
+        bytes: &[u8],
+    ) -> std::result::Result<(), SurfaceError> {
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+            self.validate_lifetime(expected)?;
+            if state.status != SurfaceStatus::Running {
+                return Err(SurfaceError::Unavailable);
+            }
+        }
+        self.write_bytes(bytes, None)
     }
 
     pub fn request_snapshot(
@@ -1042,6 +1363,14 @@ impl Surface {
         latency_id: Option<u64>,
     ) -> std::result::Result<(), SurfaceError> {
         self.require_attached(target)?;
+        self.write_bytes(bytes, latency_id)
+    }
+
+    fn write_bytes(
+        &self,
+        bytes: &[u8],
+        latency_id: Option<u64>,
+    ) -> std::result::Result<(), SurfaceError> {
         let mut input_guard = self
             .input
             .lock()

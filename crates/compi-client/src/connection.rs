@@ -41,6 +41,19 @@ impl ConnectionTarget {
         }
     }
 
+    /// Public control commands never launch a daemon as an inspection side effect.
+    pub fn connect_existing(&self) -> Result<DaemonClient> {
+        match self {
+            Self::Local { instance } => {
+                DaemonClient::connect(instance.as_deref(), std::time::Duration::from_secs(2))
+            }
+            Self::Ssh { endpoint, instance } => {
+                let mut command = endpoint.command_mode(instance.as_deref(), true);
+                DaemonClient::connect_command(&mut command)
+            }
+        }
+    }
+
     pub fn lifecycle_status(&self) -> Result<compi_protocol::LifecycleStatus> {
         match self {
             Self::Local { instance } => DaemonClient::lifecycle_status(instance.as_deref()),

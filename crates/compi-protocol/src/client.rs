@@ -289,6 +289,14 @@ fn child_stdin_file(stdin: ChildStdin) -> File {
     unsafe { File::from_raw_handle(stdin.into_raw_handle()) }
 }
 
+/// A daemon endpoint found by [`DaemonClient::local_daemons`]. `status` is
+/// `None` when the endpoint answers but cannot be inspected.
+#[derive(Debug, Clone)]
+pub struct LocalDaemon {
+    pub instance: Option<String>,
+    pub status: Option<crate::LifecycleStatus>,
+}
+
 pub struct DaemonClient {
     connection: ClientIo,
     next_request_id: u64,
@@ -419,10 +427,18 @@ impl DaemonClient {
         }
     }
 
-    pub fn local_lifecycle_statuses() -> Result<Vec<crate::LifecycleStatus>> {
+    /// Local daemons listening now, for selecting an untargeted command's
+    /// instance. Instances whose endpoint is missing are skipped without
+    /// waiting. A listening endpoint that cannot be inspected (an older or
+    /// incompatible daemon) is still reported, with `status: None`, so it
+    /// keeps the selection ambiguous instead of being silently bypassed.
+    pub fn local_daemons() -> Result<Vec<LocalDaemon>> {
+        Self::local_daemons_in(&crate::paths::data_dir()?)
+    }
+
+    fn local_daemons_in(directory: &std::path::Path) -> Result<Vec<LocalDaemon>> {
         let mut instances = std::collections::BTreeSet::new();
         instances.insert(None);
-        let directory = crate::paths::data_dir()?;
         match std::fs::read_dir(directory) {
             Ok(entries) => {
                 for entry in entries {
@@ -439,27 +455,36 @@ impl DaemonClient {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let mut statuses = Vec::new();
+        let mut daemons: Vec<LocalDaemon> = Vec::new();
         for instance in instances {
-            match Self::lifecycle_status(instance.as_deref()) {
-                Ok(status) => {
-                    if !statuses.iter().any(|existing: &crate::LifecycleStatus| {
-                        existing.server_generation == status.server_generation
-                    }) {
-                        statuses.push(status);
-                    }
-                }
-                Err(error)
-                    if ConnectionFailure::kind(error.as_ref()) == ConnectionFailureKind::Absent => {
-                }
-                Err(error) => return Err(error),
+            if !pipe::exists(&identity::instance_names(instance.as_deref())?.pipe) {
+                continue;
             }
+            let status = match Self::lifecycle_status(instance.as_deref()) {
+                Ok(status) => Some(status),
+                Err(error)
+                    if ConnectionFailure::kind(error.as_ref()) == ConnectionFailureKind::Absent =>
+                {
+                    continue;
+                }
+                Err(_) => None,
+            };
+            if let Some(status) = &status
+                && daemons.iter().any(|existing| {
+                    existing.status.as_ref().is_some_and(|existing| {
+                        existing.server_generation == status.server_generation
+                    })
+                })
+            {
+                continue;
+            }
+            daemons.push(LocalDaemon { instance, status });
         }
         #[cfg(windows)]
-        if !statuses.iter().any(|status| status.instance.is_none()) {
+        if !daemons.iter().any(|daemon| daemon.instance.is_none()) {
             Self::reject_supervisor_backoff()?;
         }
-        Ok(statuses)
+        Ok(daemons)
     }
 
     pub fn local_lifecycle_statuses_for_install(
@@ -553,6 +578,125 @@ impl DaemonClient {
     pub fn runtime_metrics(&mut self) -> Result<RuntimeMetrics> {
         match self.request(ClientMessage::GetRuntimeMetrics)? {
             ServerMessage::RuntimeMetrics { metrics } => Ok(metrics),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Read a terminal without becoming its controller or changing its dimensions.
+    pub fn inspect_surface(
+        &mut self,
+        surface: &SurfaceInfo,
+        scrollback: bool,
+    ) -> Result<crate::ScreenSnapshot> {
+        if self.target.is_some() {
+            return Err("observation requires a separate, unattached control connection".into());
+        }
+        let sequence = match self.request_bounded(
+            ClientMessage::ObserveSurface {
+                surface_id: surface.id.clone(),
+                expected_lifetime: surface.process_lifetime_id.clone(),
+                scrollback,
+            },
+            Duration::from_secs(5),
+        )? {
+            ServerMessage::SurfaceObserved { identity, sequence }
+                if identity.surface_id == surface.id
+                    && identity.process_lifetime_id == surface.process_lifetime_id =>
+            {
+                sequence
+            }
+            message => return Err(unexpected_response(message)),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.poll_event()? {
+                Some(ServerEvent::Screen(crate::ScreenMessage::Snapshot { snapshot }))
+                    if snapshot.sequence == sequence =>
+                {
+                    return Ok(snapshot);
+                }
+                Some(ServerEvent::Control {
+                    message:
+                        ServerMessage::Error {
+                            code,
+                            message,
+                            current_revision,
+                        },
+                    ..
+                }) => {
+                    return Err(Box::new(DaemonError {
+                        code,
+                        message,
+                        current_revision,
+                    }));
+                }
+                Some(_) => {}
+                None if Instant::now() >= deadline => {
+                    return Err("terminal observation timed out".into());
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// Explicit CLI input does not acquire or disturb a GUI attachment.
+    pub fn send_surface_input(&mut self, surface: &SurfaceInfo, data: Vec<u8>) -> Result<()> {
+        match self.request_bounded(
+            ClientMessage::SendSurfaceInput {
+                surface_id: surface.id.clone(),
+                expected_lifetime: surface.process_lifetime_id.clone(),
+                data,
+            },
+            Duration::from_secs(5),
+        )? {
+            ServerMessage::InputAccepted => Ok(()),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    pub fn surface_metadata(
+        &mut self,
+        surface: &SurfaceInfo,
+    ) -> Result<crate::metadata::PaneMetadata> {
+        match self.request_bounded(
+            ClientMessage::GetSurfaceMetadata {
+                surface_id: surface.id.clone(),
+                expected_lifetime: surface.process_lifetime_id.clone(),
+            },
+            Duration::from_secs(5),
+        )? {
+            ServerMessage::SurfaceMetadata { metadata } => Ok(*metadata),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    pub fn attach_console_surface(
+        &mut self,
+        surface: &SurfaceInfo,
+        cols: i16,
+        rows: i16,
+    ) -> Result<()> {
+        match self.request(ClientMessage::AttachConsole {
+            surface_id: surface.id.clone(),
+            expected_lifetime: surface.process_lifetime_id.clone(),
+            cols,
+            rows,
+        })? {
+            ServerMessage::Attached { .. } => Ok(()),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Release only an explicitly attached console, never a GUI controller.
+    pub fn detach_surface(&mut self, surface: &SurfaceInfo) -> Result<()> {
+        match self.request_bounded(
+            ClientMessage::DetachSurface {
+                surface_id: surface.id.clone(),
+                expected_lifetime: surface.process_lifetime_id.clone(),
+            },
+            Duration::from_secs(5),
+        )? {
+            ServerMessage::Detached { surface_id } if surface_id == surface.id => Ok(()),
             message => Err(unexpected_response(message)),
         }
     }
@@ -1169,6 +1313,52 @@ mod connection_classification_tests {
                 expected
             );
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_skips_missing_endpoints_and_reports_uninspectable_ones() {
+        let id = std::process::id();
+        let directory = std::env::temp_dir().join(format!("compi-discovery-{id}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let live = format!("discovery-old-{id}");
+        let dead: Vec<_> = (0..3).map(|n| format!("discovery-dead-{id}-{n}")).collect();
+        for instance in dead.iter().chain([&live]) {
+            std::fs::write(directory.join(format!("workspace-{instance}-v1.json")), "").unwrap();
+        }
+        let security = identity::PipeSecurity::for_current_user().unwrap();
+        let name = identity::instance_names(Some(&live)).unwrap().pipe;
+        let server = pipe::create_server(&name, &security, true).unwrap();
+        // An older daemon accepts, then hangs up on lifecycle inspection.
+        let older = std::thread::spawn(move || {
+            pipe::accept(&server).unwrap();
+            pipe::disconnect(&server);
+        });
+        let started = std::time::Instant::now();
+        let daemons = DaemonClient::local_daemons_in(&directory).unwrap();
+        // Each missing endpoint used to wait two seconds for a daemon to appear.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let older_daemon = daemons
+            .iter()
+            .find(|daemon| daemon.instance.as_deref() == Some(live.as_str()))
+            .expect("a listening endpoint is reported even when it cannot be inspected");
+        assert!(older_daemon.status.is_none());
+        assert!(!daemons.iter().any(|daemon| {
+            daemon
+                .instance
+                .as_ref()
+                .is_some_and(|name| dead.contains(name))
+        }));
+        older.join().unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }
 

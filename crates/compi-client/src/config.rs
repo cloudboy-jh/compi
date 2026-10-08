@@ -1,6 +1,6 @@
 //! Writable TOML schema version 1. Tables: `font`, `appearance`, `layout`,
 //! `layout_presets.<name>`, `keybindings`, `shell`, `environment`, `profiles.<name>`,
-//! `limits`, `clipboard`, `updates`.
+//! `limits`, `clipboard`, `updates`, `metadata`.
 //! `default_profile` selects a named profile over the base shell/environment.
 //! Missing settings retain defaults; invalid independent settings are diagnosed.
 //! GUI writes preserve comments and unrelated keys through an atomic replacement.
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     arrangement::{MAX_NAMED_PRESETS, Shape, valid_preset_name},
     font_catalog::{TerminalFontPreset, UiFontPreset},
-    theme::{BackgroundEffect, ThemeId},
+    theme::{BackgroundEffect, ThemeId, WorkspaceDensity},
 };
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
@@ -191,6 +191,27 @@ fn legacy_update_checks(value: &toml::Value) -> Option<bool> {
     }
 }
 
+/// Fields appended to automatic tab captions. Manual labels always win.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetadataSettings {
+    pub directory: bool,
+    pub process: bool,
+    pub git: bool,
+    pub dimensions: bool,
+}
+
+impl Default for MetadataSettings {
+    fn default() -> Self {
+        Self {
+            directory: true,
+            process: false,
+            git: false,
+            dimensions: false,
+        }
+    }
+}
+
 static CONFIG_WRITES: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,6 +225,8 @@ pub struct LoadedConfig {
     pub theme_favorites: Vec<ThemeId>,
     #[serde(default)]
     pub ui_font: UiFontPreset,
+    #[serde(default)]
+    pub density: WorkspaceDensity,
     pub sidebar_width: f32,
     pub configured_sidebar_width: f32,
     pub keybindings: HashMap<String, String>,
@@ -212,6 +235,8 @@ pub struct LoadedConfig {
     pub clipboard_policy: ClipboardPolicy,
     #[serde(default)]
     pub updates: UpdateSettings,
+    #[serde(default)]
+    pub metadata: MetadataSettings,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Named pane arrangements, shape only, keyed by preset name.
@@ -230,12 +255,14 @@ impl Default for LoadedConfig {
             configured_appearance: AppearanceSettings::default(),
             theme_favorites: Vec::new(),
             ui_font: UiFontPreset::default(),
+            density: WorkspaceDensity::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             configured_sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             keybindings: HashMap::new(),
             launch: Ok(LaunchContext::default()),
             clipboard_policy: ClipboardPolicy::default(),
             updates: UpdateSettings::default(),
+            metadata: MetadataSettings::default(),
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -245,6 +272,17 @@ impl Default for LoadedConfig {
 }
 
 impl LoadedConfig {
+    pub fn save_metadata_settings(&mut self, metadata: MetadataSettings) -> Result<(), String> {
+        update_table(&self.path, "metadata", |table| {
+            set_table_value(table, "directory", metadata.directory.into());
+            set_table_value(table, "process", metadata.process.into());
+            set_table_value(table, "git", metadata.git.into());
+            set_table_value(table, "dimensions", metadata.dimensions.into());
+        })?;
+        self.metadata = metadata;
+        Ok(())
+    }
+
     pub fn save_update_settings(&mut self, updates: UpdateSettings) -> Result<(), String> {
         update_table(&self.path, "updates", |table| {
             // The new key takes over the legacy line and its comments.
@@ -353,6 +391,15 @@ impl LoadedConfig {
             set_table_value(table, "ui_font", ui_font.id().into());
         })?;
         self.ui_font = ui_font;
+        Ok(())
+    }
+
+    /// Persist the global pane density; it applies to every window and theme.
+    pub fn save_density(&mut self, density: WorkspaceDensity) -> Result<(), String> {
+        update_appearance(&self.path, |table| {
+            set_table_value(table, "density", density.id().into());
+        })?;
+        self.density = density;
         Ok(())
     }
 
@@ -625,6 +672,18 @@ fn apply_presentation(document: &toml::Table, loaded: &mut LoadedConfig) {
                     loaded,
                     "appearance.ui_font",
                     "a bundled UI font ID",
+                    "configuration",
+                );
+            }
+        }
+        if let Some(value) = appearance.get("density") {
+            if let Some(density) = value.as_str().and_then(WorkspaceDensity::parse) {
+                loaded.density = density;
+            } else {
+                invalid(
+                    loaded,
+                    "appearance.density",
+                    "\"comfy\" or \"compact\"",
                     "configuration",
                 );
             }
@@ -1216,6 +1275,27 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
     apply_presentation(&document, loaded);
     apply_layout_presets(&document, loaded);
     apply_launch(&document, loaded);
+    if let Some(metadata) = table(&document, "metadata", loaded) {
+        for key in ["directory", "process", "git", "dimensions"] {
+            if let Some(value) = metadata.get(key) {
+                if let Some(enabled) = value.as_bool() {
+                    match key {
+                        "directory" => loaded.metadata.directory = enabled,
+                        "process" => loaded.metadata.process = enabled,
+                        "git" => loaded.metadata.git = enabled,
+                        _ => loaded.metadata.dimensions = enabled,
+                    }
+                } else {
+                    invalid(
+                        loaded,
+                        &format!("metadata.{key}"),
+                        "true or false",
+                        "configuration",
+                    );
+                }
+            }
+        }
+    }
     if let Some(updates) = table(&document, "updates", loaded) {
         if let Some(value) = updates.get("check_for_updates") {
             match value.as_bool() {
@@ -1815,6 +1895,46 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("appearance.ui_font"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn density_defaults_to_comfy_round_trips_and_rejects_unknown_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-density-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\n[appearance]\nui_font = 'inter'\n# retain me\n",
+        )
+        .unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.density, WorkspaceDensity::Comfy);
+        loaded.save_density(WorkspaceDensity::Compact).unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.density, WorkspaceDensity::Compact);
+        assert_eq!(reloaded.ui_font, UiFontPreset::Inter);
+        assert!(fs::read_to_string(&path).unwrap().contains("# retain me"));
+
+        let invalid = parse(
+            "version = 1\n[appearance]\ndensity = 'roomy'",
+            FontOverrides::default(),
+        );
+        assert_eq!(invalid.density, WorkspaceDensity::Comfy);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("appearance.density"))
         );
         fs::remove_dir_all(root).unwrap();
     }

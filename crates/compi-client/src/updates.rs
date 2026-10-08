@@ -8,6 +8,7 @@ use compi_update::{
     UpdatePhase,
 };
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::Write as _,
@@ -80,6 +81,8 @@ pub struct UpdateSnapshot {
     pub recovery_available: bool,
     /// Version whose sidebar dot the user has already seen.
     dot_seen: Option<String>,
+    /// The service has read the staged update and last outcome from disk.
+    restored: bool,
 }
 
 /// The single primary action of a state.
@@ -181,7 +184,7 @@ impl UpdateSnapshot {
         })
     }
 
-    fn ready_version(&self) -> Option<&str> {
+    pub fn ready_version(&self) -> Option<&str> {
         if self.installing || self.failure.is_some() {
             return None;
         }
@@ -202,14 +205,24 @@ impl UpdateSnapshot {
 
     /// Live shells of local daemons that the staged release must restart.
     pub fn ending_shells(&self) -> Vec<SurfaceId> {
+        self.ending_shells_by_daemon()
+            .map(|(_, surface)| surface.clone())
+            .collect()
+    }
+
+    /// `ending_shells`, each with the local daemon that runs it.
+    pub fn ending_shells_by_daemon(&self) -> impl Iterator<Item = (&ConnectionTarget, &SurfaceId)> {
         self.daemons
             .iter()
             .filter(|daemon| daemon.managed)
-            .filter_map(|daemon| daemon.status.as_ref().ok())
-            .filter(|status| self.requires_daemon_restart(status))
-            .flat_map(|status| status.live_surfaces.iter())
-            .map(|surface| surface.surface_id.clone())
-            .collect()
+            .filter_map(|daemon| Some((&daemon.target, daemon.status.as_ref().ok()?)))
+            .filter(|(_, status)| self.requires_daemon_restart(status))
+            .flat_map(|(target, status)| {
+                status
+                    .live_surfaces
+                    .iter()
+                    .map(move |surface| (target, &surface.surface_id))
+            })
     }
 
     /// `name` resolves a shell to its pane or tab label when this window knows it.
@@ -314,7 +327,7 @@ fn transfer_view(
         return UpdateView::new(format!("{label}…"), Some(UpdateButton::Cancel));
     };
     let fraction = (completed as f64 / total as f64).clamp(0.0, 1.0);
-    let mut status = format!("{label} · {}", format_transfer(completed, total));
+    let mut status = format!("{label} · {}", format_transfer(completed, total, " / "));
     if percent {
         status.push_str(&format!(" · {}%", (fraction * 100.0).floor() as u32));
     }
@@ -355,16 +368,22 @@ pub fn format_size(bytes: u64) -> String {
     format!("{}.{} MB", tenths / 10, tenths % 10)
 }
 
-/// "6.1 / 13.2 MB", in the unit of the total.
-fn format_transfer(completed: u64, total: u64) -> String {
+/// "6.1 / 13.2 MB" with `joiner` " / ", in the unit of the total.
+pub(crate) fn format_transfer(completed: u64, total: u64, joiner: &str) -> String {
     let completed = completed.min(total);
     if total >= 1_000_000 {
         let tenths = |bytes: u64| (bytes + 50_000) / 100_000;
         let (done, all) = (tenths(completed), tenths(total));
-        format!("{}.{} / {}.{} MB", done / 10, done % 10, all / 10, all % 10)
+        format!(
+            "{}.{}{joiner}{}.{} MB",
+            done / 10,
+            done % 10,
+            all / 10,
+            all % 10
+        )
     } else {
         format!(
-            "{} / {} KB",
+            "{}{joiner}{} KB",
             (completed + 500) / 1_000,
             (total + 500) / 1_000
         )
@@ -494,9 +513,29 @@ enum Request {
     /// `consented` are the shells the user saw listed when choosing to restart.
     Install {
         consented: Vec<SurfaceId>,
+        command: Option<CommandInstall>,
     },
     Reinstall,
     Repair,
+}
+
+/// A restart `compi update` handed to this GUI host.
+struct CommandInstall {
+    version: String,
+    outcome: PathBuf,
+}
+
+/// What happened to a restart handed over by `compi update`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CommandOutcome {
+    /// The update helper took over; Compi is restarting.
+    Started,
+    /// More shells would end than the command listed; it asks again.
+    ShellsChanged,
+    Failed {
+        message: String,
+    },
 }
 
 impl Request {
@@ -552,6 +591,106 @@ pub fn shared(config: &LoadedConfig, target: &ConnectionTarget) -> Arc<UpdateSer
     service
 }
 
+/// The updater for one `compi update`: no window registers a target, nothing runs
+/// unless the command asks, and saved preferences stay untouched.
+pub fn for_command() -> Arc<UpdateService> {
+    let service = SERVICE.clone();
+    service.state.lock().preferences = UpdateSettings {
+        check_for_updates: false,
+        download_updates_automatically: false,
+        last_check_unix: None,
+    };
+    service
+}
+
+/// Where this GUI host reports on a restart handed over by `compi update`: a fresh
+/// file beside the update journal. Leftovers of commands that ended with their shell
+/// are removed.
+pub fn command_outcome_path(prepared: &PreparedUpdate) -> Result<PathBuf, String> {
+    let directory = prepared
+        .journal_path
+        .parent()
+        .ok_or("Update journal has no parent")?;
+    if let Ok(entries) = fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            if command_outcome_name(&entry.file_name().to_string_lossy()) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(directory.join(format!(
+        "cli-install-{}.json",
+        compi_update::new_receipt_token()
+    )))
+}
+
+fn command_outcome_name(name: &str) -> bool {
+    name.len() <= 128 && name.starts_with("cli-install-") && name.ends_with(".json")
+}
+
+/// Reads and removes the GUI host's report, once written.
+pub fn take_command_outcome(path: &Path) -> Option<CommandOutcome> {
+    let outcome = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let _ = fs::remove_file(path);
+    Some(outcome)
+}
+
+fn write_command_outcome(path: &Path, outcome: &CommandOutcome) -> std::io::Result<()> {
+    let partial = path.with_extension("partial");
+    fs::write(&partial, serde_json::to_vec(outcome)?)?;
+    fs::rename(partial, path)
+}
+
+/// `compi update` handed its restart to this GUI host: install the update it staged,
+/// provided the shells it listed are still all that a restart ends.
+pub fn install_for_command(
+    version: String,
+    consented: Vec<SurfaceId>,
+    outcome: PathBuf,
+) -> Result<(), String> {
+    let target = InstallTarget::detect().map_err(|error| error.to_string())?;
+    if outcome.parent() != compi_update::operation_journal_path(&target).parent()
+        || !outcome
+            .file_name()
+            .is_some_and(|name| command_outcome_name(&name.to_string_lossy()))
+    {
+        return Err("compi update must report beside this installation's update journal".into());
+    }
+    let accepted = SERVICE.request(Request::Install {
+        consented,
+        command: Some(CommandInstall {
+            version,
+            outcome: outcome.clone(),
+        }),
+    });
+    if !accepted {
+        let busy = CommandOutcome::Failed {
+            message: "Compi is busy with another update step. Try again in a moment.".into(),
+        };
+        write_command_outcome(&outcome, &busy).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Takes over the update a command downloaded, which this process has not seen.
+fn adopt_staged(state: &Mutex<UpdateSnapshot>, version: &str) -> Result<(), String> {
+    let target = InstallTarget::detect().map_err(|error| error.to_string())?;
+    let prepared = compi_update::pending_update(&target)
+        .map_err(|error| error.to_string())?
+        .filter(|prepared| prepared.version == version)
+        .ok_or("The downloaded update changed. Run compi update again.")?;
+    let journal = compi_update::operation_status(&target)
+        .map_err(|error| error.to_string())?
+        .ok_or("The downloaded update has no journal")?;
+    let release = Arc::new(verified_journal_release(&journal)?);
+    let mut snapshot = state.lock();
+    snapshot.available_release = Some(release.clone());
+    snapshot.release = Some(release);
+    snapshot.prepared = Some(prepared);
+    snapshot.recovery_available = false;
+    Ok(())
+}
+
 pub fn daily_check_due(last: Option<u64>, current: u64) -> bool {
     last.is_none_or(|last| current >= last.saturating_add(86_400))
 }
@@ -588,6 +727,7 @@ impl UpdateService {
             if let Err(error) = restore_pending(&state) {
                 log(&format!("Restoring update state failed: {error}"));
             }
+            state.lock().restored = true;
             if readiness_receipt().is_some() {
                 let refreshed = state.clone();
                 thread::spawn(move || {
@@ -696,36 +836,58 @@ impl UpdateService {
                                 log(&format!("Reviewing affected work failed: {error}"));
                             }
                         }
-                        Request::Install { consented } => {
-                            review(&state, &targets, true, &cancellation)?;
-                            let snapshot = state.lock().clone();
-                            if let Some(blocker) = snapshot.install_blocker() {
-                                log(&format!("Install blocked: {blocker}"));
-                                return Ok(());
+                        Request::Install { consented, command } => {
+                            let outcome = (|| -> Result<CommandOutcome, String> {
+                                if let Some(command) = &command {
+                                    adopt_staged(&state, &command.version)?;
+                                }
+                                review(&state, &targets, true, &cancellation)?;
+                                let snapshot = state.lock().clone();
+                                if let Some(blocker) = snapshot.install_blocker() {
+                                    log(&format!("Install blocked: {blocker}"));
+                                    return Ok(CommandOutcome::Failed {
+                                        message: blocker.into(),
+                                    });
+                                }
+                                if snapshot
+                                    .ending_shells()
+                                    .iter()
+                                    .any(|shell| !consented.contains(shell))
+                                {
+                                    // The page now lists the extra shells; the next click consents.
+                                    log("Install paused: more shells would end than were shown");
+                                    return Ok(CommandOutcome::ShellsChanged);
+                                }
+                                activate(
+                                    manager(&mut manager_slot)?,
+                                    &snapshot,
+                                    &cancellation,
+                                    report,
+                                )?;
+                                log(&format!(
+                                    "Install: helper started for {}",
+                                    snapshot
+                                        .prepared
+                                        .as_ref()
+                                        .map_or("", |prepared| prepared.version.as_str())
+                                ));
+                                state.lock().installing = true;
+                                Ok(CommandOutcome::Started)
+                            })();
+                            if let Some(command) = &command {
+                                let reported = match &outcome {
+                                    Ok(outcome) => outcome.clone(),
+                                    Err(detail) => CommandOutcome::Failed {
+                                        message: detail.clone(),
+                                    },
+                                };
+                                if let Err(error) =
+                                    write_command_outcome(&command.outcome, &reported)
+                                {
+                                    log(&format!("Reporting to compi update failed: {error}"));
+                                }
                             }
-                            if snapshot
-                                .ending_shells()
-                                .iter()
-                                .any(|shell| !consented.contains(shell))
-                            {
-                                // The page now lists the extra shells; the next click consents.
-                                log("Install paused: more shells would end than were shown");
-                                return Ok(());
-                            }
-                            activate(
-                                manager(&mut manager_slot)?,
-                                &snapshot,
-                                &cancellation,
-                                report,
-                            )?;
-                            log(&format!(
-                                "Install: helper started for {}",
-                                snapshot
-                                    .prepared
-                                    .as_ref()
-                                    .map_or("", |prepared| prepared.version.as_str())
-                            ));
-                            state.lock().installing = true;
+                            outcome?;
                         }
                         Request::Reinstall => {
                             let target =
@@ -805,14 +967,14 @@ impl UpdateService {
         self.state.lock().clone()
     }
 
-    fn request(&self, request: Request) {
+    /// Whether the request was queued; operations wait for the one running.
+    fn request(&self, request: Request) -> bool {
         let Some(operation) = request.operation() else {
-            let _ = self.sender.send(request);
-            return;
+            return self.sender.send(request).is_ok();
         };
         let mut snapshot = self.state.lock();
         if snapshot.running.is_some() || snapshot.installing {
-            return;
+            return false;
         }
         snapshot.running = Some(operation);
         snapshot.failure = None;
@@ -828,7 +990,9 @@ impl UpdateService {
                 operation,
                 message: plain_failure(operation, ""),
             });
+            return false;
         }
+        true
     }
 
     pub fn check(&self) {
@@ -841,7 +1005,48 @@ impl UpdateService {
 
     /// Restarts into the staged update; `consented` are the shells the page listed.
     pub fn install(&self, consented: Vec<SurfaceId>) {
-        self.request(Request::Install { consented });
+        self.request(Request::Install {
+            consented,
+            command: None,
+        });
+    }
+
+    /// Runs a check or download for `compi update` and waits for it; `observe` sees
+    /// the state while it runs.
+    pub fn run(
+        &self,
+        operation: Operation,
+        mut observe: impl FnMut(&UpdateSnapshot),
+    ) -> Result<UpdateSnapshot, String> {
+        let request = match operation {
+            Operation::Check => Request::Check,
+            Operation::Download => Request::Download,
+            _ => return Err(format!("{operation:?} does not run from a command")),
+        };
+        // A failure restored from the last update must not pass for this operation's.
+        while {
+            let snapshot = self.state.lock();
+            !snapshot.restored || snapshot.running.is_some()
+        } {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !self.request(request) {
+            return Err(plain_failure(operation, ""));
+        }
+        loop {
+            let snapshot = self.snapshot();
+            if snapshot.running.is_none() {
+                return Ok(snapshot);
+            }
+            observe(&snapshot);
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Refreshes which local shells a restart would end, for a command waiting on it.
+    pub fn review_now(&self) -> Result<UpdateSnapshot, String> {
+        review(&self.state, &self.targets, false, &Cancellation::default())?;
+        Ok(self.snapshot())
     }
 
     /// Re-runs whatever failed. A failed install returns to the Ready state with a fresh
@@ -1787,8 +1992,11 @@ mod tests {
         assert_eq!(format_size(999_500), "1.0 MB");
         assert_eq!(format_size(13_249_999), "13.2 MB");
         assert_eq!(format_size(13_250_000), "13.3 MB");
-        assert_eq!(format_transfer(400_000, 812_000), "400 / 812 KB");
-        assert_eq!(format_transfer(20_000_000, 13_200_000), "13.2 / 13.2 MB");
+        assert_eq!(format_transfer(400_000, 812_000, " / "), "400 / 812 KB");
+        assert_eq!(
+            format_transfer(20_000_000, 13_200_000, " / "),
+            "13.2 / 13.2 MB"
+        );
     }
 
     #[test]

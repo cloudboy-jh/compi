@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 5;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,6 +41,15 @@ pub enum LaunchMode {
     UnprepareUpdate {
         handoff: PathBuf,
     },
+    /// `compi update` hands its consented restart to this host's updater.
+    InstallUpdate {
+        version: String,
+        consented: Vec<compi_protocol::SurfaceId>,
+        outcome: PathBuf,
+    },
+    Control {
+        request: crate::cli_window::Request,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +61,8 @@ pub struct LaunchRequest {
     pub mode: LaunchMode,
     #[serde(skip)]
     _permit: Option<QueuePermit>,
+    #[serde(skip)]
+    pub(crate) completion: Option<ControlCompletion>,
 }
 
 impl LaunchRequest {
@@ -61,6 +72,7 @@ impl LaunchRequest {
             config,
             mode: LaunchMode::Ordinary,
             _permit: None,
+            completion: None,
         }
     }
 
@@ -70,10 +82,14 @@ impl LaunchRequest {
             config,
             mode: LaunchMode::Restore { handoff },
             _permit: None,
+            completion: None,
         }
     }
 
     fn validate(&self) -> Result<()> {
+        if let LaunchMode::Control { request } = &self.mode {
+            request.validate()?;
+        }
         if !matches!(self.mode, LaunchMode::Ordinary) && self.initial_working_directory.is_some() {
             return Err("update handoff requests cannot replay a working directory".into());
         }
@@ -109,14 +125,26 @@ struct Envelope {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", deny_unknown_fields)]
 enum Reply {
-    Ready { version: u32 },
+    Ready {
+        version: u32,
+    },
     Accepted,
-    Rejected { message: String },
+    Rejected {
+        message: String,
+    },
+    Completed {
+        response: crate::cli_window::Response,
+    },
 }
 
 pub enum HostAcquisition {
     Forwarded,
     Host(WindowHost, Box<LaunchRequest>),
+}
+
+pub(crate) struct ControlCompletion {
+    pub sender: Sender<std::result::Result<crate::cli_window::Response, String>>,
+    pub deadline: Instant,
 }
 
 /// Keep on the acquiring (GUI/main) thread until `gui::run` returns. In particular,
@@ -224,7 +252,7 @@ pub fn acquire(instance: Option<&str>, request: LaunchRequest) -> Result<HostAcq
                 Reply::Rejected { message } => {
                     return Err(format!("GUI host rejected launch: {message}").into());
                 }
-                Reply::Ready { .. } => return Err("unexpected GUI host response".into()),
+                _ => return Err("unexpected GUI host response".into()),
             }
         }
         if Instant::now() >= deadline {
@@ -265,10 +293,12 @@ fn serve(
                                 .into(),
                         );
                     }
-                    if !matches!(envelope.launch.mode, LaunchMode::Ordinary)
-                        && (envelope.expected_host_pid != Some(std::process::id())
-                            || envelope.expected_installation.as_ref()
-                                != Some(&registry_installation()?))
+                    if !matches!(
+                        envelope.launch.mode,
+                        LaunchMode::Ordinary | LaunchMode::Control { .. }
+                    ) && (envelope.expected_host_pid != Some(std::process::id())
+                        || envelope.expected_installation.as_ref()
+                            != Some(&registry_installation()?))
                     {
                         return Err(
                             "update handoff addresses a different GUI process or installation"
@@ -280,10 +310,31 @@ fn serve(
                     }
                     pending.fetch_add(1, Ordering::AcqRel);
                     envelope.launch._permit = Some(QueuePermit(pending.clone()));
+                    let completion = if matches!(envelope.launch.mode, LaunchMode::Control { .. }) {
+                        let (sender, receiver) = mpsc::channel();
+                        envelope.launch.completion = Some(ControlCompletion {
+                            sender,
+                            deadline: deadline - Duration::from_millis(200),
+                        });
+                        Some(receiver)
+                    } else {
+                        None
+                    };
                     sender
                         .send(envelope.launch)
                         .map_err(|_| "GUI host is closing")?;
-                    send(&mut connection, &Reply::Accepted, deadline, stop)?;
+                    let reply = if let Some(completion) = completion {
+                        match completion.recv_timeout(deadline.saturating_duration_since(Instant::now()).saturating_sub(Duration::from_millis(100))) {
+                            Ok(Ok(response)) => Reply::Completed { response },
+                            Ok(Err(message)) => Reply::Rejected { message },
+                            Err(_) => Reply::Rejected {
+                                message: "GUI operation did not complete before its deadline; inspect window state before retrying".into(),
+                            },
+                        }
+                    } else {
+                        Reply::Accepted
+                    };
+                    send(&mut connection, &reply, deadline, stop)?;
                     let mut receipt = [0];
                     let _ = read_exact(&mut connection, &mut receipt, deadline, stop);
                     Ok(())
@@ -312,6 +363,49 @@ fn serve(
                 thread::sleep(POLL);
             }
         }
+    }
+}
+
+pub(crate) fn control(
+    instance: Option<&str>,
+    request: crate::cli_window::Request,
+) -> Result<crate::cli_window::Response> {
+    request.validate()?;
+    let names = identity::instance_names(instance)?;
+    let endpoint = format!("{}.gui", names.pipe);
+    let mut connection = platform::connect(&endpoint)?
+        .ok_or("No GUI host is running for this connection; open a Compi window first")?;
+    let stop = AtomicBool::new(false);
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    match receive::<Reply>(&mut connection, deadline, &stop)? {
+        Reply::Ready { version: VERSION } => {}
+        _ => {
+            return Err(
+                "GUI host does not support this public control protocol; restart its windows"
+                    .into(),
+            );
+        }
+    }
+    let mut launch = LaunchRequest::new(None, LoadedConfig::default());
+    launch.mode = LaunchMode::Control { request };
+    send(
+        &mut connection,
+        &Envelope {
+            version: VERSION,
+            instance: names.pipe,
+            launch,
+            expected_host_pid: None,
+            expected_installation: None,
+        },
+        deadline,
+        &stop,
+    )?;
+    let reply = receive::<Reply>(&mut connection, deadline, &stop)?;
+    let _ = write_all(&mut connection, &[1], deadline, &stop);
+    match reply {
+        Reply::Completed { response } => Ok(response),
+        Reply::Rejected { message } => Err(message.into()),
+        _ => Err("GUI host accepted transport but did not acknowledge an applied operation".into()),
     }
 }
 
@@ -493,6 +587,22 @@ pub fn request_update_release(host: &UpdateHost, handoff: PathBuf) -> Result<()>
 }
 pub fn request_update_abort(host: &UpdateHost, handoff: PathBuf) -> Result<()> {
     request_update(host, LaunchMode::UnprepareUpdate { handoff })
+}
+/// The host installs the update the command staged; it reports to `outcome`.
+pub fn request_update_install(
+    host: &UpdateHost,
+    version: String,
+    consented: Vec<compi_protocol::SurfaceId>,
+    outcome: PathBuf,
+) -> Result<()> {
+    request_update(
+        host,
+        LaunchMode::InstallUpdate {
+            version,
+            consented,
+            outcome,
+        },
+    )
 }
 
 fn send<T: Serialize>(

@@ -50,6 +50,8 @@ pub struct LayoutMetrics {
     pub padding_y: f32,
     pub pane_chrome_height: f32,
     pub divider_thickness: f32,
+    /// Gutter between the workspace edge and the outermost panes.
+    pub margin: f32,
     pub scale_factor: f32,
 }
 
@@ -62,6 +64,7 @@ impl LayoutMetrics {
             padding_y: nonnegative(self.padding_y),
             pane_chrome_height: nonnegative(self.pane_chrome_height),
             divider_thickness: nonnegative(self.divider_thickness),
+            margin: nonnegative(self.margin),
             scale_factor: positive(self.scale_factor, 1.0),
         }
     }
@@ -527,7 +530,12 @@ pub fn compute_layout_with_preview(
         metrics.divider_size(),
         &mut measured,
     );
-    let minimum = measured[root].minimum;
+    // The outer gutter surrounds the tree on every side.
+    let margin = metrics.ceil(metrics.margin);
+    let minimum = Size {
+        width: measured[root].minimum.width + 2.0 * margin,
+        height: measured[root].minimum.height + 2.0 * margin,
+    };
     // Minima are already whole device pixels. When the viewport covers them, the canvas
     // is exactly the viewport: re-rounding it could add a sub-pixel overflow and a
     // phantom workspace scrollbar.
@@ -553,9 +561,10 @@ pub fn compute_layout_with_preview(
         tree,
         root,
         Rect {
-            width: canvas.width,
-            height: canvas.height,
-            ..Rect::default()
+            x: margin,
+            y: margin,
+            width: canvas.width - 2.0 * margin,
+            height: canvas.height - 2.0 * margin,
         },
         None,
     );
@@ -698,6 +707,7 @@ mod tests {
             padding_y: 2.0,
             pane_chrome_height: 20.0,
             divider_thickness: 4.0,
+            margin: 0.0,
             scale_factor: 1.0,
         }
     }
@@ -1000,5 +1010,49 @@ mod tests {
         assert!(!layout.has_overflow());
         assert!(layout.canvas.width <= layout.viewport.width);
         assert!(layout.canvas.height <= layout.viewport.height);
+    }
+
+    #[test]
+    fn comfy_gutters_inset_every_pane_and_shrink_only_through_the_canvas() {
+        let tree = split(SplitAxis::Horizontal, 0.5, leaf("a"), leaf("b"));
+        let viewport = Size {
+            width: 1000.0,
+            height: 500.0,
+        };
+        let compact = compute_layout(&tree, viewport, metrics());
+        let gutter = 6.0;
+        let comfy_metrics = LayoutMetrics {
+            margin: gutter,
+            divider_thickness: gutter,
+            ..metrics()
+        };
+        let comfy = compute_layout(&tree, viewport, comfy_metrics);
+        let (a, b) = (&comfy.panes[0], &comfy.panes[1]);
+        // The outer gutter surrounds the tree; the divider is the gap between islands.
+        assert_eq!((a.rect.x, a.rect.y), (gutter, gutter));
+        assert_eq!(a.rect.height, viewport.height - 2.0 * gutter);
+        assert_eq!(b.rect.right(), viewport.width - gutter);
+        assert_eq!(b.rect.x - a.rect.right(), gutter);
+        assert_eq!(comfy.dividers[0].rect.x, a.rect.right());
+        // Cells (and therefore PTY size and hit testing) follow the inset canvas.
+        assert_eq!(
+            (a.canvas.x, a.canvas.y),
+            (a.rect.x + 4.0, a.rect.y + 2.0 + 20.0)
+        );
+        let (comfy_cols, comfy_rows) = a.grid_size(comfy_metrics);
+        let (compact_cols, compact_rows) = compact.panes[0].grid_size(metrics());
+        assert!(comfy_cols < compact_cols && comfy_rows <= compact_rows);
+        assert_eq!(
+            comfy_cols,
+            (a.canvas.width / comfy_metrics.cell_width).floor() as i16
+        );
+        // The minimum includes the gutter, so a viewport that only fits the panes overflows.
+        assert_eq!(
+            comfy.minimum.width,
+            compact.minimum.width - 4.0 + 2.0 * gutter + gutter
+        );
+        let tight = compute_layout(&tree, compact.minimum, comfy_metrics);
+        assert!(tight.has_overflow());
+        assert!(!compute_layout(&tree, compact.minimum, metrics()).has_overflow());
     }
 }

@@ -5,7 +5,9 @@ pub(in crate::gui) mod arrangements;
 pub(super) mod catalog;
 pub(in crate::gui) mod dialogs;
 pub(super) mod media;
+pub(in crate::gui) mod metadata;
 pub(in crate::gui) mod performance;
+pub(in crate::gui) mod presentation;
 pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod settings;
 pub(super) mod tree;
@@ -169,6 +171,7 @@ pub(super) struct TransferSeed {
     display_appearance: AppearanceSettings,
     display_sidebar_width: f32,
     display_zoom: f32,
+    activate: bool,
 }
 
 fn inherited_appearance(
@@ -480,6 +483,14 @@ const FLOAT_TITLE_HEIGHT: f32 = 28.0;
 const FLOAT_RESIZE_HANDLE: f32 = 6.0;
 /// Transparent drag zone around a one-device-pixel seam (split or sidebar).
 const SEAM_GRAB: f32 = 8.0;
+/// Comfy density: the gutter around and between tiled panes, and the corner radius
+/// of every terminal surface. Compact keeps edge-to-edge panes and hairline seams.
+const PANE_GUTTER: f32 = 6.0;
+const PANE_RADIUS: f32 = 8.0;
+/// Floating panes' corner radius in Compact (GPUI `rounded_md`).
+const FLOAT_RADIUS_COMPACT: f32 = 6.0;
+// Text starts `TERMINAL_PADDING` inside every edge, so rounding never reaches a cell.
+const _: () = assert!(PANE_RADIUS <= TERMINAL_PADDING);
 
 /// A floating pane's frame (title strip included) and terminal body, in
 /// terminal-area coordinates. Floats are outside the scrolled split canvas.
@@ -610,6 +621,7 @@ fn open_window_mode(
         .unwrap_or_else(|| {
             WindowBounds::Windowed(Bounds::centered(None, size(px(960.0), px(640.0)), cx))
         });
+    let activate = transferred_seed.as_ref().is_none_or(|seed| seed.activate);
     let window = cx.open_window(
         WindowOptions {
             window_bounds: Some(bounds),
@@ -628,7 +640,7 @@ fn open_window_mode(
                 #[cfg(windows)]
                 traffic_light_position: None,
             }),
-            focus: true,
+            focus: activate,
             ..Default::default()
         },
         move |window, cx| {
@@ -657,10 +669,12 @@ fn open_window_mode(
             restore_native_window_geometry(window, geometry, display_index);
         })?;
     }
-    window.update(cx, |view, window, cx| {
-        window.focus(&view.focus_handle);
-        cx.activate(true);
-    })?;
+    if activate {
+        window.update(cx, |view, window, cx| {
+            window.focus(&view.focus_handle);
+            cx.activate(true);
+        })?;
+    }
     if perf::enabled() {
         let first_frame_started_at = started_at;
         window.update(cx, |_, window, _| {
@@ -776,6 +790,7 @@ impl CompiApp {
             ime_selected_range: 0..0,
             surface_views: Vec::new(),
             surface_names: HashMap::new(),
+            metadata: metadata::MetadataUi::default(),
             focused_view: None,
             file_tree: None,
             tree_scroll: ScrollHandle::new(),
@@ -852,6 +867,7 @@ impl CompiApp {
             float_area: layout::Size::default(),
             float_drag: None,
             mutation_pending: false,
+            lost_restart: None,
             global_error: None,
             connection_error: None,
             font_settings: config.font.clone(),
@@ -909,6 +925,7 @@ impl CompiApp {
                     .await;
                 if weak
                     .update(cx, |this, cx| {
+                        this.poll_metadata(cx);
                         if this.restore_session.is_some() && !this.restore_ready {
                             this.acknowledge_update_restore();
                             cx.notify();
@@ -1054,6 +1071,7 @@ impl CompiApp {
                                 appearance: loaded.configured_appearance,
                                 favorites: loaded.theme_favorites,
                                 ui_font: loaded.ui_font,
+                                density: loaded.density,
                                 terminal_font_family: loaded.configured_font.family,
                                 diagnostics: loaded.diagnostics,
                             });
@@ -1326,6 +1344,51 @@ impl CompiApp {
         self.zoom_layout.as_ref().or(self.layout.as_ref())
     }
 
+    /// Shells lost when the daemon restarted (for example after an update) start afresh
+    /// once their pane is on screen, so no tab is left blank. Ended or failed shells are
+    /// left alone; the user restarts those explicitly.
+    fn restart_visible_lost_shell(&mut self) {
+        if self.mutation_pending || self.connection_error.is_some() {
+            return;
+        }
+        let (Some(workspace), Some(layout)) = (&self.workspace, self.visible_layout()) else {
+            return;
+        };
+        let metrics = self.metrics();
+        let lost = layout
+            .panes
+            .iter()
+            .chain(self.float_layouts.iter().map(|float| &float.pane))
+            .find_map(|pane| {
+                let surface = workspace.surface(&pane.surface_id)?;
+                (surface.status == SurfaceStatus::Lost).then(|| {
+                    (
+                        surface.id.clone(),
+                        surface.process_lifetime_id.clone(),
+                        pane.grid_size(metrics),
+                    )
+                })
+            });
+        let Some((surface_id, lifetime, (cols, rows))) = lost else {
+            return;
+        };
+        if self.lost_restart.as_ref().is_some_and(|(previous, at)| {
+            *previous == lifetime && at.elapsed() < Duration::from_secs(2)
+        }) {
+            return;
+        }
+        self.lost_restart = Some((lifetime.clone(), Instant::now()));
+        self.mutate(
+            WorkspaceMutation::RestartSurface {
+                surface_id,
+                expected_lifetime: lifetime,
+                cols,
+                rows,
+            },
+            false,
+        );
+    }
+
     fn reconcile_pane_zoom(&mut self, workspace: &WorkspaceSnapshot) {
         self.pane_zoom.retain_valid(|tab_id, pane_id| {
             workspace
@@ -1485,6 +1548,7 @@ impl CompiApp {
             WorkspaceMutation::Initialize { .. }
                 | WorkspaceMutation::CreateTab { .. }
                 | WorkspaceMutation::SplitPane { .. }
+                | WorkspaceMutation::GrowTab { .. }
                 | WorkspaceMutation::RestartSurface { .. }
         );
         let launch = if launches {
@@ -1631,8 +1695,11 @@ impl CompiApp {
             self.pane_zoom.clear_all();
             self.surface_names.clear();
         } else {
-            self.surface_names
-                .retain(|id, _| workspace.surface(id).is_some());
+            self.surface_names.retain(|id, (lifetime, _, _)| {
+                workspace
+                    .surface(id)
+                    .is_some_and(|surface| surface.process_lifetime_id == *lifetime)
+            });
         }
         self.reconcile_pane_zoom(&workspace);
         let changed = self.workspace.as_ref().is_none_or(|old| {
@@ -1752,11 +1819,17 @@ impl CompiApp {
                 appearance,
                 favorites,
                 ui_font,
+                density,
                 terminal_font_family,
                 diagnostics,
             } => {
-                self.pending_appearance_reload =
-                    Some((appearance, favorites, ui_font, terminal_font_family));
+                self.pending_appearance_reload = Some((
+                    appearance,
+                    favorites,
+                    ui_font,
+                    density,
+                    terminal_font_family,
+                ));
                 self.config_diagnostics = diagnostics;
                 self.global_warning =
                     diagnostic_warning(&self.config_diagnostics, &self.typography.diagnostics);
@@ -1888,6 +1961,7 @@ impl CompiApp {
                             ConnectionState::Exited(code.unwrap_or(0))
                         }
                         Some((SurfaceStatus::Failed, _)) => ConnectionState::Failed,
+                        _ if matches!(view.state, ConnectionState::Exited(_)) => view.state,
                         _ => ConnectionState::Attached,
                     };
                     view.error = None;
@@ -2027,6 +2101,22 @@ impl CompiApp {
                         _ if matches!(view.state, ConnectionState::Exited(_)) => view.state,
                         _ => ConnectionState::Attached,
                     };
+                    if let Some(started_at) = view.diagnostic_started_at
+                        && !view.diagnostic_screen_logged
+                        && view.mirror.snapshot().is_some_and(|snapshot| {
+                            snapshot.cells.iter().any(|row| {
+                                row.cells.iter().any(|cell| !cell.text.trim().is_empty())
+                            })
+                        })
+                    {
+                        view.diagnostic_screen_logged = true;
+                        perf::log_surface_startup_stage(
+                            &view.surface_id,
+                            &view.lifetime,
+                            "client_first_nonempty_screen",
+                            started_at.elapsed(),
+                        );
+                    }
                     view.images_dirty |= images_changed;
                     ready_probe_observed = ready_probe_marker.as_deref().is_some_and(|marker| {
                         snapshot_contains_marker(view.mirror.snapshot(), marker)
@@ -2037,6 +2127,9 @@ impl CompiApp {
                             .snapshot()
                             .and_then(|snapshot| snapshot.current_directory.clone());
                     }
+                }
+                if let Some(view) = self.surface_views.iter().find(|view| view.id == tab_id) {
+                    cache_surface_name(&mut self.surface_names, view);
                 }
                 if let Some(path) = observed_directory
                     && self.state.project_history.record(&path)
@@ -2128,26 +2221,44 @@ impl CompiApp {
                         if let Some(transport) = view.transport.take() {
                             transport.close();
                         }
-                        view.error = None;
+                        view.final_attachment_attempted = false;
                     }
                     self.refresh_surfaces(false);
                 }
-                ServerMessage::Error { message, .. } => {
+                ServerMessage::Error { code, message, .. } => {
                     if let Some(view) = self.surface_view_mut(tab_id) {
-                        view.error = Some(message);
-                        view.state = ConnectionState::Failed;
+                        view.runtime_unavailable |= view.stop.load(Ordering::Acquire)
+                            && matches!(
+                                code,
+                                compi_protocol::ErrorCode::SurfaceUnavailable
+                                    | compi_protocol::ErrorCode::SurfaceNotFound
+                            );
+                        view.error = Some(PaneError {
+                            code: Some(code),
+                            message,
+                        });
+                        if !matches!(view.state, ConnectionState::Exited(_)) {
+                            view.state = ConnectionState::Failed;
+                        }
                     }
+                    self.refresh_surfaces(false);
                 }
                 _ => {}
             },
             UiEvent::TabDisconnected { tab_id, error } => {
                 if let Some(view) = self.surface_view_mut(tab_id) {
                     view.transport = None;
+                    view.error = Some(error);
                     if !matches!(view.state, ConnectionState::Exited(_)) {
-                        view.state = ConnectionState::Failed;
-                        view.error = Some(format!(
-                            "{error}. Retry attachment when the other window has released this pane."
-                        ));
+                        view.state = if view
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.code.is_some())
+                        {
+                            ConnectionState::Failed
+                        } else {
+                            ConnectionState::Disconnected
+                        };
                     }
                 }
             }
@@ -2175,18 +2286,8 @@ impl CompiApp {
         };
         for view in &mut self.surface_views {
             if !wanted.contains(&view.surface_id) {
-                if workspace.surface(&view.surface_id).is_some()
-                    && let Some(snapshot) = view.mirror.snapshot()
-                    && !snapshot.title.trim().is_empty()
-                {
-                    self.surface_names.insert(
-                        view.surface_id.clone(),
-                        (
-                            view.lifetime.clone(),
-                            concise_tab_title(&snapshot.title),
-                            snapshot.current_directory.clone(),
-                        ),
-                    );
+                if workspace.surface(&view.surface_id).is_some() {
+                    cache_surface_name(&mut self.surface_names, view);
                 }
                 view.stop.store(true, Ordering::Release);
                 if let Some(transport) = view.transport.take() {
@@ -2195,13 +2296,29 @@ impl CompiApp {
                 if let Ok(mut routes) = EVENT_ROUTES.lock() {
                     routes.remove(&view.id);
                 }
-                view.discard_replica();
+                if workspace.surface(&view.surface_id).is_some_and(|surface| {
+                    matches!(
+                        surface.status,
+                        SurfaceStatus::Starting | SurfaceStatus::Running
+                    )
+                }) {
+                    view.discard_replica();
+                }
             }
         }
         let metrics = self.metrics();
         self.surface_views.retain(|view| {
-            workspace.surface(&view.surface_id).is_some()
-                && (wanted.contains(&view.surface_id) || !view.closed.load(Ordering::Acquire))
+            workspace.surface(&view.surface_id).is_some_and(|surface| {
+                wanted.contains(&view.surface_id)
+                    || !view.closed.load(Ordering::Acquire)
+                    || matches!(
+                        surface.status,
+                        SurfaceStatus::Ending
+                            | SurfaceStatus::Exited
+                            | SurfaceStatus::Failed
+                            | SurfaceStatus::Lost
+                    )
+            })
         });
         for (pane_id, surface_id) in leaves {
             let Some(surface) = workspace.surface(&surface_id) else {
@@ -2236,6 +2353,11 @@ impl CompiApp {
                     mirror: ScreenMirror::default(),
                     state: ConnectionState::Connecting,
                     error: None,
+                    final_attachment_attempted: false,
+                    runtime_unavailable: false,
+                    diagnostic_started_at: None,
+                    diagnostic_screen_logged: false,
+                    diagnostic_frame_logged: false,
                     transport: None,
                     scroll_offset: 0,
                     selection: None,
@@ -2267,13 +2389,37 @@ impl CompiApp {
                 }
                 view.discard_replica();
                 view.lifetime = surface.process_lifetime_id.clone();
+                view.state = ConnectionState::Connecting;
+                view.final_attachment_attempted = false;
+                view.runtime_unavailable = false;
+                view.error = None;
             }
-            if surface.status == SurfaceStatus::Lost {
-                view.error = Some(surface.error.clone().unwrap_or_else(|| {
-                    format!("{:?}: restart this surface explicitly", surface.status)
-                }));
-                view.state = ConnectionState::Failed;
+            if view.runtime_unavailable {
                 continue;
+            }
+            if matches!(surface.status, SurfaceStatus::Lost | SurfaceStatus::Failed) {
+                view.stop.store(true, Ordering::Release);
+                if let Some(transport) = view.transport.take() {
+                    transport.close();
+                }
+                if let Some(message) = &surface.error {
+                    view.error = Some(PaneError {
+                        code: Some(compi_protocol::ErrorCode::SurfaceUnavailable),
+                        message: message.clone(),
+                    });
+                }
+                view.state = if surface.status == SurfaceStatus::Lost {
+                    ConnectionState::Exited(surface.exit_code.unwrap_or(0))
+                } else {
+                    ConnectionState::Failed
+                };
+                continue;
+            }
+            if surface.status == SurfaceStatus::Exited {
+                view.state = ConnectionState::Exited(surface.exit_code.unwrap_or(0));
+                if view.stop.load(Ordering::Acquire) && view.final_attachment_attempted {
+                    continue;
+                }
             }
             if view.stop.load(Ordering::Acquire) {
                 if let Ok(mut routes) = EVENT_ROUTES.lock() {
@@ -2281,7 +2427,20 @@ impl CompiApp {
                 }
                 view.id = NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed);
                 view.stop = Arc::new(AtomicBool::new(false));
-                view.state = ConnectionState::Connecting;
+                view.state = if surface.status == SurfaceStatus::Exited {
+                    view.final_attachment_attempted = true;
+                    ConnectionState::Exited(surface.exit_code.unwrap_or(0))
+                } else if matches!(view.state, ConnectionState::Exited(_)) {
+                    view.final_attachment_attempted = true;
+                    view.state
+                } else if view.mirror.snapshot().is_some() {
+                    ConnectionState::Reconnecting
+                } else {
+                    ConnectionState::Connecting
+                };
+                view.diagnostic_started_at = perf::enabled().then(Instant::now);
+                view.diagnostic_screen_logged = false;
+                view.diagnostic_frame_logged = false;
                 view.image_pending.clear();
                 if let Ok(mut routes) = EVENT_ROUTES.lock() {
                     routes.insert(view.id, self.event_tx.0.clone());
@@ -2301,6 +2460,8 @@ impl CompiApp {
                         closed: view.closed.clone(),
                         update_quiesced: self.update_quiesced.clone(),
                         connection_guard: self.update_connection_guard.clone(),
+                        lifetime: view.lifetime.clone(),
+                        diagnostic_started_at: view.diagnostic_started_at,
                     },
                 );
             }
@@ -2420,23 +2581,83 @@ impl CompiApp {
         )
     }
 
+    /// The surface behind panes and tabs: the app background, or in Comfy the terminal
+    /// background slightly darkened so islands read against it whatever the themes.
+    /// Terminal colours themselves are never changed.
+    fn canvas_color(&self) -> u32 {
+        if !self.comfy() {
+            return self.colors().background;
+        }
+        let terminal = self.terminal_theme.terminal().background & 0x00ff_ffff;
+        let channel = |shift: u32| ((terminal >> shift) & 0xff) as f32 / 255.0;
+        let luminance = 0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0);
+        blend_rgb(terminal, 0, if luminance < 0.5 { 0.3 } else { 0.06 })
+    }
+
+    /// Comfy's canvas tone at the window's background opacity, painted around the
+    /// islands but never under them: `holes` (rounded by `PANE_RADIUS`) are cut out, so
+    /// a translucent canvas follows the opacity setting without doubling up behind a
+    /// translucent pane or sidebar.
+    fn comfy_canvas(
+        &self,
+        holes: impl Fn(Bounds<Pixels>) -> Vec<Bounds<Pixels>> + 'static,
+    ) -> impl IntoElement {
+        let fill = material_color(self.canvas_color(), self.effective_background_opacity());
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let mut path = PathBuilder::fill().with_style(gpui::PathStyle::Fill(
+                    gpui::FillOptions::default().with_fill_rule(gpui::FillRule::EvenOdd),
+                ));
+                rounded_rect_path(&mut path, bounds, 0.0);
+                for hole in holes(bounds) {
+                    rounded_rect_path(&mut path, hole, PANE_RADIUS);
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, fill);
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
     /// Logical width left of the terminal area: the device-aligned sidebar plus its seam.
     fn sidebar_extent(&self) -> f32 {
         if !self.sidebar_open {
             return 0.0;
         }
         let scale = positive_scale(self.typography_scale);
-        (self.sidebar_width * scale).round() / scale + self.seam_width()
+        let width = (self.sidebar_width * scale).round() / scale;
+        // Comfy insets the sidebar island by a gutter; the panes' own margin is the gap
+        // to its right. Compact keeps a flush sidebar with a one-device-pixel seam.
+        if self.comfy() {
+            PANE_GUTTER + width
+        } else {
+            width + self.seam_width()
+        }
+    }
+
+    fn comfy(&self) -> bool {
+        self.config.density == crate::theme::WorkspaceDensity::Comfy
     }
 
     fn metrics(&self) -> LayoutMetrics {
+        let comfy = self.comfy();
         LayoutMetrics {
             cell_width: self.typography.cell_width,
             line_height: self.typography.cell_height,
             padding_x: TERMINAL_PADDING,
             padding_y: TERMINAL_PADDING,
             pane_chrome_height: 0.0,
-            divider_thickness: self.seam_width(),
+            divider_thickness: if comfy {
+                PANE_GUTTER
+            } else {
+                self.seam_width()
+            },
+            margin: if comfy { PANE_GUTTER } else { 0.0 },
             scale_factor: self.typography_scale,
         }
     }
@@ -2547,6 +2768,11 @@ impl CompiApp {
         area: layout::Size,
         metrics: LayoutMetrics,
     ) -> Vec<FloatLayout> {
+        // A float's frame is its own surface: no workspace gutter inside it.
+        let metrics = LayoutMetrics {
+            margin: 0.0,
+            ..metrics
+        };
         let leaf = metrics.leaf_minimum();
         let minimum = layout::Size {
             width: leaf.width,
@@ -3402,12 +3628,12 @@ impl CompiApp {
             }
             Command::EndSurface => {
                 if let Some(surface) = surface {
-                    self.confirm_removal(
+                    self.mutate(
                         WorkspaceMutation::EndSurface {
                             surface_id: surface.id,
                             expected_lifetime: surface.process_lifetime_id,
                         },
-                        "End this surface's process tree? The final grid will remain readable.",
+                        false,
                     );
                 }
             }
@@ -3648,12 +3874,12 @@ impl CompiApp {
                             .as_ref()
                             .and_then(|workspace| workspace.surface(&surface_id))
                     {
-                        self.confirm_removal(
+                        self.mutate(
                             WorkspaceMutation::EndSurface {
                                 surface_id: surface.id.clone(),
                                 expected_lifetime: surface.process_lifetime_id.clone(),
                             },
-                            "End this terminal's process tree? The final grid will remain readable.",
+                            false,
                         );
                     }
                 }
@@ -3933,15 +4159,70 @@ fn concise_path_title(path: &str) -> String {
         .to_owned()
 }
 
-fn concise_tab_title(title: &str) -> String {
+fn concise_tab_title(title: &str) -> &str {
     let title = title.trim();
     let bytes = title.as_bytes();
     let is_drive_path = bytes.len() > 2 && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\');
     if title.starts_with('/') || title.starts_with("~/") || title.starts_with('\\') || is_drive_path
     {
-        concise_path_title(title)
+        let trimmed = title.trim_end_matches(['/', '\\']);
+        trimmed
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or(if title.starts_with('/') {
+                "/"
+            } else {
+                "Terminal"
+            })
     } else {
-        title.to_owned()
+        title
+    }
+}
+
+fn observed_caption_title(title: &str) -> Option<&str> {
+    let title = title.trim();
+    (!title.is_empty() && !title.eq_ignore_ascii_case("Terminal")).then(|| concise_tab_title(title))
+}
+
+fn cache_surface_name(
+    names: &mut HashMap<SurfaceId, (compi_protocol::ProcessLifetimeId, String, Option<String>)>,
+    view: &SurfaceView,
+) {
+    let Some(snapshot) = view.mirror.snapshot() else {
+        return;
+    };
+    let title = observed_caption_title(&snapshot.title);
+    let directory = snapshot
+        .current_directory
+        .as_deref()
+        .filter(|directory| !directory.trim().is_empty());
+    if title.is_none() && directory.is_none() {
+        return;
+    }
+    let Some(cached) = names.get_mut(&view.surface_id) else {
+        names.insert(
+            view.surface_id.clone(),
+            (
+                view.lifetime.clone(),
+                title.unwrap_or_default().to_owned(),
+                directory.map(str::to_owned),
+            ),
+        );
+        return;
+    };
+    if cached.0 != view.lifetime {
+        *cached = (view.lifetime.clone(), String::new(), None);
+    }
+    if let Some(title) = title
+        && cached.1 != title
+    {
+        cached.1 = title.to_owned();
+    }
+    if let Some(directory) = directory
+        && cached.2.as_deref() != Some(directory)
+    {
+        cached.2 = Some(directory.to_owned());
     }
 }
 
@@ -3950,27 +4231,8 @@ struct TabPane {
     pane_id: PaneId,
     title: String,
     directory: Option<String>,
-    /// Floating in this window; shown in the tab's hover card and pane list.
+    /// Floating in this window; shown in the pane list.
     floating: bool,
-}
-
-fn tab_caption(custom: &str, panes: &[TabPane]) -> (String, Option<String>) {
-    let custom = custom.trim();
-    let primary = if custom.is_empty() {
-        panes
-            .first()
-            .map(|pane| pane.title.clone())
-            .unwrap_or_else(|| "Terminal".into())
-    } else {
-        custom.to_owned()
-    };
-    let secondary = match panes.len() {
-        0 | 1 => None,
-        2 if custom.is_empty() => Some(panes[1].title.clone()),
-        2 => Some("2".into()),
-        count => Some(format!("{count}+")),
-    };
-    (primary, secondary)
 }
 
 impl CompiApp {
@@ -3994,10 +4256,11 @@ impl CompiApp {
                     .surface_names
                     .get(&surface_id)
                     .filter(|(lifetime, _, _)| {
-                        surface.is_some_and(|surface| surface.process_lifetime_id == *lifetime)
+                        surface.is_none_or(|surface| surface.process_lifetime_id == *lifetime)
                     });
                 let directory = snapshot
                     .and_then(|snapshot| snapshot.current_directory.clone())
+                    .filter(|directory| !directory.trim().is_empty())
                     .or_else(|| cached.and_then(|(_, _, directory)| directory.clone()))
                     .or_else(|| {
                         surface?
@@ -4006,10 +4269,14 @@ impl CompiApp {
                             .map(|cwd| cwd.resolved_wsl_path.clone())
                     });
                 let title = snapshot
-                    .map(|snapshot| snapshot.title.trim())
-                    .filter(|title| !title.is_empty())
-                    .map(concise_tab_title)
-                    .or_else(|| cached.map(|(_, title, _)| title.clone()))
+                    .and_then(|snapshot| observed_caption_title(&snapshot.title))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        cached
+                            .map(|(_, title, _)| title)
+                            .filter(|title| !title.is_empty())
+                            .cloned()
+                    })
                     .or_else(|| directory.as_deref().map(concise_path_title))
                     .unwrap_or_else(|| format!("Terminal {}", index + 1));
                 TabPane {
@@ -4043,7 +4310,7 @@ impl CompiApp {
 
     fn tab_label(&self, tab: &WorkspaceTab) -> String {
         let panes = self.tab_panes(tab);
-        let (primary, secondary) = tab_caption(&tab.label, &panes);
+        let (primary, secondary) = self.metadata_tab_caption(tab, &panes);
         match secondary {
             Some(secondary) => format!("{primary} · {secondary}"),
             None => primary,
@@ -4317,13 +4584,14 @@ impl CompiApp {
                 window.on_next_frame(move |_, cx| cx.notify(view_id));
             }
         }
-        if let Some((appearance, favorites, ui_font, terminal_font_family)) =
+        if let Some((appearance, favorites, ui_font, density, terminal_font_family)) =
             self.pending_appearance_reload.take()
         {
             self.sync_global_appearance(
                 appearance,
                 favorites,
                 ui_font,
+                density,
                 terminal_font_family,
                 window,
             );
@@ -4331,6 +4599,7 @@ impl CompiApp {
         if self.refresh_typography(window) {
             self.rebuild_layout(window, true);
         }
+        self.restart_visible_lost_shell();
         if self.rebuild_layout(window, false) {
             let view_id = cx.entity_id();
             window.on_next_frame(move |_, cx| cx.notify(view_id));
@@ -4390,6 +4659,32 @@ impl CompiApp {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        for view in &mut self.surface_views {
+            if view.diagnostic_screen_logged
+                && !view.diagnostic_frame_logged
+                && (self
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.pane(&view.pane_id).is_some())
+                    || self
+                        .float_layouts
+                        .iter()
+                        .any(|float| float.pane.pane_id == view.pane_id))
+                && let Some(started_at) = view.diagnostic_started_at
+            {
+                view.diagnostic_frame_logged = true;
+                let surface_id = view.surface_id.clone();
+                let lifetime = view.lifetime.clone();
+                window.on_next_frame(move |_, _| {
+                    perf::log_surface_startup_stage(
+                        &surface_id,
+                        &lifetime,
+                        "client_first_nonempty_frame",
+                        started_at.elapsed(),
+                    );
+                });
+            }
+        }
         if self.ready_probe_render_pending && !self.ready_probe_logged {
             self.ready_probe_render_pending = false;
             self.ready_probe_logged = true;
@@ -4415,8 +4710,10 @@ impl CompiApp {
             .clone()
             .map(|error| (error, false, true))
             .or_else(|| {
-                self.connection_error
-                    .clone()
+                self.surface_views
+                    .is_empty()
+                    .then(|| self.connection_error.clone())
+                    .flatten()
                     .map(|error| (error, true, true))
             })
             .or_else(|| {
@@ -4688,13 +4985,7 @@ impl CompiApp {
                 .selected_tab()
                 .is_some_and(|selected| selected.id == id);
             let panes = self.tab_panes(tab);
-            let (primary, secondary) = tab_caption(&tab.label, &panes);
-            let count_badge = panes.len() > 2 || (!tab.label.trim().is_empty() && panes.len() > 1);
-            let tooltip_title = (!tab.label.trim().is_empty()).then(|| tab.label.clone());
-            let tooltip_panes = panes
-                .into_iter()
-                .map(|pane| (pane.title, pane.directory, pane.floating))
-                .collect::<Vec<_>>();
+            let (primary, secondary) = self.metadata_tab_caption(tab, &panes);
             div()
                 .id(("terminal-tab", index))
                 .group("terminal-tab")
@@ -4733,16 +5024,6 @@ impl CompiApp {
                             .opacity(header_alpha))
                         }),
                 )
-                .when(self.overlay.is_none(), |tab| {
-                    tab.tooltip(move |_, cx| {
-                        cx.new(|_| TabTooltip {
-                            title: tooltip_title.clone(),
-                            panes: tooltip_panes.clone(),
-                            colors,
-                        })
-                        .into()
-                    })
-                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -4791,8 +5072,7 @@ impl CompiApp {
                             label.child(div().flex_none().child("·")).child(
                                 div()
                                     .min_w_0()
-                                    .when(count_badge, |part| part.flex_none())
-                                    .when(!count_badge, |part| part.flex_1())
+                                    .flex_none()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
@@ -4830,9 +5110,11 @@ impl CompiApp {
             .w_full()
             .flex_none()
             .relative()
-            .bg(material_color(colors.background, header_alpha))
-            .border_b_1()
-            .border_color(color(colors.border))
+            .bg(material_color(self.canvas_color(), header_alpha))
+            // Comfy's gutter already separates the header from the pane islands.
+            .when(!self.comfy(), |bar| {
+                bar.border_b_1().border_color(color(colors.border))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, _| {
@@ -5137,17 +5419,41 @@ impl CompiApp {
                 }
             }
         }
+        let comfy = self.comfy();
         div()
             .w(px(self.sidebar_extent()))
             .h_full()
             .flex_none()
             .flex()
+            // Comfy: an island inset by the gutter on the canvas behind the panes.
+            .when(comfy, |sidebar| {
+                sidebar
+                    .relative()
+                    .pl(px(PANE_GUTTER))
+                    .py(px(PANE_GUTTER))
+                    .child(self.comfy_canvas(|bounds| {
+                        let gutter = px(PANE_GUTTER);
+                        vec![Bounds::new(
+                            point(bounds.left() + gutter, bounds.top() + gutter),
+                            size(
+                                bounds.size.width - gutter,
+                                bounds.size.height - gutter * 2.0,
+                            ),
+                        )]
+                    }))
+            })
             .child(
                 div()
-                    .w(px(self.sidebar_extent() - self.seam_width()))
+                    .w(px(self.sidebar_extent()
+                        - if comfy {
+                            PANE_GUTTER
+                        } else {
+                            self.seam_width()
+                        }))
                     .h_full()
                     .flex()
                     .flex_col()
+                    .when(comfy, |island| island.rounded(px(PANE_RADIUS)))
                     .bg(color(colors.surface).opacity(if self.glass { 0.9 } else { 1.0 }))
                     .child(
                         div()
@@ -5202,61 +5508,104 @@ impl CompiApp {
                             )),
                     ),
             )
-            .child(
-                // One device pixel of seam; the transparent grab zone extends into the
-                // sidebar's padding so the seam stays easy to drag.
-                div()
-                    .w(px(self.seam_width()))
-                    .h_full()
-                    .relative()
-                    .bg(color(self.seam_color()))
-                    .child(
-                        div()
-                            .id("sidebar-divider")
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .right_0()
-                            .w(px(SEAM_GRAB))
-                            .group("sidebar-seam")
-                            .cursor(gpui::CursorStyle::ResizeLeftRight)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .bottom_0()
-                                    .right_0()
-                                    .w(px(self.seam_width()))
-                                    .when(self.sidebar_drag, |line| line.bg(color(colors.accent)))
-                                    .group_hover("sidebar-seam", move |style| {
-                                        style.bg(color(colors.accent))
-                                    }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    if event.click_count == 2 {
-                                        this.sidebar_width = this.config.configured_sidebar_width;
-                                        this.state.sidebar_width = this.sidebar_width;
-                                        this.save_state();
-                                    } else {
-                                        this.sidebar_drag = true;
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            )
+            .when(!comfy, |sidebar| {
+                sidebar.child(
+                    // One device pixel of seam; the transparent grab zone extends into the
+                    // sidebar's padding so the seam stays easy to drag.
+                    div()
+                        .w(px(self.seam_width()))
+                        .h_full()
+                        .relative()
+                        .bg(color(self.seam_color()))
+                        .child(
+                            div()
+                                .id("sidebar-divider")
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
+                                .w(px(SEAM_GRAB))
+                                .group("sidebar-seam")
+                                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .right_0()
+                                        .w(px(self.seam_width()))
+                                        .when(self.sidebar_drag, |line| {
+                                            line.bg(color(colors.accent))
+                                        })
+                                        .group_hover("sidebar-seam", move |style| {
+                                            style.bg(color(colors.accent))
+                                        }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::on_sidebar_divider_down),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
+    }
+
+    fn on_sidebar_divider_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.click_count == 2 {
+            self.sidebar_width = self.config.configured_sidebar_width;
+            self.state.sidebar_width = self.sidebar_width;
+            self.save_state();
+        } else {
+            self.sidebar_drag = true;
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Comfy's sidebar resize handle: the gap between the sidebar island and the panes,
+    /// which is the pane canvas's left gutter. A thin line shows on hover or drag.
+    fn render_sidebar_gap_handle(&self, cx: &Context<Self>) -> impl IntoElement {
+        let accent = self.colors().accent;
+        let line = 2.0 * self.seam_width();
+        div()
+            .id("sidebar-divider")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .w(px(PANE_GUTTER))
+            .group("sidebar-seam")
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px((PANE_GUTTER - line) / 2.0))
+                    .w(px(line))
+                    .when(self.sidebar_drag, |line| line.bg(color(accent)))
+                    .group_hover("sidebar-seam", move |style| style.bg(color(accent))),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::on_sidebar_divider_down),
+            )
     }
 
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
         let tiled = self.render_tiled_panes(cx);
-        if self.float_layouts.is_empty() {
+        let gap_handle = self.comfy() && self.sidebar_open;
+        if self.float_layouts.is_empty() && !gap_handle {
             return tiled;
         }
-        // Floats sit above the split canvas and below modal overlays.
+        // Floats sit above the split canvas (and the sidebar gap handle) and below
+        // modal overlays.
         div()
             .flex_1()
             .min_w_0()
@@ -5264,6 +5613,9 @@ impl CompiApp {
             .relative()
             .flex()
             .child(tiled)
+            .when(gap_handle, |panes| {
+                panes.child(self.render_sidebar_gap_handle(cx))
+            })
             .children(
                 self.float_layouts
                     .iter()
@@ -5332,8 +5684,34 @@ impl CompiApp {
                 )
                 .into_any_element();
         };
+        let comfy = self.comfy();
+        // Focus needs marking only when there is another pane to tell it apart from.
+        let mark_focus = layout.panes.len() + self.float_layouts.len() > 1;
         let panes = layout.panes.iter().enumerate().map(|(index, geometry)| {
-            self.render_pane(("pane", index), index, geometry, geometry.rect, cx)
+            let focused = mark_focus
+                && self
+                    .focused_view()
+                    .is_some_and(|view| view.pane_id == geometry.pane_id);
+            // Comfy islands keep a hairline edge so they read against any canvas colour;
+            // Compact panes are separated by seams and only the focused one is outlined.
+            let edge = if focused {
+                Some(colors.accent)
+            } else {
+                comfy.then(|| self.seam_color())
+            };
+            self.render_pane(("pane", index), geometry, geometry.rect, cx)
+                .when(comfy, |pane| pane.rounded(px(PANE_RADIUS)))
+                .when_some(edge, |pane, edge| {
+                    // Drawn last so the outline is never covered; it has no hitbox.
+                    pane.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .when(comfy, |outline| outline.rounded(px(PANE_RADIUS)))
+                            .border_1()
+                            .border_color(color(edge)),
+                    )
+                })
         });
         let dividers = layout.dividers.iter().enumerate().map(|(index, divider)| {
             let dragging = self
@@ -5341,20 +5719,54 @@ impl CompiApp {
                 .as_ref()
                 .is_some_and(|drag| drag.index == index);
             let side_by_side = divider.axis == SplitAxis::Horizontal;
-            // The visible seam is one device pixel (`divider.rect`). The transparent grab
-            // zone around it is wider and overlaps only the panes' padding, never text.
-            let zone = if side_by_side {
-                layout::Rect {
-                    x: divider.rect.x + (divider.rect.width - SEAM_GRAB) / 2.0,
-                    width: SEAM_GRAB,
-                    ..divider.rect
-                }
+            // Compact: the visible seam is the one-device-pixel `divider.rect`. Comfy: the
+            // divider is the gutter itself, and only hover or drag draws a thin line in its
+            // centre. The grab zone is at least `SEAM_GRAB` wide and never reaches text.
+            let grab = SEAM_GRAB.max(if side_by_side {
+                divider.rect.width
             } else {
-                layout::Rect {
-                    y: divider.rect.y + (divider.rect.height - SEAM_GRAB) / 2.0,
-                    height: SEAM_GRAB,
-                    ..divider.rect
-                }
+                divider.rect.height
+            });
+            let line_width = 2.0 * self.seam_width();
+            let (zone, line) = if side_by_side {
+                (
+                    layout::Rect {
+                        x: divider.rect.x + (divider.rect.width - grab) / 2.0,
+                        width: grab,
+                        ..divider.rect
+                    },
+                    if comfy {
+                        layout::Rect {
+                            x: divider.rect.x + (divider.rect.width - line_width) / 2.0,
+                            width: line_width,
+                            ..divider.rect
+                        }
+                    } else {
+                        divider.rect
+                    },
+                )
+            } else {
+                (
+                    layout::Rect {
+                        y: divider.rect.y + (divider.rect.height - grab) / 2.0,
+                        height: grab,
+                        ..divider.rect
+                    },
+                    if comfy {
+                        layout::Rect {
+                            y: divider.rect.y + (divider.rect.height - line_width) / 2.0,
+                            height: line_width,
+                            ..divider.rect
+                        }
+                    } else {
+                        divider.rect
+                    },
+                )
+            };
+            let line_color = if dragging {
+                Some(colors.accent)
+            } else {
+                (!comfy).then(|| self.seam_color())
             };
             div()
                 .id(("split-divider", index))
@@ -5372,15 +5784,11 @@ impl CompiApp {
                 .child(
                     div()
                         .absolute()
-                        .left(px(divider.rect.x - zone.x))
-                        .top(px(divider.rect.y - zone.y))
-                        .w(px(divider.rect.width))
-                        .h(px(divider.rect.height))
-                        .bg(color(if dragging {
-                            colors.accent
-                        } else {
-                            self.seam_color()
-                        }))
+                        .left(px(line.x - zone.x))
+                        .top(px(line.y - zone.y))
+                        .w(px(line.width))
+                        .h(px(line.height))
+                        .when_some(line_color, |line, fill| line.bg(color(fill)))
                         .group_hover("split-seam", move |style| style.bg(color(colors.accent))),
                 )
                 .on_mouse_down(
@@ -5422,6 +5830,24 @@ impl CompiApp {
                             .relative()
                             .w(px(layout.canvas.width))
                             .h(px(layout.canvas.height))
+                            .when(comfy, |canvas| {
+                                let islands: Vec<_> =
+                                    layout.panes.iter().map(|pane| pane.rect).collect();
+                                canvas.child(self.comfy_canvas(move |bounds| {
+                                    islands
+                                        .iter()
+                                        .map(|rect| {
+                                            Bounds::new(
+                                                point(
+                                                    bounds.left() + px(rect.x),
+                                                    bounds.top() + px(rect.y),
+                                                ),
+                                                size(px(rect.width), px(rect.height)),
+                                            )
+                                        })
+                                        .collect()
+                                }))
+                            })
                             .children(panes)
                             .children(dividers),
                     ),
@@ -5440,7 +5866,6 @@ impl CompiApp {
     fn render_pane(
         &self,
         id: impl Into<gpui::ElementId>,
-        index: usize,
         geometry: &layout::PaneLayout,
         rect: layout::Rect,
         cx: &Context<Self>,
@@ -5462,53 +5887,40 @@ impl CompiApp {
             .iter()
             .find(|view| view.pane_id == pane_id);
         let focused = view.is_some_and(|view| Some(view.id) == self.focused_view);
+        // An ended shell keeps its final screen; dimming it shows the pane is no longer live.
+        let ended = view.is_some_and(|view| {
+            matches!(
+                view.state,
+                ConnectionState::Exited(_) | ConnectionState::Failed
+            )
+        });
+        let input_owned = focused;
         let drop_view_id = view.map(|view| view.id);
         let paint = view.and_then(|view| {
             PaintModel::from_tab(
                 view,
                 self.typography.clone(),
                 self.terminal_theme.clone(),
-                focused && self.overlay.is_none(),
+                input_owned && self.overlay.is_none(),
             )
         });
+        // In Comfy the thumb's ends stay clear of the rounded corners.
+        let thumb_inset = if self.comfy() { PANE_RADIUS / 2.0 } else { 2.0 };
         let terminal_scroll = view.and_then(|view| {
             let snapshot = view.mirror.snapshot()?;
             if snapshot.modes.alternate_screen || snapshot.scrollback.is_empty() {
                 return None;
             }
-            let track = (geometry.rect.height - 4.0).max(1.0);
+            let track = (geometry.rect.height - 2.0 * thumb_inset).max(1.0);
             let visible = snapshot.cells.len().max(1) as f32;
             let history = snapshot.scrollback.len() as f32;
             let thumb = (track * visible / (visible + history)).max(18.0).min(track);
             let progress = 1.0 - view.scroll_offset.min(snapshot.scrollback.len()) as f32 / history;
             Some(((track - thumb) * progress, thumb))
         });
-        let surface = self
-            .workspace
-            .as_ref()
-            .and_then(|workspace| workspace.surface(&geometry.surface_id));
-        let status = surface
-            .map(|surface| match surface.status {
-                SurfaceStatus::Starting => "Starting",
-                SurfaceStatus::Running => {
-                    if view.is_some_and(|view| view.transport.is_some()) {
-                        "Running"
-                    } else {
-                        "Unavailable"
-                    }
-                }
-                SurfaceStatus::Ending => "Ending…",
-                SurfaceStatus::Exited => "Exited",
-                SurfaceStatus::Failed => "Failed",
-                SurfaceStatus::Lost => "Ended",
-            })
-            .unwrap_or("Removed");
-        let error = view
-            .and_then(|view| view.error.clone().or_else(|| view.image_error.clone()))
-            .or_else(|| surface.and_then(|surface| surface.error.clone()));
         let input = cx.entity();
         let input_focus = self.focus_handle.clone();
-        let composition = (focused && self.overlay.is_none() && !self.ime_text.is_empty())
+        let composition = (input_owned && self.overlay.is_none() && !self.ime_text.is_empty())
             .then(|| SharedString::from(self.ime_text.clone()));
         div()
             .id(id)
@@ -5544,66 +5956,6 @@ impl CompiApp {
                     cx.notify();
                 }),
             )
-            .when(!matches!(status, "Running"), |pane| {
-                pane.child(
-                    div()
-                        .flex_none()
-                        .min_h(px(36.0))
-                        .px_2()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_end()
-                        .gap_1()
-                        .border_b_1()
-                        .border_color(color(colors.border))
-                        .bg(color(colors.surface))
-                        .child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .text_size(px(UI_SMALL_TEXT_SIZE))
-                                .text_color(color(if matches!(status, "Failed" | "Ended") {
-                                    colors.error
-                                } else {
-                                    colors.muted
-                                }))
-                                .child(status),
-                        )
-                        .when(status == "Unavailable", |actions| {
-                            actions.child(self.pane_command_button(
-                                ("retry-pane", index),
-                                "Retry attachment",
-                                Command::Reconnect,
-                                &pane_id,
-                                cx,
-                            ))
-                        })
-                        .when(matches!(status, "Exited" | "Failed" | "Ended"), |actions| {
-                            actions.child(self.pane_command_button(
-                                ("restart-pane", index),
-                                "Restart shell",
-                                Command::RestartSurface,
-                                &pane_id,
-                                cx,
-                            ))
-                        }),
-                )
-            })
-            .when_some(error, |pane, error| {
-                pane.child(
-                    div()
-                        .flex_none()
-                        .px_2()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(color(colors.border))
-                        .bg(color(colors.surface))
-                        .text_color(color(colors.error))
-                        .text_size(px(UI_SMALL_TEXT_SIZE))
-                        .child(error),
-                )
-            })
             .when(!tree_active, |pane| {
                 pane.child(
                     div()
@@ -5616,6 +5968,7 @@ impl CompiApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                window.focus(&this.focus_handle);
                                 this.focus_pane(input_id.clone());
                                 this.on_terminal_mouse_down(event, window, cx);
                                 cx.stop_propagation();
@@ -5654,7 +6007,7 @@ impl CompiApp {
                             canvas(
                                 move |_, _, _| (),
                                 move |bounds, _, window, cx| {
-                                    if focused {
+                                    if input_owned {
                                         window.handle_input(
                                             &input_focus,
                                             ElementInputHandler::new(bounds, input.clone()),
@@ -5678,7 +6031,15 @@ impl CompiApp {
                                 },
                             )
                             .size_full(),
-                        ),
+                        )
+                        // One veil over the final screen: per-element opacity would fade each
+                        // cell quad separately and show seams between them.
+                        .when(ended, |body| {
+                            body.child(div().absolute().inset_0().bg(material_color(
+                                self.terminal_theme.terminal().background,
+                                0.55,
+                            )))
+                        }),
                 )
             })
             .when(tree_active, |pane| pane.child(self.render_file_tree(cx)))
@@ -5689,7 +6050,7 @@ impl CompiApp {
                         div()
                             .absolute()
                             .right(px(2.0))
-                            .top(px(2.0 + position))
+                            .top(px(thumb_inset + position))
                             .w(px(2.0))
                             .h(px(length))
                             .rounded_sm()
@@ -5708,6 +6069,11 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
+        let radius = if self.comfy() {
+            PANE_RADIUS
+        } else {
+            FLOAT_RADIUS_COMPACT
+        };
         let frame = float.frame;
         let pane_id = float.pane.pane_id.clone();
         let focused = self
@@ -5757,7 +6123,7 @@ impl CompiApp {
             // Occluding blocks the root's move handler while the pointer is over a
             // float; drags (move/resize, selections) must still see every event.
             .on_mouse_move(cx.listener(Self::on_workspace_mouse_move))
-            .rounded_md()
+            .rounded(px(radius))
             .shadow_lg()
             .bg(color(colors.surface))
             .on_mouse_down(
@@ -5780,7 +6146,7 @@ impl CompiApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded_t_md()
+                    .rounded_t(px(radius))
                     .border_b_1()
                     .border_color(color(colors.border))
                     .text_size(px(UI_SMALL_TEXT_SIZE))
@@ -5843,8 +6209,8 @@ impl CompiApp {
                     )),
             )
             .child(
-                self.render_pane(("floating-pane", index), index, &float.pane, body, cx)
-                    .rounded_b_md(),
+                self.render_pane(("floating-pane", index), &float.pane, body, cx)
+                    .rounded_b(px(radius)),
             )
             .child(handle(
                 "floating-resize-right",
@@ -5881,7 +6247,7 @@ impl CompiApp {
                 div()
                     .absolute()
                     .inset_0()
-                    .rounded_md()
+                    .rounded(px(radius))
                     .border_1()
                     .border_color(color(if focused {
                         colors.accent
@@ -6158,7 +6524,9 @@ impl CompiApp {
             return;
         }
         if self.sidebar_drag {
-            self.sidebar_width = f32::from(event.position.x).clamp(
+            // The pointer holds the seam (Compact) or the middle of the gap (Comfy).
+            let offset = if self.comfy() { PANE_GUTTER * 1.5 } else { 0.0 };
+            self.sidebar_width = (f32::from(event.position.x) - offset).clamp(
                 crate::config::MIN_SIDEBAR_WIDTH,
                 crate::config::MAX_SIDEBAR_WIDTH,
             );
@@ -6361,6 +6729,17 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.transfer_tab_mode(tab_id, destination, true, window, cx);
+    }
+
+    fn transfer_tab_mode(
+        &mut self,
+        tab_id: TabId,
+        destination: Option<AnyWindowHandle>,
+        activate_destination: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.capture_viewports();
         if self.mutation_pending || self.transferred_seed.is_some() {
             self.global_error =
@@ -6400,6 +6779,7 @@ impl CompiApp {
                 display_appearance,
                 display_sidebar_width: self.sidebar_width,
                 display_zoom: self.zoom,
+                activate: activate_destination,
             };
             match open_compi_window(self.target.clone(), None, config, Some(seed), cx) {
                 Ok(target) => target,
@@ -6497,8 +6877,10 @@ impl CompiApp {
             other.transferred_seed = None;
             other.save_state();
             other.rebuild_layout(target_window, true);
-            target_window.focus(&other.focus_handle);
-            other.report_focus(true);
+            if activate_destination {
+                target_window.focus(&other.focus_handle);
+            }
+            other.report_focus(target_window.is_window_active() && other.overlay.is_none());
             target_cx.notify();
         });
         if let Err(error) = result {
@@ -6512,7 +6894,7 @@ impl CompiApp {
             self.global_error = Some(format!(
                 "Transfer failed; source ownership restored: {error}"
             ));
-            self.report_focus(true);
+            self.report_focus(window.is_window_active() && self.overlay.is_none());
             if is_new {
                 let _ = target.update(cx, |_, window, _| window.remove_window());
             }
@@ -7016,6 +7398,90 @@ fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
     }
 }
 
+impl CompiApp {
+    fn pane_diagnostics(&self, view: &SurfaceView) -> String {
+        let surface = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.surface(&view.surface_id));
+        let mut details = Vec::new();
+        if let Some(error) = surface.and_then(|surface| surface.error.as_ref()) {
+            details.push(error.clone());
+        }
+        if let Some(error) = &view.error {
+            let message = match error.code {
+                Some(code) => format!("{code:?}: {}", error.message),
+                None => error.message.clone(),
+            };
+            if !details.iter().any(|detail| detail == &error.message) {
+                details.push(message);
+            }
+        }
+        if let Some(code) = surface
+            .and_then(|surface| surface.exit_code)
+            .filter(|code| *code != 0)
+        {
+            details.push(format!("Exit code: {code}"));
+        }
+        if view
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == Some(compi_protocol::ErrorCode::AlreadyAttached))
+        {
+            details.push("Release this pane in the other window, then retry attachment. Retrying does not take control from that window.".into());
+        }
+        if let Some(error) = &view.image_error {
+            details.push(format!("Image: {error}"));
+        }
+        if matches!(
+            view.state,
+            ConnectionState::Disconnected | ConnectionState::Reconnecting | ConnectionState::Failed
+        ) && let Some(error) = &self.connection_error
+            && !details.iter().any(|detail| detail == error)
+        {
+            details.push(error.clone());
+        }
+        details.join("\n")
+    }
+}
+
+/// Appends one closed rectangle with circular corners (radius clamped to fit) to `path`.
+fn rounded_rect_path(path: &mut PathBuilder, bounds: Bounds<Pixels>, radius: f32) {
+    let (left, top, right, bottom) = (bounds.left(), bounds.top(), bounds.right(), bounds.bottom());
+    let radius = px(radius
+        .min(f32::from(bounds.size.width) / 2.0)
+        .min(f32::from(bounds.size.height) / 2.0)
+        .max(0.0));
+    // Control-point offset of a cubic Bézier approximating a quarter circle.
+    let k = radius * 0.552_284_7;
+    path.move_to(point(left + radius, top));
+    path.line_to(point(right - radius, top));
+    path.cubic_bezier_to(
+        point(right, top + radius),
+        point(right - radius + k, top),
+        point(right, top + radius - k),
+    );
+    path.line_to(point(right, bottom - radius));
+    path.cubic_bezier_to(
+        point(right - radius, bottom),
+        point(right, bottom - radius + k),
+        point(right - radius + k, bottom),
+    );
+    path.line_to(point(left + radius, bottom));
+    path.cubic_bezier_to(
+        point(left, bottom - radius),
+        point(left + radius - k, bottom),
+        point(left, bottom - radius + k),
+    );
+    path.line_to(point(left, top + radius));
+    path.cubic_bezier_to(
+        point(left + radius, top),
+        point(left, top + radius - k),
+        point(left + radius - k, top),
+    );
+    path.close();
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -7026,8 +7492,8 @@ mod tests {
     use super::{
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
-        TabPane, WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title,
-        display_index_for_bounds, header_metrics, opacity_at_slider_position, tab_caption,
+        WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, display_index_for_bounds,
+        header_metrics, opacity_at_slider_position,
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};
@@ -7264,34 +7730,6 @@ mod tests {
         assert_eq!(
             concise_tab_title("user@host: ~/compi"),
             "user@host: ~/compi"
-        );
-    }
-
-    #[test]
-    fn split_tab_caption_shows_both_names_then_a_total_count() {
-        let panes: Vec<_> = ["shell", "server", "logs", "tests"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, title)| TabPane {
-                pane_id: PaneId::new(format!("pane-{index}")),
-                title: title.into(),
-                directory: None,
-                floating: false,
-            })
-            .collect();
-        assert_eq!(tab_caption("", &panes[..1]), ("shell".into(), None));
-        assert_eq!(
-            tab_caption("", &panes[..2]),
-            ("shell".into(), Some("server".into()))
-        );
-        assert_eq!(
-            tab_caption("", &panes[..3]),
-            ("shell".into(), Some("3+".into()))
-        );
-        assert_eq!(tab_caption("", &panes), ("shell".into(), Some("4+".into())));
-        assert_eq!(
-            tab_caption("my project", &panes[..2]),
-            ("my project".into(), Some("2".into()))
         );
     }
 

@@ -97,6 +97,21 @@ pub fn parse(source: &str, running: &str) -> Option<ReleaseNotes> {
     })
 }
 
+/// A release's signed notes; unexpected formatting degrades to plain summary lines.
+pub fn of_release(manifest: &compi_update::ReleaseManifest) -> ReleaseNotes {
+    parse(&manifest.release_notes, &manifest.version).unwrap_or_else(|| ReleaseNotes {
+        version: manifest.version.clone(),
+        summary: manifest
+            .release_notes
+            .lines()
+            .map(|line| line.trim().trim_start_matches(['#', '-', ' ']))
+            .filter(|line| !line.is_empty() && *line != manifest.version)
+            .map(str::to_owned)
+            .collect(),
+        details: Vec::new(),
+    })
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seen {
     #[serde(default)]

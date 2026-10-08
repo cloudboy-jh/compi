@@ -185,6 +185,7 @@ pub struct TerminalState {
     active_hyperlink: Option<SmolStr>,
     title: String,
     current_directory: Option<String>,
+    shell_pid: Option<u32>,
     modes: TerminalModes,
     keyboard_protocol_stack: Vec<u8>,
     scroll_top: usize,
@@ -225,6 +226,7 @@ impl TerminalState {
             active_hyperlink: None,
             title: String::new(),
             current_directory: None,
+            shell_pid: None,
             modes: TerminalModes {
                 auto_wrap: true,
                 ..TerminalModes::default()
@@ -270,10 +272,38 @@ impl TerminalState {
         };
     }
 
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn current_directory(&self) -> Option<&str> {
+        self.current_directory.as_deref()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
-        let mut images: Vec<_> = self.images.values().cloned().collect();
+        self.snapshot_with_graphics(true, true)
+    }
+
+    pub fn text_snapshot(&self, include_scrollback: bool) -> Snapshot {
+        self.snapshot_with_graphics(false, include_scrollback)
+    }
+
+    fn snapshot_with_graphics(&self, include_graphics: bool, include_scrollback: bool) -> Snapshot {
+        let mut images: Vec<_> = if include_graphics {
+            self.images.values().cloned().collect()
+        } else {
+            Vec::new()
+        };
         images.sort_by_key(|image| image.id);
-        let mut placements = self.placements.clone();
+        let mut placements = if include_graphics {
+            self.placements.clone()
+        } else {
+            Vec::new()
+        };
         placements.sort_by_key(|placement| {
             (
                 placement.z_index,
@@ -286,7 +316,11 @@ impl TerminalState {
             cols: self.cols() as u16,
             rows: self.rows() as u16,
             cells: self.buffer().rows.clone(),
-            scrollback: self.main.scrollback.iter().cloned().collect(),
+            scrollback: if include_scrollback {
+                self.main.scrollback.iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
             cursor: self.cursor,
             modes: self.modes.clone(),
             title: self.title.clone(),
@@ -911,6 +945,26 @@ impl TerminalState {
         }
     }
 
+    fn cursor_up(&mut self, count: usize) {
+        let row = usize::from(self.cursor.row);
+        let top = if self.modes.origin || row >= self.scroll_top {
+            self.scroll_top
+        } else {
+            0
+        };
+        self.cursor.row = row.saturating_sub(count).max(top) as u16;
+    }
+
+    fn cursor_down(&mut self, count: usize) {
+        let row = usize::from(self.cursor.row);
+        let bottom = if self.modes.origin || row < self.scroll_bottom {
+            self.scroll_bottom - 1
+        } else {
+            self.rows() - 1
+        };
+        self.cursor.row = row.saturating_add(count).min(bottom) as u16;
+    }
+
     fn set_cursor(&mut self, row: usize, col: usize) {
         let origin = if self.modes.origin {
             self.scroll_top
@@ -1531,6 +1585,15 @@ impl Perform for TerminalState {
                     self.clipboard_writes.push(text);
                 }
             }
+            "777" if params.len() == 4 && params[1] == b"compi" && params[2] == b"pid" => {
+                self.shell_pid = std::str::from_utf8(params[3])
+                    .ok()
+                    .filter(|text| {
+                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .and_then(|text| text.parse::<u32>().ok())
+                    .filter(|pid| *pid > 0);
+            }
             "777" if params.len() == 3 && params[1] == b"compi" => {
                 if params[2] == b"tree" {
                     self.shell_action = Some(ShellAction::BrowseFiles);
@@ -1549,22 +1612,24 @@ impl Perform for TerminalState {
         }
         let private = intermediates == b"?";
         let count = first_param(params, 1).max(1) as usize;
+        let query = if params.len() == 1 {
+            params.iter().next()
+        } else {
+            None
+        };
         match (action, intermediates) {
-            ('A', _) => self.cursor.row = self.cursor.row.saturating_sub(count as u16),
-            ('B', _) => {
-                self.cursor.row = (usize::from(self.cursor.row) + count).min(self.rows() - 1) as u16
-            }
+            ('A', _) => self.cursor_up(count),
+            ('B', _) => self.cursor_down(count),
             ('C', _) => {
                 self.cursor.col = (usize::from(self.cursor.col) + count).min(self.cols() - 1) as u16
             }
             ('D', _) => self.cursor.col = self.cursor.col.saturating_sub(count as u16),
             ('E', _) => {
-                self.cursor.row =
-                    (usize::from(self.cursor.row) + count).min(self.rows() - 1) as u16;
+                self.cursor_down(count);
                 self.cursor.col = 0;
             }
             ('F', _) => {
-                self.cursor.row = self.cursor.row.saturating_sub(count as u16);
+                self.cursor_up(count);
                 self.cursor.col = 0;
             }
             ('G' | '`', _) => self.set_cursor(usize::from(self.cursor.row), count - 1),
@@ -1591,7 +1656,11 @@ impl Perform for TerminalState {
             ('r', _) => {
                 let values = flat_params(params);
                 let top = values.first().copied().unwrap_or(1).max(1) as usize - 1;
-                let bottom = values.get(1).copied().unwrap_or(self.rows() as u16) as usize;
+                let bottom = values
+                    .get(1)
+                    .copied()
+                    .filter(|value| *value != 0)
+                    .map_or(self.rows(), usize::from);
                 if top < bottom && bottom <= self.rows() {
                     self.scroll_top = top;
                     self.scroll_bottom = bottom;
@@ -1626,11 +1695,28 @@ impl Perform for TerminalState {
                         self.keyboard_protocol_stack.pop().unwrap_or(0);
                 }
             }
-            ('n', _) if first_param(params, 0) == 5 => self.replies.push(b"\x1b[0n".to_vec()),
-            ('n', _) if first_param(params, 0) == 6 => self.replies.push(
-                format!("\x1b[{};{}R", self.cursor.row + 1, self.cursor.col + 1).into_bytes(),
-            ),
-            ('c', _) => self.replies.push(b"\x1b[?1;2c".to_vec()),
+            ('n', b"") if matches!(query, Some([5])) => {
+                self.replies.push(b"\x1b[0n".to_vec());
+            }
+            ('n', b"" | b"?") if matches!(query, Some([6])) => {
+                let row = if self.modes.origin {
+                    usize::from(self.cursor.row).saturating_sub(self.scroll_top)
+                } else {
+                    usize::from(self.cursor.row)
+                };
+                let prefix = if private { "?" } else { "" };
+                self.replies.push(
+                    format!("\x1b[{prefix}{};{}R", row + 1, self.cursor.col + 1).into_bytes(),
+                );
+            }
+            // VT100-compatible, without claiming optional terminal features.
+            ('c', b"") if matches!(query, Some([0])) => {
+                self.replies.push(b"\x1b[?1;0c".to_vec());
+            }
+            // VT100 identity, no firmware version or ROM cartridge.
+            ('c', b">") if matches!(query, Some([0])) => {
+                self.replies.push(b"\x1b[>0;0;0c".to_vec());
+            }
             ('q', b" ") => self.cursor_style(first_param(params, 0)),
             _ => self.diagnostics.record(format!(
                 "CSI:{action}:private={private}:intermediates={intermediates:?}:params={:?}",
@@ -1659,8 +1745,10 @@ impl Perform for TerminalState {
                 let cols = self.cols() as u16;
                 let rows = self.rows() as u16;
                 let diagnostics = std::mem::take(&mut self.diagnostics);
+                let shell_pid = self.shell_pid;
                 *self = Self::new(cols, rows);
                 self.diagnostics = diagnostics;
+                self.shell_pid = shell_pid;
             }
             b'=' => self.modes.application_keypad = true,
             b'>' => self.modes.application_keypad = false,
@@ -2095,6 +2183,19 @@ mod tests {
     }
 
     #[test]
+    fn shell_pid_metadata_is_bounded_and_survives_terminal_reset() {
+        let mut terminal = TerminalState::new(12, 3);
+        terminal.advance(b"\x1b]777;compi;pid;123\x07");
+        assert_eq!(terminal.shell_pid(), Some(123));
+        terminal.advance(b"\x1bc");
+        assert_eq!(terminal.shell_pid(), Some(123));
+        for invalid in ["0", "-1", "123x", "4294967296", ""] {
+            terminal.advance(format!("\x1b]777;compi;pid;{invalid}\x07").as_bytes());
+            assert_eq!(terminal.shell_pid(), None);
+        }
+    }
+
+    #[test]
     fn shell_actions_are_bounded_one_shot_delta_effects() {
         let mut terminal = TerminalState::new(12, 3);
         assert!(terminal.advance(b"\x1b]777;compi;tr").0.is_none());
@@ -2354,6 +2455,109 @@ mod tests {
         let (_, replies) = terminal.advance(b"\x1b[6n");
         assert_eq!(replies, vec![b"\x1b[1;4R".to_vec()]);
     }
+
+    #[test]
+    fn vertical_cursor_motion_stops_at_directional_scroll_margins() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"\x1b[?6l\x1b[1;2r\x1b[2;1H\x1b[B", b"\x1b[2;1R"),
+            (b"\x1b[3;6r\x1b[3;4H\x1b[A", b"\x1b[3;4R"),
+            (b"\x1b[3;6r\x1b[4;4H\x1b[99A", b"\x1b[3;4R"),
+            (b"\x1b[3;6r\x1b[4;4H\x1b[99B", b"\x1b[6;4R"),
+            // Above the region, CUU still reaches the screen's top edge.
+            (b"\x1b[3;6r\x1b[2;4H\x1b[99A", b"\x1b[1;4R"),
+            // Below the region, CUD still reaches the screen's bottom edge.
+            (b"\x1b[3;6r\x1b[7;4H\x1b[99B", b"\x1b[8;4R"),
+            // Moving into the region stops at the opposite scroll margin.
+            (b"\x1b[3;6r\x1b[1;4H\x1b[99B", b"\x1b[6;4R"),
+            (b"\x1b[3;6r\x1b[8;4H\x1b[99A", b"\x1b[3;4R"),
+        ];
+        for &(input, expected) in cases {
+            let mut terminal = TerminalState::new(10, 8);
+            terminal.advance(input);
+            let (_, replies) = terminal.advance(b"\x1b[6n");
+            assert_eq!(replies, vec![expected.to_vec()], "{input:?}");
+        }
+    }
+
+    #[test]
+    fn next_and_previous_line_share_vertical_bounds_and_reset_column() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"\x1b[3;6r\x1b[6;4H\x1b[E", b"\x1b[6;1R"),
+            (b"\x1b[3;6r\x1b[3;4H\x1b[F", b"\x1b[3;1R"),
+            (b"\x1b[3;6r\x1b[7;4H\x1b[99E", b"\x1b[8;1R"),
+            (b"\x1b[3;6r\x1b[2;4H\x1b[99F", b"\x1b[1;1R"),
+        ];
+        for &(input, expected) in cases {
+            let mut terminal = TerminalState::new(10, 8);
+            terminal.advance(input);
+            let (_, replies) = terminal.advance(b"\x1b[6n");
+            assert_eq!(replies, vec![expected.to_vec()], "{input:?}");
+        }
+    }
+
+    #[test]
+    fn omitted_and_zero_margins_restore_full_screen_scrolling() {
+        for reset in [b"\x1b[r".as_slice(), b"\x1b[;r", b"\x1b[0;0r", b"\x1b[1;0r"] {
+            let mut terminal = TerminalState::new(10, 8);
+            terminal.advance(b"\x1b[?6l\x1b[1;2r");
+            terminal.advance(reset);
+            let (_, replies) = terminal.advance(b"\x1b[2;1H\n\x1b[6n");
+            assert_eq!(replies, vec![b"\x1b[3;1R".to_vec()], "{reset:?}");
+        }
+        // A zero bottom margin also preserves an explicitly requested top.
+        let mut terminal = TerminalState::new(10, 8);
+        terminal.advance(b"\x1b[3;0r\x1b[3;4H\x1b[99A");
+        let (_, replies) = terminal.advance(b"\x1b[6n");
+        assert_eq!(replies, vec![b"\x1b[3;4R".to_vec()]);
+    }
+
+    #[test]
+    fn cursor_reports_preserve_query_namespace_and_origin_coordinates() {
+        let mut terminal = TerminalState::new(10, 8);
+        let (_, replies) = terminal.advance(b"\x1b[?6l\x1b[4;7H\x1b[6n\x1b[?6n");
+        assert_eq!(replies, vec![b"\x1b[4;7R".to_vec(), b"\x1b[?4;7R".to_vec()]);
+
+        terminal.advance(b"\x1b[3;6r\x1b[?6h\x1b[2;7H");
+        let (_, replies) = terminal.advance(b"\x1b[6n\x1b[?6n");
+        assert_eq!(replies, vec![b"\x1b[2;7R".to_vec(), b"\x1b[?2;7R".to_vec()]);
+
+        terminal.advance(b"\x1b[99A");
+        let (_, replies) = terminal.advance(b"\x1b[?6n");
+        assert_eq!(replies, vec![b"\x1b[?1;7R".to_vec()]);
+        terminal.advance(b"\x1b[99B");
+        let (_, replies) = terminal.advance(b"\x1b[?6n");
+        assert_eq!(replies, vec![b"\x1b[?4;7R".to_vec()]);
+    }
+
+    #[test]
+    fn status_reports_do_not_answer_other_namespaces_or_response_packets() {
+        let mut terminal = TerminalState::new(10, 8);
+        let (_, replies) = terminal
+            .advance(b"\x1b[>6n\x1b[?5n\x1b[>5n\x1b[0n\x1b[?0n\x1b[6;1n\x1b[1;1R\x1b[?1;1R");
+        assert!(replies.is_empty());
+        let (_, replies) = terminal.advance(b"\x1b[5n");
+        assert_eq!(replies, vec![b"\x1b[0n".to_vec()]);
+    }
+
+    #[test]
+    fn device_attributes_distinguish_primary_and_secondary_without_optional_claims() {
+        let mut terminal = TerminalState::new(10, 8);
+        let (_, replies) = terminal.advance(b"\x1b[c\x1b[0c\x1b[>c\x1b[>0c");
+        assert_eq!(
+            replies,
+            vec![
+                b"\x1b[?1;0c".to_vec(),
+                b"\x1b[?1;0c".to_vec(),
+                b"\x1b[>0;0;0c".to_vec(),
+                b"\x1b[>0;0;0c".to_vec(),
+            ]
+        );
+        // Neither valid response nor unsupported request can start a reply loop.
+        let (_, replies) =
+            terminal.advance(b"\x1b[?1;2c\x1b[?1;0c\x1b[>0;0;0c\x1b[1c\x1b[>1c\x1b[=c\x1b[0;0c");
+        assert!(replies.is_empty());
+    }
+
     #[test]
     fn applies_editing_modes_and_cursor_operations() {
         let mut terminal = TerminalState::new(10, 3);

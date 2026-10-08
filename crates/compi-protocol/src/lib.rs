@@ -4,6 +4,7 @@ pub mod frame;
 #[cfg_attr(unix, path = "identity_unix.rs")]
 pub mod identity;
 mod lifecycle_inventory;
+pub mod metadata;
 pub mod paths;
 pub mod perf;
 pub mod pipe;
@@ -22,19 +23,21 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub use client::{
-    ClientIo, ConnectionFailure, ConnectionFailureKind, DaemonClient, DaemonError, ServerEvent,
+    ClientIo, ConnectionFailure, ConnectionFailureKind, DaemonClient, DaemonError, LocalDaemon,
+    ServerEvent,
 };
 pub use lifecycle_inventory::{LocalDaemonProcess, local_daemon_processes};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Version 16 adds shell prompt detection, preview and managed application.
-pub const PROTOCOL_VERSION: u32 = 16;
+// Version 18 adds atomic tab growth with actor-assigned pane and surface IDs.
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_MUTATION_RECEIPTS: usize = 1_024;
+pub const MAX_TAB_PANES: usize = 256;
 
 /// Authoritative graphics storage, measured as retained base64 bytes.
 pub const DEFAULT_GRAPHICS_BYTES: usize = 64 * 1024 * 1024;
@@ -204,6 +207,30 @@ pub enum ClientMessage {
     },
     GetRuntimeMetrics,
     GetWorkspace,
+    ObserveSurface {
+        surface_id: SurfaceId,
+        expected_lifetime: ProcessLifetimeId,
+        scrollback: bool,
+    },
+    SendSurfaceInput {
+        surface_id: SurfaceId,
+        expected_lifetime: ProcessLifetimeId,
+        data: Vec<u8>,
+    },
+    GetSurfaceMetadata {
+        surface_id: SurfaceId,
+        expected_lifetime: ProcessLifetimeId,
+    },
+    AttachConsole {
+        surface_id: SurfaceId,
+        expected_lifetime: ProcessLifetimeId,
+        cols: i16,
+        rows: i16,
+    },
+    DetachSurface {
+        surface_id: SurfaceId,
+        expected_lifetime: ProcessLifetimeId,
+    },
     ListDirectory {
         surface_id: SurfaceId,
         path: String,
@@ -280,6 +307,13 @@ pub enum ServerMessage {
     },
     Workspace {
         workspace: WorkspaceSnapshot,
+    },
+    SurfaceObserved {
+        identity: TerminalIdentity,
+        sequence: u64,
+    },
+    SurfaceMetadata {
+        metadata: Box<metadata::PaneMetadata>,
     },
     DirectoryListed {
         entries: Vec<DirectoryEntry>,
@@ -488,6 +522,23 @@ pub enum LayoutNode {
     },
 }
 
+/// A complete tab layout proposed for atomic growth. Existing panes retain their
+/// surfaces and processes; the actor assigns identities to each new pane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlannedLayoutNode {
+    ExistingPane {
+        pane_id: PaneId,
+    },
+    NewPane,
+    Split {
+        axis: SplitAxis,
+        ratio: f32,
+        first: Box<PlannedLayoutNode>,
+        second: Box<PlannedLayoutNode>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkspaceTab {
     pub id: TabId,
@@ -665,6 +716,13 @@ pub enum WorkspaceMutation {
         expected_lifetime: ProcessLifetimeId,
         cols: i16,
         rows: i16,
+    },
+    /// Grow and arrange a tab in one transaction, preserving every existing pane.
+    /// The final layout must fit minimum 20-column by 4-row pane allocations.
+    GrowTab {
+        tab_id: TabId,
+        layout: PlannedLayoutNode,
+        working_directory: Option<String>,
     },
 }
 

@@ -47,6 +47,41 @@ impl BackgroundEffect {
     }
 }
 
+/// Spacing around terminal panes: rounded islands separated by gutters, or edge to edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceDensity {
+    #[default]
+    Comfy,
+    Compact,
+}
+
+impl WorkspaceDensity {
+    pub const ALL: [Self; 2] = [Self::Comfy, Self::Compact];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Comfy => "comfy",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Comfy => "Comfy",
+            Self::Compact => "Compact",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "comfy" => Some(Self::Comfy),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
 /// Packed theme colors use `0xTTRRGGBB`, where `TT` is inverse alpha (`255 - alpha`).
 /// Existing `0xRRGGBB` constants are therefore fully opaque.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

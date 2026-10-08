@@ -362,7 +362,7 @@ try {
         $updateCycle = Get-Content -Raw -LiteralPath $cycleEvidence | ConvertFrom-Json
     }
     $qualification = @{
-        schema = 1; platform = 'windows-x86_64'; version = $version; daemon_protocol = 16
+        schema = 1; platform = 'windows-x86_64'; version = $version; daemon_protocol = 18
         qualified_daemons = @($version); artifact_sha256 = (Get-FileHash -Algorithm SHA256 $updatePayload).Hash.ToLowerInvariant()
         installer_scenarios = @($installerScenarios.ToArray())
     }

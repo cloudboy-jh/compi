@@ -224,6 +224,7 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
                 padding_y: 0.0,
                 pane_chrome_height: 0.0,
                 divider_thickness: 1.0,
+                margin: 0.0,
                 scale_factor: 1.0,
             };
             let layout = workspace
@@ -826,7 +827,7 @@ fn activate_daemon_task() -> Result<()> {
 }
 
 #[cfg(unix)]
-mod console {
+pub(crate) mod console {
     use super::*;
     use compi_protocol::{Color, ScreenSnapshot};
     use std::io::{self, Read, Write};
@@ -873,7 +874,7 @@ mod console {
     pub fn attach(mut client: DaemonClient, surface: SurfaceInfo) -> Result<()> {
         let _terminal = TerminalState::configure()?;
         let mut size = dimensions();
-        client.attach_surface(&surface, size.0, size.1)?;
+        client.attach_console_surface(&surface, size.0, size.1)?;
         let mut mirror = ScreenMirror::default();
         let mut input = io::stdin().lock();
         let mut output = io::stdout().lock();
@@ -895,6 +896,10 @@ mod console {
                         client.request_snapshot()?;
                     }
                 },
+                Some(ServerEvent::Control {
+                    message: ServerMessage::Detached { .. },
+                    ..
+                }) => return Ok(()),
                 Some(ServerEvent::Control {
                     message: ServerMessage::SurfaceExited { exit_code, .. },
                     ..

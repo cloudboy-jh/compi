@@ -45,6 +45,8 @@ enum SettingsAction {
     RestartDaemon,
     Update(UpdateControl),
     Prompt(super::prompt::PromptAction),
+    Metadata(usize),
+    Density(crate::theme::WorkspaceDensity),
 }
 
 #[derive(Clone, Copy)]
@@ -81,7 +83,7 @@ impl CompiApp {
     fn settings_action_count(&self) -> usize {
         match self.settings_section {
             SettingsSection::Appearance => self.appearance_action_count(),
-            SettingsSection::Interface => self.font_choice_count() + 3,
+            SettingsSection::Interface => self.font_choice_count() + 9,
             SettingsSection::Terminal => self.prompt_offset_base() + self.prompt_actions().len(),
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
@@ -111,8 +113,17 @@ impl CompiApp {
                     };
                 }
                 match (self.settings_section, offset - choices - 1) {
-                    (SettingsSection::Interface, 0) => Some(SettingsAction::ResetSidebar),
-                    (SettingsSection::Interface, 1) => Some(SettingsAction::ResetLayout),
+                    (SettingsSection::Interface, index @ 0..=1) => {
+                        crate::theme::WorkspaceDensity::ALL
+                            .get(index)
+                            .copied()
+                            .map(SettingsAction::Density)
+                    }
+                    (SettingsSection::Interface, 2) => Some(SettingsAction::ResetSidebar),
+                    (SettingsSection::Interface, 3) => Some(SettingsAction::ResetLayout),
+                    (SettingsSection::Interface, index @ 4..=7) => {
+                        Some(SettingsAction::Metadata(index - 4))
+                    }
                     (SettingsSection::Terminal, 0) => Some(SettingsAction::Zoom(Command::ZoomOut)),
                     (SettingsSection::Terminal, 1) => {
                         Some(SettingsAction::Zoom(Command::ZoomReset))
@@ -419,6 +430,18 @@ impl CompiApp {
     ) {
         match action {
             SettingsAction::Update(control) => self.activate_update_control(control),
+            SettingsAction::Metadata(index) => {
+                let mut settings = self.config.metadata.clone();
+                match index {
+                    0 => settings.directory = !settings.directory,
+                    1 => settings.process = !settings.process,
+                    2 => settings.git = !settings.git,
+                    _ => settings.dimensions = !settings.dimensions,
+                }
+                if let Err(error) = self.config.save_metadata_settings(settings) {
+                    self.global_error = Some(error);
+                }
+            }
             SettingsAction::Scope(scope) => self.settings_scope = scope,
             SettingsAction::BrowseThemes(target) => {
                 self.open_theme_catalog_target(self.settings_scope, target)
@@ -468,6 +491,7 @@ impl CompiApp {
             SettingsAction::OpenDiagnostics => self.execute(Command::OpenDiagnostics, window, cx),
             SettingsAction::RestartDaemon => self.execute(Command::RestartDaemon, window, cx),
             SettingsAction::Prompt(action) => self.activate_prompt_action(action),
+            SettingsAction::Density(density) => self.apply_density(density, window, cx),
             SettingsAction::OpenSettings => {
                 self.settings_font_picker = None;
                 self.open_overlay(Overlay::Settings, "");
@@ -495,6 +519,25 @@ impl CompiApp {
             return;
         }
         self.ui_font = crate::font_catalog::resolve_ui_font(preset, window.text_system());
+        self.broadcast_global_appearance(window, cx);
+        cx.notify();
+    }
+
+    fn apply_density(
+        &mut self,
+        density: crate::theme::WorkspaceDensity,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.density == density {
+            return;
+        }
+        if let Err(error) = self.config.save_density(density) {
+            self.global_error = Some(error);
+            return;
+        }
+        // Geometry changes go through the ordinary resize path; shells keep running.
+        self.rebuild_layout(window, true);
         self.broadcast_global_appearance(window, cx);
         cx.notify();
     }
@@ -1233,13 +1276,14 @@ impl CompiApp {
                     ),
                 )
             })
+            .child(self.render_density_setting(choices + 1, compact, cx))
             .child(self.settings_row(
                 "Sidebar width",
                 format!("{:.0}px", self.sidebar_width),
                 self.settings_control_button(
                     "Reset width",
                     SettingsAction::ResetSidebar,
-                    choices + 1,
+                    choices + 3,
                     false,
                     cx,
                 ),
@@ -1251,13 +1295,111 @@ impl CompiApp {
                 self.settings_control_button(
                     "Reset layout",
                     SettingsAction::ResetLayout,
-                    choices + 2,
+                    choices + 4,
                     false,
                     cx,
                 ),
                 compact,
             ))
+            .child(self.settings_subheading("Tab metadata"))
+            .children(
+                [
+                    (
+                        "Directory",
+                        "Show the current directory reported by the shell.",
+                        self.config.metadata.directory,
+                    ),
+                    (
+                        "Active process",
+                        "Show the terminal foreground process, not the launcher.",
+                        self.config.metadata.process,
+                    ),
+                    (
+                        "Git branch and changes",
+                        "Show branch and change state in the terminal's environment.",
+                        self.config.metadata.git,
+                    ),
+                    (
+                        "Dimensions",
+                        "Show terminal columns and rows.",
+                        self.config.metadata.dimensions,
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (label, description, enabled))| {
+                    self.settings_row(
+                        label,
+                        description.into(),
+                        self.render_settings_toggle(
+                            enabled,
+                            SettingsAction::Metadata(index),
+                            choices + 5 + index,
+                            true,
+                            cx,
+                        ),
+                        compact,
+                    )
+                }),
+            )
             .into_any_element()
+    }
+
+    fn render_density_setting(
+        &self,
+        first: usize,
+        compact: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let base = self.settings_content_focus(0);
+        let controls = div()
+            .flex()
+            .when(compact, |controls| controls.flex_col().items_start())
+            .gap_2()
+            .children(
+                crate::theme::WorkspaceDensity::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, density)| {
+                        let offset = first + index;
+                        let focused = self.overlay_focus == base + offset;
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(self.settings_segment_button(
+                                ("settings-density", index),
+                                density.label(),
+                                self.config.density == density,
+                                focused,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.overlay_focus = base + offset;
+                                    this.activate_settings_action(
+                                        SettingsAction::Density(density),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(self.settings_focus_anchor(focused, cx))
+                    }),
+            )
+            .into_any_element();
+        self.settings_row(
+            "Pane density",
+            match self.config.density {
+                crate::theme::WorkspaceDensity::Comfy => {
+                    "Rounded panes with gaps between them, in every window."
+                }
+                crate::theme::WorkspaceDensity::Compact => {
+                    "Edge-to-edge panes for the most terminal space, in every window."
+                }
+            }
+            .into(),
+            controls,
+            compact,
+        )
     }
 
     fn render_terminal_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
@@ -1449,7 +1591,10 @@ impl CompiApp {
             UpdateControl::DownloadAutomatically,
         ]);
         if let Some(release) = snapshot.candidate() {
-            if !candidate_notes(release).details.is_empty() {
+            if !crate::release_notes::of_release(&release.manifest)
+                .details
+                .is_empty()
+            {
                 controls.push(UpdateControl::CandidateMore);
             }
             controls.push(UpdateControl::CandidateNotes);
@@ -1514,7 +1659,7 @@ impl CompiApp {
             }
             UpdateControl::CandidateNotes => {
                 if let Some(release) = self.updates.snapshot().candidate() {
-                    self.open_release_notes(&candidate_notes(release));
+                    self.open_release_notes(&crate::release_notes::of_release(&release.manifest));
                 }
             }
             UpdateControl::WhatsNewMore => {
@@ -1708,7 +1853,7 @@ impl CompiApp {
                 compact,
             ));
         if let Some(release) = snapshot.candidate() {
-            let notes = candidate_notes(release);
+            let notes = crate::release_notes::of_release(&release.manifest);
             let expanded = self.settings_update_notes_expanded;
             let more = control(
                 if expanded { "Less" } else { "More" },
@@ -2237,24 +2382,6 @@ impl CompiApp {
             .child(panel)
             .into_any_element()
     }
-}
-
-/// The candidate's signed notes; unexpected formatting degrades to plain summary lines.
-fn candidate_notes(release: &compi_update::AvailableRelease) -> crate::release_notes::ReleaseNotes {
-    let manifest = &release.manifest;
-    crate::release_notes::parse(&manifest.release_notes, &manifest.version).unwrap_or_else(|| {
-        crate::release_notes::ReleaseNotes {
-            version: manifest.version.clone(),
-            summary: manifest
-                .release_notes
-                .lines()
-                .map(|line| line.trim().trim_start_matches(['#', '-', ' ']))
-                .filter(|line| !line.is_empty() && *line != manifest.version)
-                .map(str::to_owned)
-                .collect(),
-            details: Vec::new(),
-        }
-    })
 }
 
 fn open_update_log() -> Result<(), String> {

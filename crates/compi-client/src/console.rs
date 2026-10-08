@@ -41,7 +41,7 @@ pub fn dimensions() -> (i16, i16) {
 pub fn attach(mut client: DaemonClient, surface: SurfaceInfo) -> Result<()> {
     let _console = ConsoleState::configure()?;
     let initial_size = dimensions();
-    client.attach_surface(&surface, initial_size.0, initial_size.1)?;
+    client.attach_console_surface(&surface, initial_size.0, initial_size.1)?;
 
     let (connection, next_request_id, mut pending_screen, target, _workspace) = client.into_parts();
     let target = Arc::new(target.ok_or("terminal attachment target was not established")?);

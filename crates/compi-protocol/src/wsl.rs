@@ -12,9 +12,58 @@ use windows::Win32::Storage::FileSystem::{
 
 const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 
+/// The inherited Windows search path, with order and executable directories
+/// preserved. Cargo's injected DLL directories are not shell command paths.
+pub fn launch_path() -> Option<&'static std::ffi::OsStr> {
+    static PATH: std::sync::LazyLock<Option<std::ffi::OsString>> = std::sync::LazyLock::new(|| {
+        let path = env::var_os("PATH")?;
+        let cargo_directory = env::var_os("CARGO")
+            .and_then(|_| env::current_exe().ok())
+            .and_then(|executable| executable.parent().map(Path::to_owned));
+        clean_path(&path, cargo_directory.as_deref()).ok()
+    });
+    PATH.as_deref()
+}
+
+fn clean_path(
+    path: &std::ffi::OsStr,
+    cargo_directory: Option<&Path>,
+) -> std::result::Result<std::ffi::OsString, env::JoinPathsError> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut seen = std::collections::HashSet::new();
+    let mut directories = Vec::new();
+    for directory in env::split_paths(path) {
+        if let Some(build_directory) = cargo_directory
+            && (directory.starts_with(build_directory)
+                || (directory.ends_with("lib")
+                    && directory
+                        .components()
+                        .any(|part| part.as_os_str() == "rustlib")))
+        {
+            continue;
+        }
+        let mut key: Vec<u16> = directory
+            .as_os_str()
+            .encode_wide()
+            .map(|character| match character {
+                65..=90 => character + 32,
+                47 => 92,
+                _ => character,
+            })
+            .collect();
+        while key.len() > 3 && key.last() == Some(&92) {
+            key.pop();
+        }
+        if seen.insert(key) {
+            directories.push(directory);
+        }
+    }
+    env::join_paths(directories)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WslLaunch {
-    pub distribution: Option<String>,
+    pub distribution: String,
     pub directory: String,
     pub metadata: Option<WorkingDirectory>,
 }
@@ -33,19 +82,16 @@ pub fn resolve_launch(
     working_directory: Option<&str>,
     requested_distribution: Option<&str>,
 ) -> Result<WslLaunch> {
-    let selected = requested_distribution
-        .map(selected_wsl2_distribution)
-        .transpose()?;
+    let distribution = match requested_distribution {
+        Some(name) => selected_wsl2_distribution(name)?,
+        None => native_default_distribution().unwrap_or_else(default_wsl2_distribution)?,
+    };
     let Some(requested) = working_directory else {
         return Ok(WslLaunch {
-            distribution: selected.map(|distribution| distribution.name),
+            distribution: distribution.name,
             directory: "~".to_owned(),
             metadata: None,
         });
-    };
-    let distribution = match selected {
-        Some(distribution) => distribution,
-        None => default_wsl2_distribution()?,
     };
     if requested.is_empty() {
         return Err("working directory must not be empty".into());
@@ -78,20 +124,47 @@ pub fn resolve_launch(
         )
         .into());
     }
-    let validation = run_wsl([
-        "--distribution",
-        distribution.name.as_str(),
-        "--exec",
-        "test",
-        "-d",
-        resolved_wsl_path.as_str(),
-    ])?;
-    if !validation.status.success() {
-        return Err(format!(
-            "working directory does not exist in WSL distribution {}: {resolved_wsl_path}",
-            distribution.name
-        )
-        .into());
+    // The WSL file provider validates ordinary paths without starting a second
+    // Linux process. Fall back for paths the Windows provider cannot represent.
+    let representable = resolved_wsl_path.split('/').all(|name| {
+        let base = name.split('.').next().unwrap_or_default();
+        name != "."
+            && name != ".."
+            && !name.ends_with(['.', ' '])
+            && !name
+                .bytes()
+                .any(|byte| byte < 32 || b"\\:<>\"|?*".contains(&byte))
+            && !["CON", "PRN", "AUX", "NUL"]
+                .iter()
+                .any(|reserved| base.eq_ignore_ascii_case(reserved))
+            && !(base.len() == 4
+                && (base.as_bytes()[..3].eq_ignore_ascii_case(b"COM")
+                    || base.as_bytes()[..3].eq_ignore_ascii_case(b"LPT"))
+                && matches!(base.as_bytes()[3], b'1'..=b'9'))
+    });
+    let native_directory_valid = representable
+        && Path::new(&format!(
+            r"\\wsl.localhost\{}\{}",
+            distribution.name,
+            resolved_wsl_path.trim_start_matches('/').replace('/', "\\")
+        ))
+        .is_dir();
+    if !native_directory_valid {
+        let validation = run_wsl([
+            "--distribution",
+            distribution.name.as_str(),
+            "--exec",
+            "test",
+            "-d",
+            resolved_wsl_path.as_str(),
+        ])?;
+        if !validation.status.success() {
+            return Err(format!(
+                "working directory does not exist in WSL distribution {}: {resolved_wsl_path}",
+                distribution.name
+            )
+            .into());
+        }
     }
 
     let warning_path = if windows_path {
@@ -116,7 +189,7 @@ pub fn resolve_launch(
         .as_deref()
         .and_then(synchronized_directory_warning);
     Ok(WslLaunch {
-        distribution: Some(distribution.name.clone()),
+        distribution: distribution.name.clone(),
         directory: resolved_wsl_path.clone(),
         metadata: Some(WorkingDirectory {
             requested: requested.to_owned(),
@@ -146,6 +219,11 @@ pub fn windows_path_for_wsl(path: &str, distribution: &str) -> Result<PathBuf> {
 }
 
 fn selected_wsl2_distribution(name: &str) -> Result<DefaultDistribution> {
+    if let Some(Ok(distribution)) = native_default_distribution()
+        && distribution.name.eq_ignore_ascii_case(name)
+    {
+        return Ok(distribution);
+    }
     let output = run_wsl(["--list", "--verbose"])?;
     if !output.status.success() {
         return Err("could not inspect WSL distributions".into());
@@ -327,10 +405,14 @@ fn native_default_distribution() -> Option<Result<DefaultDistribution>> {
 
 fn run_wsl<'a>(args: impl IntoIterator<Item = &'a str>) -> std::io::Result<Output> {
     use std::os::windows::process::CommandExt;
-    Command::new(WSL_EXE)
+    let mut command = Command::new(WSL_EXE);
+    command
         .args(args)
-        .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
-        .output()
+        .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+    if let Some(path) = launch_path() {
+        command.env("PATH", path);
+    }
+    command.output()
 }
 
 fn checked_output(output: Output, context: &str) -> Result<String> {
@@ -428,6 +510,42 @@ fn decode_wsl_output(output: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_path_keeps_windows_commands_and_first_entry_precedence() {
+        let path = std::ffi::OsStr::new(
+            r"C:\Tools;C:\Windows\System32;c:/tools/;C:\Work\bin;C:\Windows\System32;C:\",
+        );
+        let actual = clean_path(path, None).unwrap();
+        assert_eq!(
+            env::split_paths(&actual).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from(r"C:\Tools"),
+                PathBuf::from(r"C:\Windows\System32"),
+                PathBuf::from(r"C:\Work\bin"),
+                PathBuf::from(r"C:\"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_library_paths_do_not_leak_into_shell_search() {
+        let path = std::ffi::OsStr::new(
+            r"C:\repo\target\debug\deps;C:\repo\target\debug;C:\Rust\lib\rustlib\x64\lib;C:\Rust\bin;C:\Windows\System32",
+        );
+        let actual = clean_path(path, Some(Path::new(r"C:\repo\target\debug"))).unwrap();
+        assert_eq!(
+            env::split_paths(&actual).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from(r"C:\Rust\bin"),
+                PathBuf::from(r"C:\Windows\System32")
+            ]
+        );
+        assert_eq!(
+            env::split_paths(&clean_path(path, None).unwrap()).count(),
+            5
+        );
+    }
 
     #[test]
     fn parses_utf8_default_wsl_distribution() {

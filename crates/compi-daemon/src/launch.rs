@@ -45,11 +45,8 @@ impl LaunchDescription {
 pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
     let launch = compi_protocol::wsl::resolve_launch(working_directory, None)?;
     let mut argv = Vec::new();
-    shell_integration::prepare_wsl(launch.distribution.as_deref(), None, None, false, &mut argv)?;
-    let mut prefix = Vec::new();
-    if let Some(distribution) = launch.distribution {
-        prefix.extend([OsString::from("--distribution"), distribution.into()]);
-    }
+    shell_integration::prepare_wsl(Some(&launch.distribution), None, None, false, &mut argv)?;
+    let mut prefix = vec![OsString::from("--distribution"), launch.distribution.into()];
     prefix.extend(["--cd".into(), launch.directory.into(), "--exec".into()]);
     prefix.append(&mut argv);
     prefix.push("-i".into());
@@ -276,10 +273,8 @@ pub fn resolve_profile(
             return Err("configured WSL executable must be an absolute Linux path".into());
         }
         let mut argv: Vec<OsString> = Vec::new();
-        let distribution = resolved.distribution.as_deref();
-        if let Some(distribution) = distribution {
-            argv.extend(["--distribution".into(), distribution.into()]);
-        }
+        let distribution = resolved.distribution.as_str();
+        argv.extend(["--distribution".into(), distribution.into()]);
         argv.extend(["--cd".into(), resolved.directory.into(), "--exec".into()]);
         if let Some(context) = context
             && !context.env.is_empty()
@@ -295,7 +290,7 @@ pub fn resolve_profile(
         if profile.executable.is_none() && profile.args.is_empty() {
             let login = args.iter().any(|arg| arg == "-l");
             shell_integration::prepare_wsl(
-                distribution,
+                Some(distribution),
                 context.and_then(|context| context.env.get("HOME").map(String::as_str)),
                 context.and_then(|context| context.env.get("PROMPT_COMMAND").map(String::as_str)),
                 login,

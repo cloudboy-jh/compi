@@ -29,6 +29,17 @@ impl PtySession {
         })
     }
 
+    #[cfg(unix)]
+    pub fn metadata_fd(&self) -> Result<std::fs::File> {
+        let fd = self
+            .native
+            .master
+            .as_ref()
+            .and_then(|master| master.as_raw_fd())
+            .ok_or("PTY is closed")?;
+        duplicate_fd(fd)
+    }
+
     pub fn take_io(&mut self) -> Result<(PtyWriter, PtyReader)> {
         #[cfg(unix)]
         {
