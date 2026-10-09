@@ -88,7 +88,7 @@ registry! {
     RenameTab, "rename_tab", "Rename terminal tab", None, None;
     MoveTabLeft, "move_tab_left", "Move terminal tab left", Some("cmd-alt-shift-left"), Some("ctrl-shift-alt-left");
     MoveTabRight, "move_tab_right", "Move terminal tab right", Some("cmd-alt-shift-right"), Some("ctrl-shift-alt-right");
-    RemoveTab, "remove_tab", "Remove terminal tab", None, None;
+    RemoveTab, "remove_tab", "Close terminal tab", None, None;
     DetachTab, "detach_tab", "Hide terminal tab", Some("cmd-w"), Some("ctrl-w");
     RestoreHiddenTab, "restore_hidden_tab", "Restore hidden terminal tab", Some("cmd-shift-t"), Some("ctrl-shift-t");
     NewWindow, "new_window", "New window", Some("cmd-n"), Some("ctrl-shift-n");
@@ -118,7 +118,7 @@ registry! {
     SwapPaneRight, "swap_pane_right", "Swap pane right", None, None;
     SwapPaneUp, "swap_pane_up", "Swap pane up", None, None;
     SwapPaneDown, "swap_pane_down", "Swap pane down", None, None;
-    RemovePane, "remove_pane", "Remove pane", None, Some("ctrl-shift-w");
+    RemovePane, "remove_pane", "Close pane", None, Some("ctrl-shift-w");
     EndSurface, "end_surface", "End terminal", None, None;
     RestartSurface, "restart_surface", "Restart terminal", None, None;
     ToggleSidebar, "toggle_sidebar", "Toggle workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");

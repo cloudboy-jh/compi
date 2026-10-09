@@ -335,6 +335,8 @@ pub(super) enum Overlay {
     Confirm {
         operation: WorkspaceMutation,
         title: String,
+        /// The confirm button's label, naming what it does.
+        action: &'static str,
         revision: u64,
     },
     Workspaces,
@@ -3360,6 +3362,7 @@ impl CompiApp {
                     self.confirm_removal(
                         WorkspaceMutation::RemoveSession { session_id },
                         "Remove workspace and end all its processes?",
+                        "Remove workspace",
                     );
                 }
             }
@@ -3442,9 +3445,10 @@ impl CompiApp {
             }
             Command::RemoveTab => {
                 if let Some(tab_id) = tab_id {
-                    self.confirm_removal(
+                    self.close_work(
                         WorkspaceMutation::RemoveTab { tab_id },
-                        "Remove terminal tab and end every process in its panes?",
+                        "Close this tab and end every process in its panes?",
+                        "Close tab",
                     );
                 }
             }
@@ -3620,9 +3624,10 @@ impl CompiApp {
             | Command::SwapPaneDown => self.run_arrangement_command(command, window),
             Command::RemovePane => {
                 if let Some(pane_id) = pane_id {
-                    self.confirm_removal(
+                    self.close_work(
                         WorkspaceMutation::RemovePane { pane_id },
-                        "Remove pane and end its process tree?",
+                        "Close this pane and end its process tree?",
+                        "Close pane",
                     );
                 }
             }
@@ -3784,11 +3789,12 @@ impl CompiApp {
         cx.notify();
     }
 
-    fn confirm_removal(&mut self, operation: WorkspaceMutation, title: &str) {
+    fn confirm_removal(&mut self, operation: WorkspaceMutation, title: &str, action: &'static str) {
         self.open_overlay(
             Overlay::Confirm {
                 operation,
                 title: title.into(),
+                action,
                 revision: self
                     .workspace
                     .as_ref()
@@ -3796,6 +3802,17 @@ impl CompiApp {
             },
             "",
         );
+    }
+
+    /// Closing a tab or pane: one click by default; with "Confirm before closing" on,
+    /// a confirmation whose close button has focus, so Enter closes.
+    fn close_work(&mut self, operation: WorkspaceMutation, title: &str, action: &'static str) {
+        if !self.config.confirm_close {
+            self.mutate(operation, false);
+            return;
+        }
+        self.confirm_removal(operation, title, action);
+        self.overlay_focus = 1;
     }
 
     fn pane_action_reason(
@@ -4423,7 +4440,7 @@ impl CompiApp {
                         Command::RestoreArrangement => "Restore Previous Arrangement",
                         Command::MoveTabToNewWindow => "Move to New Window",
                         Command::DetachTab => "Hide Tab",
-                        Command::RemoveTab => "Remove Tab",
+                        Command::RemoveTab => "Close Tab",
                         Command::ToggleSidebar => "Toggle Sidebar",
                         _ => self.command_label(command),
                     };
@@ -4981,6 +4998,10 @@ impl CompiApp {
             let id = tab.id.clone();
             let context_id = id.clone();
             let close_id = id.clone();
+            let close_title = match self.configured_shortcut(Command::RemoveTab) {
+                Some(shortcut) => format!("Close tab · {shortcut}"),
+                None => "Close tab".to_owned(),
+            };
             let selected = self
                 .selected_tab()
                 .is_some_and(|selected| selected.id == id);
@@ -5082,7 +5103,7 @@ impl CompiApp {
                 )
                 .child(
                     div()
-                        .id(("hide-tab", index))
+                        .id(("close-tab", index))
                         .size(px(20.0))
                         .flex_none()
                         .flex()
@@ -5102,6 +5123,14 @@ impl CompiApp {
                             this.execute(Command::RemoveTab, window, cx);
                             cx.stop_propagation();
                         }))
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| HeaderTooltip {
+                                title: close_title.clone(),
+                                reason: Some("Ends the processes in its panes".into()),
+                                colors,
+                            })
+                            .into()
+                        })
                         .child(chrome_icon(ChromeIcon::Close, color(colors.muted))),
                 )
         });

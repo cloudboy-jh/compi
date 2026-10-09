@@ -237,6 +237,9 @@ pub struct LoadedConfig {
     pub updates: UpdateSettings,
     #[serde(default)]
     pub metadata: MetadataSettings,
+    /// Ask before closing a tab or pane ends its processes. Off: one click closes.
+    #[serde(default)]
+    pub confirm_close: bool,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Named pane arrangements, shape only, keyed by preset name.
@@ -263,6 +266,7 @@ impl Default for LoadedConfig {
             clipboard_policy: ClipboardPolicy::default(),
             updates: UpdateSettings::default(),
             metadata: MetadataSettings::default(),
+            confirm_close: false,
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -280,6 +284,14 @@ impl LoadedConfig {
             set_table_value(table, "dimensions", metadata.dimensions.into());
         })?;
         self.metadata = metadata;
+        Ok(())
+    }
+
+    pub fn save_confirm_close(&mut self, confirm: bool) -> Result<(), String> {
+        update_table(&self.path, "workspace", |table| {
+            set_table_value(table, "confirm_close", confirm.into());
+        })?;
+        self.confirm_close = confirm;
         Ok(())
     }
 
@@ -1296,6 +1308,19 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
             }
         }
     }
+    if let Some(workspace) = table(&document, "workspace", loaded)
+        && let Some(value) = workspace.get("confirm_close")
+    {
+        match value.as_bool() {
+            Some(confirm) => loaded.confirm_close = confirm,
+            None => invalid(
+                loaded,
+                "workspace.confirm_close",
+                "true or false",
+                "configuration",
+            ),
+        }
+    }
     if let Some(updates) = table(&document, "updates", loaded) {
         if let Some(value) = updates.get("check_for_updates") {
             match value.as_bool() {
@@ -1935,6 +1960,40 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("appearance.density"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirm_close_defaults_off_round_trips_and_rejects_non_booleans() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-confirm-close-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n# retain me\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert!(!loaded.confirm_close);
+        loaded.save_confirm_close(true).unwrap();
+        assert!(load(Some(&path), FontOverrides::default()).confirm_close);
+        assert!(fs::read_to_string(&path).unwrap().contains("# retain me"));
+
+        let invalid = parse(
+            "version = 1\n[workspace]\nconfirm_close = 'yes'",
+            FontOverrides::default(),
+        );
+        assert!(!invalid.confirm_close);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("workspace.confirm_close"))
         );
         fs::remove_dir_all(root).unwrap();
     }

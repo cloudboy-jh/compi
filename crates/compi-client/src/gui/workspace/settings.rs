@@ -47,6 +47,7 @@ enum SettingsAction {
     Prompt(super::prompt::PromptAction),
     Metadata(usize),
     Density(crate::theme::WorkspaceDensity),
+    ToggleConfirmClose,
 }
 
 #[derive(Clone, Copy)]
@@ -83,7 +84,7 @@ impl CompiApp {
     fn settings_action_count(&self) -> usize {
         match self.settings_section {
             SettingsSection::Appearance => self.appearance_action_count(),
-            SettingsSection::Interface => self.font_choice_count() + 9,
+            SettingsSection::Interface => self.font_choice_count() + 10,
             SettingsSection::Terminal => self.prompt_offset_base() + self.prompt_actions().len(),
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
@@ -124,6 +125,7 @@ impl CompiApp {
                     (SettingsSection::Interface, index @ 4..=7) => {
                         Some(SettingsAction::Metadata(index - 4))
                     }
+                    (SettingsSection::Interface, 8) => Some(SettingsAction::ToggleConfirmClose),
                     (SettingsSection::Terminal, 0) => Some(SettingsAction::Zoom(Command::ZoomOut)),
                     (SettingsSection::Terminal, 1) => {
                         Some(SettingsAction::Zoom(Command::ZoomReset))
@@ -439,6 +441,11 @@ impl CompiApp {
                     _ => settings.dimensions = !settings.dimensions,
                 }
                 if let Err(error) = self.config.save_metadata_settings(settings) {
+                    self.global_error = Some(error);
+                }
+            }
+            SettingsAction::ToggleConfirmClose => {
+                if let Err(error) = self.config.save_confirm_close(!self.config.confirm_close) {
                     self.global_error = Some(error);
                 }
             }
@@ -1341,6 +1348,22 @@ impl CompiApp {
                         compact,
                     )
                 }),
+            )
+            .child(self.settings_subheading("Closing"))
+            .child(
+                self.settings_row(
+                    "Confirm before closing",
+                    "Ask before closing a tab or pane ends its processes. Off: one click closes."
+                        .into(),
+                    self.render_settings_toggle(
+                        self.config.confirm_close,
+                        SettingsAction::ToggleConfirmClose,
+                        choices + 9,
+                        true,
+                        cx,
+                    ),
+                    compact,
+                ),
             )
             .into_any_element()
     }

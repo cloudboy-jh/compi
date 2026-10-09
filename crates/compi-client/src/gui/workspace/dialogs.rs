@@ -461,31 +461,19 @@ impl CompiApp {
 
     fn render_confirmation_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let daemon_restart = matches!(self.overlay, Some(Overlay::ConfirmDaemonRestart { .. }));
-        let title = if daemon_restart {
-            "Restart daemon"
-        } else {
-            "Confirm destructive action"
-        };
-        let message = self
-            .overlay
-            .as_ref()
-            .and_then(|overlay| match overlay {
-                Overlay::Confirm { title, .. } => Some(title.clone()),
-                Overlay::ConfirmDaemonRestart { details, .. } => Some(details.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let confirm_label = if daemon_restart {
-            "End work and restart daemon"
-        } else {
-            "Confirm"
+        let (title, message, confirm_label) = match &self.overlay {
+            Some(Overlay::ConfirmDaemonRestart { details, .. }) => (
+                "Restart daemon",
+                details.clone(),
+                "End work and restart daemon",
+            ),
+            Some(Overlay::Confirm { title, action, .. }) => (*action, title.clone(), *action),
+            _ => ("", String::new(), ""),
         };
         self.render_centered_scrim(
             div()
                 .w_full()
-                .max_w(px(520.0))
-                .min_h(px(220.0))
+                .max_w(px(460.0))
                 .flex()
                 .flex_col()
                 .rounded_md()
@@ -498,21 +486,9 @@ impl CompiApp {
                 .child(
                     div()
                         .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_size(px(UI_BODY_TEXT_SIZE))
-                                .text_color(color(modal_text_color(colors.foreground, &colors)))
-                                .child(message),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(UI_SMALL_TEXT_SIZE))
-                                .text_color(color(modal_text_color(colors.muted, &colors)))
-                                .child("This action cannot be undone."),
-                        ),
+                        .text_size(px(UI_BODY_TEXT_SIZE))
+                        .text_color(color(modal_text_color(colors.foreground, &colors)))
+                        .child(message),
                 )
                 .child(
                     div()
