@@ -48,6 +48,7 @@ enum SettingsAction {
     Metadata(usize),
     Density(crate::theme::WorkspaceDensity),
     ToggleConfirmClose,
+    FocusIndicator(crate::theme::FocusIndicator),
 }
 
 #[derive(Clone, Copy)]
@@ -84,7 +85,7 @@ impl CompiApp {
     fn settings_action_count(&self) -> usize {
         match self.settings_section {
             SettingsSection::Appearance => self.appearance_action_count(),
-            SettingsSection::Interface => self.font_choice_count() + 10,
+            SettingsSection::Interface => self.font_choice_count() + 14,
             SettingsSection::Terminal => self.prompt_offset_base() + self.prompt_actions().len(),
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
@@ -126,6 +127,12 @@ impl CompiApp {
                         Some(SettingsAction::Metadata(index - 4))
                     }
                     (SettingsSection::Interface, 8) => Some(SettingsAction::ToggleConfirmClose),
+                    (SettingsSection::Interface, index @ 9..=12) => {
+                        crate::theme::FocusIndicator::ALL
+                            .get(index - 9)
+                            .copied()
+                            .map(SettingsAction::FocusIndicator)
+                    }
                     (SettingsSection::Terminal, 0) => Some(SettingsAction::Zoom(Command::ZoomOut)),
                     (SettingsSection::Terminal, 1) => {
                         Some(SettingsAction::Zoom(Command::ZoomReset))
@@ -446,6 +453,11 @@ impl CompiApp {
             }
             SettingsAction::ToggleConfirmClose => {
                 if let Err(error) = self.config.save_confirm_close(!self.config.confirm_close) {
+                    self.global_error = Some(error);
+                }
+            }
+            SettingsAction::FocusIndicator(indicator) => {
+                if let Err(error) = self.config.save_focus_indicator(indicator) {
                     self.global_error = Some(error);
                 }
             }
@@ -1365,7 +1377,70 @@ impl CompiApp {
                     compact,
                 ),
             )
+            .child(self.settings_subheading("Focus"))
+            .child(self.render_focus_indicator_setting(choices + 10, compact, cx))
             .into_any_element()
+    }
+
+    fn render_focus_indicator_setting(
+        &self,
+        first: usize,
+        compact: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let base = self.settings_content_focus(0);
+        let controls = div()
+            .flex()
+            .when(compact, |controls| controls.flex_col().items_start())
+            .gap_2()
+            .children(
+                crate::theme::FocusIndicator::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, indicator)| {
+                        let offset = first + index;
+                        let focused = self.overlay_focus == base + offset;
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(self.settings_segment_button(
+                                ("settings-focus-indicator", index),
+                                indicator.label(),
+                                self.config.focus_indicator == indicator,
+                                focused,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.overlay_focus = base + offset;
+                                    this.activate_settings_action(
+                                        SettingsAction::FocusIndicator(indicator),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(self.settings_focus_anchor(focused, cx))
+                    }),
+            )
+            .into_any_element();
+        self.settings_row(
+            "Focus indicator",
+            match self.config.focus_indicator {
+                crate::theme::FocusIndicator::Marker => {
+                    "A short accent bar on the focused pane; an outline flashes when focus moves."
+                }
+                crate::theme::FocusIndicator::Outline => {
+                    "An accent outline around the focused pane."
+                }
+                crate::theme::FocusIndicator::Dim => "Other panes are dimmed.",
+                crate::theme::FocusIndicator::None => {
+                    "Only the cursor, which unfocused panes do not draw."
+                }
+            }
+            .into(),
+            controls,
+            compact,
+        )
     }
 
     fn render_density_setting(

@@ -42,7 +42,7 @@ Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, an
 - **Comfy** (default): each pane is a rounded island with an 8 px corner radius, separated from its neighbours and the window edge by 6 px gutters. The gutters use a slightly darker shade of the terminal background, or show the window material when the background is translucent. The header has no rule under it, and dragging a gutter resizes the split. The workspace sidebar is an island too; drag the gap beside it to resize it, or double-click the gap to restore its default width.
 - **Compact**: panes touch, separated by one-pixel seams, and the sidebar sits flush against the window edge, for the most terminal space.
 
-When more than one pane is visible, the focused pane has a thin accent outline; terminal colours are unchanged. Floating panes keep their shadow and title strip and use the same corner radius. Switching density resizes terminals through the normal resize path, so running programs keep running and reflow once.
+When more than one pane is visible, the focused pane is marked as set under **Focus indicator** below; terminal colours are unchanged. Floating panes keep their shadow and title strip and use the same corner radius. Switching density resizes terminals through the normal resize path, so running programs keep running and reflow once.
 
 ## Tab metadata
 
@@ -68,5 +68,21 @@ confirm_close = false
 ```
 
 Removing a whole workspace and restarting the daemon always ask. The `compi` CLI keeps its own interactive confirmation.
+
+## Focus indicator
+
+**Settings → Interface → Focus indicator** chooses how the focused pane stands out when more than one pane is visible:
+
+- **Marker** (default): a short accent bar on the middle of the pane's bottom edge, plus an accent outline that fades within 0.8 s whenever focus moves to a pane.
+- **Outline**: a permanent accent outline.
+- **Dim others**: every other pane is slightly darkened.
+- **None**: only the cursor, which unfocused panes never draw.
+
+```toml
+[workspace]
+focus_indicator = "marker" # marker, outline, dim, or none
+```
+
+Floating panes keep their **Keyboard** label with every option. When the system asks for reduced motion (Windows Animation effects off, or macOS Reduce motion), the arrival outline shows for the same time without fading; this is read when Compi starts.
 
 [Back to README](../../README.md)

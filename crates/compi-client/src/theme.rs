@@ -82,6 +82,49 @@ impl WorkspaceDensity {
     }
 }
 
+/// How the focused pane is marked when more than one pane is visible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FocusIndicator {
+    /// A short accent bar on the top edge, plus an outline that fades when focus moves.
+    #[default]
+    Marker,
+    /// A permanent accent outline.
+    Outline,
+    /// Unfocused panes are dimmed.
+    Dim,
+    /// Nothing beyond the cursor, which only the focused pane draws.
+    None,
+}
+
+impl FocusIndicator {
+    pub const ALL: [Self; 4] = [Self::Marker, Self::Outline, Self::Dim, Self::None];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Marker => "marker",
+            Self::Outline => "outline",
+            Self::Dim => "dim",
+            Self::None => "none",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Marker => "Marker",
+            Self::Outline => "Outline",
+            Self::Dim => "Dim others",
+            Self::None => "None",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|indicator| indicator.id() == value)
+    }
+}
+
 /// Packed theme colors use `0xTTRRGGBB`, where `TT` is inverse alpha (`255 - alpha`).
 /// Existing `0xRRGGBB` constants are therefore fully opaque.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,9 +1,11 @@
 use super::*;
+use crate::theme::FocusIndicator;
 use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle};
 use sha2::{Digest, Sha256};
 pub(in crate::gui) mod arrangements;
 pub(super) mod catalog;
 pub(in crate::gui) mod dialogs;
+mod focus;
 pub(super) mod media;
 pub(in crate::gui) mod metadata;
 pub(in crate::gui) mod pane_drag;
@@ -5774,16 +5776,17 @@ impl CompiApp {
         let comfy = self.comfy();
         // Focus needs marking only when there is another pane to tell it apart from.
         let mark_focus = layout.panes.len() + self.float_layouts.len() > 1;
+        // While a pane is being moved, the drop zones are the only emphasis.
+        let marking = mark_focus && !self.pane_drag_moving();
+        let indicator = self.config.focus_indicator;
+        let radius = if comfy { PANE_RADIUS } else { 0.0 };
         let panes = layout.panes.iter().enumerate().map(|(index, geometry)| {
-            // While a pane is being moved, the drop zones are the only emphasis.
-            let focused = mark_focus
-                && !self.pane_drag_moving()
-                && self
-                    .focused_view()
-                    .is_some_and(|view| view.pane_id == geometry.pane_id);
+            let focused = self
+                .focused_view()
+                .is_some_and(|view| view.pane_id == geometry.pane_id);
             // Comfy islands keep a hairline edge so they read against any canvas colour;
-            // Compact panes are separated by seams and only the focused one is outlined.
-            let edge = if focused {
+            // Compact panes are separated by seams.
+            let edge = if marking && focused && indicator == FocusIndicator::Outline {
                 Some(colors.accent)
             } else {
                 comfy.then(|| self.seam_color())
@@ -5798,6 +5801,14 @@ impl CompiApp {
                 &geometry.pane_id,
                 geometry.rect.width,
                 geometry.rect.height,
+            )
+            .when(
+                marking && !focused && indicator == FocusIndicator::Dim,
+                |pane| pane.child(self.render_focus_dim(radius)),
+            )
+            .when(
+                marking && focused && indicator == FocusIndicator::Marker,
+                |pane| pane.child(self.render_focus_marker(geometry.rect.width)),
             )
             .when(self.pane_drag.is_none(), |pane| {
                 pane.child(self.render_pane_grip(
@@ -5819,6 +5830,11 @@ impl CompiApp {
                         .border_color(color(edge)),
                 )
             })
+            // Over the seam outline, which would otherwise hide the arrival outline.
+            .when(
+                marking && focused && indicator == FocusIndicator::Marker,
+                |pane| pane.child(self.render_focus_flash(&geometry.pane_id, radius)),
+            )
         });
         let dividers = layout.dividers.iter().enumerate().map(|(index, divider)| {
             let dragging = self
@@ -6186,6 +6202,10 @@ impl CompiApp {
         let focused = self
             .focused_view()
             .is_some_and(|view| view.pane_id == pane_id);
+        let indicator = self.config.focus_indicator;
+        let marking = self.visible_layout().map_or(0, |layout| layout.panes.len())
+            + self.float_layouts.len()
+            > 1;
         let (title, tab_label) = self.floating_caption(&pane_id);
         let body = layout::Rect {
             x: 0.0,
@@ -6349,18 +6369,29 @@ impl CompiApp {
                     height: 2.0 * FLOAT_RESIZE_HANDLE,
                 },
             ))
+            .when(
+                marking && !focused && indicator == FocusIndicator::Dim,
+                |frame| frame.child(self.render_focus_dim(radius)),
+            )
             .child(
-                // Drawn last so the focus outline is never covered; it has no hitbox.
+                // Drawn last so the outline is never covered; it has no hitbox. The
+                // Keyboard label marks focus; the accent outline is the Outline option.
                 div()
                     .absolute()
                     .inset_0()
                     .rounded(px(radius))
                     .border_1()
-                    .border_color(color(if focused {
-                        colors.accent
-                    } else {
-                        colors.border
-                    })),
+                    .border_color(color(
+                        if marking && focused && indicator == FocusIndicator::Outline {
+                            colors.accent
+                        } else {
+                            colors.border
+                        },
+                    )),
+            )
+            .when(
+                marking && focused && indicator == FocusIndicator::Marker,
+                |frame| frame.child(self.render_focus_flash(&pane_id, radius)),
             )
             .into_any_element()
     }

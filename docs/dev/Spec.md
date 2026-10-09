@@ -614,6 +614,8 @@ The implemented version-1 TOML schema uses `font`, `appearance`, `layout`, `layo
 
 `[workspace] confirm_close` (default false) controls tab and pane closing: off, the tab × and **Close terminal tab**/**Close pane** end the work in one click; on, a confirmation names the action and Enter closes. Removing a workspace and restarting the daemon always confirm, and CLI close keeps its own interactive confirmation. Settings → Interface writes this global preference.
 
+`[workspace] focus_indicator` (`marker` by default, `outline`, `dim`, `none`) marks the focused pane when more than one tiled or floating pane is visible. Marker draws a 28 × 3 px accent bar centred in the bottom padding band, clear of cells and of the hover grip at the top, and an accent outline that fades over 800 ms each time focus arrives at a pane, keyed by pane so it replays on every arrival; reduced motion (read at launch) holds it for 800 ms without fading. Outline is the permanent accent border, Dim veils unfocused panes at 12% black without a hitbox, and None relies on the cursor, which unfocused panes never draw. Floating panes keep the **Keyboard** label with every option; their accent border is the Outline option. No indicator is drawn while a pane is being dragged. Settings → Interface writes this global preference.
+
 ### Theme presets and access
 
 - **Compi Neutral** is a first-class restrained baseline: neutral charcoal, subdued separators, and limited focus emphasis. It works with clear, blurred, or solid backgrounds without decorative accent-heavy surfaces. Dark Glass remains the first-run default; existing selections are not reassigned.

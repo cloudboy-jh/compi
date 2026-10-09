@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     arrangement::{MAX_NAMED_PRESETS, Shape, valid_preset_name},
     font_catalog::{TerminalFontPreset, UiFontPreset},
-    theme::{BackgroundEffect, ThemeId, WorkspaceDensity},
+    theme::{BackgroundEffect, FocusIndicator, ThemeId, WorkspaceDensity},
 };
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
@@ -240,6 +240,9 @@ pub struct LoadedConfig {
     /// Ask before closing a tab or pane ends its processes. Off: one click closes.
     #[serde(default)]
     pub confirm_close: bool,
+    /// How the focused pane is marked when several are visible.
+    #[serde(default)]
+    pub focus_indicator: FocusIndicator,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Named pane arrangements, shape only, keyed by preset name.
@@ -267,6 +270,7 @@ impl Default for LoadedConfig {
             updates: UpdateSettings::default(),
             metadata: MetadataSettings::default(),
             confirm_close: false,
+            focus_indicator: FocusIndicator::default(),
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -292,6 +296,14 @@ impl LoadedConfig {
             set_table_value(table, "confirm_close", confirm.into());
         })?;
         self.confirm_close = confirm;
+        Ok(())
+    }
+
+    pub fn save_focus_indicator(&mut self, indicator: FocusIndicator) -> Result<(), String> {
+        update_table(&self.path, "workspace", |table| {
+            set_table_value(table, "focus_indicator", indicator.id().into());
+        })?;
+        self.focus_indicator = indicator;
         Ok(())
     }
 
@@ -1308,17 +1320,28 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
             }
         }
     }
-    if let Some(workspace) = table(&document, "workspace", loaded)
-        && let Some(value) = workspace.get("confirm_close")
-    {
-        match value.as_bool() {
-            Some(confirm) => loaded.confirm_close = confirm,
-            None => invalid(
-                loaded,
-                "workspace.confirm_close",
-                "true or false",
-                "configuration",
-            ),
+    if let Some(workspace) = table(&document, "workspace", loaded) {
+        if let Some(value) = workspace.get("confirm_close") {
+            match value.as_bool() {
+                Some(confirm) => loaded.confirm_close = confirm,
+                None => invalid(
+                    loaded,
+                    "workspace.confirm_close",
+                    "true or false",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = workspace.get("focus_indicator") {
+            match value.as_str().and_then(FocusIndicator::parse) {
+                Some(indicator) => loaded.focus_indicator = indicator,
+                None => invalid(
+                    loaded,
+                    "workspace.focus_indicator",
+                    "\"marker\", \"outline\", \"dim\" or \"none\"",
+                    "configuration",
+                ),
+            }
         }
     }
     if let Some(updates) = table(&document, "updates", loaded) {
@@ -1994,6 +2017,41 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("workspace.confirm_close"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn focus_indicator_defaults_to_marker_round_trips_and_rejects_unknown_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-focus-indicator-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[workspace]\nconfirm_close = true\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.focus_indicator, FocusIndicator::Marker);
+        loaded.save_focus_indicator(FocusIndicator::Dim).unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.focus_indicator, FocusIndicator::Dim);
+        assert!(reloaded.confirm_close);
+
+        let invalid = parse(
+            "version = 1\n[workspace]\nfocus_indicator = 'glow'",
+            FontOverrides::default(),
+        );
+        assert_eq!(invalid.focus_indicator, FocusIndicator::Marker);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("workspace.focus_indicator"))
         );
         fs::remove_dir_all(root).unwrap();
     }
