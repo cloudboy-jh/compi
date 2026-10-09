@@ -1,54 +1,26 @@
-# 0.1.7
+# 0.1.8
 
-- WSL tab completion: 41.8 s → 0.07 s
-- WSL unknown command: 95 → <1 ms
-- CLI, many instances: 34 s → 0.5 s
-- New tab: no startup bar, ~0.2 s
-- New: Comfy panes, CLI, compi update
-
-## Speed
-
-- WSL finds Windows commands in one local folder, not dozens of /mnt/c folders.
-- WSL launches skip build-only and duplicate search folders.
-- Prompt hooks run once per prompt.
+- Drag panes to move or swap them
+- Drop a pane on a tab to move it there
+- Close tabs and panes in one click
+- Quieter focus marker, with a setting
+- Rounded empty screen in Comfy
 
 ## New
 
-- Comfy panes: rounded panes with gaps, default. Compact keeps them edge to edge (Settings → Interface).
-- Tab info: directory, process, Git and size.
-- Updates: one status line, one button.
-- Repair Compi fixes a broken install.
-- End in the tab menu ends a terminal in one click and dims its last screen.
-
-## CLI
-
-- compi controls workspaces, tabs, panes, layouts and windows from any terminal or script.
-- compi split --panes 4 --layout grid builds the whole layout in one step.
-- compi pane capture reads a pane's screen; compi pane send types into it.
-- Every command has --json output and its own --help, for scripts and agents.
-- Commands print one line, or nothing for send and run; --json keeps the full result.
-- Fast back-to-back commands no longer fail while a window resizes panes.
-- compi --version prints the version.
-- compi update checks, downloads and restarts, asking first and listing shells that end.
-- compi changes shows the running version and what changed in it.
-- compi theme install adds Zed themes.
-- Works inside Compi's WSL shells: clean output, and prompts can be answered.
-- Without --instance, it finds the running Compi at once; --instance '' picks the default.
+- Hover a pane and drag the ⋯ grip on its top edge: drop on an edge of another pane to split beside it, or on Swap to trade places.
+- Drop a pane on another tab to add it there. Rest on the tab to switch to it, then drop beside one of its panes.
+- Drop a pane on empty tab-bar space to give it its own tab.
+- Click the grip for the pane menu.
+- Closing a tab or pane takes one click. Settings → Interface → Confirm before closing brings the question back.
+- Focus indicator (Settings → Interface): Marker, Outline, Dim others or None. Marker is a small bar under the focused pane and a short outline when focus moves.
 
 ## Fixes
 
-- Blank tabs that blocked new tabs.
-- Shells ended by an update or restart come back on their own, in their last folder.
-- The recovery notice no longer shows on every launch.
-- Recovery overlays and hover cards removed.
-- Setup moves the service to the new version and asks before ending shells.
-- Setup accepts your own background service.
-- Remove works from any Setup file and deletes the whole folder.
-- Terminal scrolling and query replies.
-- Readable Setup log.
-- Closing the daemon console keeps it running.
+- The empty screen and the floating-tab screen are rounded like the panes in Comfy.
+- The empty screen offers Restore hidden tab only when there is one.
+- Remove tab and Remove pane are now Close tab and Close pane.
 
 ## Updating
 
 - Updating ends running shells. Save your work first.
-- On 0.1.3, use Compi-Setup.exe from this release.
