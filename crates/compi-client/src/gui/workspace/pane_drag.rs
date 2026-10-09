@@ -17,10 +17,11 @@ use crate::arrangement::{self, DropZone};
 /// The grip's hit area spans the top padding band, so it never covers a cell.
 const GRIP_WIDTH: f32 = 44.0;
 const GRIP_DOT: f32 = 3.0;
-/// Share of a target pane's width or height taken by each edge zone; the rest is
-/// Swap. Panes of another tab cannot swap, so their edge zones meet in the centre.
-const EDGE_ZONE: f32 = 0.25;
-const CROSS_TAB_EDGE_ZONE: f32 = 0.5;
+/// The centre Swap box spans at most this share of a target pane each way, and at
+/// most `SWAP_MAX` pixels. Panes of another tab cannot swap, so there the four edge
+/// zones meet in the centre.
+const SWAP_SHARE: f32 = 0.3;
+const SWAP_MAX: f32 = 160.0;
 /// How long the pointer rests on a tab before the drag switches to it.
 const SPRING_LOAD_DELAY: Duration = Duration::from_millis(400);
 
@@ -46,8 +47,6 @@ enum DropTarget {
         /// Within the dragged pane's tab: the arrangement to commit. Across tabs the
         /// tree is rebuilt from fresh state when the move commits.
         layout: LayoutNode,
-        /// Where the dragged pane lands, in canvas coordinates.
-        landing: layout::Rect,
     },
     Tab(TabId),
     NewTab,
@@ -58,6 +57,95 @@ enum DropTarget {
 enum Placement {
     Right,
     Beside(PaneId, DropZone),
+}
+
+/// The Swap box of a `width` × `height` pane in pane coordinates; a point at the
+/// centre when the pane cannot swap.
+fn swap_box(width: f32, height: f32, swap: bool) -> layout::Rect {
+    let (w, h) = if swap {
+        (
+            (width * SWAP_SHARE).min(SWAP_MAX),
+            (height * SWAP_SHARE).min(SWAP_MAX),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    layout::Rect {
+        x: (width - w) / 2.0,
+        y: (height - h) / 2.0,
+        width: w,
+        height: h,
+    }
+}
+
+/// The four edge zones as quads running from a pane edge's corners to the Swap
+/// box's matching corners, in the order Left, Right, Top, Bottom.
+fn edge_zones(width: f32, height: f32, inner: layout::Rect) -> [(DropZone, [(f32, f32); 4]); 4] {
+    let (l, t, r, b) = (
+        inner.x,
+        inner.y,
+        inner.x + inner.width,
+        inner.y + inner.height,
+    );
+    let (w, h) = (width, height);
+    [
+        (DropZone::Left, [(0.0, 0.0), (l, t), (l, b), (0.0, h)]),
+        (DropZone::Right, [(w, 0.0), (w, h), (r, b), (r, t)]),
+        (DropZone::Top, [(0.0, 0.0), (w, 0.0), (r, t), (l, t)]),
+        (DropZone::Bottom, [(0.0, h), (l, b), (r, b), (w, h)]),
+    ]
+}
+
+/// The zone under `(x, y)` in pane coordinates, matching what `edge_zones` and
+/// `swap_box` draw: Swap inside the box, otherwise the edge quad containing it.
+fn zone_at(x: f32, y: f32, width: f32, height: f32, swap: bool) -> DropZone {
+    let inner = swap_box(width, height, swap);
+    if swap
+        && x >= inner.x
+        && x <= inner.x + inner.width
+        && y >= inner.y
+        && y <= inner.y + inner.height
+    {
+        return DropZone::Swap;
+    }
+    // Points on a shared edge belong to the first quad that contains them.
+    let contains = |quad: &[(f32, f32); 4]| {
+        let mut sign = 0.0_f32;
+        for index in 0..4 {
+            let (ax, ay) = quad[index];
+            let (bx, by) = quad[(index + 1) % 4];
+            let cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+            if cross != 0.0 {
+                if sign != 0.0 && cross.signum() != sign {
+                    return false;
+                }
+                sign = cross.signum();
+            }
+        }
+        true
+    };
+    edge_zones(width, height, inner)
+        .into_iter()
+        .find(|(_, quad)| contains(quad))
+        .map_or(DropZone::Bottom, |(zone, _)| zone)
+}
+
+/// The half of a `width` × `height` pane an edge drop gives the moved pane.
+fn landing_half(zone: DropZone, width: f32, height: f32) -> Option<layout::Rect> {
+    let (half_w, half_h) = (width / 2.0, height / 2.0);
+    let (x, y, w, h) = match zone {
+        DropZone::Left => (0.0, 0.0, half_w, height),
+        DropZone::Right => (half_w, 0.0, half_w, height),
+        DropZone::Top => (0.0, 0.0, width, half_h),
+        DropZone::Bottom => (0.0, half_h, width, half_h),
+        DropZone::Swap => return None,
+    };
+    Some(layout::Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    })
 }
 
 /// `target`'s tree with the moved leaf placed. The leaf first joins on the
@@ -252,7 +340,7 @@ impl CompiApp {
     }
 
     /// The tiled pane under `position` (not the dragged one), the zone the pointer
-    /// is in, and where the dragged pane would land.
+    /// is in, and the arrangement a drop there would commit.
     fn pane_drop_target(&self, drag: &PaneDrag, position: Point<Pixels>) -> Option<DropTarget> {
         let layout = self.visible_layout()?;
         let offset = self.workspace_scroll.offset();
@@ -269,22 +357,8 @@ impl CompiApp {
         let tab = self.selected_tab()?;
         let across = tab.id != drag.tab_id;
         let rect = target.rect;
-        let u = (x - rect.x) / rect.width;
-        let v = (y - rect.y) / rect.height;
-        let (distance, edge) = [
-            (u, DropZone::Left),
-            (1.0 - u, DropZone::Right),
-            (v, DropZone::Top),
-            (1.0 - v, DropZone::Bottom),
-        ]
-        .into_iter()
-        .min_by(|a, b| a.0.total_cmp(&b.0))?;
-        let zone = if across || distance < EDGE_ZONE {
-            edge
-        } else {
-            DropZone::Swap
-        };
-        let next = if across {
+        let zone = zone_at(x - rect.x, y - rect.y, rect.width, rect.height, !across);
+        let layout = if across {
             let leaf = LayoutNode::Pane {
                 pane_id: drag.pane_id.clone(),
                 surface_id: drag.surface_id.clone(),
@@ -297,16 +371,10 @@ impl CompiApp {
         } else {
             arrangement::drop_pane(&tab.layout, &drag.pane_id, &target.pane_id, zone)?
         };
-        let floating = |pane: &PaneId| self.state.is_floating(pane);
-        let tiled = layout::without_panes(&next, &floating)?;
-        let landing = layout::compute_layout(&tiled, self.float_area, self.metrics())
-            .pane(&drag.pane_id)?
-            .rect;
         Some(DropTarget::Pane {
             pane_id: target.pane_id.clone(),
             zone,
-            layout: next,
-            landing,
+            layout,
         })
     }
 
@@ -455,6 +523,11 @@ impl CompiApp {
         }
     }
 
+    /// A pane is being moved (past the drag threshold).
+    pub(super) fn pane_drag_moving(&self) -> bool {
+        self.pane_drag.as_ref().is_some_and(|drag| drag.moving)
+    }
+
     /// While a pane is being moved: dim it where it was, and show the zones over
     /// the pane under the pointer.
     pub(super) fn decorate_dragged_pane(
@@ -486,7 +559,8 @@ impl CompiApp {
         }
     }
 
-    /// Edge wedges, plus the Swap box within the dragged pane's own tab.
+    /// Thin seams between the edge zones, the half an edge drop fills, and, within
+    /// the dragged pane's own tab, the Swap box. Only the hovered zone is filled.
     fn render_drop_zones(
         &self,
         hovered: DropZone,
@@ -496,13 +570,9 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let accent = color(colors.accent);
-        let edge = if across {
-            CROSS_TAB_EDGE_ZONE
-        } else {
-            EDGE_ZONE
-        };
-        let (ix, iy) = (width * edge, height * edge);
+        let inner = swap_box(width, height, !across);
         let swap = hovered == DropZone::Swap;
+        let radius = if self.comfy() { PANE_RADIUS } else { 0.0 };
         div()
             .absolute()
             .inset_0()
@@ -512,101 +582,62 @@ impl CompiApp {
                     move |bounds, _, window, _| {
                         let at =
                             |x: f32, y: f32| point(bounds.left() + px(x), bounds.top() + px(y));
+                        // Each corner of the pane joins the matching Swap-box corner.
                         let (w, h) = (width, height);
-                        for (zone, corners) in [
-                            (
-                                DropZone::Left,
-                                [(0.0, 0.0), (ix, iy), (ix, h - iy), (0.0, h)],
-                            ),
-                            (
-                                DropZone::Right,
-                                [(w, 0.0), (w - ix, iy), (w - ix, h - iy), (w, h)],
-                            ),
-                            (
-                                DropZone::Top,
-                                [(0.0, 0.0), (w, 0.0), (w - ix, iy), (ix, iy)],
-                            ),
-                            (
-                                DropZone::Bottom,
-                                [(0.0, h), (w, h), (w - ix, h - iy), (ix, h - iy)],
-                            ),
-                        ] {
-                            let mut path = PathBuilder::fill();
-                            path.move_to(at(corners[0].0, corners[0].1));
-                            for (x, y) in &corners[1..] {
-                                path.line_to(at(*x, *y));
-                            }
-                            path.close();
-                            if let Ok(path) = path.build() {
-                                let alpha = if zone == hovered { 0.3 } else { 0.1 };
-                                window.paint_path(path, accent.opacity(alpha));
-                            }
-                        }
-                        // Seams from each corner to the Swap box, so every zone reads.
+                        let (l, t) = (inner.x, inner.y);
+                        let (r, b) = (inner.x + inner.width, inner.y + inner.height);
                         let mut seams = PathBuilder::stroke(px(1.0));
-                        for (corner, inner) in [
-                            ((0.0, 0.0), (ix, iy)),
-                            ((w, 0.0), (w - ix, iy)),
-                            ((0.0, h), (ix, h - iy)),
-                            ((w, h), (w - ix, h - iy)),
+                        for ((ox, oy), (ix, iy)) in [
+                            ((0.0, 0.0), (l, t)),
+                            ((w, 0.0), (r, t)),
+                            ((0.0, h), (l, b)),
+                            ((w, h), (r, b)),
                         ] {
-                            seams.move_to(at(corner.0, corner.1));
-                            seams.line_to(at(inner.0, inner.1));
+                            seams.move_to(at(ox, oy));
+                            seams.line_to(at(ix, iy));
                         }
                         if let Ok(path) = seams.build() {
-                            window.paint_path(path, accent.opacity(0.4));
+                            window.paint_path(path, accent.opacity(0.35));
                         }
                     },
                 )
                 .size_full(),
             )
+            .when_some(landing_half(hovered, width, height), |zones, half| {
+                zones.child(
+                    div()
+                        .absolute()
+                        .left(px(half.x))
+                        .top(px(half.y))
+                        .w(px(half.width))
+                        .h(px(half.height))
+                        .rounded(px(radius))
+                        .border_2()
+                        .border_color(accent)
+                        .bg(accent.opacity(0.18)),
+                )
+            })
             .when(!across, |zones| {
                 zones.child(
                     div()
                         .absolute()
-                        .left(px(ix))
-                        .top(px(iy))
-                        .w(px(width - 2.0 * ix))
-                        .h(px(height - 2.0 * iy))
+                        .left(px(inner.x))
+                        .top(px(inner.y))
+                        .w(px(inner.width))
+                        .h(px(inner.height))
                         .rounded_md()
                         .border_1()
-                        .border_color(accent.opacity(0.6))
-                        .bg(accent.opacity(if swap { 0.3 } else { 0.06 }))
+                        .border_color(accent.opacity(if swap { 1.0 } else { 0.5 }))
+                        .when(swap, |swap_box| swap_box.bg(accent.opacity(0.3)))
                         .flex()
+                        .items_center()
                         .justify_center()
-                        // The label sits at the top so the card under the pointer rarely
-                        // hides it.
-                        .items_start()
-                        .pt_2()
                         .text_size(px(UI_SMALL_TEXT_SIZE))
                         .text_color(color(colors.foreground))
                         .child("Swap"),
                 )
             })
             .into_any_element()
-    }
-
-    /// The outline of where the dragged pane lands, in canvas coordinates.
-    pub(super) fn render_drop_landing(&self) -> Option<AnyElement> {
-        let Some(DropTarget::Pane { landing: rect, .. }) = self.pane_drag.as_ref()?.target.as_ref()
-        else {
-            return None;
-        };
-        let rect = *rect;
-        let accent = color(self.colors().accent);
-        Some(
-            div()
-                .absolute()
-                .left(px(rect.x))
-                .top(px(rect.y))
-                .w(px(rect.width))
-                .h(px(rect.height))
-                .when(self.comfy(), |landing| landing.rounded(px(PANE_RADIUS)))
-                .border_2()
-                .border_color(accent)
-                .bg(accent.opacity(0.1))
-                .into_any_element(),
-        )
     }
 
     /// The card that follows the pointer while a pane is moved.
@@ -617,8 +648,9 @@ impl CompiApp {
         Some(
             div()
                 .absolute()
-                .left(drag.position.x + px(12.0))
-                .top(drag.position.y + px(12.0))
+                // Below and right of the pointer, clear of the zone it is over.
+                .left(drag.position.x + px(18.0))
+                .top(drag.position.y + px(22.0))
                 .max_w(px(280.0))
                 .px_3()
                 .py_2()
@@ -635,5 +667,45 @@ impl CompiApp {
                 .child(title)
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zones_follow_the_drawn_wedges_and_swap_box() {
+        // 1000 × 400: the Swap box is 160 × 120, centred at (420..580, 140..260).
+        let at = |x, y| zone_at(x, y, 1000.0, 400.0, true);
+        assert_eq!(at(500.0, 200.0), DropZone::Swap);
+        assert_eq!(at(421.0, 141.0), DropZone::Swap);
+        assert_eq!(at(10.0, 200.0), DropZone::Left);
+        assert_eq!(at(990.0, 200.0), DropZone::Right);
+        assert_eq!(at(500.0, 10.0), DropZone::Top);
+        assert_eq!(at(500.0, 390.0), DropZone::Bottom);
+        // Just above the box is Top, though the left edge is nearer in proportion.
+        assert_eq!(at(430.0, 130.0), DropZone::Top);
+        // Beside the box, the side edge's wedge reaches the box.
+        assert_eq!(at(410.0, 200.0), DropZone::Left);
+    }
+
+    #[test]
+    fn panes_of_another_tab_have_no_swap() {
+        let at = |x, y| zone_at(x, y, 600.0, 600.0, false);
+        assert_eq!(at(300.0, 300.0 - 1.0), DropZone::Top);
+        assert_eq!(at(300.0, 300.0 + 1.0), DropZone::Bottom);
+        assert_eq!(at(299.0, 300.0), DropZone::Left);
+        assert_eq!(at(301.0, 300.0), DropZone::Right);
+    }
+
+    #[test]
+    fn edge_drops_fill_the_matching_half() {
+        let half = |zone| landing_half(zone, 800.0, 400.0).map(|r| (r.x, r.y, r.width, r.height));
+        assert_eq!(half(DropZone::Left), Some((0.0, 0.0, 400.0, 400.0)));
+        assert_eq!(half(DropZone::Right), Some((400.0, 0.0, 400.0, 400.0)));
+        assert_eq!(half(DropZone::Top), Some((0.0, 0.0, 800.0, 200.0)));
+        assert_eq!(half(DropZone::Bottom), Some((0.0, 200.0, 800.0, 200.0)));
+        assert_eq!(half(DropZone::Swap), None);
     }
 }

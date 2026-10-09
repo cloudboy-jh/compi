@@ -5775,7 +5775,9 @@ impl CompiApp {
         // Focus needs marking only when there is another pane to tell it apart from.
         let mark_focus = layout.panes.len() + self.float_layouts.len() > 1;
         let panes = layout.panes.iter().enumerate().map(|(index, geometry)| {
+            // While a pane is being moved, the drop zones are the only emphasis.
             let focused = mark_focus
+                && !self.pane_drag_moving()
                 && self
                     .focused_view()
                     .is_some_and(|view| view.pane_id == geometry.pane_id);
@@ -5954,8 +5956,7 @@ impl CompiApp {
                                 }))
                             })
                             .children(panes)
-                            .children(dividers)
-                            .children(self.render_drop_landing()),
+                            .children(dividers),
                     ),
             )
             .when(layout.canvas.width > layout.viewport.width, |pane| {
