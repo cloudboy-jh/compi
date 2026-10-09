@@ -6,7 +6,7 @@
 
 Compi is a native terminal workspace for Windows and macOS.
 
-![Compi with three panes: an agent tracing a codebase, a second agent building a snake game, and btop](assets/compi-workspace.png)
+![Compi with three panes: an agent tracing a codebase, a second agent building a snake game, and a live view of Compi's own client and daemon memory](assets/compi-workspace.png)
 
 - Shells keep running when you close the window.
 - Workspaces, tabs, and split panes.
