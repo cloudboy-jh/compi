@@ -6,6 +6,7 @@ pub(super) mod catalog;
 pub(in crate::gui) mod dialogs;
 pub(super) mod media;
 pub(in crate::gui) mod metadata;
+pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
 pub(in crate::gui) mod presentation;
 pub(in crate::gui) mod prompt;
@@ -307,7 +308,10 @@ const STALE_TAB_MENU: &str =
 #[derive(Clone)]
 pub(super) enum Overlay {
     Palette,
-    PaneActions,
+    /// The focused pane's menu: under the header button, or at the pane's grip.
+    PaneActions {
+        position: Option<Point<Pixels>>,
+    },
     /// Tab menus bind their target tab and the workspace `structure_key`, so size and
     /// status observations never invalidate them; hierarchy changes do.
     TabActions {
@@ -868,6 +872,7 @@ impl CompiApp {
             float_layouts: Vec::new(),
             float_area: layout::Size::default(),
             float_drag: None,
+            pane_drag: None,
             mutation_pending: false,
             lost_restart: None,
             global_error: None,
@@ -3117,6 +3122,10 @@ impl CompiApp {
         if self.handle_tree_key(key, cx) {
             return true;
         }
+        if key.key == "escape" && self.cancel_pane_drag() {
+            cx.notify();
+            return true;
+        }
         if key.key == "escape" && self.dragging_tab.is_some() {
             self.dragging_tab = None;
             self.tab_drag_origin = None;
@@ -3179,7 +3188,7 @@ impl CompiApp {
                     if !matches!(
                         self.overlay,
                         Some(
-                            Overlay::PaneActions
+                            Overlay::PaneActions { .. }
                                 | Overlay::TabActions { .. }
                                 | Overlay::TabPaneActions { .. }
                                 | Overlay::HeaderActions { .. }
@@ -3235,7 +3244,7 @@ impl CompiApp {
                     if !matches!(
                         self.overlay,
                         Some(
-                            Overlay::PaneActions
+                            Overlay::PaneActions { .. }
                                 | Overlay::TabActions { .. }
                                 | Overlay::TabPaneActions { .. }
                                 | Overlay::HeaderActions { .. }
@@ -3289,7 +3298,7 @@ impl CompiApp {
         if matches!(
             self.overlay,
             Some(
-                Overlay::PaneActions
+                Overlay::PaneActions { .. }
                     | Overlay::TabActions { .. }
                     | Overlay::TabPaneActions { .. }
                     | Overlay::HeaderActions { .. }
@@ -4396,14 +4405,14 @@ impl CompiApp {
         let mut choices = Vec::new();
         match &self.overlay {
             Some(
-                Overlay::PaneActions
+                Overlay::PaneActions { .. }
                 | Overlay::TabActions { .. }
                 | Overlay::TabPaneActions { .. }
                 | Overlay::HeaderActions { .. },
             ) => {
                 let context = self.command_context(cx);
                 let commands: &[Command] = match self.overlay.as_ref() {
-                    Some(Overlay::PaneActions) => &[
+                    Some(Overlay::PaneActions { .. }) => &[
                         Command::SplitRight,
                         Command::SplitDown,
                         Command::TogglePaneZoom,
@@ -4851,7 +4860,8 @@ impl CompiApp {
                             .child("Move terminal tab"),
                     )
                 },
-            );
+            )
+            .children(self.render_pane_drag_card());
         root.into_any_element()
     }
 
@@ -4949,7 +4959,7 @@ impl CompiApp {
 
     fn pane_actions_menu_button(&self, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let active = matches!(self.overlay, Some(Overlay::PaneActions));
+        let active = matches!(self.overlay, Some(Overlay::PaneActions { position: None }));
         div()
             .id("pane-actions-menu")
             .size(px(32.0))
@@ -4961,7 +4971,7 @@ impl CompiApp {
             .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {
-                this.open_overlay(Overlay::PaneActions, "");
+                this.open_overlay(Overlay::PaneActions { position: None }, "");
                 cx.stop_propagation();
                 cx.notify();
             }))
@@ -4994,6 +5004,9 @@ impl CompiApp {
             .and_then(|workspace| self.state.selected_session(workspace))
             .map(|session| self.state.visible_tabs(session).collect())
             .unwrap_or_default();
+        // A pane dragged over the tab bar: the tab it would join, or new-tab space.
+        let pane_drop = self.pane_drag_tab_target();
+        let new_tab_drop = matches!(pane_drop, Some(None));
         let tabs = visible.into_iter().enumerate().map(|(index, tab)| {
             let id = tab.id.clone();
             let context_id = id.clone();
@@ -5007,6 +5020,7 @@ impl CompiApp {
                 .is_some_and(|selected| selected.id == id);
             let panes = self.tab_panes(tab);
             let (primary, secondary) = self.metadata_tab_caption(tab, &panes);
+            let drop_here = pane_drop.is_some_and(|tab| tab == Some(&id));
             div()
                 .id(("terminal-tab", index))
                 .group("terminal-tab")
@@ -5043,6 +5057,11 @@ impl CompiApp {
                                 if selected { 0.11 } else { 0.04 },
                             ))
                             .opacity(header_alpha))
+                        })
+                        .when(drop_here, |tab| {
+                            tab.border_1()
+                                .border_color(color(colors.accent))
+                                .bg(color(colors.accent).opacity(0.18))
                         }),
                 )
                 .on_mouse_down(
@@ -5248,7 +5267,33 @@ impl CompiApp {
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll_handle)
                     .on_scroll_wheel(cx.listener(Self::on_tab_scroll))
-                    .children(tabs),
+                    .children(tabs)
+                    .when(new_tab_drop, |strip| {
+                        strip.child(
+                            div()
+                                .relative()
+                                .h_full()
+                                .w(px(metrics.tab_width))
+                                .flex_none()
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .text_color(color(colors.accent))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(2.0))
+                                        .right(px(2.0))
+                                        .top(px(4.0))
+                                        .bottom(px(4.0))
+                                        .rounded(px(4.0))
+                                        .border_1()
+                                        .border_color(color(colors.accent))
+                                        .bg(color(colors.accent).opacity(0.12)),
+                                )
+                                .child("New tab"),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -5741,19 +5786,37 @@ impl CompiApp {
             } else {
                 comfy.then(|| self.seam_color())
             };
-            self.render_pane(("pane", index), geometry, geometry.rect, cx)
-                .when(comfy, |pane| pane.rounded(px(PANE_RADIUS)))
-                .when_some(edge, |pane, edge| {
-                    // Drawn last so the outline is never covered; it has no hitbox.
-                    pane.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .when(comfy, |outline| outline.rounded(px(PANE_RADIUS)))
-                            .border_1()
-                            .border_color(color(edge)),
-                    )
-                })
+            let group = SharedString::from(format!("pane-{index}"));
+            let pane = self
+                .render_pane(("pane", index), geometry, geometry.rect, cx)
+                .group(group.clone())
+                .when(comfy, |pane| pane.rounded(px(PANE_RADIUS)));
+            self.decorate_dragged_pane(
+                pane,
+                &geometry.pane_id,
+                geometry.rect.width,
+                geometry.rect.height,
+            )
+            .when(self.pane_drag.is_none(), |pane| {
+                pane.child(self.render_pane_grip(
+                    index,
+                    group,
+                    geometry.pane_id.clone(),
+                    geometry.rect.width,
+                    cx,
+                ))
+            })
+            .when_some(edge, |pane, edge| {
+                // Drawn last so the outline is never covered; it has no hitbox.
+                pane.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .when(comfy, |outline| outline.rounded(px(PANE_RADIUS)))
+                        .border_1()
+                        .border_color(color(edge)),
+                )
+            })
         });
         let dividers = layout.dividers.iter().enumerate().map(|(index, divider)| {
             let dragging = self
@@ -5891,7 +5954,8 @@ impl CompiApp {
                                 }))
                             })
                             .children(panes)
-                            .children(dividers),
+                            .children(dividers)
+                            .children(self.render_drop_landing()),
                     ),
             )
             .when(layout.canvas.width > layout.viewport.width, |pane| {
@@ -6584,6 +6648,12 @@ impl CompiApp {
         if !event.dragging() {
             return;
         }
+        if self.pane_drag.is_some() {
+            self.update_pane_drag(event.position, window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if let Some(pane_id) = self
             .surface_views
             .iter()
@@ -6666,6 +6736,11 @@ impl CompiApp {
             next.terminal_opacity = opacity;
             self.apply_scoped_appearance(next, window, cx);
             cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.pane_drag.is_some() {
+            self.finish_pane_drag(event.position);
             cx.notify();
             return;
         }

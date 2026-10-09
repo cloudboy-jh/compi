@@ -38,7 +38,10 @@ impl CompiApp {
             Some(
                 Overlay::TabActions { position, .. }
                 | Overlay::TabPaneActions { position, .. }
-                | Overlay::HeaderActions { position },
+                | Overlay::HeaderActions { position }
+                | Overlay::PaneActions {
+                    position: Some(position),
+                },
             ) => Some((
                 f32::from(position.x).clamp(6.0, (viewport_width - 346.0).max(6.0)),
                 f32::from(position.y).clamp(6.0, (viewport_height - menu_height).max(6.0)),
@@ -989,7 +992,7 @@ impl CompiApp {
         } else if matches!(
             self.overlay,
             Some(
-                Overlay::PaneActions
+                Overlay::PaneActions { .. }
                     | Overlay::TabActions { .. }
                     | Overlay::TabPaneActions { .. }
                     | Overlay::HeaderActions { .. }

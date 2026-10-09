@@ -66,6 +66,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, PostMessageW, SW_RESTORE, ShowWindowAsync, WM_NCLBUTTONDOWN,
 };
+use workspace::pane_drag::PaneDrag;
 use workspace::{DividerDrag, FloatDrag, FloatLayout, Overlay, TransferSeed, open_compi_window};
 
 const DEFAULT_COLS: i16 = 100;
@@ -903,6 +904,8 @@ struct CompiApp {
     /// Terminal area that floating fractions are relative to.
     float_area: layout::Size,
     float_drag: Option<FloatDrag>,
+    /// A tiled pane picked up by its grip; see `workspace::pane_drag`.
+    pane_drag: Option<PaneDrag>,
     mutation_pending: bool,
     /// The last lost shell this window restarted automatically, and when; retried only
     /// after a pause if the restart did not take effect.
@@ -1189,6 +1192,10 @@ impl CompiApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A pane being moved is not terminal input, even over a mouse-reporting app.
+        if self.pane_drag.is_some() {
+            return;
+        }
         if let Some(selecting_id) = self
             .surface_views
             .iter()
@@ -1260,6 +1267,9 @@ impl CompiApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pane_drag.is_some() {
+            return;
+        }
         let selecting_id = self
             .surface_views
             .iter()
