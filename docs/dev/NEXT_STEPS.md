@@ -10,6 +10,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - Qualify the transient loading frame, native tab tear-off drag, and real mixed-DPI transitions on supported Windows displays. Automated captures already cover normal, narrow, maximized, split, sidebar, palette, settings, theme catalog, overflow, empty, disconnected, exited, failed, lost, confirmation, and recovery states.
 - Verify hover, focus, active, disabled, pending, and destructive states without relying on color alone. Keep New terminal, pane actions, and custom Windows controls visible, reachable, and non-overlapping.
 - Exercise physical keyboard navigation, terminal input, native drag, maximize, close, platform shortcuts, clipboard, IME/dead keys, exact user fonts, and fallback glyphs on supported Windows display configurations.
+- Qualify pane drag-and-drop and the focus indicator with a physical mouse and on native macOS: grip reveal, click versus drag threshold, edge/Swap zones, tab spring-loading, drops across tabs, the Marker arrival outline under reduced motion, and mixed-DPI drags. Windows evidence used posted input.
 
 ### Appearance and theme follow-through
 

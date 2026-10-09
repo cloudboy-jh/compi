@@ -9,7 +9,7 @@ Compi is a native terminal workspace for Windows and macOS.
 ![Compi with three panes: an agent tracing a codebase, a second agent building a snake game, and a live view of Compi's own client and daemon memory](assets/compi-workspace.png)
 
 - Shells keep running when you close the window.
-- Workspaces, tabs, and split panes.
+- Workspaces, tabs, and split panes. Drag a pane to move it, swap it, or send it to another tab.
 - Floating terminals and layout presets.
 - A `compi` command that lets scripts and agents open panes, send input, and read output.
 - Shell prompt styles from Oh My Posh or Starship.
