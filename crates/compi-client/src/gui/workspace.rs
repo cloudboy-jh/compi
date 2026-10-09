@@ -5631,58 +5631,71 @@ impl CompiApp {
             if let Some(element) = self.render_floated_tab_placeholder(cx) {
                 return element;
             }
-            return div()
-                .flex_1()
-                .size_full()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(material_color(colors.background, self.effective_background_opacity()))
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(680.0))
-                        .px_4()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_3()
-                        .text_center()
-                        .child(div().text_size(px(18.0)).child("Your work stays here"))
-                        .child(
-                            div()
-                                .w_full()
-                                .text_color(color(colors.muted))
-                                .child("Create a terminal tab or restore hidden work. Hiding a tab keeps its processes running."),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .justify_center()
-                                .gap_2()
-                                .child(self.command_button(
-                                    "empty-new-terminal",
-                                    "New terminal tab",
-                                    Command::NewTab,
-                                    cx,
-                                ))
-                                .child(self.command_button(
-                                    "empty-new-workspace",
-                                    "New workspace",
-                                    Command::CreateWorkspace,
-                                    cx,
-                                ))
-                                .child(self.command_button(
-                                    "empty-restore",
-                                    "Restore hidden tab",
-                                    Command::RestoreHiddenTab,
-                                    cx,
-                                )),
-                        ),
-                )
-                .into_any_element();
+            let hidden = !self.state.hidden_tabs.is_empty();
+            let mark_tint = color(colors.muted);
+            return self.render_empty_island(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(680.0))
+                            .px_4()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .text_center()
+                            .child(
+                                canvas(
+                                    |_, _, _| (),
+                                    move |bounds, _, window, _| {
+                                        brand::paint(bounds, mark_tint, window)
+                                    },
+                                )
+                                .size(px(36.0)),
+                            )
+                            .child(div().text_size(px(18.0)).child("No open tabs"))
+                            .child(div().w_full().text_color(color(colors.muted)).child(
+                                if hidden {
+                                    "Start a shell, or bring back a hidden tab. Hidden tabs keep running."
+                                } else {
+                                    "Start a shell to get going."
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(self.command_button(
+                                        "empty-new-terminal",
+                                        "New tab",
+                                        Command::NewTab,
+                                        cx,
+                                    ))
+                                    .child(self.command_button(
+                                        "empty-new-workspace",
+                                        "New workspace",
+                                        Command::CreateWorkspace,
+                                        cx,
+                                    ))
+                                    .when(hidden, |actions| {
+                                        actions.child(self.command_button(
+                                            "empty-restore",
+                                            "Restore hidden tab",
+                                            Command::RestoreHiddenTab,
+                                            cx,
+                                        ))
+                                    }),
+                            ),
+                    ),
+            );
         };
         let comfy = self.comfy();
         // Focus needs marking only when there is another pane to tell it apart from.
@@ -6296,42 +6309,85 @@ impl CompiApp {
         }
         let colors = *self.colors();
         Some(
-            div()
-                .flex_1()
-                .size_full()
-                .min_w_0()
-                .p_4()
-                .flex()
-                .flex_col()
-                // Top-left stays clear of floats, which open on the right by default.
-                .items_start()
-                .gap_3()
-                .bg(material_color(
-                    colors.background,
-                    self.effective_background_opacity(),
-                ))
-                .child(
-                    div()
-                        .text_color(color(colors.muted))
-                        .child("This tab's terminal is floating. Its process keeps running."),
-                )
-                .children(
-                    leaves
-                        .iter()
-                        .filter(|(pane, _)| self.state.is_floating(pane))
-                        .enumerate()
-                        .map(|(index, (pane, _))| {
-                            self.pane_command_button(
-                                ("dock-floated-tab", index),
-                                "Dock pane",
-                                Command::TogglePaneFloat,
-                                pane,
-                                cx,
-                            )
-                        }),
-                )
-                .into_any_element(),
+            self.render_empty_island(
+                div()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    // Top-left stays clear of floats, which open on the right by default.
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_color(color(colors.muted))
+                            .child("This tab's terminal is floating. Its process keeps running."),
+                    )
+                    .children(
+                        leaves
+                            .iter()
+                            .filter(|(pane, _)| self.state.is_floating(pane))
+                            .enumerate()
+                            .map(|(index, (pane, _))| {
+                                self.pane_command_button(
+                                    ("dock-floated-tab", index),
+                                    "Dock pane",
+                                    Command::TogglePaneFloat,
+                                    pane,
+                                    cx,
+                                )
+                            }),
+                    ),
+            ),
         )
+    }
+
+    /// The pane area when no tiled pane shows. In Comfy it is an island like a pane:
+    /// inset by the gutter on the canvas, rounded, with the same hairline edge.
+    fn render_empty_island(&self, content: impl IntoElement) -> AnyElement {
+        let comfy = self.comfy();
+        let island = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(material_color(
+                if comfy {
+                    self.terminal_theme.terminal().background
+                } else {
+                    self.colors().background
+                },
+                self.effective_background_opacity(),
+            ))
+            .child(content);
+        let area = div().flex_1().size_full().min_w_0().flex();
+        if !comfy {
+            return area.child(island).into_any_element();
+        }
+        area.relative()
+            .p(px(PANE_GUTTER))
+            .child(self.comfy_canvas(|bounds| {
+                let gutter = px(PANE_GUTTER);
+                vec![Bounds::new(
+                    point(bounds.left() + gutter, bounds.top() + gutter),
+                    size(
+                        bounds.size.width - gutter * 2.0,
+                        bounds.size.height - gutter * 2.0,
+                    ),
+                )]
+            }))
+            .child(
+                island.rounded(px(PANE_RADIUS)).child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .rounded(px(PANE_RADIUS))
+                        .border_1()
+                        .border_color(color(self.seam_color())),
+                ),
+            )
+            .into_any_element()
     }
 
     fn start_float_drag(&mut self, pane_id: PaneId, mode: FloatDragMode, origin: Point<Pixels>) {
