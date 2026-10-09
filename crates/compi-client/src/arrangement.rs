@@ -335,6 +335,82 @@ pub fn swap(layout: &LayoutNode, a: &PaneId, b: &PaneId) -> Option<LayoutNode> {
     Some(replace(layout, &leaf_a, &leaf_b))
 }
 
+/// Where a dragged pane lands on a target pane: beside one of its edges, or in
+/// its place (the target takes the dragged pane's place).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Swap,
+}
+
+/// `moved` dropped on `target`. An edge drop takes `moved` out of its split (its
+/// sibling fills the space) and splits `target`'s space evenly with it; Swap
+/// exchanges the two. `None` when either pane is absent, they match, or the
+/// tree would not change.
+pub fn drop_pane(
+    layout: &LayoutNode,
+    moved: &PaneId,
+    target: &PaneId,
+    zone: DropZone,
+) -> Option<LayoutNode> {
+    let (axis, moved_first) = match zone {
+        DropZone::Swap => return swap(layout, moved, target),
+        DropZone::Left => (SplitAxis::Horizontal, true),
+        DropZone::Right => (SplitAxis::Horizontal, false),
+        DropZone::Top => (SplitAxis::Vertical, true),
+        DropZone::Bottom => (SplitAxis::Vertical, false),
+    };
+    if moved == target {
+        return None;
+    }
+    let all = leaves(layout);
+    let moved_leaf = all.iter().find(|(id, _)| id == moved)?.clone();
+    all.iter().find(|(id, _)| id == target)?;
+    let rest = crate::layout::without_panes(layout, &|id| id == moved)?;
+    fn beside(
+        node: LayoutNode,
+        target: &PaneId,
+        split: &dyn Fn(LayoutNode) -> LayoutNode,
+    ) -> LayoutNode {
+        match node {
+            LayoutNode::Pane { ref pane_id, .. } if pane_id == target => split(node),
+            LayoutNode::Pane { .. } => node,
+            LayoutNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => LayoutNode::Split {
+                axis,
+                ratio,
+                first: Box::new(beside(*first, target, split)),
+                second: Box::new(beside(*second, target, split)),
+            },
+        }
+    }
+    let moved_node = LayoutNode::Pane {
+        pane_id: moved_leaf.0,
+        surface_id: moved_leaf.1,
+    };
+    let result = beside(rest, target, &|target_node| {
+        let (first, second) = if moved_first {
+            (moved_node.clone(), target_node)
+        } else {
+            (target_node, moved_node.clone())
+        };
+        LayoutNode::Split {
+            axis,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    });
+    (result != *layout).then_some(result)
+}
+
 /// The previous arrangement fitted to the tab's current panes: panes keep their
 /// earlier positions and panes added since then join the last slot.
 pub fn restore(previous: &LayoutNode, current: &LayoutNode) -> Option<LayoutNode> {
@@ -657,6 +733,70 @@ mod tests {
             pane("a"),
             split(SplitAxis::Vertical, 0.5, pane("b"), pane("c")),
         )
+    }
+
+    #[test]
+    fn edge_drop_collapses_the_source_split_and_halves_the_target() {
+        let a = PaneId::new("a");
+        let b = PaneId::new("b");
+        let c = PaneId::new("c");
+        let left = drop_pane(&three(), &c, &a, DropZone::Left).unwrap();
+        assert_eq!(
+            placement(&left),
+            [
+                ("c".into(), [0, 0, 25, 100]),
+                ("a".into(), [25, 0, 25, 100]),
+                ("b".into(), [50, 0, 50, 100]),
+            ]
+        );
+        assert_eq!(sorted_leaves(&left), sorted_leaves(&three()));
+        let below = drop_pane(&three(), &b, &c, DropZone::Bottom).unwrap();
+        assert_eq!(
+            placement(&below),
+            [
+                ("a".into(), [0, 0, 50, 100]),
+                ("c".into(), [50, 0, 50, 50]),
+                ("b".into(), [50, 50, 50, 50]),
+            ]
+        );
+        let top = drop_pane(&three(), &a, &b, DropZone::Top).unwrap();
+        assert_eq!(
+            placement(&top),
+            [
+                ("a".into(), [0, 0, 100, 25]),
+                ("b".into(), [0, 25, 100, 25]),
+                ("c".into(), [0, 50, 100, 50]),
+            ]
+        );
+    }
+
+    #[test]
+    fn drops_that_change_nothing_or_miss_a_pane_are_rejected() {
+        let a = PaneId::new("a");
+        let b = PaneId::new("b");
+        let pair = split(SplitAxis::Horizontal, 0.5, pane("a"), pane("b"));
+        assert_eq!(drop_pane(&pair, &a, &b, DropZone::Left), None);
+        assert_eq!(drop_pane(&pair, &a, &a, DropZone::Right), None);
+        assert_eq!(drop_pane(&pair, &a, &a, DropZone::Swap), None);
+        assert_eq!(
+            drop_pane(&pair, &PaneId::new("x"), &b, DropZone::Right),
+            None
+        );
+        assert_eq!(
+            placement(&drop_pane(&pair, &a, &b, DropZone::Right).unwrap()),
+            [
+                ("b".into(), [0, 0, 50, 100]),
+                ("a".into(), [50, 0, 50, 100])
+            ]
+        );
+        assert_eq!(
+            placement(&drop_pane(&three(), &a, &PaneId::new("c"), DropZone::Swap).unwrap()),
+            [
+                ("c".into(), [0, 0, 50, 100]),
+                ("b".into(), [50, 0, 50, 50]),
+                ("a".into(), [50, 50, 50, 50]),
+            ]
+        );
     }
 
     #[test]
