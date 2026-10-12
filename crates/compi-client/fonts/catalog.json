@@ -100,5 +100,11 @@
         "fonts/atkinson-hyperlegible-mono/AtkinsonHyperlegibleMono-Italic[wght].ttf"
       ]
     }
+  ],
+  "symbol_fonts": [
+    {
+      "family": "Symbols Nerd Font Mono",
+      "files": ["fonts/symbols-nerd-font-mono/SymbolsNerdFontMono-Regular.ttf"]
+    }
   ]
 }

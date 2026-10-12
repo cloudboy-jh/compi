@@ -38,6 +38,15 @@ struct FontCatalog {
     fonts: Vec<FontPreset>,
     terminal_default: String,
     terminal_fonts: Vec<FontPreset>,
+    symbol_fonts: Vec<SymbolFont>,
+}
+
+/// Glyph fallback embedded for its icons only; never a selectable preset.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymbolFont {
+    family: String,
+    files: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -306,26 +315,55 @@ fn validate_font_presets(
             );
         }
         for file in &font.files {
-            let path = Path::new(file);
-            assert!(
-                file.starts_with("fonts/")
-                    && path.is_relative()
-                    && !path.components().any(|component| matches!(
-                        component,
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                    ))
-                    && files.insert(file.clone())
-                    && fs::metadata(path).is_ok_and(|metadata| metadata.is_file()),
-                "{kind} font {} has an invalid, duplicate, or missing file: {file:?}",
-                font.id
-            );
-            println!("cargo:rerun-if-changed={file}");
+            validate_font_file(kind, &font.id, file, files);
         }
     }
     assert!(
         ids.contains(default),
         "default {kind} font must exist in catalog"
     );
+}
+
+fn validate_font_file(kind: &str, owner: &str, file: &str, files: &mut HashSet<String>) {
+    let path = Path::new(file);
+    assert!(
+        file.starts_with("fonts/")
+            && path.is_relative()
+            && !path.components().any(|component| matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            ))
+            && files.insert(file.to_owned())
+            && fs::metadata(path).is_ok_and(|metadata| metadata.is_file()),
+        "{kind} font {owner} has an invalid, duplicate, or missing file: {file:?}"
+    );
+    println!("cargo:rerun-if-changed={file}");
+}
+
+fn validate_symbol_fonts(catalog: &FontCatalog) {
+    let presets = catalog.fonts.iter().chain(&catalog.terminal_fonts);
+    let mut families = HashSet::new();
+    let mut files = presets
+        .clone()
+        .flat_map(|font| font.files.iter().cloned())
+        .collect();
+    for font in &catalog.symbol_fonts {
+        assert!(
+            !font.family.trim().is_empty()
+                && !font.family.chars().any(char::is_control)
+                && families.insert(font.family.to_ascii_lowercase())
+                && !presets.clone().any(|preset| {
+                    preset.family_windows.eq_ignore_ascii_case(&font.family)
+                        || preset.family_macos.eq_ignore_ascii_case(&font.family)
+                })
+                && !font.files.is_empty(),
+            "invalid, duplicate, selectable, or empty symbol font: {:?}",
+            font.family
+        );
+        for file in &font.files {
+            validate_font_file("symbol", &font.family, file, &mut files);
+        }
+    }
 }
 
 fn generate_font_enum(output: &mut String, enum_name: &str, default: &str, fonts: &[FontPreset]) {
@@ -434,6 +472,7 @@ fn generate_font_catalog() {
         &catalog.terminal_fonts,
         &mut HashSet::new(),
     );
+    validate_symbol_fonts(&catalog);
 
     let mut output = String::from("// Generated from fonts/catalog.json; do not edit.\n");
     generate_font_enum(
@@ -448,9 +487,7 @@ fn generate_font_catalog() {
         &catalog.terminal_default,
         &catalog.terminal_fonts,
     );
-    output.push_str(
-        "#[cfg(any(windows, target_os = \"macos\"))]\npub fn bundled_font_data() -> Vec<std::borrow::Cow<'static, [u8]>> {\n    vec![\n",
-    );
+    let mut preset_files = Vec::new();
     let mut embedded = HashSet::new();
     for file in catalog
         .fonts
@@ -458,16 +495,52 @@ fn generate_font_catalog() {
         .chain(&catalog.terminal_fonts)
         .flat_map(|font| &font.files)
     {
-        if !embedded.insert(file) {
-            continue;
+        if embedded.insert(file) {
+            preset_files.push(file);
         }
+    }
+    // Symbol fonts serve only GPUI's CoreText fallback cascade, which Windows
+    // resolves against system fonts alone; embedding them there would be dead weight.
+    let symbol_files: Vec<_> = catalog
+        .symbol_fonts
+        .iter()
+        .flat_map(|font| font.files.iter().map(move |file| (&font.family, file)))
+        .collect();
+    output.push_str(
+        "#[cfg(target_os = \"macos\")]\n/// Family and data of each file embedded only as a glyph fallback.\npub const BUNDLED_SYMBOL_FONTS: &[(&str, &[u8])] = &[\n",
+    );
+    for (family, file) in &symbol_files {
         writeln!(
             output,
-            "        std::borrow::Cow::Borrowed(include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/\", {file:?})).as_slice()),"
+            "    ({family:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/\", {file:?})).as_slice()),"
         )
         .unwrap();
     }
-    output.push_str("    ]\n}\n");
+    output.push_str("];\n");
+    for (platform, symbols) in [("windows", false), ("target_os = \"macos\"", true)] {
+        writeln!(
+            output,
+            "#[cfg({platform})]\npub fn bundled_font_data() -> Vec<std::borrow::Cow<'static, [u8]>> {{\n    vec!["
+        )
+        .unwrap();
+        for file in &preset_files {
+            writeln!(
+                output,
+                "        std::borrow::Cow::Borrowed(include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/\", {file:?})).as_slice()),"
+            )
+            .unwrap();
+        }
+        if symbols {
+            for index in 0..symbol_files.len() {
+                writeln!(
+                    output,
+                    "        std::borrow::Cow::Borrowed(BUNDLED_SYMBOL_FONTS[{index}].1),"
+                )
+                .unwrap();
+            }
+        }
+        output.push_str("    ]\n}\n");
+    }
 
     let destination = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
     fs::write(destination.join("font_catalog.rs"), output).expect("write generated font catalog");

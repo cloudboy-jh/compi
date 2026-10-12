@@ -90,6 +90,7 @@ impl TerminalTypography {
         }
         // Menlo has no Nerd Font private-use icons. Add an actually installed
         // patched font after user choices, rather than relying on OS PUA fallback.
+        // On macOS the last entry is bundled and registered at startup.
         if let Some(family) = SYMBOL_MONOSPACE
             .iter()
             .find_map(|family| installed_family(&available, family))
