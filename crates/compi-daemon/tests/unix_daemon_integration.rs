@@ -5,8 +5,9 @@ mod kitty;
 
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::{
-    ClientMessage, DaemonClient, DaemonError, ErrorCode, PROTOCOL_VERSION, ScreenSnapshot,
-    ServerEvent, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus,
+    ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, LayoutNode,
+    PROTOCOL_VERSION, PaneContent, ScreenSnapshot, ServerEvent, ServerMessage, SplitAxis,
+    SplitGeometry, SurfaceId, SurfaceInfo, SurfaceStatus, WorkspaceMutation,
 };
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -670,6 +671,87 @@ fn daemon_restart_preserves_lost_surface_metadata_without_claiming_liveness() {
     let mut attached = Controller::attach(&daemon, &replacement, 80, 24);
     attached.input(b"printf 'AFTER_RESTART_%s\\n' \"$((20+22))\"\r");
     attached.until("AFTER_RESTART_42");
+    daemon.shutdown();
+}
+
+#[test]
+fn content_pane_survives_daemon_restart_and_closes_without_a_process() {
+    let mut daemon = DaemonGuard::start();
+    let mut control = daemon.client();
+    let surface = control.create_surface(80, 24, None).unwrap();
+    let terminal = control.workspace().unwrap().sessions[0].tabs[0]
+        .layout
+        .leaf_pane()
+        .unwrap()
+        .clone();
+    let project = daemon.directory.join("project");
+    let notes = project.join("notes.md").to_string_lossy().into_owned();
+    let content = PaneContent {
+        environment: ContentEnvironment::Host,
+        root: project.to_string_lossy().into_owned(),
+        files: vec![notes.clone()],
+        active_file: Some(notes),
+    };
+    let opened = control
+        .mutate(WorkspaceMutation::OpenContent {
+            pane_id: terminal.clone(),
+            axis: SplitAxis::Horizontal,
+            geometry: SplitGeometry {
+                width: 800.0,
+                height: 480.0,
+                min_width: 160.0,
+                min_height: 80.0,
+                divider: 4.0,
+            },
+            content: content.clone(),
+        })
+        .unwrap();
+    assert_eq!(opened.operation_state, "committed");
+    assert!(opened.affected_surfaces.is_empty());
+    let content_leaf = LayoutNode::Content {
+        pane_id: opened.affected_panes[1].clone(),
+        content,
+    };
+    drop(control);
+    daemon.crash_and_restart();
+
+    let mut control = daemon.client();
+    let lost = wait_status(&mut control, &surface.id, SurfaceStatus::Lost);
+    let LayoutNode::Split { first, second, .. } = control.workspace().unwrap().sessions[0].tabs[0]
+        .layout
+        .clone()
+    else {
+        panic!("the tab keeps its terminal and content pane");
+    };
+    assert_eq!(first.leaf_pane(), Some(&terminal));
+    assert_eq!(*second, content_leaf);
+
+    // Closing content ends no process, even beside a running shell.
+    control
+        .mutate(WorkspaceMutation::RestartSurface {
+            surface_id: surface.id.clone(),
+            expected_lifetime: lost.process_lifetime_id,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+    wait_status(&mut control, &surface.id, SurfaceStatus::Running);
+    let removed = control
+        .mutate(WorkspaceMutation::RemovePane {
+            pane_id: content_leaf.leaf_pane().unwrap().clone(),
+        })
+        .unwrap();
+    assert_eq!(removed.operation_state, "removed");
+    assert!(removed.affected_surfaces.is_empty());
+    let workspace = control.workspace().unwrap();
+    assert_eq!(
+        workspace.sessions[0].tabs[0].layout.leaf_pane(),
+        Some(&terminal)
+    );
+    assert_eq!(
+        workspace.surface(&surface.id).unwrap().status,
+        SurfaceStatus::Running
+    );
     daemon.shutdown();
 }
 

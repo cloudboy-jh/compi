@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);

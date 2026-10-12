@@ -201,6 +201,8 @@ pub fn search(query: &str) -> impl Iterator<Item = &'static CommandSpec> + '_ {
         .filter(move |spec| spec.matches_query(query))
 }
 
+const CONTENT_PANE_REASON: &str = "This pane shows files, not a terminal";
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CommandContext {
     pub connected: bool,
@@ -217,6 +219,8 @@ pub struct CommandContext {
     pub has_workspace: bool,
     pub has_tab: bool,
     pub has_pane: bool,
+    /// The focused pane shows content, not a terminal.
+    pub content_pane: bool,
     pub tab_index: usize,
     pub has_selection: bool,
     pub terminal_available: bool,
@@ -612,6 +616,8 @@ impl Command {
             EndSurface => {
                 if !c.has_pane {
                     Some("Select a pane first")
+                } else if c.content_pane {
+                    Some(CONTENT_PANE_REASON)
                 } else if matches!(
                     c.surface_status,
                     Some(SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending)
@@ -624,6 +630,8 @@ impl Command {
             RestartSurface => {
                 if !c.has_pane {
                     Some("Select a pane first")
+                } else if c.content_pane {
+                    Some(CONTENT_PANE_REASON)
                 } else if matches!(
                     c.surface_status,
                     Some(SurfaceStatus::Exited | SurfaceStatus::Failed | SurfaceStatus::Lost)
@@ -633,8 +641,15 @@ impl Command {
                     Some("Wait for this terminal to stop before restarting")
                 }
             }
-            BrowseFiles | JumpProject => (!c.has_pane).then_some("Select a terminal pane first"),
+            BrowseFiles | JumpProject => {
+                if !c.has_pane {
+                    Some("Select a terminal pane first")
+                } else {
+                    c.content_pane.then_some(CONTENT_PANE_REASON)
+                }
+            }
             Copy => (!c.has_selection).then_some("Select terminal text to copy"),
+            Paste | SelectAll | ClearScrollback if c.content_pane => Some(CONTENT_PANE_REASON),
             Paste => {
                 if !c.has_pane
                     || c.surface_status != Some(SurfaceStatus::Running)

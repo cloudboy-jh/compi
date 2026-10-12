@@ -3,7 +3,7 @@
 //! Arrangements preserve existing leaves; growth plans add actor-assigned slots
 //! for one atomic transaction. Panes fill slots in reading order (depth first).
 use crate::layout::Rect;
-use compi_protocol::{LayoutNode, PaneId, PlannedLayoutNode, SplitAxis, SurfaceId};
+use compi_protocol::{LayoutNode, PaneId, PlannedLayoutNode, SplitAxis};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_NAMED_PRESETS: usize = 32;
@@ -86,7 +86,7 @@ pub enum Shape {
 impl Shape {
     pub fn of(layout: &LayoutNode) -> Self {
         match layout {
-            LayoutNode::Pane { .. } => Self::Slot,
+            LayoutNode::Pane { .. } | LayoutNode::Content { .. } => Self::Slot,
             LayoutNode::Split {
                 axis,
                 ratio,
@@ -154,16 +154,14 @@ pub fn valid_preset_name(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
-type Leaf = (PaneId, SurfaceId);
+/// A terminal or content leaf, moved whole so a pane keeps its surface or content.
+type Leaf = LayoutNode;
 
 /// Leaves in reading order.
 pub fn leaves(layout: &LayoutNode) -> Vec<Leaf> {
     fn collect(node: &LayoutNode, output: &mut Vec<Leaf>) {
         match node {
-            LayoutNode::Pane {
-                pane_id,
-                surface_id,
-            } => output.push((pane_id.clone(), surface_id.clone())),
+            LayoutNode::Pane { .. } | LayoutNode::Content { .. } => output.push(node.clone()),
             LayoutNode::Split { first, second, .. } => {
                 collect(first, output);
                 collect(second, output);
@@ -173,6 +171,10 @@ pub fn leaves(layout: &LayoutNode) -> Vec<Leaf> {
     let mut output = Vec::new();
     collect(layout, &mut output);
     output
+}
+
+fn leaf_id(leaf: &Leaf) -> &PaneId {
+    leaf.leaf_pane().expect("leaves holds only leaf nodes")
 }
 
 /// Arrange `current` into `preset`. `main` takes the first slot of the main +
@@ -189,7 +191,7 @@ pub fn arrange(
             let mut order = leaves(current);
             if builtin.uses_main()
                 && let Some(index) =
-                    main.and_then(|main| order.iter().position(|(id, _)| id == main))
+                    main.and_then(|main| order.iter().position(|leaf| leaf_id(leaf) == main))
             {
                 let leaf = order.remove(index);
                 order.insert(0, leaf);
@@ -209,7 +211,9 @@ pub fn arrange(
 pub fn plan_growth(current: &LayoutNode, preset: Preset<'_>, total: usize) -> PlannedLayoutNode {
     fn collect_panes<'a>(node: &'a LayoutNode, panes: &mut Vec<&'a PaneId>) {
         match node {
-            LayoutNode::Pane { pane_id, .. } => panes.push(pane_id),
+            LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+                panes.push(pane_id)
+            }
             LayoutNode::Split { first, second, .. } => {
                 collect_panes(first, panes);
                 collect_panes(second, panes);
@@ -268,7 +272,7 @@ pub fn combine(layouts: &[&LayoutNode]) -> Option<LayoutNode> {
 /// Mirror and/or flip an arrangement in place of its current tree.
 pub fn apply_transform(layout: LayoutNode, transform: Transform) -> LayoutNode {
     match layout {
-        pane @ LayoutNode::Pane { .. } => pane,
+        leaf @ (LayoutNode::Pane { .. } | LayoutNode::Content { .. }) => leaf,
         LayoutNode::Split {
             axis,
             ratio,
@@ -302,21 +306,17 @@ pub fn swap(layout: &LayoutNode, a: &PaneId, b: &PaneId) -> Option<LayoutNode> {
         return None;
     }
     let all = leaves(layout);
-    let leaf_a = all.iter().find(|(id, _)| id == a)?.clone();
-    let leaf_b = all.iter().find(|(id, _)| id == b)?.clone();
+    let leaf_a = all.iter().find(|leaf| leaf_id(leaf) == a)?;
+    let leaf_b = all.iter().find(|leaf| leaf_id(leaf) == b)?;
     fn replace(node: &LayoutNode, a: &Leaf, b: &Leaf) -> LayoutNode {
         match node {
-            LayoutNode::Pane { pane_id, .. } => {
-                let (pane_id, surface_id) = if pane_id == &a.0 {
+            LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+                if pane_id == leaf_id(a) {
                     b.clone()
-                } else if pane_id == &b.0 {
+                } else if pane_id == leaf_id(b) {
                     a.clone()
                 } else {
-                    return node.clone();
-                };
-                LayoutNode::Pane {
-                    pane_id,
-                    surface_id,
+                    node.clone()
                 }
             }
             LayoutNode::Split {
@@ -332,7 +332,7 @@ pub fn swap(layout: &LayoutNode, a: &PaneId, b: &PaneId) -> Option<LayoutNode> {
             },
         }
     }
-    Some(replace(layout, &leaf_a, &leaf_b))
+    Some(replace(layout, leaf_a, leaf_b))
 }
 
 /// Where a dragged pane lands on a target pane: beside one of its edges, or in
@@ -367,8 +367,8 @@ pub fn drop_pane(
         return None;
     }
     let all = leaves(layout);
-    let moved_leaf = all.iter().find(|(id, _)| id == moved)?.clone();
-    all.iter().find(|(id, _)| id == target)?;
+    let moved_node = all.iter().find(|leaf| leaf_id(leaf) == moved)?.clone();
+    all.iter().find(|leaf| leaf_id(leaf) == target)?;
     let rest = crate::layout::without_panes(layout, &|id| id == moved)?;
     fn beside(
         node: LayoutNode,
@@ -376,8 +376,13 @@ pub fn drop_pane(
         split: &dyn Fn(LayoutNode) -> LayoutNode,
     ) -> LayoutNode {
         match node {
-            LayoutNode::Pane { ref pane_id, .. } if pane_id == target => split(node),
-            LayoutNode::Pane { .. } => node,
+            LayoutNode::Pane { .. } | LayoutNode::Content { .. } => {
+                if node.leaf_pane() == Some(target) {
+                    split(node)
+                } else {
+                    node
+                }
+            }
             LayoutNode::Split {
                 axis,
                 ratio,
@@ -391,10 +396,6 @@ pub fn drop_pane(
             },
         }
     }
-    let moved_node = LayoutNode::Pane {
-        pane_id: moved_leaf.0,
-        surface_id: moved_leaf.1,
-    };
     let result = beside(rest, target, &|target_node| {
         let (first, second) = if moved_first {
             (moved_node.clone(), target_node)
@@ -415,14 +416,20 @@ pub fn drop_pane(
 /// earlier positions and panes added since then join the last slot.
 pub fn restore(previous: &LayoutNode, current: &LayoutNode) -> Option<LayoutNode> {
     let present = leaves(current);
-    let kept =
-        crate::layout::without_panes(previous, &|id| !present.iter().any(|(pane, _)| pane == id))?;
+    let kept = crate::layout::without_panes(previous, &|id| {
+        !present.iter().any(|leaf| leaf_id(leaf) == id)
+    })?;
     let mut order: Vec<Leaf> = leaves(&kept)
         .into_iter()
-        .filter_map(|(id, _)| present.iter().find(|(pane, _)| pane == &id).cloned())
+        .filter_map(|old| {
+            present
+                .iter()
+                .find(|leaf| leaf_id(leaf) == leaf_id(&old))
+                .cloned()
+        })
         .collect();
     for leaf in &present {
-        if !order.iter().any(|(id, _)| id == &leaf.0) {
+        if !order.iter().any(|kept| leaf_id(kept) == leaf_id(leaf)) {
             order.push(leaf.clone());
         }
     }
@@ -434,7 +441,9 @@ pub fn restore(previous: &LayoutNode, current: &LayoutNode) -> Option<LayoutNode
 pub fn pane_fractions(layout: &LayoutNode) -> Vec<(PaneId, Rect)> {
     fn place(node: &LayoutNode, area: Rect, output: &mut Vec<(PaneId, Rect)>) {
         match node {
-            LayoutNode::Pane { pane_id, .. } => output.push((pane_id.clone(), area)),
+            LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+                output.push((pane_id.clone(), area))
+            }
             LayoutNode::Split {
                 axis,
                 ratio,
@@ -600,13 +609,7 @@ fn expand_last_slot(shape: Shape, count: usize, parent: Option<SplitAxis>) -> Sh
 /// Assign leaves to slots in reading order; `shape` must have exactly as many slots.
 fn fill(shape: &Shape, order: &mut impl Iterator<Item = Leaf>) -> LayoutNode {
     match shape {
-        Shape::Slot => {
-            let (pane_id, surface_id) = order.next().expect("shape fits the pane count");
-            LayoutNode::Pane {
-                pane_id,
-                surface_id,
-            }
-        }
+        Shape::Slot => order.next().expect("shape fits the pane count"),
         Shape::Split {
             axis,
             ratio,
@@ -635,7 +638,7 @@ fn equalize(layout: &LayoutNode) -> LayoutNode {
         }
     }
     match layout {
-        LayoutNode::Pane { .. } => layout.clone(),
+        LayoutNode::Pane { .. } | LayoutNode::Content { .. } => layout.clone(),
         LayoutNode::Split {
             axis,
             first,
@@ -689,6 +692,7 @@ fn equalize_shape(shape: &Shape) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compi_protocol::{ContentEnvironment, PaneContent, SurfaceId};
 
     fn pane(id: &str) -> LayoutNode {
         LayoutNode::Pane {
@@ -722,7 +726,7 @@ mod tests {
 
     fn sorted_leaves(layout: &LayoutNode) -> Vec<Leaf> {
         let mut all = leaves(layout);
-        all.sort();
+        all.sort_by(|a, b| leaf_id(a).cmp(leaf_id(b)));
         all
     }
 
@@ -992,7 +996,7 @@ mod tests {
         assert_eq!(
             leaves(&rows)
                 .into_iter()
-                .map(|(id, _)| id.to_string())
+                .map(|leaf| leaf_id(&leaf).to_string())
                 .collect::<Vec<_>>(),
             ["a", "b", "c", "d", "e", "f"]
         );
@@ -1028,6 +1032,31 @@ mod tests {
                 ("d".into(), [67, 50, 33, 50]),
             ]
         );
+    }
+
+    #[test]
+    fn content_panes_keep_their_content_when_swapped_and_arranged() {
+        let content = LayoutNode::Content {
+            pane_id: PaneId::new("notes"),
+            content: PaneContent {
+                environment: ContentEnvironment::Host,
+                root: "/work".into(),
+                files: vec!["/work/a.md".into()],
+                active_file: Some("/work/a.md".into()),
+            },
+        };
+        let tree = split(SplitAxis::Horizontal, 0.5, pane("a"), content.clone());
+        let swapped = swap(&tree, &PaneId::new("a"), &PaneId::new("notes")).unwrap();
+        assert_eq!(leaves(&swapped), [content.clone(), pane("a")]);
+        let arranged = arrange(
+            &swapped,
+            Preset::Builtin(Builtin::Rows),
+            None,
+            Transform::default(),
+        );
+        assert_eq!(sorted_leaves(&arranged), sorted_leaves(&tree));
+        let restored = restore(&tree, &arranged).unwrap();
+        assert_eq!(leaves(&restored), [pane("a"), content]);
     }
 
     #[test]

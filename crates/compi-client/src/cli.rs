@@ -10,7 +10,8 @@ mod update;
 use crate::{DaemonClient, Result, arrangement, config, connection::ConnectionTarget};
 use compi_protocol::{
     LayoutNode, MutationId, MutationRequest, PaneId, ScreenSnapshot, SplitAxis, SurfaceId,
-    SurfaceInfo, SurfaceStatus, WorkspaceMutation, WorkspaceSnapshot,
+    SurfaceInfo, SurfaceStatus, WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot,
+    WorkspaceTab,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -515,7 +516,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                     session.tabs.iter().flat_map(|tab| {
                         arrangement::leaves(&tab.layout)
                             .into_iter()
-                            .map(|(_, surface)| surface)
+                            .filter_map(|leaf| leaf.surface_id().cloned())
                     }),
                 )?;
                 WorkspaceMutation::RemoveSession {
@@ -581,7 +582,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                     &state,
                     arrangement::leaves(&tab.layout)
                         .into_iter()
-                        .map(|(_, surface)| surface),
+                        .filter_map(|leaf| leaf.surface_id().cloned()),
                 )?;
                 WorkspaceMutation::RemoveTab {
                     tab_id: tab.id.clone(),
@@ -652,7 +653,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                     None
                 };
                 let selected_pane = if options.pane.is_some() {
-                    Some(targets::pane(&state, options)?.2)
+                    targets::pane(&state, options)?.2.leaf_pane().cloned()
                 } else {
                     None
                 };
@@ -668,55 +669,66 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                         if selected_tab.as_ref().is_some_and(|id| id != &tab.id) {
                             continue;
                         }
-                        for (pane_id, surface_id) in arrangement::leaves(&tab.layout) {
+                        for leaf in arrangement::leaves(&tab.layout) {
                             if selected_pane
                                 .as_ref()
-                                .is_some_and(|selected| selected != &pane_id)
+                                .is_some_and(|selected| Some(selected) != leaf.leaf_pane())
                             {
                                 continue;
                             }
-                            let surface = state
-                                .surface(&surface_id)
-                                .ok_or_else(|| CliError::target("pane surface is missing"))?;
-                            panes.push(json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"surface":surface,"metadata":client.surface_metadata(surface)?}));
+                            panes.push(pane_row(&mut client, &state, session, tab, &leaf)?);
                         }
                     }
                 }
                 return Ok(Output::Value(json!(panes)));
             }
-            let (session, tab, pane_id, surface_id) = targets::pane(&state, options)?;
-            let surface = state
-                .surface(&surface_id)
-                .ok_or_else(|| CliError::target("pane surface is missing"))?;
+            let (session, tab, leaf) = targets::pane(&state, options)?;
+            let pane_id = leaf
+                .leaf_pane()
+                .expect("targets resolve only leaf nodes")
+                .clone();
             match action.unwrap() {
                 "show" => {
-                    return Ok(Output::Value(
-                        json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"surface":surface,"metadata":client.surface_metadata(surface)?}),
-                    ));
+                    return Ok(Output::Value(pane_row(
+                        &mut client,
+                        &state,
+                        session,
+                        tab,
+                        &leaf,
+                    )?));
                 }
+                // A content pane has no process, so closing it needs no confirmation.
                 "close" => {
-                    confirm_close(&state, [surface_id.clone()])?;
+                    confirm_close(&state, leaf.surface_id().cloned())?;
                     WorkspaceMutation::RemovePane { pane_id }
                 }
-                "terminate" => WorkspaceMutation::EndSurface {
-                    surface_id,
-                    expected_lifetime: surface.process_lifetime_id.clone(),
-                },
+                "terminate" => {
+                    let (_, surface_id) = targets::terminal(&leaf, "pane terminate")?;
+                    WorkspaceMutation::EndSurface {
+                        expected_lifetime: pane_surface(&state, &surface_id)?
+                            .process_lifetime_id
+                            .clone(),
+                        surface_id,
+                    }
+                }
                 "swap" => {
                     let other_options = Options {
                         pane: Some(options.with[0].clone()),
                         tab: Some(tab.id.to_string()),
                         ..Default::default()
                     };
-                    let other = targets::pane(&state, &other_options)?.2;
+                    let (_, _, other) = targets::pane(&state, &other_options)?;
+                    let other = other.leaf_pane().expect("targets resolve only leaf nodes");
                     WorkspaceMutation::ArrangeTab {
                         tab_id: tab.id.clone(),
-                        layout: arrangement::swap(&tab.layout, &pane_id, &other).ok_or_else(
+                        layout: arrangement::swap(&tab.layout, &pane_id, other).ok_or_else(
                             || CliError::usage("swap needs two distinct panes in the same tab"),
                         )?,
                     }
                 }
                 "capture" => {
+                    let (_, surface_id) = targets::terminal(&leaf, "pane capture")?;
+                    let surface = pane_surface(&state, &surface_id)?;
                     let scope = options
                         .values
                         .get("--scope")
@@ -734,6 +746,8 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                     ));
                 }
                 "send" => {
+                    let (_, surface_id) = targets::terminal(&leaf, "pane send")?;
+                    let surface = pane_surface(&state, &surface_id)?;
                     let snapshot = client.inspect_surface(surface, false)?;
                     let data = if let Some(text) = options.values.get("--text") {
                         literal_text(text, snapshot.modes.bracketed_paste)?
@@ -750,13 +764,27 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                 operation => {
                     let action = match operation {
                         "focus" => crate::cli_window::Action::FocusPane { pane_id },
-                        "resize" => crate::cli_window::Action::ResizePane {
-                            pane_id,
-                            cols: optional_number(options, "--cols", 20, i16::MAX as usize)?
-                                .map_or(surface.cols, |cols| cols as i16),
-                            rows: optional_number(options, "--rows", 4, i16::MAX as usize)?
-                                .map_or(surface.rows, |rows| rows as i16),
-                        },
+                        "resize" => {
+                            // Content panes are not sized in cells; resize a terminal beside it.
+                            let (_, surface_id) = targets::terminal(&leaf, "pane resize")?;
+                            let cols = optional_number(options, "--cols", 20, i16::MAX as usize)?
+                                .map(|cols| cols as i16);
+                            let rows = optional_number(options, "--rows", 4, i16::MAX as usize)?
+                                .map(|rows| rows as i16);
+                            let (cols, rows) = match (cols, rows) {
+                                (Some(cols), Some(rows)) => (cols, rows),
+                                // An omitted dimension keeps the terminal's current size.
+                                _ => {
+                                    let surface = pane_surface(&state, &surface_id)?;
+                                    (cols.unwrap_or(surface.cols), rows.unwrap_or(surface.rows))
+                                }
+                            };
+                            crate::cli_window::Action::ResizePane {
+                                pane_id,
+                                cols,
+                                rows,
+                            }
+                        }
                         "zoom" => crate::cli_window::Action::ZoomPane { pane_id },
                         "unzoom" => crate::cli_window::Action::UnzoomPane { pane_id },
                         "float" => crate::cli_window::Action::FloatPane { pane_id },
@@ -813,11 +841,8 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         }
         "split" => return split(&mut client, &mut state, options, &config),
         "attach" | "detach" | "run" => {
-            let (_, _, pane_id, surface_id) = targets::pane(&state, options)?;
-            let surface = state
-                .surface(&surface_id)
-                .ok_or_else(|| CliError::target("pane surface is missing"))?
-                .clone();
+            let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
+            let surface = pane_surface(&state, &surface_id)?.clone();
             if command == "detach" {
                 client.detach_surface(&surface)?;
                 return Ok(Output::Report {
@@ -916,6 +941,7 @@ fn changed(
                 pane_id,
                 surface_id,
             } => output.push((pane_id, surface_id)),
+            LayoutNode::Content { .. } => {}
             LayoutNode::Split { first, second, .. } => {
                 leaves(first, output);
                 leaves(second, output);
@@ -952,6 +978,41 @@ fn changed(
         text: format!("{text}\n"),
         value,
     }
+}
+
+/// The surface behind a terminal pane, which the workspace lists beside its layout.
+fn pane_surface<'a>(
+    state: &'a WorkspaceSnapshot,
+    surface_id: &SurfaceId,
+) -> std::result::Result<&'a SurfaceInfo, CliError> {
+    state
+        .surface(surface_id)
+        .ok_or_else(|| CliError::target("pane surface is missing"))
+}
+
+/// One `pane list`/`pane show` entry. Terminals report their surface and fresh runtime
+/// metadata; content panes have no process and report the folder and files they show.
+fn pane_row(
+    client: &mut DaemonClient,
+    state: &WorkspaceSnapshot,
+    session: &WorkspaceSession,
+    tab: &WorkspaceTab,
+    leaf: &LayoutNode,
+) -> std::result::Result<Value, CliError> {
+    use crate::cli_window::PaneType;
+    Ok(match leaf {
+        LayoutNode::Pane {
+            pane_id,
+            surface_id,
+        } => {
+            let surface = pane_surface(state, surface_id)?;
+            json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Terminal,"surface":surface,"metadata":client.surface_metadata(surface)?})
+        }
+        LayoutNode::Content { pane_id, content } => {
+            json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Content,"content":content})
+        }
+        LayoutNode::Split { .. } => unreachable!("pane rows are built only for leaf nodes"),
+    })
 }
 
 fn presentation(
@@ -1453,10 +1514,8 @@ fn split(
             launch,
         )?);
     } else {
-        let (_, _, pane_id, surface_id) = targets::pane(state, options)?;
-        let surface = state
-            .surface(&surface_id)
-            .ok_or_else(|| CliError::target("pane surface is missing"))?;
+        let (_, _, pane_id, surface_id) = targets::terminal_pane(state, options, "split")?;
+        let surface = pane_surface(state, &surface_id)?;
         let axis = if options.switches.contains("--down") {
             SplitAxis::Vertical
         } else {

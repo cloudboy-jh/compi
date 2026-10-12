@@ -4,9 +4,9 @@ use crate::connection::ConnectionTarget;
 use crate::console;
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use compi_protocol::{
-    ClientMessage, LayoutNode, PaneId, ScreenMessage, ServerMessage, SessionId, SplitAxis,
-    SurfaceId, SurfaceInfo, SurfaceStatus, TabId, WorkspaceMutation, WorkspaceSnapshot,
-    WorkspaceTab,
+    ClientMessage, ContentEnvironment, LayoutNode, PaneContent, PaneId, ScreenMessage,
+    ServerMessage, SessionId, SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabId,
+    WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -112,6 +112,8 @@ fn usage() {
          compi-probe [connection options] tab arrange <tab-id> <preset> [--with <tab-id>]... [--main <pane-id>] [--mirror] [--flip]\n  \
          compi-probe [connection options] tab mirror|flip|restore-arrangement|split-merged <tab-id>\n  \
          compi-probe [connection options] pane split-right|split-down <pane-id> [working-directory]\n  \
+         compi-probe [connection options] pane open-content <pane-id> <folder> [--down] [--file <path>]... [--active <path>]\n  \
+         compi-probe [connection options] pane update-content <pane-id> <folder> [--file <path>]... [--active <path>]\n  \
          compi-probe [connection options] pane swap <pane-id> <pane-id>\n  \
          compi-probe [connection options] pane remove <pane-id>\n  \
          compi-probe [connection options] surface attach|inspect|end|restart <surface-id>\n  \
@@ -124,6 +126,9 @@ fn usage() {
          tab of the same workspace into <tab-id>; split-merged (or restore-arrangement\n\
          right after a merge) recreates the merged tabs. Arranging only moves and\n\
          resizes existing panes; no shell is started, restarted, or ended.\n\
+         open-content puts a content pane right of (or, with --down, below) a pane;\n\
+         update-content replaces what a content pane shows. Host paths are made\n\
+         absolute against the current directory; WSL paths are used as given.\n\
          Press Ctrl+] to detach without stopping the shell."
     );
 }
@@ -217,58 +222,72 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
             } else {
                 SplitAxis::Vertical
             };
-            let metrics = crate::layout::LayoutMetrics {
-                cell_width: 1.0,
-                line_height: 1.0,
-                padding_x: 0.0,
-                padding_y: 0.0,
-                pane_chrome_height: 0.0,
-                divider_thickness: 1.0,
-                margin: 0.0,
-                scale_factor: 1.0,
-            };
-            let layout = workspace
-                .sessions
-                .iter()
-                .flat_map(|session| &session.tabs)
-                .map(|tab| {
-                    crate::layout::compute_layout(
-                        &tab.layout,
-                        crate::layout::Size {
-                            width: f32::from(cols),
-                            height: f32::from(rows),
-                        },
-                        metrics,
-                    )
-                })
-                .find(|layout| layout.pane(&pane_id).is_some())
-                .ok_or("pane was not found")?;
-            let rect = layout.split_feasibility(&pane_id, axis)?;
+            let geometry = split_geometry(
+                &workspace,
+                &pane_id,
+                axis,
+                crate::layout::PaneKind::Terminal,
+                (cols, rows),
+            )?;
             let (cols, rows) = match axis {
                 SplitAxis::Horizontal => (
-                    ((rect.width - 1.0) / 2.0).floor() as i16,
-                    rect.height.floor() as i16,
+                    (geometry.width - geometry.divider) / 2.0 / PROBE_METRICS.cell_width,
+                    geometry.height / PROBE_METRICS.line_height,
                 ),
                 SplitAxis::Vertical => (
-                    rect.width.floor() as i16,
-                    ((rect.height - 1.0) / 2.0).floor() as i16,
+                    geometry.width / PROBE_METRICS.cell_width,
+                    (geometry.height - geometry.divider) / 2.0 / PROBE_METRICS.line_height,
                 ),
             };
             WorkspaceMutation::SplitPane {
                 pane_id,
                 axis,
-                cols,
-                rows,
+                cols: cols.floor() as i16,
+                rows: rows.floor() as i16,
                 working_directory: args.get(2).cloned(),
-                // The headless probe uses terminal-cell units, without native pane chrome.
-                geometry: compi_protocol::SplitGeometry {
-                    width: rect.width,
-                    height: rect.height,
-                    min_width: 20.0,
-                    min_height: 4.0,
-                    divider: 1.0,
-                },
+                geometry,
             }
+        }
+        Some("open-content") if args.len() >= 3 => {
+            let pane_id = PaneId::new(args[1].clone());
+            let environment = match find_leaf(&workspace, &pane_id)? {
+                LayoutNode::Pane { surface_id, .. } => ContentEnvironment::of_surface(
+                    workspace
+                        .surface(&surface_id)
+                        .ok_or("pane surface is missing")?,
+                ),
+                LayoutNode::Content { content, .. } => content.environment,
+                LayoutNode::Split { .. } => unreachable!("leaves holds only leaf nodes"),
+            };
+            let (content, down) = content_arguments(&args[2..], environment, true)?;
+            let axis = if down {
+                SplitAxis::Vertical
+            } else {
+                SplitAxis::Horizontal
+            };
+            WorkspaceMutation::OpenContent {
+                geometry: split_geometry(
+                    &workspace,
+                    &pane_id,
+                    axis,
+                    crate::layout::PaneKind::Content,
+                    (cols, rows),
+                )?,
+                pane_id,
+                axis,
+                content,
+            }
+        }
+        Some("update-content") if args.len() >= 3 => {
+            let pane_id = PaneId::new(args[1].clone());
+            let LayoutNode::Content { content, .. } = find_leaf(&workspace, &pane_id)? else {
+                return Err(format!(
+                    "pane {pane_id} is a terminal pane; update-content needs a content pane"
+                )
+                .into());
+            };
+            let (content, _) = content_arguments(&args[2..], content.environment, false)?;
+            WorkspaceMutation::UpdateContent { pane_id, content }
         }
         Some("remove") if args.len() == 2 => WorkspaceMutation::RemovePane {
             pane_id: PaneId::new(args[1].clone()),
@@ -276,6 +295,104 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
         _ => return Err("invalid pane command; run compi-probe help".into()),
     };
     print_receipt(submit(&mut client, &workspace, operation)?)
+}
+
+/// The headless probe sizes the console as 8x16-pixel cells without native pane chrome,
+/// so terminal minimums (in cells) and content minimums (in logical pixels) both apply.
+const PROBE_METRICS: crate::layout::LayoutMetrics = crate::layout::LayoutMetrics {
+    cell_width: 8.0,
+    line_height: 16.0,
+    padding_x: 0.0,
+    padding_y: 0.0,
+    pane_chrome_height: 0.0,
+    divider_thickness: 1.0,
+    margin: 0.0,
+    scale_factor: 1.0,
+};
+
+/// Geometry for splitting `pane_id` to add a `new_pane`, laid out in a console of
+/// `(cols, rows)`, with the minimum the daemon checks both children against.
+fn split_geometry(
+    workspace: &WorkspaceSnapshot,
+    pane_id: &PaneId,
+    axis: SplitAxis,
+    new_pane: crate::layout::PaneKind,
+    (cols, rows): (i16, i16),
+) -> Result<compi_protocol::SplitGeometry> {
+    let size = crate::layout::Size {
+        width: f32::from(cols) * PROBE_METRICS.cell_width,
+        height: f32::from(rows) * PROBE_METRICS.line_height,
+    };
+    let layout = workspace
+        .sessions
+        .iter()
+        .flat_map(|session| &session.tabs)
+        .map(|tab| crate::layout::compute_layout(&tab.layout, size, PROBE_METRICS))
+        .find(|layout| layout.pane(pane_id).is_some())
+        .ok_or("pane was not found")?;
+    let rect = layout.split_feasibility(pane_id, axis, new_pane)?;
+    let minimum = layout
+        .split_minimum(pane_id, new_pane)
+        .expect("the pane is in this layout");
+    Ok(compi_protocol::SplitGeometry {
+        width: rect.width,
+        height: rect.height,
+        min_width: minimum.width,
+        min_height: minimum.height,
+        divider: PROBE_METRICS.divider_size(),
+    })
+}
+
+fn find_leaf(workspace: &WorkspaceSnapshot, pane_id: &PaneId) -> Result<LayoutNode> {
+    workspace
+        .sessions
+        .iter()
+        .flat_map(|session| &session.tabs)
+        .flat_map(|tab| crate::arrangement::leaves(&tab.layout))
+        .find(|leaf| leaf.leaf_pane() == Some(pane_id))
+        .ok_or_else(|| format!("pane {pane_id} was not found").into())
+}
+
+/// Parse `<folder> [--down] [--file <path>]... [--active <path>]` into content shown in
+/// `environment`, and whether `--down` was given (accepted only when `allow_down`).
+fn content_arguments(
+    args: &[String],
+    environment: ContentEnvironment,
+    allow_down: bool,
+) -> Result<(PaneContent, bool)> {
+    // Host paths are relative to this shell; WSL paths are Linux paths and pass through.
+    let path = |value: &str| -> Result<String> {
+        Ok(match environment {
+            ContentEnvironment::Host => std::path::absolute(value)?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| format!("path {value:?} is not valid UTF-8"))?,
+            ContentEnvironment::Wsl { .. } => value.to_owned(),
+        })
+    };
+    let mut options = args.iter();
+    let root = path(options.next().ok_or("a folder is required")?)?;
+    let mut files = Vec::new();
+    let mut active_file = None;
+    let mut down = false;
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--down" if allow_down && !down => down = true,
+            "--file" => files.push(path(options.next().ok_or("--file requires a path")?)?),
+            "--active" if active_file.is_none() => {
+                active_file = Some(path(options.next().ok_or("--active requires a path")?)?);
+            }
+            _ => return Err(format!("unknown or repeated content option {option:?}").into()),
+        }
+    }
+    let content = PaneContent {
+        environment,
+        root,
+        files,
+        active_file,
+    };
+    content.validate()?;
+    Ok((content, down))
 }
 
 /// Submit against the snapshot the operation was computed from, so a concurrent
@@ -322,7 +439,7 @@ fn arrange_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
                 .find(|tab| {
                     arrangement::leaves(&tab.layout)
                         .iter()
-                        .any(|(id, _)| id == &a)
+                        .any(|leaf| leaf.leaf_pane() == Some(&a))
                 })
                 .ok_or_else(|| format!("pane {a} was not found"))?;
             let layout = arrangement::swap(&tab.layout, &a, &b)
@@ -413,7 +530,7 @@ fn arrange_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
             if let Some(main) = &main
                 && !arrangement::leaves(&current)
                     .iter()
-                    .any(|(id, _)| id == main)
+                    .any(|leaf| leaf.leaf_pane() == Some(main))
             {
                 return Err(format!("pane {main} is not in the arranged tabs").into());
             }

@@ -1,6 +1,8 @@
 use super::{CliError, Options};
 use crate::arrangement;
-use compi_protocol::{PaneId, SurfaceId, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab};
+use compi_protocol::{
+    LayoutNode, PaneId, SurfaceId, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
+};
 
 fn unique<T>(mut matches: Vec<T>, kind: &str, selector: Option<&str>) -> Result<T, CliError> {
     match matches.len() {
@@ -48,7 +50,7 @@ pub fn tab<'a>(
         return find_tab(state, selector, selected_workspace);
     }
     if let Some(selector) = options.pane.as_deref() {
-        let (session, tab, _, _) = find_pane(state, Some(selector), selected_workspace, None)?;
+        let (session, tab, _) = find_pane(state, Some(selector), selected_workspace, None)?;
         return Ok((session, tab));
     }
     if let Some((session, tab, _)) = context(state, options)
@@ -68,10 +70,11 @@ pub fn tab<'a>(
     )
 }
 
+/// The selected pane as its leaf node: a terminal or a content pane.
 pub fn pane<'a>(
     state: &'a WorkspaceSnapshot,
     options: &Options,
-) -> Result<(&'a WorkspaceSession, &'a WorkspaceTab, PaneId, SurfaceId), CliError> {
+) -> Result<(&'a WorkspaceSession, &'a WorkspaceTab, LayoutNode), CliError> {
     let selected_workspace = options
         .workspace
         .as_deref()
@@ -101,6 +104,33 @@ pub fn pane<'a>(
         selected_workspace,
         selected_tab,
     )
+}
+
+/// The selected pane for `command`, which needs a terminal's surface.
+pub fn terminal_pane<'a>(
+    state: &'a WorkspaceSnapshot,
+    options: &Options,
+    command: &str,
+) -> Result<(&'a WorkspaceSession, &'a WorkspaceTab, PaneId, SurfaceId), CliError> {
+    let (session, tab, leaf) = pane(state, options)?;
+    let (pane_id, surface_id) = terminal(&leaf, command)?;
+    Ok((session, tab, pane_id, surface_id))
+}
+
+/// The pane and surface of a terminal leaf; content panes have no process to act on.
+pub fn terminal(leaf: &LayoutNode, command: &str) -> Result<(PaneId, SurfaceId), CliError> {
+    match leaf {
+        LayoutNode::Pane {
+            pane_id,
+            surface_id,
+        } => Ok((pane_id.clone(), surface_id.clone())),
+        LayoutNode::Content { pane_id, .. } => Err(CliError::new(
+            3,
+            "terminal_pane_required",
+            format!("pane {pane_id} is a content pane; {command} needs a terminal pane"),
+        )),
+        LayoutNode::Split { .. } => unreachable!("targets resolve only leaf nodes"),
+    }
 }
 
 fn find_workspace<'a>(
@@ -157,7 +187,7 @@ fn find_pane<'a>(
     selector: Option<&str>,
     workspace: Option<&WorkspaceSession>,
     tab: Option<&WorkspaceTab>,
-) -> Result<(&'a WorkspaceSession, &'a WorkspaceTab, PaneId, SurfaceId), CliError> {
+) -> Result<(&'a WorkspaceSession, &'a WorkspaceTab, LayoutNode), CliError> {
     let mut candidates = Vec::new();
     for session in &state.sessions {
         if workspace.is_some_and(|selected| selected.id != session.id) {
@@ -167,16 +197,21 @@ fn find_pane<'a>(
             if tab.is_some_and(|selected| selected.id != current_tab.id) {
                 continue;
             }
-            for (id, surface) in arrangement::leaves(&current_tab.layout) {
+            for leaf in arrangement::leaves(&current_tab.layout) {
+                let id = leaf.leaf_pane().expect("leaves holds only leaf nodes");
                 if let Some(selector) = selector {
-                    if id.as_str() == selector || surface.as_str() == selector {
-                        return Ok((session, current_tab, id, surface));
+                    if id.as_str() == selector
+                        || leaf
+                            .surface_id()
+                            .is_some_and(|surface| surface.as_str() == selector)
+                    {
+                        return Ok((session, current_tab, leaf));
                     }
                     if !qualified(selector, &[&session.label, &current_tab.label, id.as_str()]) {
                         continue;
                     }
                 }
-                candidates.push((session, current_tab, id, surface));
+                candidates.push((session, current_tab, leaf));
             }
         }
     }
@@ -206,17 +241,12 @@ fn context<'a>(
     let surface = options.surface.as_deref()?;
     for session in &state.sessions {
         for tab in &session.tabs {
-            fn find<'a>(
-                node: &'a compi_protocol::LayoutNode,
-                surface: &str,
-            ) -> Option<&'a SurfaceId> {
+            fn find<'a>(node: &'a LayoutNode, surface: &str) -> Option<&'a SurfaceId> {
                 match node {
-                    compi_protocol::LayoutNode::Pane { surface_id, .. }
-                        if surface_id.as_str() == surface =>
-                    {
+                    LayoutNode::Pane { surface_id, .. } if surface_id.as_str() == surface => {
                         Some(surface_id)
                     }
-                    compi_protocol::LayoutNode::Split { first, second, .. } => {
+                    LayoutNode::Split { first, second, .. } => {
                         find(first, surface).or_else(|| find(second, surface))
                     }
                     _ => None,
@@ -254,7 +284,9 @@ pub fn validate_context(state: &WorkspaceSnapshot, options: &Options) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::{LayoutNode, ServerGeneration, ServerId, SessionId, TabId};
+    use compi_protocol::{
+        ContentEnvironment, PaneContent, ServerGeneration, ServerId, SessionId, TabId,
+    };
 
     fn state() -> WorkspaceSnapshot {
         let session =
@@ -325,7 +357,8 @@ mod tests {
             workspace(&state, &options).unwrap().id.as_str(),
             "session-b"
         );
-        assert_eq!(pane(&state, &options).unwrap().2.as_str(), "pane-b");
+        let (_, _, leaf) = pane(&state, &options).unwrap();
+        assert_eq!(leaf.leaf_pane().unwrap().as_str(), "pane-b");
     }
 
     #[test]
@@ -336,11 +369,49 @@ mod tests {
             surface: Some("surface-a".into()),
             ..Default::default()
         };
-        assert_eq!(pane(&state, &options).unwrap().2.as_str(), "pane-b");
+        let (_, _, leaf) = pane(&state, &options).unwrap();
+        assert_eq!(leaf.leaf_pane().unwrap().as_str(), "pane-b");
         let contradicted = Options {
             workspace: Some("session-a".into()),
             ..options
         };
         assert_eq!(validate_context(&state, &contradicted).unwrap_err().exit, 3);
+    }
+
+    #[test]
+    fn content_panes_resolve_but_surface_commands_reject_them() {
+        let mut state = state();
+        state.sessions[1].tabs[0].layout = LayoutNode::Content {
+            pane_id: PaneId::new("pane-b"),
+            content: PaneContent {
+                environment: ContentEnvironment::Host,
+                root: "/work".into(),
+                files: Vec::new(),
+                active_file: None,
+            },
+        };
+        let content = Options {
+            pane: Some("pane-b".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            pane(&state, &content).unwrap().2,
+            LayoutNode::Content { .. }
+        ));
+        let error = terminal_pane(&state, &content, "pane send").unwrap_err();
+        assert_eq!(error.code, "terminal_pane_required");
+        assert_eq!(
+            error.message,
+            "pane pane-b is a content pane; pane send needs a terminal pane"
+        );
+        let by_surface = Options {
+            pane: Some("surface-a".into()),
+            ..Default::default()
+        };
+        let (_, _, pane_id, surface_id) = terminal_pane(&state, &by_surface, "pane send").unwrap();
+        assert_eq!(
+            (pane_id.as_str(), surface_id.as_str()),
+            ("pane-a", "surface-a")
+        );
     }
 }

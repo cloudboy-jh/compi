@@ -218,17 +218,14 @@ impl CompiApp {
         tab: &WorkspaceTab,
         panes: &[TabPane],
     ) -> (String, Option<String>) {
-        let focused = self
-            .focused_view
-            .and_then(|id| self.surface_views.iter().find(|view| view.id == id))
-            .map(|view| &view.pane_id);
+        let focused = self.focused_pane();
         let pane = focused
             .and_then(|focused| panes.iter().find(|pane| &pane.pane_id == focused))
             .or_else(|| panes.first());
         let fallback = pane.map_or("Terminal", |pane| pane.title.as_str());
         let metadata = pane
             .and_then(|pane| self.tab_pane_target(&tab.id, &pane.pane_id))
-            .and_then(|(_, id)| self.pane_metadata(&id));
+            .and_then(|(_, id)| self.pane_metadata(&id?));
         let fields = metadata
             .map(|metadata| crate::metadata::caption_fields(metadata, &self.config.metadata))
             .unwrap_or_default();

@@ -1,9 +1,10 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
-    ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES, MergedTab,
-    MutationId, MutationReceipt, MutationRequest, PaneId, PlannedLayoutNode, ProcessLifetimeId,
-    ServerGeneration, SessionId, SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabId, TabMerge,
-    WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
+    ContentEnvironment, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES,
+    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId,
+    PlannedLayoutNode, ProcessLifetimeId, ServerGeneration, SessionId, SplitAxis, SurfaceId,
+    SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation, WorkspaceSession,
+    WorkspaceSnapshot, WorkspaceTab,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -895,34 +896,87 @@ fn apply_mutation(
             validate_split_geometry(geometry, *axis).map_err(invalid)?;
             let new_pane = PaneId::new(allocate("pane", ordinal));
             let surface = new_surface(*cols, *rows, working_directory.clone(), ordinal);
-            let mut replaced = false;
-            for session in &mut workspace.sessions {
-                for tab in &mut session.tabs {
-                    if split_pane(
-                        &mut tab.layout,
-                        pane_id,
-                        *axis,
-                        new_pane.clone(),
-                        surface.id.clone(),
-                    ) {
-                        affected_sessions.push(session.id.clone());
-                        affected_tabs.push(tab.id.clone());
-                        replaced = true;
-                        break;
-                    }
-                }
-                if replaced {
-                    break;
-                }
-            }
-            if !replaced {
-                return Err(invalid(format!("pane {pane_id} was not found")));
-            }
+            let (session_id, tab_id) = split_leaf(
+                &mut workspace.sessions,
+                pane_id,
+                *axis,
+                LayoutNode::Pane {
+                    pane_id: new_pane.clone(),
+                    surface_id: surface.id.clone(),
+                },
+            )
+            .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            affected_sessions.push(session_id);
+            affected_tabs.push(tab_id);
             affected_panes.extend([pane_id.clone(), new_pane]);
             affected_surfaces.push(surface.id.clone());
             effects.push(WorkspaceEffect::Launch(surface.clone(), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
+        }
+        WorkspaceMutation::OpenContent {
+            pane_id,
+            axis,
+            geometry,
+            content,
+        } => {
+            validate_split_geometry(geometry, *axis).map_err(invalid)?;
+            validate_content(content).map_err(invalid)?;
+            let new_pane = PaneId::new(allocate("pane", ordinal));
+            let (session_id, tab_id) = split_leaf(
+                &mut workspace.sessions,
+                pane_id,
+                *axis,
+                LayoutNode::Content {
+                    pane_id: new_pane.clone(),
+                    content: content.clone(),
+                },
+            )
+            .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            affected_sessions.push(session_id);
+            affected_tabs.push(tab_id);
+            affected_panes.extend([pane_id.clone(), new_pane]);
+            Ok("committed".into())
+        }
+        WorkspaceMutation::UpdateContent { pane_id, content } => {
+            validate_content(content).map_err(invalid)?;
+            let tab = workspace
+                .sessions
+                .iter_mut()
+                .flat_map(|session| &mut session.tabs)
+                .find(|tab| contains_pane(&tab.layout, pane_id))
+                .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            let Some(LayoutNode::Content {
+                content: current, ..
+            }) = leaf_mut(&mut tab.layout, pane_id)
+            else {
+                return Err(invalid(format!(
+                    "pane {pane_id} is a terminal, not a content pane"
+                )));
+            };
+            affected_tabs.push(tab.id.clone());
+            if current == content {
+                return Ok("unchanged".into());
+            }
+            *current = content.clone();
+            // Restorable and split-back trees hold this same leaf; they must not
+            // bring back what the pane showed before.
+            let merge = tab.merge.as_deref_mut().into_iter().flat_map(|merge| {
+                merge
+                    .own_layout
+                    .iter_mut()
+                    .chain(merge.tabs.iter_mut().map(|record| &mut record.layout))
+            });
+            for tree in tab.previous_layout.as_deref_mut().into_iter().chain(merge) {
+                if let Some(LayoutNode::Content {
+                    content: recorded, ..
+                }) = leaf_mut(tree, pane_id)
+                {
+                    *recorded = content.clone();
+                }
+            }
+            affected_panes.push(pane_id.clone());
+            Ok("committed".into())
         }
         WorkspaceMutation::GrowTab {
             tab_id,
@@ -942,9 +996,17 @@ fn apply_mutation(
                 })
                 .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
             let tab = &workspace.sessions[session_index].tabs[tab_index];
+            if tab.layout.has_content() {
+                return Err(invalid(format!(
+                    "tab {tab_id} holds a content pane; growing a tab sizes panes in terminal cells, so close or move the content pane first"
+                )));
+            }
             let mut leaves = Vec::new();
             collect_leaves(&tab.layout, &mut leaves);
-            let existing: std::collections::HashMap<_, _> = leaves.into_iter().collect();
+            let existing: std::collections::HashMap<_, _> = leaves
+                .into_iter()
+                .filter_map(|leaf| Some((leaf.leaf_pane()?, leaf)))
+                .collect();
             let extent = tab_cell_extent(&tab.layout, &workspace.surfaces).map_err(invalid)?;
             let mut seen = HashSet::new();
             let mut count = 0;
@@ -989,7 +1051,7 @@ fn apply_mutation(
                     continue;
                 };
                 let tab = &mut session.tabs[index];
-                if matches!(tab.layout, LayoutNode::Pane { .. }) {
+                if tab.layout.leaf_pane().is_some() {
                     return Err(invalid(format!(
                         "pane {pane_id} is the only pane in its tab"
                     )));
@@ -997,10 +1059,7 @@ fn apply_mutation(
                 let detached =
                     extract_pane(&mut tab.layout, pane_id).expect("pane was found in a split tab");
                 forget_pane_history(tab, pane_id);
-                let LayoutNode::Pane { surface_id, .. } = &detached else {
-                    unreachable!("only a leaf can be detached");
-                };
-                let surface_id = surface_id.clone();
+                let surface_id = detached.surface_id().cloned();
                 let old_tab_id = tab.id.clone();
                 let new_tab_id = TabId::new(allocate("tab", ordinal));
                 session.tabs.insert(
@@ -1016,7 +1075,7 @@ fn apply_mutation(
                 affected_sessions.push(session.id.clone());
                 affected_tabs.extend([new_tab_id, old_tab_id]);
                 affected_panes.push(pane_id.clone());
-                affected_surfaces.push(surface_id);
+                affected_surfaces.extend(surface_id);
                 return Ok("committed".into());
             }
             Err(invalid(format!("pane {pane_id} was not found")))
@@ -1557,32 +1616,36 @@ fn find_tab_mut<'a>(
         .find(|tab| &tab.id == tab_id)
 }
 
-fn split_pane(
-    node: &mut LayoutNode,
+/// Split leaf `target`, keeping it first and putting `new_leaf` second. Returns the
+/// session and tab that hold it.
+fn split_leaf(
+    sessions: &mut [WorkspaceSession],
     target: &PaneId,
     axis: SplitAxis,
-    new_pane: PaneId,
-    new_surface: SurfaceId,
-) -> bool {
+    new_leaf: LayoutNode,
+) -> Option<(SessionId, TabId)> {
+    for session in sessions {
+        for tab in &mut session.tabs {
+            if let Some(leaf) = leaf_mut(&mut tab.layout, target) {
+                *leaf = LayoutNode::Split {
+                    axis,
+                    ratio: 0.5,
+                    first: Box::new(leaf.clone()),
+                    second: Box::new(new_leaf),
+                };
+                return Some((session.id.clone(), tab.id.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn leaf_mut<'a>(node: &'a mut LayoutNode, target: &PaneId) -> Option<&'a mut LayoutNode> {
     match node {
-        LayoutNode::Pane { pane_id, .. } if pane_id == target => {
-            let original = node.clone();
-            *node = LayoutNode::Split {
-                axis,
-                ratio: 0.5,
-                first: Box::new(original),
-                second: Box::new(LayoutNode::Pane {
-                    pane_id: new_pane,
-                    surface_id: new_surface,
-                }),
-            };
-            true
-        }
-        LayoutNode::Pane { .. } => false,
         LayoutNode::Split { first, second, .. } => {
-            split_pane(first, target, axis, new_pane.clone(), new_surface.clone())
-                || split_pane(second, target, axis, new_pane, new_surface)
+            leaf_mut(first, target).or_else(|| leaf_mut(second, target))
         }
+        leaf => (leaf.leaf_pane() == Some(target)).then_some(leaf),
     }
 }
 
@@ -1613,6 +1676,9 @@ fn tab_cell_extent(node: &LayoutNode, surfaces: &[SurfaceInfo]) -> Result<(i32, 
                 .ok_or_else(|| format!("pane surface {surface_id} was not found"))?;
             Ok((i32::from(surface.cols), i32::from(surface.rows)))
         }
+        LayoutNode::Content { pane_id, .. } => Err(format!(
+            "pane {pane_id} shows content and has no terminal cell size"
+        )),
         LayoutNode::Split {
             axis,
             ratio,
@@ -1657,7 +1723,7 @@ fn split_cell_extent(extent: (i32, i32), axis: SplitAxis, ratio: f32) -> ((i32, 
 fn validate_growth_plan<'a>(
     plan: &'a PlannedLayoutNode,
     extent: (i32, i32),
-    existing: &std::collections::HashMap<&PaneId, &SurfaceId>,
+    existing: &std::collections::HashMap<&PaneId, &LayoutNode>,
     seen: &mut HashSet<&'a PaneId>,
     count: &mut usize,
     depth: usize,
@@ -1703,16 +1769,13 @@ fn validate_growth_plan<'a>(
 fn materialize_growth_plan(
     plan: &PlannedLayoutNode,
     extent: (i32, i32),
-    existing: &std::collections::HashMap<&PaneId, &SurfaceId>,
+    existing: &std::collections::HashMap<&PaneId, &LayoutNode>,
     working_directory: &Option<String>,
     ordinal: &mut u64,
     created: &mut Vec<SurfaceInfo>,
 ) -> LayoutNode {
     match plan {
-        PlannedLayoutNode::ExistingPane { pane_id } => LayoutNode::Pane {
-            pane_id: pane_id.clone(),
-            surface_id: (*existing[pane_id]).clone(),
-        },
+        PlannedLayoutNode::ExistingPane { pane_id } => (*existing[pane_id]).clone(),
         PlannedLayoutNode::NewPane => {
             let pane_id = PaneId::new(allocate("pane", ordinal));
             let surface = new_surface(
@@ -1792,6 +1855,29 @@ fn validate_split_geometry(
     Ok(())
 }
 
+/// Content paths must be absolute where they live: on this host, or inside a WSL
+/// distribution, which only a Windows host can reach.
+fn validate_content(content: &PaneContent) -> Result<(), String> {
+    content.validate()?;
+    let mut paths = std::iter::once(&content.root).chain(&content.files);
+    match &content.environment {
+        ContentEnvironment::Host => {
+            if let Some(path) = paths.find(|path| !std::path::Path::new(path).is_absolute()) {
+                return Err(format!("content path {path} is not absolute on this host"));
+            }
+        }
+        ContentEnvironment::Wsl { .. } => {
+            if !cfg!(windows) {
+                return Err("WSL content is only available on Windows hosts".into());
+            }
+            if let Some(path) = paths.find(|path| !path.starts_with('/')) {
+                return Err(format!("WSL content path {path} must start with '/'"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_launch_context(context: &compi_protocol::LaunchContext) -> Result<(), String> {
     if context.scrollback_lines > 100_000
         || context.graphics_bytes > compi_protocol::MAX_GRAPHICS_BYTES
@@ -1826,10 +1912,10 @@ fn validate_launch_context(context: &compi_protocol::LaunchContext) -> Result<()
 
 fn contains_pane(node: &LayoutNode, target: &PaneId) -> bool {
     match node {
-        LayoutNode::Pane { pane_id, .. } => pane_id == target,
         LayoutNode::Split { first, second, .. } => {
             contains_pane(first, target) || contains_pane(second, target)
         }
+        leaf => leaf.leaf_pane() == Some(target),
     }
 }
 
@@ -1838,45 +1924,29 @@ fn extract_pane(node: &mut LayoutNode, target: &PaneId) -> Option<LayoutNode> {
     let LayoutNode::Split { first, second, .. } = node else {
         return None;
     };
-    let child = match (&**first, &**second) {
-        (
-            LayoutNode::Pane {
-                pane_id,
-                surface_id,
-            },
-            _,
-        ) if pane_id == target => Some((true, pane_id, surface_id)),
-        (
-            _,
-            LayoutNode::Pane {
-                pane_id,
-                surface_id,
-            },
-        ) if pane_id == target => Some((false, pane_id, surface_id)),
-        _ => None,
+    let placeholder = if first.leaf_pane() == Some(target) {
+        (**first).clone()
+    } else if second.leaf_pane() == Some(target) {
+        (**second).clone()
+    } else {
+        return extract_pane(first, target).or_else(|| extract_pane(second, target));
     };
-    if let Some((take_first, pane_id, surface_id)) = child {
-        let placeholder = LayoutNode::Pane {
-            pane_id: pane_id.clone(),
-            surface_id: surface_id.clone(),
-        };
-        let LayoutNode::Split { first, second, .. } = std::mem::replace(node, placeholder) else {
-            unreachable!("the node was a split");
-        };
-        return if take_first {
-            *node = *second;
-            Some(*first)
-        } else {
-            *node = *first;
-            Some(*second)
-        };
+    let LayoutNode::Split { first, second, .. } = std::mem::replace(node, placeholder) else {
+        unreachable!("the node was a split");
+    };
+    if first.leaf_pane() == Some(target) {
+        *node = *second;
+        Some(*first)
+    } else {
+        *node = *first;
+        Some(*second)
     }
-    extract_pane(first, target).or_else(|| extract_pane(second, target))
 }
 
 fn collect_surfaces(node: &LayoutNode, output: &mut Vec<SurfaceId>) {
     match node {
         LayoutNode::Pane { surface_id, .. } => output.push(surface_id.clone()),
+        LayoutNode::Content { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             collect_surfaces(first, output);
             collect_surfaces(second, output);
@@ -1884,27 +1954,28 @@ fn collect_surfaces(node: &LayoutNode, output: &mut Vec<SurfaceId>) {
     }
 }
 
-fn collect_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<(&'a PaneId, &'a SurfaceId)>) {
+fn collect_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<&'a LayoutNode>) {
     match node {
-        LayoutNode::Pane {
-            pane_id,
-            surface_id,
-        } => output.push((pane_id, surface_id)),
         LayoutNode::Split { first, second, .. } => {
             collect_leaves(first, output);
             collect_leaves(second, output);
         }
+        leaf => output.push(leaf),
     }
 }
 
 fn pane_ids(node: &LayoutNode) -> Vec<PaneId> {
     let mut leaves = Vec::new();
     collect_leaves(node, &mut leaves);
-    leaves.into_iter().map(|(pane, _)| pane.clone()).collect()
+    leaves
+        .into_iter()
+        .filter_map(LayoutNode::leaf_pane)
+        .cloned()
+        .collect()
 }
 
-/// Whether `proposed` holds each pane/surface leaf of `expected` exactly once
-/// and nothing else, so committing it can only move existing panes.
+/// Whether `proposed` holds each leaf of `expected` exactly once and nothing else,
+/// so committing it can only move existing panes, never change what one shows.
 fn same_leaves(expected: &[&LayoutNode], proposed: &LayoutNode) -> bool {
     let mut current = Vec::new();
     for tree in expected {
@@ -1912,12 +1983,16 @@ fn same_leaves(expected: &[&LayoutNode], proposed: &LayoutNode) -> bool {
     }
     let mut candidate = Vec::new();
     collect_leaves(proposed, &mut candidate);
-    let expected: std::collections::HashSet<_> = current.iter().copied().collect();
-    let mut seen = std::collections::HashSet::new();
+    let expected: std::collections::HashMap<_, _> = current
+        .iter()
+        .filter_map(|leaf| Some((leaf.leaf_pane()?, *leaf)))
+        .collect();
+    let mut seen = HashSet::new();
     candidate.len() == current.len()
-        && candidate
-            .iter()
-            .all(|leaf| expected.contains(leaf) && seen.insert(*leaf))
+        && candidate.iter().all(|leaf| {
+            leaf.leaf_pane()
+                .is_some_and(|pane| expected.get(pane) == Some(leaf) && seen.insert(pane))
+        })
 }
 
 /// Keep restore and split-back records limited to panes that remain in the tab.
@@ -1986,7 +2061,7 @@ fn collect_surface_for_pane(node: &LayoutNode, pane_id: &PaneId, output: &mut Ve
             pane_id: current,
             surface_id,
         } if current == pane_id => output.push(surface_id.clone()),
-        LayoutNode::Pane { .. } => {}
+        LayoutNode::Pane { .. } | LayoutNode::Content { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             collect_surface_for_pane(first, pane_id, output);
             collect_surface_for_pane(second, pane_id, output);
@@ -2027,8 +2102,6 @@ fn apply_removal(workspace: &mut StoredWorkspace, target: &RemovalTarget) {
 
 fn remove_pane(node: LayoutNode, target: &PaneId) -> Option<LayoutNode> {
     match node {
-        LayoutNode::Pane { pane_id, .. } if &pane_id == target => None,
-        pane @ LayoutNode::Pane { .. } => Some(pane),
         LayoutNode::Split {
             axis,
             ratio,
@@ -2044,6 +2117,8 @@ fn remove_pane(node: LayoutNode, target: &PaneId) -> Option<LayoutNode> {
             (Some(survivor), None) | (None, Some(survivor)) => Some(survivor),
             (None, None) => None,
         },
+        leaf if leaf.leaf_pane() == Some(target) => None,
+        leaf => Some(leaf),
     }
 }
 
@@ -2053,6 +2128,7 @@ fn prune_unreferenced_surfaces(workspace: &mut StoredWorkspace) {
             LayoutNode::Pane { surface_id, .. } => {
                 output.insert(surface_id.clone());
             }
+            LayoutNode::Content { .. } => {}
             LayoutNode::Split { first, second, .. } => {
                 collect(first, output);
                 collect(second, output);
@@ -3142,15 +3218,7 @@ mod tests {
         }
         let before = actor.snapshot().unwrap();
         let tree = before.sessions[0].tabs[0].layout.clone();
-        let leaf = |pane: &PaneId| {
-            let mut found = Vec::new();
-            collect_leaves(&tree, &mut found);
-            let (pane_id, surface_id) = found.into_iter().find(|(id, _)| *id == pane).unwrap();
-            LayoutNode::Pane {
-                pane_id: pane_id.clone(),
-                surface_id: surface_id.clone(),
-            }
-        };
+        let leaf = |pane: &PaneId| leaf_node(&tree, pane);
         let node = |axis, ratio, first: LayoutNode, second: LayoutNode| LayoutNode::Split {
             axis,
             ratio,
@@ -3272,15 +3340,7 @@ mod tests {
             .previous_layout
             .as_deref()
             .unwrap();
-        let mut remaining = Vec::new();
-        collect_leaves(previous, &mut remaining);
-        assert_eq!(
-            remaining
-                .iter()
-                .map(|(id, _)| (*id).clone())
-                .collect::<Vec<_>>(),
-            vec![a.clone(), c.clone()]
-        );
+        assert_eq!(pane_ids(previous), vec![a.clone(), c.clone()]);
         assert!(detached.sessions[0].tabs[1].previous_layout.is_none());
         crate::workspace_store::validate(&StoredWorkspace {
             server_id: detached.server_id.clone(),
@@ -3405,13 +3465,7 @@ mod tests {
                 .map(|tab| &tab.layout)
                 .find(|tree| contains_pane(tree, pane))
                 .unwrap();
-            let mut found = Vec::new();
-            collect_leaves(tree, &mut found);
-            let (pane_id, surface_id) = found.into_iter().find(|(id, _)| *id == pane).unwrap();
-            LayoutNode::Pane {
-                pane_id: pane_id.clone(),
-                surface_id: surface_id.clone(),
-            }
+            leaf_node(tree, pane)
         };
         let node = |axis, first: LayoutNode, second: LayoutNode| LayoutNode::Split {
             axis,
@@ -3912,17 +3966,7 @@ mod tests {
         for index in 0..3 {
             let before = actor.snapshot().unwrap();
             let tab = &before.sessions[0].tabs[0];
-            fn leaves(node: &LayoutNode, output: &mut Vec<PaneId>) {
-                match node {
-                    LayoutNode::Pane { pane_id, .. } => output.push(pane_id.clone()),
-                    LayoutNode::Split { first, second, .. } => {
-                        leaves(first, output);
-                        leaves(second, output);
-                    }
-                }
-            }
-            let mut panes = Vec::new();
-            leaves(&tab.layout, &mut panes);
+            let panes = pane_ids(&tab.layout);
             let pane_id = if index == 2 {
                 panes.last().unwrap().clone()
             } else {
@@ -4134,5 +4178,634 @@ mod tests {
             effects.recv().unwrap(),
             WorkspaceEffect::End { .. }
         ));
+    }
+
+    fn leaf_node(tree: &LayoutNode, pane: &PaneId) -> LayoutNode {
+        let mut found = Vec::new();
+        collect_leaves(tree, &mut found);
+        found
+            .into_iter()
+            .find(|leaf| leaf.leaf_pane() == Some(pane))
+            .unwrap()
+            .clone()
+    }
+
+    fn split_geometry() -> compi_protocol::SplitGeometry {
+        compi_protocol::SplitGeometry {
+            width: 800.0,
+            height: 480.0,
+            min_width: 160.0,
+            min_height: 80.0,
+            divider: 4.0,
+        }
+    }
+
+    /// A folder and files whose paths are absolute on every test host.
+    fn host_content(files: &[&str]) -> PaneContent {
+        let root = std::env::temp_dir().join("compi-content-project");
+        let path = |name: &str| root.join(name).to_string_lossy().into_owned();
+        PaneContent {
+            environment: ContentEnvironment::Host,
+            root: root.to_string_lossy().into_owned(),
+            files: files.iter().map(|file| path(file)).collect(),
+            active_file: files.first().map(|file| path(file)),
+        }
+    }
+
+    fn open_content(pane_id: &PaneId, content: PaneContent) -> WorkspaceMutation {
+        WorkspaceMutation::OpenContent {
+            pane_id: pane_id.clone(),
+            axis: SplitAxis::Horizontal,
+            geometry: split_geometry(),
+            content,
+        }
+    }
+
+    fn mutate_current(
+        actor: &WorkspaceActor,
+        id: &str,
+        operation: WorkspaceMutation,
+    ) -> std::result::Result<MutationReceipt, ActorError> {
+        let revision = actor.snapshot().unwrap().revision;
+        actor.mutate(request(actor, id, revision, operation))
+    }
+
+    /// One tab holding one running terminal.
+    fn running_terminal() -> (
+        WorkspaceActor,
+        Receiver<WorkspaceEffect>,
+        SurfaceInfo,
+        PaneId,
+    ) {
+        let (actor, effects) = WorkspaceActor::memory();
+        actor
+            .mutate(request(
+                &actor,
+                "content-init",
+                0,
+                WorkspaceMutation::Initialize {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: None,
+                },
+            ))
+            .unwrap();
+        let WorkspaceEffect::Launch(surface, _) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        actor.observe(RuntimeObservation::Running {
+            surface_id: surface.id.clone(),
+            process_lifetime_id: surface.process_lifetime_id.clone(),
+            working_directory: None,
+        });
+        let running = wait_revision(&actor, 2);
+        let terminal = pane_ids(&running.sessions[0].tabs[0].layout)[0].clone();
+        (actor, effects, surface, terminal)
+    }
+
+    #[test]
+    fn content_opens_beside_a_running_terminal_without_a_process() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let before = actor.snapshot().unwrap();
+        let content = host_content(&["src/main.rs", "README.md"]);
+        let receipt = actor
+            .mutate(request(
+                &actor,
+                "open-content",
+                before.revision,
+                open_content(&terminal, content.clone()),
+            ))
+            .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(receipt.revision, before.revision + 1);
+        assert_eq!(
+            receipt.affected_tabs,
+            vec![before.sessions[0].tabs[0].id.clone()]
+        );
+        assert!(receipt.affected_surfaces.is_empty());
+        assert_eq!(receipt.affected_panes[0], terminal);
+        let content_pane = receipt.affected_panes[1].clone();
+        let content_leaf = LayoutNode::Content {
+            pane_id: content_pane.clone(),
+            content,
+        };
+        let opened = actor.snapshot().unwrap();
+        assert_eq!(opened.revision, receipt.revision);
+        assert_eq!(
+            opened.sessions[0].tabs[0].layout,
+            LayoutNode::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(before.sessions[0].tabs[0].layout.clone()),
+                second: Box::new(content_leaf.clone()),
+            }
+        );
+        assert_eq!(opened.surfaces, before.surfaces);
+        assert_eq!(
+            opened.surface(&surface.id).unwrap().status,
+            SurfaceStatus::Running
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+
+        // A content pane splits like a terminal: the new shell goes second.
+        let split = mutate_current(
+            &actor,
+            "split-content",
+            WorkspaceMutation::SplitPane {
+                pane_id: content_pane,
+                axis: SplitAxis::Vertical,
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+                geometry: split_geometry(),
+            },
+        )
+        .unwrap();
+        let WorkspaceEffect::Launch(shell, _) = effects.recv().unwrap() else {
+            panic!("a split launches its shell");
+        };
+        let LayoutNode::Split { second, .. } =
+            &actor.snapshot().unwrap().sessions[0].tabs[0].layout
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            **second,
+            LayoutNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(content_leaf),
+                second: Box::new(LayoutNode::Pane {
+                    pane_id: split.affected_panes[1].clone(),
+                    surface_id: shell.id,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_content_requests_change_nothing() {
+        let (actor, effects, _, terminal) = running_terminal();
+        let before = actor.snapshot().unwrap();
+        let reject = |mutation: MutationRequest| {
+            let id = mutation.mutation_id.clone();
+            let error = actor.mutate(mutation).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{id}: {error}");
+            assert_eq!(actor.snapshot().unwrap(), before, "{id}");
+            assert!(actor.outcome(id).unwrap().is_none());
+            error.message
+        };
+        let open = |id: &str, operation: WorkspaceMutation| {
+            request(&actor, id, before.revision, operation)
+        };
+
+        let mut cramped = split_geometry();
+        cramped.width = 200.0;
+        let message = reject(open(
+            "content-cramped",
+            WorkspaceMutation::OpenContent {
+                pane_id: terminal.clone(),
+                axis: SplitAxis::Horizontal,
+                geometry: cramped,
+                content: host_content(&[]),
+            },
+        ));
+        assert!(message.contains("minimum-sized"), "{message}");
+
+        let relative_root = PaneContent {
+            root: "relative/project".into(),
+            ..host_content(&[])
+        };
+        let message = reject(open(
+            "content-relative-root",
+            open_content(&terminal, relative_root),
+        ));
+        assert!(message.contains("not absolute"), "{message}");
+
+        let relative_file = PaneContent {
+            files: vec!["notes.txt".into()],
+            ..host_content(&[])
+        };
+        let message = reject(open(
+            "content-relative-file",
+            open_content(&terminal, relative_file),
+        ));
+        assert!(message.contains("notes.txt"), "{message}");
+
+        let unopened_active = PaneContent {
+            active_file: host_content(&["b.rs"]).active_file,
+            ..host_content(&["a.rs"])
+        };
+        let message = reject(open(
+            "content-unopened-active",
+            open_content(&terminal, unopened_active),
+        ));
+        assert!(message.contains("active file"), "{message}");
+
+        let wsl = PaneContent {
+            environment: ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+            },
+            root: "/home/user/project".into(),
+            files: Vec::new(),
+            active_file: None,
+        };
+        if cfg!(windows) {
+            let relative = PaneContent {
+                root: "home/user/project".into(),
+                ..wsl
+            };
+            let message = reject(open("content-wsl", open_content(&terminal, relative)));
+            assert!(message.contains("must start with '/'"), "{message}");
+        } else {
+            let message = reject(open("content-wsl", open_content(&terminal, wsl)));
+            assert_eq!(message, "WSL content is only available on Windows hosts");
+        }
+
+        let mut launching = open("content-launch", open_content(&terminal, host_content(&[])));
+        launching.launch = Some(Box::new(compi_protocol::LaunchContext::default()));
+        assert_eq!(
+            reject(launching),
+            "launch context requires a launch operation"
+        );
+
+        let message = reject(open(
+            "content-missing-pane",
+            open_content(&PaneId::new("missing-pane"), host_content(&[])),
+        ));
+        assert!(message.contains("was not found"), "{message}");
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn content_updates_reach_restore_and_split_back_records() {
+        let (actor, effects, _, terminal) = running_terminal();
+        let content_pane = mutate_current(
+            &actor,
+            "open",
+            open_content(&terminal, host_content(&["a.rs"])),
+        )
+        .unwrap()
+        .affected_panes[1]
+            .clone();
+        let tab_a = actor.snapshot().unwrap().sessions[0].tabs[0].clone();
+        let LayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = tab_a.layout.clone()
+        else {
+            unreachable!()
+        };
+        // Swapping leaves a restorable tree that holds the content leaf too.
+        mutate_current(
+            &actor,
+            "swap",
+            WorkspaceMutation::ArrangeTab {
+                tab_id: tab_a.id.clone(),
+                layout: LayoutNode::Split {
+                    axis,
+                    ratio,
+                    first: second,
+                    second: first,
+                },
+            },
+        )
+        .unwrap();
+        let update = |id: &str, pane_id: &PaneId, content: &PaneContent| {
+            mutate_current(
+                &actor,
+                id,
+                WorkspaceMutation::UpdateContent {
+                    pane_id: pane_id.clone(),
+                    content: content.clone(),
+                },
+            )
+        };
+        let shown = |content: &PaneContent| LayoutNode::Content {
+            pane_id: content_pane.clone(),
+            content: content.clone(),
+        };
+
+        let two_files = host_content(&["a.rs", "b.rs"]);
+        let receipt = update("update", &content_pane, &two_files).unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(receipt.affected_tabs, vec![tab_a.id.clone()]);
+        assert_eq!(receipt.affected_panes, vec![content_pane.clone()]);
+        assert!(receipt.affected_surfaces.is_empty());
+        let updated = actor.snapshot().unwrap();
+        let tab = &updated.sessions[0].tabs[0];
+        assert_eq!(leaf_node(&tab.layout, &content_pane), shown(&two_files));
+        assert_eq!(
+            leaf_node(tab.previous_layout.as_deref().unwrap(), &content_pane),
+            shown(&two_files)
+        );
+        assert_eq!(
+            update("update-same", &content_pane, &two_files)
+                .unwrap()
+                .operation_state,
+            "unchanged"
+        );
+        let error = update("update-terminal", &terminal, &two_files).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            format!("pane {terminal} is a terminal, not a content pane")
+        );
+        let error = update("update-missing", &PaneId::new("missing-pane"), &two_files).unwrap_err();
+        assert!(error.message.contains("was not found"), "{error}");
+        let error = update(
+            "update-invalid",
+            &content_pane,
+            &PaneContent {
+                root: "relative".into(),
+                ..two_files.clone()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+        // Merge the content pane's tab into another, then change what it shows.
+        let session_id = updated.sessions[0].id.clone();
+        mutate_current(
+            &actor,
+            "tab-b",
+            WorkspaceMutation::CreateTab {
+                session_id,
+                label: "build".into(),
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::Launch(_, _)
+        ));
+        let tabs = actor.snapshot().unwrap().sessions[0].tabs.clone();
+        let (a_tab, b_tab) = (&tabs[0], &tabs[1]);
+        let merged = LayoutNode::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.5,
+            first: Box::new(b_tab.layout.clone()),
+            second: Box::new(a_tab.layout.clone()),
+        };
+        let merge = |id: &str, layout: LayoutNode| {
+            mutate_current(
+                &actor,
+                id,
+                WorkspaceMutation::MergeTabs {
+                    tab_id: b_tab.id.clone(),
+                    sources: vec![a_tab.id.clone()],
+                    layout,
+                },
+            )
+        };
+        // Merging moves panes; it never changes what a content pane shows.
+        let mut altered = merged.clone();
+        *leaf_mut(&mut altered, &content_pane).unwrap() = shown(&host_content(&["a.rs"]));
+        assert_eq!(
+            merge("merge-altered", altered).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        merge("merge", merged).unwrap();
+        let one_file = host_content(&["c.rs"]);
+        update("update-merged", &content_pane, &one_file).unwrap();
+        mutate_current(
+            &actor,
+            "split-back",
+            WorkspaceMutation::SplitMergedTabs {
+                tab_id: b_tab.id.clone(),
+            },
+        )
+        .unwrap();
+        let restored = actor.snapshot().unwrap();
+        let restored_a = restored.sessions[0]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == a_tab.id)
+            .unwrap();
+        let restored_b = restored.sessions[0]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == b_tab.id)
+            .unwrap();
+        assert_eq!(
+            pane_ids(&restored_a.layout),
+            vec![content_pane.clone(), terminal]
+        );
+        assert_eq!(
+            leaf_node(&restored_a.layout, &content_pane),
+            shown(&one_file)
+        );
+        assert_eq!(restored_b.layout, b_tab.layout);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn closing_content_is_immediate_and_leaves_the_terminal_running() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let before = actor.snapshot().unwrap();
+        let content_pane = mutate_current(
+            &actor,
+            "open",
+            open_content(&terminal, host_content(&["a.rs"])),
+        )
+        .unwrap()
+        .affected_panes[1]
+            .clone();
+        let receipt = mutate_current(
+            &actor,
+            "remove-content",
+            WorkspaceMutation::RemovePane {
+                pane_id: content_pane,
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "removed");
+        assert!(receipt.affected_surfaces.is_empty());
+        let removed = actor.snapshot().unwrap();
+        assert_eq!(removed.sessions, before.sessions);
+        assert_eq!(
+            removed.surface(&surface.id).unwrap().status,
+            SurfaceStatus::Running
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+
+        // Closing a tab that also holds content waits only for its terminal.
+        mutate_current(&actor, "reopen", open_content(&terminal, host_content(&[]))).unwrap();
+        let closing = mutate_current(
+            &actor,
+            "remove-tab",
+            WorkspaceMutation::RemoveTab {
+                tab_id: before.sessions[0].tabs[0].id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(closing.operation_state, "ending");
+        assert_eq!(closing.affected_surfaces, vec![surface.id.clone()]);
+        let WorkspaceEffect::End { surface_id, .. } = effects.recv().unwrap() else {
+            panic!("closing the tab ends its terminal");
+        };
+        assert_eq!(surface_id, surface.id);
+        let ending = actor.snapshot().unwrap();
+        actor.observe(RuntimeObservation::Exited {
+            surface_id: surface.id.clone(),
+            process_lifetime_id: surface.process_lifetime_id.clone(),
+            exit_code: 0,
+        });
+        let closed = wait_revision(&actor, ending.revision + 1);
+        assert!(closed.sessions[0].tabs.is_empty());
+        assert!(closed.surfaces.is_empty());
+    }
+
+    #[test]
+    fn arrange_ratio_and_detach_move_content_panes_unchanged() {
+        let (actor, effects, _, terminal) = running_terminal();
+        let content = host_content(&["a.rs"]);
+        let content_pane = mutate_current(&actor, "open", open_content(&terminal, content.clone()))
+            .unwrap()
+            .affected_panes[1]
+            .clone();
+        let tab = actor.snapshot().unwrap().sessions[0].tabs[0].clone();
+        let content_leaf = LayoutNode::Content {
+            pane_id: content_pane.clone(),
+            content,
+        };
+        let terminal_leaf = leaf_node(&tab.layout, &terminal);
+        let column = |first: &LayoutNode, second: &LayoutNode| LayoutNode::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.5,
+            first: Box::new(first.clone()),
+            second: Box::new(second.clone()),
+        };
+        let arrange = |id: &str, layout: LayoutNode| {
+            mutate_current(
+                &actor,
+                id,
+                WorkspaceMutation::ArrangeTab {
+                    tab_id: tab.id.clone(),
+                    layout,
+                },
+            )
+        };
+        // An arrangement may move a content pane, not drop it or change what it shows.
+        let altered = LayoutNode::Content {
+            pane_id: content_pane.clone(),
+            content: host_content(&["b.rs"]),
+        };
+        for (id, layout) in [
+            ("arrange-altered", column(&altered, &terminal_leaf)),
+            ("arrange-dropped", terminal_leaf.clone()),
+        ] {
+            assert_eq!(
+                arrange(id, layout).unwrap_err().code,
+                ErrorCode::InvalidRequest
+            );
+        }
+        let swapped = column(&content_leaf, &terminal_leaf);
+        assert_eq!(
+            arrange("arrange-swap", swapped.clone())
+                .unwrap()
+                .operation_state,
+            "committed"
+        );
+        let arranged = actor.snapshot().unwrap();
+        assert_eq!(arranged.sessions[0].tabs[0].layout, swapped);
+        assert_eq!(
+            arranged.sessions[0].tabs[0].previous_layout.as_deref(),
+            Some(&tab.layout)
+        );
+        mutate_current(
+            &actor,
+            "ratio",
+            WorkspaceMutation::SetSplitRatio {
+                tab_id: tab.id.clone(),
+                path: Vec::new(),
+                ratio: 0.3,
+            },
+        )
+        .unwrap();
+
+        // Detaching content gives it a tab of its own; no surface moves.
+        let detached = mutate_current(
+            &actor,
+            "detach",
+            WorkspaceMutation::DetachPane {
+                pane_id: content_pane.clone(),
+            },
+        )
+        .unwrap();
+        assert!(detached.affected_surfaces.is_empty());
+        let after = actor.snapshot().unwrap();
+        assert_eq!(after.sessions[0].tabs[0].layout, terminal_leaf);
+        assert_eq!(after.sessions[0].tabs[1].layout, content_leaf);
+        let error = mutate_current(
+            &actor,
+            "detach-again",
+            WorkspaceMutation::DetachPane {
+                pane_id: content_pane,
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("only pane"), "{error}");
+        let closed = mutate_current(
+            &actor,
+            "close-content-tab",
+            WorkspaceMutation::RemoveTab {
+                tab_id: after.sessions[0].tabs[1].id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(closed.operation_state, "removed");
+        assert_eq!(actor.snapshot().unwrap().sessions[0].tabs.len(), 1);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn growing_a_tab_with_content_is_refused() {
+        let (actor, effects, _, terminal) = running_terminal();
+        let content_pane =
+            mutate_current(&actor, "open", open_content(&terminal, host_content(&[])))
+                .unwrap()
+                .affected_panes[1]
+                .clone();
+        let before = actor.snapshot().unwrap();
+        let tab_id = before.sessions[0].tabs[0].id.clone();
+        let error = actor
+            .mutate(request(
+                &actor,
+                "grow-content",
+                before.revision,
+                WorkspaceMutation::GrowTab {
+                    tab_id: tab_id.clone(),
+                    layout: PlannedLayoutNode::Split {
+                        axis: SplitAxis::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(PlannedLayoutNode::ExistingPane { pane_id: terminal }),
+                        second: Box::new(PlannedLayoutNode::Split {
+                            axis: SplitAxis::Vertical,
+                            ratio: 0.5,
+                            first: Box::new(PlannedLayoutNode::ExistingPane {
+                                pane_id: content_pane,
+                            }),
+                            second: Box::new(PlannedLayoutNode::NewPane),
+                        }),
+                    },
+                    working_directory: None,
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            format!(
+                "tab {tab_id} holds a content pane; growing a tab sizes panes in terminal cells, so close or move the content pane first"
+            )
+        );
+        assert_eq!(actor.snapshot().unwrap(), before);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
     }
 }

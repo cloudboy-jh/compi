@@ -343,7 +343,7 @@ fn tab_label(workspace: &WorkspaceSnapshot, surface: &SurfaceId) -> Option<Strin
         .find(|tab| {
             arrangement::leaves(&tab.layout)
                 .iter()
-                .any(|(_, leaf)| leaf == surface)
+                .any(|leaf| leaf.surface_id() == Some(surface))
         })?;
     let label = tab.label.trim();
     (!label.is_empty()).then(|| label.to_owned())

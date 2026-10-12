@@ -73,12 +73,23 @@ impl Request {
     }
 }
 
+/// What a pane holds; reported as `"type": "terminal" | "content"`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneType {
+    Terminal,
+    Content,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: PaneId,
-    pub surface_id: SurfaceId,
-    pub cols: i16,
-    pub rows: i16,
+    #[serde(rename = "type")]
+    pub pane_type: PaneType,
+    /// The terminal's surface and grid; `None` for a content pane, which has neither.
+    pub surface_id: Option<SurfaceId>,
+    pub cols: Option<i16>,
+    pub rows: Option<i16>,
     pub focused: bool,
     pub floating: bool,
     pub zoomed: bool,

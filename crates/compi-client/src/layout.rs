@@ -3,6 +3,25 @@ use compi_protocol::{LayoutNode, PaneId, SplitAxis, SurfaceId};
 
 pub const MIN_COLUMNS: usize = 20;
 pub const MIN_ROWS: usize = 4;
+/// Content panes are not sized in terminal cells; their minimum is in logical pixels.
+pub const CONTENT_MIN_WIDTH: f32 = 200.0;
+pub const CONTENT_MIN_HEIGHT: f32 = 96.0;
+
+/// What fills a pane, which decides its minimum size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneKind {
+    Terminal,
+    Content,
+}
+
+impl PaneKind {
+    pub fn of(node: &LayoutNode) -> Self {
+        match node {
+            LayoutNode::Content { .. } => Self::Content,
+            LayoutNode::Pane { .. } | LayoutNode::Split { .. } => Self::Terminal,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Size {
@@ -79,6 +98,7 @@ impl LayoutMetrics {
         let metrics = self.normalized();
         metrics.ceil(metrics.divider_thickness)
     }
+    /// The smallest terminal pane: 20 columns by 4 rows plus padding and chrome.
     pub fn leaf_minimum(self) -> Size {
         let m = self.normalized();
         Size {
@@ -86,6 +106,20 @@ impl LayoutMetrics {
             height: m.ceil(MIN_ROWS as f32 * m.line_height)
                 + 2.0 * m.ceil(m.padding_y)
                 + m.ceil(m.pane_chrome_height),
+        }
+    }
+    /// The smallest content pane, in logical pixels whatever the terminal font.
+    pub fn content_minimum(self) -> Size {
+        let m = self.normalized();
+        Size {
+            width: m.ceil(CONTENT_MIN_WIDTH),
+            height: m.ceil(CONTENT_MIN_HEIGHT) + m.ceil(m.pane_chrome_height),
+        }
+    }
+    pub fn minimum(self, kind: PaneKind) -> Size {
+        match kind {
+            PaneKind::Terminal => self.leaf_minimum(),
+            PaneKind::Content => self.content_minimum(),
         }
     }
 }
@@ -116,13 +150,22 @@ pub enum Direction {
 #[derive(Clone, Debug)]
 pub struct PaneLayout {
     pub pane_id: PaneId,
-    pub surface_id: SurfaceId,
+    /// The terminal's surface; `None` for a content pane.
+    pub surface_id: Option<SurfaceId>,
     pub rect: Rect,
     pub canvas: Rect,
     pub parent_divider: Option<usize>,
 }
 
 impl PaneLayout {
+    pub fn kind(&self) -> PaneKind {
+        if self.surface_id.is_some() {
+            PaneKind::Terminal
+        } else {
+            PaneKind::Content
+        }
+    }
+
     /// Dimensions use the whole allocation, never its clipped viewport intersection.
     pub fn grid_size(&self, metrics: LayoutMetrics) -> (i16, i16) {
         let m = metrics.normalized();
@@ -222,17 +265,41 @@ impl WorkspaceLayout {
             .parent_divider
             .and_then(|index| self.dividers.get(index))
     }
-    pub fn split_feasibility(&self, pane: &PaneId, axis: SplitAxis) -> Result<Rect, &'static str> {
+    /// Whether `pane` can be split to hold a new `new_pane` beside it. Both children
+    /// must fit `split_minimum`, exactly as the daemon checks the split's geometry.
+    pub fn split_feasibility(
+        &self,
+        pane: &PaneId,
+        axis: SplitAxis,
+        new_pane: PaneKind,
+    ) -> Result<Rect, &'static str> {
+        let minimum = self
+            .split_minimum(pane, new_pane)
+            .ok_or("The focused pane no longer exists")?;
         let pane = self.pane(pane).ok_or("The focused pane no longer exists")?;
         if self.has_overflow() {
             return Err("Enlarge the workspace before adding a split");
         }
-        let leaf = self.metrics.leaf_minimum();
-        let required = combine(leaf, leaf, axis, self.metrics.divider_size());
+        let required = combine(minimum, minimum, axis, self.metrics.divider_size());
         if pane.rect.width < required.width || pane.rect.height < required.height {
-            return Err("The focused pane is too small for two 20-column by 4-row terminals");
+            return Err(match (pane.kind(), new_pane) {
+                (PaneKind::Terminal, PaneKind::Terminal) => {
+                    "The focused pane is too small for two 20-column by 4-row terminals"
+                }
+                _ => "The focused pane is too small to fit another pane beside it",
+            });
         }
         Ok(pane.rect)
+    }
+    /// Minimum allocation for each child of a split of `pane` adding `new_pane`: the
+    /// larger of the two kinds' minima, since the daemon gets one minimum per split.
+    pub fn split_minimum(&self, pane: &PaneId, new_pane: PaneKind) -> Option<Size> {
+        let existing = self.metrics.minimum(self.pane(pane)?.kind());
+        let added = self.metrics.minimum(new_pane);
+        Some(Size {
+            width: existing.width.max(added.width),
+            height: existing.height.max(added.height),
+        })
     }
     pub fn focus_neighbor(&self, pane: &PaneId, direction: Direction) -> Option<&PaneId> {
         let source = self.pane(pane)?.rect;
@@ -330,7 +397,7 @@ fn reveal_axis(scroll: f32, viewport: f32, start: f32, size: f32) -> f32 {
 
 pub fn first_leaf(node: &LayoutNode) -> &PaneId {
     match node {
-        LayoutNode::Pane { pane_id, .. } => pane_id,
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => pane_id,
         LayoutNode::Split { first, .. } => first_leaf(first),
     }
 }
@@ -350,7 +417,9 @@ pub fn node_at_path<'a>(mut node: &'a LayoutNode, path: &[bool]) -> Option<&'a L
 /// Returns `None` when every leaf is omitted.
 pub fn without_panes(node: &LayoutNode, omit: &impl Fn(&PaneId) -> bool) -> Option<LayoutNode> {
     match node {
-        LayoutNode::Pane { pane_id, .. } => (!omit(pane_id)).then(|| node.clone()),
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+            (!omit(pane_id)).then(|| node.clone())
+        }
         LayoutNode::Split {
             axis,
             ratio,
@@ -400,7 +469,7 @@ pub fn saved_path(
 
 fn has_kept_leaf(node: &LayoutNode, omit: &impl Fn(&PaneId) -> bool) -> bool {
     match node {
-        LayoutNode::Pane { pane_id, .. } => !omit(pane_id),
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => !omit(pane_id),
         LayoutNode::Split { first, second, .. } => {
             has_kept_leaf(first, omit) || has_kept_leaf(second, omit)
         }
@@ -465,13 +534,13 @@ struct Measured<'a> {
 
 fn measure<'a>(
     node: &'a LayoutNode,
-    leaf: Size,
+    metrics: LayoutMetrics,
     divider: f32,
     measured: &mut Vec<Measured<'a>>,
 ) -> usize {
     let item = match node {
-        LayoutNode::Pane { pane_id, .. } => Measured {
-            minimum: leaf,
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => Measured {
+            minimum: metrics.minimum(PaneKind::of(node)),
             first: 0,
             second: 0,
             first_leaf: pane_id,
@@ -482,8 +551,8 @@ fn measure<'a>(
             second,
             ..
         } => {
-            let first = measure(first, leaf, divider, measured);
-            let second = measure(second, leaf, divider, measured);
+            let first = measure(first, metrics, divider, measured);
+            let second = measure(second, metrics, divider, measured);
             Measured {
                 minimum: combine(
                     measured[first].minimum,
@@ -524,12 +593,7 @@ pub fn compute_layout_with_preview(
         height: nonnegative(viewport.height),
     };
     let mut measured = Vec::new();
-    let root = measure(
-        tree,
-        metrics.leaf_minimum(),
-        metrics.divider_size(),
-        &mut measured,
-    );
+    let root = measure(tree, metrics, metrics.divider_size(), &mut measured);
     // The outer gutter surrounds the tree on every side.
     let margin = metrics.ceil(metrics.margin);
     let minimum = Size {
@@ -591,13 +655,28 @@ impl Allocation<'_, '_> {
                 let chrome = m.ceil(m.pane_chrome_height);
                 self.output.panes.push(PaneLayout {
                     pane_id: pane_id.clone(),
-                    surface_id: surface_id.clone(),
+                    surface_id: Some(surface_id.clone()),
                     rect,
                     canvas: Rect {
                         x: rect.x + px,
                         y: rect.y + py + chrome,
                         width: rect.width - 2.0 * px,
                         height: rect.height - 2.0 * py - chrome,
+                    },
+                    parent_divider: parent,
+                });
+            }
+            LayoutNode::Content { pane_id, .. } => {
+                // Content is laid out in pixels, without the terminal's cell padding.
+                let chrome = m.ceil(m.pane_chrome_height);
+                self.output.panes.push(PaneLayout {
+                    pane_id: pane_id.clone(),
+                    surface_id: None,
+                    rect,
+                    canvas: Rect {
+                        y: rect.y + chrome,
+                        height: rect.height - chrome,
+                        ..rect
                     },
                     parent_divider: parent,
                 });
@@ -669,11 +748,8 @@ impl Allocation<'_, '_> {
                     ),
                 };
                 let parent = self.output.dividers.len();
-                let immediate_parent_pane = match (first.as_ref(), second.as_ref()) {
-                    (LayoutNode::Pane { pane_id, .. }, _)
-                    | (_, LayoutNode::Pane { pane_id, .. }) => Some(pane_id.clone()),
-                    _ => None,
-                };
+                let immediate_parent_pane =
+                    first.leaf_pane().or_else(|| second.leaf_pane()).cloned();
                 self.output.dividers.push(DividerLayout {
                     path: self.path.clone(),
                     first_leaf: self.measured[index].first_leaf.clone(),
@@ -757,7 +833,7 @@ mod tests {
         }));
         assert!(
             small
-                .split_feasibility(&"a".into(), SplitAxis::Vertical)
+                .split_feasibility(&"a".into(), SplitAxis::Vertical, PaneKind::Terminal)
                 .is_err()
         );
         assert!(small.dividers[0].disabled_reason().is_some());
@@ -787,7 +863,7 @@ mod tests {
         let layout = compute_layout(&leaf("a"), required, m);
         assert!(
             layout
-                .split_feasibility(&"a".into(), SplitAxis::Horizontal)
+                .split_feasibility(&"a".into(), SplitAxis::Horizontal, PaneKind::Terminal)
                 .is_ok()
         );
         let smaller = compute_layout(
@@ -800,7 +876,7 @@ mod tests {
         );
         assert!(
             smaller
-                .split_feasibility(&"a".into(), SplitAxis::Horizontal)
+                .split_feasibility(&"a".into(), SplitAxis::Horizontal, PaneKind::Terminal)
                 .is_err()
         );
         let divided = compute_layout(
@@ -814,6 +890,67 @@ mod tests {
                 .iter()
                 .all(|pane| pane.canvas.width >= 20.0 * m.cell_width
                     && pane.canvas.height >= 4.0 * m.line_height)
+        );
+    }
+
+    #[test]
+    fn content_panes_use_their_pixel_minimum_and_split_beside_terminals() {
+        let m = metrics();
+        let content = LayoutNode::Content {
+            pane_id: "notes".into(),
+            content: compi_protocol::PaneContent {
+                environment: compi_protocol::ContentEnvironment::Host,
+                root: "/work".into(),
+                files: Vec::new(),
+                active_file: None,
+            },
+        };
+        let tree = split(SplitAxis::Horizontal, 0.5, leaf("a"), content);
+        let required = combine(
+            m.leaf_minimum(),
+            m.content_minimum(),
+            SplitAxis::Horizontal,
+            m.divider_size(),
+        );
+        let layout = compute_layout(&tree, required, m);
+        assert_eq!(layout.minimum, required);
+        let notes = layout.pane(&"notes".into()).unwrap();
+        assert_eq!(notes.kind(), PaneKind::Content);
+        assert_eq!(notes.surface_id, None);
+        assert_eq!(notes.rect.width, m.content_minimum().width);
+        assert_eq!(
+            layout.pane(&"a".into()).unwrap().surface_id,
+            Some("a".into())
+        );
+
+        // Like the daemon, a split needs room for two children of the larger minimum.
+        let single = compute_layout(&leaf("a"), required, m);
+        let minimum = single
+            .split_minimum(&"a".into(), PaneKind::Content)
+            .unwrap();
+        assert_eq!(
+            minimum,
+            Size {
+                width: m.leaf_minimum().width.max(m.content_minimum().width),
+                height: m.leaf_minimum().height.max(m.content_minimum().height),
+            }
+        );
+        assert!(
+            single
+                .split_feasibility(&"a".into(), SplitAxis::Horizontal, PaneKind::Content)
+                .is_err()
+        );
+        let fits = combine(minimum, minimum, SplitAxis::Horizontal, m.divider_size());
+        let single = compute_layout(&leaf("a"), fits, m);
+        assert!(
+            single
+                .split_feasibility(&"a".into(), SplitAxis::Horizontal, PaneKind::Content)
+                .is_ok()
+        );
+        assert!(
+            single
+                .split_feasibility(&"a".into(), SplitAxis::Vertical, PaneKind::Content)
+                .is_err()
         );
     }
 

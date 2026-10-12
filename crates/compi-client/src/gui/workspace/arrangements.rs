@@ -181,8 +181,7 @@ impl CompiApp {
         let layouts: Vec<_> = tabs.iter().map(|tab| &tab.layout).collect();
         let current = arrangement::combine(&layouts)?;
         let main = self
-            .focused_view()
-            .map(|view| &view.pane_id)
+            .focused_pane()
             .filter(|pane| layout_contains_pane(&current, pane));
         Some(match choice {
             ArrangementChoice::Current => arrangement::apply_transform(current, transform),
@@ -342,7 +341,7 @@ impl CompiApp {
                     Command::SwapPaneUp => layout::Direction::Up,
                     _ => layout::Direction::Down,
                 };
-                let pane = self.focused_view().map(|view| view.pane_id.clone());
+                let pane = self.focused_pane().cloned();
                 pane.as_ref()
                     .and_then(|pane| self.layout.as_ref()?.focus_neighbor(pane, direction))
                     .and_then(|neighbor| arrangement::swap(&tab.layout, pane.as_ref()?, neighbor))
@@ -643,7 +642,7 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let panes: Vec<_> = tabs.iter().flat_map(|tab| self.tab_panes(tab)).collect();
-        let focused = self.focused_view().map(|view| view.pane_id.clone());
+        let focused = self.focused_pane().cloned();
         let cells = candidate
             .map(arrangement::pane_fractions)
             .unwrap_or_default()

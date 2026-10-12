@@ -744,6 +744,7 @@ fn copy_viewports(
                 destination.insert(surface_id.to_string(), viewport.clone());
             }
         }
+        LayoutNode::Content { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             copy_viewports(first, source, destination);
             copy_viewports(second, source, destination);
@@ -753,14 +754,16 @@ fn copy_viewports(
 
 fn first_pane(layout: &LayoutNode) -> &PaneId {
     match layout {
-        LayoutNode::Pane { pane_id, .. } => pane_id,
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => pane_id,
         LayoutNode::Split { first, .. } => first_pane(first),
     }
 }
 
 fn find_pane<'a>(layout: &'a LayoutNode, id: &PaneId) -> Option<&'a PaneId> {
     match layout {
-        LayoutNode::Pane { pane_id, .. } => (pane_id == id).then_some(pane_id),
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+            (pane_id == id).then_some(pane_id)
+        }
         LayoutNode::Split { first, second, .. } => {
             find_pane(first, id).or_else(|| find_pane(second, id))
         }
@@ -772,7 +775,9 @@ fn first_tiled_pane<'a>(
     floating: &impl Fn(&PaneId) -> bool,
 ) -> Option<&'a PaneId> {
     match layout {
-        LayoutNode::Pane { pane_id, .. } => (!floating(pane_id)).then_some(pane_id),
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+            (!floating(pane_id)).then_some(pane_id)
+        }
         LayoutNode::Split { first, second, .. } => {
             first_tiled_pane(first, floating).or_else(|| first_tiled_pane(second, floating))
         }

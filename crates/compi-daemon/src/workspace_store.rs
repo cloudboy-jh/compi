@@ -421,6 +421,16 @@ fn validate_layout(
                 );
             }
         }
+        // Only shape checks: whether paths are absolute depends on the host, and a
+        // stored workspace must load wherever it was saved.
+        LayoutNode::Content { pane_id, content } => {
+            if !panes.insert(pane_id.clone()) {
+                return Err("workspace contains duplicate pane IDs".into());
+            }
+            content
+                .validate()
+                .map_err(|error| format!("content pane {pane_id}: {error}"))?;
+        }
         LayoutNode::Split {
             ratio,
             first,
@@ -444,11 +454,8 @@ fn validate_previous_layout(
     panes: &mut std::collections::HashSet<PaneId>,
 ) -> Result<()> {
     match node {
-        LayoutNode::Pane {
-            pane_id,
-            surface_id,
-        } => {
-            if !panes.insert(pane_id.clone()) || !contains_leaf(current, pane_id, surface_id) {
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+            if !panes.insert(pane_id.clone()) || !contains_leaf(current, node) {
                 return Err(format!(
                     "previous arrangement references pane {pane_id} outside its tab"
                 )
@@ -471,15 +478,14 @@ fn validate_previous_layout(
     Ok(())
 }
 
-fn contains_leaf(node: &LayoutNode, pane: &PaneId, surface: &SurfaceId) -> bool {
-    match node {
-        LayoutNode::Pane {
-            pane_id,
-            surface_id,
-        } => pane_id == pane && surface_id == surface,
+/// Whether `current` holds `leaf` unchanged: the same pane with the same surface or
+/// content.
+fn contains_leaf(current: &LayoutNode, leaf: &LayoutNode) -> bool {
+    match current {
         LayoutNode::Split { first, second, .. } => {
-            contains_leaf(first, pane, surface) || contains_leaf(second, pane, surface)
+            contains_leaf(first, leaf) || contains_leaf(second, leaf)
         }
+        current => current == leaf,
     }
 }
 
@@ -579,6 +585,7 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compi_protocol::{ContentEnvironment, PaneContent, SplitAxis};
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -756,6 +763,114 @@ mod tests {
                 merge: None,
             }],
         });
+        assert!(validate(&workspace).is_err());
+    }
+
+    /// A tab with a terminal beside a content pane whose previous arrangement swaps them.
+    fn content_workspace(status: SurfaceStatus) -> (StoredWorkspace, LayoutNode) {
+        let (_, mut workspace) = WorkspaceStore::memory();
+        workspace.initialized = true;
+        workspace.surfaces.push(SurfaceInfo {
+            id: SurfaceId::new("surface-1"),
+            process_lifetime_id: ProcessLifetimeId::new("lifetime-1"),
+            status,
+            attached: false,
+            cols: 80,
+            rows: 24,
+            created_at_ms: 1,
+            exit_code: None,
+            error: None,
+            launch: LaunchRequest {
+                working_directory: None,
+                profile: None,
+            },
+            working_directory: None,
+        });
+        // WSL paths load on every host: loading applies no host path rules.
+        let content = LayoutNode::Content {
+            pane_id: PaneId::new("pane-2"),
+            content: PaneContent {
+                environment: ContentEnvironment::Wsl {
+                    distribution: "Ubuntu".into(),
+                },
+                root: "/home/user/project".into(),
+                files: vec!["/home/user/project/a.rs".into()],
+                active_file: Some("/home/user/project/a.rs".into()),
+            },
+        };
+        let terminal = LayoutNode::Pane {
+            pane_id: PaneId::new("pane-1"),
+            surface_id: SurfaceId::new("surface-1"),
+        };
+        let split = |first: &LayoutNode, second: &LayoutNode| LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(first.clone()),
+            second: Box::new(second.clone()),
+        };
+        workspace.sessions.push(WorkspaceSession {
+            id: SessionId::new("session-1"),
+            label: "Default".into(),
+            tabs: vec![WorkspaceTab {
+                id: TabId::new("tab-1"),
+                label: String::new(),
+                layout: split(&terminal, &content),
+                previous_layout: Some(Box::new(split(&content, &terminal))),
+                merge: None,
+            }],
+        });
+        (workspace, content)
+    }
+
+    #[test]
+    fn content_panes_survive_reopen_while_terminals_become_lost() {
+        let path = test_path("content");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let (workspace, _) = content_workspace(SurfaceStatus::Running);
+        store.commit(&workspace).unwrap();
+        let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.surfaces[0].status, SurfaceStatus::Lost);
+        assert_eq!(reopened.sessions, workspace.sessions);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn content_leaves_must_be_well_formed_and_match_their_history() {
+        let (mut workspace, content) = content_workspace(SurfaceStatus::Lost);
+        validate(&workspace).unwrap();
+        let LayoutNode::Content {
+            pane_id,
+            content: shown,
+        } = content
+        else {
+            unreachable!()
+        };
+        let tab = &mut workspace.sessions[0].tabs[0];
+        let Some(LayoutNode::Split { first, .. }) = tab.previous_layout.as_deref_mut() else {
+            unreachable!()
+        };
+        **first = LayoutNode::Content {
+            pane_id: pane_id.clone(),
+            content: PaneContent {
+                files: Vec::new(),
+                active_file: None,
+                ..shown.clone()
+            },
+        };
+        assert!(validate(&workspace).is_err());
+
+        let tab = &mut workspace.sessions[0].tabs[0];
+        tab.previous_layout = None;
+        let LayoutNode::Split { second, .. } = &mut tab.layout else {
+            unreachable!()
+        };
+        **second = LayoutNode::Content {
+            pane_id,
+            content: PaneContent {
+                active_file: Some("/home/user/project/missing.rs".into()),
+                ..shown
+            },
+        };
         assert!(validate(&workspace).is_err());
     }
 }

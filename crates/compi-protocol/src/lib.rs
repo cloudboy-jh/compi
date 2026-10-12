@@ -31,8 +31,8 @@ pub use lifecycle_inventory::{LocalDaemonProcess, local_daemon_processes};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Version 18 adds atomic tab growth with actor-assigned pane and surface IDs.
-pub const PROTOCOL_VERSION: u32 = 18;
+// Version 19 adds content panes: layout leaves without a terminal surface.
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
@@ -48,6 +48,8 @@ pub const MAX_IMAGE_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const IMAGE_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_DIRECTORY_PATH_BYTES: usize = 4096;
 pub const MAX_DIRECTORY_QUERY_BYTES: usize = 256;
+/// Open files one content pane may list.
+pub const MAX_CONTENT_FILES: usize = 256;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -510,9 +512,15 @@ pub enum SplitAxis {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LayoutNode {
+    /// A terminal pane, backed by one surface and its process.
     Pane {
         pane_id: PaneId,
         surface_id: SurfaceId,
+    },
+    /// A pane that shows files instead of a terminal. It has no surface or process.
+    Content {
+        pane_id: PaneId,
+        content: PaneContent,
     },
     Split {
         axis: SplitAxis,
@@ -520,6 +528,141 @@ pub enum LayoutNode {
         first: Box<LayoutNode>,
         second: Box<LayoutNode>,
     },
+}
+
+impl LayoutNode {
+    /// The pane of a terminal or content leaf; `None` for a split.
+    pub fn leaf_pane(&self) -> Option<&PaneId> {
+        match self {
+            Self::Pane { pane_id, .. } | Self::Content { pane_id, .. } => Some(pane_id),
+            Self::Split { .. } => None,
+        }
+    }
+
+    /// The surface of a terminal leaf; `None` for content leaves and splits.
+    pub fn surface_id(&self) -> Option<&SurfaceId> {
+        match self {
+            Self::Pane { surface_id, .. } => Some(surface_id),
+            Self::Content { .. } | Self::Split { .. } => None,
+        }
+    }
+
+    /// Whether any leaf in this tree is a content pane.
+    pub fn has_content(&self) -> bool {
+        match self {
+            Self::Pane { .. } => false,
+            Self::Content { .. } => true,
+            Self::Split { first, second, .. } => first.has_content() || second.has_content(),
+        }
+    }
+}
+
+/// Where a content pane's paths live.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentEnvironment {
+    /// The daemon host's own filesystem.
+    Host,
+    /// A WSL2 distribution of a Windows daemon host; paths are Linux paths inside it.
+    Wsl { distribution: String },
+}
+
+impl ContentEnvironment {
+    /// The environment a terminal runs in, so content opened beside it shows the same files.
+    pub fn of_surface(surface: &SurfaceInfo) -> Self {
+        surface
+            .working_directory
+            .as_ref()
+            .map(|directory| directory.distribution.as_str())
+            .or_else(|| {
+                surface
+                    .launch
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.distribution.as_deref())
+            })
+            .filter(|distribution| !distribution.is_empty())
+            .map_or(Self::Host, |distribution| Self::Wsl {
+                distribution: distribution.to_owned(),
+            })
+    }
+}
+
+impl fmt::Display for ContentEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Host => formatter.write_str("host"),
+            Self::Wsl { distribution } => write!(formatter, "WSL: {distribution}"),
+        }
+    }
+}
+
+/// What a content pane shows: a folder in one environment and the files open from it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneContent {
+    pub environment: ContentEnvironment,
+    /// Absolute folder path in `environment`.
+    pub root: String,
+    /// Absolute file paths in `environment`, in display order, each once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// One of `files`, or `None` when no file is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_file: Option<String>,
+}
+
+impl PaneContent {
+    /// Shape checks every host applies. Whether a path is absolute on the daemon's host
+    /// is checked by the daemon, which knows its own path rules.
+    pub fn validate(&self) -> Result<(), String> {
+        fn path(value: &str, what: &str) -> Result<(), String> {
+            if value.is_empty() || value.len() > MAX_DIRECTORY_PATH_BYTES || value.contains('\0') {
+                return Err(format!(
+                    "{what} must be a non-empty path of at most {MAX_DIRECTORY_PATH_BYTES} bytes"
+                ));
+            }
+            Ok(())
+        }
+        if let ContentEnvironment::Wsl { distribution } = &self.environment
+            && (distribution.is_empty()
+                || distribution.len() > 256
+                || distribution.contains(['\0', '/', '\\']))
+        {
+            return Err("content environment names an invalid WSL distribution".into());
+        }
+        path(&self.root, "content root")?;
+        if self.files.len() > MAX_CONTENT_FILES {
+            return Err(format!(
+                "a content pane can list at most {MAX_CONTENT_FILES} files"
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.files.len());
+        for file in &self.files {
+            path(file, "content file")?;
+            if !seen.insert(file.as_str()) {
+                return Err(format!("content file {file} is listed twice"));
+            }
+        }
+        if let Some(active) = &self.active_file
+            && !seen.contains(active.as_str())
+        {
+            return Err("the active file must be one of the open files".into());
+        }
+        Ok(())
+    }
+
+    /// The root folder's last component, for captions.
+    pub fn folder_name(&self) -> &str {
+        let trimmed = self.root.trim_end_matches(['/', '\\']);
+        trimmed
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .unwrap_or(if trimmed.is_empty() {
+                &self.root
+            } else {
+                trimmed
+            })
+    }
 }
 
 /// A complete tab layout proposed for atomic growth. Existing panes retain their
@@ -596,18 +739,21 @@ impl WorkspaceSnapshot {
         self.surfaces.iter().find(|surface| &surface.id == id)
     }
 
+    /// The first terminal in workspace order, skipping content panes.
     pub fn first_surface(&self) -> Option<&SurfaceInfo> {
-        self.sessions.iter().find_map(|session| {
-            session.tabs.iter().find_map(|tab| {
-                fn first(node: &LayoutNode) -> &SurfaceId {
-                    match node {
-                        LayoutNode::Pane { surface_id, .. } => surface_id,
-                        LayoutNode::Split { first: child, .. } => first(child),
-                    }
-                }
-                self.surface(first(&tab.layout))
-            })
-        })
+        fn first(node: &LayoutNode) -> Option<&SurfaceId> {
+            match node {
+                LayoutNode::Pane { surface_id, .. } => Some(surface_id),
+                LayoutNode::Content { .. } => None,
+                LayoutNode::Split {
+                    first: a, second, ..
+                } => first(a).or_else(|| first(second)),
+            }
+        }
+        self.sessions
+            .iter()
+            .flat_map(|session| &session.tabs)
+            .find_map(|tab| self.surface(first(&tab.layout)?))
     }
 }
 
@@ -718,11 +864,25 @@ pub enum WorkspaceMutation {
         rows: i16,
     },
     /// Grow and arrange a tab in one transaction, preserving every existing pane.
-    /// The final layout must fit minimum 20-column by 4-row pane allocations.
+    /// The final layout must fit minimum 20-column by 4-row pane allocations, so
+    /// tabs holding content panes, which are not sized in cells, are rejected.
     GrowTab {
         tab_id: TabId,
         layout: PlannedLayoutNode,
         working_directory: Option<String>,
+    },
+    /// Split `pane_id` and put a new content pane second, without starting a shell.
+    /// `geometry` is checked like `SplitPane`'s.
+    OpenContent {
+        pane_id: PaneId,
+        axis: SplitAxis,
+        geometry: SplitGeometry,
+        content: PaneContent,
+    },
+    /// Replace what the content pane `pane_id` shows.
+    UpdateContent {
+        pane_id: PaneId,
+        content: PaneContent,
     },
 }
 
@@ -858,5 +1018,52 @@ mod tests {
             recovery_message: None,
         };
         assert_eq!(workspace.first_surface(), Some(&surface));
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+
+    fn content(files: &[&str], active: Option<&str>) -> PaneContent {
+        PaneContent {
+            environment: ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+            },
+            root: "/home/user/project/".into(),
+            files: files.iter().map(|file| (*file).to_owned()).collect(),
+            active_file: active.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn content_leaf_roundtrips_and_has_no_surface() {
+        let leaf = LayoutNode::Content {
+            pane_id: PaneId::new("pane-2"),
+            content: content(
+                &["/home/user/project/a.rs"],
+                Some("/home/user/project/a.rs"),
+            ),
+        };
+        let json = serde_json::to_string(&leaf).unwrap();
+        assert_eq!(serde_json::from_str::<LayoutNode>(&json).unwrap(), leaf);
+        assert_eq!(leaf.leaf_pane(), Some(&PaneId::new("pane-2")));
+        assert_eq!(leaf.surface_id(), None);
+        assert!(leaf.has_content());
+        if let LayoutNode::Content { content, .. } = &leaf {
+            assert_eq!(content.folder_name(), "project");
+            assert_eq!(content.environment.to_string(), "WSL: Ubuntu");
+        }
+    }
+
+    #[test]
+    fn content_validation_rejects_duplicates_and_stray_active_files() {
+        assert!(content(&["/a", "/b"], Some("/b")).validate().is_ok());
+        assert!(content(&["/a", "/a"], None).validate().is_err());
+        assert!(content(&["/a"], Some("/b")).validate().is_err());
+        assert!(content(&[""], None).validate().is_err());
+        let mut root = content(&[], None);
+        root.root.clear();
+        assert!(root.validate().is_err());
     }
 }

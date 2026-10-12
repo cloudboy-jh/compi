@@ -27,7 +27,8 @@ const SPRING_LOAD_DELAY: Duration = Duration::from_millis(400);
 
 pub(in crate::gui) struct PaneDrag {
     pane_id: PaneId,
-    surface_id: SurfaceId,
+    /// The dragged terminal or content leaf, as it is in `tree`.
+    leaf: LayoutNode,
     tab_id: TabId,
     /// The tab's tree at pickup; a different tree at release cancels a move within it.
     tree: LayoutNode,
@@ -151,10 +152,7 @@ fn landing_half(zone: DropZone, width: f32, height: f32) -> Option<layout::Rect>
 /// `target`'s tree with the moved leaf placed. The leaf first joins on the
 /// right, so `drop_pane` can take it out again and put it beside a pane.
 fn placed(target: &LayoutNode, leaf: LayoutNode, placement: &Placement) -> LayoutNode {
-    let pane_id = match &leaf {
-        LayoutNode::Pane { pane_id, .. } => pane_id.clone(),
-        LayoutNode::Split { .. } => unreachable!("only a pane leaf is moved"),
-    };
+    let pane_id = leaf.leaf_pane().expect("only a pane leaf is moved").clone();
     let joined = LayoutNode::Split {
         axis: SplitAxis::Horizontal,
         ratio: 0.5,
@@ -221,15 +219,15 @@ impl CompiApp {
         let Some(tab) = self.selected_tab() else {
             return;
         };
-        let Some((_, surface_id)) = arrangement::leaves(&tab.layout)
+        let Some(leaf) = arrangement::leaves(&tab.layout)
             .into_iter()
-            .find(|(id, _)| id == &pane_id)
+            .find(|leaf| leaf.leaf_pane() == Some(&pane_id))
         else {
             return;
         };
         self.pane_drag = Some(PaneDrag {
             pane_id,
-            surface_id,
+            leaf,
             tab_id: tab.id.clone(),
             tree: tab.layout.clone(),
             origin,
@@ -359,10 +357,7 @@ impl CompiApp {
         let rect = target.rect;
         let zone = zone_at(x - rect.x, y - rect.y, rect.width, rect.height, !across);
         let layout = if across {
-            let leaf = LayoutNode::Pane {
-                pane_id: drag.pane_id.clone(),
-                surface_id: drag.surface_id.clone(),
-            };
+            let leaf = drag.leaf.clone();
             placed(
                 &tab.layout,
                 leaf,

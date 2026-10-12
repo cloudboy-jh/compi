@@ -1,5 +1,7 @@
 use super::*;
-use crate::cli_window::{Action, Applied, PaneInfo, Request, Response, TargetIdentity, WindowInfo};
+use crate::cli_window::{
+    Action, Applied, PaneInfo, PaneType, Request, Response, TargetIdentity, WindowInfo,
+};
 
 struct ResizeStep {
     tab_id: TabId,
@@ -205,13 +207,32 @@ impl CompiApp {
                 .filter(|view| !view.stop.load(Ordering::Acquire))
                 .map(|view| PaneInfo {
                     pane_id: view.pane_id.clone(),
-                    surface_id: view.surface_id.clone(),
-                    cols: view.cols,
-                    rows: view.rows,
+                    pane_type: PaneType::Terminal,
+                    surface_id: Some(view.surface_id.clone()),
+                    cols: Some(view.cols),
+                    rows: Some(view.rows),
                     focused: self.focused_view == Some(view.id),
                     floating: self.state.is_floating(&view.pane_id),
                     zoomed: self.zoomed_pane() == Some(&view.pane_id),
                 })
+                .chain(
+                    // Content panes have no view; list the ones this window shows.
+                    self.visible_layout()
+                        .map_or(&[][..], |layout| &layout.panes)
+                        .iter()
+                        .chain(self.float_layouts.iter().map(|float| &float.pane))
+                        .filter(|pane| pane.surface_id.is_none())
+                        .map(|pane| PaneInfo {
+                            pane_id: pane.pane_id.clone(),
+                            pane_type: PaneType::Content,
+                            surface_id: None,
+                            cols: None,
+                            rows: None,
+                            focused: self.focused_pane() == Some(&pane.pane_id),
+                            floating: self.state.is_floating(&pane.pane_id),
+                            zoomed: self.zoomed_pane() == Some(&pane.pane_id),
+                        }),
+                )
                 .collect(),
             busy: self.mutation_pending
                 || self.daemon_restarting
@@ -317,10 +338,7 @@ impl CompiApp {
                     self.select_terminal(tab_id, false);
                 }
                 self.focus_pane(pane_id.clone());
-                if self
-                    .focused_view()
-                    .is_none_or(|view| view.pane_id != *pane_id)
-                {
+                if self.focused_pane() != Some(pane_id) {
                     return Err("Pane could not receive GUI focus".into());
                 }
             }
@@ -383,6 +401,13 @@ impl CompiApp {
                 cols,
                 rows,
             } => {
+                if self
+                    .tab_by_id(&tab_id)
+                    .and_then(|tab| leaf_node(&tab.layout, pane_id))
+                    .is_some_and(|leaf| matches!(leaf, LayoutNode::Content { .. }))
+                {
+                    return Err("Content panes are not sized in terminal columns and rows; resize a terminal beside it instead".into());
+                }
                 self.rebuild_layout(window, true);
                 resize = self.resize_presentation(pane_id, *cols, *rows)?;
             }

@@ -1631,7 +1631,10 @@ impl CompiApp {
         for tab in workspace.sessions.iter().flat_map(|session| &session.tabs) {
             let mut leaves = Vec::new();
             collect_leaves(&tab.layout, &mut leaves);
-            let Some(index) = leaves.iter().position(|(_, id)| id == surface) else {
+            let Some(index) = leaves
+                .iter()
+                .position(|(_, id)| id.as_ref() == Some(surface))
+            else {
                 continue;
             };
             let custom = tab.label.trim();

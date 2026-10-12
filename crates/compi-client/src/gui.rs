@@ -813,6 +813,9 @@ struct CompiApp {
     pending_present_latency_ids: Vec<u64>,
     window_title: String,
     focus_handle: FocusHandle,
+    /// Keyboard focus of the focused content pane. Its keys run Compi shortcuts and
+    /// never reach a shell; `focus_handle` keeps terminal and overlay input.
+    content_focus: FocusHandle,
     ime_text: String,
     ime_marked_range: Option<Range<usize>>,
     ime_selected_range: Range<usize>,
@@ -938,6 +941,26 @@ impl CompiApp {
     fn focused_view_mut(&mut self) -> Option<&mut SurfaceView> {
         let active = self.focused_view?;
         self.surface_views.iter_mut().find(|tab| tab.id == active)
+    }
+
+    /// The pane with the keyboard, terminal or content. `focused_view` is only ever
+    /// a terminal, so it is `None` while a content pane has the keyboard.
+    fn focused_pane(&self) -> Option<&PaneId> {
+        self.state.focused_pane(self.workspace.as_ref()?)
+    }
+
+    /// The focused pane's content, if it is a content pane.
+    fn focused_content(&self) -> Option<&compi_protocol::PaneContent> {
+        let pane = self.focused_pane()?;
+        self.workspace
+            .as_ref()?
+            .sessions
+            .iter()
+            .flat_map(|session| &session.tabs)
+            .find_map(|tab| match workspace::leaf_node(&tab.layout, pane)? {
+                LayoutNode::Content { content, .. } => Some(content),
+                _ => None,
+            })
     }
     fn refresh_typography(&mut self, window: &Window) -> bool {
         let scale = window.scale_factor();

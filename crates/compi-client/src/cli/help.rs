@@ -72,7 +72,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("pane", Some("list")) => (
             "pane list",
-            "List pane IDs, surface IDs, process state and fresh runtime metadata; narrow with --workspace, --tab or --pane.",
+            "List each pane's ID and type: terminal panes with surface IDs, process state and fresh runtime metadata; content panes with the folder and files they show. Narrow with --workspace, --tab or --pane.",
             "compi --tab work/build --json pane list",
         ),
         ("pane", Some("show")) => (
@@ -87,7 +87,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("pane", Some("resize")) => (
             "pane resize [--cols N] [--rows N]",
-            "Resize the selected pane's native presentation. At least one dimension is required; the omitted dimension retains its actual current value. Minimum 20 columns and 4 rows.",
+            "Resize the selected terminal pane's native presentation. At least one dimension is required; the omitted dimension retains its actual current value. Minimum 20 columns and 4 rows. Content panes are not sized in cells; resize a terminal beside one instead.",
             "compi --pane pane-id pane resize --cols 100",
         ),
         ("pane", Some("swap")) => (
@@ -117,27 +117,27 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("pane", Some("close")) => (
             "pane close",
-            "Remove the selected pane, confirming interactively before ending a running process.",
+            "Remove the selected pane, confirming interactively before ending a running process. Content panes have no process and close without confirmation.",
             "compi --pane pane-id pane close",
         ),
         ("pane", Some("terminate")) => (
             "pane terminate",
-            "Explicitly terminate this pane's process lifetime; preserve pane and surface IDs.",
+            "Explicitly terminate this terminal pane's process lifetime; preserve pane and surface IDs.",
             "compi --pane pane-id pane terminate",
         ),
         ("pane", Some("send")) => (
             "pane send (--text TEXT | --key KEY)",
-            "Send literal text with no implicit Enter, or one explicit key. Keys: enter, tab, escape, space, backspace, arrows, home/end, insert/delete, pageup/pagedown, f1..f12; ctrl-/alt-/shift- modifiers supported.",
+            "Send literal text with no implicit Enter, or one explicit key, to a terminal pane. Keys: enter, tab, escape, space, backspace, arrows, home/end, insert/delete, pageup/pagedown, f1..f12; ctrl-/alt-/shift- modifiers supported.",
             "compi --pane pane-id pane send --text 'echo hello'; compi --pane pane-id pane send --key enter",
         ),
         ("pane", Some("capture")) => (
             "pane capture [--scope screen|scrollback] [--format text|ansi]",
-            "Capture observationally: screen is the default; scrollback includes retained history and the current screen. Text is the default; ANSI preserves text styling and hyperlinks. Soft wraps join, hard breaks and spaces remain. Never attaches or resizes.",
+            "Capture a terminal pane observationally: screen is the default; scrollback includes retained history and the current screen. Text is the default; ANSI preserves text styling and hyperlinks. Soft wraps join, hard breaks and spaces remain. Never attaches or resizes.",
             "compi --pane pane-id pane capture --scope scrollback --format ansi",
         ),
         ("split", _) => (
             "split [--right | --down] [--cwd PATH]\n       compi split --panes TOTAL --layout PRESET [--cwd PATH]",
-            "Split the selected pane, or fill the selected tab to TOTAL panes and arrange it. Reuses all existing shells and IDs; a lower total is rejected before mutation. Built-ins and named configured presets are accepted.",
+            "Split the selected terminal pane, or fill the selected tab to TOTAL panes and arrange it. Reuses all existing shells and IDs; a lower total is rejected before mutation. Built-ins and named configured presets are accepted.",
             "compi split --panes 4 --layout grid",
         ),
         ("layout", _) => (
@@ -162,7 +162,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("window", Some("list")) => (
             "window list",
-            "List native window slot IDs, visible tab IDs, and pane presentation state for the selected connection.",
+            "List native window slot IDs, visible tab IDs, and pane presentation state, with each pane's type (terminal or content), for the selected connection.",
             "compi --instance dev --json window list",
         ),
         ("theme", Some("install")) => (

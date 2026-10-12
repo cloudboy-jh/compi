@@ -4,6 +4,7 @@ use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle
 use sha2::{Digest, Sha256};
 pub(in crate::gui) mod arrangements;
 pub(super) mod catalog;
+mod content;
 pub(in crate::gui) mod dialogs;
 mod focus;
 pub(super) mod media;
@@ -793,6 +794,7 @@ impl CompiApp {
             pending_present_latency_ids: Vec::new(),
             window_title: "Compi".into(),
             focus_handle: cx.focus_handle(),
+            content_focus: cx.focus_handle(),
             ime_text: String::new(),
             ime_marked_range: None,
             ime_selected_range: 0..0,
@@ -1127,7 +1129,7 @@ impl CompiApp {
         if let Some(tab) = self.selected_tab() {
             collect_leaves(&tab.layout, &mut selected);
         }
-        let attached = selected.iter().all(|(_, id)| {
+        let attached = selected.iter().filter_map(|(_, id)| id.as_ref()).all(|id| {
             workspace.surface(id).is_some_and(|surface| {
                 !matches!(
                     surface.status,
@@ -1369,7 +1371,7 @@ impl CompiApp {
             .iter()
             .chain(self.float_layouts.iter().map(|float| &float.pane))
             .find_map(|pane| {
-                let surface = workspace.surface(&pane.surface_id)?;
+                let surface = workspace.surface(pane.surface_id.as_ref()?)?;
                 (surface.status == SurfaceStatus::Lost).then(|| {
                     (
                         surface.id.clone(),
@@ -2283,10 +2285,20 @@ impl CompiApp {
         if let Some(tab) = self.selected_tab() {
             collect_leaves(&tab.layout, &mut leaves);
         }
+        // Only terminals attach; content panes have no surface to observe.
+        let mut leaves: Vec<(PaneId, SurfaceId)> = leaves
+            .into_iter()
+            .filter_map(|(pane, surface)| Some((pane, surface?)))
+            .collect();
         // Floating panes stay attached while another tab or workspace is selected.
         for float in self.floating_leaves() {
-            if !leaves.iter().any(|(pane, _)| pane == &float.0) {
-                leaves.push(float);
+            if let LayoutNode::Pane {
+                pane_id,
+                surface_id,
+            } = float
+                && !leaves.iter().any(|(pane, _)| pane == &pane_id)
+            {
+                leaves.push((pane_id, surface_id));
             }
         }
         let wanted: HashSet<_> = leaves.iter().map(|(_, surface)| surface.clone()).collect();
@@ -2715,11 +2727,8 @@ impl CompiApp {
         });
         let zoom_layout = tiled.as_ref().and_then(|(tab_id, layout)| {
             let pane = layout.pane(self.pane_zoom.pane(tab_id)?)?;
-            let tree = LayoutNode::Pane {
-                pane_id: pane.pane_id.clone(),
-                surface_id: pane.surface_id.clone(),
-            };
-            Some(layout::compute_layout(&tree, available, metrics))
+            let tree = leaf_node(&self.selected_tab()?.layout, &pane.pane_id)?;
+            Some(layout::compute_layout(tree, available, metrics))
         });
         if zoom_layout.is_none()
             && let Some(tab_id) = self.selected_tab().map(|tab| tab.id.clone())
@@ -2782,17 +2791,18 @@ impl CompiApp {
             margin: 0.0,
             ..metrics
         };
-        let leaf = metrics.leaf_minimum();
-        let minimum = layout::Size {
-            width: leaf.width,
-            height: leaf.height + FLOAT_TITLE_HEIGHT,
-        };
         let mut leaves = self.floating_leaves().into_iter();
         self.state
             .floating
             .iter()
             .filter_map(|float| {
-                let (pane_id, surface_id) = leaves.find(|(pane, _)| pane == &float.pane_id)?;
+                let tree = leaves.find(|leaf| leaf.leaf_pane() == Some(&float.pane_id))?;
+                // A float is never smaller than its pane kind's minimum plus the title strip.
+                let minimum = metrics.minimum(layout::PaneKind::of(&tree));
+                let minimum = layout::Size {
+                    width: minimum.width,
+                    height: minimum.height + FLOAT_TITLE_HEIGHT,
+                };
                 let frame = layout::float_frame(
                     layout::Rect {
                         x: float.rect.x,
@@ -2807,10 +2817,6 @@ impl CompiApp {
                     width: frame.width,
                     height: (frame.height - FLOAT_TITLE_HEIGHT).max(1.0),
                 };
-                let tree = LayoutNode::Pane {
-                    pane_id,
-                    surface_id,
-                };
                 let mut pane = layout::compute_layout(&tree, body, metrics).panes.pop()?;
                 for rect in [&mut pane.rect, &mut pane.canvas] {
                     rect.x += frame.x;
@@ -2821,8 +2827,9 @@ impl CompiApp {
             .collect()
     }
 
-    /// Floating panes that still exist anywhere in the workspace, back to front.
-    fn floating_leaves(&self) -> Vec<(PaneId, SurfaceId)> {
+    /// Floating panes that still exist anywhere in the workspace, back to front, as
+    /// their terminal or content leaves.
+    fn floating_leaves(&self) -> Vec<LayoutNode> {
         let Some(workspace) = &self.workspace else {
             return Vec::new();
         };
@@ -2834,8 +2841,8 @@ impl CompiApp {
                     .sessions
                     .iter()
                     .flat_map(|session| &session.tabs)
-                    .find_map(|tab| pane_surface(&tab.layout, &float.pane_id))
-                    .map(|surface| (float.pane_id.clone(), surface.clone()))
+                    .find_map(|tab| leaf_node(&tab.layout, &float.pane_id))
+                    .cloned()
             })
             .collect()
     }
@@ -2899,12 +2906,14 @@ fn opacity_at_slider_position(position: Pixels, bounds: Bounds<Pixels>) -> f32 {
         + progress * (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY)
 }
 
-fn collect_leaves(tree: &LayoutNode, output: &mut Vec<(PaneId, SurfaceId)>) {
+/// Every leaf in reading order with its terminal surface; content panes have none.
+fn collect_leaves(tree: &LayoutNode, output: &mut Vec<(PaneId, Option<SurfaceId>)>) {
     match tree {
         LayoutNode::Pane {
             pane_id,
             surface_id,
-        } => output.push((pane_id.clone(), surface_id.clone())),
+        } => output.push((pane_id.clone(), Some(surface_id.clone()))),
+        LayoutNode::Content { pane_id, .. } => output.push((pane_id.clone(), None)),
         LayoutNode::Split { first, second, .. } => {
             collect_leaves(first, output);
             collect_leaves(second, output);
@@ -2933,7 +2942,7 @@ impl CompiApp {
         let workspace = self.workspace.as_ref();
         let session = workspace.and_then(|workspace| self.state.selected_session(workspace));
         let tab = self.selected_tab();
-        let pane = self.focused_view().map(|view| &view.pane_id);
+        let pane = self.focused_pane();
         let status = self
             .focused_view()
             .and_then(|view| workspace?.surface(&view.surface_id))
@@ -2941,7 +2950,13 @@ impl CompiApp {
         let split_reason = |axis| {
             self.layout
                 .as_ref()
-                .and_then(|layout| pane.map(|pane| layout.split_feasibility(pane, axis).err()))
+                .and_then(|layout| {
+                    pane.map(|pane| {
+                        layout
+                            .split_feasibility(pane, axis, layout::PaneKind::Terminal)
+                            .err()
+                    })
+                })
                 .flatten()
         };
         let neighbor = |direction| {
@@ -2988,6 +3003,7 @@ impl CompiApp {
             has_workspace: session.is_some(),
             has_tab: tab.is_some(),
             has_pane: pane.is_some(),
+            content_pane: self.focused_content().is_some(),
             tab_index: tab
                 .and_then(|tab| visible.iter().position(|item| item.id == tab.id))
                 .unwrap_or(0),
@@ -3336,7 +3352,8 @@ impl CompiApp {
             return;
         }
         let tab_id = self.selected_tab().map(|tab| tab.id.clone());
-        let pane_id = self.focused_view().map(|view| view.pane_id.clone());
+        let pane_id = self.focused_pane().cloned();
+        let content_focused = self.focused_content().is_some();
         let surface = self
             .focused_view()
             .and_then(|view| self.workspace.as_ref()?.surface(&view.surface_id))
@@ -3492,8 +3509,16 @@ impl CompiApp {
                         SplitAxis::Vertical
                     };
                     if let Some(layout) = &self.layout {
-                        match layout.split_feasibility(&pane_id, axis) {
-                            Ok(rect) => {
+                        let new_pane = layout::PaneKind::Terminal;
+                        match layout
+                            .split_feasibility(&pane_id, axis, new_pane)
+                            .and_then(|rect| {
+                                layout
+                                    .split_minimum(&pane_id, new_pane)
+                                    .map(|minimum| (rect, minimum))
+                                    .ok_or("The focused pane no longer exists")
+                            }) {
+                            Ok((rect, minimum)) => {
                                 let metrics = self.metrics();
                                 self.mutate(
                                     WorkspaceMutation::SplitPane {
@@ -3508,11 +3533,8 @@ impl CompiApp {
                                         geometry: compi_protocol::SplitGeometry {
                                             width: rect.width,
                                             height: rect.height,
-                                            min_width: 20.0 * metrics.cell_width
-                                                + 2.0 * metrics.padding_x,
-                                            min_height: 4.0 * metrics.line_height
-                                                + 2.0 * metrics.padding_y
-                                                + metrics.pane_chrome_height,
+                                            min_width: minimum.width,
+                                            min_height: minimum.height,
                                             divider: metrics.divider_thickness,
                                         },
                                     },
@@ -3635,11 +3657,16 @@ impl CompiApp {
             | Command::SwapPaneDown => self.run_arrangement_command(command, window),
             Command::RemovePane => {
                 if let Some(pane_id) = pane_id {
-                    self.close_work(
-                        WorkspaceMutation::RemovePane { pane_id },
-                        "Close this pane and end its process tree?",
-                        "Close pane",
-                    );
+                    if content_focused {
+                        // No process ends, so there is nothing to confirm.
+                        self.mutate(WorkspaceMutation::RemovePane { pane_id }, false);
+                    } else {
+                        self.close_work(
+                            WorkspaceMutation::RemovePane { pane_id },
+                            "Close this pane and end its process tree?",
+                            "Close pane",
+                        );
+                    }
                 }
             }
             Command::EndSurface => {
@@ -3833,7 +3860,7 @@ impl CompiApp {
         action: PaneAction,
     ) -> Option<&'static str> {
         let Some((count, surface_id)) = self.tab_pane_target(tab_id, pane_id) else {
-            return Some("This terminal is no longer in this tab");
+            return Some("This pane is no longer in this tab");
         };
         match action {
             PaneAction::Detach if count < 2 => Some("The tab has only one pane"),
@@ -3843,11 +3870,12 @@ impl CompiApp {
             {
                 Some("Dock a floating pane first")
             }
+            PaneAction::End if surface_id.is_none() => Some("A content pane has no process"),
             PaneAction::End
                 if self
                     .workspace
                     .as_ref()
-                    .and_then(|workspace| workspace.surface(&surface_id))
+                    .and_then(|workspace| workspace.surface(surface_id.as_ref()?))
                     .is_none_or(|surface| {
                         !matches!(
                             surface.status,
@@ -3896,7 +3924,7 @@ impl CompiApp {
                     }
                 }
                 PaneAction::End => {
-                    if let Some((_, surface_id)) = self.tab_pane_target(&tab_id, &pane_id)
+                    if let Some((_, Some(surface_id))) = self.tab_pane_target(&tab_id, &pane_id)
                         && let Some(surface) = self
                             .workspace
                             .as_ref()
@@ -4265,56 +4293,68 @@ struct TabPane {
 
 impl CompiApp {
     fn tab_panes(&self, tab: &WorkspaceTab) -> Vec<TabPane> {
-        let mut leaves = Vec::new();
-        collect_leaves(&tab.layout, &mut leaves);
-        leaves
+        crate::arrangement::leaves(&tab.layout)
             .into_iter()
             .enumerate()
-            .map(|(index, (pane_id, surface_id))| {
-                let surface = self
-                    .workspace
-                    .as_ref()
-                    .and_then(|workspace| workspace.surface(&surface_id));
-                let view = self
-                    .surface_views
-                    .iter()
-                    .find(|view| view.surface_id == surface_id);
-                let snapshot = view.and_then(|view| view.mirror.snapshot());
-                let cached = self
-                    .surface_names
-                    .get(&surface_id)
-                    .filter(|(lifetime, _, _)| {
-                        surface.is_none_or(|surface| surface.process_lifetime_id == *lifetime)
-                    });
-                let directory = snapshot
-                    .and_then(|snapshot| snapshot.current_directory.clone())
-                    .filter(|directory| !directory.trim().is_empty())
-                    .or_else(|| cached.and_then(|(_, _, directory)| directory.clone()))
-                    .or_else(|| {
-                        surface?
-                            .working_directory
-                            .as_ref()
-                            .map(|cwd| cwd.resolved_wsl_path.clone())
-                    });
-                let title = snapshot
-                    .and_then(|snapshot| observed_caption_title(&snapshot.title))
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        cached
-                            .map(|(_, title, _)| title)
-                            .filter(|title| !title.is_empty())
-                            .cloned()
-                    })
-                    .or_else(|| directory.as_deref().map(concise_path_title))
-                    .unwrap_or_else(|| format!("Terminal {}", index + 1));
-                TabPane {
+            .filter_map(|(index, leaf)| match leaf {
+                LayoutNode::Content { pane_id, content } => Some(TabPane {
                     floating: self.state.is_floating(&pane_id),
                     pane_id,
-                    title,
-                    directory,
-                }
+                    title: content.folder_name().to_owned(),
+                    directory: Some(content.root),
+                }),
+                LayoutNode::Pane {
+                    pane_id,
+                    surface_id,
+                } => Some(self.terminal_tab_pane(index, pane_id, &surface_id)),
+                LayoutNode::Split { .. } => None,
             })
             .collect()
+    }
+
+    fn terminal_tab_pane(&self, index: usize, pane_id: PaneId, surface_id: &SurfaceId) -> TabPane {
+        let surface = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.surface(surface_id));
+        let view = self
+            .surface_views
+            .iter()
+            .find(|view| &view.surface_id == surface_id);
+        let snapshot = view.and_then(|view| view.mirror.snapshot());
+        let cached = self
+            .surface_names
+            .get(surface_id)
+            .filter(|(lifetime, _, _)| {
+                surface.is_none_or(|surface| surface.process_lifetime_id == *lifetime)
+            });
+        let directory = snapshot
+            .and_then(|snapshot| snapshot.current_directory.clone())
+            .filter(|directory| !directory.trim().is_empty())
+            .or_else(|| cached.and_then(|(_, _, directory)| directory.clone()))
+            .or_else(|| {
+                surface?
+                    .working_directory
+                    .as_ref()
+                    .map(|cwd| cwd.resolved_wsl_path.clone())
+            });
+        let title = snapshot
+            .and_then(|snapshot| observed_caption_title(&snapshot.title))
+            .map(str::to_owned)
+            .or_else(|| {
+                cached
+                    .map(|(_, title, _)| title)
+                    .filter(|title| !title.is_empty())
+                    .cloned()
+            })
+            .or_else(|| directory.as_deref().map(concise_path_title))
+            .unwrap_or_else(|| format!("Terminal {}", index + 1));
+        TabPane {
+            floating: self.state.is_floating(&pane_id),
+            pane_id,
+            title,
+            directory,
+        }
     }
 
     fn tab_by_id(&self, tab_id: &TabId) -> Option<&WorkspaceTab> {
@@ -4326,7 +4366,12 @@ impl CompiApp {
             .find(|tab| &tab.id == tab_id)
     }
 
-    fn tab_pane_target(&self, tab_id: &TabId, pane_id: &PaneId) -> Option<(usize, SurfaceId)> {
+    /// The tab's pane count and the pane's terminal surface (`None` for content).
+    fn tab_pane_target(
+        &self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+    ) -> Option<(usize, Option<SurfaceId>)> {
         let mut leaves = Vec::new();
         collect_leaves(&self.tab_by_id(tab_id)?.layout, &mut leaves);
         let count = leaves.len();
@@ -4349,7 +4394,7 @@ impl CompiApp {
         let mut leaves = Vec::new();
         collect_leaves(&tab.layout, &mut leaves);
         let mut statuses = Vec::new();
-        for (_, id) in &leaves {
+        for id in leaves.iter().filter_map(|(_, id)| id.as_ref()) {
             if let Some(surface) = self
                 .workspace
                 .as_ref()
@@ -4382,8 +4427,8 @@ impl CompiApp {
             "Restore split layout"
         } else if command == Command::TogglePaneFloat
             && self
-                .focused_view()
-                .is_some_and(|view| self.state.is_floating(&view.pane_id))
+                .focused_pane()
+                .is_some_and(|pane| self.state.is_floating(pane))
         {
             "Dock pane"
         } else {
@@ -4612,6 +4657,7 @@ impl CompiApp {
                 window.on_next_frame(move |_, cx| cx.notify(view_id));
             }
         }
+        self.reconcile_keyboard_focus(window, cx);
         if let Some((appearance, favorites, ui_font, density, terminal_font_family)) =
             self.pending_appearance_reload.take()
         {
@@ -5781,9 +5827,7 @@ impl CompiApp {
         let indicator = self.config.focus_indicator;
         let radius = if comfy { PANE_RADIUS } else { 0.0 };
         let panes = layout.panes.iter().enumerate().map(|(index, geometry)| {
-            let focused = self
-                .focused_view()
-                .is_some_and(|view| view.pane_id == geometry.pane_id);
+            let focused = self.focused_pane() == Some(&geometry.pane_id);
             // Comfy islands keep a hairline edge so they read against any canvas colour;
             // Compact panes are separated by seams.
             let edge = if marking && focused && indicator == FocusIndicator::Outline {
@@ -5993,6 +6037,9 @@ impl CompiApp {
         rect: layout::Rect,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        if geometry.surface_id.is_none() {
+            return self.render_content_pane(id, geometry, rect, cx);
+        }
         let colors = *self.colors();
         let pane_id = geometry.pane_id.clone();
         let tree_active = self
@@ -6199,9 +6246,7 @@ impl CompiApp {
         };
         let frame = float.frame;
         let pane_id = float.pane.pane_id.clone();
-        let focused = self
-            .focused_view()
-            .is_some_and(|view| view.pane_id == pane_id);
+        let focused = self.focused_pane() == Some(&pane_id);
         let indicator = self.config.focus_indicator;
         let marking = self.visible_layout().map_or(0, |layout| layout.panes.len())
             + self.float_layouts.len()
@@ -6433,6 +6478,14 @@ impl CompiApp {
             return None;
         }
         let colors = *self.colors();
+        let notice = if leaves
+            .iter()
+            .any(|(pane, surface)| surface.is_none() && self.state.is_floating(pane))
+        {
+            "This tab's pane is floating."
+        } else {
+            "This tab's terminal is floating. Its process keeps running."
+        };
         Some(
             self.render_empty_island(
                 div()
@@ -6442,11 +6495,7 @@ impl CompiApp {
                     // Top-left stays clear of floats, which open on the right by default.
                     .items_start()
                     .gap_3()
-                    .child(
-                        div()
-                            .text_color(color(colors.muted))
-                            .child("This tab's terminal is floating. Its process keeps running."),
-                    )
+                    .child(div().text_color(color(colors.muted)).child(notice))
                     .children(
                         leaves
                             .iter()
@@ -6952,7 +7001,7 @@ impl CompiApp {
         };
         let mut leaves = Vec::new();
         collect_leaves(&tab.layout, &mut leaves);
-        let surfaces: HashSet<_> = leaves.iter().map(|(_, id)| id.clone()).collect();
+        let surfaces: HashSet<_> = leaves.iter().filter_map(|(_, id)| id.clone()).collect();
         // Resolve creation and all fallible preconditions before releasing a source view.
         let is_new = destination.is_none();
         let target = if let Some(destination) = destination {
@@ -7008,7 +7057,8 @@ impl CompiApp {
                 .extract_if(.., |view| surfaces.contains(&view.surface_id))
                 .collect::<Vec<_>>(),
         );
-        let expected_count = leaves.len();
+        // Content panes have no view; they move with the tab's layout.
+        let expected_count = surfaces.len();
         if transferred
             .as_ref()
             .is_none_or(|views| views.len() != expected_count)
@@ -7438,8 +7488,8 @@ impl CompiApp {
     fn reap_retired_views(&mut self) {
         let floating: HashSet<_> = self
             .floating_leaves()
-            .into_iter()
-            .map(|(_, surface)| surface)
+            .iter()
+            .filter_map(|leaf| leaf.surface_id().cloned())
             .collect();
         let tab = self
             .workspace
@@ -7513,6 +7563,11 @@ fn structure_key(workspace: &WorkspaceSnapshot) -> u64 {
                 pane_id.as_str().hash(hasher);
                 surface_id.as_str().hash(hasher);
             }
+            // What a content pane shows is not part of what menus target.
+            LayoutNode::Content { pane_id, .. } => {
+                2_u8.hash(hasher);
+                pane_id.as_str().hash(hasher);
+            }
             LayoutNode::Split {
                 axis,
                 first,
@@ -7555,35 +7610,31 @@ fn positive_scale(scale: f32) -> f32 {
 
 fn leaf_count(tree: &LayoutNode) -> usize {
     match tree {
-        LayoutNode::Pane { .. } => 1,
+        LayoutNode::Pane { .. } | LayoutNode::Content { .. } => 1,
         LayoutNode::Split { first, second, .. } => leaf_count(first) + leaf_count(second),
     }
 }
 
-fn pane_surface<'a>(tree: &'a LayoutNode, pane: &PaneId) -> Option<&'a SurfaceId> {
+/// The terminal or content leaf of `pane`.
+pub(super) fn leaf_node<'a>(tree: &'a LayoutNode, pane: &PaneId) -> Option<&'a LayoutNode> {
     match tree {
-        LayoutNode::Pane {
-            pane_id,
-            surface_id,
-        } => (pane_id == pane).then_some(surface_id),
+        LayoutNode::Pane { pane_id, .. } | LayoutNode::Content { pane_id, .. } => {
+            (pane_id == pane).then_some(tree)
+        }
         LayoutNode::Split { first, second, .. } => {
-            pane_surface(first, pane).or_else(|| pane_surface(second, pane))
+            leaf_node(first, pane).or_else(|| leaf_node(second, pane))
         }
     }
 }
 
 fn layout_contains_pane(tree: &LayoutNode, pane: &PaneId) -> bool {
-    match tree {
-        LayoutNode::Pane { pane_id, .. } => pane_id == pane,
-        LayoutNode::Split { first, second, .. } => {
-            layout_contains_pane(first, pane) || layout_contains_pane(second, pane)
-        }
-    }
+    leaf_node(tree, pane).is_some()
 }
 
 fn contains_surface(tree: &LayoutNode, surface: &SurfaceId) -> bool {
     match tree {
         LayoutNode::Pane { surface_id, .. } => surface_id == surface,
+        LayoutNode::Content { .. } => false,
         LayoutNode::Split { first, second, .. } => {
             contains_surface(first, surface) || contains_surface(second, surface)
         }
