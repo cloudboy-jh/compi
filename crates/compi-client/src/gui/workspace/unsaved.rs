@@ -921,6 +921,7 @@ mod tests {
                 root: "/work".into(),
                 files: Vec::new(),
                 active_file: None,
+                view: compi_protocol::ContentView::Files,
             },
         };
         let tab = |id: &str, layout| WorkspaceTab {

@@ -3,6 +3,7 @@ pub mod conpty;
 mod content_files;
 pub mod daemon;
 pub mod file_tree;
+mod git;
 pub mod launch;
 pub mod metadata;
 mod prompt;

@@ -121,6 +121,7 @@ pub(super) fn run(
                         root: folder.clone(),
                         files: Vec::new(),
                         active_file: None,
+                        view: compi_protocol::ContentView::Files,
                     },
                     Show::File { path, .. } => PaneContent {
                         root: match directory {
@@ -129,6 +130,7 @@ pub(super) fn run(
                         },
                         files: vec![path.clone()],
                         active_file: Some(path.clone()),
+                        view: compi_protocol::ContentView::Files,
                         environment,
                     },
                 };
@@ -385,6 +387,7 @@ mod tests {
                     root: root.into(),
                     files: files.iter().map(|file| (*file).to_owned()).collect(),
                     active_file: None,
+                    view: compi_protocol::ContentView::Files,
                 },
             }
         };

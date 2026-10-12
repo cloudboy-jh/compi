@@ -226,6 +226,9 @@ fn generate_catalog() {
         "accent",
         "error",
         "selection",
+        "added",
+        "removed",
+        "modified",
     ];
     for (theme, (_, palette)) in catalog.themes.iter().zip(&palettes) {
         writeln!(output, "        Self::{} => &ThemeColors {{", theme.variant).unwrap();

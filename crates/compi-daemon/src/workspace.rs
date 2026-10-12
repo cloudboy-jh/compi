@@ -4210,6 +4210,7 @@ mod tests {
             root: root.to_string_lossy().into_owned(),
             files: files.iter().map(|file| path(file)).collect(),
             active_file: files.first().map(|file| path(file)),
+            view: compi_protocol::ContentView::Files,
         }
     }
 
@@ -4411,6 +4412,7 @@ mod tests {
             root: "/home/user/project".into(),
             files: Vec::new(),
             active_file: None,
+            view: compi_protocol::ContentView::Files,
         };
         if cfg!(windows) {
             let relative = PaneContent {

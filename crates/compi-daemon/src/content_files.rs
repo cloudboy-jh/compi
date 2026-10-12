@@ -143,7 +143,7 @@ pub fn write_file(
     Ok(version_of(text.as_bytes()))
 }
 
-fn resolve(environment: &ContentEnvironment, path: &str) -> Result<Root, Failure> {
+pub(crate) fn resolve(environment: &ContentEnvironment, path: &str) -> Result<Root, Failure> {
     let root = match environment {
         #[cfg(unix)]
         ContentEnvironment::Host => file_tree::resolve_root(path, None),
@@ -391,7 +391,7 @@ impl Drop for SaveLock {
     }
 }
 
-fn open_options(write: bool) -> OpenOptions {
+pub(crate) fn open_options(write: bool) -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(write);
     // Opening a FIFO for reading would block until a writer appears; the file type is
@@ -402,7 +402,7 @@ fn open_options(write: bool) -> OpenOptions {
 }
 
 /// Open the file, returning the path last tried for diagnosing a failure.
-fn open(root: &Root, options: &OpenOptions) -> (PathBuf, io::Result<File>) {
+pub(crate) fn open(root: &Root, options: &OpenOptions) -> (PathBuf, io::Result<File>) {
     let opened = options.open(&root.host);
     #[cfg(windows)]
     if let (Err(error), Some(distribution)) = (&opened, root.distribution.as_deref())
@@ -416,7 +416,7 @@ fn open(root: &Root, options: &OpenOptions) -> (PathBuf, io::Result<File>) {
 }
 
 /// The open file's metadata, failing unless it is a regular file.
-fn regular_metadata(file: &File, root: &Root) -> Result<Metadata, Failure> {
+pub(crate) fn regular_metadata(file: &File, root: &Root) -> Result<Metadata, Failure> {
     let metadata = file.metadata().map_err(|error| read_failure(root, error))?;
     if metadata.is_dir() {
         return Err(folder_failure(root));
@@ -455,7 +455,7 @@ fn current_len(file: &File, root: &Root) -> Result<u64, Failure> {
 }
 
 /// Like Git, a NUL byte near the start marks a binary file even when it is valid UTF-8.
-const BINARY_PROBE_BYTES: usize = 8 * 1024;
+pub(crate) const BINARY_PROBE_BYTES: usize = 8 * 1024;
 
 fn version_of(bytes: &[u8]) -> FileVersion {
     FileVersion {
@@ -610,7 +610,7 @@ fn folder_failure(root: &Root) -> Failure {
 }
 
 /// Opening a folder fails with `IsADirectory` on Unix and access denied on Windows.
-fn open_failure(root: &Root, path: &Path, error: io::Error) -> Failure {
+pub(crate) fn open_failure(root: &Root, path: &Path, error: io::Error) -> Failure {
     if error.kind() == io::ErrorKind::IsADirectory || is_folder(path) {
         return folder_failure(root);
     }
@@ -627,7 +627,7 @@ fn save_failure(root: &Root, error: io::Error) -> Failure {
     )
 }
 
-fn read_failure(root: &Root, error: io::Error) -> Failure {
+pub(crate) fn read_failure(root: &Root, error: io::Error) -> Failure {
     (
         ErrorCode::Internal,
         format!("could not read {:?}: {error}", root.shell),

@@ -800,6 +800,7 @@ mod tests {
                 root: "/home/user/project".into(),
                 files: vec!["/home/user/project/a.rs".into()],
                 active_file: Some("/home/user/project/a.rs".into()),
+                view: compi_protocol::ContentView::Files,
             },
         };
         let terminal = LayoutNode::Pane {

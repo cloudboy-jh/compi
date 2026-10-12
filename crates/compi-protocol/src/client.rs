@@ -2,10 +2,11 @@ use crate::Result;
 use crate::frame;
 use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, DirectoryEntry, ErrorCode,
-    FileContent, FileState, FileVersion, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES,
-    MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME,
-    SearchEntry, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget,
-    WorkspaceMutation, WorkspaceSnapshot, decode_server, decode_terminal_frame, encode_client,
+    FileContent, FileState, FileVersion, GitChanges, GitFileContent, GitRevision,
+    IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest,
+    PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId,
+    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
+    decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
@@ -788,6 +789,37 @@ impl DaemonClient {
             text,
         })? {
             ServerMessage::ContentFileWritten { version } => Ok(version),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// The uncommitted changes of the Git work tree holding `path`; `None` outside one.
+    pub fn read_git_changes(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+    ) -> Result<Option<GitChanges>> {
+        match self.request(ClientMessage::ReadGitChanges { environment, path })? {
+            ServerMessage::GitChangesRead { changes } => Ok(changes),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// One side of a changed file, `path` relative to the repository top level `repo`.
+    pub fn read_git_file(
+        &mut self,
+        environment: ContentEnvironment,
+        repo: String,
+        path: String,
+        revision: GitRevision,
+    ) -> Result<GitFileContent> {
+        match self.request(ClientMessage::ReadGitFile {
+            environment,
+            repo,
+            path,
+            revision,
+        })? {
+            ServerMessage::GitFileRead { content } => Ok(content),
             message => Err(unexpected_response(message)),
         }
     }

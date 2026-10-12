@@ -903,6 +903,7 @@ mod tests {
                 root: "/work".into(),
                 files: Vec::new(),
                 active_file: None,
+                view: compi_protocol::ContentView::Files,
             },
         };
         let tree = split(SplitAxis::Horizontal, 0.5, leaf("a"), content);

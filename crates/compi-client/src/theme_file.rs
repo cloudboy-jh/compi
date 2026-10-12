@@ -40,8 +40,9 @@ pub enum ThemeAppearance {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedTheme {
-    /// Background, surface, hover, border, foreground, muted, accent, error, selection.
-    pub application: [u32; 9],
+    /// Background, surface, hover, border, foreground, muted, accent, error, selection,
+    /// added, removed, modified.
+    pub application: [u32; 12],
     /// Background, foreground, selection, cursor, then ANSI 0 through 15.
     pub terminal: [u32; 20],
 }
@@ -432,6 +433,7 @@ impl ThemeFamily {
     /// - text.muted -> text.placeholder -> foreground
     /// - text.accent -> icon.accent -> border.focused; error -> deleted
     /// - element.selected -> ghost_element.selected
+    /// - created -> terminal green; deleted -> terminal red; modified -> terminal yellow
     /// - terminal.background -> editor.background -> application background
     /// - terminal.foreground -> editor.foreground -> application foreground
     /// - players[0].selection -> application selection; players[0].cursor -> accent
@@ -480,7 +482,7 @@ impl ThemeFamily {
             },
         )?;
         let foreground = first(style, &["text", "editor.foreground"], defaults[4])?;
-        let application = [
+        let mut application = [
             background,
             surface,
             first(
@@ -517,6 +519,9 @@ impl ThemeFamily {
                 &["element.selected", "ghost_element.selected"],
                 defaults[8],
             )?,
+            0,
+            0,
+            0,
         ];
         let player = player(style)?;
         let mut terminal = [0; 20];
@@ -543,6 +548,9 @@ impl ThemeFamily {
         for (index, field) in ANSI_FIELDS.iter().enumerate() {
             terminal[index + 4] = color(style, field)?.unwrap_or(ansi[index]);
         }
+        application[9] = first(style, &["created"], terminal[4 + 2])?;
+        application[10] = first(style, &["deleted"], terminal[4 + 1])?;
+        application[11] = first(style, &["modified"], terminal[4 + 3])?;
         Ok(ResolvedTheme {
             application,
             terminal,

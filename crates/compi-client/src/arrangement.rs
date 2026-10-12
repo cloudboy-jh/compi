@@ -1043,6 +1043,7 @@ mod tests {
                 root: "/work".into(),
                 files: vec!["/work/a.md".into()],
                 active_file: Some("/work/a.md".into()),
+                view: compi_protocol::ContentView::Files,
             },
         };
         let tree = split(SplitAxis::Horizontal, 0.5, pane("a"), content.clone());

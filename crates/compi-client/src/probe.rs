@@ -390,6 +390,7 @@ fn content_arguments(
         root,
         files,
         active_file,
+        view: compi_protocol::ContentView::Files,
     };
     content.validate()?;
     Ok((content, down))

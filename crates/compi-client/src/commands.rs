@@ -135,6 +135,7 @@ registry! {
     ShowFiles, "show_files", "Files", None, None;
     OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
     NewEditor, "new_editor", "New editor", None, None;
+    ShowChanges, "show_changes", "Changes", None, None;
     RecoverUnsavedEdits, "recover_unsaved_edits", "Recover unsaved edits…", None, None;
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
@@ -275,7 +276,9 @@ impl Command {
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
             | SwapPaneDown | RemovePane => CommandCategory::Panes,
-            ShowFiles | OpenFile | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
+            ShowFiles | ShowChanges | OpenFile | NewEditor | RecoverUnsavedEdits => {
+                CommandCategory::Files
+            }
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
@@ -340,6 +343,9 @@ impl Command {
                 "Searches this pane's folder and opens a file in the editor; your terminal gets no input.",
             ),
             NewEditor => Some("Opens this pane's folder in a new file pane beside it."),
+            ShowChanges => Some(
+                "Reviews this repository's uncommitted Git changes beside the pane; nothing is staged or changed.",
+            ),
             RecoverUnsavedEdits => Some(
                 "Reopens a file whose unsaved edits were kept when Compi closed, with the edits back.",
             ),
@@ -379,6 +385,7 @@ impl Command {
             ShowFiles => "folder browse explorer editor content",
             OpenFile => "quick open find search fuzzy goto editor",
             NewEditor => "file folder pane content split",
+            ShowChanges => "git diff review status staged unstaged uncommitted",
             RecoverUnsavedEdits => "backup restore crash lost unsaved changes editor",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
@@ -469,6 +476,7 @@ impl Command {
                         | MoveTabToNewWindow
                         | MoveTabToWindow
                         | ShowFiles
+                        | ShowChanges
                         | OpenFile
                         | RecoverUnsavedEdits
                 ))
@@ -680,7 +688,7 @@ impl Command {
                     c.content_pane.then_some(CONTENT_PANE_REASON)
                 }
             }
-            ShowFiles | NewEditor => {
+            ShowFiles | ShowChanges | NewEditor => {
                 if !c.has_pane {
                     Some("Select a pane first")
                 } else {

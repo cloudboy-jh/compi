@@ -2,7 +2,7 @@
 //! environment; previews render the real provider with each style as is;
 //! every change is planned, backed up and applied only with the plan's token.
 mod config;
-mod target;
+pub(crate) mod target;
 
 use compi_protocol::ErrorCode;
 use compi_protocol::prompt::{

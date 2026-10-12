@@ -169,7 +169,7 @@ pub(super) fn error_text(output: &Output) -> String {
 }
 
 /// `wsl.exe` reports its own failures in UTF-16; Linux programs write UTF-8.
-fn decode(bytes: &[u8]) -> String {
+pub(crate) fn decode(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes.len().is_multiple_of(2) && bytes.chunks(2).any(|pair| pair[1] == 0)
     {
         let words: Vec<u16> = bytes

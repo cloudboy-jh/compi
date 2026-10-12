@@ -691,6 +691,7 @@ fn content_pane_survives_daemon_restart_and_closes_without_a_process() {
         root: project.to_string_lossy().into_owned(),
         files: vec![notes.clone()],
         active_file: Some(notes),
+        view: compi_protocol::ContentView::Files,
     };
     let opened = control
         .mutate(WorkspaceMutation::OpenContent {

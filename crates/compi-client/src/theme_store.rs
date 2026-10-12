@@ -579,7 +579,7 @@ impl ThemeLibrary {
     }
 }
 
-fn resolved_arrays(definition: &ThemeDefinition) -> ([u32; 9], [u32; 20]) {
+fn resolved_arrays(definition: &ThemeDefinition) -> ([u32; 12], [u32; 20]) {
     let a = definition.colors();
     let t = definition.terminal();
     let application = [
@@ -592,6 +592,9 @@ fn resolved_arrays(definition: &ThemeDefinition) -> ([u32; 9], [u32; 20]) {
         a.accent,
         a.error,
         a.selection,
+        a.added,
+        a.removed,
+        a.modified,
     ];
     let mut terminal = [0; 20];
     terminal[..4].copy_from_slice(&[t.background, t.foreground, t.selection, t.cursor]);
@@ -629,6 +632,9 @@ fn resolve_family(
                 accent,
                 error,
                 selection,
+                added,
+                removed,
+                modified,
             ] = resolved.application;
             let mut ansi = [0; 16];
             ansi.copy_from_slice(&resolved.terminal[4..]);
@@ -655,6 +661,9 @@ fn resolve_family(
                     accent,
                     error,
                     selection,
+                    added,
+                    removed,
+                    modified,
                 },
                 terminal: TerminalPalette {
                     background: resolved.terminal[0],

@@ -975,6 +975,33 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
                     }
                 }
+                ClientMessage::ReadGitChanges { environment, path } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| crate::git::read_changes(&environment, &path))
+                    {
+                        Ok(changes) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::GitChangesRead { changes },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
+                ClientMessage::ReadGitFile {
+                    environment,
+                    repo,
+                    path,
+                    revision,
+                } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| crate::git::read_file(&environment, &repo, &path, revision))
+                    {
+                        Ok(content) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::GitFileRead { content },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::Prompt {
                     distribution,
                     request,

@@ -35,7 +35,8 @@ use std::fmt;
 // Version 20 adds content files: environment directory listing, file reads and versioned saves.
 // Version 21 says why a file is not shown as text, reports writability and checks a held
 // version against the file on disk.
-pub const PROTOCOL_VERSION: u32 = 21;
+// Version 22 adds the review of a repository's uncommitted Git changes.
+pub const PROTOCOL_VERSION: u32 = 22;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -57,6 +58,10 @@ pub const MAX_DIRECTORY_QUERY_BYTES: usize = 256;
 pub const MAX_CONTENT_FILES: usize = 256;
 /// Largest file a content pane reads or saves, in bytes.
 pub const MAX_CONTENT_FILE_BYTES: usize = 1024 * 1024;
+/// Changes one Git changes listing returns.
+pub const MAX_GIT_CHANGES: usize = 5000;
+/// Largest image a Git file read returns as an image, in bytes.
+pub const MAX_GIT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -274,6 +279,18 @@ pub enum ClientMessage {
         expected: Option<FileVersion>,
         text: String,
     },
+    /// The uncommitted changes of the Git work tree holding `path`, a folder or file.
+    ReadGitChanges {
+        environment: ContentEnvironment,
+        path: String,
+    },
+    /// One side of a changed file: `path` is relative to the repository top level `repo`.
+    ReadGitFile {
+        environment: ContentEnvironment,
+        repo: String,
+        path: String,
+        revision: GitRevision,
+    },
     Mutate {
         mutation: MutationRequest,
     },
@@ -366,6 +383,13 @@ pub enum ServerMessage {
     },
     ContentFileWritten {
         version: FileVersion,
+    },
+    /// `None` when the path is not inside a Git work tree.
+    GitChangesRead {
+        changes: Option<GitChanges>,
+    },
+    GitFileRead {
+        content: GitFileContent,
     },
     WorkspaceChanged {
         revision: u64,
@@ -501,6 +525,117 @@ pub enum FileState {
     },
     /// Deleted, or no longer a regular file.
     Missing,
+}
+
+/// Which comparison a change belongs to, as in `git status`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GitScope {
+    /// The work tree against the index.
+    Unstaged,
+    /// The index against `HEAD`.
+    Staged,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GitChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Untracked,
+    Conflicted,
+}
+
+/// Which version of a repository file to read.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRevision {
+    Head,
+    Index,
+    WorkTree,
+}
+
+/// One changed path in one scope. A path changed both in the index and in the work tree
+/// appears once in each scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitChange {
+    pub scope: GitScope,
+    pub kind: GitChangeKind,
+    /// Repository-relative, `/`-separated.
+    pub path: String,
+    /// The source path of a rename or copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// Lines added and removed (git numstat); `None` for binary, untracked and conflicted
+    /// files.
+    pub added: Option<u32>,
+    pub removed: Option<u32>,
+    /// Opaque; differs whenever either side of this change may hold different bytes
+    /// (index/HEAD blob ids, plus the work-tree file's length and modification time for
+    /// Unstaged).
+    pub stamp: String,
+}
+
+/// A repository's uncommitted changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitChanges {
+    /// Absolute repository top level in the request's environment.
+    pub repo: String,
+    /// Current branch, `None` when detached or unborn.
+    pub branch: Option<String>,
+    /// Abbreviated HEAD commit, `None` before the first commit.
+    pub head: Option<String>,
+    /// Unstaged entries first, then staged; each group sorted by path.
+    pub changes: Vec<GitChange>,
+    /// More than `MAX_GIT_CHANGES` entries; the list was cut.
+    pub truncated: bool,
+}
+
+/// One side of a changed file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GitFileContent {
+    /// UTF-8 text of at most `MAX_CONTENT_FILE_BYTES`.
+    Text { text: String },
+    /// An image of at most `MAX_GIT_IMAGE_BYTES`, recognised by extension and signature,
+    /// as standard padded base64.
+    Image {
+        format: GitImageFormat,
+        base64: String,
+        len: u64,
+    },
+    /// Not UTF-8 text, and not a recognised image.
+    Binary { len: u64 },
+    /// Larger than `MAX_CONTENT_FILE_BYTES`, or `MAX_GIT_IMAGE_BYTES` for an image.
+    TooLarge { len: u64 },
+    /// No such file at that revision (added, deleted or untracked side).
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GitImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Bmp,
+    Ico,
+    Svg,
+}
+
+/// Whether `path` names a file relative to a repository top level: `/`-separated, not
+/// absolute, without NUL or `..` components.
+pub fn is_repo_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_DIRECTORY_PATH_BYTES
+        && !path.starts_with('/')
+        && !path.contains('\0')
+        && !path.split('/').any(|part| part == "..")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -710,6 +845,37 @@ pub struct PaneContent {
     /// One of `files`, or `None` when no file is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_file: Option<String>,
+    /// What the pane shows. Absent in older state = Files.
+    #[serde(default, skip_serializing_if = "ContentView::is_files")]
+    pub view: ContentView,
+}
+
+/// What a content pane shows of its folder.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentView {
+    /// The folder's files, with `files` open.
+    #[default]
+    Files,
+    /// The repository's uncommitted changes; `root` is the repository top level.
+    Changes {
+        /// The change on screen: repository-relative path and scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected: Option<GitFileRef>,
+    },
+}
+
+impl ContentView {
+    pub fn is_files(&self) -> bool {
+        matches!(self, Self::Files)
+    }
+}
+
+/// A changed file in one scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct GitFileRef {
+    pub path: String,
+    pub scope: GitScope,
 }
 
 impl PaneContent {
@@ -732,6 +898,17 @@ impl PaneContent {
             return Err("content environment names an invalid WSL distribution".into());
         }
         path(&self.root, "content root")?;
+        if let ContentView::Changes { selected } = &self.view {
+            if !self.files.is_empty() || self.active_file.is_some() {
+                return Err("a changes view has no open files".into());
+            }
+            if let Some(selected) = selected
+                && !is_repo_path(&selected.path)
+            {
+                return Err("the selected change must be a repository-relative path".into());
+            }
+            return Ok(());
+        }
         if self.files.len() > MAX_CONTENT_FILES {
             return Err(format!(
                 "a content pane can list at most {MAX_CONTENT_FILES} files"
@@ -1179,6 +1356,7 @@ mod content_tests {
             root: "/home/user/project/".into(),
             files: files.iter().map(|file| (*file).to_owned()).collect(),
             active_file: active.map(str::to_owned),
+            view: ContentView::Files,
         }
     }
 
@@ -1211,5 +1389,34 @@ mod content_tests {
         let mut root = content(&[], None);
         root.root.clear();
         assert!(root.validate().is_err());
+    }
+
+    #[test]
+    fn changes_view_has_no_files_and_a_relative_selection() {
+        let changes = |path: &str| PaneContent {
+            view: ContentView::Changes {
+                selected: Some(GitFileRef {
+                    path: path.into(),
+                    scope: GitScope::Staged,
+                }),
+            },
+            ..content(&[], None)
+        };
+        let shown = changes("src/main.rs");
+        assert!(shown.validate().is_ok());
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["view"]["type"], "changes");
+        assert_eq!(serde_json::from_value::<PaneContent>(json).unwrap(), shown);
+        for path in ["", "/etc/passwd", "a/../../b", "a\0b"] {
+            assert!(changes(path).validate().is_err(), "accepted {path:?}");
+        }
+        let with_files = PaneContent {
+            files: vec!["/a".into()],
+            ..changes("a")
+        };
+        assert!(with_files.validate().is_err());
+        // Files views omit the field, so older state loads unchanged.
+        let files = serde_json::to_value(content(&[], None)).unwrap();
+        assert!(files.get("view").is_none());
     }
 }

@@ -138,6 +138,12 @@ pub struct ThemeColors {
     pub accent: u32,
     pub error: u32,
     pub selection: u32,
+    /// Added lines and files (Zed `created`).
+    pub added: u32,
+    /// Removed lines and files (Zed `deleted`).
+    pub removed: u32,
+    /// Modified files (Zed `modified`).
+    pub modified: u32,
 }
 
 /// Theme tokens retain inverse alpha like [`ThemeColors`]. Explicit terminal cell backgrounds

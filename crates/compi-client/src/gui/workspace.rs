@@ -4,8 +4,10 @@ use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle
 use sha2::{Digest, Sha256};
 pub(in crate::gui) mod arrangements;
 pub(super) mod catalog;
+mod changes;
 pub(in crate::gui) mod content;
 pub(in crate::gui) mod dialogs;
+mod diff_view;
 mod files;
 mod focus;
 pub(super) mod media;
@@ -3786,6 +3788,7 @@ impl CompiApp {
             Command::JumpProject => self.open_project_jump(),
             Command::ShowFiles => self.show_files(false, window, cx),
             Command::NewEditor => self.show_files(true, window, cx),
+            Command::ShowChanges => self.show_changes(window, cx),
             Command::OpenFile => self.open_file_picker(),
             Command::Copy => self.copy_selection(cx),
             Command::Paste => self.paste_clipboard(cx),
@@ -4430,7 +4433,12 @@ impl CompiApp {
                 LayoutNode::Content { pane_id, content } => Some(TabPane {
                     floating: self.state.is_floating(&pane_id),
                     pane_id,
-                    title: content.folder_name().to_owned(),
+                    title: match content.view {
+                        compi_protocol::ContentView::Files => content.folder_name().to_owned(),
+                        compi_protocol::ContentView::Changes { .. } => {
+                            format!("Changes · {}", content.folder_name())
+                        }
+                    },
                     directory: Some(content.root),
                 }),
                 LayoutNode::Pane {
