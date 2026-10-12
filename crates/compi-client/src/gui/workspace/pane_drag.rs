@@ -250,8 +250,7 @@ impl CompiApp {
         if !drag.moving && !drag_threshold_crossed(drag.origin, position) {
             return;
         }
-        let (viewport_width, _) = logical_viewport_dimensions(window);
-        let hovered = self.tab_bar_target(position, viewport_width);
+        let hovered = self.tab_bar_target(position, window);
         let target = match &hovered {
             Some(Some(tab_id)) if tab_id == &drag.tab_id => None,
             Some(Some(tab_id)) => Some(DropTarget::Tab(tab_id.clone())),
@@ -300,22 +299,19 @@ impl CompiApp {
 
     /// `Some(Some(tab))` over a visible tab, `Some(None)` over empty tab-bar space,
     /// `None` outside the tab bar.
-    fn tab_bar_target(
-        &self,
-        position: Point<Pixels>,
-        viewport_width: f32,
-    ) -> Option<Option<TabId>> {
+    fn tab_bar_target(&self, position: Point<Pixels>, window: &Window) -> Option<Option<TabId>> {
         let (x, y) = (f32::from(position.x), f32::from(position.y));
-        let header = header_metrics(viewport_width);
+        let (viewport_width, _) = logical_viewport_dimensions(window);
+        let leading_width = titlebar_leading_width(window);
+        let header = header_metrics(viewport_width, leading_width);
         let tab_region_right = viewport_width
             - WINDOW_CONTROLS_WIDTH
             - HEADER_BUTTON_SLOT_WIDTH
             - header.pane_actions_width;
-        if !(0.0..=CHROME_HEIGHT).contains(&y) || x < TITLEBAR_BRAND_WIDTH || x >= tab_region_right
-        {
+        if !(0.0..=CHROME_HEIGHT).contains(&y) || x < leading_width || x >= tab_region_right {
             return None;
         }
-        let offset = x - TITLEBAR_BRAND_WIDTH - f32::from(self.tab_scroll_handle.offset().x);
+        let offset = x - leading_width - f32::from(self.tab_scroll_handle.offset().x);
         let index = (offset / header.tab_width).floor().max(0.0) as usize;
         let workspace = self.workspace.as_ref()?;
         let session_id = self.state.selected_session.as_ref()?;

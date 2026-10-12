@@ -33,6 +33,13 @@ pub enum Action {
     DockPane {
         pane_id: PaneId,
     },
+    /// Focus the content pane `pane_id`, show `file` (one of its open files) and put
+    /// the cursor at the start of the 1-based `line`, scrolled into view.
+    RevealFile {
+        pane_id: PaneId,
+        file: String,
+        line: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +75,9 @@ impl Request {
             && (cols < crate::layout::MIN_COLUMNS as i16 || rows < crate::layout::MIN_ROWS as i16)
         {
             return Err("GUI panes require at least 20 columns and 4 rows".into());
+        }
+        if let Action::RevealFile { line: 0, .. } = self.action {
+            return Err("file lines are numbered from 1".into());
         }
         Ok(())
     }

@@ -1,10 +1,10 @@
 use crate::Result;
 use crate::frame;
 use crate::{
-    CONTROL_FRAME, ClientControl, ClientMessage, DirectoryEntry, ErrorCode,
-    IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest,
-    PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId,
-    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
+    CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, DirectoryEntry, ErrorCode,
+    FileVersion, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt,
+    MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage,
+    SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
     decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
@@ -727,6 +727,50 @@ impl DaemonClient {
             query,
         })? {
             ServerMessage::DirectorySearched { entries } => Ok(entries),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// List immediate children of an absolute folder in a content environment.
+    pub fn list_content_directory(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+    ) -> Result<Vec<DirectoryEntry>> {
+        match self.request(ClientMessage::ListContentDirectory { environment, path })? {
+            ServerMessage::ContentDirectoryListed { entries } => Ok(entries),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Read a UTF-8 text file and the version a later save must match.
+    pub fn read_content_file(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+    ) -> Result<(String, FileVersion)> {
+        match self.request(ClientMessage::ReadContentFile { environment, path })? {
+            ServerMessage::ContentFileRead { text, version } => Ok((text, version)),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Save `text` if the file still matches `expected` (`None` creates a new file).
+    /// A changed file fails with a `DaemonError` whose code is `ErrorCode::FileConflict`.
+    pub fn write_content_file(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+        expected: Option<FileVersion>,
+        text: String,
+    ) -> Result<FileVersion> {
+        match self.request(ClientMessage::WriteContentFile {
+            environment,
+            path,
+            expected,
+            text,
+        })? {
+            ServerMessage::ContentFileWritten { version } => Ok(version),
             message => Err(unexpected_response(message)),
         }
     }

@@ -1,4 +1,4 @@
-use compi_protocol::PaneId;
+use compi_protocol::{ContentEnvironment, PaneId, SurfaceId};
 
 #[derive(Clone, Debug)]
 pub(in crate::gui) struct Entry {
@@ -26,6 +26,10 @@ pub(in crate::gui) struct FileTree {
     pub searching: bool,
     pub pending_shell: bool,
     pub project_mode: bool,
+    /// The terminal surface the daemon lists and searches folders through.
+    pub surface_id: Option<SurfaceId>,
+    /// Open file…: a chosen file opens in a content pane of this environment.
+    pub opens_in: Option<ContentEnvironment>,
     pub error: Option<String>,
     pub request: u64,
     pub search_request: u64,
@@ -34,7 +38,7 @@ pub(in crate::gui) struct FileTree {
 impl FileTree {
     pub fn new(pane_id: PaneId, path: String) -> Self {
         let name = path
-            .rsplit('/')
+            .rsplit(['/', '\\'])
             .find(|part| !part.is_empty())
             .unwrap_or("/");
         Self {
@@ -54,6 +58,8 @@ impl FileTree {
             searching: false,
             pending_shell: false,
             project_mode: false,
+            surface_id: None,
+            opens_in: None,
             error: None,
             request: 1,
             search_request: 0,
@@ -160,12 +166,18 @@ impl FileTree {
     }
 }
 
+/// `name` inside `parent`, joined with the separator `parent` uses: native Windows
+/// folders of a content pane use backslashes, every other path forward slashes.
 pub(super) fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
-        format!("/{name}")
-    } else {
-        format!("{}/{name}", parent.trim_end_matches('/'))
+        return format!("/{name}");
     }
+    let separator = if parent.contains('\\') && !parent.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    format!("{}{separator}{name}", parent.trim_end_matches(['/', '\\']))
 }
 
 #[cfg(test)]
@@ -227,5 +239,21 @@ mod tests {
         ]);
         tree.move_selection(1);
         assert_eq!(tree.selected().unwrap().path, "/work/other/beta.txt");
+    }
+
+    #[test]
+    fn windows_folders_keep_backslashes() {
+        let mut tree = FileTree::new(PaneId::new("pane"), r"C:\work\".into());
+        assert_eq!(tree.rows[0].name, "work");
+        tree.replace_children(
+            r"C:\work\",
+            vec![Entry {
+                name: "main.rs".into(),
+                directory: false,
+            }],
+        );
+        assert_eq!(tree.rows[1].path, r"C:\work\main.rs");
+        assert_eq!(join_path(r"C:\", "src"), r"C:\src");
+        assert_eq!(join_path("/mnt/c/work/", "src"), "/mnt/c/work/src");
     }
 }

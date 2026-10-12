@@ -1,5 +1,6 @@
 #[cfg(windows)]
 pub mod conpty;
+mod content_files;
 pub mod daemon;
 pub mod file_tree;
 pub mod launch;

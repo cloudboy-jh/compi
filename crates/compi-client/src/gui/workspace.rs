@@ -4,8 +4,9 @@ use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle
 use sha2::{Digest, Sha256};
 pub(in crate::gui) mod arrangements;
 pub(super) mod catalog;
-mod content;
+pub(in crate::gui) mod content;
 pub(in crate::gui) mod dialogs;
+mod files;
 mod focus;
 pub(super) mod media;
 pub(in crate::gui) mod metadata;
@@ -794,7 +795,7 @@ impl CompiApp {
             pending_present_latency_ids: Vec::new(),
             window_title: "Compi".into(),
             focus_handle: cx.focus_handle(),
-            content_focus: cx.focus_handle(),
+            content: content::ContentUi::default(),
             ime_text: String::new(),
             ime_marked_range: None,
             ime_selected_range: 0..0,
@@ -928,6 +929,15 @@ impl CompiApp {
             .push(cx.observe_window_activation(window, |this, window, cx| {
                 this.report_focus(window.is_window_active() && this.overlay.is_none());
                 cx.notify();
+            }));
+        let editor_keys = cx.entity().downgrade();
+        this.subscriptions
+            .push(cx.intercept_keystrokes(move |event, window, cx| {
+                if let Some(app) = editor_keys.upgrade() {
+                    app.update(cx, |this, cx| {
+                        this.intercept_editor_key(&event.keystroke, window, cx)
+                    });
+                }
             }));
         cx.spawn(async move |weak, cx| {
             loop {
@@ -1753,6 +1763,7 @@ impl CompiApp {
             self.state.reconcile(self.workspace.as_ref(), &workspace);
             self.workspace = Some(workspace);
             self.sync_visible_views();
+            self.prune_content();
             self.save_state();
         } else {
             self.workspace = Some(workspace);
@@ -1883,6 +1894,22 @@ impl CompiApp {
             } => {
                 self.tree_searched(pane_id, request, result);
             }
+            UiEvent::ContentListed {
+                pane_id,
+                root,
+                parent,
+                result,
+            } => self.content_listed(&pane_id, &root, &parent, result),
+            UiEvent::ContentFileRead {
+                pane_id,
+                path,
+                result,
+            } => self.content_file_read(pane_id, path, result),
+            UiEvent::ContentFileSaved {
+                pane_id,
+                path,
+                result,
+            } => self.content_file_saved(pane_id, path, result, cx),
             UiEvent::PromptResponded {
                 job,
                 request,
@@ -2980,6 +3007,7 @@ impl CompiApp {
         let visible: Vec<_> = session
             .map(|session| self.state.visible_tabs(session).collect())
             .unwrap_or_default();
+        let file_scope = self.file_scope();
         commands::CommandContext {
             connected: workspace.is_some() && !self.loading_surfaces,
             workspace_count: workspace.map_or(0, |workspace| workspace.sessions.len()),
@@ -3004,6 +3032,11 @@ impl CompiApp {
             has_tab: tab.is_some(),
             has_pane: pane.is_some(),
             content_pane: self.focused_content().is_some(),
+            files_reason: file_scope.as_ref().err().copied(),
+            file_search_reason: file_scope
+                .as_ref()
+                .ok()
+                .and_then(|scope| scope.search.as_ref().err().copied()),
             tab_index: tab
                 .and_then(|tab| visible.iter().position(|item| item.id == tab.id))
                 .unwrap_or(0),
@@ -3137,7 +3170,7 @@ impl CompiApp {
         if self.inspector_key(key, window, cx) {
             return true;
         }
-        if self.handle_tree_key(key, cx) {
+        if self.handle_tree_key(key, window, cx) {
             return true;
         }
         if key.key == "escape" && self.cancel_pane_drag() {
@@ -3279,6 +3312,10 @@ impl CompiApp {
             cx.notify();
             return true;
         }
+        if self.editor_has_keyboard(window, cx) {
+            // The keystroke interceptor already ran Compi's shortcuts; the rest is text.
+            return false;
+        }
         let platform = if cfg!(target_os = "macos") {
             commands::Platform::Mac
         } else {
@@ -3308,7 +3345,7 @@ impl CompiApp {
                 true
             }
             commands::KeyRoute::Owned => true,
-            commands::KeyRoute::Terminal => false,
+            commands::KeyRoute::Terminal | commands::KeyRoute::Editor => false,
         }
     }
 
@@ -3658,8 +3695,18 @@ impl CompiApp {
             Command::RemovePane => {
                 if let Some(pane_id) = pane_id {
                     if content_focused {
-                        // No process ends, so there is nothing to confirm.
-                        self.mutate(WorkspaceMutation::RemovePane { pane_id }, false);
+                        // No process ends; only unsaved edits would be lost.
+                        match self.unsaved_files(&pane_id) {
+                            0 => self.mutate(WorkspaceMutation::RemovePane { pane_id }, false),
+                            count => {
+                                self.global_error = Some(format!(
+                                    "{count} file{} in this pane {} unsaved changes; save or close {} first",
+                                    if count == 1 { "" } else { "s" },
+                                    if count == 1 { "has" } else { "have" },
+                                    if count == 1 { "it" } else { "them" },
+                                ));
+                            }
+                        }
                     } else {
                         self.close_work(
                             WorkspaceMutation::RemovePane { pane_id },
@@ -3706,6 +3753,9 @@ impl CompiApp {
             }
             Command::BrowseFiles => self.open_file_tree(),
             Command::JumpProject => self.open_project_jump(),
+            Command::ShowFiles => self.show_files(false, window, cx),
+            Command::NewEditor => self.show_files(true, window, cx),
+            Command::OpenFile => self.open_file_picker(),
             Command::Copy => self.copy_selection(cx),
             Command::Paste => self.paste_clipboard(cx),
             Command::SelectAll => {
@@ -4657,7 +4707,6 @@ impl CompiApp {
                 window.on_next_frame(move |_, cx| cx.notify(view_id));
             }
         }
-        self.reconcile_keyboard_focus(window, cx);
         if let Some((appearance, favorites, ui_font, density, terminal_font_family)) =
             self.pending_appearance_reload.take()
         {
@@ -4678,6 +4727,9 @@ impl CompiApp {
             let view_id = cx.entity_id();
             window.on_next_frame(move |_, cx| cx.notify(view_id));
         }
+        self.sync_editor_theme(cx);
+        self.prepare_content(window, cx);
+        self.reconcile_keyboard_focus(window, cx);
         for view in &mut self.surface_views {
             if !view.stop.load(Ordering::Acquire) {
                 view.refresh_images(
@@ -5042,10 +5094,11 @@ impl CompiApp {
         let colors = *self.colors();
         let header_alpha = self.effective_background_opacity();
         let (window_width, _) = logical_viewport_dimensions(window);
-        let metrics = header_metrics(window_width);
+        let leading_width = titlebar_leading_width(window);
+        let metrics = header_metrics(window_width, leading_width);
         let trailing_width =
             WINDOW_CONTROLS_WIDTH + HEADER_BUTTON_SLOT_WIDTH + metrics.pane_actions_width;
-        let tab_region_right = (window_width - trailing_width).max(TITLEBAR_BRAND_WIDTH);
+        let tab_region_right = (window_width - trailing_width).max(leading_width);
         let visible: Vec<_> = self
             .workspace
             .as_ref()
@@ -5245,7 +5298,7 @@ impl CompiApp {
                 div()
                     .id("app-mark-slot")
                     .absolute()
-                    .left(px(TITLEBAR_BRAND_WIDTH - 80.0))
+                    .left(px(leading_width - 80.0))
                     .top_0()
                     .h_full()
                     .w(px(40.0))
@@ -5258,7 +5311,7 @@ impl CompiApp {
                 div()
                     .id("sidebar-toggle-slot")
                     .absolute()
-                    .left(px(TITLEBAR_BRAND_WIDTH - 40.0))
+                    .left(px(leading_width - 40.0))
                     .top_0()
                     .h_full()
                     .w(px(40.0))
@@ -5289,10 +5342,10 @@ impl CompiApp {
                     .is_some_and(|position| f32::from(position.y) <= CHROME_HEIGHT),
                 |bar| {
                     let x = f32::from(self.drag_position.unwrap().x);
-                    let insertion = (((x - TITLEBAR_BRAND_WIDTH) / metrics.tab_width).round()
+                    let insertion = (((x - leading_width) / metrics.tab_width).round()
                         * metrics.tab_width
-                        + TITLEBAR_BRAND_WIDTH)
-                        .clamp(TITLEBAR_BRAND_WIDTH, tab_region_right);
+                        + leading_width)
+                        .clamp(leading_width, tab_region_right);
                     bar.child(
                         div()
                             .absolute()
@@ -5308,7 +5361,7 @@ impl CompiApp {
                 div()
                     .id("terminal-tabs")
                     .absolute()
-                    .left(px(TITLEBAR_BRAND_WIDTH))
+                    .left(px(leading_width))
                     .right(px(trailing_width))
                     .h_full()
                     .flex()
@@ -6893,19 +6946,19 @@ impl CompiApp {
                 && pointer_x < viewport_width
                 && pointer_y < viewport_height;
             if inside {
-                let header = header_metrics(viewport_width);
+                let leading_width = titlebar_leading_width(window);
+                let header = header_metrics(viewport_width, leading_width);
                 let tab_region_right = viewport_width
                     - WINDOW_CONTROLS_WIDTH
                     - HEADER_BUTTON_SLOT_WIDTH
                     - header.pane_actions_width;
                 if pointer_y <= CHROME_HEIGHT
-                    && pointer_x >= TITLEBAR_BRAND_WIDTH
+                    && pointer_x >= leading_width
                     && pointer_x < tab_region_right
                     && let Some(session_id) = self.state.selected_session.clone()
                 {
-                    let x = pointer_x
-                        - TITLEBAR_BRAND_WIDTH
-                        - f32::from(self.tab_scroll_handle.offset().x);
+                    let x =
+                        pointer_x - leading_width - f32::from(self.tab_scroll_handle.offset().x);
                     let visible_index = (x / header.tab_width).floor().max(0.0) as usize;
                     let session = self.workspace.as_ref().and_then(|workspace| {
                         workspace
@@ -7735,8 +7788,8 @@ mod tests {
     use super::{
         COMPACT_TAB_WIDTH, HEADER_BUTTON_SLOT_WIDTH, PANE_ACTIONS_COMPACT_WIDTH,
         PANE_ACTIONS_FULL_WIDTH, PaneActionsMode, PaneZoomState, TAB_WIDTH, TITLEBAR_BRAND_WIDTH,
-        WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title, display_index_for_bounds,
-        header_metrics, opacity_at_slider_position,
+        TITLEBAR_TRAFFIC_LIGHT_INSET, WINDOW_CONTROLS_WIDTH, concise_path_title, concise_tab_title,
+        display_index_for_bounds, header_metrics, opacity_at_slider_position,
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};
@@ -8013,24 +8066,25 @@ mod tests {
 
     #[test]
     fn narrow_header_collapses_before_active_tab_becomes_a_sliver() {
-        let wide_threshold = TITLEBAR_BRAND_WIDTH
+        let leading_width = TITLEBAR_BRAND_WIDTH + TITLEBAR_TRAFFIC_LIGHT_INSET;
+        let wide_threshold = leading_width
             + WINDOW_CONTROLS_WIDTH
             + HEADER_BUTTON_SLOT_WIDTH
             + PANE_ACTIONS_FULL_WIDTH
             + TAB_WIDTH;
         assert_eq!(
-            header_metrics(wide_threshold).pane_actions,
+            header_metrics(wide_threshold, leading_width).pane_actions,
             PaneActionsMode::Full
         );
         assert_eq!(
-            header_metrics(wide_threshold - 1.0).pane_actions,
+            header_metrics(wide_threshold - 1.0, leading_width).pane_actions,
             PaneActionsMode::Compact
         );
 
-        let minimum = header_metrics(420.0);
+        let minimum = header_metrics(420.0, leading_width);
         assert_eq!(minimum.pane_actions, PaneActionsMode::Compact);
         assert!(minimum.tab_width >= COMPACT_TAB_WIDTH);
-        let occupied = TITLEBAR_BRAND_WIDTH
+        let occupied = leading_width
             + WINDOW_CONTROLS_WIDTH
             + HEADER_BUTTON_SLOT_WIDTH
             + PANE_ACTIONS_COMPACT_WIDTH

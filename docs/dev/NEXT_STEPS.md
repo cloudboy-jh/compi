@@ -2,20 +2,11 @@
 
 Remaining phases of features 1 and 2 (editor, then diffs and Git), one phase per session. Product scope lives in the separate features doc; finished work is in [Completed work](COMPLETED.md).
 
-Done: phase 0, GPUI upgrade (`2e2b9fe`), and phase 1, content panes (`4b458be`).
+Done: phase 0, GPUI upgrade (`2e2b9fe`); phase 1, content panes (`4b458be`); phase 2, files and editor (see [Completed work](COMPLETED.md#files-and-editor-phase-2--2026-10-11)).
 
 **Goal:** edit, save, run, review, commit and push Compi itself inside Compi, without opening Zed.
 
-## Phase 2: Files and editor
-
-- The daemon reads and saves files in the shell's real environment (local, WSL or SSH), with versioned saves.
-- With no file open, the content pane shows the folder across the whole pane. Picking a file turns it into the GPUI Kit editor, with file tabs and an optional collapsible tree inside the pane. The workspace sidebar doesn't change.
-- Editor: syntax highlighting, line numbers, search, file switching and save.
-- Open it with `compi files [dir]`, `compi edit [file[:line]]`, the palette (Files, Open file…, New editor) and terminal file links. New panes open beside the current terminal, with no new shell or tab.
-- Risk: GPUI Kit components may need their own root view; if so, Compi's window root gets wrapped here.
-- Also qualify content panes on Windows/WSL, which phase 1 could not.
-
-**Done when:** you can open a real Compi source file, edit it, save it, then run the changed code in the terminal next to it.
+Phase 2 left open: macOS qualification of the editor and the three macOS fixes, live TUI redraws through ConPTY with synchronized output, and IME in the editor.
 
 ## Phase 3: File safety
 

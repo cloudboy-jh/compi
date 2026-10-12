@@ -22,7 +22,8 @@ use lifecycle::PaneError;
 mod workspace;
 use crate::typography::TerminalTypography;
 use crate::viewport::{
-    inherited_working_directory, visible_row, visible_rows, visible_to_absolute, web_link_at,
+    file_link_at, inherited_working_directory, visible_row, visible_rows, visible_to_absolute,
+    web_link_at,
 };
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use base64::Engine as _;
@@ -82,10 +83,12 @@ const PANE_ACTIONS_COMPACT_WIDTH: f32 = 40.0;
 const WINDOW_CONTROLS_WIDTH: f32 = 138.0;
 #[cfg(target_os = "macos")]
 const WINDOW_CONTROLS_WIDTH: f32 = 0.0;
-#[cfg(windows)]
 const TITLEBAR_BRAND_WIDTH: f32 = 80.0;
+/// Space reserved for the macOS traffic lights; they are hidden in native fullscreen.
+#[cfg(windows)]
+const TITLEBAR_TRAFFIC_LIGHT_INSET: f32 = 0.0;
 #[cfg(target_os = "macos")]
-const TITLEBAR_BRAND_WIDTH: f32 = 158.0;
+const TITLEBAR_TRAFFIC_LIGHT_INSET: f32 = 78.0;
 const UI_BODY_TEXT_SIZE: f32 = 14.0;
 const UI_SMALL_TEXT_SIZE: f32 = 13.0;
 const UI_MICRO_TEXT_SIZE: f32 = 12.0;
@@ -140,10 +143,11 @@ fn run_application(
     let empty_measurement = perf::empty_window_enabled();
     gpui_platform::application().run(move |cx: &mut App| {
         let mut config = config;
-        if !empty_measurement
-            && let Err(error) = crate::font_catalog::register_bundled(cx.text_system())
-        {
-            config.diagnostics.push(error);
+        if !empty_measurement {
+            gpui_component::init(cx);
+            if let Err(error) = crate::font_catalog::register_bundled(cx.text_system()) {
+                config.diagnostics.push(error);
+            }
         }
         let opened = if empty_measurement {
             open_empty_measurement_window(cx)
@@ -559,6 +563,22 @@ enum UiEvent {
         request: u64,
         result: Result<Vec<compi_protocol::SearchEntry>, String>,
     },
+    ContentListed {
+        pane_id: PaneId,
+        root: String,
+        parent: String,
+        result: Result<Vec<compi_protocol::DirectoryEntry>, String>,
+    },
+    ContentFileRead {
+        pane_id: PaneId,
+        path: String,
+        result: Result<(String, compi_protocol::FileVersion), String>,
+    },
+    ContentFileSaved {
+        pane_id: PaneId,
+        path: String,
+        result: Result<compi_protocol::FileVersion, String>,
+    },
     PromptResponded {
         job: workspace::prompt::PromptJob,
         request: u64,
@@ -690,11 +710,18 @@ struct HeaderMetrics {
     tab_width: f32,
 }
 
-fn header_metrics(window_width: f32) -> HeaderMetrics {
-    let full_fixed = TITLEBAR_BRAND_WIDTH
-        + WINDOW_CONTROLS_WIDTH
-        + HEADER_BUTTON_SLOT_WIDTH
-        + PANE_ACTIONS_FULL_WIDTH;
+/// Width of the leading titlebar region (traffic lights + brand slots) before the tabs.
+fn titlebar_leading_width(window: &Window) -> f32 {
+    if window.is_fullscreen() {
+        TITLEBAR_BRAND_WIDTH
+    } else {
+        TITLEBAR_BRAND_WIDTH + TITLEBAR_TRAFFIC_LIGHT_INSET
+    }
+}
+
+fn header_metrics(window_width: f32, leading_width: f32) -> HeaderMetrics {
+    let full_fixed =
+        leading_width + WINDOW_CONTROLS_WIDTH + HEADER_BUTTON_SLOT_WIDTH + PANE_ACTIONS_FULL_WIDTH;
     let pane_actions = if window_width - full_fixed >= TAB_WIDTH {
         PaneActionsMode::Full
     } else {
@@ -705,7 +732,7 @@ fn header_metrics(window_width: f32) -> HeaderMetrics {
         PaneActionsMode::Compact => PANE_ACTIONS_COMPACT_WIDTH,
     };
     let available = window_width
-        - TITLEBAR_BRAND_WIDTH
+        - leading_width
         - WINDOW_CONTROLS_WIDTH
         - HEADER_BUTTON_SLOT_WIDTH
         - pane_actions_width;
@@ -813,9 +840,9 @@ struct CompiApp {
     pending_present_latency_ids: Vec<u64>,
     window_title: String,
     focus_handle: FocusHandle,
-    /// Keyboard focus of the focused content pane. Its keys run Compi shortcuts and
-    /// never reach a shell; `focus_handle` keeps terminal and overlay input.
-    content_focus: FocusHandle,
+    /// Content panes' client-local state: keyboard focus, folder trees and open editors.
+    /// Their keys never reach a shell; `focus_handle` keeps terminal and overlay input.
+    content: workspace::content::ContentUi,
     ime_text: String,
     ime_marked_range: Option<Range<usize>>,
     ime_selected_range: Range<usize>,
@@ -951,16 +978,7 @@ impl CompiApp {
 
     /// The focused pane's content, if it is a content pane.
     fn focused_content(&self) -> Option<&compi_protocol::PaneContent> {
-        let pane = self.focused_pane()?;
-        self.workspace
-            .as_ref()?
-            .sessions
-            .iter()
-            .flat_map(|session| &session.tabs)
-            .find_map(|tab| match workspace::leaf_node(&tab.layout, pane)? {
-                LayoutNode::Content { content, .. } => Some(content),
-                _ => None,
-            })
+        workspace::content::find_content(self.workspace.as_ref()?, self.focused_pane()?)
     }
     fn refresh_typography(&mut self, window: &Window) -> bool {
         let scale = window.scale_factor();
@@ -1171,9 +1189,12 @@ impl CompiApp {
         let activates_hyperlink = Self::activates_hyperlink(
             event.button,
             event.modifiers,
-            visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point)
-                .and_then(|point| web_link_at(tab.mirror.snapshot(), point))
-                .is_some(),
+            visible_to_absolute(tab.mirror.snapshot(), tab.scroll_offset, point).is_some_and(
+                |point| {
+                    web_link_at(tab.mirror.snapshot(), point).is_some()
+                        || file_link_at(tab.mirror.snapshot(), point).is_some()
+                },
+            ),
         );
         tab.mouse_reporting_down = false;
         if Self::terminal_owns_mouse(mouse_mode, event.modifiers, activates_hyperlink) {
@@ -1288,7 +1309,7 @@ impl CompiApp {
         &mut self,
         event: &MouseUpEvent,
         pane_id: &PaneId,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.pane_drag.is_some() {
@@ -1352,15 +1373,20 @@ impl CompiApp {
                     && strict_point.is_some()
                     && event.button == MouseButton::Left
                     && event.modifiers.secondary())
-                .then(|| web_link_at(tab.mirror.snapshot(), selection.head))
-                .flatten()
+                .then_some(selection.head)
             } else {
                 None
             };
-            if let Some(uri) = clicked_link
-                && let Err(error) = open_web_url(&uri)
-            {
-                self.global_error = Some(format!("Could not open link: {error}"));
+            // Web links win over file paths, as they do over mouse reporting.
+            if let Some(point) = clicked_link {
+                let snapshot = tab.mirror.snapshot();
+                if let Some(uri) = web_link_at(snapshot, point) {
+                    if let Err(error) = open_web_url(&uri) {
+                        self.global_error = Some(format!("Could not open link: {error}"));
+                    }
+                } else if let Some(location) = file_link_at(snapshot, point) {
+                    self.open_terminal_file_link(pane_id, location, window, cx);
+                }
             }
         }
         self.save_state();

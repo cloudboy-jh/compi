@@ -9,6 +9,7 @@ pub mod config;
 pub mod connection;
 #[cfg(windows)]
 pub mod console;
+pub mod content_path;
 pub mod font_catalog;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod gui;

@@ -140,6 +140,16 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "Split the selected terminal pane, or fill the selected tab to TOTAL panes and arrange it. Reuses all existing shells and IDs; a lower total is rejected before mutation. Built-ins and named configured presets are accepted.",
             "compi split --panes 4 --layout grid",
         ),
+        ("files", _) => (
+            "files [DIR]",
+            "Browse DIR (default: the shell's current directory) in a content pane beside the selected terminal, in that terminal's environment (host or its WSL distribution). Relative DIR resolves against the shell's directory; . and .. are resolved without touching the filesystem. A content pane in the tab already showing DIR is focused instead of opening another; from a content pane (--pane), that pane shows DIR.",
+            "compi files ../docs",
+        ),
+        ("edit", _) => (
+            "edit [FILE[:LINE[:COL]]]",
+            "Open FILE in a content pane beside the selected terminal and put the cursor on LINE (default 1; COL is accepted and ignored). Reuses a content pane in the tab whose folder holds FILE (or the --pane content pane); otherwise opens one rooted at the shell's directory when it holds FILE, else at FILE's folder. A missing or unreadable FILE is reported by the editor. An existing folder without :LINE, or no FILE, browses it like files. With no Compi window showing the tab the pane still opens and a note says it was not shown.",
+            "compi edit src/main.rs:42",
+        ),
         ("layout", _) => (
             "layout list | PRESET | mirror | flip | restore",
             "Arrange the selected tab without restarting processes. Presets come from built-ins and configured layout_presets. Restore returns to the previous arrangement, or restores original tabs immediately after a merge.",
@@ -182,7 +192,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         _ => (
             "[GLOBAL OPTIONS] COMMAND [ARGS]",
-            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
+            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
             "compi --instance dev --json workspace list",
         ),
     };

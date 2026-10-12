@@ -26,11 +26,14 @@ pub struct SearchEntry {
     pub is_directory: bool,
 }
 
-struct Root {
-    host: PathBuf,
-    shell: String,
+/// A folder or file resolved to the path this host opens, keeping the requested path for
+/// messages and WSL symlink resolution.
+pub(crate) struct Root {
+    pub(crate) host: PathBuf,
+    pub(crate) shell: String,
+    /// The WSL distribution whose share holds `host`; `None` for native Windows paths.
     #[cfg(windows)]
-    distribution: String,
+    pub(crate) distribution: Option<String>,
 }
 
 struct ScannedEntry {
@@ -41,7 +44,11 @@ struct ScannedEntry {
 /// List immediate children of an absolute path in the terminal's path namespace.
 /// On Windows, the path is a WSL path and `distribution` selects its WSL2 share.
 pub fn list_directory(path: &str, distribution: Option<&str>) -> Result<Vec<DirectoryEntry>> {
-    let root = resolve_root(path, distribution)?;
+    list_root(resolve_root(path, distribution)?)
+}
+
+/// List immediate children of a resolved folder, directories first.
+pub(crate) fn list_root(root: Root) -> Result<Vec<DirectoryEntry>> {
     #[cfg(windows)]
     let mut root = root;
     let mut count = 0;
@@ -52,7 +59,7 @@ pub fn list_directory(path: &str, distribution: Option<&str>) -> Result<Vec<Dire
         root.host.as_path(),
         &root.shell,
         #[cfg(windows)]
-        &root.distribution,
+        root.distribution.as_deref(),
         Instant::now(),
         &mut count,
         MAX_DIRECTORY_ENTRIES,
@@ -106,7 +113,7 @@ pub fn search_files(
             host.as_path(),
             &shell,
             #[cfg(windows)]
-            &root.distribution,
+            root.distribution.as_deref(),
             started,
             &mut count,
             MAX_SEARCH_ENTRIES,
@@ -160,7 +167,7 @@ fn scan_directory(
     #[cfg(windows)] host: &mut PathBuf,
     #[cfg(not(windows))] host: &std::path::Path,
     shell: &str,
-    #[cfg(windows)] distribution: &str,
+    #[cfg(windows)] distribution: Option<&str>,
     started: Instant,
     count: &mut usize,
     max_entries: usize,
@@ -168,38 +175,22 @@ fn scan_directory(
 ) -> Result<Vec<ScannedEntry>> {
     check_time(started)?;
     #[cfg(windows)]
-    let directory = fs::read_dir(host.as_path());
+    let directory = match (fs::read_dir(host.as_path()), distribution) {
+        // A search skips unreadable descendants without starting WSL for each one.
+        (Err(error), Some(distribution))
+            if needs_wsl_resolution(&error)
+                && !(skip_unreadable && error.kind() == std::io::ErrorKind::PermissionDenied) =>
+        {
+            // Resolve only failed listings, keeping ordinary directories on the share.
+            *host = compi_protocol::wsl::windows_path_for_wsl(shell, distribution)?;
+            fs::read_dir(host.as_path())
+        }
+        (directory, _) => directory,
+    };
     #[cfg(not(windows))]
     let directory = fs::read_dir(host);
     let directory = match directory {
         Ok(directory) => directory,
-        #[cfg(windows)]
-        Err(error)
-            if matches!(error.raw_os_error(), Some(code)
-                if code == windows::Win32::Foundation::ERROR_DIRECTORY.0 as i32
-                    || code == windows::Win32::Foundation::ERROR_PATH_NOT_FOUND.0 as i32) =>
-        {
-            // Windows exposes a WSL symlink into a mounted drive as a file,
-            // and descendants of that link as missing paths. Resolve only
-            // failed listings, keeping ordinary directories on the native path.
-            let resolved = compi_protocol::wsl::windows_path_for_wsl(shell, distribution)?;
-            *host = resolved;
-            match fs::read_dir(host.as_path()) {
-                Ok(directory) => directory,
-                Err(error)
-                    if skip_unreadable
-                        && matches!(
-                            error.kind(),
-                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                        ) =>
-                {
-                    return Ok(Vec::new());
-                }
-                Err(error) => {
-                    return Err(format!("cannot open directory {shell:?}: {error}").into());
-                }
-            }
-        }
         Err(error)
             if skip_unreadable
                 && matches!(
@@ -244,21 +235,34 @@ fn check_time(started: Instant) -> Result<()> {
     Ok(())
 }
 
+/// Whether a failed access through the WSL share may succeed on the path WSL resolves.
+/// Windows cannot follow a Linux symlink on the share (a link into a mounted drive reads as
+/// a file and its descendants as missing), and the share denies access to drive mounts such
+/// as `/mnt/c`, which `wslpath` maps to native Windows paths.
+#[cfg(windows)]
+pub(crate) fn needs_wsl_resolution(error: &std::io::Error) -> bool {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_PATH_NOT_FOUND};
+    matches!(error.raw_os_error(), Some(code)
+        if [ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_PATH_NOT_FOUND]
+            .iter()
+            .any(|known| code == known.0 as i32))
+}
+
 fn validate_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.len() > MAX_PATH_BYTES
         || path.contains('\0')
         || !path.starts_with('/')
     {
-        return Err(
-            "directory path must be an absolute Unix path (up to 4096 bytes) without NUL".into(),
-        );
+        return Err("path must be an absolute Unix path (up to 4096 bytes) without NUL".into());
     }
     Ok(())
 }
 
+/// Resolve an absolute path in the terminal's path namespace: the host's own on Unix,
+/// and on Windows a WSL path inside `distribution` (or the default distribution).
 #[cfg(unix)]
-fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Root> {
+pub(crate) fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Root> {
     validate_path(path)?;
     if distribution.is_some() {
         return Err("WSL distribution is not supported on this host".into());
@@ -273,7 +277,7 @@ fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Root> {
 }
 
 #[cfg(windows)]
-fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Root> {
+pub(crate) fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Root> {
     let segments = wsl_segments(path)?;
     // Explicit distributions are attached to the surface; their WSL2 status
     // need only be checked once. Never cache the default: it can change while
@@ -309,9 +313,34 @@ fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Root> {
     Ok(Root {
         host,
         shell,
-        distribution: name,
+        distribution: Some(name),
     })
 }
+
+/// Resolve an absolute native Windows path: a drive path such as `C:\folder` or a UNC share.
+/// Verbatim (`\\?\`) and device (`\\.\`) paths are not folders a user browses.
+#[cfg(windows)]
+pub(crate) fn resolve_host_root(path: &str) -> Result<Root> {
+    use std::path::{Component, Prefix};
+    let host = PathBuf::from(path);
+    let mut components = host.components();
+    let absolute = matches!(
+        components.next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(..))
+    ) && components.next() == Some(Component::RootDir);
+    if !absolute || path.len() > MAX_PATH_BYTES || path.contains('\0') {
+        return Err(
+            "path must be an absolute Windows path such as C:\\folder (up to 4096 bytes) without NUL"
+                .into(),
+        );
+    }
+    Ok(Root {
+        host,
+        shell: path.to_owned(),
+        distribution: None,
+    })
+}
+
 #[cfg(windows)]
 fn wsl_segments(path: &str) -> Result<Vec<&str>> {
     validate_path(path)?;

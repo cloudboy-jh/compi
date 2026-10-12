@@ -25,6 +25,22 @@ base64.workspace = true
 smallvec.workspace = true
 gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8" }
+gpui-component = { version = "=0.7.1", default-features = false, features = [
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-css",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-javascript",
+    "tree-sitter-markdown",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-toml",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 raw-window-handle = "0.6"
 

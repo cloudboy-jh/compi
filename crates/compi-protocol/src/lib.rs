@@ -32,10 +32,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // Version 19 adds content panes: layout leaves without a terminal surface.
-pub const PROTOCOL_VERSION: u32 = 19;
+// Version 20 adds content files: environment directory listing, file reads and versioned saves.
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
-pub const MAX_CONTROL_PAYLOAD: usize = 1024 * 1024;
+/// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
+/// byte into six characters.
+pub const MAX_CONTROL_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const MAX_MUTATION_RECEIPTS: usize = 1_024;
 pub const MAX_TAB_PANES: usize = 256;
 
@@ -50,6 +53,8 @@ pub const MAX_DIRECTORY_PATH_BYTES: usize = 4096;
 pub const MAX_DIRECTORY_QUERY_BYTES: usize = 256;
 /// Open files one content pane may list.
 pub const MAX_CONTENT_FILES: usize = 256;
+/// Largest file a content pane reads or saves, in bytes.
+pub const MAX_CONTENT_FILE_BYTES: usize = 1024 * 1024;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -242,6 +247,24 @@ pub enum ClientMessage {
         root: String,
         query: String,
     },
+    /// Immediate children of an absolute folder in a content environment.
+    ListContentDirectory {
+        environment: ContentEnvironment,
+        path: String,
+    },
+    /// A UTF-8 text file of at most `MAX_CONTENT_FILE_BYTES`.
+    ReadContentFile {
+        environment: ContentEnvironment,
+        path: String,
+    },
+    /// Replace a file's contents only if they still match `expected`; `None` creates a new
+    /// file and fails if one exists. A mismatch fails with `ErrorCode::FileConflict`.
+    WriteContentFile {
+        environment: ContentEnvironment,
+        path: String,
+        expected: Option<FileVersion>,
+        text: String,
+    },
     Mutate {
         mutation: MutationRequest,
     },
@@ -323,6 +346,16 @@ pub enum ServerMessage {
     DirectorySearched {
         entries: Vec<SearchEntry>,
     },
+    ContentDirectoryListed {
+        entries: Vec<DirectoryEntry>,
+    },
+    ContentFileRead {
+        text: String,
+        version: FileVersion,
+    },
+    ContentFileWritten {
+        version: FileVersion,
+    },
     WorkspaceChanged {
         revision: u64,
     },
@@ -384,6 +417,8 @@ pub enum ErrorCode {
     NotAttached,
     SurfaceUnavailable,
     RevisionConflict,
+    /// A save found the file changed since `expected`, or already present when creating.
+    FileConflict,
     StaleGeneration,
     StaleLifetime,
     MutationIdReused,
@@ -415,6 +450,14 @@ pub struct SearchEntry {
     /// Absolute path in the terminal's filesystem namespace.
     pub path: String,
     pub is_directory: bool,
+}
+
+/// The bytes a content file held when it was last read or saved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FileVersion {
+    pub len: u64,
+    /// Lowercase hexadecimal SHA-256 of the file's bytes.
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

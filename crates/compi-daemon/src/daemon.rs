@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::content_files;
 use crate::file_tree;
 use crate::launch;
 use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
@@ -921,6 +922,44 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, message),
                     }
                 }
+                ClientMessage::ListContentDirectory { environment, path } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| content_files::list_directory(&environment, &path))
+                    {
+                        Ok(entries) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ContentDirectoryListed { entries },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
+                ClientMessage::ReadContentFile { environment, path } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| content_files::read_file(&environment, &path))
+                    {
+                        Ok((text, version)) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ContentFileRead { text, version },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
+                ClientMessage::WriteContentFile {
+                    environment,
+                    path,
+                    expected,
+                    text,
+                } => {
+                    match without_target(target.as_ref()).and_then(|()| {
+                        content_files::write_file(&environment, &path, expected.as_ref(), &text)
+                    }) {
+                        Ok(version) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ContentFileWritten { version },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::Prompt {
                     distribution,
                     request,
@@ -1263,6 +1302,18 @@ fn validate_directory_path(path: &str) -> std::result::Result<(), (ErrorCode, &'
         ));
     }
     Ok(())
+}
+
+fn without_target(
+    target: Option<&TerminalTarget>,
+) -> std::result::Result<(), content_files::Failure> {
+    match target {
+        Some(_) => Err((
+            ErrorCode::InvalidRequest,
+            "content file operations do not accept an attachment target".to_owned(),
+        )),
+        None => Ok(()),
+    }
 }
 
 fn read_next(

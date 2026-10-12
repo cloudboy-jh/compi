@@ -18,6 +18,13 @@ struct PresentationChange {
 
 type PendingResize = (gpui::WindowHandle<CompiApp>, Applied, VecDeque<ResizeStep>);
 
+enum Pending {
+    Resize(PendingResize),
+    /// `compi edit` and `compi files` ask for the reveal or focus right after the workspace
+    /// change that adds the pane or file, so the window may not have received it yet.
+    Polled(gpui::WindowHandle<CompiApp>, Applied),
+}
+
 fn inventory(target: &TargetIdentity, cx: &mut App) -> Vec<WindowInfo> {
     cx.windows()
         .into_iter()
@@ -39,7 +46,7 @@ pub(in crate::gui) fn dispatch(
     completion: crate::window_host::ControlCompletion,
     cx: &mut App,
 ) {
-    let result = (|| -> crate::Result<Option<PendingResize>> {
+    let result = (|| -> crate::Result<Option<Pending>> {
         request.validate()?;
         if Instant::now() >= completion.deadline {
             return Err("GUI control expired before application; no operation was applied".into());
@@ -89,6 +96,17 @@ pub(in crate::gui) fn dispatch(
                     .map(|_| typed)
             })
             .ok_or("Selected window closed before application")?;
+        if matches!(
+            request.action,
+            Action::RevealFile { .. } | Action::FocusPane { .. }
+        ) {
+            let applied = Applied {
+                window_id: selected,
+                action: request.action.clone(),
+                destination_window_id: None,
+            };
+            return Ok(Some(Pending::Polled(handle, applied)));
+        }
         let change = handle.update(cx, |app, window, cx| {
             app.apply_presentation(&request.action, window, cx)
         })??;
@@ -98,7 +116,7 @@ pub(in crate::gui) fn dispatch(
             destination_window_id: change.destination,
         };
         if matches!(request.action, Action::ResizePane { .. }) {
-            Ok(Some((handle, applied, change.resize)))
+            Ok(Some(Pending::Resize((handle, applied, change.resize))))
         } else {
             let windows = inventory(&request.target, cx);
             let _ = completion.sender.send(Ok(Response {
@@ -113,7 +131,7 @@ pub(in crate::gui) fn dispatch(
             let _ = completion.sender.send(Err(error.to_string()));
         }
         Ok(None) => {}
-        Ok(Some((handle, applied, mut steps))) => {
+        Ok(Some(Pending::Resize((handle, applied, mut steps)))) => {
             cx.spawn(async move |cx| {
                 let mut active: Option<ResizeStep> = None;
                 loop {
@@ -174,6 +192,51 @@ pub(in crate::gui) fn dispatch(
                     }
                 }
             }).detach();
+        }
+        Ok(Some(Pending::Polled(handle, applied))) => {
+            cx.spawn(async move |cx| {
+                loop {
+                    let checked = cx.update(|cx| {
+                        handle.update(cx, |app, window, cx| {
+                            app.polled_presentation(&request.action, window, cx)
+                        })
+                    });
+                    match checked {
+                        Ok(Ok(true)) => {
+                            let response = cx.update(|cx| Response {
+                                windows: inventory(&request.target, cx),
+                                applied: Some(applied),
+                            });
+                            let _ = completion.sender.send(Ok(response));
+                            return;
+                        }
+                        Ok(Ok(false)) if Instant::now() < completion.deadline => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(20))
+                                .await;
+                        }
+                        Ok(Ok(false)) => {
+                            let _ = completion.sender.send(Err(match request.action {
+                                Action::RevealFile { .. } => "The pane did not list the file before the request expired; open it in the pane first",
+                                _ => "Pane ID does not exist in this window's daemon workspace",
+                            }
+                            .into()));
+                            return;
+                        }
+                        Ok(Err(error)) => {
+                            let _ = completion.sender.send(Err(error.to_string()));
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = completion.sender.send(Err(format!(
+                                "Window closed before the request was applied: {error}"
+                            )));
+                            return;
+                        }
+                    }
+                }
+            })
+            .detach();
         }
     }
 }
@@ -261,6 +324,7 @@ impl CompiApp {
             .ok_or("Window has no authoritative workspace")?;
         let tab_id = match action {
             Action::List => return Err("Listing is not a window mutation".into()),
+            Action::RevealFile { .. } => unreachable!("dispatch polls file reveals"),
             Action::FocusTab { tab_id } | Action::DetachTab { tab_id } => tab_id.clone(),
             Action::FocusPane { pane_id }
             | Action::ResizePane { pane_id, .. }
@@ -411,7 +475,7 @@ impl CompiApp {
                 self.rebuild_layout(window, true);
                 resize = self.resize_presentation(pane_id, *cols, *rows)?;
             }
-            Action::List => unreachable!(),
+            Action::List | Action::RevealFile { .. } => unreachable!(),
         }
         self.rebuild_layout(window, true);
         if let Action::ZoomPane { pane_id } = action
@@ -430,6 +494,115 @@ impl CompiApp {
             destination: None,
             resize,
         })
+    }
+
+    /// Applies an action `dispatch` polls: `Ok(false)` while this window has not yet received
+    /// the workspace change that added the pane (or, for a reveal, the file in it).
+    fn polled_presentation(
+        &mut self,
+        action: &Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> crate::Result<bool> {
+        let Action::FocusPane { pane_id } = action else {
+            return self.reveal_presentation(action, window, cx);
+        };
+        let known = self.workspace.as_ref().is_some_and(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .flat_map(|session| &session.tabs)
+                .any(|tab| layout_contains_pane(&tab.layout, pane_id))
+        });
+        if !known
+            || self.mutation_pending
+            || self.daemon_restarting
+            || self.update_quiesced.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        self.apply_presentation(action, window, cx).map(|_| true)
+    }
+
+    /// Applies `Action::RevealFile`: `Ok(false)` while the pane, or the file in it, has not
+    /// reached this window yet, so `dispatch` asks again.
+    fn reveal_presentation(
+        &mut self,
+        action: &Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> crate::Result<bool> {
+        let Action::RevealFile {
+            pane_id,
+            file,
+            line,
+        } = action
+        else {
+            unreachable!("polled_presentation passes only file reveals here");
+        };
+        if self.overlay.is_some() {
+            return Err("Close the active GUI menu or dialog before controlling this window; CLI requests cannot bypass confirmation".into());
+        }
+        if self.mutation_pending
+            || self.daemon_restarting
+            || self.update_quiesced.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or("Window has no authoritative workspace")?;
+        let Some(tab) = workspace
+            .sessions
+            .iter()
+            .flat_map(|session| &session.tabs)
+            .find(|tab| layout_contains_pane(&tab.layout, pane_id))
+        else {
+            return Ok(false);
+        };
+        if !workspace
+            .sessions
+            .iter()
+            .flat_map(|session| self.state.visible_tabs(session))
+            .any(|visible| visible.id == tab.id)
+        {
+            return Err(
+                "Tab is not visible in the selected window; choose the window that owns it".into(),
+            );
+        }
+        let Some(LayoutNode::Content { content, .. }) = leaf_node(&tab.layout, pane_id) else {
+            return Err("Pane shows a terminal, not files".into());
+        };
+        if !content.files.contains(file) {
+            return Ok(false);
+        }
+        let environment = content.environment.clone();
+        let tab_id = tab.id.clone();
+        if !self.state.is_floating(pane_id) {
+            self.select_terminal(tab_id, false);
+        }
+        self.focus_pane(pane_id.clone());
+        if self.focused_pane() != Some(pane_id) {
+            return Err("Pane could not receive GUI focus".into());
+        }
+        self.open_content_file(
+            pane_id,
+            environment,
+            None,
+            Some(file.clone()),
+            Some(*line),
+            false,
+            window,
+            cx,
+        );
+        self.rebuild_layout(window, true);
+        self.save_state();
+        window.focus(&self.focus_handle, cx);
+        cx.activate(true);
+        self.report_focus(window.is_window_active());
+        cx.notify();
+        Ok(true)
     }
 
     fn resize_presentation(

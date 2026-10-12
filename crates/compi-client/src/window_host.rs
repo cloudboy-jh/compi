@@ -15,7 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const VERSION: u32 = 6;
+// Version 7 adds the `reveal_file` presentation action for content panes.
+const VERSION: u32 = 7;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);

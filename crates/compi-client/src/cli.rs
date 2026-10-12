@@ -2,6 +2,7 @@
 //! to the owning native host; observation and explicit input never acquire a view.
 mod capture;
 mod changes;
+mod content;
 mod help;
 mod targets;
 #[cfg(any(windows, target_os = "macos"))]
@@ -25,6 +26,8 @@ const COMMANDS: &[&str] = &[
     "pane",
     "window",
     "split",
+    "files",
+    "edit",
     "layout",
     "run",
     "attach",
@@ -70,6 +73,7 @@ impl From<crate::Error> for CliError {
                 ErrorCode::Busy => (5, "busy"),
                 ErrorCode::IncompatibleProtocol => (5, "incompatible_protocol"),
                 ErrorCode::RevisionConflict => (6, "revision_conflict"),
+                ErrorCode::FileConflict => (6, "file_conflict"),
                 ErrorCode::StaleGeneration => (6, "stale_generation"),
                 ErrorCode::StaleLifetime => (6, "stale_lifetime"),
                 ErrorCode::MutationIdReused => (1, "mutation_id_reused"),
@@ -840,6 +844,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
             }
         }
         "split" => return split(&mut client, &mut state, options, &config),
+        "files" | "edit" => return content::run(&mut client, &state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
             let surface = pane_surface(&state, &surface_id)?.clone();
@@ -1344,6 +1349,7 @@ fn validate(
             &["--cwd", "--panes", "--layout"],
             &["--right", "--down"],
         ),
+        ("files" | "edit", _) => (1, 2, &[], &[]),
         ("layout", Some(_)) => (2, 2, &[], &[]),
         ("run", _) => (2, usize::MAX, &[], &[]),
         ("attach" | "detach", _) => (1, 1, &[], &[]),
@@ -1625,6 +1631,33 @@ mod tests {
         ] {
             let error = accepted(rejected).unwrap_err();
             assert_eq!(error.exit, 2, "{rejected:?}");
+        }
+    }
+    #[test]
+    fn files_and_edit_take_at_most_one_path() {
+        let validated = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(recognizes(&args));
+            parse(&args).and_then(|options| {
+                let command = options.args[0].clone();
+                validate(&options, &command, options.args.get(1).map(String::as_str))
+            })
+        };
+        for accepted in [
+            &["files"][..],
+            &["files", "../docs"],
+            &["edit"],
+            &["--json", "edit", "src/main.rs:12:5"],
+            &["--pane", "pane-1", "edit", "--", "-notes.md"],
+        ] {
+            assert!(validated(accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            &["edit", "a.rs", "b.rs"][..],
+            &["files", "--right"],
+            &["edit", "a.rs", "--cwd", "/tmp"],
+        ] {
+            assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }
     }
 }

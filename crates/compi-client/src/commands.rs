@@ -25,6 +25,7 @@ impl Platform {
 pub enum CommandCategory {
     Tabs,
     Panes,
+    Files,
     Workspaces,
     Terminal,
     Window,
@@ -33,9 +34,10 @@ pub enum CommandCategory {
 }
 
 impl CommandCategory {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Tabs,
         Self::Panes,
+        Self::Files,
         Self::Workspaces,
         Self::Terminal,
         Self::Window,
@@ -47,6 +49,7 @@ impl CommandCategory {
         match self {
             Self::Tabs => "Tabs",
             Self::Panes => "Panes",
+            Self::Files => "Files",
             Self::Workspaces => "Workspaces",
             Self::Terminal => "Terminal",
             Self::Window => "Window",
@@ -129,6 +132,9 @@ registry! {
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
     BrowseFiles, "browse_files", "Browse files in terminal pane", Some("cmd-shift-e"), Some("ctrl-shift-e");
     JumpProject, "jump_project", "Jump to project directory", None, None;
+    ShowFiles, "show_files", "Files", None, None;
+    OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
+    NewEditor, "new_editor", "New editor", None, None;
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
     ZoomReset, "zoom_reset", "Reset font size", Some("cmd-0"), Some("ctrl-0");
@@ -221,6 +227,11 @@ pub struct CommandContext {
     pub has_pane: bool,
     /// The focused pane shows content, not a terminal.
     pub content_pane: bool,
+    /// Why the focused pane's folder cannot open in a content pane: a terminal that
+    /// has not reported its directory.
+    pub files_reason: Option<&'static str>,
+    /// Why the focused pane's folder cannot be searched for a file to open.
+    pub file_search_reason: Option<&'static str>,
     pub tab_index: usize,
     pub has_selection: bool,
     pub terminal_available: bool,
@@ -263,6 +274,7 @@ impl Command {
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
             | SwapPaneDown | RemovePane => CommandCategory::Panes,
+            ShowFiles | OpenFile | NewEditor => CommandCategory::Files,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
@@ -322,6 +334,11 @@ impl Command {
             BrowseFiles | JumpProject => {
                 Some("Browses folders without sending commands to your terminal.")
             }
+            ShowFiles => Some("Shows this pane's folder in a file pane beside it."),
+            OpenFile => Some(
+                "Searches this pane's folder and opens a file in the editor; your terminal gets no input.",
+            ),
+            NewEditor => Some("Opens this pane's folder in a new file pane beside it."),
             ResetClientLayout => Some("Resets this window's layout without changing your tabs."),
             Reconnect => Some("Reconnects this window without stopping your terminals."),
             RestartDaemon => Some("Stops all running terminals before restarting the server."),
@@ -355,6 +372,9 @@ impl Command {
             SplitMergedTabs => "unmerge separate tabs layout",
             SaveArrangement => "layout preset template",
             SwapPaneLeft | SwapPaneRight | SwapPaneUp | SwapPaneDown => "move exchange layout",
+            ShowFiles => "folder browse explorer editor content",
+            OpenFile => "quick open find search fuzzy goto editor",
+            NewEditor => "file folder pane content split",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
             _ => "",
@@ -431,6 +451,7 @@ impl Command {
                 | SwapPaneUp
                 | SwapPaneDown
                 | RemovePane
+                | NewEditor
                 | EndSurface
                 | RestartSurface
         );
@@ -438,7 +459,12 @@ impl Command {
             && (mutation
                 || matches!(
                     self,
-                    Paste | ClearScrollback | MoveTabToNewWindow | MoveTabToWindow
+                    Paste
+                        | ClearScrollback
+                        | MoveTabToNewWindow
+                        | MoveTabToWindow
+                        | ShowFiles
+                        | OpenFile
                 ))
         {
             return Some("Reconnect to the server first");
@@ -648,6 +674,20 @@ impl Command {
                     c.content_pane.then_some(CONTENT_PANE_REASON)
                 }
             }
+            ShowFiles | NewEditor => {
+                if !c.has_pane {
+                    Some("Select a pane first")
+                } else {
+                    c.files_reason
+                }
+            }
+            OpenFile => {
+                if !c.has_pane {
+                    Some("Select a pane first")
+                } else {
+                    c.files_reason.or(c.file_search_reason)
+                }
+            }
             Copy => (!c.has_selection).then_some("Select terminal text to copy"),
             Paste | SelectAll | ClearScrollback if c.content_pane => Some(CONTENT_PANE_REASON),
             Paste => {
@@ -680,6 +720,8 @@ pub struct ShortcutKey<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputOwner {
     Terminal,
+    /// A content pane's code editor, or its search field.
+    Editor,
     Palette,
     Menu,
     ThemePicker,
@@ -690,6 +732,8 @@ pub enum InputOwner {
 pub enum KeyRoute {
     /// Forward to the existing terminal encoder/native composed-text path.
     Terminal,
+    /// Leave to the focused code editor's own bindings and text input.
+    Editor,
     /// The focused palette, menu, picker, or text field owns this event.
     Owned,
     Command(Command),
@@ -707,6 +751,8 @@ fn route_command(command: Command, context: &CommandContext) -> KeyRoute {
 /// Explicit user bindings take precedence over defaults and selection-aware Ctrl+C.
 /// Empty overrides unbind commands. Resolve collisions in stable registry order,
 /// never HashMap iteration order. Focused overlays own all their keyboard input.
+/// A code editor keeps every Compi shortcut except its own text clipboard and
+/// selection, and receives every other key.
 pub fn resolve_key(
     platform: Platform,
     key: ShortcutKey<'_>,
@@ -714,9 +760,27 @@ pub fn resolve_key(
     context: &CommandContext,
     overrides: &HashMap<String, String>,
 ) -> KeyRoute {
-    if owner != InputOwner::Terminal {
-        return KeyRoute::Owned;
+    match owner {
+        InputOwner::Terminal => resolve_terminal_key(platform, key, context, overrides),
+        InputOwner::Editor => match resolve_terminal_key(platform, key, context, overrides) {
+            KeyRoute::Command(Command::Copy | Command::Paste | Command::SelectAll)
+            | KeyRoute::Disabled(Command::Copy | Command::Paste | Command::SelectAll, _)
+            | KeyRoute::Terminal => KeyRoute::Editor,
+            route => route,
+        },
+        InputOwner::Palette
+        | InputOwner::Menu
+        | InputOwner::ThemePicker
+        | InputOwner::TextField => KeyRoute::Owned,
     }
+}
+
+fn resolve_terminal_key(
+    platform: Platform,
+    key: ShortcutKey<'_>,
+    context: &CommandContext,
+    overrides: &HashMap<String, String>,
+) -> KeyRoute {
     for spec in REGISTRY {
         if let Some(binding) = overrides.get(spec.id)
             && shortcut_matches(binding, key)
@@ -1278,6 +1342,76 @@ mod tests {
     }
 
     #[test]
+    fn code_editor_keeps_compi_shortcuts_but_owns_text_editing_keys() {
+        let mut context = CommandContext {
+            content_pane: true,
+            ..ready()
+        };
+        let bindings = HashMap::new();
+        let route = |platform, key, context: &CommandContext| {
+            resolve_key(platform, key, InputOwner::Editor, context, &bindings)
+        };
+        let ctrl_shift = |key| ShortcutKey {
+            shift: true,
+            ..ctrl(key)
+        };
+        let command = |key| ShortcutKey {
+            key,
+            command: true,
+            ..ShortcutKey::default()
+        };
+        for key in ["a", "c", "v", "x", "z", "s", "f"] {
+            assert_eq!(
+                route(Platform::Windows, ctrl(key), &context),
+                KeyRoute::Editor
+            );
+            assert_eq!(
+                route(Platform::Mac, command(key), &context),
+                KeyRoute::Editor
+            );
+        }
+        context.has_selection = true;
+        assert_eq!(
+            route(Platform::Windows, ctrl("c"), &context),
+            KeyRoute::Editor
+        );
+        assert_eq!(
+            route(Platform::Windows, ctrl_shift("v"), &context),
+            KeyRoute::Editor
+        );
+        assert_eq!(
+            route(Platform::Windows, ctrl_shift("p"), &context),
+            KeyRoute::Command(Command::OpenPalette)
+        );
+        assert_eq!(
+            route(
+                Platform::Windows,
+                ShortcutKey {
+                    key: "left",
+                    alt: true,
+                    shift: true,
+                    ..ShortcutKey::default()
+                },
+                &context
+            ),
+            KeyRoute::Command(Command::ResizeSplitDecrease)
+        );
+        assert_eq!(
+            route(
+                Platform::Mac,
+                ShortcutKey {
+                    key: "up",
+                    alt: true,
+                    command: true,
+                    ..ShortcutKey::default()
+                },
+                &context
+            ),
+            KeyRoute::Command(Command::FocusUp)
+        );
+    }
+
+    #[test]
     fn overlay_and_explicit_override_precedence_is_deterministic() {
         let context = ready();
         let overrides = HashMap::from([
@@ -1501,6 +1635,36 @@ mod tests {
                 .disabled_reason(&context)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn file_commands_need_a_pane_with_a_known_folder() {
+        let mut context = ready();
+        for command in [Command::ShowFiles, Command::OpenFile, Command::NewEditor] {
+            assert!(command.disabled_reason(&context).is_none(), "{command:?}");
+        }
+        context.file_search_reason = Some("no search");
+        assert_eq!(
+            Command::OpenFile.disabled_reason(&context),
+            Some("no search")
+        );
+        assert!(Command::ShowFiles.disabled_reason(&context).is_none());
+        context.files_reason = Some("no folder");
+        for command in [Command::ShowFiles, Command::OpenFile, Command::NewEditor] {
+            assert_eq!(command.disabled_reason(&context), Some("no folder"));
+        }
+        context.has_pane = false;
+        assert!(Command::ShowFiles.disabled_reason(&context).is_some());
+        context.connected = false;
+        assert_eq!(
+            Command::OpenFile.disabled_reason(&context),
+            Some("Reconnect to the server first")
+        );
+        assert_eq!(
+            search("open file").next().map(|spec| spec.command),
+            Some(Command::OpenFile)
+        );
+        assert!(search("quick open").any(|spec| spec.command == Command::OpenFile));
     }
 
     #[test]
