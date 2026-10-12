@@ -4,8 +4,18 @@ This file tracks only unfinished work. Completed implementation and verification
 
 Work in the order below. Keep changes on the existing workspace, persistence, protocol, and navigation contracts unless a listed item requires a narrow extension.
 
-## 1. Remaining UI/UX qualification
+## 1. Editor and diff panes
 
+Features 1 and 2 of the current plan (editor, then diffs and Git) ship one phase per session. Phase 1, content panes, is complete: `LayoutNode::Content` (protocol 19) carries an environment, root folder, open files and active file, and behaves like any pane with a placeholder body. See [Content panes](COMPLETED.md#content-panes-phase-1--2026-10-11).
+
+- Phase 2, the editor: replace the placeholder body with an editor over `PaneContent`'s open files, using `UpdateContent` for open/close/switch, and add `compi files` / `compi edit`. Content focus already keeps keys away from shells and runs Compi shortcuts; the editor must register its own text input on `content_focus` so typing and IME work there.
+- Phase 4, the diff view, builds on the same content panes. Phases 3, 5 and 6 are defined in the owner's plan, not in this repository; record each here before it starts.
+- Qualify content panes where phase 1 did not: Windows and WSL content (`ContentEnvironment::Wsl` is refused on non-Windows hosts, so only Host content was exercised), the Windows and Linux client builds (first exercised by Core CI on `4b458be`), physical mouse and keyboard, and IME in overlays opened from a content pane.
+- Known limits to revisit with the editor: CLI `split` and `pane resize` refuse content panes because they size in terminal cells, `split --panes` and presets that add panes refuse tabs holding one, and `compi-probe pane open-content` sizes the tab from the console, so a small console reports the pane too small.
+
+## 2. Remaining UI/UX qualification
+
+- Re-qualify Windows native interaction after the GPUI `gpui-pre` 0.3.8 upgrade; only macOS `cargo dev` interaction was exercised.
 - Preserve the completed top-tab navigation, optional workspace sidebar, flat responsive overlays, typography, and compact control system. Change them only where native evidence exposes a defect.
 - Qualify the transient loading frame, native tab tear-off drag, and real mixed-DPI transitions on supported Windows displays. Automated captures already cover normal, narrow, maximized, split, sidebar, palette, settings, theme catalog, overflow, empty, disconnected, exited, failed, lost, confirmation, and recovery states.
 - Verify hover, focus, active, disabled, pending, and destructive states without relying on color alone. Keep New terminal, pane actions, and custom Windows controls visible, reachable, and non-overlapping.
@@ -19,9 +29,9 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - Exercise an unmodified downloaded Zed family through the finished Bash/WSL command, observe all variants in the native catalog, apply explicitly, and export. Exported JSON already passes the published schema; load it in a real Zed application to qualify interoperability beyond schema validation.
 - Qualify Clear/Blurred and solid fallback on native macOS and with reduced-transparency settings. Compare Compi Neutral side by side with the Tern reference on light, dark, and busy desktops; low opacity cannot guarantee arbitrary-wallpaper contrast.
 - Repeat catalog, settings, alternate-font, and tab-menu interactions across real display scales and mixed-DPI transitions. Cover keyboard/pointer selection, tooltip suppression, disabled lone-pane Detach, confirmed End, and workspace-revision invalidation without replacing shell processes.
-- Online publishing is not implemented. If requested, define it separately with explicit consent, authorship, licensing, and validation; local import must never publish implicitly. Native editor, notes, web-preview, and diff features remain separate scope, not surfaces delivered by the appearance changes.
+- Online publishing is not implemented. If requested, define it separately with explicit consent, authorship, licensing, and validation; local import must never publish implicitly. Notes and web-preview remain separate scope; the editor and diff views are tracked in section 1.
 
-## 2. Performance and daily-use qualification
+## 3. Performance and daily-use qualification
 
 - Measure key receipt → PTY → replica → presentation latency, scrolling, resizing, and frame pacing under idle and sustained-output workloads. Use the current-FPS overlay for live feedback, not as a substitute for attributed timing.
 - Record build and display context and compare identical workloads before and after any fix. Confirm opt-in continuous frame scheduling remains inactive when Performance and the FPS overlay are both hidden.
@@ -31,11 +41,11 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 
 ### Remaining protocol and persistence contracts
 
-- Protocol 18 rejects mismatched versions but does not negotiate capabilities or server identity/generation in `Hello`. Implement the explicit handshake required by [the wire contract](Spec.md#wire-contract) before treating that acceptance gate as complete.
+- Protocol 19 rejects mismatched versions but does not negotiate capabilities or server identity/generation in `Hello`. Implement the explicit handshake required by [the wire contract](Spec.md#wire-contract) before treating that acceptance gate as complete.
 - Snapshots and deltas carry bounded scrollback, but there is no on-demand history paging or history epoch for reconnect and selection anchors. Implement and verify the stronger [replication contract](Spec.md#replication), including eviction/reflow behavior; current identity/sequence/geometry/content checks are not equivalent.
 - Exercise durable workspace mutations and lifecycle recovery with fault injection at commit boundaries across supported hosts. Existing actor, receipt, migration, and quarantine coverage is not exhaustive.
 
-## 3. Native Mac and shared-platform qualification
+## 4. Native Mac and shared-platform qualification
 
 - Qualify the bundled application, not a bare `cargo run`, across the complete workspace flow: shell and fullscreen-editor input, resize, close/reopen, same-process persistence, workspace/tab/split operations, tear-off and transfer, Settings, appearance, and recovery states.
 - Exercise physical Cmd/Ctrl/Option keys, clipboard, dead keys/IME, exact user font and fallback glyphs, native controls, fullscreen, scaling, mixed displays/DPI, and display pacing.
@@ -49,7 +59,7 @@ Work in the order below. Keep changes on the existing workspace, persistence, pr
 - Qualify shell prompt settings on a native Mac and one real SSH host: login Zsh startup and live reload through the ZDOTDIR wrappers, login-shell scope in `~/.zshrc`, BSD userland file writes (`mktemp`, `dd`, `wc`), and `dscl` login-shell detection. Also exercise Starship (presets, `STARSHIP_CONFIG`, its ble.sh integration) on any host; only Oh My Posh in WSL Bash/Zsh was exercised.
 - Run focused regressions and final workspace/dependency checks after integration. Report unavailable physical-platform checks explicitly.
 
-## 4. Distribution and process discovery
+## 5. Distribution and process discovery
 
 - Fix same-version Setup reruns. Every build gets a new MSI product code and `MajorUpgrade` does not allow same versions, so running a 0.1.7 Setup over an installed 0.1.7 registers a second product and keeps the old files (equal file versions are not overwritten). Every later Setup then stops with "Windows lists more than one Compi", and bare `msiexec /x` cannot clean up because the MSI lock helper cannot open the SYSTEM installer process. Treat Install with the installed version as Repair (`REINSTALL=ALL REINSTALLMODE=amus`) and allow same-version upgrades, then verify a rerun replaces the files and leaves one registration. Seen on the owner's machine on 2026-10-08 and recovered by removing both registrations with `UPGRADINGPRODUCTCODE` set, reinstalling, then repairing.
 - Qualify one real SSH host end to end with host-key verification and authentication: install the matching daemon, launch/attach/detach, drop the relay, reconnect to the same server and process lifetime, upload an image, and exercise the remote headless commands. Deterministic relay tests and the actual OpenSSH failure path are complete, but no reachable SSH server was available for a successful real-host run.
