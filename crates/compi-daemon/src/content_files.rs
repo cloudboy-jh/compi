@@ -1,16 +1,19 @@
-//! Files of content panes: folder listings, bounded UTF-8 reads, and saves that never
-//! overwrite changes made on disk after the editor read the file.
+//! Files of content panes: folder listings, bounded reads, checks for changes on disk, and
+//! saves that never overwrite changes made on disk after the editor read the file.
 
 use crate::file_tree::{self, Root};
 use compi_protocol::{
-    ContentEnvironment, DirectoryEntry, ErrorCode, FileVersion, MAX_CONTENT_FILE_BYTES,
+    ContentEnvironment, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
+    MAX_CONTENT_FILE_BYTES,
 };
 use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::collections::VecDeque;
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 /// A rejected request: its protocol error code and a message for the user.
 pub type Failure = (ErrorCode, String);
@@ -35,32 +38,84 @@ pub fn list_directory(
         .collect())
 }
 
-/// A UTF-8 text file of at most `MAX_CONTENT_FILE_BYTES`, with the version a save expects.
-pub fn read_file(
-    environment: &ContentEnvironment,
-    path: &str,
-) -> Result<(String, FileVersion), Failure> {
+/// The file's text with the version a save expects, or why it cannot be edited as text.
+pub fn read_file(environment: &ContentEnvironment, path: &str) -> Result<FileContent, Failure> {
     let root = resolve(environment, path)?;
+    let checked = SystemTime::now();
     let (opened_path, opened) = open(&root, &open_options(false));
     let mut file = opened.map_err(|error| open_failure(&root, &opened_path, error))?;
-    let bytes = read_contents(&mut file, &root)?.ok_or_else(|| {
-        (
-            ErrorCode::InvalidRequest,
-            format!(
-                "{:?} is larger than the {} MiB file size limit",
-                root.shell,
-                MAX_CONTENT_FILE_BYTES / (1024 * 1024)
-            ),
-        )
-    })?;
-    let version = version_of(&bytes);
-    let text = String::from_utf8(bytes).map_err(|_| {
-        (
-            ErrorCode::InvalidRequest,
-            format!("{:?} is not a UTF-8 text file", root.shell),
-        )
-    })?;
-    Ok((text, version))
+    let metadata = regular_metadata(&file, &root)?;
+    let Some(bytes) = read_contents(&mut file, &metadata, &root)? else {
+        return Ok(FileContent::TooLarge {
+            len: current_len(&file, &root)?,
+        });
+    };
+    let len = bytes.len() as u64;
+    if bytes[..bytes.len().min(BINARY_PROBE_BYTES)].contains(&0) {
+        return Ok(FileContent::Binary { len });
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ok(FileContent::Binary { len });
+    };
+    let version = version_of(text.as_bytes());
+    let writable = writable(&opened_path, &metadata);
+    remember(&opened_path, checked, &metadata, &version, writable);
+    Ok(FileContent::Text {
+        text,
+        version,
+        writable,
+    })
+}
+
+/// Compare the file on disk with `known`. The file is read, and its writability probed,
+/// only when its length or modification time differ from when this daemon last read it.
+pub fn check_file(
+    environment: &ContentEnvironment,
+    path: &str,
+    known: &FileVersion,
+) -> Result<FileState, Failure> {
+    let root = resolve(environment, path)?;
+    let checked = SystemTime::now();
+    let (opened_path, opened) = open(&root, &open_options(false));
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) || is_folder(&opened_path) =>
+        {
+            return Ok(FileState::Missing);
+        }
+        Err(error) => return Err(open_failure(&root, &opened_path, error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| read_failure(&root, error))?;
+    if !metadata.is_file() {
+        return Ok(FileState::Missing);
+    }
+    let (version, writable) = match remembered(&opened_path, &metadata) {
+        Some(remembered) => remembered,
+        None => {
+            let writable = writable(&opened_path, &metadata);
+            let version = match read_contents(&mut file, &metadata, &root)? {
+                Some(bytes) => version_of(&bytes),
+                // No saved or read version is this large, nor has an empty hash.
+                None => FileVersion {
+                    len: current_len(&file, &root)?,
+                    sha256: String::new(),
+                },
+            };
+            remember(&opened_path, checked, &metadata, &version, writable);
+            (version, writable)
+        }
+    };
+    Ok(if version == *known {
+        FileState::Unchanged { writable }
+    } else {
+        FileState::Changed { version, writable }
+    })
 }
 
 /// Save `text` if the file still holds `expected`, or create it when `expected` is `None`.
@@ -173,7 +228,8 @@ fn replace(root: &Root, expected: &FileVersion, text: &str) -> Result<(), Failur
         io::ErrorKind::NotFound => conflict("was deleted"),
         _ => open_failure(root, &opened_path, error),
     })?;
-    let current = read_contents(&mut file, root)?;
+    let metadata = regular_metadata(&file, root)?;
+    let current = read_contents(&mut file, &metadata, root)?;
     if current.is_none_or(|current| version_of(&current) != *expected) {
         return Err(conflict("changed on disk"));
     }
@@ -359,16 +415,9 @@ fn open(root: &Root, options: &OpenOptions) -> (PathBuf, io::Result<File>) {
     (root.host.clone(), opened)
 }
 
-/// The file's bytes, or `None` when it exceeds `MAX_CONTENT_FILE_BYTES`. Reads at most one
-/// byte past the limit, even if the file grows while it is read.
-fn read_contents(file: &mut File, root: &Root) -> Result<Option<Vec<u8>>, Failure> {
-    let read_failure = |error: io::Error| {
-        (
-            ErrorCode::Internal,
-            format!("could not read {:?}: {error}", root.shell),
-        )
-    };
-    let metadata = file.metadata().map_err(read_failure)?;
+/// The open file's metadata, failing unless it is a regular file.
+fn regular_metadata(file: &File, root: &Root) -> Result<Metadata, Failure> {
+    let metadata = file.metadata().map_err(|error| read_failure(root, error))?;
     if metadata.is_dir() {
         return Err(folder_failure(root));
     }
@@ -378,15 +427,35 @@ fn read_contents(file: &mut File, root: &Root) -> Result<Option<Vec<u8>>, Failur
             format!("{:?} is not a regular file", root.shell),
         ));
     }
+    Ok(metadata)
+}
+
+/// The file's bytes, or `None` when it exceeds `MAX_CONTENT_FILE_BYTES`. Reads at most one
+/// byte past the limit, even if the file grows while it is read.
+fn read_contents(
+    file: &mut File,
+    metadata: &Metadata,
+    root: &Root,
+) -> Result<Option<Vec<u8>>, Failure> {
     if metadata.len() > MAX_CONTENT_FILE_BYTES as u64 {
         return Ok(None);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(MAX_CONTENT_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(read_failure)?;
+        .map_err(|error| read_failure(root, error))?;
     Ok((bytes.len() <= MAX_CONTENT_FILE_BYTES).then_some(bytes))
 }
+
+/// The length of a file `read_contents` found too large; it may have grown while read.
+fn current_len(file: &File, root: &Root) -> Result<u64, Failure> {
+    file.metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|error| read_failure(root, error))
+}
+
+/// Like Git, a NUL byte near the start marks a binary file even when it is valid UTF-8.
+const BINARY_PROBE_BYTES: usize = 8 * 1024;
 
 fn version_of(bytes: &[u8]) -> FileVersion {
     FileVersion {
@@ -396,6 +465,105 @@ fn version_of(bytes: &[u8]) -> FileVersion {
             .map(|byte| format!("{byte:02x}"))
             .collect(),
     }
+}
+
+/// Whether a save can replace the file at `path`, which `metadata` describes, without
+/// changing anything on disk.
+#[cfg(unix)]
+fn writable(path: &Path, metadata: &Metadata) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let _ = metadata;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Native files report the read-only attribute. The WSL share does not reflect Linux modes
+/// in attributes, so a share file is opened for writing without truncating it; Linux sees
+/// that as an open and close for writing.
+#[cfg(windows)]
+fn writable(path: &Path, metadata: &Metadata) -> bool {
+    !metadata.permissions().readonly()
+        && (!on_wsl_share(path) || OpenOptions::new().write(true).open(path).is_ok())
+}
+
+#[cfg(windows)]
+fn on_wsl_share(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let (Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _)) = prefix.kind() else {
+        return false;
+    };
+    server.eq_ignore_ascii_case("wsl.localhost") || server.eq_ignore_ascii_case("wsl$")
+}
+
+/// What this daemon last read of a file, with the length and modification time the file
+/// had before it was read.
+struct Remembered {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+    version: FileVersion,
+    writable: bool,
+}
+
+/// Recently read files, oldest first, so a check of an unchanged file need not read it or
+/// probe its writability.
+static REMEMBERED: Mutex<VecDeque<Remembered>> = Mutex::new(VecDeque::new());
+const MAX_REMEMBERED: usize = 1024;
+
+/// The coarsest modification time tick in use (FAT's). A write in the same tick as a read
+/// keeps the modification time, so a version is only remembered for a file last modified
+/// more than a tick before it was read.
+const MODIFIED_TICK: Duration = Duration::from_secs(2);
+
+/// Remember the version of bytes read after `checked` from a file `metadata` described.
+fn remember(
+    path: &Path,
+    checked: SystemTime,
+    metadata: &Metadata,
+    version: &FileVersion,
+    writable: bool,
+) {
+    let Ok(modified) = metadata.modified() else {
+        return;
+    };
+    let mut remembered = REMEMBERED.lock();
+    remembered.retain(|entry| entry.path != path);
+    let settled = checked
+        .duration_since(modified)
+        .is_ok_and(|age| age > MODIFIED_TICK);
+    // A length change means the file changed while it was read.
+    if !settled || version.len != metadata.len() {
+        return;
+    }
+    if remembered.len() == MAX_REMEMBERED {
+        remembered.pop_front();
+    }
+    remembered.push_back(Remembered {
+        path: path.to_owned(),
+        len: metadata.len(),
+        modified,
+        version: version.clone(),
+        writable,
+    });
+}
+
+/// The remembered version and writability of the file at `path` if its length and
+/// modification time are still those it had when it was read.
+fn remembered(path: &Path, metadata: &Metadata) -> Option<(FileVersion, bool)> {
+    let modified = metadata.modified().ok()?;
+    REMEMBERED
+        .lock()
+        .iter()
+        .find(|entry| {
+            entry.path == path && entry.len == metadata.len() && entry.modified == modified
+        })
+        .map(|entry| (entry.version.clone(), entry.writable))
 }
 
 fn in_wsl(root: &Root) -> bool {
@@ -459,6 +627,13 @@ fn save_failure(root: &Root, error: io::Error) -> Failure {
     )
 }
 
+fn read_failure(root: &Root, error: io::Error) -> Failure {
+    (
+        ErrorCode::Internal,
+        format!("could not read {:?}: {error}", root.shell),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,18 +667,40 @@ mod tests {
 
     const HOST: ContentEnvironment = ContentEnvironment::Host;
 
+    /// The text, version and writability of a text file.
+    fn read_text(name: &str) -> (String, FileVersion, bool) {
+        match read_file(&HOST, name).unwrap() {
+            FileContent::Text {
+                text,
+                version,
+                writable,
+            } => (text, version, writable),
+            other => panic!("{name} is not text: {other:?}"),
+        }
+    }
+
+    fn set_modified(path: &Path, modified: SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
     #[test]
     fn read_version_is_accepted_by_a_save_and_a_stale_save_conflicts() {
         let folder = Folder::new();
         let (path, name) = folder.file("main.rs");
         fs::write(&path, "fn main() {}\n").unwrap();
-        let (text, opened) = read_file(&HOST, &name).unwrap();
+        let (text, opened, writable) = read_text(&name);
         assert_eq!(text, "fn main() {}\n");
         assert_eq!(opened.len, 13);
         assert_eq!(opened.sha256.len(), 64);
+        assert!(writable);
 
         let saved = write_file(&HOST, &name, Some(&opened), "fn main() { run(); }\n").unwrap();
-        assert_eq!(read_file(&HOST, &name).unwrap().1, saved);
+        assert_eq!(read_text(&name).1, saved);
         assert_eq!(fs::read_to_string(&path).unwrap(), "fn main() { run(); }\n");
 
         let (code, message) = write_file(&HOST, &name, Some(&opened), "stale").unwrap_err();
@@ -527,10 +724,7 @@ mod tests {
         let folder = Folder::new();
         let (path, name) = folder.file("new.txt");
         let created = write_file(&HOST, &name, None, "first").unwrap();
-        assert_eq!(
-            read_file(&HOST, &name).unwrap(),
-            ("first".to_owned(), created)
-        );
+        assert_eq!(read_text(&name), ("first".to_owned(), created, true));
 
         let (code, message) = write_file(&HOST, &name, None, "second").unwrap_err();
         assert_eq!(code, ErrorCode::FileConflict);
@@ -544,19 +738,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_folders_oversized_and_non_utf8_files() {
+    fn oversized_and_binary_files_are_reported_without_their_contents() {
         let folder = Folder::new();
         let (large, large_name) = folder.file("large.txt");
         fs::write(&large, vec![b'a'; MAX_CONTENT_FILE_BYTES + 1]).unwrap();
-        let (code, message) = read_file(&HOST, &large_name).unwrap_err();
-        assert_eq!(code, ErrorCode::InvalidRequest);
-        assert!(message.contains("1 MiB"), "{message}");
+        assert_eq!(
+            read_file(&HOST, &large_name).unwrap(),
+            FileContent::TooLarge {
+                len: MAX_CONTENT_FILE_BYTES as u64 + 1
+            }
+        );
 
         let (binary, binary_name) = folder.file("binary.bin");
-        fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
-        let (code, message) = read_file(&HOST, &binary_name).unwrap_err();
-        assert_eq!(code, ErrorCode::InvalidRequest);
-        assert!(message.contains("not a UTF-8 text file"), "{message}");
+        fs::write(&binary, [0xff, 0xfe, 0x41]).unwrap();
+        assert_eq!(
+            read_file(&HOST, &binary_name).unwrap(),
+            FileContent::Binary { len: 3 }
+        );
+        fs::write(&binary, "text\0more").unwrap();
+        assert_eq!(
+            read_file(&HOST, &binary_name).unwrap(),
+            FileContent::Binary { len: 9 }
+        );
 
         let (code, message) = read_file(&HOST, folder.0.to_str().unwrap()).unwrap_err();
         assert_eq!(code, ErrorCode::InvalidRequest);
@@ -568,23 +771,115 @@ mod tests {
     }
 
     #[test]
-    fn saving_a_read_only_file_fails_without_replacing_it() {
+    fn check_reports_unchanged_changed_and_missing_files() {
+        let folder = Folder::new();
+        let (path, name) = folder.file("notes.txt");
+        fs::write(&path, "one\n").unwrap();
+        let read = read_text(&name).1;
+        let unchanged = FileState::Unchanged { writable: true };
+        assert_eq!(check_file(&HOST, &name, &read).unwrap(), unchanged);
+
+        let saved = write_file(&HOST, &name, Some(&read), "two\n").unwrap();
+        assert_eq!(check_file(&HOST, &name, &saved).unwrap(), unchanged);
+        assert_eq!(
+            check_file(&HOST, &name, &read).unwrap(),
+            FileState::Changed {
+                version: saved.clone(),
+                writable: true
+            }
+        );
+
+        // An outside write of the same length, possibly within the save's time tick.
+        fs::write(&path, "six\n").unwrap();
+        assert_eq!(
+            check_file(&HOST, &name, &saved).unwrap(),
+            FileState::Changed {
+                version: version_of(b"six\n"),
+                writable: true
+            }
+        );
+
+        fs::write(&path, vec![b'a'; MAX_CONTENT_FILE_BYTES + 1]).unwrap();
+        assert_eq!(
+            check_file(&HOST, &name, &saved).unwrap(),
+            FileState::Changed {
+                version: FileVersion {
+                    len: MAX_CONTENT_FILE_BYTES as u64 + 1,
+                    sha256: String::new()
+                },
+                writable: true
+            }
+        );
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            check_file(&HOST, &name, &saved).unwrap(),
+            FileState::Missing
+        );
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            check_file(&HOST, &name, &saved).unwrap(),
+            FileState::Missing
+        );
+    }
+
+    #[test]
+    fn check_sees_same_length_writes_by_time_and_within_a_time_tick() {
+        let folder = Folder::new();
+        let (path, name) = folder.file("notes.txt");
+        let now = SystemTime::now();
+        fs::write(&path, "old\n").unwrap();
+        set_modified(&path, now - Duration::from_secs(3600));
+        let read = read_text(&name).1;
+        let unchanged = FileState::Unchanged { writable: true };
+        assert_eq!(check_file(&HOST, &name, &read).unwrap(), unchanged);
+        assert_eq!(check_file(&HOST, &name, &read).unwrap(), unchanged);
+
+        fs::write(&path, "new\n").unwrap();
+        set_modified(&path, now - Duration::from_secs(1800));
+        let changed = FileState::Changed {
+            version: version_of(b"new\n"),
+            writable: true,
+        };
+        assert_eq!(check_file(&HOST, &name, &read).unwrap(), changed);
+
+        // A file system with coarse times can give a write the time of the last read.
+        fs::write(&path, "abc\n").unwrap();
+        set_modified(&path, now);
+        let read = read_text(&name).1;
+        fs::write(&path, "xyz\n").unwrap();
+        set_modified(&path, now);
+        assert_eq!(
+            check_file(&HOST, &name, &read).unwrap(),
+            FileState::Changed {
+                version: version_of(b"xyz\n"),
+                writable: true
+            }
+        );
+    }
+
+    #[test]
+    fn read_only_files_are_reported_and_saving_them_fails_without_replacing_them() {
         let folder = Folder::new();
         let (path, name) = folder.file("locked.txt");
         fs::write(&path, "kept").unwrap();
-        let version = read_file(&HOST, &name).unwrap().1;
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_readonly(true);
         fs::set_permissions(&path, permissions.clone()).unwrap();
 
+        let (_, version, writable) = read_text(&name);
+        let checked = check_file(&HOST, &name, &version);
         let result = write_file(&HOST, &name, Some(&version), "replaced");
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         fs::set_permissions(&path, permissions).unwrap();
+        assert!(!writable);
+        assert_eq!(checked.unwrap(), FileState::Unchanged { writable: false });
         let (code, message) = result.unwrap_err();
         assert_eq!(code, ErrorCode::Internal);
         assert!(message.contains("read-only"), "{message}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "kept");
+        assert!(read_text(&name).2);
     }
 
     #[test]
@@ -618,7 +913,7 @@ mod tests {
         let (link, link_name) = folder.file("link.sh");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let version = read_file(&HOST, &link_name).unwrap().1;
+        let version = read_text(&link_name).1;
         write_file(&HOST, &link_name, Some(&version), "echo two\n").unwrap();
         assert!(
             fs::symlink_metadata(&link)
@@ -630,7 +925,7 @@ mod tests {
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o751);
 
-        let version = read_file(&HOST, &target_name).unwrap().1;
+        let version = read_text(&target_name).1;
         write_file(&HOST, &target_name, Some(&version), "echo three\n").unwrap();
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o751);

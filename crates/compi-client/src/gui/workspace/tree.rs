@@ -180,6 +180,44 @@ pub(super) fn join_path(parent: &str, name: &str) -> String {
     format!("{}{separator}{name}", parent.trim_end_matches(['/', '\\']))
 }
 
+/// Indices of the `rows` a filter shows: those whose name contains `filter`, ignoring
+/// case, and the folders above them. An empty filter shows every row.
+pub(super) fn filter_rows(rows: &[Row], filter: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..rows.len()).collect();
+    }
+    let needle = filter.to_lowercase();
+    let mut shown = vec![false; rows.len()];
+    // The latest row at each depth above the current one: the folders holding it.
+    let mut folders: Vec<usize> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        folders.truncate(row.depth);
+        if contains_folded(&row.name, &needle) {
+            shown[index] = true;
+            // A shown folder's own folders are shown already.
+            for &folder in folders.iter().rev() {
+                if std::mem::replace(&mut shown[folder], true) {
+                    break;
+                }
+            }
+        }
+        folders.push(index);
+    }
+    shown
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shown)| shown.then_some(index))
+        .collect()
+}
+
+/// Whether `name` contains the already lowercase `needle`, ignoring case.
+fn contains_folded(name: &str, needle: &str) -> bool {
+    name.char_indices().any(|(start, _)| {
+        let mut rest = name[start..].chars().flat_map(char::to_lowercase);
+        needle.chars().all(|wanted| rest.next() == Some(wanted))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +293,43 @@ mod tests {
         assert_eq!(tree.rows[1].path, r"C:\work\main.rs");
         assert_eq!(join_path(r"C:\", "src"), r"C:\src");
         assert_eq!(join_path("/mnt/c/work/", "src"), "/mnt/c/work/src");
+    }
+
+    #[test]
+    fn a_filter_keeps_matching_names_and_the_folders_above_them() {
+        let entry = |name: &str, directory| Entry {
+            name: name.into(),
+            directory,
+        };
+        let mut tree = FileTree::new(PaneId::new("pane"), "/work".into());
+        tree.replace_children(
+            "/work",
+            vec![
+                entry("src", true),
+                entry("docs", true),
+                entry("README.md", false),
+            ],
+        );
+        tree.toggle(1);
+        tree.replace_children(
+            "/work/src",
+            vec![entry("gui", true), entry("Main.rs", false)],
+        );
+        tree.toggle(2);
+        tree.replace_children("/work/src/gui", vec![entry("readme_view.rs", false)]);
+        let names = |filter: &str| {
+            filter_rows(&tree.rows, filter)
+                .into_iter()
+                .map(|index| tree.rows[index].name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names("README"),
+            ["work", "src", "gui", "readme_view.rs", "README.md"]
+        );
+        assert_eq!(names("main"), ["work", "src", "Main.rs"]);
+        assert_eq!(names("docs"), ["work", "docs"]);
+        assert!(names("absent").is_empty());
+        assert_eq!(names("").len(), tree.rows.len());
     }
 }

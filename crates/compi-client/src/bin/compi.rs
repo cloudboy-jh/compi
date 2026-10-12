@@ -181,8 +181,19 @@ fn main() {
         }
         return;
     }
+    // From a Compi shell, open the shell's own instance as its CLI commands do.
+    let instance = args
+        .instance
+        .clone()
+        .or_else(|| {
+            args.connect
+                .is_none()
+                .then(compi_client::cli::inherited_instance)
+                .flatten()
+        })
+        .filter(|instance| !instance.is_empty());
     let target = match compi_client::connection::ConnectionTarget::from_options(
-        args.instance.clone(),
+        instance,
         args.connect.clone(),
     ) {
         Ok(target) => target,

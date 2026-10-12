@@ -33,7 +33,9 @@ use std::fmt;
 
 // Version 19 adds content panes: layout leaves without a terminal surface.
 // Version 20 adds content files: environment directory listing, file reads and versioned saves.
-pub const PROTOCOL_VERSION: u32 = 20;
+// Version 21 says why a file is not shown as text, reports writability and checks a held
+// version against the file on disk.
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -252,10 +254,17 @@ pub enum ClientMessage {
         environment: ContentEnvironment,
         path: String,
     },
-    /// A UTF-8 text file of at most `MAX_CONTENT_FILE_BYTES`.
+    /// A file's text, or why it cannot be shown as text.
     ReadContentFile {
         environment: ContentEnvironment,
         path: String,
+    },
+    /// Whether the file still holds `known`; cheap while its size and modification time
+    /// are unchanged.
+    CheckContentFile {
+        environment: ContentEnvironment,
+        path: String,
+        known: FileVersion,
     },
     /// Replace a file's contents only if they still match `expected`; `None` creates a new
     /// file and fails if one exists. A mismatch fails with `ErrorCode::FileConflict`.
@@ -350,8 +359,10 @@ pub enum ServerMessage {
         entries: Vec<DirectoryEntry>,
     },
     ContentFileRead {
-        text: String,
-        version: FileVersion,
+        content: FileContent,
+    },
+    ContentFileChecked {
+        state: FileState,
     },
     ContentFileWritten {
         version: FileVersion,
@@ -460,6 +471,38 @@ pub struct FileVersion {
     pub sha256: String,
 }
 
+/// What reading a content file found.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileContent {
+    /// UTF-8 text of at most `MAX_CONTENT_FILE_BYTES`.
+    Text {
+        text: String,
+        version: FileVersion,
+        /// Whether a save can replace the file.
+        writable: bool,
+    },
+    /// Larger than `MAX_CONTENT_FILE_BYTES`; nothing was read past the limit.
+    TooLarge { len: u64 },
+    /// Not UTF-8 text.
+    Binary { len: u64 },
+}
+
+/// A content file on disk compared with a version the client holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileState {
+    Unchanged {
+        writable: bool,
+    },
+    Changed {
+        version: FileVersion,
+        writable: bool,
+    },
+    /// Deleted, or no longer a regular file.
+    Missing,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkingDirectory {
     pub requested: String,
@@ -543,6 +586,31 @@ pub struct SurfaceInfo {
     pub launch: LaunchRequest,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectory>,
+    /// The WSL2 distribution the shell runs in, on a Windows daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<String>,
+}
+
+impl SurfaceInfo {
+    /// The WSL2 distribution this terminal's shell runs in: the one the daemon launched
+    /// it in, else the one its requested directory or profile names. `None` for a shell
+    /// on the daemon host itself.
+    pub fn wsl_distribution(&self) -> Option<&str> {
+        self.distribution
+            .as_deref()
+            .or_else(|| {
+                self.working_directory
+                    .as_ref()
+                    .map(|directory| directory.distribution.as_str())
+            })
+            .or_else(|| {
+                self.launch
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.distribution.as_deref())
+            })
+            .filter(|distribution| !distribution.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -614,17 +682,7 @@ impl ContentEnvironment {
     /// The environment a terminal runs in, so content opened beside it shows the same files.
     pub fn of_surface(surface: &SurfaceInfo) -> Self {
         surface
-            .working_directory
-            .as_ref()
-            .map(|directory| directory.distribution.as_str())
-            .or_else(|| {
-                surface
-                    .launch
-                    .profile
-                    .as_ref()
-                    .and_then(|profile| profile.distribution.as_deref())
-            })
-            .filter(|distribution| !distribution.is_empty())
+            .wsl_distribution()
             .map_or(Self::Host, |distribution| Self::Wsl {
                 distribution: distribution.to_owned(),
             })
@@ -1037,6 +1095,7 @@ mod tests {
                 profile: None,
             },
             working_directory: None,
+            distribution: None,
         };
         let workspace = WorkspaceSnapshot {
             server_id: ServerId::new("server-1"),
@@ -1061,6 +1120,50 @@ mod tests {
             recovery_message: None,
         };
         assert_eq!(workspace.first_surface(), Some(&surface));
+    }
+
+    #[test]
+    fn surface_environment_comes_from_its_distribution() {
+        let mut surface = SurfaceInfo {
+            id: SurfaceId::new("surface-1"),
+            process_lifetime_id: ProcessLifetimeId::new("lifetime-1"),
+            status: SurfaceStatus::Running,
+            attached: false,
+            cols: 80,
+            rows: 24,
+            created_at_ms: 1,
+            exit_code: None,
+            error: None,
+            launch: LaunchRequest {
+                working_directory: None,
+                profile: None,
+            },
+            working_directory: None,
+            distribution: None,
+        };
+        assert_eq!(
+            ContentEnvironment::of_surface(&surface),
+            ContentEnvironment::Host
+        );
+        // A shell in the default distribution names it nowhere but in its launch.
+        surface.distribution = Some("Ubuntu".into());
+        assert_eq!(
+            ContentEnvironment::of_surface(&surface),
+            ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into()
+            }
+        );
+        let json = serde_json::to_value(&surface).unwrap();
+        assert_eq!(json["distribution"], "Ubuntu");
+        // Workspaces persisted before the field existed still load.
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("distribution");
+        let old: SurfaceInfo = serde_json::from_value(old).unwrap();
+        assert_eq!(old.distribution, None);
+        assert_eq!(
+            ContentEnvironment::of_surface(&old),
+            ContentEnvironment::Host
+        );
     }
 }
 

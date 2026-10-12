@@ -707,14 +707,8 @@ impl CompiApp {
             .filter(|path| path.starts_with('/'));
         #[cfg(windows)]
         let distribution = surface
-            .and_then(|surface| surface.working_directory.as_ref())
-            .map(|cwd| cwd.distribution.clone())
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                surface
-                    .and_then(|surface| surface.launch.profile.as_ref())
-                    .and_then(|profile| profile.distribution.clone())
-            })
+            .and_then(|surface| surface.wsl_distribution())
+            .map(str::to_owned)
             .filter(|_| !self.target.is_remote());
         #[cfg(not(windows))]
         let distribution = None;

@@ -103,6 +103,10 @@ pub struct PaneInfo {
     pub focused: bool,
     pub floating: bool,
     pub zoomed: bool,
+    /// Absolute paths of files with unsaved edits in this window's content pane; empty
+    /// (and omitted) for terminal panes and for content panes with nothing unsaved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsaved_files: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindowInfo {
@@ -132,6 +136,27 @@ pub fn execute(
     window: Option<&str>,
     action: Action,
 ) -> Result<Response> {
+    send(target, window, action)?.ok_or_else(|| {
+        if cfg!(any(windows, target_os = "macos")) {
+            "No GUI host is running for this connection; open a Compi window first"
+        } else {
+            "GUI presentation control is unavailable on this platform; daemon workspace, pane, metadata, and input commands remain available. Run window controls on the native Windows or macOS GUI host"
+        }
+        .into()
+    })
+}
+
+/// Every window of this connection, or `None` when no GUI host is running.
+pub fn windows(target: &ConnectionTarget) -> Result<Option<Vec<WindowInfo>>> {
+    Ok(send(target, None, Action::List)?.map(|response| response.windows))
+}
+
+/// `None` when no GUI host is running; none runs on platforms without the native GUI.
+fn send(
+    target: &ConnectionTarget,
+    window: Option<&str>,
+    action: Action,
+) -> Result<Option<Response>> {
     let request = Request {
         target: TargetIdentity::from_target(target),
         window: window.map(str::to_owned),
@@ -144,6 +169,6 @@ pub fn execute(
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        Err("GUI presentation control is unavailable on this platform; daemon workspace, pane, metadata, and input commands remain available. Run window controls on the native Windows or macOS GUI host".into())
+        Ok(None)
     }
 }

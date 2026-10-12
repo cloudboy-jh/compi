@@ -253,7 +253,7 @@ impl SurfaceManager {
                         let surface_id = info.id.clone();
                         let lifetime = info.process_lifetime_id.clone();
                         match Surface::spawn(
-                            info,
+                            *info,
                             launch,
                             context.as_deref(),
                             worker_actor.clone(),
@@ -812,6 +812,7 @@ impl Surface {
             surface_id: surface.id.clone(),
             process_lifetime_id: surface.process_lifetime_id.clone(),
             working_directory: surface.working_directory.clone(),
+            distribution: surface.distribution.clone(),
         });
         Ok(surface)
     }
@@ -1052,6 +1053,7 @@ impl Surface {
                 error: Some("surface state lock was poisoned".into()),
                 launch: self.launch_request.clone(),
                 working_directory: self.working_directory.clone(),
+                distribution: self.distribution.clone(),
             })
     }
 
@@ -1652,6 +1654,7 @@ impl Surface {
             error: state.error.clone(),
             launch: self.launch_request.clone(),
             working_directory: self.working_directory.clone(),
+            distribution: self.distribution.clone(),
         }
     }
 }

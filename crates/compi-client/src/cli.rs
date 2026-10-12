@@ -44,6 +44,8 @@ struct CliError {
     exit: i32,
     code: &'static str,
     message: String,
+    /// Files a refused or cancelled close would have discarded; in the JSON error.
+    unsaved_files: Vec<UnsavedFile>,
 }
 impl CliError {
     fn new(exit: i32, code: &'static str, message: impl Into<String>) -> Self {
@@ -51,6 +53,7 @@ impl CliError {
             exit,
             code,
             message: message.into(),
+            unsaved_files: Vec::new(),
         }
     }
     fn usage(message: impl Into<String>) -> Self {
@@ -115,8 +118,15 @@ pub fn dispatch(raw: &[String]) -> Option<i32> {
         && raw
             .iter()
             .all(|arg| matches!(arg.as_str(), "--version" | "-V" | "--json"));
-    if !version && !recognizes(raw) {
-        return None;
+    let mut unknown = None;
+    if !version {
+        match classify(raw, shell_surface().is_some(), |word| {
+            shell_path(word).is_ok_and(|path| path.is_dir())
+        }) {
+            Invocation::Gui => return None,
+            Invocation::Cli => {}
+            Invocation::Unknown(word) => unknown = Some(word),
+        }
     }
     #[cfg(windows)]
     attach_parent_console();
@@ -131,7 +141,10 @@ pub fn dispatch(raw: &[String]) -> Option<i32> {
     }
     watch_bridged_input();
     let json_output = wants_json(raw);
-    let result = parse(raw).and_then(|options| execute(&options));
+    let result = match unknown {
+        Some(word) => Err(unknown_command(word)),
+        None => parse(raw).and_then(|options| execute(&options)),
+    };
     Some(match result {
         Ok(Output::Help(text)) => {
             if json_output {
@@ -169,10 +182,12 @@ pub fn dispatch(raw: &[String]) -> Option<i32> {
         }
         Err(error) => {
             if json_output {
-                eprintln!(
-                    "{}",
-                    json!({"ok": false, "error": {"code":error.code,"message":error.message,"exit_code":error.exit}})
-                );
+                let mut detail =
+                    json!({"code":error.code,"message":error.message,"exit_code":error.exit});
+                if !error.unsaved_files.is_empty() {
+                    detail["unsaved_files"] = json!(error.unsaved_files);
+                }
+                eprintln!("{}", json!({"ok": false, "error": detail}));
             } else {
                 eprintln!("compi: {}", error.message);
             }
@@ -249,7 +264,23 @@ fn attach_parent_console() {
     }
 }
 
-fn recognizes(raw: &[String]) -> bool {
+/// How `dispatch` handles a non-version invocation.
+#[derive(Debug, PartialEq)]
+enum Invocation<'a> {
+    Cli,
+    /// The native application, given GUI flags or a working directory.
+    Gui,
+    /// A bare word, inside a Compi shell, that is neither a command nor a directory.
+    Unknown(&'a str),
+}
+
+/// Outside a Compi shell an unrecognised first word stays a GUI working directory,
+/// as `compi PATH` always was. Inside one it is almost always a mistyped command.
+fn classify<'a>(
+    raw: &'a [String],
+    in_shell: bool,
+    is_directory: impl FnOnce(&str) -> bool,
+) -> Invocation<'a> {
     let mut index = 0;
     while index < raw.len() {
         let arg = raw[index].as_str();
@@ -271,19 +302,92 @@ fn recognizes(raw: &[String]) -> bool {
             index += 1;
             continue;
         }
-        return COMMANDS.contains(&arg);
+        return if COMMANDS.contains(&arg) {
+            Invocation::Cli
+        } else if in_shell
+            && !arg.starts_with('-')
+            && !arg.contains(['/', '\\'])
+            && !is_directory(arg)
+        {
+            Invocation::Unknown(arg)
+        } else {
+            Invocation::Gui
+        };
     }
-    raw.iter()
+    if raw
+        .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        Invocation::Cli
+    } else {
+        Invocation::Gui
+    }
+}
+
+fn unknown_command(word: &str) -> CliError {
+    let hint = match suggestion(word) {
+        Some(command) => format!("did you mean '{command}'? See"),
+        None => "see".to_owned(),
+    };
+    CliError::usage(format!(
+        "unknown command '{word}'; {hint} compi --help for commands"
+    ))
+}
+
+/// The command closest to `word`, if close enough to be a typo of it.
+fn suggestion(word: &str) -> Option<&'static str> {
+    let limit = word.chars().count().max(3) / 3;
+    COMMANDS
+        .iter()
+        .map(|command| (edit_distance(word, command), *command))
+        .filter(|(distance, _)| *distance <= limit)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, command)| command)
+}
+
+/// Levenshtein distance that also counts an adjacent transposition as one edit.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut rows = vec![vec![0; b.len() + 1]; a.len() + 1];
+    for (i, row) in rows.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in rows[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let substitution = rows[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            let mut distance = substitution.min(rows[i - 1][j] + 1).min(rows[i][j - 1] + 1);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                distance = distance.min(rows[i - 2][j - 2] + 1);
+            }
+            rows[i][j] = distance;
+        }
+    }
+    rows[a.len()][b.len()]
+}
+
+/// The surface of the Compi shell running this command, if any.
+fn shell_surface() -> Option<String> {
+    std::env::var("COMPI_SURFACE_ID")
+        .ok()
+        .filter(|surface| !surface.is_empty())
+}
+
+/// The instance a Compi shell exports for commands it runs; empty names the default
+/// instance. GUI launches from the shell use it too, so they open that instance's
+/// windows rather than the default instance's.
+pub fn inherited_instance() -> Option<String> {
+    std::env::var("COMPI_INSTANCE").ok()
 }
 
 fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
-    let inherited_instance = std::env::var("COMPI_INSTANCE").ok();
+    let inherited_instance = inherited_instance();
     let mut options = Options {
         instance: inherited_instance.clone(),
-        surface: std::env::var("COMPI_SURFACE_ID")
-            .ok()
-            .filter(|s| !s.is_empty()),
+        surface: shell_surface(),
         ..Default::default()
     };
     let mut explicit_instance = false;
@@ -406,7 +510,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
     validate(options, command, action)?;
     if command == "theme" {
         let (mut store, diagnostics) = crate::theme_store::ThemeLibrary::load();
-        let path = theme_path(&options.args[2])?;
+        let path = shell_path(&options.args[2])?;
         let installed = store.import_file(&path).map_err(CliError::usage)?;
         return Ok(Output::Value(
             json!({"installed": installed.iter().map(|theme| theme.id()).collect::<Vec<_>>(), "diagnostics":diagnostics}),
@@ -516,12 +620,12 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
             "close" => {
                 let session = targets::workspace(&state, options)?;
                 confirm_close(
+                    &target,
                     &state,
-                    session.tabs.iter().flat_map(|tab| {
-                        arrangement::leaves(&tab.layout)
-                            .into_iter()
-                            .filter_map(|leaf| leaf.surface_id().cloned())
-                    }),
+                    session
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| arrangement::leaves(&tab.layout)),
                 )?;
                 WorkspaceMutation::RemoveSession {
                     session_id: session.id.clone(),
@@ -582,12 +686,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
             }
             "close" => {
                 let tab = targets::tab(&state, options)?.1;
-                confirm_close(
-                    &state,
-                    arrangement::leaves(&tab.layout)
-                        .into_iter()
-                        .filter_map(|leaf| leaf.surface_id().cloned()),
-                )?;
+                confirm_close(&target, &state, arrangement::leaves(&tab.layout))?;
                 WorkspaceMutation::RemoveTab {
                     tab_id: tab.id.clone(),
                 }
@@ -701,9 +800,8 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                         &leaf,
                     )?));
                 }
-                // A content pane has no process, so closing it needs no confirmation.
                 "close" => {
-                    confirm_close(&state, leaf.surface_id().cloned())?;
+                    confirm_close(&target, &state, [leaf])?;
                     WorkspaceMutation::RemovePane { pane_id }
                 }
                 "terminate" => {
@@ -1135,33 +1233,84 @@ fn read_answer() -> std::result::Result<String, CliError> {
     Ok(answer)
 }
 
-fn confirm_close(
-    state: &WorkspaceSnapshot,
-    surfaces: impl IntoIterator<Item = compi_protocol::SurfaceId>,
-) -> std::result::Result<(), CliError> {
-    let running = surfaces
-        .into_iter()
-        .filter(|id| {
-            state.surface(id).is_some_and(|surface| {
-                matches!(
-                    surface.status,
-                    SurfaceStatus::Starting | SurfaceStatus::Running
-                )
+/// A file with unsaved edits in a content pane that a close would remove.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+struct UnsavedFile {
+    pane_id: PaneId,
+    path: String,
+}
+
+/// The files open windows report unsaved in the content panes among `closing`, each
+/// once even when several windows show the pane.
+fn unsaved_files(
+    closing: &[PaneId],
+    windows: &[crate::cli_window::WindowInfo],
+) -> Vec<UnsavedFile> {
+    windows
+        .iter()
+        .flat_map(|window| &window.panes)
+        .filter(|pane| {
+            pane.pane_type == crate::cli_window::PaneType::Content
+                && closing.contains(&pane.pane_id)
+        })
+        .flat_map(|pane| {
+            pane.unsaved_files.iter().map(|path| UnsavedFile {
+                pane_id: pane.pane_id.clone(),
+                path: path.clone(),
             })
         })
-        .collect::<Vec<_>>();
-    if running.is_empty() {
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Ask once before a close that would end running processes or discard edits that open
+/// windows hold unsaved in its content panes. With no GUI host running nothing is
+/// unsaved. There is no bypass: scripts terminate panes and save files first.
+fn confirm_close(
+    target: &ConnectionTarget,
+    state: &WorkspaceSnapshot,
+    leaves: impl IntoIterator<Item = LayoutNode>,
+) -> std::result::Result<(), CliError> {
+    let mut running = Vec::new();
+    let mut closing = Vec::new();
+    for leaf in leaves {
+        match leaf {
+            LayoutNode::Pane { surface_id, .. } => {
+                if state.surface(&surface_id).is_some_and(|surface| {
+                    matches!(
+                        surface.status,
+                        SurfaceStatus::Starting | SurfaceStatus::Running
+                    )
+                }) {
+                    running.push(surface_id);
+                }
+            }
+            LayoutNode::Content { pane_id, .. } => closing.push(pane_id),
+            LayoutNode::Split { .. } => {}
+        }
+    }
+    let unsaved = if closing.is_empty() {
+        Vec::new()
+    } else {
+        let windows = crate::cli_window::windows(target).map_err(|error| {
+            CliError::new(
+                1,
+                "operation_failed",
+                format!("cannot check open windows for unsaved edits: {error}; nothing was closed"),
+            )
+        })?;
+        unsaved_files(&closing, &windows.unwrap_or_default())
+    };
+    if running.is_empty() && unsaved.is_empty() {
         return Ok(());
     }
-    if !interactive() {
-        return Err(CliError::new(
-            4,
-            "confirmation_required",
-            "close would end running processes; interactive confirmation is required. Scripts must explicitly use pane terminate first; no --yes/--force bypass",
-        ));
-    }
-    eprint!(
-        "Close will end {} running process(es) [{}]. Type close to confirm: ",
+    let refused = |exit, code, message: String| CliError {
+        unsaved_files: unsaved.clone(),
+        ..CliError::new(exit, code, message)
+    };
+    let processes = format!(
+        "end {} running process(es) [{}]",
         running.len(),
         running
             .iter()
@@ -1169,15 +1318,59 @@ fn confirm_close(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if !interactive() {
+        let mut effects = Vec::new();
+        if !running.is_empty() {
+            effects.push(processes);
+        }
+        if !unsaved.is_empty() {
+            effects.push(format!(
+                "discard unsaved changes to {}",
+                unsaved
+                    .iter()
+                    .map(|file| format!("{} (pane {})", file.path, file.pane_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Err(refused(
+            4,
+            "confirmation_required",
+            format!(
+                "close would {}; interactive confirmation is required. Scripts must explicitly use pane terminate and save files in their window first; no --yes/--force bypass",
+                effects.join(" and ")
+            ),
+        ));
+    }
+    if !unsaved.is_empty() {
+        eprintln!("Unsaved changes:");
+        for file in &unsaved {
+            eprintln!("  pane {}  {}", file.pane_id, file.path);
+        }
+    }
+    let prompt = match (running.is_empty(), unsaved.is_empty()) {
+        (true, _) => "Close and discard unsaved changes? [y/N] ".to_owned(),
+        (false, true) => format!("Close will {processes}. Type close to confirm: "),
+        (false, false) => {
+            format!("Close will {processes} and discard unsaved changes. Type close to confirm: ")
+        }
+    };
+    eprint!("{prompt}");
     io::stderr()
         .flush()
         .map_err(|e| CliError::new(1, "io_error", e.to_string()))?;
     let answer = read_answer()?;
-    if answer.trim() != "close" {
-        return Err(CliError::new(
+    let answer = answer.trim();
+    let confirmed = if running.is_empty() {
+        answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+    } else {
+        answer == "close"
+    };
+    if !confirmed {
+        return Err(refused(
             4,
             "cancelled",
-            "close cancelled; no processes were ended",
+            "close cancelled; nothing was closed".to_owned(),
         ));
     }
     Ok(())
@@ -1470,7 +1663,9 @@ fn validate(
     Ok(())
 }
 
-fn theme_path(path: &str) -> std::result::Result<PathBuf, CliError> {
+/// Resolve a path argument as the invoking shell names it; relative WSL paths are
+/// relative to that shell's directory, not to this Windows process's.
+fn shell_path(path: &str) -> std::result::Result<PathBuf, CliError> {
     #[cfg(windows)]
     if let Ok(distribution) = std::env::var("WSL_DISTRO_NAME") {
         let native = PathBuf::from(path);
@@ -1480,7 +1675,7 @@ fn theme_path(path: &str) -> std::result::Result<PathBuf, CliError> {
             let absolute = if path.starts_with('/') {
                 path.to_owned()
             } else {
-                let cwd=std::env::var("COMPI_SHELL_CWD").map_err(|_|CliError::usage("relative WSL theme path needs shell cwd; invoke through the compi shell bridge or use an absolute Unix path"))?;
+                let cwd=std::env::var("COMPI_SHELL_CWD").map_err(|_|CliError::usage("relative WSL path needs shell cwd; invoke through the compi shell bridge or use an absolute Unix path"))?;
                 format!("{}/{path}", cwd.trim_end_matches('/'))
             };
             return compi_protocol::wsl::windows_path_for_wsl(&absolute, &distribution)
@@ -1609,10 +1804,52 @@ mod tests {
         assert_eq!(parse(&args).unwrap_err().exit, 2);
     }
     #[test]
+    fn unknown_words_are_commands_only_inside_a_compi_shell() {
+        let check = |args: &[&str], in_shell: bool, expected: Invocation| {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            let invocation = classify(&args, in_shell, |word| word == "project");
+            assert_eq!(invocation, expected, "{args:?} in_shell={in_shell}");
+        };
+        for in_shell in [true, false] {
+            check(&["files"], in_shell, Invocation::Cli);
+            check(&["--instance", "dev", "edit"], in_shell, Invocation::Cli);
+            check(&["--help"], in_shell, Invocation::Cli);
+            check(&[], in_shell, Invocation::Gui);
+            check(&["project"], in_shell, Invocation::Gui);
+            check(&["../missing"], in_shell, Invocation::Gui);
+            check(&["--theme", "dracula", "fiiles"], in_shell, Invocation::Gui);
+        }
+        check(&["fiiles"], false, Invocation::Gui);
+        check(&["fiiles"], true, Invocation::Unknown("fiiles"));
+        check(
+            &["--json", "--instance", "dev", "edti"],
+            true,
+            Invocation::Unknown("edti"),
+        );
+    }
+    #[test]
+    fn unknown_commands_suggest_only_close_commands() {
+        assert_eq!(suggestion("fiiles"), Some("files"));
+        assert_eq!(suggestion("edti"), Some("edit"));
+        assert_eq!(suggestion("workspce"), Some("workspace"));
+        assert_eq!(suggestion("xyz"), None);
+        assert_eq!(suggestion("elephant"), None);
+        let error = unknown_command("fiiles");
+        assert_eq!(error.exit, 2);
+        assert_eq!(
+            error.message,
+            "unknown command 'fiiles'; did you mean 'files'? See compi --help for commands"
+        );
+        assert_eq!(
+            unknown_command("xyz").message,
+            "unknown command 'xyz'; see compi --help for commands"
+        );
+    }
+    #[test]
     fn update_accepts_only_check_and_json() {
         let accepted = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-            assert!(recognizes(&args));
+            assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
             parse(&args).and_then(|options| {
                 let command = options.args[0].clone();
                 validate(&options, &command, options.args.get(1).map(String::as_str))?;
@@ -1637,7 +1874,7 @@ mod tests {
     fn files_and_edit_take_at_most_one_path() {
         let validated = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-            assert!(recognizes(&args));
+            assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
             parse(&args).and_then(|options| {
                 let command = options.args[0].clone();
                 validate(&options, &command, options.args.get(1).map(String::as_str))
@@ -1659,5 +1896,84 @@ mod tests {
         ] {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }
+    }
+    #[test]
+    fn close_reports_unsaved_files_of_closing_content_panes_from_every_window() {
+        use crate::cli_window::{PaneInfo, PaneType, TargetIdentity, WindowInfo};
+        let pane = |id: &str, pane_type, unsaved: &[&str]| PaneInfo {
+            pane_id: PaneId::new(id),
+            pane_type,
+            surface_id: None,
+            cols: None,
+            rows: None,
+            focused: false,
+            floating: false,
+            zoomed: false,
+            unsaved_files: unsaved.iter().map(|path| (*path).to_owned()).collect(),
+        };
+        let window = |id: &str, panes| WindowInfo {
+            window_id: id.to_owned(),
+            target: TargetIdentity {
+                instance: None,
+                connect: None,
+            },
+            server_id: None,
+            selected_tab: None,
+            visible_tabs: Vec::new(),
+            panes,
+            busy: false,
+        };
+        let file = |pane: &str, path: &str| UnsavedFile {
+            pane_id: PaneId::new(pane),
+            path: path.to_owned(),
+        };
+        let closing = [PaneId::new("content-a"), PaneId::new("term")];
+
+        let one = [window(
+            "primary",
+            vec![
+                pane("content-a", PaneType::Content, &["/src/a.rs"]),
+                pane("content-b", PaneType::Content, &["/src/b.rs"]),
+            ],
+        )];
+        assert_eq!(
+            unsaved_files(&closing, &one),
+            [file("content-a", "/src/a.rs")]
+        );
+
+        let clean = [window(
+            "primary",
+            vec![pane("content-a", PaneType::Content, &[])],
+        )];
+        assert!(unsaved_files(&closing, &clean).is_empty());
+        assert!(unsaved_files(&closing, &[]).is_empty());
+
+        let several = [
+            window(
+                "primary",
+                vec![pane("content-a", PaneType::Content, &["/src/a.rs"])],
+            ),
+            window(
+                "aux",
+                vec![pane(
+                    "content-a",
+                    PaneType::Content,
+                    &["/src/c.rs", "/src/a.rs"],
+                )],
+            ),
+        ];
+        assert_eq!(
+            unsaved_files(&closing, &several),
+            [
+                file("content-a", "/src/a.rs"),
+                file("content-a", "/src/c.rs")
+            ]
+        );
+
+        let terminal = [window(
+            "primary",
+            vec![pane("term", PaneType::Terminal, &["/src/t.rs"])],
+        )];
+        assert!(unsaved_files(&closing, &terminal).is_empty());
     }
 }

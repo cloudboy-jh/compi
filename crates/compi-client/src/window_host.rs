@@ -15,8 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Version 7 adds the `reveal_file` presentation action for content panes.
-const VERSION: u32 = 7;
+// Version 8 reports each content pane's `unsaved_files` in window listings, which
+// `pane close`, `tab close` and `workspace close` consult before closing.
+const VERSION: u32 = 8;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -367,15 +368,17 @@ fn serve(
     }
 }
 
+/// `None` when no GUI host is running for this connection.
 pub(crate) fn control(
     instance: Option<&str>,
     request: crate::cli_window::Request,
-) -> Result<crate::cli_window::Response> {
+) -> Result<Option<crate::cli_window::Response>> {
     request.validate()?;
     let names = identity::instance_names(instance)?;
     let endpoint = format!("{}.gui", names.pipe);
-    let mut connection = platform::connect(&endpoint)?
-        .ok_or("No GUI host is running for this connection; open a Compi window first")?;
+    let Some(mut connection) = platform::connect(&endpoint)? else {
+        return Ok(None);
+    };
     let stop = AtomicBool::new(false);
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     match receive::<Reply>(&mut connection, deadline, &stop)? {
@@ -404,7 +407,7 @@ pub(crate) fn control(
     let reply = receive::<Reply>(&mut connection, deadline, &stop)?;
     let _ = write_all(&mut connection, &[1], deadline, &stop);
     match reply {
-        Reply::Completed { response } => Ok(response),
+        Reply::Completed { response } => Ok(Some(response)),
         Reply::Rejected { message } => Err(message.into()),
         _ => Err("GUI host accepted transport but did not acknowledge an applied operation".into()),
     }

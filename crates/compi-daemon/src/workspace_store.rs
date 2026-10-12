@@ -289,6 +289,7 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
                 profile: None,
             },
             working_directory: session.working_directory,
+            distribution: None,
         });
     }
     let initialized = !tabs.is_empty();
@@ -615,6 +616,7 @@ mod tests {
                 profile: None,
             },
             working_directory: None,
+            distribution: None,
         });
         workspace.sessions.push(WorkspaceSession {
             id: SessionId::new("session-1"),
@@ -740,6 +742,7 @@ mod tests {
                 profile: None,
             },
             working_directory: None,
+            distribution: None,
         });
         workspace.sessions.push(WorkspaceSession {
             id: SessionId::new("session-1"),
@@ -785,6 +788,7 @@ mod tests {
                 profile: None,
             },
             working_directory: None,
+            distribution: None,
         });
         // WSL paths load on every host: loading applies no host path rules.
         let content = LayoutNode::Content {

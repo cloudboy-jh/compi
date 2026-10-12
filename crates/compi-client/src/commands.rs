@@ -135,6 +135,7 @@ registry! {
     ShowFiles, "show_files", "Files", None, None;
     OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
     NewEditor, "new_editor", "New editor", None, None;
+    RecoverUnsavedEdits, "recover_unsaved_edits", "Recover unsaved edits…", None, None;
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
     ZoomReset, "zoom_reset", "Reset font size", Some("cmd-0"), Some("ctrl-0");
@@ -274,7 +275,7 @@ impl Command {
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
             | SwapPaneDown | RemovePane => CommandCategory::Panes,
-            ShowFiles | OpenFile | NewEditor => CommandCategory::Files,
+            ShowFiles | OpenFile | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
@@ -339,6 +340,9 @@ impl Command {
                 "Searches this pane's folder and opens a file in the editor; your terminal gets no input.",
             ),
             NewEditor => Some("Opens this pane's folder in a new file pane beside it."),
+            RecoverUnsavedEdits => Some(
+                "Reopens a file whose unsaved edits were kept when Compi closed, with the edits back.",
+            ),
             ResetClientLayout => Some("Resets this window's layout without changing your tabs."),
             Reconnect => Some("Reconnects this window without stopping your terminals."),
             RestartDaemon => Some("Stops all running terminals before restarting the server."),
@@ -375,6 +379,7 @@ impl Command {
             ShowFiles => "folder browse explorer editor content",
             OpenFile => "quick open find search fuzzy goto editor",
             NewEditor => "file folder pane content split",
+            RecoverUnsavedEdits => "backup restore crash lost unsaved changes editor",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
             _ => "",
@@ -465,6 +470,7 @@ impl Command {
                         | MoveTabToWindow
                         | ShowFiles
                         | OpenFile
+                        | RecoverUnsavedEdits
                 ))
         {
             return Some("Reconnect to the server first");
@@ -688,6 +694,7 @@ impl Command {
                     c.files_reason.or(c.file_search_reason)
                 }
             }
+            RecoverUnsavedEdits => (!c.has_pane).then_some("Select a pane first"),
             Copy => (!c.has_selection).then_some("Select terminal text to copy"),
             Paste | SelectAll | ClearScrollback if c.content_pane => Some(CONTENT_PANE_REASON),
             Paste => {

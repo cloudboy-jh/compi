@@ -820,6 +820,16 @@ pub struct StateSlot {
     last_save_failed: bool,
 }
 
+/// The directory of `instance` under a per-user state root, so instances (the default
+/// one, `cargo dev`'s, each SSH target) never share client files.
+pub fn instance_directory(instance: Option<&str>) -> String {
+    #[cfg(unix)]
+    let instance = Some(instance.unwrap_or("default"));
+    instance
+        .map(|name| format!("instance-{name}"))
+        .unwrap_or_else(|| "primary-instance".to_owned())
+}
+
 impl StateSlot {
     pub fn claim(
         instance: Option<&str>,
@@ -843,14 +853,9 @@ impl StateSlot {
         if !valid_id(server_id.as_str()) {
             return Err("invalid stable server identity for client state".into());
         }
-        let root = compi_protocol::paths::data_dir()?.join("client-state-v1");
-        #[cfg(unix)]
-        let instance = Some(instance.unwrap_or("default"));
-        let root = root.join(
-            instance
-                .map(|name| format!("instance-{name}"))
-                .unwrap_or_else(|| "primary-instance".to_owned()),
-        );
+        let root = compi_protocol::paths::data_dir()?
+            .join("client-state-v1")
+            .join(instance_directory(instance));
         // Hex encoding is lossless and separator-free, including on case-insensitive filesystems.
         // Chunk long identities so no path component exceeds native filename limits.
         let mut root = root;
@@ -1615,6 +1620,7 @@ mod tests {
                 profile: None,
             },
             working_directory: None,
+            distribution: None,
         });
         let mut source = ClientState::default();
         source

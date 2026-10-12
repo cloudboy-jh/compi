@@ -88,10 +88,7 @@ pub(crate) fn unavailable(surface: &compi_protocol::SurfaceInfo) -> PaneMetadata
                 EnvironmentKind::Unix
             },
             hostname: MetadataField::unavailable("terminal runtime unavailable"),
-            distribution: surface
-                .working_directory
-                .as_ref()
-                .map(|directory| directory.distribution.clone()),
+            distribution: surface.wsl_distribution().map(str::to_owned),
         },
         cols: surface.cols as u16,
         rows: surface.rows as u16,

@@ -22,7 +22,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("workspace", Some("close")) => (
             "workspace close",
-            "Close the workspace. Running processes require interactive confirmation; scripts must explicitly terminate panes first.",
+            "Close the workspace. Running processes and unsaved edits in open windows require interactive confirmation; scripts must explicitly terminate panes and save files first.",
             "compi --workspace work workspace close",
         ),
         ("tab", Some("list")) => (
@@ -57,7 +57,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("tab", Some("close")) => (
             "tab close",
-            "Close the selected tab, confirming interactively if any process is running.",
+            "Close the selected tab, confirming interactively if any process is running or an open window holds unsaved edits in its content panes.",
             "compi --tab work/tests tab close",
         ),
         ("tab", Some("merge")) => (
@@ -117,7 +117,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("pane", Some("close")) => (
             "pane close",
-            "Remove the selected pane, confirming interactively before ending a running process. Content panes have no process and close without confirmation.",
+            "Remove the selected pane, confirming interactively before ending a running process or discarding a content pane's unsaved edits in an open window.",
             "compi --pane pane-id pane close",
         ),
         ("pane", Some("terminate")) => (
@@ -172,7 +172,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("window", Some("list")) => (
             "window list",
-            "List native window slot IDs, visible tab IDs, and pane presentation state, with each pane's type (terminal or content), for the selected connection.",
+            "List native window slot IDs, visible tab IDs, and pane presentation state, with each pane's type (terminal or content) and a content pane's unsaved_files, for the selected connection.",
             "compi --instance dev --json window list",
         ),
         ("theme", Some("install")) => (

@@ -937,9 +937,24 @@ fn handle_connection(
                     match without_target(target.as_ref())
                         .and_then(|()| content_files::read_file(&environment, &path))
                     {
-                        Ok((text, version)) => sink.send_control(&ServerControl {
+                        Ok(content) => sink.send_control(&ServerControl {
                             request_id: Some(request_id),
-                            message: ServerMessage::ContentFileRead { text, version },
+                            message: ServerMessage::ContentFileRead { content },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
+                ClientMessage::CheckContentFile {
+                    environment,
+                    path,
+                    known,
+                } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| content_files::check_file(&environment, &path, &known))
+                    {
+                        Ok(state) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ContentFileChecked { state },
                         })?,
                         Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
                     }
@@ -1277,15 +1292,7 @@ fn directory_distribution(
         .ok_or((ErrorCode::SurfaceNotFound, "surface was not found"))?;
     #[cfg(windows)]
     {
-        Ok(surface
-            .working_directory
-            .map(|directory| directory.distribution)
-            .or_else(|| {
-                surface
-                    .launch
-                    .profile
-                    .and_then(|profile| profile.distribution)
-            }))
+        Ok(surface.wsl_distribution().map(str::to_owned))
     }
     #[cfg(unix)]
     {

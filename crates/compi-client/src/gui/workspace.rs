@@ -17,6 +17,7 @@ pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod settings;
 pub(super) mod tree;
 mod tree_ui;
+pub(in crate::gui) mod unsaved;
 mod whats_new;
 static PREPARED_HANDOFF: LazyLock<Mutex<Option<std::path::PathBuf>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -358,6 +359,17 @@ pub(super) enum Overlay {
     },
     Windows,
     Diagnostics,
+    /// Save / Don't save / Cancel before `then` drops these dirty editors; `saving`
+    /// while Save waits for every save.
+    Unsaved {
+        files: Vec<unsaved::PromptFile>,
+        then: unsaved::AfterUnsaved,
+        saving: Option<std::rc::Rc<unsaved::SaveBatch>>,
+    },
+    /// Backed-up edits of files no pane has open.
+    Recover {
+        backups: Vec<unsaved::BackupEntry>,
+    },
     /// Bound to one tab; mirror/flip apply to whichever preset is selected.
     Arrangements {
         tab_id: TabId,
@@ -777,6 +789,13 @@ impl CompiApp {
         let performance_enabled = Arc::new(AtomicBool::new(state.show_fps));
         let updates = crate::updates::shared(&config, &target);
         let attach_only = restore_session.is_some();
+        let content = content::ContentUi::new(
+            unsaved::Backups::for_instance(target.state_instance().as_deref()),
+            (
+                snapshot.server_id.clone(),
+                snapshot.server_generation.clone(),
+            ),
+        );
         let mut this = Self {
             started_at,
             target,
@@ -795,7 +814,7 @@ impl CompiApp {
             pending_present_latency_ids: Vec::new(),
             window_title: "Compi".into(),
             focus_handle: cx.focus_handle(),
-            content: content::ContentUi::default(),
+            content,
             ime_text: String::new(),
             ime_marked_range: None,
             ime_selected_range: 0..0,
@@ -907,16 +926,21 @@ impl CompiApp {
         if this.transferred_seed.is_none() {
             this.sync_visible_views();
         }
-        this.subscriptions
-            .push(cx.on_release(|this, _| this.flush_state()));
-        this.subscriptions.push(cx.on_app_quit(|this, _| {
+        this.subscriptions.push(cx.on_release(|this, cx| {
             this.flush_state();
+            this.write_backups(true, cx);
+        }));
+        this.subscriptions.push(cx.on_app_quit(|this, cx| {
+            this.flush_state();
+            this.write_backups(true, cx);
+            unsaved::sync();
             async {}
         }));
         let closing_view = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
-            let _ = closing_view.update(cx, |this, _| this.flush_state());
-            true
+        window.on_window_should_close(cx, move |window, cx| {
+            closing_view
+                .update(cx, |this, cx| this.window_should_close(window, cx))
+                .unwrap_or(true)
         });
         this.subscriptions
             .push(cx.observe_window_bounds(window, |this, window, cx| {
@@ -961,6 +985,7 @@ impl CompiApp {
             }
         })
         .detach();
+        this.watch_content_files(window, cx);
         cx.spawn(async move |weak, cx| {
             while let Ok(first) = rx.recv().await {
                 let started = Instant::now();
@@ -1764,6 +1789,7 @@ impl CompiApp {
             self.workspace = Some(workspace);
             self.sync_visible_views();
             self.prune_content();
+            self.refresh_unsaved_prompt();
             self.save_state();
         } else {
             self.workspace = Some(workspace);
@@ -1904,12 +1930,22 @@ impl CompiApp {
                 pane_id,
                 path,
                 result,
-            } => self.content_file_read(pane_id, path, result),
+                backup,
+            } => self.content_file_read(pane_id, path, result, backup),
+            UiEvent::ContentFileChecked {
+                pane_id,
+                path,
+                known,
+                result,
+            } => self.content_file_checked(&pane_id, &path, &known, result),
             UiEvent::ContentFileSaved {
                 pane_id,
                 path,
+                target,
                 result,
-            } => self.content_file_saved(pane_id, path, result, cx),
+            } => self.content_file_saved(pane_id, path, target, result, cx),
+            UiEvent::UnsavedSaved(batch) => self.unsaved_saved(batch, cx),
+            UiEvent::UnsavedBackupsListed(backups) => self.offer_backups(backups),
             UiEvent::PromptResponded {
                 job,
                 request,
@@ -3360,6 +3396,7 @@ impl CompiApp {
                     | Overlay::QuickAppearance
                     | Overlay::Settings
                     | Overlay::Confirm { .. }
+                    | Overlay::Unsaved { .. }
                     | Overlay::Diagnostics
                     | Overlay::Arrangements { .. }
             )
@@ -3514,6 +3551,8 @@ impl CompiApp {
                         WorkspaceMutation::RemoveTab { tab_id },
                         "Close this tab and end every process in its panes?",
                         "Close tab",
+                        window,
+                        cx,
                     );
                 }
             }
@@ -3696,22 +3735,14 @@ impl CompiApp {
                 if let Some(pane_id) = pane_id {
                     if content_focused {
                         // No process ends; only unsaved edits would be lost.
-                        match self.unsaved_files(&pane_id) {
-                            0 => self.mutate(WorkspaceMutation::RemovePane { pane_id }, false),
-                            count => {
-                                self.global_error = Some(format!(
-                                    "{count} file{} in this pane {} unsaved changes; save or close {} first",
-                                    if count == 1 { "" } else { "s" },
-                                    if count == 1 { "has" } else { "have" },
-                                    if count == 1 { "it" } else { "them" },
-                                ));
-                            }
-                        }
+                        self.remove_work(WorkspaceMutation::RemovePane { pane_id }, window, cx);
                     } else {
                         self.close_work(
                             WorkspaceMutation::RemovePane { pane_id },
                             "Close this pane and end its process tree?",
                             "Close pane",
+                            window,
+                            cx,
                         );
                     }
                 }
@@ -3871,7 +3902,13 @@ impl CompiApp {
                 });
             }
             Command::OpenDiagnostics => self.open_overlay(Overlay::Diagnostics, ""),
-            Command::Quit => cx.quit(),
+            Command::RecoverUnsavedEdits => self.list_backups(),
+            Command::Quit => self.guard_unsaved(
+                unsaved::CloseScope::App,
+                unsaved::AfterUnsaved::Quit,
+                window,
+                cx,
+            ),
         }
         self.rebuild_layout(window, true);
         cx.notify();
@@ -3893,14 +3930,42 @@ impl CompiApp {
     }
 
     /// Closing a tab or pane: one click by default; with "Confirm before closing" on,
-    /// a confirmation whose close button has focus, so Enter closes.
-    fn close_work(&mut self, operation: WorkspaceMutation, title: &str, action: &'static str) {
+    /// a confirmation whose close button has focus, so Enter closes. Unsaved edits in
+    /// its content panes ask last.
+    fn close_work(
+        &mut self,
+        operation: WorkspaceMutation,
+        title: &str,
+        action: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.config.confirm_close {
-            self.mutate(operation, false);
+            self.remove_work(operation, window, cx);
             return;
         }
         self.confirm_removal(operation, title, action);
         self.overlay_focus = 1;
+    }
+
+    /// Removes a pane, tab or workspace once unsaved edits in it are saved or dropped.
+    fn remove_work(
+        &mut self,
+        operation: WorkspaceMutation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panes = self
+            .workspace
+            .as_ref()
+            .map(|workspace| unsaved::removed_panes(workspace, &operation))
+            .unwrap_or_default();
+        self.guard_unsaved(
+            unsaved::CloseScope::Panes(panes),
+            unsaved::AfterUnsaved::Mutate(operation),
+            window,
+            cx,
+        );
     }
 
     fn pane_action_reason(
@@ -4053,7 +4118,7 @@ impl CompiApp {
                     return;
                 }
                 self.dismiss_overlay();
-                self.mutate(operation, false);
+                self.remove_work(operation, window, cx);
             }
             Overlay::ConfirmDaemonRestart {
                 revision, consent, ..
@@ -4070,8 +4135,14 @@ impl CompiApp {
                     return;
                 }
                 self.dismiss_overlay();
-                self.begin_daemon_restart(consent);
+                self.guard_unsaved(
+                    unsaved::CloseScope::App,
+                    unsaved::AfterUnsaved::RestartDaemon(consent),
+                    window,
+                    cx,
+                );
             }
+            Overlay::Unsaved { .. } => self.answer_unsaved(self.overlay_focus, window, cx),
             Overlay::Diagnostics => self.dismiss_overlay(),
             other => {
                 let choices = self.overlay_choices(cx);
@@ -4142,6 +4213,13 @@ impl CompiApp {
                                 self.transfer_tab(tab, Some(handle), window, cx);
                             }
                         }
+                        ChoiceAction::Recover(index) => {
+                            if let Overlay::Recover { backups } = &other
+                                && let Some(backup) = backups.get(index).cloned()
+                            {
+                                self.recover_backup(backup, window, cx);
+                            }
+                        }
                         ChoiceAction::Arrangement(choice) => {
                             if let Overlay::Arrangements {
                                 tab_id,
@@ -4180,6 +4258,8 @@ enum ChoiceAction {
     Arrangement(arrangements::ArrangementChoice),
     /// Toggles whether another tab is merged by the arrangement picker.
     ArrangementTab(TabId),
+    /// A backup in `Overlay::Recover`, by index.
+    Recover(usize),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaneAction {
@@ -4678,6 +4758,9 @@ impl CompiApp {
                 ..
             }) => {
                 choices = self.arrangement_choices(tab_id, merge, confirm_delete.as_deref());
+            }
+            Some(Overlay::Recover { backups }) => {
+                choices = self.recover_choices(backups, &query);
             }
             _ => {}
         }
@@ -7016,6 +7099,8 @@ impl CompiApp {
         cx.notify();
     }
 
+    /// Moves a tab to another window, once unsaved edits in its content panes (whose
+    /// editors live in this window) are saved or dropped.
     fn transfer_tab(
         &mut self,
         tab_id: TabId,
@@ -7023,7 +7108,20 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.transfer_tab_mode(tab_id, destination, true, window, cx);
+        let panes = self
+            .workspace
+            .as_ref()
+            .map(|workspace| unsaved::tab_panes(workspace, &tab_id))
+            .unwrap_or_default();
+        self.guard_unsaved(
+            unsaved::CloseScope::Panes(panes),
+            unsaved::AfterUnsaved::Transfer {
+                tab_id,
+                destination,
+            },
+            window,
+            cx,
+        );
     }
 
     fn transfer_tab_mode(
@@ -7197,6 +7295,8 @@ impl CompiApp {
             self.pane_zoom.clear(&tab_id);
             self.zoom_layout = None;
             self.state.hide_tab(&workspace, &tab_id);
+            // The destination builds its own editors, restoring any edits from backups.
+            self.release_content_panes(&unsaved::tab_panes(&workspace, &tab_id), cx);
             self.sync_visible_views();
             self.save_state();
             self.rebuild_layout(window, true);

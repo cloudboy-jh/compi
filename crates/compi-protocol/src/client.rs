@@ -2,10 +2,10 @@ use crate::Result;
 use crate::frame;
 use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, DirectoryEntry, ErrorCode,
-    FileVersion, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt,
-    MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage,
-    SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
-    decode_server, decode_terminal_frame, encode_client,
+    FileContent, FileState, FileVersion, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES,
+    MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME,
+    SearchEntry, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget,
+    WorkspaceMutation, WorkspaceSnapshot, decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
@@ -743,14 +743,31 @@ impl DaemonClient {
         }
     }
 
-    /// Read a UTF-8 text file and the version a later save must match.
+    /// Read a file: its text and the version a later save must match, or why it is not text.
     pub fn read_content_file(
         &mut self,
         environment: ContentEnvironment,
         path: String,
-    ) -> Result<(String, FileVersion)> {
+    ) -> Result<FileContent> {
         match self.request(ClientMessage::ReadContentFile { environment, path })? {
-            ServerMessage::ContentFileRead { text, version } => Ok((text, version)),
+            ServerMessage::ContentFileRead { content } => Ok(content),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Compare the file on disk with the version the caller holds.
+    pub fn check_content_file(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+        known: FileVersion,
+    ) -> Result<FileState> {
+        match self.request(ClientMessage::CheckContentFile {
+            environment,
+            path,
+            known,
+        })? {
+            ServerMessage::ContentFileChecked { state } => Ok(state),
             message => Err(unexpected_response(message)),
         }
     }

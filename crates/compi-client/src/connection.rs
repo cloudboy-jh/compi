@@ -108,6 +108,19 @@ impl ConnectionTarget {
     pub const fn is_remote(&self) -> bool {
         matches!(self, Self::Ssh { .. })
     }
+
+    /// The SSH host this target reaches, without user or port; `None` when local.
+    pub fn ssh_host(&self) -> Option<&str> {
+        match self {
+            Self::Local { .. } => None,
+            Self::Ssh { endpoint, .. } => Some(
+                endpoint
+                    .destination
+                    .split_once('@')
+                    .map_or(endpoint.destination.as_str(), |(_, host)| host),
+            ),
+        }
+    }
 }
 
 impl SshEndpoint {
@@ -229,6 +242,7 @@ mod tests {
             Some("dev@example.com:2222".into()),
         )
         .unwrap();
+        assert_eq!(target.ssh_host(), Some("example.com"));
         let ConnectionTarget::Ssh { endpoint, instance } = target else {
             panic!("expected SSH target");
         };

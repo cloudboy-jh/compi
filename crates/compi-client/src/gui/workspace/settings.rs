@@ -438,7 +438,7 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         match action {
-            SettingsAction::Update(control) => self.activate_update_control(control),
+            SettingsAction::Update(control) => self.activate_update_control(control, window, cx),
             SettingsAction::Metadata(index) => {
                 let mut settings = self.config.metadata.clone();
                 match index {
@@ -1713,7 +1713,12 @@ impl CompiApp {
         (snapshot, view, controls)
     }
 
-    fn activate_update_control(&mut self, control: UpdateControl) {
+    fn activate_update_control(
+        &mut self,
+        control: UpdateControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use crate::updates::{Preference, UpdateButton};
         match control {
             UpdateControl::Primary(button) => {
@@ -1726,11 +1731,20 @@ impl CompiApp {
                     UpdateButton::CheckNow => self.updates.check(),
                     UpdateButton::Download => self.updates.download(),
                     UpdateButton::Cancel => self.updates.cancel(),
-                    UpdateButton::Restart => self.updates.install(Vec::new()),
+                    // Installing restarts Compi: unsaved edits in any window ask first.
+                    UpdateButton::Restart => self.guard_unsaved(
+                        super::unsaved::CloseScope::App,
+                        super::unsaved::AfterUnsaved::Install(Vec::new()),
+                        window,
+                        cx,
+                    ),
                     // The listed shells are exactly what this click consents to end.
-                    UpdateButton::RestartEndShells => {
-                        self.updates.install(snapshot.ending_shells())
-                    }
+                    UpdateButton::RestartEndShells => self.guard_unsaved(
+                        super::unsaved::CloseScope::App,
+                        super::unsaved::AfterUnsaved::Install(snapshot.ending_shells()),
+                        window,
+                        cx,
+                    ),
                     UpdateButton::TryAgain => self.updates.retry(),
                     UpdateButton::DownloadSetup => {
                         if let Err(error) = open_web_url(crate::updates::SETUP_DOWNLOAD_URL) {

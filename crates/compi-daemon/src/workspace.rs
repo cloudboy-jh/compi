@@ -29,7 +29,7 @@ pub struct WorkspaceActor {
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceEffect {
-    Launch(SurfaceInfo, Option<Box<compi_protocol::LaunchContext>>),
+    Launch(Box<SurfaceInfo>, Option<Box<compi_protocol::LaunchContext>>),
     /// One transaction's effects occupy one bounded queue slot. The worker
     /// processes them in order while the actor remains available for feedback.
     Batch(Vec<WorkspaceEffect>),
@@ -45,6 +45,7 @@ pub enum RuntimeObservation {
         surface_id: SurfaceId,
         process_lifetime_id: ProcessLifetimeId,
         working_directory: Option<compi_protocol::WorkingDirectory>,
+        distribution: Option<String>,
     },
     Resized {
         surface_id: SurfaceId,
@@ -792,7 +793,7 @@ fn apply_mutation(
             affected_tabs.push(tab_id);
             affected_panes.push(pane_id);
             affected_surfaces.push(surface.id.clone());
-            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
+            effects.push(WorkspaceEffect::Launch(Box::new(surface.clone()), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
@@ -850,7 +851,7 @@ fn apply_mutation(
             affected_tabs.push(tab_id);
             affected_panes.push(pane_id);
             affected_surfaces.push(surface.id.clone());
-            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
+            effects.push(WorkspaceEffect::Launch(Box::new(surface.clone()), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
@@ -910,7 +911,7 @@ fn apply_mutation(
             affected_tabs.push(tab_id);
             affected_panes.extend([pane_id.clone(), new_pane]);
             affected_surfaces.push(surface.id.clone());
-            effects.push(WorkspaceEffect::Launch(surface.clone(), None));
+            effects.push(WorkspaceEffect::Launch(Box::new(surface.clone()), None));
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
@@ -1036,7 +1037,7 @@ fn apply_mutation(
             }
             let starting = !created.is_empty();
             for surface in created {
-                effects.push(WorkspaceEffect::Launch(surface.clone(), None));
+                effects.push(WorkspaceEffect::Launch(Box::new(surface.clone()), None));
                 workspace.surfaces.push(surface);
             }
             Ok(if starting { "starting" } else { "committed" }.into())
@@ -1345,7 +1346,7 @@ fn apply_mutation(
             if resume.is_some() {
                 launch.launch.working_directory = resume;
             }
-            effects.push(WorkspaceEffect::Launch(launch, None));
+            effects.push(WorkspaceEffect::Launch(Box::new(launch), None));
             affected_surfaces.push(surface_id.clone());
             Ok("starting".into())
         }
@@ -1382,11 +1383,7 @@ fn apply_mutation(
 fn resume_directory_exists(surface: &SurfaceInfo, directory: &str) -> bool {
     #[cfg(windows)]
     {
-        let Some(distribution) = surface
-            .working_directory
-            .as_ref()
-            .map(|directory| directory.distribution.as_str())
-        else {
+        let Some(distribution) = surface.wsl_distribution() else {
             return true;
         };
         let share = format!(
@@ -1514,13 +1511,16 @@ fn apply_observation(
     }
     match observation {
         RuntimeObservation::Running {
-            working_directory, ..
+            working_directory,
+            distribution,
+            ..
         } => {
             if surface.status != SurfaceStatus::Starting {
                 return None;
             }
             surface.status = SurfaceStatus::Running;
             surface.working_directory = working_directory;
+            surface.distribution = distribution;
             surface.error = None;
         }
         RuntimeObservation::Resized { cols, rows, .. } => {
@@ -1603,6 +1603,7 @@ fn new_surface(
             profile: None,
         },
         working_directory: None,
+        distribution: None,
     }
 }
 
@@ -2419,7 +2420,7 @@ mod tests {
                 .unwrap_or_else(|| effects.recv().unwrap())
             {
                 WorkspaceEffect::Batch(batch) => pending.extend(batch),
-                WorkspaceEffect::Launch(surface, _) => launched.push(surface),
+                WorkspaceEffect::Launch(surface, _) => launched.push(*surface),
                 WorkspaceEffect::End { .. } => panic!("growth must only launch missing panes"),
             }
         }
@@ -2568,6 +2569,7 @@ mod tests {
                     surface_id: surface.id.clone(),
                     process_lifetime_id: surface.process_lifetime_id.clone(),
                     working_directory: None,
+                    distribution: None,
                 });
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
@@ -3044,6 +3046,7 @@ mod tests {
             surface_id: detached_surface.id.clone(),
             process_lifetime_id: detached_surface.process_lifetime_id.clone(),
             working_directory: None,
+            distribution: None,
         });
         let before = wait_revision(&actor, revision + 1);
         let receipt = actor
@@ -3857,16 +3860,13 @@ mod tests {
                 profile: None,
             },
             working_directory: None,
+            distribution: None,
         };
         let missing = format!("/compi-missing-{}-{}", std::process::id(), now_ms());
         if cfg!(windows) {
             // Windows checks a WSL shell's path through its distribution's share.
-            surface.working_directory = Some(compi_protocol::WorkingDirectory {
-                requested: "/".into(),
-                resolved_wsl_path: "/".into(),
-                distribution: format!("compi-no-such-distribution-{}", std::process::id()),
-                warning: None,
-            });
+            surface.distribution =
+                Some(format!("compi-no-such-distribution-{}", std::process::id()));
         }
         assert!(!resume_directory_exists(&surface, &missing));
     }
@@ -3893,6 +3893,7 @@ mod tests {
             surface_id: surface.id.clone(),
             process_lifetime_id: surface.process_lifetime_id.clone(),
             working_directory: None,
+            distribution: None,
         });
         let running = wait_revision(&actor, 2);
         let tab_id = running.sessions[0].tabs[0].id.clone();
@@ -4257,10 +4258,11 @@ mod tests {
             surface_id: surface.id.clone(),
             process_lifetime_id: surface.process_lifetime_id.clone(),
             working_directory: None,
+            distribution: None,
         });
         let running = wait_revision(&actor, 2);
         let terminal = pane_ids(&running.sessions[0].tabs[0].layout)[0].clone();
-        (actor, effects, surface, terminal)
+        (actor, effects, *surface, terminal)
     }
 
     #[test]

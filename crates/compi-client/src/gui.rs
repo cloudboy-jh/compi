@@ -572,13 +572,26 @@ enum UiEvent {
     ContentFileRead {
         pane_id: PaneId,
         path: String,
-        result: Result<(String, compi_protocol::FileVersion), String>,
+        result: Result<compi_protocol::FileContent, String>,
+        /// The file's unsaved edits, for its first read.
+        backup: Option<workspace::unsaved::Backup>,
+    },
+    ContentFileChecked {
+        pane_id: PaneId,
+        path: String,
+        known: compi_protocol::FileVersion,
+        result: Result<compi_protocol::FileState, String>,
     },
     ContentFileSaved {
         pane_id: PaneId,
         path: String,
-        result: Result<compi_protocol::FileVersion, String>,
+        /// Where it was saved: `path` itself, or the new file of a Save as.
+        target: String,
+        result: Result<compi_protocol::FileVersion, workspace::content::SaveFailure>,
     },
+    /// Every save the unsaved-changes prompt started (by batch id) has finished.
+    UnsavedSaved(u64),
+    UnsavedBackupsListed(Vec<workspace::unsaved::BackupEntry>),
     PromptResponded {
         job: workspace::prompt::PromptJob,
         request: u64,
@@ -1636,9 +1649,8 @@ fn window_control(
             WindowControlArea::Max => toggle_window_maximized(window),
             WindowControlArea::Close => {
                 if let Some(view) = window.root::<CompiApp>().flatten() {
-                    view.update(cx, |this, _| this.flush_state());
+                    view.update(cx, |this, cx| this.request_window_close(window, cx));
                 }
-                window.remove_window();
             }
             WindowControlArea::Drag => {}
         })

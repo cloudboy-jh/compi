@@ -531,6 +531,108 @@ impl CompiApp {
         )
     }
 
+    /// Save / Don't save / Cancel for the dirty files an action would drop: each file's
+    /// name over its folder and environment.
+    fn render_unsaved_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let Some(Overlay::Unsaved { files, saving, .. }) = &self.overlay else {
+            return div().into_any_element();
+        };
+        let saving = saving.is_some();
+        let count = files.len();
+        let message = if count == 1 {
+            "This file has unsaved changes. Save them first?".to_owned()
+        } else {
+            format!("{count} files have unsaved changes. Save them first?")
+        };
+        let rows = files.iter().enumerate().map(|(index, file)| {
+            div()
+                .id(("unsaved-file", index))
+                .py_1()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(UI_BODY_TEXT_SIZE))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(content::file_name(&file.path).to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_color(color(colors.muted))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(file.place.clone()),
+                )
+        });
+        let button = |id: &'static str, label: &'static str, choice: usize| {
+            let run = cx.listener(move |this, _, window, cx| {
+                this.answer_unsaved(choice, window, cx);
+                cx.stop_propagation();
+            });
+            let focused = self.overlay_focus == choice;
+            match choice {
+                2 => self.settings_primary_button(id, label, focused, run),
+                _ => self.settings_action_button(id, label, focused, choice == 1, run),
+            }
+        };
+        self.render_centered_scrim(
+            div()
+                .w_full()
+                .max_w(px(460.0))
+                .flex()
+                .flex_col()
+                .rounded_md()
+                .border_1()
+                .border_color(color(colors.border))
+                .bg(color(colors.surface))
+                .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(self.render_dialog_header("Unsaved changes", cx))
+                .child(
+                    div()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .text_color(color(modal_text_color(colors.foreground, &colors)))
+                        .child(div().text_size(px(UI_BODY_TEXT_SIZE)).child(message))
+                        .child(
+                            div()
+                                .id("unsaved-files")
+                                .max_h(px(220.0))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_h(px(48.0))
+                        .flex_none()
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(color(colors.border))
+                        .child(button("unsaved-cancel", "Cancel", 0))
+                        .child(button("unsaved-discard", "Don't save", 1))
+                        .child(button(
+                            "unsaved-save",
+                            if saving { "Saving…" } else { "Save" },
+                            2,
+                        )),
+                ),
+            window,
+            cx,
+        )
+    }
+
     fn render_text_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let title = match &self.overlay {
@@ -840,11 +942,18 @@ impl CompiApp {
             Some(Overlay::Tabs { hidden_only: true }) => "Restore hidden terminal tab",
             Some(Overlay::Tabs { .. }) => "Switch terminal tab",
             Some(Overlay::Windows) => "Move terminal tab to window",
+            Some(Overlay::Recover { .. }) => "Recover unsaved edits",
             _ => "Choose",
         };
         let editable = matches!(
             self.overlay,
-            Some(Overlay::Palette | Overlay::Workspaces | Overlay::Tabs { .. } | Overlay::Windows)
+            Some(
+                Overlay::Palette
+                    | Overlay::Workspaces
+                    | Overlay::Tabs { .. }
+                    | Overlay::Windows
+                    | Overlay::Recover { .. }
+            )
         );
         div()
             .absolute()
@@ -908,6 +1017,19 @@ impl CompiApp {
                 }
                 "enter" | "space" if self.overlay_focus == 1 => self.activate_overlay(window, cx),
                 "enter" | "space" => self.dismiss_overlay(),
+                _ => return true,
+            }
+            cx.notify();
+            return true;
+        }
+        if matches!(self.overlay, Some(Overlay::Unsaved { .. })) {
+            // Cancel, Don't save, Save; Save starts focused, so Enter saves.
+            match key.key.as_str() {
+                "escape" => self.answer_unsaved(0, window, cx),
+                "tab" if key.modifiers.shift => self.overlay_focus = (self.overlay_focus + 2) % 3,
+                "tab" | "right" => self.overlay_focus = (self.overlay_focus + 1) % 3,
+                "left" => self.overlay_focus = (self.overlay_focus + 2) % 3,
+                "enter" | "space" => self.answer_unsaved(self.overlay_focus, window, cx),
                 _ => return true,
             }
             cx.notify();
@@ -1009,6 +1131,8 @@ impl CompiApp {
             Some(Overlay::Confirm { .. } | Overlay::ConfirmDaemonRestart { .. })
         ) {
             self.render_confirmation_dialog(window, cx)
+        } else if matches!(self.overlay, Some(Overlay::Unsaved { .. })) {
+            self.render_unsaved_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Text { .. })) {
             self.render_text_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Diagnostics)) {

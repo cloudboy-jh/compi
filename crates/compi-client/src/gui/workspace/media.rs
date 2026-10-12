@@ -202,16 +202,10 @@ impl CompiApp {
         } else {
             #[cfg(windows)]
             {
-                let surface = workspace.surface(&view.surface_id);
-                let distribution = surface
-                    .and_then(|surface| surface.working_directory.as_ref())
-                    .map(|cwd| cwd.distribution.clone())
-                    .filter(|name| !name.is_empty())
-                    .or_else(|| {
-                        surface
-                            .and_then(|surface| surface.launch.profile.as_ref())
-                            .and_then(|profile| profile.distribution.clone())
-                    });
+                let distribution = workspace
+                    .surface(&view.surface_id)
+                    .and_then(|surface| surface.wsl_distribution())
+                    .map(str::to_owned);
                 ImageTarget::Wsl { distribution }
             }
             #[cfg(target_os = "macos")]

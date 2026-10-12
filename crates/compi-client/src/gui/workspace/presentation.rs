@@ -217,7 +217,7 @@ pub(in crate::gui) fn dispatch(
                         }
                         Ok(Ok(false)) => {
                             let _ = completion.sender.send(Err(match request.action {
-                                Action::RevealFile { .. } => "The pane did not list the file before the request expired; open it in the pane first",
+                                Action::RevealFile { .. } => "The pane did not show the file before the request expired; open it in the pane first",
                                 _ => "Pane ID does not exist in this window's daemon workspace",
                             }
                             .into()));
@@ -255,6 +255,7 @@ impl CompiApp {
                     .collect()
             })
             .unwrap_or_default();
+        let shown_content: Vec<&PaneId> = self.shown_content_panes().collect();
         WindowInfo {
             window_id: self.slot_id.clone(),
             target: TargetIdentity::from_target(&self.target),
@@ -277,23 +278,39 @@ impl CompiApp {
                     focused: self.focused_view == Some(view.id),
                     floating: self.state.is_floating(&view.pane_id),
                     zoomed: self.zoomed_pane() == Some(&view.pane_id),
+                    unsaved_files: Vec::new(),
                 })
                 .chain(
                     // Content panes have no view; list the ones this window shows.
-                    self.visible_layout()
-                        .map_or(&[][..], |layout| &layout.panes)
-                        .iter()
-                        .chain(self.float_layouts.iter().map(|float| &float.pane))
-                        .filter(|pane| pane.surface_id.is_none())
-                        .map(|pane| PaneInfo {
-                            pane_id: pane.pane_id.clone(),
-                            pane_type: PaneType::Content,
-                            surface_id: None,
-                            cols: None,
-                            rows: None,
-                            focused: self.focused_pane() == Some(&pane.pane_id),
-                            floating: self.state.is_floating(&pane.pane_id),
-                            zoomed: self.zoomed_pane() == Some(&pane.pane_id),
+                    shown_content.iter().map(|pane_id| PaneInfo {
+                        pane_id: (*pane_id).clone(),
+                        pane_type: PaneType::Content,
+                        surface_id: None,
+                        cols: None,
+                        rows: None,
+                        focused: self.focused_pane() == Some(*pane_id),
+                        floating: self.state.is_floating(pane_id),
+                        zoomed: self.zoomed_pane() == Some(*pane_id),
+                        unsaved_files: self.unsaved_files(pane_id),
+                    }),
+                )
+                .chain(
+                    // Hidden tabs keep their editors; closing them must still see edits.
+                    self.content_panes()
+                        .filter(|pane_id| !shown_content.contains(pane_id))
+                        .filter_map(|pane_id| {
+                            let unsaved_files = self.unsaved_files(pane_id);
+                            (!unsaved_files.is_empty()).then(|| PaneInfo {
+                                pane_id: pane_id.clone(),
+                                pane_type: PaneType::Content,
+                                surface_id: None,
+                                cols: None,
+                                rows: None,
+                                focused: false,
+                                floating: self.state.is_floating(pane_id),
+                                zoomed: false,
+                                unsaved_files,
+                            })
                         }),
                 )
                 .collect(),
@@ -497,7 +514,7 @@ impl CompiApp {
     }
 
     /// Applies an action `dispatch` polls: `Ok(false)` while this window has not yet received
-    /// the workspace change that added the pane (or, for a reveal, the file in it).
+    /// the workspace change that added the pane (or, for a reveal, made the file active).
     fn polled_presentation(
         &mut self,
         action: &Action,
@@ -524,8 +541,9 @@ impl CompiApp {
         self.apply_presentation(action, window, cx).map(|_| true)
     }
 
-    /// Applies `Action::RevealFile`: `Ok(false)` while the pane, or the file in it, has not
-    /// reached this window yet, so `dispatch` asks again.
+    /// Applies `Action::RevealFile`: `Ok(false)` until the pane shows the file as active, so
+    /// the reveal follows the CLI's own change instead of submitting one from a stale
+    /// snapshot (which the daemon would refuse as a revision conflict).
     fn reveal_presentation(
         &mut self,
         action: &Action,
@@ -574,7 +592,7 @@ impl CompiApp {
         let Some(LayoutNode::Content { content, .. }) = leaf_node(&tab.layout, pane_id) else {
             return Err("Pane shows a terminal, not files".into());
         };
-        if !content.files.contains(file) {
+        if content.active_file.as_ref() != Some(file) {
             return Ok(false);
         }
         let environment = content.environment.clone();

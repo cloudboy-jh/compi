@@ -3,24 +3,53 @@
 //! attach, resize a PTY, or receive terminal input. Without an active file a pane
 //! browses its folder; with one it shows its open files as tabs above a GPUI Kit code
 //! editor, with the folder as an optional sidebar. Folders are listed and files read
-//! and saved through the daemon, so host and WSL folders behave the same.
-use super::tree::{Entry, FileTree};
+//! and saved through the daemon, so host and WSL folders behave the same. Shown files
+//! are compared with the disk every few seconds, so outside edits reload or warn, and
+//! a save never replaces bytes the editor has not seen. Dirty editors are backed up
+//! (see `unsaved`) and never dropped without asking.
+use super::tree::{Entry, FileTree, filter_rows};
 use super::tree_ui::tree_entry_icon;
+use super::unsaved::{self, Backup, Backups, SaveTicket};
 use super::*;
-use compi_protocol::{ContentEnvironment, DirectoryEntry, ErrorCode, FileVersion, PaneContent};
+use compi_protocol::{
+    ContentEnvironment, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
+    MAX_CONTENT_FILE_BYTES, PaneContent, ServerGeneration, ServerId,
+};
 use gpui::Entity;
 use gpui_component::highlighter::HighlightTheme;
-use gpui_component::input::{Editor, EditorState, InputEvent, Position, Rope};
+use gpui_component::input::{
+    Editor, EditorState, Input, InputEvent, InputState, Position, Rope, RopeExt,
+};
 use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
 /// Width of the folder sidebar beside an open file.
 const SIDEBAR_WIDTH: f32 = 220.0;
 const FILE_TAB_HEIGHT: f32 = 30.0;
-const TREE_ROW_HEIGHT: f32 = 22.0;
-#[cfg(target_os = "macos")]
-const SAVE_SHORTCUT: &str = "⌘S";
-#[cfg(windows)]
-const SAVE_SHORTCUT: &str = "Ctrl+S";
+/// Folder rows: the left inset and the indent per level.
+const TREE_INSET: f32 = 8.0;
+const TREE_INDENT: f32 = 14.0;
+/// How often a shown file is compared with the disk.
+const CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_TICK: Duration = Duration::from_millis(250);
+/// Larger files open as plain text: a 900 KB Rust file took about twice as long per
+/// keystroke highlighted as plain, while 334 KB showed no measurable cost.
+const HIGHLIGHT_LIMIT: usize = 512 * 1024;
+
+/// Why a save failed.
+pub(in crate::gui) enum SaveFailure {
+    /// The file is not what the save expected: it changed or was deleted on disk, or a
+    /// new file's path already exists.
+    Conflict,
+    Other(String),
+}
+
+/// What a save must find on disk.
+enum Expect {
+    /// These bytes, or with `None` no file: Save as and re-creating a deleted file.
+    Exactly(Option<FileVersion>),
+    /// Overwrite: whatever is there when the save starts, checked against this version.
+    Whatever(FileVersion),
+}
 
 /// Client-local state of content panes. What a pane shows (its folder, open files and
 /// active file) lives in the daemon's `PaneContent`; this keeps what only this window
@@ -33,8 +62,32 @@ pub(in crate::gui) struct ContentUi {
     released: Option<PaneId>,
     /// A line to reveal in a file whose pane `OpenContent` is still creating.
     pending_reveal: Option<PendingReveal>,
-    /// Some file was read and needs an editor, which only a window can build.
+    /// Some file was read and needs an editor, or an editor needs the text read again,
+    /// which only a window can do.
     unbuilt: bool,
+    /// Where this instance keeps unsaved edits; `None` without a data directory.
+    backups: Option<Backups>,
+    /// The daemon run the panes were last pruned against. Panes gone within one run
+    /// were removed, so their backups go too; after a restart they are kept.
+    server: Option<(ServerId, ServerGeneration)>,
+}
+
+impl ContentUi {
+    /// `server` is the daemon run the window's first workspace came from.
+    pub(in crate::gui) fn new(
+        backups: Option<Backups>,
+        server: (ServerId, ServerGeneration),
+    ) -> Self {
+        Self {
+            backups,
+            server: Some(server),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn backups(&self) -> Option<&Backups> {
+        self.backups.as_ref()
+    }
 }
 
 struct PendingReveal {
@@ -49,6 +102,9 @@ struct PaneUi {
     environment: ContentEnvironment,
     tree: FileTree,
     tree_scroll: ScrollHandle,
+    /// Narrows the folder to names containing this, ignoring case. Only folders already
+    /// listed are searched; collapsed ones are not opened for it.
+    filter: String,
     /// The folder shows beside an open file.
     sidebar: bool,
     /// The latest save failure or close warning, and the file it is about.
@@ -65,12 +121,21 @@ struct OpenFile {
 enum FileBody {
     Loading,
     Failed(String),
-    /// Read, waiting for the next frame to build its editor.
-    Read {
-        text: String,
-        version: FileVersion,
-    },
+    /// Read, with the backup of its unsaved edits if it has one, waiting for the next
+    /// frame to build its editor.
+    Read(FreshText, Option<Box<Backup>>),
     Ready(Box<FileEditor>),
+    /// Shown as a placeholder instead of an editor.
+    Unopenable {
+        reason: Unopenable,
+        len: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unopenable {
+    TooLarge,
+    Binary,
 }
 
 struct FileEditor {
@@ -83,8 +148,280 @@ struct FileEditor {
     dirty: bool,
     /// The text being saved, until the daemon answers.
     saving: Option<Rope>,
-    /// The tab's close button was pressed once with unsaved changes.
-    discard_armed: bool,
+    /// How the file ended its lines when read; saves keep it.
+    endings: LineEndings,
+    /// Don't save was chosen: the edits are about to go with the editor, unasked and
+    /// without a backup. Typing again takes it back.
+    discarded: bool,
+    /// When the edits are next written to their backup.
+    backup_due: Option<Instant>,
+    /// Prompts waiting for the save under way.
+    save_tickets: Vec<SaveTicket>,
+    /// The edits came from a backup written at this Unix time.
+    restored: Option<u64>,
+    /// Whether a save can replace the file; a read-only file opens a read-only editor.
+    writable: bool,
+    /// What the last check found on disk.
+    disk: OnDisk,
+    banner: Option<Banner>,
+    /// Reload was pressed once with unsaved changes.
+    reload_armed: bool,
+    /// A read of the file is under way to replace the editor's text.
+    reload: Option<Reload>,
+    /// The text that read found, until a window puts it in the editor.
+    fresh: Option<FreshText>,
+    /// A check of the file against the disk is under way.
+    checking: bool,
+    last_check: Instant,
+    /// The editor was visible, in an active window, at the last watch tick.
+    shown: bool,
+    save_as: Option<SaveAs>,
+    /// Saved as this file; the editor moves to it once the pane lists it.
+    moving_to: Option<String>,
+}
+
+/// A file on disk compared with the version its editor holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OnDisk {
+    Current,
+    /// Changed to this version, which the user chose not to load.
+    Changed(FileVersion),
+    Missing,
+}
+
+/// A file notice with actions, shown above its editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Banner {
+    /// A save found the file changed on disk: reload, overwrite, or save as.
+    Conflict,
+    /// Changed on disk while the editor has unsaved changes: reload or keep mine.
+    Changed,
+    Deleted,
+    /// Saving a read-only file: save as instead.
+    ReadOnly,
+}
+
+impl Banner {
+    /// Banners that a matching disk resolves; `ReadOnly` lasts while the file is.
+    fn about_disk(self) -> bool {
+        self != Self::ReadOnly
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reload {
+    /// The file changed while the editor was clean; edits made meanwhile win.
+    Quiet,
+    /// The user discards their edits.
+    Discard,
+}
+
+struct FreshText {
+    text: String,
+    version: FileVersion,
+    writable: bool,
+}
+
+/// The inline path field of Save as.
+struct SaveAs {
+    input: Entity<InputState>,
+    _events: Subscription,
+    error: Option<String>,
+}
+
+/// What a check of the disk asks of an editor.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckAction {
+    Nothing,
+    /// The disk matches again: drop disk banners.
+    Settled,
+    /// Read the file again into the clean editor.
+    Reload,
+    Show(Banner),
+}
+
+/// How the last known disk state `previous` and a fresh check combine, for an editor
+/// that is `clean` (no unsaved changes, no save under way).
+fn after_check(previous: &OnDisk, state: &FileState, clean: bool) -> (OnDisk, CheckAction) {
+    match state {
+        FileState::Unchanged { .. } if *previous == OnDisk::Current => {
+            (OnDisk::Current, CheckAction::Nothing)
+        }
+        FileState::Unchanged { .. } => (OnDisk::Current, CheckAction::Settled),
+        FileState::Changed { .. } if clean => (previous.clone(), CheckAction::Reload),
+        FileState::Changed { version, .. } => {
+            let changed = OnDisk::Changed(version.clone());
+            if *previous == changed {
+                (changed, CheckAction::Nothing)
+            } else {
+                (changed, CheckAction::Show(Banner::Changed))
+            }
+        }
+        FileState::Missing if *previous == OnDisk::Missing => {
+            (OnDisk::Missing, CheckAction::Nothing)
+        }
+        FileState::Missing => (OnDisk::Missing, CheckAction::Show(Banner::Deleted)),
+    }
+}
+
+/// The version a plain save must find: a deleted file is created again.
+fn save_expected(disk: &OnDisk, version: &FileVersion) -> Option<FileVersion> {
+    (*disk != OnDisk::Missing).then(|| version.clone())
+}
+
+/// The byte offset of `position` in `text`, clamped to its last line and that line's end.
+fn clamped_offset(text: &Rope, position: Position) -> usize {
+    let line = position.line.min(text.lines_len().saturating_sub(1) as u32);
+    text.position_to_offset(&Position::new(line, position.character))
+}
+
+/// A byte count as people read file sizes: `812 B`, `24 KB`, `2.4 MB`.
+fn human_size(len: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if len < 1024 {
+        return format!("{len} B");
+    }
+    let mut size = len as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if size < 10.0 {
+        format!("{size:.1} {}", UNITS[unit])
+    } else {
+        format!("{size:.0} {}", UNITS[unit])
+    }
+}
+
+/// Where content lives, for captions: `host` or `WSL: Ubuntu` on this machine; through
+/// SSH, its host name first.
+fn environment_label(ssh_host: Option<&str>, environment: &ContentEnvironment) -> String {
+    match (ssh_host, environment) {
+        (None, environment) => environment.to_string(),
+        (Some(host), ContentEnvironment::Host) => format!("SSH: {host}"),
+        (Some(host), environment) => format!("SSH: {host}, {environment}"),
+    }
+}
+
+/// This machine's home folder, which a local host folder shows as `~`.
+static CLIENT_HOME: LazyLock<Option<String>> = LazyLock::new(|| {
+    std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok())
+});
+
+/// The Unix home folder holding `path`, `/home/<user>` or `/root`. WSL and remote homes
+/// are not known here, so a folder under one shows it as `~`.
+fn unix_home(path: &str) -> Option<&str> {
+    if let Some(rest) = path.strip_prefix("/home/") {
+        let user = rest.split('/').next().filter(|user| !user.is_empty())?;
+        return Some(&path[.."/home/".len() + user.len()]);
+    }
+    (path == "/root" || path.starts_with("/root/")).then_some("/root")
+}
+
+/// What follows `home` in `path` when `path` is `home` or inside it. Drive paths ignore
+/// case, as Windows does.
+fn strip_home<'a>(path: &'a str, home: &str) -> Option<&'a str> {
+    let head = path.get(..home.len())?;
+    let same = if home.contains(':') {
+        head.eq_ignore_ascii_case(home)
+    } else {
+        head == home
+    };
+    let rest = &path[home.len()..];
+    (same && (rest.is_empty() || rest.starts_with(['/', '\\']))).then_some(rest)
+}
+
+/// `path` for a caption: `home` as `~`, and at most `max` characters, eliding middle
+/// folders so the start and the innermost folders stay readable.
+fn caption_path(path: &str, home: Option<&str>, max: usize) -> String {
+    let separator = if path.contains('\\') && !path.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    // A trailing separator goes, unless it is the root itself: `/` or `C:\`.
+    let path = match path.trim_end_matches(['/', '\\']) {
+        trimmed if trimmed.is_empty() || trimmed.ends_with(':') => path,
+        trimmed => trimmed,
+    };
+    let home = home
+        .map(|home| home.trim_end_matches(['/', '\\']))
+        .filter(|home| !home.is_empty());
+    let path = match home.and_then(|home| strip_home(path, home)) {
+        Some(rest) => format!("~{rest}"),
+        None => path.to_owned(),
+    };
+    let count = path.chars().count();
+    if count <= max {
+        return path;
+    }
+    let first = path.split(separator).next().unwrap_or_default();
+    // The first component, a separator and the ellipsis.
+    let kept = first.chars().count() + 2;
+    let mut tail = path.len();
+    for (index, _) in path.rmatch_indices(separator) {
+        if index <= first.len() || kept + path[index..].chars().count() > max {
+            break;
+        }
+        tail = index;
+    }
+    if tail < path.len() {
+        return format!("{first}{separator}…{}", &path[tail..]);
+    }
+    // Not even the innermost name fits: elide characters instead.
+    let head = max.saturating_sub(1) / 2;
+    let tail = max.saturating_sub(1) - head;
+    let at = |chars: usize| {
+        path.char_indices()
+            .nth(chars)
+            .map_or(path.len(), |(at, _)| at)
+    };
+    format!("{}…{}", &path[..at(head)], &path[at(count - tail)..])
+}
+
+/// The editor inserts `\n` for Enter, so a file whose every line ended in `\r\n` would
+/// gain bare `\n` lines on save. Mixed files are saved as typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum LineEndings {
+    Lf,
+    Crlf,
+}
+
+impl LineEndings {
+    fn of(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut newlines = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .peekable();
+        if newlines.peek().is_some()
+            && newlines.all(|(index, _)| index > 0 && bytes[index - 1] == b'\r')
+        {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
+
+    /// `text` as it should be written: every bare `\n` becomes `\r\n` in a CRLF file.
+    fn apply(self, text: String) -> String {
+        if self == Self::Lf || !text.contains('\n') {
+            return text;
+        }
+        let mut out = String::with_capacity(text.len() + text.len() / 32);
+        let mut previous = '\0';
+        for c in text.chars() {
+            if c == '\n' && previous != '\r' {
+                out.push('\r');
+            }
+            out.push(c);
+            previous = c;
+        }
+        out
+    }
 }
 
 /// The GPUI Kit colors this window last installed; see `sync_editor_theme`.
@@ -92,6 +429,8 @@ struct FileEditor {
 struct AppliedEditorTheme {
     colors: ThemeColors,
     dark: bool,
+    /// The pane material is solid, so the editor gutter can be too.
+    opaque: bool,
     ui_font: &'static str,
 }
 
@@ -104,6 +443,7 @@ impl PaneUi {
             environment,
             tree: FileTree::new(pane_id.clone(), root),
             tree_scroll: ScrollHandle::new(),
+            filter: String::new(),
             sidebar: false,
             notice: None,
             files: HashMap::new(),
@@ -112,6 +452,24 @@ impl PaneUi {
 
     fn root(&self) -> &str {
         &self.tree.rows[0].path
+    }
+
+    /// Indices of the tree rows the folder shows: every row below the root, which the
+    /// header names, or with a filter the matching names and the folders above them.
+    fn visible_rows(&self) -> Vec<usize> {
+        let mut rows = filter_rows(&self.tree.rows, &self.filter);
+        rows.retain(|&index| index > 0);
+        rows
+    }
+
+    fn scroll_to_selected(&self) {
+        if let Some(position) = self
+            .visible_rows()
+            .iter()
+            .position(|&index| index == self.tree.selected)
+        {
+            self.tree_scroll.scroll_to_item(position);
+        }
     }
 
     /// Whether `focused` is this pane, something inside it, or one of its editors,
@@ -155,7 +513,10 @@ pub(in crate::gui) fn find_content<'a>(
         })
 }
 
-fn content_leaves<'a>(node: &'a LayoutNode, visit: &mut impl FnMut(&'a PaneId, &'a PaneContent)) {
+pub(super) fn content_leaves<'a>(
+    node: &'a LayoutNode,
+    visit: &mut impl FnMut(&'a PaneId, &'a PaneContent),
+) {
     match node {
         LayoutNode::Content { pane_id, content } => visit(pane_id, content),
         LayoutNode::Pane { .. } => {}
@@ -213,7 +574,7 @@ fn same_folder(left: &str, right: &str) -> bool {
 }
 
 /// The folder holding `path`: `/` and `C:\` keep their separator.
-fn parent_folder(path: &str) -> String {
+pub(super) fn parent_folder(path: &str) -> String {
     match path.rfind(['/', '\\']) {
         Some(0) => path[..1].to_owned(),
         Some(index) if path[..index].ends_with(':') => path[..=index].to_owned(),
@@ -222,7 +583,7 @@ fn parent_folder(path: &str) -> String {
     }
 }
 
-fn file_name(path: &str) -> &str {
+pub(super) fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
@@ -311,35 +672,154 @@ fn reveal_in_editor(
     }
 }
 
+/// The highlighter language for a file of `len` bytes at `path`.
+fn editor_language(path: &str, len: usize) -> &'static str {
+    if len > HIGHLIGHT_LIMIT {
+        "text"
+    } else {
+        language_for(path)
+    }
+}
+
+/// The editor of a file just read, holding the edits of `restore` if it has a backup.
 fn file_editor(
     pane_id: &PaneId,
     path: &str,
-    text: String,
-    version: FileVersion,
+    read: FreshText,
+    restore: Option<Box<Backup>>,
     window: &mut Window,
     cx: &mut Context<CompiApp>,
 ) -> FileEditor {
+    let FreshText {
+        text,
+        version,
+        writable,
+    } = read;
+    let endings = LineEndings::of(&text);
     let state = cx.new(|cx| {
         EditorState::new(window, cx)
-            .language(language_for(path))
+            .language(editor_language(path, text.len()))
             .soft_wrap(false)
             .default_value(text)
     });
     let saved = state.read(cx).text().clone();
-    let (pane_id, path) = (pane_id.clone(), path.to_owned());
+    let pane_id = pane_id.clone();
     let changes = cx.subscribe(&state, move |this, editor, event: &InputEvent, cx| {
         if matches!(event, InputEvent::Change) {
-            this.editor_changed(&pane_id, &path, &editor, cx);
+            this.editor_changed(&pane_id, &editor, cx);
         }
     });
-    FileEditor {
+    let mut editor = FileEditor {
         state,
         _changes: changes,
         version,
         saved,
         dirty: false,
         saving: None,
-        discard_armed: false,
+        endings,
+        discarded: false,
+        backup_due: None,
+        save_tickets: Vec::new(),
+        restored: None,
+        writable,
+        disk: OnDisk::Current,
+        banner: None,
+        reload_armed: false,
+        reload: None,
+        fresh: None,
+        checking: false,
+        last_check: Instant::now(),
+        // Editors are built for shown files, which were just read.
+        shown: true,
+        save_as: None,
+        moving_to: None,
+    };
+    if let Some(backup) = restore.map(|backup| *backup) {
+        editor
+            .state
+            .update(cx, |state, cx| state.set_value(backup.text, window, cx));
+        editor.dirty = editor.state.read(cx).text() != &editor.saved;
+        if editor.dirty {
+            editor.endings = backup.endings;
+            editor.restored = Some(backup.saved_at);
+            if unsaved::restore_against(&backup.base, &editor.version) == unsaved::Restore::Changed
+            {
+                // As if the file changed while editing: saves must still match the
+                // version the edits started from, and the banner offers the disk's.
+                editor.disk = OnDisk::Changed(std::mem::replace(&mut editor.version, backup.base));
+                editor.banner = Some(Banner::Changed);
+            }
+        }
+    }
+    editor
+}
+
+/// Puts text read again into `editor`, keeping the cursor's line and column (clamped)
+/// and the scroll position.
+fn apply_fresh(
+    editor: &mut FileEditor,
+    path: &str,
+    fresh: FreshText,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let language = editor_language(path, fresh.text.len());
+    editor.endings = LineEndings::of(&fresh.text);
+    editor.state.update(cx, |state, cx| {
+        let cursor = state.cursor_position();
+        let scroll = state.scroll_offset();
+        if state.language_name() != language {
+            state.set_highlighter(language, cx);
+        }
+        state.set_value(fresh.text, window, cx);
+        let offset = clamped_offset(state.text(), cursor);
+        state.set_selected_range(offset..offset, cx);
+        state.set_scroll_offset(scroll, cx);
+    });
+    editor.saved = editor.state.read(cx).text().clone();
+    editor.version = fresh.version;
+    editor.writable = fresh.writable;
+    editor.dirty = false;
+    editor.discarded = false;
+    editor.backup_due = None;
+    editor.restored = None;
+    editor.reload_armed = false;
+    editor.disk = OnDisk::Current;
+    editor.banner = editor
+        .banner
+        .filter(|banner| !banner.about_disk() && !editor.writable);
+}
+
+/// Writes the backups of `ui`'s editors whose edits are due by `due_by`, or with `None`
+/// of every editor whose backup is behind.
+fn write_pane_backups(backups: &Backups, ui: &mut PaneUi, due_by: Option<Instant>, cx: &App) {
+    for (path, file) in &mut ui.files {
+        let FileBody::Ready(editor) = &mut file.body else {
+            continue;
+        };
+        // A file being saved as another is backed up under its new path once it moves.
+        if editor.moving_to.is_some()
+            || !editor
+                .backup_due
+                .is_some_and(|due| due_by.is_none_or(|by| due <= by))
+        {
+            continue;
+        }
+        editor.backup_due = None;
+        if !editor.dirty || editor.discarded {
+            continue;
+        }
+        let text = editor.state.read(cx).text().clone();
+        // Larger text cannot be saved, nor restored into an editor.
+        if text.len() <= MAX_CONTENT_FILE_BYTES {
+            backups.write(
+                &ui.environment,
+                path,
+                editor.version.clone(),
+                editor.endings,
+                text,
+            );
+        }
     }
 }
 
@@ -351,6 +831,7 @@ impl CompiApp {
         let applied = AppliedEditorTheme {
             colors: *self.colors(),
             dark: self.theme.is_dark(),
+            opaque: self.effective_background_opacity() >= 1.0,
             ui_font: self.ui_font.family(),
         };
         if cx.try_global::<AppliedEditorTheme>() == Some(&applied) {
@@ -375,7 +856,8 @@ impl CompiApp {
         theme.accent = color(colors.surface_hover);
         theme.accent_foreground = color(colors.foreground);
         theme.muted = color(colors.surface);
-        theme.muted_foreground = color(colors.muted);
+        // Line numbers paint in this; reduced, they recede behind the code.
+        theme.muted_foreground = color(colors.muted).opacity(0.7);
         theme.popover = color(colors.surface);
         theme.popover_foreground = color(colors.foreground);
         theme.list_hover = color(colors.surface_hover);
@@ -397,34 +879,49 @@ impl CompiApp {
         }
         .as_ref()
         .clone();
-        // The pane's material shows through; the gutter and current line stay subtle.
+        // The code area is transparent, so the pane material shows through. The gutter
+        // is painted over horizontally scrolled text, and without its own color GPUI Kit
+        // reads the transparent editor background as unset and fills the gutter with its
+        // surface color, a lighter strip. Over a solid pane the gutter takes the pane's
+        // color, matching the code and still covering scrolled text; over a translucent
+        // pane it stays clear.
         highlight.style.editor_background = Some(gpui::transparent_black());
-        highlight.style.editor_gutter_background = None;
+        highlight.style.editor_gutter_background = Some(if applied.opaque {
+            material_color(colors.background, 1.0)
+        } else {
+            gpui::transparent_black()
+        });
         highlight.style.editor_foreground = Some(color(colors.foreground));
-        highlight.style.editor_line_number = Some(color(colors.muted));
+        highlight.style.editor_line_number = Some(theme.muted_foreground);
         highlight.style.editor_active_line_number = Some(color(colors.foreground));
-        highlight.style.editor_active_line = Some(color(colors.surface).opacity(0.6));
+        // A faint wash, not a block: the current line's number already stands out.
+        highlight.style.editor_active_line = Some(color(colors.foreground).opacity(0.05));
         theme.highlight_theme = Arc::new(highlight);
         Theme::sync_base(cx);
         cx.set_global(applied);
     }
 
+    /// Content panes this window draws: tiled in the visible tab, or floating.
+    pub(super) fn shown_content_panes(&self) -> impl Iterator<Item = &PaneId> {
+        self.visible_layout()
+            .into_iter()
+            .flat_map(|layout| &layout.panes)
+            .chain(self.float_layouts.iter().map(|float| &float.pane))
+            .filter(|pane| pane.surface_id.is_none())
+            .map(|pane| &pane.pane_id)
+    }
+
     /// Before drawing: state for every visible content pane, a read for each shown file
-    /// not yet loaded, editors for files just read, and pending line reveals.
+    /// not yet loaded, editors for files just read, text read again into its editor,
+    /// and pending line reveals.
     pub(super) fn prepare_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut work = Vec::new();
         if let Some(workspace) = &self.workspace {
-            let visible = self
-                .visible_layout()
-                .into_iter()
-                .flat_map(|layout| &layout.panes)
-                .chain(self.float_layouts.iter().map(|float| &float.pane))
-                .filter(|pane| pane.surface_id.is_none());
-            for pane in visible {
-                let Some(content) = find_content(workspace, &pane.pane_id) else {
+            for pane_id in self.shown_content_panes() {
+                let Some(content) = find_content(workspace, pane_id) else {
                     continue;
                 };
-                let ui = self.content.panes.get(&pane.pane_id);
+                let ui = self.content.panes.get(pane_id);
                 let current = ui.is_some_and(|ui| {
                     ui.environment == content.environment && ui.root() == content.root
                 });
@@ -433,7 +930,7 @@ impl CompiApp {
                     .as_ref()
                     .is_none_or(|active| ui.is_some_and(|ui| ui.files.contains_key(active)));
                 if !current || !shown {
-                    work.push((pane.pane_id.clone(), content.clone()));
+                    work.push((pane_id.clone(), content.clone()));
                 }
             }
         }
@@ -441,12 +938,31 @@ impl CompiApp {
             self.prepare_pane(pane_id, content, cx);
         }
         if std::mem::take(&mut self.content.unbuilt) {
+            let backups = self.content.backups.as_ref();
             for (pane_id, ui) in &mut self.content.panes {
                 for (path, file) in &mut ui.files {
                     file.body = match std::mem::replace(&mut file.body, FileBody::Loading) {
-                        FileBody::Read { text, version } => FileBody::Ready(Box::new(file_editor(
-                            pane_id, path, text, version, window, cx,
-                        ))),
+                        FileBody::Read(fresh, restore) => {
+                            let restoring = restore.is_some();
+                            let editor = file_editor(pane_id, path, fresh, restore, window, cx);
+                            if restoring && !editor.dirty {
+                                // The file already holds the backed-up text.
+                                if let Some(backups) = backups {
+                                    backups.delete(&ui.environment, path);
+                                }
+                            }
+                            FileBody::Ready(Box::new(editor))
+                        }
+                        FileBody::Ready(mut editor) => {
+                            if let Some(fresh) = editor.fresh.take() {
+                                let discarding = editor.dirty;
+                                apply_fresh(&mut editor, path, fresh, window, cx);
+                                if discarding && let Some(backups) = backups {
+                                    backups.delete(&ui.environment, path);
+                                }
+                            }
+                            FileBody::Ready(editor)
+                        }
                         body => body,
                     };
                 }
@@ -458,6 +974,10 @@ impl CompiApp {
     fn prepare_pane(&mut self, pane_id: PaneId, content: PaneContent, cx: &mut Context<Self>) {
         let relist = match self.content.panes.get_mut(&pane_id) {
             Some(ui) if ui.environment != content.environment => {
+                // Its editors go with the old environment; their edits stay in backups.
+                if let Some(backups) = &self.content.backups {
+                    write_pane_backups(backups, ui, None, cx);
+                }
                 *ui = PaneUi::new(
                     &pane_id,
                     content.environment.clone(),
@@ -468,6 +988,7 @@ impl CompiApp {
             }
             Some(ui) if ui.root() != content.root => {
                 ui.tree = FileTree::new(pane_id.clone(), content.root.clone());
+                ui.filter.clear();
                 true
             }
             Some(_) => false,
@@ -513,7 +1034,7 @@ impl CompiApp {
                 reveal,
             },
         );
-        self.request_content_read(pane_id, content.environment, active);
+        self.request_content_read(pane_id, content.environment, active, true);
     }
 
     /// Puts the cursor on pending lines of shown editors that have laid out; until then
@@ -569,30 +1090,213 @@ impl CompiApp {
         }
     }
 
-    /// Drops state of panes and files the workspace no longer has.
+    /// Drops state of panes and files the workspace no longer has, after moving an
+    /// editor saved as another file to that file once its pane lists it. Unsaved edits
+    /// of a pane or file someone removed (the CLI asked first; another window asked
+    /// about its own) are discarded with their backups; after a daemon restart the
+    /// backups are kept for Recover unsaved edits.
     pub(super) fn prune_content(&mut self) {
         let Some(workspace) = &self.workspace else {
             return;
+        };
+        let settled = !self.mutation_pending;
+        let server = (
+            workspace.server_id.clone(),
+            workspace.server_generation.clone(),
+        );
+        let backups = self
+            .content
+            .backups
+            .as_ref()
+            .filter(|_| self.content.server.as_ref() == Some(&server));
+        let forget = |environment: &ContentEnvironment, path: &str, file: &OpenFile| {
+            if let (Some(backups), FileBody::Ready(editor)) = (backups, &file.body)
+                && editor.dirty
+            {
+                backups.delete(environment, path);
+            }
         };
         self.content
             .panes
             .retain(|pane_id, ui| match find_content(workspace, pane_id) {
                 Some(content) => {
-                    ui.files.retain(|path, _| content.files.contains(path));
+                    let moves: Vec<(String, String)> = ui
+                        .files
+                        .iter()
+                        .filter_map(|(path, file)| match &file.body {
+                            FileBody::Ready(editor) => editor
+                                .moving_to
+                                .as_ref()
+                                .filter(|target| content.files.contains(target))
+                                .map(|target| (path.clone(), target.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    for (from, to) in moves {
+                        if let Some(mut file) = ui.files.remove(&from) {
+                            if let FileBody::Ready(editor) = &mut file.body {
+                                editor.moving_to = None;
+                            }
+                            ui.files.insert(to, file);
+                        }
+                    }
+                    if settled {
+                        // The change that would have moved them is over.
+                        for file in ui.files.values_mut() {
+                            if let FileBody::Ready(editor) = &mut file.body {
+                                editor.moving_to = None;
+                            }
+                        }
+                    }
+                    ui.files.retain(|path, file| {
+                        let open = content.files.contains(path);
+                        if !open {
+                            forget(&ui.environment, path, file);
+                        }
+                        open
+                    });
                     true
                 }
-                None => false,
+                None => {
+                    for (path, file) in &ui.files {
+                        forget(&ui.environment, path, file);
+                    }
+                    false
+                }
             });
+        self.content.server = Some(server);
     }
 
-    /// Open files in `pane_id` with unsaved changes.
-    pub(super) fn unsaved_files(&self, pane_id: &PaneId) -> usize {
-        self.content.panes.get(pane_id).map_or(0, |ui| {
-            ui.files
-                .values()
-                .filter(|file| matches!(&file.body, FileBody::Ready(editor) if editor.dirty))
-                .count()
-        })
+    /// Content panes with client state, shown or not.
+    pub(super) fn content_panes(&self) -> impl Iterator<Item = &PaneId> {
+        self.content.panes.keys()
+    }
+
+    /// Open files in `pane_id` with unsaved changes, in tab order.
+    pub(super) fn unsaved_files(&self, pane_id: &PaneId) -> Vec<String> {
+        let (Some(ui), Some(content)) = (
+            self.content.panes.get(pane_id),
+            self.workspace
+                .as_ref()
+                .and_then(|workspace| find_content(workspace, pane_id)),
+        ) else {
+            return Vec::new();
+        };
+        content
+            .files
+            .iter()
+            .filter(|path| {
+                ui.editor(path)
+                    .is_some_and(|editor| editor.dirty && !editor.discarded)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// This window's editors with edits a close would lose, by path.
+    pub(super) fn unsaved_editors(&self) -> Vec<(PaneId, String, ContentEnvironment)> {
+        let mut editors: Vec<_> = self
+            .content
+            .panes
+            .iter()
+            .flat_map(|(pane_id, ui)| {
+                ui.files
+                    .iter()
+                    .filter(|(_, file)| {
+                        matches!(&file.body, FileBody::Ready(editor)
+                            if editor.dirty && !editor.discarded)
+                    })
+                    .map(move |(path, _)| (pane_id.clone(), path.clone(), ui.environment.clone()))
+            })
+            .collect();
+        editors.sort_by(|left, right| left.1.cmp(&right.1));
+        editors
+    }
+
+    /// Don't save: the edits go with their editor, without a backup or asking again.
+    pub(super) fn discard_edits(&mut self, pane_id: &PaneId, path: &str) {
+        let ContentUi { panes, backups, .. } = &mut self.content;
+        let Some(ui) = panes.get_mut(pane_id) else {
+            return;
+        };
+        if let Some(editor) = ui.editor_mut(path) {
+            editor.discarded = true;
+            editor.backup_due = None;
+        }
+        if let Some(backups) = backups {
+            backups.delete(&ui.environment, path);
+        }
+    }
+
+    /// The prompt's Save for one file; `ticket` tells the prompt whether it was saved.
+    /// A read-only file is not written and shows why.
+    pub(super) fn save_for_prompt(
+        &mut self,
+        pane_id: &PaneId,
+        path: &str,
+        ticket: SaveTicket,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .and_then(|ui| ui.editor_mut(path))
+        else {
+            return;
+        };
+        if !editor.dirty {
+            ticket.saved();
+            return;
+        }
+        if !editor.writable {
+            editor.banner = Some(Banner::ReadOnly);
+            return;
+        }
+        if editor.moving_to.is_some() {
+            return;
+        }
+        editor.save_tickets.push(ticket);
+        // A save already under way answers for this one.
+        if editor.saving.is_none() {
+            let expected = save_expected(&editor.disk, &editor.version);
+            self.write_content(
+                pane_id,
+                path,
+                path.to_owned(),
+                Expect::Exactly(expected),
+                cx,
+            );
+        }
+    }
+
+    /// Writes the backups of edits that waited `BACKUP_DELAY`, or with `all` of every
+    /// edit not yet written.
+    pub(super) fn write_backups(&mut self, all: bool, cx: &App) {
+        let ContentUi {
+            panes,
+            backups: Some(backups),
+            ..
+        } = &mut self.content
+        else {
+            return;
+        };
+        let due_by = (!all).then(Instant::now);
+        for ui in panes.values_mut() {
+            write_pane_backups(backups, ui, due_by, cx);
+        }
+    }
+
+    /// Drops this window's editors of `panes`, which another window now shows; edits
+    /// not saved or discarded travel through their backups.
+    pub(super) fn release_content_panes(&mut self, panes: &[PaneId], cx: &App) {
+        for pane_id in panes {
+            if let Some(mut ui) = self.content.panes.remove(pane_id)
+                && let Some(backups) = &self.content.backups
+            {
+                write_pane_backups(backups, &mut ui, None, cx);
+            }
+        }
     }
 
     /// Keyboard focus follows the focused pane: a content pane keeps it on its editor
@@ -887,8 +1591,30 @@ impl CompiApp {
         self.update_content(pane_id, content);
     }
 
-    /// Closes the tab of `path`. Unsaved changes take a second click to discard.
-    fn close_content_file(&mut self, pane_id: &PaneId, path: &str) {
+    /// The tab's close button: unsaved changes ask first.
+    fn close_content_file(
+        &mut self,
+        pane_id: &PaneId,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.guard_unsaved(
+            unsaved::CloseScope::File {
+                pane_id: pane_id.clone(),
+                path: path.to_owned(),
+            },
+            unsaved::AfterUnsaved::CloseFile {
+                pane_id: pane_id.clone(),
+                path: path.to_owned(),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Closes the tab of `path`, its editor going once the pane no longer lists it.
+    pub(super) fn drop_content_file(&mut self, pane_id: &PaneId, path: &str) {
         let Some(mut content) = self
             .workspace
             .as_ref()
@@ -900,21 +1626,6 @@ impl CompiApp {
         let Some(index) = content.files.iter().position(|file| file == path) else {
             return;
         };
-        if let Some(ui) = self.content.panes.get_mut(pane_id)
-            && let Some(editor) = ui.editor_mut(path)
-            && editor.dirty
-            && !editor.discard_armed
-        {
-            editor.discard_armed = true;
-            ui.notice = Some((
-                path.to_owned(),
-                format!(
-                    "{} has unsaved changes. Save with {SAVE_SHORTCUT}, or close its tab again to discard them.",
-                    file_name(path)
-                ),
-            ));
-            return;
-        }
         content.files.remove(index);
         if content.active_file.as_deref() == Some(path) {
             content.active_file = content
@@ -926,15 +1637,13 @@ impl CompiApp {
         self.update_content(pane_id, content);
     }
 
+    /// Ctrl/Cmd+S: saves the focused file if it has changes, or was deleted on disk.
+    /// A read-only file is not written; its banner offers Save as instead.
     fn save_focused_file(&mut self, cx: &mut Context<Self>) {
-        let Some((pane_id, environment, path)) = self.focused_pane().and_then(|pane| {
-            let content = self.focused_content()?;
-            Some((
-                pane.clone(),
-                content.environment.clone(),
-                content.active_file.clone()?,
-            ))
-        }) else {
+        let Some((pane_id, path)) = self
+            .focused_pane()
+            .and_then(|pane| Some((pane.clone(), self.focused_content()?.active_file.clone()?)))
+        else {
             return;
         };
         let Some(editor) = self
@@ -942,45 +1651,142 @@ impl CompiApp {
             .panes
             .get_mut(&pane_id)
             .and_then(|ui| ui.editor_mut(&path))
-            .filter(|editor| editor.dirty && editor.saving.is_none())
+        else {
+            return;
+        };
+        if !editor.writable {
+            editor.banner = Some(Banner::ReadOnly);
+            return;
+        }
+        if (editor.dirty || editor.disk == OnDisk::Missing) && editor.saving.is_none() {
+            let expected = save_expected(&editor.disk, &editor.version);
+            self.write_content(&pane_id, &path, path.clone(), Expect::Exactly(expected), cx);
+        }
+    }
+
+    /// Writes the editor of `path` to `target` (itself, or a Save as file) in the pane's
+    /// environment; `ContentFileSaved` reports the outcome.
+    fn write_content(
+        &mut self,
+        pane_id: &PaneId,
+        path: &str,
+        target: String,
+        expect: Expect,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let environment = ui.environment.clone();
+        let Some(editor) = ui
+            .editor_mut(path)
+            .filter(|editor| editor.saving.is_none() && editor.moving_to.is_none())
         else {
             return;
         };
         let text = editor.state.read(cx).text().clone();
         editor.saving = Some(text.clone());
-        let expected = editor.version.clone();
-        let target = self.target.clone();
+        let endings = editor.endings;
+        let connection = self.target.clone();
         let sender = self.event_tx.clone();
+        let (pane_id, path) = (pane_id.clone(), path.to_owned());
         thread::spawn(move || {
             let result = (|| -> crate::Result<_> {
-                target.connect()?.write_content_file(
+                let mut client = connection.connect()?;
+                let expected = match expect {
+                    Expect::Exactly(expected) => expected,
+                    Expect::Whatever(known) => match client.check_content_file(
+                        environment.clone(),
+                        target.clone(),
+                        known.clone(),
+                    )? {
+                        FileState::Unchanged { .. } => Some(known),
+                        FileState::Changed { version, .. } => Some(version),
+                        FileState::Missing => None,
+                    },
+                };
+                client.write_content_file(
                     environment,
-                    path.clone(),
-                    Some(expected),
-                    text.to_string(),
+                    target.clone(),
+                    expected,
+                    endings.apply(text.to_string()),
                 )
             })()
             .map_err(|error| {
                 match error.downcast_ref::<compi_protocol::DaemonError>() {
-                    Some(error) if error.code == ErrorCode::FileConflict => {
-                        "The file changed on disk after it was opened, so Compi did not overwrite it. Your edits are still here.".to_owned()
-                    }
-                    _ => error.to_string(),
+                    Some(error) if error.code == ErrorCode::FileConflict => SaveFailure::Conflict,
+                    _ => SaveFailure::Other(error.to_string()),
                 }
             });
             sender.send(UiEvent::ContentFileSaved {
                 pane_id,
                 path,
+                target,
                 result,
             });
         });
     }
 
-    fn editor_changed(
+    /// Overwrite: saves over whatever the disk holds now. If it changes again between
+    /// that check and the write, the conflict shows again.
+    fn overwrite_content_file(&mut self, pane_id: &PaneId, path: &str, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .and_then(|ui| ui.editor_mut(path))
+        else {
+            return;
+        };
+        if !editor.writable {
+            editor.banner = Some(Banner::ReadOnly);
+            return;
+        }
+        let known = editor.version.clone();
+        self.write_content(pane_id, path, path.to_owned(), Expect::Whatever(known), cx);
+    }
+
+    /// Reload: reads the file again, discarding the editor's text. With unsaved
+    /// changes it takes a second click.
+    fn reload_content_file(&mut self, pane_id: &PaneId, path: &str) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let environment = ui.environment.clone();
+        let Some(editor) = ui
+            .editor_mut(path)
+            .filter(|editor| editor.saving.is_none() && editor.moving_to.is_none())
+        else {
+            return;
+        };
+        if editor.dirty && !editor.reload_armed {
+            editor.reload_armed = true;
+            return;
+        }
+        editor.reload_armed = false;
+        editor.reload = Some(Reload::Discard);
+        self.request_content_read(pane_id.clone(), environment, path.to_owned(), false);
+    }
+
+    fn dismiss_banner(&mut self, pane_id: &PaneId, path: &str) {
+        if let Some(editor) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .and_then(|ui| ui.editor_mut(path))
+        {
+            editor.banner = None;
+            editor.reload_armed = false;
+        }
+    }
+
+    /// Save as: an inline path field, filled with the file's path, in the pane's
+    /// environment.
+    fn open_save_as(
         &mut self,
         pane_id: &PaneId,
         path: &str,
-        state: &Entity<EditorState>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(editor) = self
@@ -991,11 +1797,249 @@ impl CompiApp {
         else {
             return;
         };
+        let input = match &editor.save_as {
+            Some(save_as) => save_as.input.clone(),
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).default_value(path.to_owned()));
+                let (pane, file) = (pane_id.clone(), path.to_owned());
+                let events = cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.submit_save_as(&pane, &file, cx);
+                        cx.notify();
+                    }
+                });
+                editor.save_as = Some(SaveAs {
+                    input: input.clone(),
+                    _events: events,
+                    error: None,
+                });
+                input
+            }
+        };
+        input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    fn submit_save_as(&mut self, pane_id: &PaneId, path: &str, cx: &mut Context<Self>) {
+        let Some(save_as) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .and_then(|ui| ui.editor_mut(path))
+            .and_then(|editor| editor.save_as.as_mut())
+        else {
+            return;
+        };
+        let target = save_as.input.read(cx).value().trim().to_owned();
+        if target.is_empty() || target == path {
+            save_as.error = Some("Choose a new path".into());
+            return;
+        }
+        save_as.error = None;
+        self.write_content(pane_id, path, target, Expect::Exactly(None), cx);
+    }
+
+    /// Closes the Save as field and returns the keyboard to the editor.
+    fn close_save_as(
+        &mut self,
+        pane_id: &PaneId,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .and_then(|ui| ui.editor_mut(path))
+            && editor.save_as.take().is_some()
+        {
+            editor.state.update(cx, |state, cx| state.focus(window, cx));
+        }
+    }
+
+    fn editor_changed(
+        &mut self,
+        pane_id: &PaneId,
+        state: &Entity<EditorState>,
+        cx: &mut Context<Self>,
+    ) {
+        let ContentUi { panes, backups, .. } = &mut self.content;
+        let Some(ui) = panes.get_mut(pane_id) else {
+            return;
+        };
+        let Some((path, editor)) =
+            ui.files
+                .iter_mut()
+                .find_map(|(path, file)| match &mut file.body {
+                    FileBody::Ready(editor) if editor.state == *state => Some((path, editor)),
+                    _ => None,
+                })
+        else {
+            return;
+        };
         let dirty = state.read(cx).text() != &editor.saved;
+        if dirty {
+            editor.discarded = false;
+            // Within `BACKUP_DELAY` of the first edit since the last write, however
+            // fast the typing.
+            editor
+                .backup_due
+                .get_or_insert_with(|| Instant::now() + unsaved::BACKUP_DELAY);
+        } else if editor.dirty {
+            // Undone back to the file: nothing left to keep.
+            editor.backup_due = None;
+            editor.restored = None;
+            if let Some(backups) = backups {
+                backups.delete(&ui.environment, path);
+            }
+        }
         if dirty != editor.dirty {
             editor.dirty = dirty;
-            editor.discard_armed &= dirty;
+            editor.reload_armed &= dirty;
             cx.notify();
+        }
+    }
+
+    /// Compares shown files with the disk on a timer while the window is active, and
+    /// writes the backups of edits as they come due.
+    pub(super) fn watch_content_files(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCH_TICK).await;
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.check_shown_files(window);
+                        this.write_backups(false, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Checks each file shown in an active window when it comes into view and every
+    /// `CHECK_INTERVAL` after, one check per file at a time, on background threads.
+    fn check_shown_files(&mut self, window: &Window) {
+        if self.update_quiesced.load(Ordering::Acquire) {
+            return;
+        }
+        let shown: Vec<(PaneId, String)> = match &self.workspace {
+            Some(workspace) if window.is_window_active() => self
+                .shown_content_panes()
+                .filter_map(|pane_id| {
+                    let active = find_content(workspace, pane_id)?.active_file.clone()?;
+                    Some((pane_id.clone(), active))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut checks = Vec::new();
+        for (pane_id, ui) in &mut self.content.panes {
+            for (path, file) in &mut ui.files {
+                let FileBody::Ready(editor) = &mut file.body else {
+                    continue;
+                };
+                if !shown
+                    .iter()
+                    .any(|(shown_pane, shown_path)| shown_pane == pane_id && shown_path == path)
+                {
+                    editor.shown = false;
+                    continue;
+                }
+                let due = !editor.shown || editor.last_check.elapsed() >= CHECK_INTERVAL;
+                editor.shown = true;
+                let busy = editor.checking
+                    || editor.saving.is_some()
+                    || editor.reload.is_some()
+                    || editor.fresh.is_some()
+                    || editor.moving_to.is_some();
+                if due && !busy {
+                    editor.checking = true;
+                    editor.last_check = Instant::now();
+                    checks.push((
+                        pane_id.clone(),
+                        ui.environment.clone(),
+                        path.clone(),
+                        editor.version.clone(),
+                    ));
+                }
+            }
+        }
+        for (pane_id, environment, path, known) in checks {
+            let connection = self.target.clone();
+            let sender = self.event_tx.clone();
+            thread::spawn(move || {
+                let result = (|| -> crate::Result<_> {
+                    connection.connect()?.check_content_file(
+                        environment,
+                        path.clone(),
+                        known.clone(),
+                    )
+                })()
+                .map_err(|error| error.to_string());
+                sender.send(UiEvent::ContentFileChecked {
+                    pane_id,
+                    path,
+                    known,
+                    result,
+                });
+            });
+        }
+    }
+
+    pub(super) fn content_file_checked(
+        &mut self,
+        pane_id: &PaneId,
+        path: &str,
+        known: &FileVersion,
+        result: Result<FileState, String>,
+    ) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let environment = ui.environment.clone();
+        let Some(editor) = ui.editor_mut(path) else {
+            return;
+        };
+        editor.checking = false;
+        // A save or reload since the check began makes its answer stale; a failed check
+        // is tried again on the next tick.
+        let Ok(state) = result else {
+            return;
+        };
+        if editor.version != *known
+            || editor.saving.is_some()
+            || editor.reload.is_some()
+            || editor.fresh.is_some()
+            || editor.moving_to.is_some()
+        {
+            return;
+        }
+        if let FileState::Unchanged { writable } | FileState::Changed { writable, .. } = &state {
+            editor.writable = *writable;
+            if *writable && editor.banner == Some(Banner::ReadOnly) {
+                editor.banner = None;
+            }
+        }
+        let (disk, action) = after_check(&editor.disk, &state, !editor.dirty);
+        editor.disk = disk;
+        match action {
+            CheckAction::Nothing => {}
+            CheckAction::Settled => {
+                editor.banner = editor.banner.filter(|banner| !banner.about_disk());
+                editor.reload_armed = false;
+            }
+            CheckAction::Show(banner) => {
+                editor.banner = Some(banner);
+                editor.reload_armed = false;
+            }
+            CheckAction::Reload => {
+                editor.reload = Some(Reload::Quiet);
+                self.request_content_read(pane_id.clone(), environment, path.to_owned(), false);
+            }
         }
     }
 
@@ -1024,20 +2068,34 @@ impl CompiApp {
         });
     }
 
-    fn request_content_read(&self, pane_id: PaneId, environment: ContentEnvironment, path: String) {
+    /// Reads `path` for its pane; with `restore`, a first read that also finds the
+    /// file's backup, if it has one.
+    fn request_content_read(
+        &self,
+        pane_id: PaneId,
+        environment: ContentEnvironment,
+        path: String,
+        restore: bool,
+    ) {
         let target = self.target.clone();
         let sender = self.event_tx.clone();
+        let backups = self.content.backups.clone().filter(|_| restore);
         thread::spawn(move || {
             let result = (|| -> crate::Result<_> {
                 target
                     .connect()?
-                    .read_content_file(environment, path.clone())
+                    .read_content_file(environment.clone(), path.clone())
             })()
             .map_err(|error| error.to_string());
+            let backup = match (&result, backups) {
+                (Ok(FileContent::Text { .. }), Some(backups)) => backups.load(&environment, &path),
+                _ => None,
+            };
             sender.send(UiEvent::ContentFileRead {
                 pane_id,
                 path,
                 result,
+                backup,
             });
         });
     }
@@ -1094,57 +2152,177 @@ impl CompiApp {
         &mut self,
         pane_id: PaneId,
         path: String,
-        result: Result<(String, FileVersion), String>,
+        result: Result<FileContent, String>,
+        backup: Option<Backup>,
     ) {
-        let Some(file) = self
-            .content
-            .panes
-            .get_mut(&pane_id)
-            .and_then(|ui| ui.files.get_mut(&path))
-            .filter(|file| matches!(file.body, FileBody::Loading))
-        else {
+        let Some(ui) = self.content.panes.get_mut(&pane_id) else {
             return;
         };
-        file.body = match result {
-            Ok((text, version)) => {
-                self.content.unbuilt = true;
-                FileBody::Read { text, version }
-            }
-            Err(error) => FileBody::Failed(error),
+        let Some(file) = ui.files.get_mut(&path) else {
+            return;
         };
+        // Text for an editor, or the placeholder that replaces one.
+        let result = result.map(|content| match content {
+            FileContent::Text {
+                text,
+                version,
+                writable,
+            } => Ok(FreshText {
+                text,
+                version,
+                writable,
+            }),
+            FileContent::TooLarge { len } => Err(FileBody::Unopenable {
+                reason: Unopenable::TooLarge,
+                len,
+            }),
+            FileContent::Binary { len } => Err(FileBody::Unopenable {
+                reason: Unopenable::Binary,
+                len,
+            }),
+        });
+        let replacement = match &mut file.body {
+            FileBody::Loading => Some(match result {
+                Ok(Ok(fresh)) => {
+                    self.content.unbuilt = true;
+                    FileBody::Read(fresh, backup.map(Box::new))
+                }
+                Ok(Err(placeholder)) => placeholder,
+                Err(error) => FileBody::Failed(error),
+            }),
+            FileBody::Ready(editor) => {
+                let Some(reload) = editor.reload.take() else {
+                    return;
+                };
+                match result {
+                    Ok(read)
+                        if reload == Reload::Quiet && (editor.dirty || editor.saving.is_some()) =>
+                    {
+                        // Edits made while it was read win; the banner offers the disk's.
+                        if editor.saving.is_none() {
+                            if let Ok(fresh) = read {
+                                editor.disk = OnDisk::Changed(fresh.version);
+                            }
+                            editor.banner = Some(Banner::Changed);
+                        }
+                        None
+                    }
+                    Ok(Ok(fresh)) => {
+                        editor.fresh = Some(fresh);
+                        self.content.unbuilt = true;
+                        None
+                    }
+                    Ok(Err(placeholder)) => Some(placeholder),
+                    Err(error) => {
+                        if reload == Reload::Discard {
+                            ui.notice = Some((
+                                path.clone(),
+                                format!("{} was not reloaded: {error}", file_name(&path)),
+                            ));
+                        }
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(body) = replacement {
+            file.body = body;
+        }
     }
 
     pub(super) fn content_file_saved(
         &mut self,
         pane_id: PaneId,
         path: String,
-        result: Result<FileVersion, String>,
+        target: String,
+        result: Result<FileVersion, SaveFailure>,
         cx: &mut Context<Self>,
     ) {
-        let Some(ui) = self.content.panes.get_mut(&pane_id) else {
+        let ContentUi { panes, backups, .. } = &mut self.content;
+        let Some(ui) = panes.get_mut(&pane_id) else {
             return;
         };
-        let Some(editor) = ui.editor_mut(&path) else {
+        let Some(FileBody::Ready(editor)) = ui.files.get_mut(&path).map(|file| &mut file.body)
+        else {
             return;
         };
         let Some(saved) = editor.saving.take() else {
             return;
         };
+        // Dropped unresolved on failure: prompts waiting for this save cancel.
+        let tickets = std::mem::take(&mut editor.save_tickets);
+        let save_as = target != path;
         match result {
             Ok(version) => {
                 editor.version = version;
                 editor.dirty = editor.state.read(cx).text() != &saved;
-                editor.discard_armed = false;
+                editor.reload_armed = false;
                 editor.saved = saved;
+                editor.disk = OnDisk::Current;
+                editor.banner = editor.banner.filter(|banner| !banner.about_disk());
+                editor.restored = None;
+                if let Some(backups) = backups {
+                    backups.delete(&ui.environment, &path);
+                }
+                // Edits typed during the save are backed up against the new version.
+                editor.backup_due = editor.dirty.then(Instant::now);
+                for ticket in tickets {
+                    ticket.saved();
+                }
+                if save_as {
+                    editor.writable = true;
+                    editor.banner = None;
+                    editor.save_as = None;
+                    editor.moving_to = Some(target.clone());
+                    let language = editor_language(&target, editor.saved.len());
+                    editor.state.update(cx, |state, cx| {
+                        if state.language_name() != language {
+                            state.set_highlighter(language, cx);
+                        }
+                    });
+                }
                 if ui.notice.as_ref().is_some_and(|(file, _)| *file == path) {
                     ui.notice = None;
                 }
             }
-            Err(error) => {
-                let message = format!("{} was not saved: {error}", file_name(&path));
-                ui.notice = Some((path, message));
+            Err(failure) => {
+                match (editor.save_as.as_mut().filter(|_| save_as), failure) {
+                    (Some(field), SaveFailure::Conflict) => {
+                        field.error = Some(format!("{} already exists", file_name(&target)));
+                    }
+                    (Some(field), SaveFailure::Other(error)) => field.error = Some(error),
+                    (None, SaveFailure::Conflict) => {
+                        editor.banner = Some(Banner::Conflict);
+                        editor.reload_armed = false;
+                    }
+                    (None, SaveFailure::Other(error)) => {
+                        let message = format!("{} was not saved: {error}", file_name(&path));
+                        ui.notice = Some((path, message));
+                    }
+                }
+                return;
             }
         }
+        if !save_as {
+            return;
+        }
+        // The tab now shows the new file; the original is left as it was.
+        let Some(mut content) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, &pane_id))
+            .cloned()
+        else {
+            return;
+        };
+        content.files.retain(|file| *file != target);
+        match content.files.iter().position(|file| *file == path) {
+            Some(index) => content.files[index] = target.clone(),
+            None => content.files.push(target.clone()),
+        }
+        content.active_file = Some(target);
+        self.update_content(&pane_id, content);
     }
 
     fn retry_content_file(&mut self, pane_id: &PaneId, path: &str) {
@@ -1202,7 +2380,7 @@ impl CompiApp {
         };
         let file = (!row.directory).then(|| row.path.clone());
         ui.tree.selected = index;
-        ui.tree_scroll.scroll_to_item(index);
+        ui.scroll_to_selected();
         let environment = ui.environment.clone();
         match file {
             Some(path) => self.open_content_file(
@@ -1225,8 +2403,8 @@ impl CompiApp {
     }
 
     /// Folder navigation while the pane itself has the keyboard: arrows move and
-    /// expand, Enter opens. With a file open and the folder hidden, Enter returns to
-    /// the editor.
+    /// expand, Enter opens, typing filters the names and Escape clears the filter.
+    /// With a file open and the folder hidden, Enter returns to the editor.
     fn content_tree_key(
         &mut self,
         pane_id: &PaneId,
@@ -1235,7 +2413,7 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let modifiers = &key.modifiers;
-        if modifiers.control || modifiers.platform || modifiers.alt || modifiers.shift {
+        if modifiers.control || modifiers.platform || modifiers.alt {
             return false;
         }
         let file_open = self
@@ -1247,44 +2425,84 @@ impl CompiApp {
             return false;
         };
         if file_open && !ui.sidebar {
-            if key.key == "enter" {
+            if key.key == "enter" && !modifiers.shift {
                 self.content.released = None;
                 return true;
             }
             return false;
         }
-        let tree = &mut ui.tree;
+        let visible = ui.visible_rows();
+        let at = visible.iter().position(|&index| index == ui.tree.selected);
+        let selected = at.map(|_| ui.tree.selected);
         match key.key.as_str() {
-            "up" => tree.move_selection(-1),
-            "down" => tree.move_selection(1),
+            "escape" if !ui.filter.is_empty() => ui.filter.clear(),
+            "backspace" if !ui.filter.is_empty() => {
+                ui.filter.pop();
+            }
+            "up" | "down" if !modifiers.shift => {
+                let Some(last) = visible.len().checked_sub(1) else {
+                    return true;
+                };
+                let up = key.key == "up";
+                ui.tree.selected = visible[match at {
+                    Some(at) if up => at.saturating_sub(1),
+                    Some(at) => (at + 1).min(last),
+                    None if up => last,
+                    None => 0,
+                }];
+            }
             "right"
-                if tree
-                    .selected()
-                    .is_some_and(|row| row.directory && !row.expanded) =>
+                if !modifiers.shift
+                    && selected.is_some_and(|index| {
+                        let row = &ui.tree.rows[index];
+                        row.directory && !row.expanded
+                    }) =>
             {
-                let index = tree.selected;
+                let index = ui.tree.selected;
                 self.activate_content_row(pane_id, index, window, cx);
                 return true;
             }
-            "left" => {
-                let selected = tree.selected;
+            "left" if !modifiers.shift => {
+                let Some(selected) = selected else {
+                    return true;
+                };
+                let tree = &mut ui.tree;
+                let depth = tree.rows[selected].depth;
                 if tree.rows[selected].expanded {
                     tree.toggle(selected);
-                } else if tree.rows[selected].depth > 0 {
+                } else if depth > 1 {
+                    // The folder above; it shows, since a shown row's folders do.
                     tree.selected = (0..selected)
                         .rev()
-                        .find(|index| tree.rows[*index].depth < tree.rows[selected].depth)
-                        .unwrap_or(0);
+                        .find(|index| tree.rows[*index].depth < depth)
+                        .unwrap_or(selected);
                 }
             }
-            "enter" => {
-                let index = tree.selected;
-                self.activate_content_row(pane_id, index, window, cx);
+            "enter" if !modifiers.shift => {
+                if let Some(index) = selected {
+                    self.activate_content_row(pane_id, index, window, cx);
+                }
                 return true;
             }
-            _ => return false,
+            _ => {
+                let Some(text) = key
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                else {
+                    return false;
+                };
+                ui.filter.push_str(text);
+            }
         }
-        ui.tree_scroll.scroll_to_item(ui.tree.selected);
+        // A selection the filter hid moves to the first row still shown.
+        let visible = ui.visible_rows();
+        if !visible.contains(&ui.tree.selected)
+            && let Some(&first) = visible.first()
+        {
+            ui.tree.selected = first;
+        }
+        ui.scroll_to_selected();
         true
     }
 
@@ -1300,9 +2518,20 @@ impl CompiApp {
         };
         if !ui.focus.is_focused(window) {
             // A key the editor or its search field left alone. Text input still needs
-            // it, so only Escape stops here: it hands the keyboard to the pane.
+            // it, so only Escape stops here: it closes Save as, or hands the keyboard
+            // to the pane.
             if event.keystroke.key == "escape" {
-                if !self.handle_app_key(event, window, cx) {
+                let saving_as = ui.files.iter().find_map(|(path, file)| match &file.body {
+                    FileBody::Ready(editor) => editor
+                        .save_as
+                        .as_ref()
+                        .filter(|save_as| save_as.input.focus_handle(cx).is_focused(window))
+                        .map(|_| path.clone()),
+                    _ => None,
+                });
+                if let Some(path) = saving_as {
+                    self.close_save_as(pane_id, &path, window, cx);
+                } else if !self.handle_app_key(event, window, cx) {
                     self.release_editor(pane_id, window, cx);
                 }
                 cx.stop_propagation();
@@ -1411,6 +2640,11 @@ impl CompiApp {
                                     .when_some(ui.notice.as_ref(), |body, (_, notice)| {
                                         body.child(self.render_content_notice(&pane_id, notice, cx))
                                     })
+                                    .when_some(ui.editor(active), |body, editor| {
+                                        body.child(
+                                            self.render_file_banner(&pane_id, active, editor, cx),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .flex_1()
@@ -1426,6 +2660,23 @@ impl CompiApp {
                                                         .flex_col()
                                                         .border_r_1()
                                                         .border_color(color(colors.border))
+                                                        .child(
+                                                            div()
+                                                                .flex_none()
+                                                                .px_3()
+                                                                .pt_2()
+                                                                .pb_1()
+                                                                .overflow_hidden()
+                                                                .text_ellipsis()
+                                                                .whitespace_nowrap()
+                                                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                                .text_color(color(colors.muted))
+                                                                .child(
+                                                                    content
+                                                                        .folder_name()
+                                                                        .to_owned(),
+                                                                ),
+                                                        )
                                                         .child(self.render_content_tree(
                                                             &pane_id,
                                                             ui,
@@ -1436,9 +2687,9 @@ impl CompiApp {
                                             })
                                             .child(self.render_file_body(&pane_id, active, ui, cx)),
                                     ),
-                                None => {
-                                    body.child(self.render_folder_view(&pane_id, content, ui, cx))
-                                }
+                                None => body.child(
+                                    self.render_folder_view(&pane_id, content, ui, rect.width, cx),
+                                ),
                             }),
                     )
                 },
@@ -1450,9 +2701,17 @@ impl CompiApp {
         pane_id: &PaneId,
         content: &PaneContent,
         ui: &PaneUi,
+        width: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = *self.colors();
+        let home = match (&content.environment, self.target.ssh_host()) {
+            (ContentEnvironment::Host, None) => CLIENT_HOME.as_deref(),
+            _ => unix_home(&content.root),
+        };
+        // Roughly how many caption characters fit; the middle goes before the pane clips.
+        let fits = ((width - 24.0) / (UI_MICRO_TEXT_SIZE * 0.6)).max(12.0) as usize;
+        let root = content.root.clone();
         div()
             .size_full()
             .flex()
@@ -1461,15 +2720,15 @@ impl CompiApp {
                 div()
                     .flex_none()
                     .px_3()
-                    .py_2()
+                    .pt_2()
+                    .pb_1()
                     .flex()
                     .flex_col()
-                    .border_b_1()
-                    .border_color(color(colors.border))
+                    .gap(px(2.0))
                     .child(
                         div()
                             .flex()
-                            .items_baseline()
+                            .items_center()
                             .gap_2()
                             .min_w_0()
                             .child(
@@ -1484,33 +2743,37 @@ impl CompiApp {
                             .child(
                                 div()
                                     .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(color(colors.surface_hover))
                                     .text_size(px(UI_MICRO_TEXT_SIZE))
                                     .text_color(color(colors.muted))
-                                    .child(content.environment.to_string()),
+                                    .child(self.environment_label(&content.environment)),
                             ),
                     )
                     .child(
                         div()
+                            .id("content-folder-path")
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(px(UI_MICRO_TEXT_SIZE))
                             .text_color(color(colors.muted))
-                            .child(content.root.clone()),
+                            .child(caption_path(&content.root, home, fits))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| HeaderTooltip {
+                                    title: root.clone(),
+                                    reason: None,
+                                    colors,
+                                })
+                                .into()
+                            }),
                     ),
             )
             .child(self.render_content_tree(pane_id, ui, None, cx))
-            .child(
-                div()
-                    .flex_none()
-                    .px_3()
-                    .py_1()
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                    .text_color(color(colors.muted))
-                    .child("Click a file to open it · ↑↓ select · ←→ fold · Enter open"),
-            )
     }
 
+    /// The folder's filter field and the rows it shows, below the root the header names.
     fn render_content_tree(
         &self,
         pane_id: &PaneId,
@@ -1519,10 +2782,29 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = *self.colors();
-        let rows = ui.tree.rows.iter().enumerate().map(|(index, row)| {
+        // The density of the terminal's file tree.
+        let row_height = self.typography.cell_height.max(18.0);
+        // Keys reach the folder rather than an editor.
+        let keyboard = self.keyboard_content_pane() == Some(pane_id)
+            && (active.is_none() || self.content.released.as_ref() == Some(pane_id));
+        let visible = ui.visible_rows();
+        let empty = if !visible.is_empty() {
+            None
+        } else if !ui.filter.is_empty() {
+            Some("No listed name matches; folders not expanded are not searched.")
+        } else if ui.tree.rows[0].loading {
+            Some("Loading…")
+        } else if ui.tree.error.is_none() {
+            Some("Empty folder")
+        } else {
+            None
+        };
+        let rows = visible.into_iter().map(|index| {
+            let row = &ui.tree.rows[index];
             let selected = index == ui.tree.selected;
             let open = active == Some(row.path.as_str());
             let folder = row.directory;
+            let level = row.depth.saturating_sub(1).min(31);
             let row_pane = pane_id.clone();
             let tint = if selected || open {
                 colors.foreground
@@ -1533,19 +2815,15 @@ impl CompiApp {
             };
             div()
                 .id(("content-tree-row", index))
-                .h(px(TREE_ROW_HEIGHT))
+                .group("content-tree-row")
+                .relative()
+                .h(px(row_height))
                 .flex_none()
-                .pl(px(6.0 + row.depth.min(31) as f32 * 14.0))
+                .pl(px(TREE_INSET + level as f32 * TREE_INDENT))
                 .pr_2()
                 .flex()
                 .items_center()
-                .whitespace_nowrap()
                 .cursor_pointer()
-                .when(selected, |entry| entry.bg(color(colors.selection)))
-                .when(!selected, |entry| {
-                    entry.hover(move |style| style.bg(color(colors.surface_hover)))
-                })
-                .when(open, |entry| entry.text_color(color(colors.accent)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
@@ -1557,33 +2835,157 @@ impl CompiApp {
                         cx.notify();
                     }),
                 )
+                // One guide per folder above, through the middle of its arrow.
+                .children((0..level).map(|guide| {
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(TREE_INSET + guide as f32 * TREE_INDENT + 11.0))
+                        .w(px(1.0))
+                        .bg(color(colors.border))
+                }))
                 .child(
                     div()
-                        .w(px(14.0))
-                        .flex_none()
-                        .text_color(color(colors.muted))
-                        .child(match (folder, row.expanded) {
-                            (false, _) => "",
-                            (true, true) => "▾",
-                            (true, false) => "▸",
-                        }),
-                )
-                .child(tree_entry_icon(folder, row.expanded, color(tint)))
-                .child(
-                    div()
-                        .ml_1()
+                        .h(px(row_height - 2.0))
                         .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(row.name.clone()),
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .whitespace_nowrap()
+                        .when(selected, |item| item.bg(color(colors.selection)))
+                        .when(!selected, |item| {
+                            item.group_hover("content-tree-row", move |style| {
+                                style.bg(color(colors.surface_hover))
+                            })
+                        })
+                        .when(open, |item| item.text_color(color(colors.accent)))
+                        // Dotfiles and dot-folders recede.
+                        .when(row.name.starts_with('.') && !selected, |item| {
+                            item.opacity(0.55)
+                        })
+                        .child(
+                            div()
+                                .w(px(14.0))
+                                .flex_none()
+                                .text_color(color(colors.muted))
+                                .child(match (folder, row.expanded) {
+                                    (false, _) => "",
+                                    (true, true) => "▾",
+                                    (true, false) => "▸",
+                                }),
+                        )
+                        .child(tree_entry_icon(folder, row.expanded, color(tint)))
+                        .child(
+                            div()
+                                .ml_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(row.name.clone()),
+                        ),
                 )
         });
+        let focus_pane = pane_id.clone();
+        let clear_pane = pane_id.clone();
+        let caret = keyboard.then(|| {
+            div()
+                .flex_none()
+                .w(px(1.0))
+                .h(px(UI_SMALL_LINE_HEIGHT - 4.0))
+                .bg(color(colors.accent))
+        });
+        let filter = div()
+            .id("content-tree-filter")
+            .flex_none()
+            .mx_2()
+            .mb_1()
+            .h(px(row_height + 4.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_sm()
+            .border_1()
+            .border_color(color(if keyboard {
+                colors.accent
+            } else {
+                colors.border
+            }))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.release_editor(&focus_pane, window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: "Type to filter the listed names".into(),
+                    reason: Some("↑↓ select · ←→ fold · Enter open · Esc clear".into()),
+                    colors,
+                })
+                .into()
+            })
+            .map(|field| {
+                if ui.filter.is_empty() {
+                    field
+                        .children(caret)
+                        .child(div().text_color(color(colors.muted)).child("Filter"))
+                } else {
+                    field
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(ui.filter.clone()),
+                        )
+                        .children(caret)
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("content-tree-filter-clear")
+                                .flex_none()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(color(colors.muted))
+                                .hover(move |style| {
+                                    style
+                                        .bg(color(colors.surface_hover))
+                                        .text_color(color(colors.foreground))
+                                })
+                                .child("×")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        if let Some(ui) = this.content.panes.get_mut(&clear_pane) {
+                                            ui.filter.clear();
+                                            ui.scroll_to_selected();
+                                        }
+                                        this.release_editor(&clear_pane, window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                }
+            });
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
             .text_size(px(UI_SMALL_TEXT_SIZE))
+            .child(filter)
             .when_some(ui.tree.error.as_deref(), |tree, error| {
                 tree.child(
                     div()
@@ -1599,10 +3001,19 @@ impl CompiApp {
                     .id("content-tree")
                     .flex_1()
                     .min_h_0()
-                    .py_1()
+                    .pb_1()
                     .overflow_y_scroll()
                     .track_scroll(&ui.tree_scroll)
-                    .children(rows),
+                    .children(rows)
+                    .when_some(empty, |list, text| {
+                        list.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_color(color(colors.muted))
+                                .child(text),
+                        )
+                    }),
             )
     }
 
@@ -1615,11 +3026,15 @@ impl CompiApp {
     ) -> impl IntoElement {
         let colors = *self.colors();
         let toggle_pane = pane_id.clone();
+        let environment = self.environment_label(&ui.environment);
         let tabs = content.files.iter().enumerate().map(|(index, path)| {
             let active = content.active_file.as_ref() == Some(path);
-            let dirty = ui.editor(path).is_some_and(|editor| editor.dirty);
+            let editor = ui.editor(path);
+            let dirty = editor.is_some_and(|editor| editor.dirty);
+            let read_only = editor.is_some_and(|editor| !editor.writable);
             let (open_pane, open_path) = (pane_id.clone(), path.clone());
             let (close_pane, close_path) = (pane_id.clone(), path.clone());
+            let (title, reason) = (path.clone(), environment.clone());
             div()
                 .id(("content-file-tab", index))
                 .flex_none()
@@ -1654,6 +3069,14 @@ impl CompiApp {
                         cx.notify();
                     }),
                 )
+                .tooltip(move |_, cx| {
+                    cx.new(|_| HeaderTooltip {
+                        title: title.clone(),
+                        reason: Some(reason.clone()),
+                        colors,
+                    })
+                    .into()
+                })
                 .child(
                     div()
                         .min_w_0()
@@ -1662,6 +3085,18 @@ impl CompiApp {
                         .whitespace_nowrap()
                         .child(file_name(path).to_owned()),
                 )
+                .when(read_only, |tab| {
+                    tab.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(color(colors.surface_hover))
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .child("Read-only"),
+                    )
+                })
                 .when(dirty, |tab| {
                     tab.child(
                         div()
@@ -1689,8 +3124,8 @@ impl CompiApp {
                         .child("×")
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.close_content_file(&close_pane, &close_path);
+                            cx.listener(move |this, _, window, cx| {
+                                this.close_content_file(&close_pane, &close_path, window, cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
@@ -1745,6 +3180,243 @@ impl CompiApp {
                     .overflow_x_scroll()
                     .children(tabs),
             )
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(160.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_color(color(colors.muted))
+                    .child(environment),
+            )
+    }
+
+    /// Where content of `environment` lives, as captions name it.
+    pub(super) fn environment_label(&self, environment: &ContentEnvironment) -> String {
+        environment_label(self.target.ssh_host(), environment)
+    }
+
+    /// The active file's banner and its Save as field.
+    fn render_file_banner(
+        &self,
+        pane_id: &PaneId,
+        path: &str,
+        editor: &FileEditor,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = *self.colors();
+        let name = file_name(path);
+        let action =
+            |id: &'static str,
+             label: &'static str,
+             run: fn(&mut Self, &PaneId, &str, &mut Window, &mut Context<Self>)| {
+                let (pane_id, path) = (pane_id.clone(), path.to_owned());
+                div()
+                    .id(id)
+                    .flex_none()
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(color(colors.accent))
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            run(this, &pane_id, &path, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            };
+        let reload = || {
+            action(
+                "content-banner-reload",
+                "Reload",
+                |this, pane, path, _, _| this.reload_content_file(pane, path),
+            )
+        };
+        let save_as = || {
+            action(
+                "content-banner-save-as",
+                "Save as…",
+                |this, pane, path, window, cx| this.open_save_as(pane, path, window, cx),
+            )
+        };
+        let dismiss = || {
+            action("content-banner-dismiss", "×", |this, pane, path, _, _| {
+                this.dismiss_banner(pane, path)
+            })
+        };
+        let restored = editor.restored.map(|saved_at| {
+            div()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .border_b_1()
+                .border_color(color(colors.border))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(color(colors.muted))
+                        .child(unsaved::restored_note(saved_at)),
+                )
+                .child(action(
+                    "content-restored-dismiss",
+                    "×",
+                    |this, pane, path, _, _| {
+                        if let Some(editor) = this
+                            .content
+                            .panes
+                            .get_mut(pane)
+                            .and_then(|ui| ui.editor_mut(path))
+                        {
+                            editor.restored = None;
+                        }
+                    },
+                ))
+        });
+        let armed = "Reload again to discard your edits.".to_owned();
+        let banner = editor.banner.map(|banner| {
+            let (tone, message, actions): (u32, String, Vec<_>) = match banner {
+                Banner::Conflict => (
+                    colors.error,
+                    if editor.reload_armed {
+                        armed.clone()
+                    } else {
+                        format!("{name} changed on disk since you opened it.")
+                    },
+                    vec![
+                        reload(),
+                        action(
+                            "content-banner-overwrite",
+                            "Overwrite",
+                            |this, pane, path, _, cx| this.overwrite_content_file(pane, path, cx),
+                        ),
+                        save_as(),
+                        dismiss(),
+                    ],
+                ),
+                Banner::Changed => (
+                    colors.accent,
+                    if editor.reload_armed {
+                        armed.clone()
+                    } else {
+                        format!("{name} changed on disk.")
+                    },
+                    vec![
+                        reload(),
+                        action(
+                            "content-banner-keep",
+                            "Keep mine",
+                            |this, pane, path, _, _| this.dismiss_banner(pane, path),
+                        ),
+                    ],
+                ),
+                Banner::Deleted => (
+                    colors.error,
+                    format!("{name} was deleted on disk. Saving creates it again."),
+                    vec![dismiss()],
+                ),
+                Banner::ReadOnly => (
+                    colors.accent,
+                    format!("{name} is read-only."),
+                    vec![save_as(), dismiss()],
+                ),
+            };
+            div()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .border_b_1()
+                .border_color(color(tone))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(color(tone))
+                        .child(message),
+                )
+                .children(actions)
+        });
+        let field = editor.save_as.as_ref().map(|field| {
+            let (pane, file) = (pane_id.clone(), path.to_owned());
+            div()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .border_b_1()
+                .border_color(color(colors.border))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_none().child("Save as"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&field.input).appearance(true)),
+                        )
+                        .child(
+                            div()
+                                .id("content-save-as-submit")
+                                .flex_none()
+                                .px_2()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(color(colors.accent))
+                                .hover(move |style| style.bg(color(colors.surface_hover)))
+                                .child(if editor.saving.is_some() {
+                                    "Saving…"
+                                } else {
+                                    "Save"
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.submit_save_as(&pane, &file, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(action(
+                            "content-save-as-cancel",
+                            "Cancel",
+                            |this, pane, path, window, cx| {
+                                this.close_save_as(pane, path, window, cx)
+                            },
+                        )),
+                )
+                .when_some(field.error.clone(), |row, error| {
+                    row.child(div().text_color(color(colors.error)).child(error))
+                })
+        });
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .children(restored)
+            .children(banner)
+            .children(field)
     }
 
     fn render_content_notice(
@@ -1803,11 +3475,55 @@ impl CompiApp {
                     Editor::new(&editor.state)
                         .appearance(false)
                         .bordered(false)
+                        .readonly(!editor.writable)
                         .font_family(self.typography.font.family.clone())
                         .text_size(px(self.typography.font_size))
                         .size_full(),
                 )
                 .into_any_element(),
+            Some(FileBody::Unopenable { reason, len }) => {
+                let copied = path.to_owned();
+                area.p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .child(
+                        div()
+                            .text_size(px(UI_BODY_TEXT_SIZE))
+                            .child(file_name(path).to_owned()),
+                    )
+                    .child(div().text_color(color(colors.muted)).child(format!(
+                        "{} · {}",
+                        human_size(*len),
+                        match reason {
+                            Unopenable::TooLarge => format!(
+                                "Larger than the {} MiB editor limit",
+                                MAX_CONTENT_FILE_BYTES / (1024 * 1024)
+                            ),
+                            Unopenable::Binary => "Not a text file".to_owned(),
+                        }
+                    )))
+                    .child(
+                        div()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .child(path.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .id("content-file-copy-path")
+                            .mt_1()
+                            .cursor_pointer()
+                            .text_color(color(colors.accent))
+                            .child("Copy path")
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                                cx.stop_propagation();
+                            }),
+                    )
+                    .into_any_element()
+            }
             Some(FileBody::Failed(error)) => {
                 let (retry_pane, retry_path) = (pane_id.clone(), path.to_owned());
                 area.p_3()
@@ -1841,7 +3557,7 @@ impl CompiApp {
                     )
                     .into_any_element()
             }
-            Some(FileBody::Loading | FileBody::Read { .. }) | None => area
+            Some(FileBody::Loading | FileBody::Read(..)) | None => area
                 .p_3()
                 .text_size(px(UI_SMALL_TEXT_SIZE))
                 .text_color(color(colors.muted))
@@ -1854,6 +3570,23 @@ impl CompiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_keep_crlf_files_crlf_and_leave_other_files_as_typed() {
+        let crlf = LineEndings::of("\u{feff}one\r\ntwo\r\n");
+        assert_eq!(crlf, LineEndings::Crlf);
+        // Enter in the editor inserts a bare `\n`.
+        assert_eq!(
+            crlf.apply("\u{feff}one\r\nnew\ntwo\r\n".into()),
+            "\u{feff}one\r\nnew\r\ntwo\r\n"
+        );
+        assert_eq!(LineEndings::of("one\ntwo\r\n"), LineEndings::Lf);
+        assert_eq!(LineEndings::of("no newline"), LineEndings::Lf);
+        assert_eq!(
+            LineEndings::Lf.apply("mixed\r\nnew\n".into()),
+            "mixed\r\nnew\n"
+        );
+    }
 
     #[test]
     fn languages_follow_file_names_then_extensions() {
@@ -1928,5 +3661,138 @@ mod tests {
             target("terminal", "/work/src/b.rs", &ContentEnvironment::Host),
             None
         );
+    }
+
+    #[test]
+    fn sizes_read_like_file_sizes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(812), "812 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(24 * 1024 + 300), "24 KB");
+        assert_eq!(human_size(2_516_582), "2.4 MB");
+        assert_eq!(human_size(1024 * 1024 + 1), "1.0 MB");
+        assert_eq!(human_size(3 << 30), "3.0 GB");
+    }
+
+    #[test]
+    fn a_reload_keeps_the_cursor_within_the_new_text() {
+        let text = Rope::from("one\ntwo\n");
+        assert_eq!(clamped_offset(&text, Position::new(1, 1)), 5);
+        assert_eq!(clamped_offset(&text, Position::new(1, 99)), 7);
+        assert_eq!(clamped_offset(&text, Position::new(9, 3)), 8);
+        assert_eq!(clamped_offset(&Rope::from("é\nx"), Position::new(0, 1)), 2);
+        assert_eq!(clamped_offset(&Rope::from(""), Position::new(4, 4)), 0);
+    }
+
+    #[test]
+    fn checks_reload_clean_editors_and_warn_once_about_unsaved_ones() {
+        let version = |sha: &str| FileVersion {
+            len: 1,
+            sha256: sha.into(),
+        };
+        let changed = |sha: &str| FileState::Changed {
+            version: version(sha),
+            writable: true,
+        };
+        let unchanged = FileState::Unchanged { writable: true };
+        let current = OnDisk::Current;
+        assert_eq!(
+            after_check(&current, &unchanged, false),
+            (OnDisk::Current, CheckAction::Nothing)
+        );
+        assert_eq!(
+            after_check(&current, &changed("b"), true),
+            (OnDisk::Current, CheckAction::Reload)
+        );
+        assert_eq!(
+            after_check(&current, &changed("b"), false),
+            (
+                OnDisk::Changed(version("b")),
+                CheckAction::Show(Banner::Changed)
+            )
+        );
+        // Keep mine: the same change does not warn again; a newer one does.
+        let kept = OnDisk::Changed(version("b"));
+        assert_eq!(
+            after_check(&kept, &changed("b"), false),
+            (kept.clone(), CheckAction::Nothing)
+        );
+        assert_eq!(
+            after_check(&kept, &changed("c"), false),
+            (
+                OnDisk::Changed(version("c")),
+                CheckAction::Show(Banner::Changed)
+            )
+        );
+        assert_eq!(
+            after_check(&kept, &unchanged, false),
+            (OnDisk::Current, CheckAction::Settled)
+        );
+        assert_eq!(
+            after_check(&current, &FileState::Missing, true),
+            (OnDisk::Missing, CheckAction::Show(Banner::Deleted))
+        );
+        assert_eq!(
+            after_check(&OnDisk::Missing, &FileState::Missing, false),
+            (OnDisk::Missing, CheckAction::Nothing)
+        );
+        assert_eq!(
+            after_check(&OnDisk::Missing, &unchanged, true),
+            (OnDisk::Current, CheckAction::Settled)
+        );
+        // A deleted file is created again; any other save must find its version.
+        assert_eq!(save_expected(&OnDisk::Missing, &version("a")), None);
+        assert_eq!(save_expected(&kept, &version("a")), Some(version("a")));
+    }
+
+    #[test]
+    fn remote_content_names_its_ssh_host() {
+        let wsl = ContentEnvironment::Wsl {
+            distribution: "Ubuntu".into(),
+        };
+        assert_eq!(environment_label(None, &wsl), wsl.to_string());
+        assert_eq!(
+            environment_label(None, &ContentEnvironment::Host),
+            ContentEnvironment::Host.to_string()
+        );
+        assert!(
+            environment_label(Some("build.example"), &ContentEnvironment::Host)
+                .contains("build.example")
+        );
+        let remote_wsl = environment_label(Some("build.example"), &wsl);
+        assert!(remote_wsl.contains("build.example") && remote_wsl.contains("Ubuntu"));
+    }
+
+    #[test]
+    fn folder_paths_show_home_as_tilde_and_elide_their_middle() {
+        let home = Some("/home/john");
+        assert_eq!(
+            caption_path("/home/john/src/compi/", home, 80),
+            "~/src/compi"
+        );
+        assert_eq!(caption_path("/home/john", home, 80), "~");
+        assert_eq!(caption_path("/home/johnny/x", home, 80), "/home/johnny/x");
+        assert_eq!(
+            caption_path(r"C:\Users\John\proj\", Some(r"c:\users\john\"), 80),
+            r"~\proj"
+        );
+        assert_eq!(caption_path("/", None, 80), "/");
+        assert_eq!(caption_path(r"C:\", None, 80), r"C:\");
+        assert_eq!(
+            caption_path("/home/john/a/b/c/deeply/nested/project", home, 24),
+            "~/…/nested/project"
+        );
+        assert_eq!(
+            caption_path(r"D:\work\a\b\client", None, 16),
+            r"D:\…\a\b\client"
+        );
+        assert_eq!(
+            caption_path("/averyveryverylongfoldername", None, 10),
+            "/ave…rname"
+        );
+        assert_eq!(unix_home("/home/john/src"), Some("/home/john"));
+        assert_eq!(unix_home("/root"), Some("/root"));
+        assert_eq!(unix_home("/home/"), None);
+        assert_eq!(unix_home("/srv/john"), None);
     }
 }
