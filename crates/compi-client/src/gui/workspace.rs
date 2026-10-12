@@ -10,6 +10,7 @@ pub(in crate::gui) mod dialogs;
 mod diff_view;
 mod files;
 mod focus;
+mod git_gutter;
 pub(super) mod media;
 pub(in crate::gui) mod metadata;
 pub(in crate::gui) mod pane_drag;
@@ -3070,6 +3071,9 @@ impl CompiApp {
             has_tab: tab.is_some(),
             has_pane: pane.is_some(),
             content_pane: self.focused_content().is_some(),
+            file_tab: self
+                .focused_content()
+                .is_some_and(|content| content.active_file().is_some()),
             files_reason: file_scope.as_ref().err().copied(),
             file_search_reason: file_scope
                 .as_ref()
@@ -3789,6 +3793,9 @@ impl CompiApp {
             Command::ShowFiles => self.show_files(false, window, cx),
             Command::NewEditor => self.show_files(true, window, cx),
             Command::ShowChanges => self.show_changes(window, cx),
+            Command::DiffThisFile => self.diff_this_file(window, cx),
+            Command::NextChange => self.step_editor_change(true, window, cx),
+            Command::PreviousChange => self.step_editor_change(false, window, cx),
             Command::OpenFile => self.open_file_picker(),
             Command::Copy => self.copy_selection(cx),
             Command::Paste => self.paste_clipboard(cx),
@@ -4433,12 +4440,7 @@ impl CompiApp {
                 LayoutNode::Content { pane_id, content } => Some(TabPane {
                     floating: self.state.is_floating(&pane_id),
                     pane_id,
-                    title: match content.view {
-                        compi_protocol::ContentView::Files => content.folder_name().to_owned(),
-                        compi_protocol::ContentView::Changes { .. } => {
-                            format!("Changes · {}", content.folder_name())
-                        }
-                    },
+                    title: content.folder_name().to_owned(),
                     directory: Some(content.root),
                 }),
                 LayoutNode::Pane {

@@ -1,6 +1,6 @@
 //! Explicit, acknowledged presentation control through the same-user GUI host.
 use crate::connection::ConnectionTarget;
-use compi_protocol::{PaneId, Result, SurfaceId, TabId};
+use compi_protocol::{GitScope, PaneId, Result, SurfaceId, TabId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +40,19 @@ pub enum Action {
         file: String,
         line: u32,
     },
+    /// Focus the content pane `pane_id` and show its diff tab of repository path `path`
+    /// (`/`-separated, relative to the top level of the pane's repository) in `scope`,
+    /// with the 1-based new-side `line` scrolled into view.
+    RevealDiff {
+        pane_id: PaneId,
+        path: String,
+        scope: GitScope,
+        line: Option<u32>,
+    },
+    /// Focus the content pane `pane_id` and switch its sidebar to the Changes list.
+    ShowChanges {
+        pane_id: PaneId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,8 +89,15 @@ impl Request {
         {
             return Err("GUI panes require at least 20 columns and 4 rows".into());
         }
-        if let Action::RevealFile { line: 0, .. } = self.action {
+        if let Action::RevealFile { line: 0, .. } | Action::RevealDiff { line: Some(0), .. } =
+            self.action
+        {
             return Err("file lines are numbered from 1".into());
+        }
+        if let Action::RevealDiff { path, .. } = &self.action
+            && !compi_protocol::is_repo_path(path)
+        {
+            return Err("diff paths are relative to the repository top level".into());
         }
         Ok(())
     }

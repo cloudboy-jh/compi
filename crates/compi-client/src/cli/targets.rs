@@ -386,9 +386,8 @@ mod tests {
             content: PaneContent {
                 environment: ContentEnvironment::Host,
                 root: "/work".into(),
-                files: Vec::new(),
-                active_file: None,
-                view: compi_protocol::ContentView::Files,
+                tabs: Vec::new(),
+                active: None,
             },
         };
         let content = Options {

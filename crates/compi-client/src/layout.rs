@@ -901,9 +901,8 @@ mod tests {
             content: compi_protocol::PaneContent {
                 environment: compi_protocol::ContentEnvironment::Host,
                 root: "/work".into(),
-                files: Vec::new(),
-                active_file: None,
-                view: compi_protocol::ContentView::Files,
+                tabs: Vec::new(),
+                active: None,
             },
         };
         let tree = split(SplitAxis::Horizontal, 0.5, leaf("a"), content);

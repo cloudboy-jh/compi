@@ -1,7 +1,7 @@
-//! The body of the Changes view: one changed file drawn as a diff, an image compare, or a
-//! short message when there is nothing to draw line by line. Its own GPUI view, so it owns
-//! its background work (the diff and the syntax highlighting are built off the UI thread),
-//! its scroll position, the expanded context, find and hunk navigation.
+//! One changed file drawn as a diff, an image compare, or a short message when there is
+//! nothing to draw line by line: the body of a diff tab. Its own GPUI view, so it owns its
+//! background work (the diff and the syntax highlighting are built off the UI thread), its
+//! scroll position, the expanded context, find and hunk navigation.
 //!
 //! Long lines wrap inside their row (or half); the diff never scrolls sideways. SVG sides are
 //! compared as images: GPUI rasterizes SVG itself, so a drawing reads better than its markup.
@@ -207,6 +207,9 @@ pub(super) struct DiffView {
     /// The view's size when last drawn.
     size: Option<Size<Pixels>>,
     find: Option<Find>,
+    /// A line (0-based) asked for before it could be scrolled to: before the first build
+    /// landed or the view was sized.
+    reveal: Option<(Side, u32)>,
 }
 
 impl DiffView {
@@ -242,6 +245,7 @@ impl DiffView {
             layout: decide_layout(settings.layout, None, None),
             size: None,
             find: None,
+            reveal: None,
         };
         view.start_build(cx);
         view
@@ -324,6 +328,61 @@ impl DiffView {
         }
         self.rebuild_rows(anchor);
         cx.notify();
+    }
+
+    /// Scrolls 1-based `line` of `side` a third of the way down, unfolding it if hidden.
+    /// Asked before the diff is built or drawn, it happens once it is.
+    pub(super) fn reveal_line(&mut self, side: Side, line: u32, cx: &mut Context<Self>) {
+        self.reveal = Some((side, line.saturating_sub(1)));
+        self.apply_reveal();
+        cx.notify();
+    }
+
+    /// The line a third of the way down the view, 1-based: a new-side line when the diff
+    /// has one near there, else an old-side one. `None` without a text diff.
+    pub(super) fn line_in_view(&self) -> Option<(Side, u32)> {
+        let Body::Text(text) = &self.body else {
+            return None;
+        };
+        let reference = (self.list.logical_scroll_top().item_ix + self.rows_above(1.0 / 3.0))
+            .min(text.rows.len());
+        // From the reference row down, then up from it.
+        let near = |side: Side| {
+            let (above, below) = text.rows.split_at(reference);
+            below
+                .iter()
+                .chain(above.iter().rev())
+                .find_map(|row| row_line(row, side))
+        };
+        near(Side::New)
+            .map(|line| (Side::New, line + 1))
+            .or_else(|| near(Side::Old).map(|line| (Side::Old, line + 1)))
+    }
+
+    /// Scrolls to the requested line once there are rows and a size to place it with.
+    fn apply_reveal(&mut self) {
+        let (Some((side, line)), Body::Text(text), Some(_)) = (self.reveal, &self.body, self.size)
+        else {
+            return;
+        };
+        let len = match side {
+            Side::Old => text.diff.old_len(),
+            Side::New => text.diff.new_len(),
+        };
+        self.reveal = None;
+        if len == 0 {
+            return;
+        }
+        let line = line.min(len - 1);
+        let (rows, diff) = (text.rows.clone(), text.diff.clone());
+        let row = self.line_rows().row(side, line);
+        if !row.is_some_and(|row| rows.get(row).and_then(|row| row_line(row, side)) == Some(line)) {
+            self.context.reveal(&diff, side, line);
+            self.rebuild_rows(None);
+        }
+        if let Some(row) = self.line_rows().row(side, line) {
+            self.scroll_row_to(row, 1.0 / 3.0);
+        }
     }
 
     /// Keys while the pane has focus and no text field does: Ctrl/Cmd+F find, Enter/Shift+Enter
@@ -679,9 +738,11 @@ impl DiffView {
             Body::Text(_) => {
                 self.rebuild_rows(anchor);
                 self.refresh_matches(true);
+                self.apply_reveal();
             }
             _ => {
                 self.find = None;
+                self.reveal = None;
                 self.list.reset(0);
             }
         }
@@ -775,6 +836,7 @@ impl DiffView {
         }
         self.size = Some(size);
         self.relayout(cx);
+        self.apply_reveal();
         if matches!(self.body, Body::Images { .. }) {
             cx.notify();
         }

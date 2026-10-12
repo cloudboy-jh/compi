@@ -1,20 +1,22 @@
 //! Content panes: layout leaves that show files instead of a terminal. They tile,
 //! float, zoom and move like terminal panes but have no surface, so they never
-//! attach, resize a PTY, or receive terminal input. Without an active file a pane
-//! browses its folder; with one it shows its open files as tabs above a GPUI Kit code
-//! editor, with the folder as an optional sidebar. Folders are listed and files read
+//! attach, resize a PTY, or receive terminal input. Without an active tab a pane
+//! browses its folder; with one it shows its open tabs (files, and diffs of changed
+//! files) above a GPUI Kit code editor or a diff, with the folder (or, in a Git work
+//! tree, its changes) as an optional sidebar. Folders are listed and files read
 //! and saved through the daemon, so host and WSL folders behave the same. Shown files
 //! are compared with the disk every few seconds, so outside edits reload or warn, and
 //! a save never replaces bytes the editor has not seen. Dirty editors are backed up
 //! (see `unsaved`) and never dropped without asking.
-use super::changes::{ChangesSettings, ChangesUi};
+use super::changes::{ChangesSettings, DiffTab, RepoStatus, SidebarMode};
+use super::git_gutter::GitGutter;
 use super::tree::{Entry, FileTree, filter_rows};
 use super::tree_ui::tree_entry_icon;
 use super::unsaved::{self, Backup, Backups, SaveTicket};
 use super::*;
 use compi_protocol::{
-    ContentEnvironment, ContentView, DirectoryEntry, ErrorCode, FileContent, FileState,
-    FileVersion, GitChanges, MAX_CONTENT_FILE_BYTES, PaneContent, ServerGeneration, ServerId,
+    ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
+    GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent, ServerGeneration, ServerId,
 };
 use gpui::Entity;
 use gpui_component::highlighter::HighlightTheme;
@@ -23,14 +25,14 @@ use gpui_component::input::{
 };
 use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
-/// Width of the folder sidebar beside an open file, and of a Changes pane's list.
+/// Width of the folder sidebar beside an open tab.
 pub(super) const SIDEBAR_WIDTH: f32 = 220.0;
 pub(super) const FILE_TAB_HEIGHT: f32 = 30.0;
 /// Folder rows: the left inset and the indent per level.
 pub(super) const TREE_INSET: f32 = 8.0;
 pub(super) const TREE_INDENT: f32 = 14.0;
-/// How often a shown file is compared with the disk, and a shown Changes pane's
-/// repository read again.
+/// How often a shown file is compared with the disk, and a shown pane's folder read
+/// again for its Git changes.
 pub(super) const CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_TICK: Duration = Duration::from_millis(250);
 /// Larger files open as plain text: a 900 KB Rust file took about twice as long per
@@ -53,10 +55,10 @@ enum Expect {
     Whatever(FileVersion),
 }
 
-/// Client-local state of content panes. What a pane shows (its folder, open files and
-/// active file, or the change a Changes pane selected) lives in the daemon's
-/// `PaneContent`; this keeps what only this window needs: keyboard focus, folder
-/// trees, an editor per open file, and Changes panes' listings and diffs.
+/// Client-local state of content panes. What a pane shows (its folder, open tabs and
+/// active tab) lives in the daemon's `PaneContent`; this keeps what only this window
+/// needs: keyboard focus, folder trees, an editor per open file, the folder's Git changes
+/// and the diffs of diff tabs.
 #[derive(Default)]
 pub(in crate::gui) struct ContentUi {
     pub(super) panes: HashMap<PaneId, PaneUi>,
@@ -73,10 +75,12 @@ pub(in crate::gui) struct ContentUi {
     /// The daemon run the panes were last pruned against. Panes gone within one run
     /// were removed, so their backups go too; after a restart they are kept.
     server: Option<(ServerId, ServerGeneration)>,
-    /// How every Changes pane in this window shows its changes.
+    /// How every Changes list and diff in this window shows changes.
     pub(super) changes: ChangesSettings,
     /// A listing the Changes command just read, for the pane `OpenContent` is creating.
     pub(super) changes_seed: Option<(ContentEnvironment, GitChanges)>,
+    /// A diff asked for in a pane this window has not drawn yet: `open_diff`'s arguments.
+    pub(super) pending_diff: Option<(PaneId, String, Option<GitScope>, Option<u32>)>,
 }
 
 impl ContentUi {
@@ -112,13 +116,19 @@ pub(super) struct PaneUi {
     /// Narrows the folder to names containing this, ignoring case. Only folders already
     /// listed are searched; collapsed ones are not opened for it.
     filter: String,
-    /// The folder shows beside an open file.
-    sidebar: bool,
+    /// The sidebar shows beside an open tab.
+    pub(super) sidebar: bool,
+    /// What the sidebar, or the folder view, lists.
+    pub(super) mode: SidebarMode,
     /// The latest save failure or close warning, and the file it is about.
     notice: Option<(String, String)>,
     files: HashMap<String, OpenFile>,
-    /// A Changes pane's listing and diff; `None` while the pane shows files.
-    pub(super) changes: Option<Box<ChangesUi>>,
+    /// The folder's Git changes.
+    pub(super) repo: RepoStatus,
+    /// The diff of each diff tab drawn so far.
+    pub(super) diffs: HashMap<ContentTab, DiffTab>,
+    /// A new-side line to reveal in a diff tab once its diff exists.
+    pub(super) diff_reveal: Option<(ContentTab, u32)>,
 }
 
 struct OpenFile {
@@ -147,8 +157,8 @@ enum Unopenable {
     Binary,
 }
 
-struct FileEditor {
-    state: Entity<EditorState>,
+pub(super) struct FileEditor {
+    pub(super) state: Entity<EditorState>,
     _changes: Subscription,
     /// What the file on disk was when last read or saved; a save must still match it.
     version: FileVersion,
@@ -187,6 +197,8 @@ struct FileEditor {
     save_as: Option<SaveAs>,
     /// Saved as this file; the editor moves to it once the pane lists it.
     moving_to: Option<String>,
+    /// Marks where the text differs from the Git index.
+    pub(super) gutter: GitGutter,
 }
 
 /// A file on disk compared with the version its editor holds.
@@ -455,13 +467,16 @@ impl PaneUi {
         Self {
             focus: cx.focus_handle(),
             environment,
-            tree: FileTree::new(pane_id.clone(), root),
+            tree: FileTree::new(pane_id.clone(), root.clone()),
             tree_scroll: ScrollHandle::new(),
             filter: String::new(),
             sidebar: false,
+            mode: SidebarMode::Files,
             notice: None,
             files: HashMap::new(),
-            changes: None,
+            repo: RepoStatus::new(root),
+            diffs: HashMap::new(),
+            diff_reveal: None,
         }
     }
 
@@ -498,14 +513,14 @@ impl PaneUi {
             })
     }
 
-    fn editor(&self, path: &str) -> Option<&FileEditor> {
+    pub(super) fn editor(&self, path: &str) -> Option<&FileEditor> {
         match &self.files.get(path)?.body {
             FileBody::Ready(editor) => Some(editor),
             _ => None,
         }
     }
 
-    fn editor_mut(&mut self, path: &str) -> Option<&mut FileEditor> {
+    pub(super) fn editor_mut(&mut self, path: &str) -> Option<&mut FileEditor> {
         match &mut self.files.get_mut(path)?.body {
             FileBody::Ready(editor) => Some(editor),
             _ => None,
@@ -543,10 +558,9 @@ pub(super) fn content_leaves<'a>(
 }
 
 /// The content pane in `layout` to show `file` (or, without one, the folder `root`) in:
-/// one showing files in `environment` whose root holds the file, preferring `beside`
-/// itself, then one with the file open, then the deepest root. Changes panes never show
-/// files.
-fn reusable_content<'a>(
+/// one in `environment` whose root holds the file, preferring `beside` itself, then one
+/// with the file open, then the deepest root.
+pub(super) fn reusable_content<'a>(
     layout: &'a LayoutNode,
     beside: &PaneId,
     environment: &ContentEnvironment,
@@ -555,16 +569,12 @@ fn reusable_content<'a>(
 ) -> Option<(&'a PaneId, &'a PaneContent)> {
     let mut best: Option<((bool, bool, usize), &PaneId, &PaneContent)> = None;
     content_leaves(layout, &mut |pane_id, content| {
-        if &content.environment != environment || !content.view.is_files() {
+        if &content.environment != environment {
             return;
         }
         let rank = match (file, root) {
-            (Some(file), _) => root_contains(&content.root, file).then(|| {
-                (
-                    content.files.iter().any(|open| open == file),
-                    content.root.len(),
-                )
-            }),
+            (Some(file), _) => root_contains(&content.root, file)
+                .then(|| (content.files().any(|open| open == file), content.root.len())),
             (None, Some(root)) => same_folder(&content.root, root).then_some((true, 0)),
             (None, None) => None,
         };
@@ -673,7 +683,7 @@ fn is_save_key(key: &Keystroke) -> bool {
 
 /// Puts the cursor on 1-based `line` and scrolls it to the middle of the laid-out view,
 /// as editors do when jumping to a location.
-fn reveal_in_editor(
+pub(super) fn reveal_in_editor(
     state: &mut EditorState,
     line: u32,
     window: &mut Window,
@@ -749,6 +759,7 @@ fn file_editor(
         shown: true,
         save_as: None,
         moving_to: None,
+        gutter: GitGutter::default(),
     };
     if let Some(backup) = restore.map(|backup| *backup) {
         editor
@@ -804,6 +815,8 @@ fn apply_fresh(
     editor.banner = editor
         .banner
         .filter(|banner| !banner.about_disk() && !editor.writable);
+    // `set_value` sends no change event.
+    editor.gutter.text_replaced();
 }
 
 /// Writes the backups of `ui`'s editors whose edits are due by `due_by`, or with `None`
@@ -929,37 +942,20 @@ impl CompiApp {
 
     /// Before drawing: state for every visible content pane, a read for each shown file
     /// not yet loaded, editors for files just read, text read again into its editor,
-    /// pending line reveals, and the window's look for Changes panes' diffs.
+    /// pending line reveals, and active diff tabs read and given the window's look.
     pub(super) fn prepare_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut work = Vec::new();
-        let mut changes = Vec::new();
         if let Some(workspace) = &self.workspace {
             for pane_id in self.shown_content_panes() {
                 let Some(content) = find_content(workspace, pane_id) else {
                     continue;
                 };
                 let ui = self.content.panes.get(pane_id);
-                if !content.view.is_files() {
-                    let current = ui.is_some_and(|ui| {
-                        ui.environment == content.environment
-                            && ui
-                                .changes
-                                .as_ref()
-                                .is_some_and(|changes| same_folder(changes.repo(), &content.root))
-                    });
-                    if !current {
-                        changes.push((pane_id.clone(), content.clone()));
-                    }
-                    continue;
-                }
                 let current = ui.is_some_and(|ui| {
-                    ui.environment == content.environment
-                        && ui.root() == content.root
-                        && ui.changes.is_none()
+                    ui.environment == content.environment && ui.root() == content.root
                 });
                 let shown = content
-                    .active_file
-                    .as_ref()
+                    .active_file()
                     .is_none_or(|active| ui.is_some_and(|ui| ui.files.contains_key(active)));
                 if !current || !shown {
                     work.push((pane_id.clone(), content.clone()));
@@ -969,10 +965,7 @@ impl CompiApp {
         for (pane_id, content) in work {
             self.prepare_pane(pane_id, content, cx);
         }
-        for (pane_id, content) in changes {
-            self.prepare_changes_pane(pane_id, content, window, cx);
-        }
-        self.sync_changes_views(cx);
+        self.prepare_diff_tabs(window, cx);
         if std::mem::take(&mut self.content.unbuilt) {
             let backups = self.content.backups.as_ref();
             for (pane_id, ui) in &mut self.content.panes {
@@ -1008,7 +1001,7 @@ impl CompiApp {
     }
 
     fn prepare_pane(&mut self, pane_id: PaneId, content: PaneContent, cx: &mut Context<Self>) {
-        let relist = match self.content.panes.get_mut(&pane_id) {
+        let created = match self.content.panes.get_mut(&pane_id) {
             Some(ui) if ui.environment != content.environment => {
                 // Its editors go with the old environment; their edits stay in backups.
                 if let Some(backups) = &self.content.backups {
@@ -1022,10 +1015,10 @@ impl CompiApp {
                 );
                 true
             }
-            Some(ui) if ui.changes.is_some() || ui.root() != content.root => {
-                ui.changes = None;
+            Some(ui) if ui.root() != content.root => {
                 ui.tree = FileTree::new(pane_id.clone(), content.root.clone());
                 ui.filter.clear();
+                ui.repo = RepoStatus::new(content.root.clone());
                 true
             }
             Some(_) => false,
@@ -1042,15 +1035,36 @@ impl CompiApp {
                 true
             }
         };
-        if relist {
+        if created {
             self.request_content_listing(
                 pane_id.clone(),
                 content.environment.clone(),
                 content.root.clone(),
                 content.root.clone(),
             );
+            let seed = self
+                .content
+                .changes_seed
+                .take_if(|(environment, listing)| {
+                    *environment == content.environment && same_folder(&listing.repo, &content.root)
+                })
+                .map(|(_, listing)| listing);
+            let pending = self
+                .content
+                .pending_diff
+                .take_if(|(pending, ..)| *pending == pane_id)
+                .map(|(_, path, scope, line)| (path, scope, line));
+            let tree = self.content.changes.tree;
+            if let Some(ui) = self.content.panes.get_mut(&pane_id) {
+                if let Some(listing) = seed {
+                    // The Changes command opened this pane to list them.
+                    ui.mode = SidebarMode::Changes;
+                    ui.repo.seed(listing, tree);
+                }
+                ui.repo.pending_open = pending;
+            }
         }
-        let Some(active) = content.active_file else {
+        let Some(active) = content.active_file().map(str::to_owned) else {
             return;
         };
         let Some(ui) = self.content.panes.get_mut(&pane_id) else {
@@ -1083,13 +1097,13 @@ impl CompiApp {
         let mut pending = Vec::new();
         for (pane_id, ui) in &self.content.panes {
             if let Some(active) =
-                find_content(workspace, pane_id).and_then(|content| content.active_file.as_ref())
+                find_content(workspace, pane_id).and_then(|content| content.active_file())
                 && ui
                     .files
                     .get(active)
                     .is_some_and(|file| file.reveal.is_some())
             {
-                pending.push((pane_id.clone(), active.clone()));
+                pending.push((pane_id.clone(), active.to_owned()));
             }
         }
         let mut waiting = false;
@@ -1164,7 +1178,7 @@ impl CompiApp {
                             FileBody::Ready(editor) => editor
                                 .moving_to
                                 .as_ref()
-                                .filter(|target| content.files.contains(target))
+                                .filter(|target| content.files().any(|open| open == *target))
                                 .map(|target| (path.clone(), target.clone())),
                             _ => None,
                         })
@@ -1186,12 +1200,13 @@ impl CompiApp {
                         }
                     }
                     ui.files.retain(|path, file| {
-                        let open = content.files.contains(path);
+                        let open = content.files().any(|open| open == path);
                         if !open {
                             forget(&ui.environment, path, file);
                         }
                         open
                     });
+                    ui.diffs.retain(|tab, _| content.tabs.contains(tab));
                     true
                 }
                 None => {
@@ -1220,13 +1235,12 @@ impl CompiApp {
             return Vec::new();
         };
         content
-            .files
-            .iter()
+            .files()
             .filter(|path| {
                 ui.editor(path)
                     .is_some_and(|editor| editor.dirty && !editor.discarded)
             })
-            .cloned()
+            .map(str::to_owned)
             .collect()
     }
 
@@ -1370,7 +1384,7 @@ impl CompiApp {
                     return;
                 }
                 self.focused_content()
-                    .and_then(|content| content.active_file.as_deref())
+                    .and_then(|content| content.active_file())
                     .filter(|_| self.content.released.as_ref() != Some(pane_id))
                     .and_then(|active| ui.editor(active))
                     .map_or_else(|| ui.focus.clone(), |editor| editor.state.focus_handle(cx))
@@ -1488,12 +1502,13 @@ impl CompiApp {
         self.content.released = None;
         if let Some((pane_id, mut content)) = reuse {
             if let Some(file) = &file {
-                let listed = content.files.contains(file);
-                if !listed || content.active_file.as_ref() != Some(file) {
+                let tab = ContentTab::File { path: file.clone() };
+                let listed = content.tabs.contains(&tab);
+                if !listed || content.active.as_ref() != Some(&tab) {
                     if !listed {
-                        content.files.push(file.clone());
+                        content.tabs.push(tab.clone());
                     }
-                    content.active_file = Some(file.clone());
+                    content.active = Some(tab);
                     self.mutate(
                         WorkspaceMutation::UpdateContent {
                             pane_id: pane_id.clone(),
@@ -1516,9 +1531,11 @@ impl CompiApp {
         let content = PaneContent {
             environment: environment.clone(),
             root,
-            files: file.iter().cloned().collect(),
-            active_file: file.clone(),
-            view: ContentView::Files,
+            tabs: file
+                .iter()
+                .map(|path| ContentTab::File { path: path.clone() })
+                .collect(),
+            active: file.clone().map(|path| ContentTab::File { path }),
         };
         if self.open_content_beside(beside, content)
             && let (Some(path), Some(line)) = (file, line)
@@ -1587,7 +1604,7 @@ impl CompiApp {
             .workspace
             .as_ref()
             .and_then(|workspace| find_content(workspace, pane_id))
-            .and_then(|content| content.active_file.as_deref())
+            .and_then(|content| content.active_file())
             == Some(path);
         let Some(file) = self
             .content
@@ -1623,17 +1640,17 @@ impl CompiApp {
         );
     }
 
-    fn activate_content_file(&mut self, pane_id: &PaneId, path: &str) {
+    fn activate_content_tab(&mut self, pane_id: &PaneId, tab: &ContentTab) {
         let Some(mut content) = self
             .workspace
             .as_ref()
             .and_then(|workspace| find_content(workspace, pane_id))
-            .filter(|content| content.active_file.as_deref() != Some(path))
+            .filter(|content| content.active.as_ref() != Some(tab))
             .cloned()
         else {
             return;
         };
-        content.active_file = Some(path.to_owned());
+        content.active = Some(tab.clone());
         self.content.released = None;
         self.update_content(pane_id, content);
     }
@@ -1660,8 +1677,9 @@ impl CompiApp {
         );
     }
 
-    /// Closes the tab of `path`, its editor going once the pane no longer lists it.
-    pub(super) fn drop_content_file(&mut self, pane_id: &PaneId, path: &str) {
+    /// Closes `tab`, its editor or diff going once the pane no longer lists it. The tab
+    /// after it becomes active, else the one before.
+    pub(super) fn drop_content_tab(&mut self, pane_id: &PaneId, tab: &ContentTab) {
         let Some(mut content) = self
             .workspace
             .as_ref()
@@ -1670,15 +1688,15 @@ impl CompiApp {
         else {
             return;
         };
-        let Some(index) = content.files.iter().position(|file| file == path) else {
+        let Some(index) = content.tabs.iter().position(|open| open == tab) else {
             return;
         };
-        content.files.remove(index);
-        if content.active_file.as_deref() == Some(path) {
-            content.active_file = content
-                .files
+        content.tabs.remove(index);
+        if content.active.as_ref() == Some(tab) {
+            content.active = content
+                .tabs
                 .get(index)
-                .or_else(|| content.files.get(index.wrapping_sub(1)))
+                .or_else(|| content.tabs.get(index.wrapping_sub(1)))
                 .cloned();
         }
         self.update_content(pane_id, content);
@@ -1687,10 +1705,12 @@ impl CompiApp {
     /// Ctrl/Cmd+S: saves the focused file if it has changes, or was deleted on disk.
     /// A read-only file is not written; its banner offers Save as instead.
     fn save_focused_file(&mut self, cx: &mut Context<Self>) {
-        let Some((pane_id, path)) = self
-            .focused_pane()
-            .and_then(|pane| Some((pane.clone(), self.focused_content()?.active_file.clone()?)))
-        else {
+        let Some((pane_id, path)) = self.focused_pane().and_then(|pane| {
+            Some((
+                pane.clone(),
+                self.focused_content()?.active_file()?.to_owned(),
+            ))
+        }) else {
             return;
         };
         let Some(editor) = self
@@ -1945,11 +1965,13 @@ impl CompiApp {
             editor.reload_armed &= dirty;
             cx.notify();
         }
+        let path = path.clone();
+        self.gutter_edited(pane_id, &path, cx);
     }
 
     /// Compares shown files with the disk on a timer while the window is active, reads
-    /// shown Changes panes' repositories again, and writes the backups of edits as they
-    /// come due.
+    /// shown panes' folders again for their Git changes, brings shown editors' Git gutters up to
+    /// date, and writes the backups of edits as they come due.
     pub(super) fn watch_content_files(&self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -1957,8 +1979,9 @@ impl CompiApp {
                 if this
                     .update_in(cx, |this, window, cx| {
                         this.check_shown_files(window);
-                        this.refresh_changes(window, cx);
+                        this.refresh_repos(window, cx);
                         this.write_backups(false, cx);
+                        this.refresh_gutters(cx);
                     })
                     .is_err()
                 {
@@ -1979,7 +2002,7 @@ impl CompiApp {
             Some(workspace) if window.is_window_active() => self
                 .shown_content_panes()
                 .filter_map(|pane_id| {
-                    let active = find_content(workspace, pane_id)?.active_file.clone()?;
+                    let active = find_content(workspace, pane_id)?.active_file()?.to_owned();
                     Some((pane_id.clone(), active))
                 })
                 .collect(),
@@ -2365,12 +2388,13 @@ impl CompiApp {
         else {
             return;
         };
-        content.files.retain(|file| *file != target);
-        match content.files.iter().position(|file| *file == path) {
-            Some(index) => content.files[index] = target.clone(),
-            None => content.files.push(target.clone()),
+        let (source, target) = (ContentTab::File { path }, ContentTab::File { path: target });
+        content.tabs.retain(|tab| *tab != target);
+        match content.tabs.iter().position(|tab| *tab == source) {
+            Some(index) => content.tabs[index] = target.clone(),
+            None => content.tabs.push(target.clone()),
         }
-        content.active_file = Some(target);
+        content.active = Some(target);
         self.update_content(&pane_id, content);
     }
 
@@ -2386,8 +2410,8 @@ impl CompiApp {
         }
     }
 
-    /// Files in a content pane: its folder, beside an open file as the sidebar, with the
-    /// keyboard on the folder. A Changes pane's repository opens in a files pane beside it.
+    /// Files in a content pane: its folder, beside an open tab as the sidebar, with the
+    /// keyboard on the folder.
     pub(super) fn show_content_folder(
         &mut self,
         pane_id: &PaneId,
@@ -2401,23 +2425,10 @@ impl CompiApp {
         else {
             return;
         };
-        if let ContentView::Changes { .. } = content.view {
-            let (environment, root) = (content.environment.clone(), content.root.clone());
-            self.open_content_file(
-                pane_id,
-                environment,
-                Some(root),
-                None,
-                None,
-                false,
-                window,
-                cx,
-            );
-            return;
-        }
-        let file_open = content.active_file.is_some();
+        let tab_open = content.active.is_some();
         if let Some(ui) = self.content.panes.get_mut(pane_id) {
-            ui.sidebar |= file_open;
+            ui.sidebar |= tab_open;
+            ui.mode = SidebarMode::Files;
         }
         self.release_editor(pane_id, window, cx);
     }
@@ -2482,19 +2493,22 @@ impl CompiApp {
         if modifiers.control || modifiers.platform || modifiers.alt {
             return false;
         }
-        let file_open = self
+        let tab_open = self
             .workspace
             .as_ref()
             .and_then(|workspace| find_content(workspace, pane_id))
-            .is_some_and(|content| content.active_file.is_some());
+            .is_some_and(|content| content.active.is_some());
         let Some(ui) = self.content.panes.get_mut(pane_id) else {
             return false;
         };
-        if file_open && !ui.sidebar {
+        if tab_open && !ui.sidebar {
             if key.key == "enter" && !modifiers.shift {
                 self.content.released = None;
                 return true;
             }
+            return false;
+        }
+        if ui.mode == SidebarMode::Changes {
             return false;
         }
         let visible = ui.visible_rows();
@@ -2606,12 +2620,16 @@ impl CompiApp {
             return;
         }
         // Compi shortcuts still run; every other key stops here, so nothing typed in
-        // a content pane reaches a shell.
-        let handled = if ui.changes.is_some() {
-            self.changes_key_down(pane_id, event, window, cx)
-        } else {
-            self.content_tree_key(pane_id, &event.keystroke, window, cx)
-        };
+        // a content pane reaches a shell. A diff tab takes the keys it knows first.
+        let diff = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id))
+            .and_then(|content| content.active.clone())
+            .filter(|tab| matches!(tab, ContentTab::Diff { .. }));
+        let handled = diff
+            .is_some_and(|tab| self.diff_tab_key_down(pane_id, &tab, event, window, cx))
+            || self.content_tree_key(pane_id, &event.keystroke, window, cx);
         if !handled {
             self.handle_app_key(event, window, cx);
         }
@@ -2705,69 +2723,99 @@ impl CompiApp {
                             )
                             .flex()
                             .flex_col()
-                            .map(|body| match (&ui.changes, &content.active_file) {
-                                (Some(changes), _) => body.child(
-                                    self.render_changes(&pane_id, content, changes, rect.width, cx),
-                                ),
-                                (None, Some(active)) => body
-                                    .child(self.render_file_tabs(&pane_id, content, ui, cx))
+                            .map(|body| match &content.active {
+                                Some(tab) => body
+                                    .child(self.render_content_tabs(&pane_id, content, ui, cx))
                                     .when_some(ui.notice.as_ref(), |body, (_, notice)| {
                                         body.child(self.render_content_notice(&pane_id, notice, cx))
                                     })
-                                    .when_some(ui.editor(active), |body, editor| {
-                                        body.child(
-                                            self.render_file_banner(&pane_id, active, editor, cx),
-                                        )
-                                    })
+                                    .when_some(
+                                        content
+                                            .active_file()
+                                            .and_then(|active| Some((active, ui.editor(active)?))),
+                                        |body, (active, editor)| {
+                                            body.child(
+                                                self.render_file_banner(
+                                                    &pane_id, active, editor, cx,
+                                                ),
+                                            )
+                                        },
+                                    )
                                     .child(
                                         div()
                                             .flex_1()
                                             .min_h_0()
                                             .flex()
                                             .when(ui.sidebar, |row| {
-                                                row.child(
-                                                    div()
-                                                        .w(px(SIDEBAR_WIDTH.min(rect.width / 2.0)))
-                                                        .flex_none()
-                                                        .h_full()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .border_r_1()
-                                                        .border_color(color(colors.border))
-                                                        .child(
-                                                            div()
-                                                                .flex_none()
-                                                                .px_3()
-                                                                .pt_2()
-                                                                .pb_1()
-                                                                .overflow_hidden()
-                                                                .text_ellipsis()
-                                                                .whitespace_nowrap()
-                                                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                                                .text_color(color(colors.muted))
-                                                                .child(
-                                                                    content
-                                                                        .folder_name()
-                                                                        .to_owned(),
-                                                                ),
-                                                        )
-                                                        .child(self.render_content_tree(
-                                                            &pane_id,
-                                                            ui,
-                                                            Some(active),
-                                                            cx,
-                                                        )),
-                                                )
+                                                row.child(self.render_content_sidebar(
+                                                    &pane_id,
+                                                    content,
+                                                    ui,
+                                                    SIDEBAR_WIDTH.min(rect.width / 2.0),
+                                                    cx,
+                                                ))
                                             })
-                                            .child(self.render_file_body(&pane_id, active, ui, cx)),
+                                            .child(match tab {
+                                                ContentTab::File { path } => self
+                                                    .render_file_body(&pane_id, path, ui, cx)
+                                                    .into_any_element(),
+                                                ContentTab::Diff { .. } => {
+                                                    self.render_diff_tab(&pane_id, ui, tab, cx)
+                                                }
+                                            }),
                                     ),
-                                (None, None) => body.child(
+                                None => body.child(
                                     self.render_folder_view(&pane_id, content, ui, rect.width, cx),
                                 ),
                             }),
                     )
                 },
             )
+    }
+
+    /// The sidebar beside an open tab: the folder's name, the Files | Changes switch in a
+    /// work tree, and the folder or its changes.
+    fn render_content_sidebar(
+        &self,
+        pane_id: &PaneId,
+        content: &PaneContent,
+        ui: &PaneUi,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = *self.colors();
+        div()
+            .w(px(width))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(color(colors.border))
+            .child(
+                div()
+                    .flex_none()
+                    .px_3()
+                    .pt_2()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_color(color(colors.muted))
+                    .child(content.folder_name().to_owned()),
+            )
+            .children(self.render_sidebar_switch(pane_id, ui, cx))
+            .child(match ui.mode {
+                SidebarMode::Files => div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .pt_1()
+                    .child(self.render_content_tree(pane_id, ui, content.active_file(), cx))
+                    .into_any_element(),
+                SidebarMode::Changes => self.render_changes_list(pane_id, ui, width, cx),
+            })
     }
 
     fn render_folder_view(
@@ -2844,7 +2892,13 @@ impl CompiApp {
                             }),
                     ),
             )
-            .child(self.render_content_tree(pane_id, ui, None, cx))
+            .children(self.render_sidebar_switch(pane_id, ui, cx))
+            .child(match ui.mode {
+                SidebarMode::Files => self
+                    .render_content_tree(pane_id, ui, None, cx)
+                    .into_any_element(),
+                SidebarMode::Changes => self.render_changes_list(pane_id, ui, width, cx),
+            })
     }
 
     /// The folder's filter field and the rows it shows, below the root the header names.
@@ -2880,6 +2934,7 @@ impl CompiApp {
             let folder = row.directory;
             let level = row.depth.saturating_sub(1).min(31);
             let row_pane = pane_id.clone();
+            let mark = ui.repo.tree_mark(&row.path);
             let tint = if selected || open {
                 colors.foreground
             } else if folder {
@@ -2960,6 +3015,10 @@ impl CompiApp {
                                 .child(row.name.clone()),
                         ),
                 )
+                .when_some(mark, |item, mark| {
+                    item.child(div().flex_1())
+                        .child(self.render_tree_mark(pane_id, index, mark, row_height, cx))
+                })
         });
         let focus_pane = pane_id.clone();
         let clear_pane = pane_id.clone();
@@ -3091,7 +3150,9 @@ impl CompiApp {
             )
     }
 
-    fn render_file_tabs(
+    /// The tab strip: the sidebar toggle, the file and diff tabs in order, and where the
+    /// files live.
+    fn render_content_tabs(
         &self,
         pane_id: &PaneId,
         content: &PaneContent,
@@ -3101,14 +3162,23 @@ impl CompiApp {
         let colors = *self.colors();
         let toggle_pane = pane_id.clone();
         let environment = self.environment_label(&ui.environment);
-        let tabs = content.files.iter().enumerate().map(|(index, path)| {
-            let active = content.active_file.as_ref() == Some(path);
-            let editor = ui.editor(path);
+        let tabs = content.tabs.iter().enumerate().map(|(index, tab)| {
+            let active = content.active.as_ref() == Some(tab);
+            let (name, glyph, hint, title) = match tab {
+                ContentTab::File { path } => {
+                    (file_name(path).to_owned(), false, None, path.clone())
+                }
+                ContentTab::Diff { .. } => {
+                    let (name, hint, title) = Self::diff_tab_caption(ui, tab).unwrap_or_default();
+                    (name, true, hint, title)
+                }
+            };
+            let editor = tab.file().and_then(|path| ui.editor(path));
             let dirty = editor.is_some_and(|editor| editor.dirty);
             let read_only = editor.is_some_and(|editor| !editor.writable);
-            let (open_pane, open_path) = (pane_id.clone(), path.clone());
-            let (close_pane, close_path) = (pane_id.clone(), path.clone());
-            let (title, reason) = (path.clone(), environment.clone());
+            let (open_pane, open_tab) = (pane_id.clone(), tab.clone());
+            let (close_pane, close_tab) = (pane_id.clone(), tab.clone());
+            let reason = environment.clone();
             div()
                 .id(("content-file-tab", index))
                 .flex_none()
@@ -3138,7 +3208,7 @@ impl CompiApp {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
-                        this.activate_content_file(&open_pane, &open_path);
+                        this.activate_content_tab(&open_pane, &open_tab);
                         cx.stop_propagation();
                         cx.notify();
                     }),
@@ -3151,14 +3221,32 @@ impl CompiApp {
                     })
                     .into()
                 })
+                .when(glyph, |tab| {
+                    tab.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .child("Δ"),
+                    )
+                })
                 .child(
                     div()
                         .min_w_0()
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .child(file_name(path).to_owned()),
+                        .child(name),
                 )
+                .when_some(hint, |tab, hint| {
+                    tab.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .child(hint),
+                    )
+                })
                 .when(read_only, |tab| {
                     tab.child(
                         div()
@@ -3199,7 +3287,14 @@ impl CompiApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
-                                this.close_content_file(&close_pane, &close_path, window, cx);
+                                match &close_tab {
+                                    ContentTab::File { path } => {
+                                        this.close_content_file(&close_pane, path, window, cx)
+                                    }
+                                    ContentTab::Diff { .. } => {
+                                        this.drop_content_tab(&close_pane, &close_tab)
+                                    }
+                                }
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
@@ -3253,6 +3348,11 @@ impl CompiApp {
                     .flex()
                     .overflow_x_scroll()
                     .children(tabs),
+            )
+            .children(
+                content
+                    .active_file()
+                    .and_then(|path| self.render_baseline(pane_id, path, cx)),
             )
             .child(
                 div()
@@ -3543,6 +3643,7 @@ impl CompiApp {
         let area = div().flex_1().min_w_0().h_full();
         match ui.files.get(path).map(|file| &file.body) {
             Some(FileBody::Ready(editor)) => area
+                .relative()
                 // The editor's own context menu, not the palette, answers a right click.
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .child(
@@ -3554,6 +3655,7 @@ impl CompiApp {
                         .text_size(px(self.typography.font_size))
                         .size_full(),
                 )
+                .children(self.render_gutter(pane_id, path, cx))
                 .into_any_element(),
             Some(FileBody::Unopenable { reason, len }) => {
                 let copied = path.to_owned();
@@ -3697,9 +3799,13 @@ mod tests {
             content: PaneContent {
                 environment: wsl.clone(),
                 root: root.into(),
-                files: files.iter().map(|file| (*file).into()).collect(),
-                active_file: None,
-                view: compi_protocol::ContentView::Files,
+                tabs: files
+                    .iter()
+                    .map(|file| ContentTab::File {
+                        path: (*file).into(),
+                    })
+                    .collect(),
+                active: None,
             },
         };
         let split = |first, second| LayoutNode::Split {

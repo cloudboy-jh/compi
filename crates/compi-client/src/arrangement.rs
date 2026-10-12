@@ -1041,9 +1041,12 @@ mod tests {
             content: PaneContent {
                 environment: ContentEnvironment::Host,
                 root: "/work".into(),
-                files: vec!["/work/a.md".into()],
-                active_file: Some("/work/a.md".into()),
-                view: compi_protocol::ContentView::Files,
+                tabs: vec![compi_protocol::ContentTab::File {
+                    path: "/work/a.md".into(),
+                }],
+                active: Some(compi_protocol::ContentTab::File {
+                    path: "/work/a.md".into(),
+                }),
             },
         };
         let tree = split(SplitAxis::Horizontal, 0.5, pane("a"), content.clone());

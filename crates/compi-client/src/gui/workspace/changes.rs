@@ -1,42 +1,43 @@
-//! Changes panes: a repository's uncommitted Git changes, reviewed beside the terminal
-//! that made them. The list shows two sections as `git status` does (Unstaged: the work
-//! tree against the index, untracked files included; Staged: the index against `HEAD`)
-//! and the selected change shows in a `DiffView` beside it. While a pane is visible its
-//! repository is read again every `CHECK_INTERVAL`; the list updates in place and only
-//! the selected change is read again, when its stamp changed. Reviewing never writes:
-//! the daemon reads with Git's optional locks off, so neither files, the index nor any
-//! other Git state change.
+//! A content pane's repository and its diff tabs. While a pane is visible its folder's
+//! Git changes are read again every `CHECK_INTERVAL` (`repo_changes`); its sidebar can list
+//! them in two sections as `git status` does (Unstaged: the work tree against the index,
+//! untracked files included; Staged: the index against `HEAD`), and a change opens as a
+//! diff tab beside the file tabs (`open_diff`). An open diff is read again when its change's
+//! stamp moves and replaced in place, keeping scroll, context and find. Reviewing never
+//! writes: the daemon reads with Git's optional locks off, so neither files, the index nor
+//! any other Git state change.
 use super::content::{
-    CHECK_INTERVAL, FILE_TAB_HEIGHT, PaneUi, SIDEBAR_WIDTH, TREE_INDENT, TREE_INSET,
-    content_leaves, find_content, same_folder,
+    CHECK_INTERVAL, FILE_TAB_HEIGHT, PaneUi, TREE_INDENT, TREE_INSET, file_name, find_content,
+    reusable_content, same_folder,
 };
 use super::diff_view::{DiffSettings, DiffStyle, DiffView, LayoutMode};
 use super::files::FileScope;
+use super::tree::join_path;
 use super::tree_ui::tree_entry_icon;
 use super::*;
-use crate::diff::Whitespace;
+use crate::content_path::{repo_relative, work_tree_path};
+use crate::diff::{Side, Whitespace};
 use compi_protocol::{
-    ContentEnvironment, ContentView, GitChange, GitChangeKind, GitChanges, GitFileContent,
-    GitFileRef, GitRevision, GitScope, PaneContent,
+    ContentEnvironment, ContentTab, GitChange, GitChangeKind, GitChanges, GitFileContent,
+    GitRevision, GitScope, PaneContent,
 };
 use gpui::{AnyElement, Entity, ScrollStrategy, UniformListScrollHandle, uniform_list};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
-/// A diff of another file that takes longer than this to read and build replaces the
-/// previous one with a loading line; quicker ones swap without it.
+/// A diff that takes longer than this to read and build shows a loading line.
 const LOADING_DELAY: Duration = Duration::from_millis(150);
 /// A repository read that takes longer than this shows the refreshing mark.
 const REFRESHING_DELAY: Duration = Duration::from_millis(300);
-/// A selection rests this long before it is saved with the pane, so stepping through
-/// files does not queue a workspace change per file.
-const SELECTION_SAVE_DELAY: Duration = Duration::from_secs(1);
+/// A folder outside any work tree is asked again this rarely, so `git init` is noticed
+/// without running Git every few seconds for every folder.
+const NOT_REPO_INTERVAL: Duration = Duration::from_secs(30);
 /// Rough glyph advance of the UI font at micro size, for eliding folders.
 const MICRO_GLYPH_WIDTH: f32 = UI_MICRO_TEXT_SIZE * 0.56;
 const SMALL_GLYPH_WIDTH: f32 = UI_SMALL_TEXT_SIZE * 0.56;
 
-/// How every Changes pane of a window shows changes.
+/// How every Changes list and diff tab of a window shows changes. Not saved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ChangesSettings {
     pub diff: DiffSettings,
@@ -44,11 +45,18 @@ pub(super) struct ChangesSettings {
     pub tree: bool,
 }
 
-/// A Changes pane's client state: the latest listing, the list built from it, and the
-/// diff of the selected change.
-pub(super) struct ChangesUi {
-    /// The repository top level, as the pane's content root names it.
-    repo: String,
+/// What a content pane's folder sidebar, or its folder view, lists. Client-local.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SidebarMode {
+    #[default]
+    Files,
+    Changes,
+}
+
+/// The Git changes of a content pane's folder and the Changes list built from them.
+pub(super) struct RepoStatus {
+    /// The folder read: the pane's root.
+    root: String,
     listing: Listing,
     /// Files and lines across the listing: distinct paths, added, removed.
     totals: (usize, u64, u64),
@@ -68,17 +76,19 @@ pub(super) struct ChangesUi {
     scroll: UniformListScrollHandle,
     /// The list's width at the last draw, for eliding folder names.
     list_width: Cell<f32>,
-    selected: Option<GitFileRef>,
-    /// The user picked `selected` then; the pane has not saved it yet.
-    picked_at: Option<Instant>,
-    /// The diff on screen.
-    shown: Option<Shown>,
-    /// The diff being read or built to replace it.
-    pending: Option<Pending>,
-    /// Reading the sides of this change failed.
-    failed: Option<(GitFileRef, String)>,
-    /// Counts loads, so a superseded one is dropped when it finishes.
-    loads: u64,
+    /// A diff asked for before the folder was read: path, scope and line for `open_diff`.
+    pub(super) pending_open: Option<(String, Option<GitScope>, Option<u32>)>,
+    /// The folder tree's marks for the latest listing, by tree path; see `tree_marks`.
+    marks: HashMap<String, TreeMark>,
+}
+
+/// What the folder tree shows beside a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TreeMark {
+    /// A changed file: its status, and its repository path for opening its diff.
+    File { kind: GitChangeKind, path: String },
+    /// A folder holding changes.
+    Folder,
 }
 
 enum Listing {
@@ -88,14 +98,25 @@ enum Listing {
     Ready(GitChanges),
 }
 
+/// The diff a diff tab shows.
+#[derive(Default)]
+pub(super) struct DiffTab {
+    /// The diff on screen, at its change's stamp.
+    shown: Option<Shown>,
+    /// The diff being read or built at a newer stamp.
+    pending: Option<Pending>,
+    /// Reading the sides at this stamp failed.
+    failed: Option<(String, String)>,
+    /// Counts loads, so a superseded one is dropped when it finishes.
+    loads: u64,
+}
+
 struct Shown {
-    file: GitFileRef,
     stamp: String,
     view: Entity<DiffView>,
 }
 
 struct Pending {
-    file: GitFileRef,
     stamp: String,
     load: u64,
     started: Instant,
@@ -129,10 +150,10 @@ enum ListRow {
     File { change: usize, depth: usize },
 }
 
-impl ChangesUi {
-    fn new(repo: String, selected: Option<GitFileRef>) -> Self {
+impl RepoStatus {
+    pub(super) fn new(root: String) -> Self {
         Self {
-            repo,
+            root,
             listing: Listing::Reading,
             totals: (0, 0, 0),
             reading: None,
@@ -143,39 +164,35 @@ impl ChangesUi {
             rows: Vec::new(),
             order: Vec::new(),
             scroll: UniformListScrollHandle::new(),
-            list_width: Cell::new(SIDEBAR_WIDTH),
-            selected,
-            picked_at: None,
-            shown: None,
-            pending: None,
-            failed: None,
-            loads: 0,
+            list_width: Cell::new(0.0),
+            pending_open: None,
+            marks: HashMap::new(),
         }
     }
 
-    pub(super) fn repo(&self) -> &str {
-        &self.repo
+    /// The latest listing; `None` outside a work tree or before the first read.
+    pub(super) fn listing(&self) -> Option<&GitChanges> {
+        match &self.listing {
+            Listing::Ready(listing) => Some(listing),
+            _ => None,
+        }
     }
 
     fn changes(&self) -> &[GitChange] {
-        match &self.listing {
-            Listing::Ready(listing) => &listing.changes,
-            _ => &[],
+        self.listing()
+            .map_or(&[], |listing| listing.changes.as_slice())
+    }
+
+    /// The change a diff tab of `repo` shows, if the listing has it.
+    fn change(&self, repo: &str, path: &str, scope: GitScope) -> Option<&GitChange> {
+        let listing = self.listing()?;
+        if !same_folder(&listing.repo, repo) {
+            return None;
         }
-    }
-
-    fn selected_change(&self) -> Option<&GitChange> {
-        let selected = self.selected.as_ref()?;
-        self.changes().iter().find(|change| is(change, selected))
-    }
-
-    /// Every change in list order.
-    fn refs(&self) -> Vec<GitFileRef> {
-        let changes = self.changes();
-        self.order
+        listing
+            .changes
             .iter()
-            .map(|&index| file_ref(&changes[index]))
-            .collect()
+            .find(|change| change.scope == scope && change.path == path)
     }
 
     fn rebuild(&mut self, tree: bool) {
@@ -184,8 +201,7 @@ impl ChangesUi {
         self.order = order;
     }
 
-    /// Takes a fresh listing; whether anything shown changed. The selection stays on
-    /// its change, or moves to the change now at its place in the list.
+    /// Takes a fresh listing; whether anything shown changed.
     fn apply_listing(&mut self, listing: GitChanges, tree: bool) -> bool {
         let cleared = self.refresh_error.take().is_some();
         if let Listing::Ready(current) = &self.listing
@@ -193,7 +209,6 @@ impl ChangesUi {
         {
             return cleared;
         }
-        let previous = self.refs();
         let mut paths: Vec<&str> = listing
             .changes
             .iter()
@@ -212,28 +227,29 @@ impl ChangesUi {
                         removed + u64::from(change.removed.unwrap_or(0)),
                     )
                 });
-        let first = !matches!(self.listing, Listing::Ready(_));
+        self.marks = tree_marks(&self.root, &listing);
         self.listing = Listing::Ready(listing);
         self.rebuild(tree);
-        let current = self.refs();
-        self.selected = match &self.selected {
-            Some(selected) => reselect(&previous, selected, &current),
-            None => current.first().cloned(),
-        };
-        if first {
-            // A restored pane's selection may be far down the list.
-            self.scroll_to_selected();
-        }
         true
     }
 
-    /// Unfolds what hides `file` and scrolls the list to it.
-    fn reveal(&mut self, file: &GitFileRef, tree: bool) {
-        let mut unfolded = self.folds.sections.remove(&file.scope);
-        self.folds.folders.retain(|(scope, folder)| {
-            let hides = *scope == file.scope
-                && file
-                    .path
+    /// A listing read for this folder elsewhere (the Changes command), as if read here.
+    pub(super) fn seed(&mut self, listing: GitChanges, tree: bool) {
+        self.apply_listing(listing, tree);
+        self.read_at = Some(Instant::now());
+    }
+
+    /// The folder tree's mark for the tree path `path`.
+    pub(super) fn tree_mark(&self, path: &str) -> Option<&TreeMark> {
+        self.marks.get(path)
+    }
+
+    /// Unfolds what hides the change of `path` in `scope` and scrolls the list to it.
+    fn reveal(&mut self, path: &str, scope: GitScope, tree: bool) {
+        let mut unfolded = self.folds.sections.remove(&scope);
+        self.folds.folders.retain(|(folded, folder)| {
+            let hides = *folded == scope
+                && path
                     .strip_prefix(folder.as_str())
                     .is_some_and(|rest| rest.starts_with('/'));
             unfolded |= hides;
@@ -242,56 +258,87 @@ impl ChangesUi {
         if unfolded {
             self.rebuild(tree);
         }
-        self.scroll_to_selected();
-    }
-
-    fn scroll_to_selected(&self) {
-        let Some(selected) = &self.selected else {
-            return;
-        };
         let changes = self.changes();
         if let Some(row) = self.rows.iter().position(|row| match row {
-            ListRow::File { change, .. } => is(&changes[*change], selected),
+            ListRow::File { change, .. } => {
+                changes[*change].scope == scope && changes[*change].path == path
+            }
             _ => false,
         }) {
             self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
     }
+}
 
-    /// The diffs this pane holds: the one shown and the one replacing it.
+impl DiffTab {
+    /// The diff on screen.
+    fn view(&self) -> Option<&Entity<DiffView>> {
+        self.shown.as_ref().map(|shown| &shown.view)
+    }
+
+    /// The diffs this tab holds: the one shown and one waiting to replace it.
     fn views(&self) -> impl Iterator<Item = &Entity<DiffView>> {
-        self.shown
-            .as_ref()
-            .map(|shown| &shown.view)
-            .into_iter()
-            .chain(
-                self.pending
-                    .as_ref()
-                    .and_then(|pending| pending.view.as_ref())
-                    .map(|(view, _)| view),
-            )
+        self.view().into_iter().chain(
+            self.pending
+                .as_ref()
+                .and_then(|pending| pending.view.as_ref())
+                .map(|(view, _)| view),
+        )
     }
 
-    /// A new diff is slow to come, so the previous one gives way to a loading line.
+    /// Nothing to show yet, and the first diff is slow to come.
     fn loading(&self) -> bool {
-        self.pending.as_ref().is_some_and(|pending| {
-            pending.started.elapsed() >= LOADING_DELAY
-                && self
-                    .shown
-                    .as_ref()
-                    .is_none_or(|shown| shown.file != pending.file)
-        })
+        self.shown.is_none()
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.started.elapsed() >= LOADING_DELAY)
     }
 }
 
-fn is(change: &GitChange, file: &GitFileRef) -> bool {
-    change.scope == file.scope && change.path == file.path
+/// The folder tree's marks for `listing`, keyed by tree path below the pane's folder
+/// `root` (built as the tree joins names): every changed file still in the work tree with
+/// its status (an unstaged change wins over a staged one, as the listing puts unstaged
+/// changes first), and every folder holding a change, deletions included.
+fn tree_marks(root: &str, listing: &GitChanges) -> HashMap<String, TreeMark> {
+    let mut marks = HashMap::new();
+    let top = listing.repo.trim_end_matches(['/', '\\']);
+    let here = root.trim_end_matches(['/', '\\']);
+    let prefix = if top == here || (listing.repo.contains('\\') && top.eq_ignore_ascii_case(here)) {
+        String::new()
+    } else {
+        match repo_relative(&listing.repo, root) {
+            Some(relative) => format!("{relative}/"),
+            None => return marks,
+        }
+    };
+    for change in &listing.changes {
+        let Some(rest) = change.path.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        let mut path = root.to_owned();
+        let mut parts = rest.split('/').peekable();
+        while let Some(part) = parts.next() {
+            path = join_path(&path, part);
+            if parts.peek().is_some() {
+                marks.entry(path.clone()).or_insert(TreeMark::Folder);
+            } else if change.kind != GitChangeKind::Deleted {
+                marks.entry(path).or_insert_with(|| TreeMark::File {
+                    kind: change.kind,
+                    path: change.path.clone(),
+                });
+                break;
+            }
+        }
+    }
+    marks
 }
 
-fn file_ref(change: &GitChange) -> GitFileRef {
-    GitFileRef {
-        path: change.path.clone(),
-        scope: change.scope,
+/// What a diff tab compares, in words, when its change is not listed.
+fn scope_baseline(scope: GitScope) -> &'static str {
+    match scope {
+        GitScope::Unstaged => "Working tree vs index",
+        GitScope::Staged => "Index vs HEAD",
     }
 }
 
@@ -415,23 +462,6 @@ fn list_rows(changes: &[GitChange], tree: bool, folds: &Folds) -> (Vec<ListRow>,
     (rows, order)
 }
 
-/// The change to select after the list went from `previous` to `current`: the same one,
-/// else the one now at its place, else none when the list is empty.
-fn reselect(
-    previous: &[GitFileRef],
-    selected: &GitFileRef,
-    current: &[GitFileRef],
-) -> Option<GitFileRef> {
-    if current.contains(selected) {
-        return Some(selected.clone());
-    }
-    let at = previous
-        .iter()
-        .position(|file| file == selected)
-        .unwrap_or(0);
-    current.get(at.min(current.len().checked_sub(1)?)).cloned()
-}
-
 /// The two sides a change compares, old then new: a path and the revision to read it
 /// at, or `None` for a side without the file.
 fn sides(change: &GitChange) -> [Option<(&str, GitRevision)>; 2] {
@@ -477,7 +507,7 @@ fn kind_label(kind: GitChangeKind) -> &'static str {
     }
 }
 
-fn status_letter(kind: GitChangeKind) -> &'static str {
+pub(super) fn status_letter(kind: GitChangeKind) -> &'static str {
     match kind {
         GitChangeKind::Added => "A",
         GitChangeKind::Modified => "M",
@@ -490,7 +520,7 @@ fn status_letter(kind: GitChangeKind) -> &'static str {
     }
 }
 
-fn kind_color(kind: GitChangeKind, colors: &ThemeColors) -> u32 {
+pub(super) fn kind_color(kind: GitChangeKind, colors: &ThemeColors) -> u32 {
     match kind {
         GitChangeKind::Added | GitChangeKind::Untracked => colors.added,
         GitChangeKind::Deleted => colors.removed,
@@ -589,6 +619,28 @@ fn list_icon(tree: bool, tint: Hsla) -> impl IntoElement {
     .size(px(16.0))
 }
 
+/// A plus over a minus: open a file's diff.
+fn diff_icon(tint: Hsla) -> impl IntoElement {
+    canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            let x = |value: f32| bounds.left() + px(value);
+            let y = |value: f32| bounds.top() + px(value);
+            let mut path = PathBuilder::stroke(px(1.25));
+            path.move_to(point(x(4.5), y(5.5)));
+            path.line_to(point(x(11.5), y(5.5)));
+            path.move_to(point(x(8.0), y(2.0)));
+            path.line_to(point(x(8.0), y(9.0)));
+            path.move_to(point(x(4.5), y(12.5)));
+            path.line_to(point(x(11.5), y(12.5)));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, tint);
+            }
+        },
+    )
+    .size(px(16.0))
+}
+
 /// Chevrons apart (show unchanged lines) or together (fold them again).
 fn context_icon(expanded: bool, tint: Hsla) -> impl IntoElement {
     canvas(
@@ -616,13 +668,116 @@ fn context_icon(expanded: bool, tint: Hsla) -> impl IntoElement {
 }
 
 impl CompiApp {
-    /// The Changes command: the repository holding the focused pane's folder, in a
-    /// Changes pane beside it, or the one this tab already has for it.
-    pub(super) fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The Git changes of `pane_id`'s folder: `None` outside a work tree or until the
+    /// first read lands. Kept fresh while the pane is visible.
+    pub(super) fn repo_changes(&self, pane_id: &PaneId) -> Option<&GitChanges> {
+        self.content.panes.get(pane_id)?.repo.listing()
+    }
+
+    /// Shows the diff of repository path `path` as a tab of the content pane `pane_id`,
+    /// opening it or activating the one open. Without `scope`, the unstaged change wins
+    /// over the staged one; a file with neither leaves a message. `line` (1-based, new
+    /// side) is scrolled into view, now or once the diff is built. Asked before the folder
+    /// was read, it happens when the read lands.
+    pub(in crate::gui) fn open_diff(
+        &mut self,
+        pane_id: &PaneId,
+        path: String,
+        scope: Option<GitScope>,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut content) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id))
+            .cloned()
+        else {
+            self.global_error = Some("The pane to show the diff in no longer exists".into());
+            return;
+        };
+        let tree = self.content.changes.tree;
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            // Not drawn in this window yet; it reads its folder when it is.
+            self.content.pending_diff = Some((pane_id.clone(), path, scope, line));
+            self.focus_pane(pane_id.clone());
+            cx.notify();
+            return;
+        };
+        let listing = match &ui.repo.listing {
+            Listing::Ready(listing) => listing,
+            Listing::Reading => {
+                ui.repo.pending_open = Some((path, scope, line));
+                self.request_repo_listing(pane_id, window, cx);
+                return;
+            }
+            Listing::NotRepo => {
+                self.global_error = Some(format!("Not a Git repository: {}", content.root));
+                return;
+            }
+            Listing::Failed(error) => {
+                self.global_error = Some(format!("Cannot read the Git changes: {error}"));
+                return;
+            }
+        };
+        let listed = |scope: GitScope| {
+            listing
+                .changes
+                .iter()
+                .any(|change| change.scope == scope && change.path == path)
+        };
+        let scope = match scope {
+            Some(scope) => scope,
+            None => match [GitScope::Unstaged, GitScope::Staged]
+                .into_iter()
+                .find(|scope| listed(*scope))
+            {
+                Some(scope) => scope,
+                None => {
+                    self.global_error =
+                        Some(format!("{} has no uncommitted changes", file_name(&path)));
+                    cx.notify();
+                    return;
+                }
+            },
+        };
+        let repo = listing.repo.clone();
+        ui.repo.reveal(&path, scope, tree);
+        let tab = ContentTab::Diff { repo, path, scope };
+        if let Some(line) = line {
+            match ui.diffs.get(&tab).and_then(DiffTab::view) {
+                Some(view) => view.update(cx, |view, cx| view.reveal_line(Side::New, line, cx)),
+                None => ui.diff_reveal = Some((tab.clone(), line)),
+            }
+        }
+        let listed = content.tabs.contains(&tab);
+        if !listed && content.tabs.len() >= compi_protocol::MAX_CONTENT_FILES {
+            self.global_error =
+                Some("Close a tab first: this pane has as many as it can hold".into());
+            return;
+        }
+        if !listed || content.active.as_ref() != Some(&tab) {
+            if !listed {
+                content.tabs.push(tab.clone());
+            }
+            content.active = Some(tab);
+            self.update_content(pane_id, content);
+        }
+        self.focus_pane(pane_id.clone());
+        self.release_editor(pane_id, window, cx);
+        cx.notify();
+    }
+
+    /// The Changes command: in a content pane, its sidebar lists the changes; from a
+    /// terminal, the content pane of its repository does, opened beside it if the tab
+    /// has none.
+    pub(in crate::gui) fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let FileScope {
             pane_id,
             environment,
             folder,
+            content,
             ..
         } = match self.file_scope() {
             Ok(scope) => scope,
@@ -631,6 +786,10 @@ impl CompiApp {
                 return;
             }
         };
+        if content {
+            self.show_changes_list(&pane_id, window, cx);
+            return;
+        }
         let target = self.target.clone();
         cx.spawn_in(window, async move |this, cx| {
             let read = {
@@ -662,6 +821,8 @@ impl CompiApp {
         .detach();
     }
 
+    /// The content pane of `listing`'s repository in `beside`'s tab shows its changes,
+    /// or a new one beside it does.
     fn open_changes(
         &mut self,
         beside: &PaneId,
@@ -680,39 +841,27 @@ impl CompiApp {
             self.global_error = Some("The pane to show changes beside no longer exists".into());
             return;
         };
-        let mut existing = None;
-        content_leaves(&tab.layout, &mut |pane_id, content| {
-            if content.environment == environment
-                && !content.view.is_files()
-                && same_folder(&content.root, &listing.repo)
-                && existing.is_none_or(|found| found != beside)
-            {
-                existing = Some(pane_id);
-            }
-        });
+        let existing =
+            reusable_content(&tab.layout, beside, &environment, Some(&listing.repo), None)
+                .map(|(pane_id, _)| pane_id.clone());
         let tree = self.content.changes.tree;
-        if let Some(pane_id) = existing.cloned() {
-            self.focus_pane(pane_id.clone());
-            if let Some(changes) = self.changes_mut(&pane_id)
-                && changes.apply_listing(listing, tree)
+        if let Some(pane_id) = existing {
+            if let Some(ui) = self.content.panes.get_mut(&pane_id)
+                && ui.repo.reading.is_none()
+                && same_folder(&ui.repo.root, &listing.repo)
+                && ui.repo.apply_listing(listing, tree)
             {
-                changes.read_at = Some(Instant::now());
-                self.load_selected(&pane_id, window, cx);
+                ui.repo.read_at = Some(Instant::now());
             }
-            cx.notify();
+            self.focus_pane(pane_id.clone());
+            self.show_changes_list(&pane_id, window, cx);
             return;
         }
-        let (_, order) = list_rows(&listing.changes, tree, &Folds::default());
         let content = PaneContent {
             environment: environment.clone(),
             root: listing.repo.clone(),
-            files: Vec::new(),
-            active_file: None,
-            view: ContentView::Changes {
-                selected: order
-                    .first()
-                    .map(|&index| file_ref(&listing.changes[index])),
-            },
+            tabs: Vec::new(),
+            active: None,
         };
         if self.open_content_beside(beside, content) {
             self.content.changes_seed = Some((environment, listing));
@@ -720,243 +869,249 @@ impl CompiApp {
         cx.notify();
     }
 
-    fn changes_mut(&mut self, pane_id: &PaneId) -> Option<&mut ChangesUi> {
-        self.content.panes.get_mut(pane_id)?.changes.as_deref_mut()
+    /// The end of a folder tree row with a mark: a changed file's status letter, with an
+    /// **Open diff** button before it while the row is hovered, or a folder's quiet dot.
+    pub(super) fn render_tree_mark(
+        &self,
+        pane_id: &PaneId,
+        index: usize,
+        mark: &TreeMark,
+        row_height: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let slot = div()
+            .flex_none()
+            .w(px(12.0))
+            .h(px(row_height))
+            .flex()
+            .items_center()
+            .justify_center();
+        let TreeMark::File { kind, path } = mark else {
+            return slot
+                .child(
+                    div()
+                        .size(px(5.0))
+                        .rounded_full()
+                        .bg(color(colors.modified))
+                        .opacity(0.6),
+                )
+                .into_any_element();
+        };
+        let (pane, path) = (pane_id.clone(), path.clone());
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id(("content-tree-diff", index))
+                    .flex_none()
+                    .size(px(16.0))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .invisible()
+                    .group_hover("content-tree-row", |style| style.visible())
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                    .child(diff_icon(color(colors.muted)))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| HeaderTooltip {
+                            title: "Open diff".into(),
+                            reason: None,
+                            colors,
+                        })
+                        .into()
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_diff(&pane, path.clone(), None, None, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                slot.text_size(px(UI_MICRO_TEXT_SIZE))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color(kind_color(*kind, &colors)))
+                    .child(status_letter(*kind)),
+            )
+            .into_any_element()
     }
 
-    /// State for a Changes pane this window has none for: just opened, restored after a
-    /// restart, or moved here. The Changes command's listing is used when it is for
-    /// this pane; otherwise the repository is read.
-    pub(super) fn prepare_changes_pane(
+    /// Switches `pane_id`'s sidebar to the Changes list and shows it beside an open tab.
+    pub(super) fn show_changes_list(
         &mut self,
-        pane_id: PaneId,
-        content: PaneContent,
+        pane_id: &PaneId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ContentView::Changes { selected } = content.view else {
-            return;
-        };
-        let seed = self
-            .content
-            .changes_seed
-            .take_if(|(environment, listing)| {
-                *environment == content.environment && same_folder(&listing.repo, &content.root)
-            })
-            .map(|(_, listing)| listing);
-        let mut changes = ChangesUi::new(content.root.clone(), selected);
-        let seeded = seed.is_some();
-        if let Some(listing) = seed {
-            changes.apply_listing(listing, self.content.changes.tree);
-            changes.read_at = Some(Instant::now());
+        let tab_open = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id))
+            .is_some_and(|content| content.active.is_some());
+        if let Some(ui) = self.content.panes.get_mut(pane_id) {
+            ui.mode = SidebarMode::Changes;
+            ui.sidebar |= tab_open;
         }
-        let ui = self
-            .content
-            .panes
-            .entry(pane_id.clone())
-            .or_insert_with(|| {
-                PaneUi::new(
-                    &pane_id,
-                    content.environment.clone(),
-                    content.root.clone(),
-                    cx,
-                )
-            });
-        if ui.environment != content.environment {
-            *ui = PaneUi::new(
-                &pane_id,
-                content.environment.clone(),
-                content.root.clone(),
-                cx,
-            );
-        }
-        ui.changes = Some(Box::new(changes));
-        if seeded {
-            self.load_selected(&pane_id, window, cx);
-        } else {
-            self.request_changes_listing(&pane_id, window, cx);
-        }
+        self.release_editor(pane_id, window, cx);
+        cx.notify();
     }
 
-    /// Gives every diff the window's colors and terminal font; unchanged, a no-op.
-    pub(super) fn sync_changes_views(&mut self, cx: &mut Context<Self>) {
+    /// Diff this file: the focused pane's open file against the index, else its staged
+    /// change, at the editor's cursor line.
+    pub(in crate::gui) fn diff_this_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane_id, path)) = self.focused_pane().cloned().and_then(|pane_id| {
+            let path = self.focused_content()?.active_file()?.to_owned();
+            Some((pane_id, path))
+        }) else {
+            self.global_error = Some("Open a file in the editor first".into());
+            return;
+        };
+        let name = file_name(&path).to_owned();
+        let Some(ui) = self.content.panes.get(&pane_id) else {
+            return;
+        };
+        // The diff's new side is the saved file (unstaged) or the index (staged), so the
+        // cursor's line is a close guess when the buffer has unsaved edits.
+        let line = ui
+            .editor(&path)
+            .map(|editor| editor.state.read(cx).cursor_position().line + 1);
+        let relative = match &ui.repo.listing {
+            Listing::Ready(listing) => repo_relative(&listing.repo, &path),
+            Listing::Reading => {
+                self.global_error = Some("Still reading this folder's Git changes".into());
+                return;
+            }
+            Listing::NotRepo => {
+                self.global_error = Some(format!("{name} is not in a Git repository"));
+                return;
+            }
+            Listing::Failed(error) => {
+                self.global_error = Some(format!("Cannot read the Git changes: {error}"));
+                return;
+            }
+        };
+        let Some(relative) = relative else {
+            self.global_error = Some(format!("{name} is outside this folder's repository"));
+            return;
+        };
+        self.open_diff(&pane_id, relative, None, line, window, cx);
+    }
+
+    /// Edit file: the work-tree file of a diff tab, at the line the diff shows a third of
+    /// the way down.
+    fn edit_from_diff(
+        &mut self,
+        pane_id: &PaneId,
+        tab: &ContentTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ContentTab::Diff { repo, path, .. } = tab else {
+            return;
+        };
+        let Some(ui) = self.content.panes.get(pane_id) else {
+            return;
+        };
+        let line = ui
+            .diffs
+            .get(tab)
+            .and_then(DiffTab::view)
+            .and_then(|view| view.read(cx).line_in_view())
+            .and_then(|(side, line)| (side == Side::New).then_some(line));
+        let environment = ui.environment.clone();
+        self.open_content_file(
+            pane_id,
+            environment,
+            None,
+            Some(work_tree_path(repo, path)),
+            line,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// Before drawing: the active diff tab of each shown pane is read when its change is
+    /// new or moved, and every diff takes the window's colors and font.
+    pub(super) fn prepare_diff_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active: Vec<(PaneId, ContentTab)> = match &self.workspace {
+            Some(workspace) => self
+                .shown_content_panes()
+                .filter_map(|pane_id| {
+                    let active = find_content(workspace, pane_id)?.active.as_ref()?;
+                    matches!(active, ContentTab::Diff { .. })
+                        .then(|| (pane_id.clone(), active.clone()))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        for (pane_id, tab) in active {
+            self.load_diff(&pane_id, &tab, window, cx);
+        }
         let style = DiffStyle {
             colors: *self.colors(),
             typography: self.typography.clone(),
         };
-        for ui in self.content.panes.values() {
-            let Some(changes) = ui.changes.as_deref() else {
-                continue;
-            };
-            for view in changes.views() {
-                view.update(cx, |view, cx| view.set_style(style.clone(), cx));
-            }
+        for view in self
+            .content
+            .panes
+            .values()
+            .flat_map(|ui| ui.diffs.values())
+            .flat_map(DiffTab::views)
+        {
+            view.update(cx, |view, cx| view.set_style(style.clone(), cx));
         }
     }
 
-    /// On the watch tick: reads each shown Changes pane's repository again once
-    /// `CHECK_INTERVAL` passed since the last read finished, one read per pane at a time,
-    /// marks reads that take a while, and saves selections that came to rest.
-    pub(super) fn refresh_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.update_quiesced.load(Ordering::Acquire) {
-            return;
-        }
-        let shown: Vec<PaneId> = self
-            .shown_content_panes()
-            .filter(|pane_id| {
-                self.content
-                    .panes
-                    .get(*pane_id)
-                    .is_some_and(|ui| ui.changes.is_some())
-            })
-            .cloned()
-            .collect();
-        let mut redraw = false;
-        for pane_id in &shown {
-            let Some(changes) = self.changes_mut(pane_id) else {
-                continue;
-            };
-            match changes.reading {
-                Some(since) => {
-                    if !changes.marked && since.elapsed() >= REFRESHING_DELAY {
-                        changes.marked = true;
-                        redraw = true;
-                    }
-                }
-                None => {
-                    if changes
-                        .read_at
-                        .is_none_or(|at| at.elapsed() >= CHECK_INTERVAL)
-                    {
-                        self.request_changes_listing(pane_id, window, cx);
-                    }
-                }
-            }
-        }
-        self.save_changes_selection();
-        if redraw {
-            cx.notify();
-        }
-    }
-
-    fn request_changes_listing(
+    /// Reads both sides of a diff tab's change unless they are on screen or on their way
+    /// at its current stamp. A diff on screen is replaced in place.
+    fn load_diff(
         &mut self,
         pane_id: &PaneId,
+        tab: &ContentTab,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ContentTab::Diff { repo, path, scope } = tab else {
+            return;
+        };
         let Some(ui) = self.content.panes.get_mut(pane_id) else {
             return;
         };
-        let environment = ui.environment.clone();
-        let Some(changes) = ui.changes.as_deref_mut() else {
-            return;
-        };
-        if changes.reading.is_some() {
-            return;
-        }
-        changes.reading = Some(Instant::now());
-        let repo = changes.repo.clone();
-        let target = self.target.clone();
-        let pane_id = pane_id.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    (|| -> crate::Result<_> {
-                        target.connect()?.read_git_changes(environment, repo)
-                    })()
-                    .map_err(|error| error.to_string())
-                })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                this.changes_listed(&pane_id, result, window, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn changes_listed(
-        &mut self,
-        pane_id: &PaneId,
-        result: Result<Option<GitChanges>, String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let tree = self.content.changes.tree;
-        let Some(changes) = self.changes_mut(pane_id) else {
-            return;
-        };
-        let marked = std::mem::take(&mut changes.marked);
-        changes.reading = None;
-        changes.read_at = Some(Instant::now());
-        let changed = match result {
-            Ok(Some(listing)) => changes.apply_listing(listing, tree),
-            Ok(None) => {
-                let changed = !matches!(changes.listing, Listing::NotRepo);
-                changes.listing = Listing::NotRepo;
-                changes.rebuild(tree);
-                changed
-            }
-            Err(error) if matches!(changes.listing, Listing::Ready(_)) => {
-                let changed = changes.refresh_error.as_ref() != Some(&error);
-                changes.refresh_error = Some(error);
-                changed
-            }
-            Err(error) => {
-                changes.listing = Listing::Failed(error);
-                true
-            }
-        };
-        if changed {
-            self.load_selected(pane_id, window, cx);
-        }
-        if changed || marked {
-            cx.notify();
-        }
-    }
-
-    /// Reads both sides of the selected change, unless they are on screen or on their
-    /// way at its current stamp. A diff of the change on screen is replaced in place;
-    /// another change's diff replaces the one shown once it can draw.
-    fn load_selected(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+        let Some(change) = ui.repo.change(repo, path, *scope).cloned() else {
             return;
         };
         let environment = ui.environment.clone();
-        let Some(changes) = ui.changes.as_deref_mut() else {
-            return;
-        };
-        let Some(change) = changes.selected_change().cloned() else {
-            changes.shown = None;
-            changes.pending = None;
-            changes.failed = None;
-            return;
-        };
-        let file = file_ref(&change);
-        let current = |at: &GitFileRef, stamp: &str| *at == file && stamp == change.stamp;
-        if changes
+        let state = ui.diffs.entry(tab.clone()).or_default();
+        let current = |stamp: &str| stamp == change.stamp;
+        if state
             .shown
             .as_ref()
-            .is_some_and(|shown| current(&shown.file, &shown.stamp))
+            .is_some_and(|shown| current(&shown.stamp))
         {
-            changes.pending = None;
-            changes.failed = None;
+            state.pending = None;
             return;
         }
-        if changes
+        if state
             .pending
             .as_ref()
-            .is_some_and(|pending| current(&pending.file, &pending.stamp))
+            .is_some_and(|pending| current(&pending.stamp))
+            || state
+                .failed
+                .as_ref()
+                .is_some_and(|(stamp, _)| current(stamp))
         {
             return;
         }
-        changes.loads += 1;
-        let load = changes.loads;
-        changes.failed = None;
-        changes.pending = Some(Pending {
-            file,
+        state.loads += 1;
+        let load = state.loads;
+        state.failed = None;
+        state.pending = Some(Pending {
             stamp: change.stamp.clone(),
             load,
             started: Instant::now(),
@@ -966,11 +1121,8 @@ impl CompiApp {
             sides(&change).map(|side| side.map(|(path, revision)| (path.to_owned(), revision)));
         let executor = cx.background_executor().clone();
         let read = |side: Option<(String, GitRevision)>| {
-            let (target, environment, repo) = (
-                self.target.clone(),
-                environment.clone(),
-                changes.repo.clone(),
-            );
+            let (target, environment, repo) =
+                (self.target.clone(), environment.clone(), repo.clone());
             executor.spawn(async move {
                 let Some((path, revision)) = side else {
                     return Ok(GitFileContent::Missing);
@@ -985,11 +1137,11 @@ impl CompiApp {
         };
         // Both sides read at once, on background threads.
         let (old, new) = (read(old), read(new));
-        let pane = pane_id.clone();
+        let (pane, tab) = (pane_id.clone(), tab.clone());
         cx.spawn_in(window, async move |this, cx| {
             let (old, new) = (old.await, new.await);
             this.update_in(cx, |this, window, cx| {
-                this.change_read(&pane, load, old, new, window, cx);
+                this.diff_read(&pane, &tab, load, old, new, window, cx);
             })
             .ok();
         })
@@ -1002,83 +1154,94 @@ impl CompiApp {
         .detach();
     }
 
-    fn change_read(
+    #[allow(clippy::too_many_arguments)]
+    fn diff_read(
         &mut self,
         pane_id: &PaneId,
+        tab: &ContentTab,
         load: u64,
         old: Result<GitFileContent, String>,
         new: Result<GitFileContent, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ContentTab::Diff { path, .. } = tab else {
+            return;
+        };
         let style = DiffStyle {
             colors: *self.colors(),
             typography: self.typography.clone(),
         };
         let settings = self.content.changes.diff;
-        let Some(changes) = self.changes_mut(pane_id) else {
+        let Some(PaneUi {
+            diffs, diff_reveal, ..
+        }) = self.content.panes.get_mut(pane_id)
+        else {
             return;
         };
-        let Some(pending) = changes.pending.take_if(|pending| pending.load == load) else {
+        let Some(state) = diffs.get_mut(tab) else {
+            return;
+        };
+        let Some(pending) = state.pending.take_if(|pending| pending.load == load) else {
             return;
         };
         let (old, new) = match (old, new) {
             (Ok(old), Ok(new)) => (old, new),
             (Err(error), _) | (_, Err(error)) => {
-                changes.failed = Some((pending.file, error));
+                state.failed = Some((pending.stamp, error));
                 cx.notify();
                 return;
             }
         };
-        if let Some(shown) = changes
-            .shown
-            .as_mut()
-            .filter(|shown| shown.file == pending.file)
-        {
+        if let Some(shown) = &mut state.shown {
             shown.view.update(cx, |view, cx| view.replace(old, new, cx));
             shown.stamp = pending.stamp;
             cx.notify();
             return;
         }
-        let path = pending.file.path.clone();
+        let reveal = diff_reveal
+            .take_if(|(waiting, _)| waiting == tab)
+            .map(|(_, line)| line);
+        let path = path.clone();
         let view = cx.new(|cx| {
             let mut view = DiffView::new(path, old, new, settings, window, cx);
             view.set_style(style, cx);
+            if let Some(line) = reveal {
+                view.reveal_line(Side::New, line, cx);
+            }
             view
         });
-        if view.read(cx).is_ready() {
-            changes.shown = Some(Shown {
-                file: pending.file,
-                stamp: pending.stamp,
-                view,
-            });
-        } else {
-            let pane = pane_id.clone();
-            let subscription = cx.observe_in(&view, window, move |this, view, _, cx| {
-                this.diff_view_changed(&pane, &view, cx);
-            });
-            changes.pending = Some(Pending {
-                view: Some((view, subscription)),
-                ..pending
-            });
-        }
+        let (pane, waiting) = (pane_id.clone(), tab.clone());
+        let subscription = cx.observe_in(&view, window, move |this, view, _, cx| {
+            this.diff_view_changed(&pane, &waiting, &view, cx);
+        });
+        state.pending = Some(Pending {
+            view: Some((view, subscription)),
+            ..pending
+        });
         cx.notify();
     }
 
-    /// A diff waiting to replace the one shown takes its place once it can draw.
+    /// A new diff takes its tab once it can draw.
     fn diff_view_changed(
         &mut self,
         pane_id: &PaneId,
+        tab: &ContentTab,
         view: &Entity<DiffView>,
         cx: &mut Context<Self>,
     ) {
         if !view.read(cx).is_ready() {
             return;
         }
-        let Some(changes) = self.changes_mut(pane_id) else {
+        let Some(state) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .and_then(|ui| ui.diffs.get_mut(tab))
+        else {
             return;
         };
-        let Some(pending) = changes.pending.take_if(|pending| {
+        let Some(pending) = state.pending.take_if(|pending| {
             pending
                 .view
                 .as_ref()
@@ -1086,113 +1249,151 @@ impl CompiApp {
         }) else {
             return;
         };
-        changes.shown = Some(Shown {
-            file: pending.file,
+        state.shown = Some(Shown {
             stamp: pending.stamp,
             view: view.clone(),
         });
         cx.notify();
     }
 
-    /// The user picked `file`: it shows, its list row comes into view, and the pane
-    /// saves it once the selection rests.
-    fn select_change(
+    /// On the watch tick: reads each shown content pane's folder again once its interval
+    /// passed since the last read finished, one read per pane at a time, and marks reads
+    /// that take a while.
+    pub(super) fn refresh_repos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_quiesced.load(Ordering::Acquire) {
+            return;
+        }
+        let shown: Vec<PaneId> = self.shown_content_panes().cloned().collect();
+        let mut redraw = false;
+        for pane_id in &shown {
+            let Some(repo) = self.content.panes.get_mut(pane_id).map(|ui| &mut ui.repo) else {
+                continue;
+            };
+            match repo.reading {
+                Some(since) => {
+                    if !repo.marked && since.elapsed() >= REFRESHING_DELAY {
+                        repo.marked = true;
+                        redraw = true;
+                    }
+                }
+                None => {
+                    let interval = match repo.listing {
+                        Listing::NotRepo => NOT_REPO_INTERVAL,
+                        _ => CHECK_INTERVAL,
+                    };
+                    if repo.read_at.is_none_or(|at| at.elapsed() >= interval) {
+                        self.request_repo_listing(pane_id, window, cx);
+                    }
+                }
+            }
+        }
+        if redraw {
+            cx.notify();
+        }
+    }
+
+    fn request_repo_listing(
         &mut self,
         pane_id: &PaneId,
-        file: GitFileRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        if ui.repo.reading.is_some() {
+            return;
+        }
+        ui.repo.reading = Some(Instant::now());
+        let (environment, root) = (ui.environment.clone(), ui.repo.root.clone());
+        let target = self.target.clone();
+        let pane_id = pane_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = {
+                let root = root.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        (|| -> crate::Result<_> {
+                            target.connect()?.read_git_changes(environment, root)
+                        })()
+                        .map_err(|error| error.to_string())
+                    })
+                    .await
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.repo_listed(&pane_id, &root, result, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn repo_listed(
+        &mut self,
+        pane_id: &PaneId,
+        root: &str,
+        result: Result<Option<GitChanges>, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let tree = self.content.changes.tree;
-        let Some(changes) = self.changes_mut(pane_id) else {
+        let Some(repo) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .map(|ui| &mut ui.repo)
+            .filter(|repo| repo.root == root)
+        else {
             return;
         };
-        if changes.selected.as_ref() != Some(&file) {
-            changes.selected = Some(file.clone());
-            changes.picked_at = Some(Instant::now());
+        let marked = std::mem::take(&mut repo.marked);
+        repo.reading = None;
+        repo.read_at = Some(Instant::now());
+        let changed = match result {
+            Ok(Some(listing)) => repo.apply_listing(listing, tree),
+            Ok(None) => {
+                let changed = !matches!(repo.listing, Listing::NotRepo);
+                repo.listing = Listing::NotRepo;
+                repo.rebuild(tree);
+                repo.marks.clear();
+                changed
+            }
+            Err(error) if matches!(repo.listing, Listing::Ready(_)) => {
+                let changed = repo.refresh_error.as_ref() != Some(&error);
+                repo.refresh_error = Some(error);
+                changed
+            }
+            Err(error) => {
+                repo.listing = Listing::Failed(error);
+                true
+            }
+        };
+        if let Some((path, scope, line)) = repo.pending_open.take() {
+            self.open_diff(pane_id, path, scope, line, window, cx);
         }
-        changes.reveal(&file, tree);
-        self.load_selected(pane_id, window, cx);
-        cx.notify();
+        if changed || marked {
+            cx.notify();
+        }
     }
 
-    /// `]` and `[`: the next or previous change in list order, across sections.
-    fn step_change(
-        &mut self,
-        pane_id: &PaneId,
-        forward: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(changes) = self.changes_mut(pane_id) else {
-            return;
-        };
-        let refs = changes.refs();
-        let Some(last) = refs.len().checked_sub(1) else {
-            return;
-        };
-        let at = changes
-            .selected
-            .as_ref()
-            .and_then(|selected| refs.iter().position(|file| file == selected));
-        let next = match at {
-            Some(at) if forward => (at + 1).min(last),
-            Some(at) => at.saturating_sub(1),
-            None => 0,
-        };
-        self.select_change(pane_id, refs[next].clone(), window, cx);
-    }
-
-    /// Saves one rested user selection with its pane per call; a workspace change under
-    /// way waits for the next tick.
-    fn save_changes_selection(&mut self) {
-        let Some(workspace) = &self.workspace else {
-            return;
-        };
-        let mut save = None;
-        for (pane_id, ui) in &mut self.content.panes {
-            let Some(changes) = ui.changes.as_deref_mut() else {
-                continue;
-            };
-            if changes
-                .picked_at
-                .is_none_or(|at| at.elapsed() < SELECTION_SAVE_DELAY)
-            {
-                continue;
-            }
-            let Some(mut content) = find_content(workspace, pane_id).cloned() else {
-                changes.picked_at = None;
-                continue;
-            };
-            let ContentView::Changes { selected } = &mut content.view else {
-                changes.picked_at = None;
-                continue;
-            };
-            if *selected == changes.selected {
-                changes.picked_at = None;
-            } else if save.is_none() && !self.mutation_pending {
-                selected.clone_from(&changes.selected);
-                changes.picked_at = None;
-                save = Some((pane_id.clone(), content));
+    /// Try again after a failed read of the folder or of the active diff.
+    fn retry_repo(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ui) = self.content.panes.get_mut(pane_id) {
+            for state in ui.diffs.values_mut() {
+                state.failed = None;
             }
         }
-        if let Some((pane_id, content)) = save {
-            self.update_content(&pane_id, content);
-        }
+        self.request_repo_listing(pane_id, window, cx);
     }
 
     fn set_changes_settings(&mut self, settings: ChangesSettings, cx: &mut Context<Self>) {
         let previous = std::mem::replace(&mut self.content.changes, settings);
         for ui in self.content.panes.values_mut() {
-            let Some(changes) = ui.changes.as_deref_mut() else {
-                continue;
-            };
             if previous.tree != settings.tree {
-                changes.rebuild(settings.tree);
-                changes.scroll_to_selected();
+                ui.repo.rebuild(settings.tree);
             }
             if previous.diff != settings.diff {
-                for view in changes.views() {
+                for view in ui.diffs.values().flat_map(DiffTab::views) {
                     view.update(cx, |view, cx| view.set_settings(settings.diff, cx));
                 }
             }
@@ -1200,130 +1401,371 @@ impl CompiApp {
         cx.notify();
     }
 
+    fn set_sidebar_mode(&mut self, pane_id: &PaneId, mode: SidebarMode) {
+        if let Some(ui) = self.content.panes.get_mut(pane_id) {
+            ui.mode = mode;
+        }
+    }
+
     fn toggle_changes_section(&mut self, pane_id: &PaneId, scope: GitScope) {
         let tree = self.content.changes.tree;
-        if let Some(changes) = self.changes_mut(pane_id) {
-            if !changes.folds.sections.remove(&scope) {
-                changes.folds.sections.insert(scope);
+        if let Some(ui) = self.content.panes.get_mut(pane_id) {
+            let folds = &mut ui.repo.folds;
+            if !folds.sections.remove(&scope) {
+                folds.sections.insert(scope);
             }
-            changes.rebuild(tree);
+            ui.repo.rebuild(tree);
         }
     }
 
     fn toggle_changes_folder(&mut self, pane_id: &PaneId, scope: GitScope, path: String) {
         let tree = self.content.changes.tree;
-        if let Some(changes) = self.changes_mut(pane_id) {
+        if let Some(ui) = self.content.panes.get_mut(pane_id) {
             let key = (scope, path);
-            if !changes.folds.folders.remove(&key) {
-                changes.folds.folders.insert(key);
+            let folds = &mut ui.repo.folds;
+            if !folds.folders.remove(&key) {
+                folds.folders.insert(key);
             }
-            changes.rebuild(tree);
+            ui.repo.rebuild(tree);
         }
     }
 
-    fn retry_changes(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(changes) = self.changes_mut(pane_id) {
-            changes.failed = None;
+    /// `[` and `]` on a diff tab: the previous or next change in list order, across
+    /// sections, in the same tab (or the tab already showing it).
+    fn step_diff(&mut self, pane_id: &PaneId, forward: bool) {
+        let Some(mut content) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(current) = content.active.clone() else {
+            return;
+        };
+        let ContentTab::Diff { repo, path, scope } = &current else {
+            return;
+        };
+        let tree = self.content.changes.tree;
+        let Some(status) = self.content.panes.get_mut(pane_id).map(|ui| &mut ui.repo) else {
+            return;
+        };
+        let changes = status.changes();
+        let order: Vec<(&str, GitScope)> = status
+            .order
+            .iter()
+            .map(|&index| (changes[index].path.as_str(), changes[index].scope))
+            .collect();
+        let Some(last) = order.len().checked_sub(1) else {
+            return;
+        };
+        let next = match order
+            .iter()
+            .position(|&(listed, at)| listed == path && at == *scope)
+        {
+            Some(at) if forward => (at + 1).min(last),
+            Some(at) => at.saturating_sub(1),
+            None => 0,
+        };
+        let next = ContentTab::Diff {
+            repo: repo.clone(),
+            path: order[next].0.to_owned(),
+            scope: order[next].1,
+        };
+        if next == current {
+            return;
         }
-        self.request_changes_listing(pane_id, window, cx);
-        self.load_selected(pane_id, window, cx);
+        if let ContentTab::Diff { path, scope, .. } = &next {
+            status.reveal(path, *scope, tree);
+        }
+        if !content.tabs.contains(&next)
+            && let Some(slot) = content.tabs.iter_mut().find(|tab| **tab == current)
+        {
+            *slot = next.clone();
+        }
+        content.active = Some(next);
+        self.update_content(pane_id, content);
     }
 
-    /// Keys while the Changes pane itself has the keyboard: `[`/`]` step through the
-    /// changes, Ctrl/Cmd+F finds in the diff, and the diff takes the rest it knows.
-    pub(super) fn changes_key_down(
+    /// Keys while a diff tab is active and the pane itself has the keyboard: `[`/`]` step
+    /// through the changes, Ctrl/Cmd+F finds in the diff, and the diff takes the rest it
+    /// knows.
+    pub(super) fn diff_tab_key_down(
         &mut self,
         pane_id: &PaneId,
+        tab: &ContentTab,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let key = &event.keystroke;
         let modifiers = &key.modifiers;
-        let primary = if cfg!(target_os = "macos") {
-            modifiers.platform && !modifiers.control
-        } else {
-            modifiers.control && !modifiers.platform
-        };
+        if !modifiers.control && !modifiers.platform && !modifiers.alt {
+            let typed = key.key_char.as_deref().unwrap_or(key.key.as_str());
+            if matches!(typed, "[" | "]") {
+                self.step_diff(pane_id, typed == "]");
+                return true;
+            }
+        }
         let view = self
             .content
             .panes
             .get(pane_id)
-            .and_then(|ui| ui.changes.as_deref())
-            .and_then(|changes| changes.shown.as_ref())
-            .map(|shown| shown.view.clone());
-        if primary && !modifiers.alt && !modifiers.shift && key.key == "f" {
-            if let Some(view) = view {
-                view.update(cx, |view, cx| view.focus_find(window, cx));
-            }
-            return true;
-        }
-        if !modifiers.control && !modifiers.platform && !modifiers.alt {
-            let typed = key.key_char.as_deref().unwrap_or(key.key.as_str());
-            if matches!(typed, "[" | "]") {
-                self.step_change(pane_id, typed == "]", window, cx);
-                return true;
-            }
-        }
+            .and_then(|ui| ui.diffs.get(tab))
+            .and_then(DiffTab::view)
+            .cloned();
         view.is_some_and(|view| view.update(cx, |view, cx| view.key_down(event, window, cx)))
     }
 
-    /// A Changes pane: the bar, then the list beside the selected change's diff, or a
-    /// message while there is nothing to list.
-    pub(super) fn render_changes(
+    /// The sidebar's Files | Changes switch, shown once the folder is known to be in a
+    /// work tree (or while Changes shows why it is not).
+    pub(super) fn render_sidebar_switch(
         &self,
         pane_id: &PaneId,
-        content: &PaneContent,
-        changes: &ChangesUi,
+        ui: &PaneUi,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let repository = matches!(ui.repo.listing, Listing::Ready(_));
+        if !repository && ui.mode == SidebarMode::Files {
+            return None;
+        }
+        let colors = *self.colors();
+        let count = ui.repo.listing().map(|listing| listing.changes.len());
+        let segment = |mode: SidebarMode, label: &'static str, index: usize| {
+            let active = ui.mode == mode;
+            let pane = pane_id.clone();
+            div()
+                .id(("content-sidebar-mode", index))
+                .flex_none()
+                .h(px(20.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(color(if active {
+                    colors.foreground
+                } else {
+                    colors.muted
+                }))
+                .when(active, |segment| segment.bg(color(colors.selection)))
+                .when(!active, |segment| {
+                    segment.hover(move |style| style.bg(color(colors.surface_hover)))
+                })
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.set_sidebar_mode(&pane, mode);
+                        this.release_editor(&pane, window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+        };
+        let switch = div()
+            .flex_none()
+            .p(px(1.0))
+            .flex()
+            .gap(px(1.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(color(colors.border))
+            .child(segment(SidebarMode::Files, "Files", 0))
+            .child(segment(SidebarMode::Changes, "Changes", 1).when_some(
+                count.filter(|count| *count > 0),
+                |segment, count| {
+                    segment.child(
+                        div()
+                            .text_color(color(colors.muted))
+                            .child(count.to_string()),
+                    )
+                },
+            ));
+        Some(
+            div()
+                .flex_none()
+                .px_2()
+                .pt_1()
+                .pb_1()
+                .flex()
+                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .child(switch)
+                .into_any_element(),
+        )
+    }
+
+    /// The Changes list of a pane's sidebar or folder view: branch and totals above the
+    /// sections, or what keeps them from showing.
+    pub(super) fn render_changes_list(
+        &self,
+        pane_id: &PaneId,
+        ui: &PaneUi,
         width: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let body = match &changes.listing {
-            Listing::Reading => self.changes_message("Reading changes…", None, None, cx),
-            Listing::NotRepo => self.changes_message(
-                "Not a Git repository",
-                Some((content.root.clone(), colors.muted)),
-                Some(pane_id),
-                cx,
-            ),
-            Listing::Failed(error) => self.changes_message(
-                "Cannot read the changes",
-                Some((error.clone(), colors.error)),
-                Some(pane_id),
-                cx,
-            ),
-            Listing::Ready(listing) if listing.changes.is_empty() => self.changes_message(
+        let repo = &ui.repo;
+        let listing = match &repo.listing {
+            Listing::Reading => return self.changes_message("Reading changes…", None, None, cx),
+            Listing::NotRepo => {
+                return self.changes_message(
+                    "Not a Git repository",
+                    Some((repo.root.clone(), colors.muted)),
+                    None,
+                    cx,
+                );
+            }
+            Listing::Failed(error) => {
+                return self.changes_message(
+                    "Cannot read the changes",
+                    Some((error.clone(), colors.error)),
+                    Some(pane_id),
+                    cx,
+                );
+            }
+            Listing::Ready(listing) => listing,
+        };
+        repo.list_width.set(width);
+        let tree = self.content.changes.tree;
+        let (files, added, removed) = repo.totals;
+        let tree_button = div()
+            .id("changes-tree")
+            .flex_none()
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .when(tree, |button| button.bg(color(colors.selection)))
+            .hover(move |style| style.bg(color(colors.surface_hover)))
+            .child(list_icon(
+                tree,
+                color(if tree { colors.accent } else { colors.muted }),
+            ))
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: if tree { "Show as list" } else { "Show as tree" }.into(),
+                    reason: None,
+                    colors,
+                })
+                .into()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    let mut settings = this.content.changes;
+                    settings.tree = !settings.tree;
+                    this.set_changes_settings(settings, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        let header = div()
+            .flex_none()
+            .pl_3()
+            .pr_1()
+            .py(px(2.0))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x_2()
+            .text_size(px(UI_MICRO_TEXT_SIZE))
+            .text_color(color(colors.muted))
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(branch_label(listing)),
+            )
+            .when(!listing.changes.is_empty(), |header| {
+                header
+                    .child(div().flex_none().child(if files == 1 {
+                        "1 file".to_owned()
+                    } else {
+                        format!("{files} files")
+                    }))
+                    .children(line_counts(added, removed, &colors).map(|counts| {
+                        div()
+                            .flex_none()
+                            .font_family(self.typography.font.family.clone())
+                            .child(counts)
+                    }))
+            })
+            .when(repo.marked, |header| {
+                header.child(div().flex_none().child("Refreshing…"))
+            })
+            .when_some(repo.refresh_error.clone(), |header, error| {
+                header.child(
+                    div()
+                        .id("changes-refresh-error")
+                        .flex_none()
+                        .text_color(color(colors.error))
+                        .child("Refresh failed")
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| HeaderTooltip {
+                                title: "The repository could not be read again".into(),
+                                reason: Some(error.clone()),
+                                colors,
+                            })
+                            .into()
+                        }),
+                )
+            })
+            .child(div().flex_1())
+            .child(tree_button);
+        let body = if listing.changes.is_empty() {
+            self.changes_message(
                 "No changes",
-                Some((
-                    format!(
-                        "{} · the working tree and index match HEAD",
-                        branch_label(listing)
-                    ),
-                    colors.muted,
-                )),
+                Some(("The working tree and index match HEAD".into(), colors.muted)),
                 None,
                 cx,
-            ),
-            Listing::Ready(listing) => {
-                let list_width = SIDEBAR_WIDTH.min(width / 2.0);
-                changes.list_width.set(list_width);
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(self.render_changes_list(pane_id, changes, listing, list_width, cx))
-                    .child(self.render_change_detail(pane_id, changes, cx))
-                    .into_any_element()
-            }
+            )
+        } else {
+            let pane = pane_id.clone();
+            uniform_list(
+                "changes-list",
+                repo.rows.len(),
+                cx.processor(move |this, range: Range<usize>, _, cx| {
+                    this.render_change_rows(&pane, range, cx)
+                }),
+            )
+            .track_scroll(&repo.scroll)
+            .flex_1()
+            .min_h_0()
+            .py_1()
+            .into_any_element()
         };
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .child(self.render_changes_bar(content, changes, cx))
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .child(header)
             .child(body)
+            .when(listing.truncated, |list| {
+                list.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(color(colors.border))
+                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_color(color(colors.muted))
+                        .child(format!(
+                            "Showing the first {} changes",
+                            compi_protocol::MAX_GIT_CHANGES
+                        )),
+                )
+            })
             .into_any_element()
     }
 
@@ -1369,362 +1811,14 @@ impl CompiApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
-                                this.retry_changes(&pane_id, window, cx);
+                                this.retry_repo(&pane_id, window, cx);
+                                cx.stop_propagation();
                                 cx.notify();
                             }),
                         ),
                 )
             })
             .into_any_element()
-    }
-
-    /// Repository, branch and totals on the left; how diffs show on the right.
-    fn render_changes_bar(
-        &self,
-        content: &PaneContent,
-        changes: &ChangesUi,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let colors = *self.colors();
-        let settings = self.content.changes;
-        let listing = match &changes.listing {
-            Listing::Ready(listing) => Some(listing),
-            _ => None,
-        };
-        let (files, added, removed) = changes.totals;
-        let shown = changes.shown.as_ref().map(|shown| shown.view.clone());
-        let expanded = shown
-            .as_ref()
-            .is_some_and(|view| view.read(cx).context_expanded());
-        let layouts = [
-            (
-                LayoutMode::Auto,
-                "Auto",
-                "Split when the pane is wide enough",
-            ),
-            (
-                LayoutMode::Unified,
-                "Unified",
-                "Old and new lines in one column",
-            ),
-            (LayoutMode::Split, "Split", "Old and new side by side"),
-        ];
-        let layout = div()
-            .flex_none()
-            .flex()
-            .p(px(1.0))
-            .gap(px(1.0))
-            .rounded_sm()
-            .border_1()
-            .border_color(color(colors.border))
-            .children(
-                layouts
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (mode, label, reason))| {
-                        let active = settings.diff.layout == mode;
-                        div()
-                            .id(("changes-layout", index))
-                            .h(px(20.0))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(color(if active {
-                                colors.foreground
-                            } else {
-                                colors.muted
-                            }))
-                            .when(active, |segment| segment.bg(color(colors.selection)))
-                            .when(!active, |segment| {
-                                segment.hover(move |style| style.bg(color(colors.surface_hover)))
-                            })
-                            .child(label)
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| HeaderTooltip {
-                                    title: format!("{label} layout"),
-                                    reason: Some(reason.into()),
-                                    colors,
-                                })
-                                .into()
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    let mut settings = this.content.changes;
-                                    settings.diff.layout = mode;
-                                    this.set_changes_settings(settings, cx);
-                                }),
-                            )
-                    }),
-            );
-        let whitespace = settings.diff.whitespace;
-        let (whitespace_label, next_whitespace) = match whitespace {
-            Whitespace::Exact => ("Exact whitespace", Whitespace::IgnoreSpace),
-            Whitespace::IgnoreSpace => ("Ignore space", Whitespace::IgnoreFormatting),
-            Whitespace::IgnoreFormatting => ("Ignore formatting", Whitespace::Exact),
-        };
-        let whitespace_button = div()
-            .id("changes-whitespace")
-            .flex_none()
-            .h(px(22.0))
-            .px_2()
-            .flex()
-            .items_center()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(colors.border))
-            .cursor_pointer()
-            .text_color(color(if whitespace == Whitespace::Exact {
-                colors.muted
-            } else {
-                colors.accent
-            }))
-            .hover(move |style| style.bg(color(colors.surface_hover)))
-            .child(whitespace_label)
-            .tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: "Whitespace".into(),
-                    reason: Some(
-                        "Click to switch: exact, ignore changes in spacing, ignore formatting-only changes"
-                            .into(),
-                    ),
-                    colors,
-                })
-                .into()
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    let mut settings = this.content.changes;
-                    settings.diff.whitespace = next_whitespace;
-                    this.set_changes_settings(settings, cx);
-                }),
-            );
-        let icon_button = |id: &'static str, active: bool, enabled: bool| {
-            div()
-                .id(id)
-                .flex_none()
-                .w(px(24.0))
-                .h(px(22.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_sm()
-                .when(active, |button| button.bg(color(colors.selection)))
-                .when(enabled, |button| {
-                    button
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(color(colors.surface_hover)))
-                })
-                .when(!enabled, |button| button.opacity(0.4))
-        };
-        let tree = settings.tree;
-        let tree_button = icon_button("changes-tree", tree, true)
-            .child(list_icon(
-                tree,
-                color(if tree { colors.accent } else { colors.muted }),
-            ))
-            .tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: if tree { "Show as list" } else { "Show as tree" }.into(),
-                    reason: None,
-                    colors,
-                })
-                .into()
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    let mut settings = this.content.changes;
-                    settings.tree = !settings.tree;
-                    this.set_changes_settings(settings, cx);
-                }),
-            );
-        let context_button = icon_button("changes-context", expanded, shown.is_some())
-            .child(context_icon(
-                expanded,
-                color(if expanded {
-                    colors.accent
-                } else {
-                    colors.muted
-                }),
-            ))
-            .tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: if expanded {
-                        "Fold unchanged lines"
-                    } else {
-                        "Show all unchanged lines"
-                    }
-                    .into(),
-                    reason: Some("E".into()),
-                    colors,
-                })
-                .into()
-            })
-            .when_some(shown, |button, view| {
-                button.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    view.update(cx, |view, cx| view.set_context_expanded(!expanded, cx));
-                })
-            });
-        div()
-            .flex_none()
-            .min_h(px(FILE_TAB_HEIGHT))
-            .py(px(3.0))
-            .pl_3()
-            .pr_1()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_x_2()
-            .gap_y_1()
-            .border_b_1()
-            .border_color(color(colors.border))
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .whitespace_nowrap()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(200.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(format!("Changes · {}", content.folder_name())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(color(colors.surface_hover))
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(colors.muted))
-                            .child(self.environment_label(&content.environment)),
-                    )
-                    .when_some(listing, |bar, listing| {
-                        bar.child(
-                            div()
-                                .flex_none()
-                                .text_color(color(colors.muted))
-                                .child(branch_label(listing)),
-                        )
-                        .when(!listing.changes.is_empty(), |bar| {
-                            bar.child(div().flex_none().text_color(color(colors.muted)).child(
-                                if files == 1 {
-                                    "1 file".to_owned()
-                                } else {
-                                    format!("{files} files")
-                                },
-                            ))
-                            .children(
-                                line_counts(added, removed, &colors).map(|counts| {
-                                    div()
-                                        .flex_none()
-                                        .font_family(self.typography.font.family.clone())
-                                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                                        .child(counts)
-                                }),
-                            )
-                        })
-                    })
-                    .when(changes.marked, |bar| {
-                        bar.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .text_color(color(colors.muted))
-                                .child("Refreshing…"),
-                        )
-                    })
-                    .when_some(changes.refresh_error.clone(), |bar, error| {
-                        bar.child(
-                            div()
-                                .id("changes-refresh-error")
-                                .flex_none()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .text_color(color(colors.error))
-                                .child("Refresh failed")
-                                .tooltip(move |_, cx| {
-                                    cx.new(|_| HeaderTooltip {
-                                        title: "The repository could not be read again".into(),
-                                        reason: Some(error.clone()),
-                                        colors,
-                                    })
-                                    .into()
-                                }),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                    .child(layout)
-                    .child(whitespace_button)
-                    .child(tree_button)
-                    .child(context_button),
-            )
-    }
-
-    fn render_changes_list(
-        &self,
-        pane_id: &PaneId,
-        changes: &ChangesUi,
-        listing: &GitChanges,
-        width: f32,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let colors = *self.colors();
-        let pane = pane_id.clone();
-        div()
-            .w(px(width))
-            .flex_none()
-            .h_full()
-            .flex()
-            .flex_col()
-            .border_r_1()
-            .border_color(color(colors.border))
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .child(
-                uniform_list(
-                    "changes-list",
-                    changes.rows.len(),
-                    cx.processor(move |this, range: Range<usize>, _, cx| {
-                        this.render_change_rows(&pane, range, cx)
-                    }),
-                )
-                .track_scroll(&changes.scroll)
-                .flex_1()
-                .min_h_0()
-                .py_1(),
-            )
-            .when(listing.truncated, |list| {
-                list.child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(color(colors.border))
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                        .text_color(color(colors.muted))
-                        .child(format!(
-                            "Showing the first {} changes",
-                            compi_protocol::MAX_GIT_CHANGES
-                        )),
-                )
-            })
     }
 
     /// The list rows in `range`, drawn as the list scrolls to them.
@@ -1734,24 +1828,31 @@ impl CompiApp {
         range: Range<usize>,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
-        let Some(changes) = self
-            .content
-            .panes
-            .get(pane_id)
-            .and_then(|ui| ui.changes.as_deref())
-        else {
+        let Some(repo) = self.content.panes.get(pane_id).map(|ui| &ui.repo) else {
             return Vec::new();
         };
-        let Listing::Ready(listing) = &changes.listing else {
+        let Listing::Ready(listing) = &repo.listing else {
             return Vec::new();
         };
-        let Some(rows) = changes.rows.get(range.clone()) else {
+        let Some(rows) = repo.rows.get(range.clone()) else {
             return Vec::new();
         };
+        let active = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id))
+            .and_then(|content| match &content.active {
+                Some(ContentTab::Diff { repo, path, scope })
+                    if same_folder(repo, &listing.repo) =>
+                {
+                    Some((path.as_str(), *scope))
+                }
+                _ => None,
+            });
         let colors = *self.colors();
         let tree = self.content.changes.tree;
         let row_height = self.typography.cell_height.max(18.0);
-        let list_width = changes.list_width.get();
+        let list_width = repo.list_width.get();
         let mono = self.typography.font.family.clone();
         rows.iter()
             .zip(range)
@@ -1859,10 +1960,7 @@ impl CompiApp {
                     }
                     ListRow::File { change, depth } => {
                         let change = &listing.changes[*change];
-                        let selected = changes
-                            .selected
-                            .as_ref()
-                            .is_some_and(|selected| is(change, selected));
+                        let selected = active == Some((change.path.as_str(), change.scope));
                         let (folder, name) = split_path(&change.path);
                         let level = if tree { *depth } else { 0 };
                         let inset = TREE_INSET + level as f32 * TREE_INDENT;
@@ -1886,7 +1984,7 @@ impl CompiApp {
                         let folder = (!tree && !folder.is_empty())
                             .then(|| truncate_middle(folder, (room / MICRO_GLYPH_WIDTH) as usize))
                             .filter(|folder| folder.chars().count() >= 4);
-                        let file = file_ref(change);
+                        let (path, scope) = (change.path.clone(), change.scope);
                         let deleted = change.kind == GitChangeKind::Deleted;
                         let kind = change.kind;
                         base.pl(px(inset))
@@ -1957,8 +2055,17 @@ impl CompiApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
-                                    this.release_editor(&pane, window, cx);
-                                    this.select_change(&pane, file.clone(), window, cx);
+                                    if let Some(ui) = this.content.panes.get_mut(&pane) {
+                                        ui.sidebar = true;
+                                    }
+                                    this.open_diff(
+                                        &pane,
+                                        path.clone(),
+                                        Some(scope),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
                                     cx.stop_propagation();
                                     cx.notify();
                                 }),
@@ -1970,56 +2077,115 @@ impl CompiApp {
             .collect()
     }
 
-    /// The selected change's header and diff.
-    fn render_change_detail(
+    /// A diff tab's caption: the file name, a scope hint for staged changes, and what is
+    /// compared for the tooltip.
+    pub(super) fn diff_tab_caption(
+        ui: &PaneUi,
+        tab: &ContentTab,
+    ) -> Option<(String, Option<&'static str>, String)> {
+        let ContentTab::Diff { repo, path, scope } = tab else {
+            return None;
+        };
+        let compared = ui
+            .repo
+            .change(repo, path, *scope)
+            .map_or_else(|| scope_baseline(*scope).to_owned(), baseline);
+        Some((
+            split_path(path).1.to_owned(),
+            (*scope == GitScope::Staged).then_some("staged"),
+            format!("{path} · {}", lowercase_first(&compared)),
+        ))
+    }
+
+    /// A diff tab's body: the change's header with the diff controls, then its diff or
+    /// what keeps it from showing.
+    pub(super) fn render_diff_tab(
         &self,
         pane_id: &PaneId,
-        changes: &ChangesUi,
+        ui: &PaneUi,
+        tab: &ContentTab,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
+        let ContentTab::Diff { repo, path, scope } = tab else {
+            return div().into_any_element();
+        };
         let colors = *self.colors();
-        let change = changes.selected_change();
+        let change = ui.repo.change(repo, path, *scope);
+        let state = ui.diffs.get(tab);
         let body = div().flex_1().min_h_0().relative().flex().flex_col();
-        let body = match (change, &changes.failed, &changes.shown) {
-            (None, ..) => body
+        let muted_line = |text: String| {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
                 .items_center()
                 .justify_center()
                 .text_size(px(UI_SMALL_TEXT_SIZE))
                 .text_color(color(colors.muted))
-                .child("Select a change")
-                .into_any_element(),
-            (Some(change), Some((file, error)), _) if is(change, file) => {
-                let retry = pane_id.clone();
-                body.p_3()
-                    .gap_1()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .child(format!("Cannot read {}", split_path(&change.path).1))
-                    .child(div().text_color(color(colors.error)).child(error.clone()))
-                    .child(
-                        div()
-                            .id("change-retry")
-                            .mt_1()
-                            .cursor_pointer()
-                            .text_color(color(colors.accent))
-                            .child("Try again")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.retry_changes(&retry, window, cx);
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .into_any_element()
+                .child(text)
+                .into_any_element()
+        };
+        let body = match (&ui.repo.listing, change) {
+            (Listing::Reading, _) => muted_line("Reading changes…".into()),
+            (Listing::NotRepo, _) => muted_line(format!("Not a Git repository: {}", ui.repo.root)),
+            (Listing::Failed(_), _) => {
+                self.changes_message("Cannot read the changes", None, Some(pane_id), cx)
             }
-            (Some(change), ..) if changes.loading() => body
-                .p_3()
-                .text_size(px(UI_SMALL_TEXT_SIZE))
-                .text_color(color(colors.muted))
-                .child(format!("Loading {}…", split_path(&change.path).1))
-                .into_any_element(),
-            (Some(_), _, Some(shown)) => body.child(shown.view.clone()).into_any_element(),
-            (Some(_), _, None) => body.into_any_element(),
+            (Listing::Ready(listing), _) if !same_folder(&listing.repo, repo) => {
+                muted_line(format!("Not in this folder's repository: {repo}"))
+            }
+            (Listing::Ready(_), None) => self.changes_message(
+                "No changes",
+                Some((
+                    format!(
+                        "{} · {}",
+                        split_path(path).1,
+                        scope_baseline(*scope).to_lowercase()
+                    ),
+                    colors.muted,
+                )),
+                None,
+                cx,
+            ),
+            (Listing::Ready(_), Some(_)) => match state {
+                Some(DiffTab {
+                    failed: Some((_, error)),
+                    ..
+                }) => {
+                    let retry = pane_id.clone();
+                    body.p_3()
+                        .gap_1()
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .child(format!("Cannot read {}", split_path(path).1))
+                        .child(div().text_color(color(colors.error)).child(error.clone()))
+                        .child(
+                            div()
+                                .id("diff-retry")
+                                .mt_1()
+                                .cursor_pointer()
+                                .text_color(color(colors.accent))
+                                .child("Try again")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.retry_repo(&retry, window, cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                Some(state) if state.loading() => body
+                    .p_3()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .text_color(color(colors.muted))
+                    .child(format!("Loading {}…", split_path(path).1))
+                    .into_any_element(),
+                Some(DiffTab {
+                    shown: Some(shown), ..
+                }) => body.child(shown.view.clone()).into_any_element(),
+                _ => body.into_any_element(),
+            },
         };
         div()
             .flex_1()
@@ -2027,100 +2193,331 @@ impl CompiApp {
             .h_full()
             .flex()
             .flex_col()
-            .when_some(change, |detail, change| {
-                detail.child(self.render_change_header(change, changes, cx))
-            })
+            .child(self.render_diff_header(pane_id, tab, path, *scope, change, state, cx))
             .child(body)
+            .into_any_element()
     }
 
-    /// Path, kind, line counts and what the diff compares.
-    fn render_change_header(
+    /// Path, kind, line counts and what the diff compares; how diffs show; Edit file.
+    #[allow(clippy::too_many_arguments)]
+    fn render_diff_header(
         &self,
-        change: &GitChange,
-        changes: &ChangesUi,
+        pane_id: &PaneId,
+        tab: &ContentTab,
+        path: &str,
+        scope: GitScope,
+        change: Option<&GitChange>,
+        state: Option<&DiffTab>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = *self.colors();
-        let (folder, name) = split_path(&change.path);
-        let counts = changes
-            .shown
+        let settings = self.content.changes;
+        let (folder, name) = split_path(path);
+        // A diff whose change left the listing is not on screen; neither are its counts.
+        let shown = state
+            .and_then(DiffTab::view)
+            .filter(|_| change.is_some())
+            .cloned();
+        let counts = shown
             .as_ref()
-            .filter(|shown| is(change, &shown.file))
-            .and_then(|shown| shown.view.read(cx).stats())
-            .or(change.added.zip(change.removed))
+            .and_then(|view| view.read(cx).stats())
+            .or(change.and_then(|change| change.added.zip(change.removed)))
             .map(|(added, removed)| (u64::from(added), u64::from(removed)));
-        let title = change.path.clone();
-        let reason = baseline(change);
-        div()
-            .id("change-header")
+        let compared = change.map_or_else(|| scope_baseline(scope).to_owned(), baseline);
+        let (title, reason) = (path.to_owned(), compared.clone());
+        let expanded = shown
+            .as_ref()
+            .is_some_and(|view| view.read(cx).context_expanded());
+        let layouts = [
+            (
+                LayoutMode::Auto,
+                "Auto",
+                "Split when the pane is wide enough",
+            ),
+            (
+                LayoutMode::Unified,
+                "Unified",
+                "Old and new lines in one column",
+            ),
+            (LayoutMode::Split, "Split", "Old and new side by side"),
+        ];
+        let layout = div()
             .flex_none()
-            .h(px(FILE_TAB_HEIGHT))
-            .px_3()
             .flex()
+            .p(px(1.0))
+            .gap(px(1.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(color(colors.border))
+            .children(
+                layouts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (mode, label, reason))| {
+                        let active = settings.diff.layout == mode;
+                        div()
+                            .id(("diff-layout", index))
+                            .h(px(18.0))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(color(if active {
+                                colors.foreground
+                            } else {
+                                colors.muted
+                            }))
+                            .when(active, |segment| segment.bg(color(colors.selection)))
+                            .when(!active, |segment| {
+                                segment.hover(move |style| style.bg(color(colors.surface_hover)))
+                            })
+                            .child(label)
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| HeaderTooltip {
+                                    title: format!("{label} layout"),
+                                    reason: Some(reason.into()),
+                                    colors,
+                                })
+                                .into()
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    let mut settings = this.content.changes;
+                                    settings.diff.layout = mode;
+                                    this.set_changes_settings(settings, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                    }),
+            );
+        let whitespace = settings.diff.whitespace;
+        let (whitespace_label, next_whitespace) = match whitespace {
+            Whitespace::Exact => ("Exact whitespace", Whitespace::IgnoreSpace),
+            Whitespace::IgnoreSpace => ("Ignore space", Whitespace::IgnoreFormatting),
+            Whitespace::IgnoreFormatting => ("Ignore formatting", Whitespace::Exact),
+        };
+        let button = |id: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .h(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+        };
+        let whitespace_button = button("diff-whitespace")
+            .px_2()
+            .border_1()
+            .border_color(color(colors.border))
+            .cursor_pointer()
+            .text_color(color(if whitespace == Whitespace::Exact {
+                colors.muted
+            } else {
+                colors.accent
+            }))
+            .hover(move |style| style.bg(color(colors.surface_hover)))
+            .child(whitespace_label)
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: "Whitespace".into(),
+                    reason: Some(
+                        "Click to switch: exact, ignore changes in spacing, ignore formatting-only changes"
+                            .into(),
+                    ),
+                    colors,
+                })
+                .into()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    let mut settings = this.content.changes;
+                    settings.diff.whitespace = next_whitespace;
+                    this.set_changes_settings(settings, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        let context_button = button("diff-context")
+            .w(px(24.0))
+            .when(expanded, |button| button.bg(color(colors.selection)))
+            .when(shown.is_some(), |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+            })
+            .when(shown.is_none(), |button| button.opacity(0.4))
+            .child(context_icon(
+                expanded,
+                color(if expanded {
+                    colors.accent
+                } else {
+                    colors.muted
+                }),
+            ))
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: if expanded {
+                        "Fold unchanged lines"
+                    } else {
+                        "Show all unchanged lines"
+                    }
+                    .into(),
+                    reason: Some("E".into()),
+                    colors,
+                })
+                .into()
+            })
+            .when_some(shown, |button, view| {
+                button.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    view.update(cx, |view, cx| view.set_context_expanded(!expanded, cx));
+                    cx.stop_propagation();
+                })
+            });
+        // A change without a work-tree file (deleted) has nothing to edit.
+        let editable = change.is_some_and(|change| sides(change)[1].is_some());
+        let (edit_pane, edit_tab) = (pane_id.clone(), tab.clone());
+        let edit_button = button("diff-edit-file")
+            .px_2()
+            .border_1()
+            .border_color(color(colors.border))
+            .text_color(color(colors.foreground))
+            .child("Edit file")
+            .when(editable, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.edit_from_diff(&edit_pane, &edit_tab, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            })
+            .when(!editable, |button| button.opacity(0.4))
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: "Edit file".into(),
+                    reason: Some(
+                        if editable {
+                            "Opens the working-tree file at the line in view"
+                        } else {
+                            "The file is not in the working tree"
+                        }
+                        .into(),
+                    ),
+                    colors,
+                })
+                .into()
+            });
+        div()
+            .flex_none()
+            .min_h(px(FILE_TAB_HEIGHT))
+            .py(px(3.0))
+            .pl_3()
+            .pr_1()
+            .flex()
+            .flex_wrap()
             .items_center()
-            .gap_2()
+            .gap_x_2()
+            .gap_y_1()
             .border_b_1()
             .border_color(color(colors.border))
             .text_size(px(UI_SMALL_TEXT_SIZE))
             .whitespace_nowrap()
             .child(
                 div()
-                    // The name stays readable; the folder and the baseline give way.
-                    .flex_shrink_0()
-                    .max_w(gpui::relative(0.7))
-                    .min_w_0()
+                    .id("diff-header")
+                    .flex_1()
+                    .min_w(px(160.0))
                     .flex()
+                    .items_center()
+                    .gap_2()
                     .overflow_hidden()
-                    .when(!folder.is_empty(), |path| {
-                        path.child(
+                    .child(
+                        div()
+                            // The name stays readable; the folder and the baseline give way.
+                            .flex_shrink_0()
+                            .max_w(gpui::relative(0.7))
+                            .min_w_0()
+                            .flex()
+                            .overflow_hidden()
+                            .when(!folder.is_empty(), |path| {
+                                path.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_color(color(colors.muted))
+                                        .child(format!("{folder}/")),
+                                )
+                            })
+                            .child(div().flex_none().child(name.to_owned())),
+                    )
+                    .when_some(change, |header, change| {
+                        header.child(
                             div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_color(color(colors.muted))
-                                .child(format!("{folder}/")),
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(color(colors.surface_hover))
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .text_color(color(kind_color(change.kind, &colors)))
+                                .child(kind_label(change.kind)),
                         )
                     })
-                    .child(div().flex_none().child(name.to_owned())),
+                    .children(counts.and_then(|(added, removed)| {
+                        line_counts(added, removed, &colors).map(|counts| {
+                            div()
+                                .flex_none()
+                                .font_family(self.typography.font.family.clone())
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .child(counts)
+                        })
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .child(compared),
+                    )
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| HeaderTooltip {
+                            title: title.clone(),
+                            reason: Some(reason.clone()),
+                            colors,
+                        })
+                        .into()
+                    }),
             )
             .child(
                 div()
                     .flex_none()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(color(colors.surface_hover))
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_size(px(UI_MICRO_TEXT_SIZE))
-                    .text_color(color(kind_color(change.kind, &colors)))
-                    .child(kind_label(change.kind)),
+                    .child(layout)
+                    .child(whitespace_button)
+                    .child(context_button)
+                    .child(edit_button),
             )
-            .children(counts.and_then(|(added, removed)| {
-                line_counts(added, removed, &colors).map(|counts| {
-                    div()
-                        .flex_none()
-                        .font_family(self.typography.font.family.clone())
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                        .child(counts)
-                })
-            }))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                    .text_color(color(colors.muted))
-                    .child(baseline(change)),
-            )
-            .tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: title.clone(),
-                    reason: Some(reason.clone()),
-                    colors,
-                })
-                .into()
-            })
     }
+}
+
+/// `text` with its first letter in lower case, for captions joined mid-sentence.
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(chars).collect()
+    })
 }
 
 /// One guide per folder above a tree row, through the middle of its arrow.
@@ -2152,11 +2549,59 @@ mod tests {
         }
     }
 
-    fn file(scope: GitScope, path: &str) -> GitFileRef {
-        GitFileRef {
-            path: path.into(),
-            scope,
-        }
+    #[test]
+    fn tree_marks_key_tree_paths_below_the_pane_folder() {
+        use GitChangeKind::{Added, Deleted, Modified};
+        use GitScope::{Staged, Unstaged};
+        let listing = |repo: &str, changes: Vec<GitChange>| GitChanges {
+            repo: repo.into(),
+            branch: None,
+            head: None,
+            changes,
+            truncated: false,
+        };
+        let file = |kind, path: &str| {
+            Some(TreeMark::File {
+                kind,
+                path: path.into(),
+            })
+        };
+        let marks = tree_marks(
+            "/home/me/proj/src",
+            &listing(
+                "/home/me/proj",
+                vec![
+                    change(Unstaged, Modified, "src/gui/a.rs"),
+                    change(Unstaged, Deleted, "src/old/gone.rs"),
+                    change(Unstaged, Modified, "README.md"),
+                    change(Staged, Added, "src/gui/a.rs"),
+                    change(Staged, Added, "src/new.rs"),
+                ],
+            ),
+        );
+        let mark = |path: &str| marks.get(path).cloned();
+        assert_eq!(
+            mark("/home/me/proj/src/gui/a.rs"),
+            file(Modified, "src/gui/a.rs")
+        );
+        assert_eq!(mark("/home/me/proj/src/new.rs"), file(Added, "src/new.rs"));
+        assert_eq!(mark("/home/me/proj/src/gui"), Some(TreeMark::Folder));
+        assert_eq!(mark("/home/me/proj/src/old"), Some(TreeMark::Folder));
+        assert_eq!(mark("/home/me/proj/src/old/gone.rs"), None);
+        assert_eq!(marks.len(), 4);
+        // A Windows folder in other letter case than Git's top level.
+        let marks = tree_marks(
+            r"c:\users\me\proj\",
+            &listing(
+                r"C:\Users\Me\Proj",
+                vec![change(Unstaged, Modified, "src/a.rs")],
+            ),
+        );
+        assert_eq!(
+            marks.get(r"c:\users\me\proj\src\a.rs").cloned(),
+            file(Modified, "src/a.rs")
+        );
+        assert_eq!(marks.get(r"c:\users\me\proj\src"), Some(&TreeMark::Folder));
     }
 
     #[test]
@@ -2261,30 +2706,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn a_vanished_selection_moves_to_the_change_at_its_place() {
-        let a = file(GitScope::Unstaged, "a");
-        let b = file(GitScope::Unstaged, "b");
-        let c = file(GitScope::Staged, "c");
-        let previous = [a.clone(), b.clone(), c.clone()];
-        assert_eq!(reselect(&previous, &b, &previous), Some(b.clone()));
-        assert_eq!(
-            reselect(&previous, &b, &[a.clone(), c.clone()]),
-            Some(c.clone())
-        );
-        assert_eq!(reselect(&previous, &c, &[a.clone(), b.clone()]), Some(b));
-        assert_eq!(reselect(&previous, &a, &[]), None);
-        // A selection the list never had (a restored pane) goes to the first change.
-        assert_eq!(
-            reselect(
-                &[],
-                &file(GitScope::Staged, "gone"),
-                std::slice::from_ref(&c)
-            ),
-            Some(c)
-        );
     }
 
     #[test]

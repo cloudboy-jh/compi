@@ -22,7 +22,8 @@ use windows::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows::core::PCWSTR;
 
-const FORMAT_VERSION: u32 = 1;
+/// Format 2 (protocol 23) holds a content pane's open files and diffs as `tabs`.
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -124,7 +125,15 @@ impl WorkspaceStore {
         };
         if path.is_file() {
             let bytes = fs::read(&path)?;
-            return match serde_json::from_slice::<Manifest>(&bytes) {
+            let manifest =
+                serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|mut value| {
+                    if value.get("format_version") == Some(&serde_json::Value::from(1)) {
+                        migrate_content_tabs(&mut value);
+                        value["format_version"] = FORMAT_VERSION.into();
+                    }
+                    serde_json::from_value::<Manifest>(value)
+                });
+            return match manifest {
                 Ok(manifest) if manifest.format_version == FORMAT_VERSION => {
                     validate(&manifest.workspace)?;
                     let mut workspace = manifest.workspace;
@@ -313,6 +322,35 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
             backup.display()
         )),
         last_directories: BTreeMap::new(),
+    }
+}
+
+/// Format 1 (protocol 22 and earlier) gave a content pane `files`, an `active_file` and a
+/// `view`. Files become file tabs and the active file the active tab; a Changes view, whose
+/// root is its repository, becomes that folder with nothing open. Every layout copy (current,
+/// previous, merge records) holds content leaves, so the whole workspace is walked.
+fn migrate_content_tabs(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(migrate_content_tabs),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("content")
+                && let Some(Value::Object(content)) = object.get_mut("content")
+            {
+                let tab = |path: Value| serde_json::json!({ "type": "file", "path": path });
+                content.remove("view");
+                if let Some(Value::Array(files)) = content.remove("files") {
+                    let tabs = files.into_iter().map(tab).collect();
+                    content.insert("tabs".into(), Value::Array(tabs));
+                }
+                if let Some(active @ Value::String(_)) = content.remove("active_file") {
+                    content.insert("active".into(), tab(active));
+                }
+                return;
+            }
+            object.values_mut().for_each(migrate_content_tabs);
+        }
+        _ => {}
     }
 }
 
@@ -586,7 +624,7 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::{ContentEnvironment, PaneContent, SplitAxis};
+    use compi_protocol::{ContentEnvironment, ContentTab, PaneContent, SplitAxis};
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -798,9 +836,12 @@ mod tests {
                     distribution: "Ubuntu".into(),
                 },
                 root: "/home/user/project".into(),
-                files: vec!["/home/user/project/a.rs".into()],
-                active_file: Some("/home/user/project/a.rs".into()),
-                view: compi_protocol::ContentView::Files,
+                tabs: vec![ContentTab::File {
+                    path: "/home/user/project/a.rs".into(),
+                }],
+                active: Some(ContentTab::File {
+                    path: "/home/user/project/a.rs".into(),
+                }),
             },
         };
         let terminal = LayoutNode::Pane {
@@ -857,8 +898,8 @@ mod tests {
         **first = LayoutNode::Content {
             pane_id: pane_id.clone(),
             content: PaneContent {
-                files: Vec::new(),
-                active_file: None,
+                tabs: Vec::new(),
+                active: None,
                 ..shown.clone()
             },
         };
@@ -872,10 +913,82 @@ mod tests {
         **second = LayoutNode::Content {
             pane_id,
             content: PaneContent {
-                active_file: Some("/home/user/project/missing.rs".into()),
+                active: Some(ContentTab::File {
+                    path: "/home/user/project/missing.rs".into(),
+                }),
                 ..shown
             },
         };
         assert!(validate(&workspace).is_err());
+    }
+
+    #[test]
+    fn protocol_22_content_panes_load_as_tabs() {
+        let path = test_path("format-1");
+        let leaf = |pane: &str, content: serde_json::Value| serde_json::json!({ "type": "content", "pane_id": pane, "content": content });
+        let editor = leaf(
+            "pane-1",
+            serde_json::json!({
+                "environment": { "type": "host" },
+                "root": "/work",
+                "files": ["/work/a.rs", "/work/b.rs"],
+                "active_file": "/work/b.rs",
+            }),
+        );
+        let changes = leaf(
+            "pane-2",
+            serde_json::json!({
+                "environment": { "type": "wsl", "distribution": "Ubuntu" },
+                "root": "/home/user/repo",
+                "view": { "type": "changes", "selected": { "path": "src/a.rs", "scope": "staged" } },
+            }),
+        );
+        let split = |first: &serde_json::Value, second: &serde_json::Value| {
+            serde_json::json!({
+                "type": "split", "axis": "horizontal", "ratio": 0.5,
+                "first": first, "second": second,
+            })
+        };
+        let (_, mut empty) = WorkspaceStore::memory();
+        empty.initialized = true;
+        let mut manifest = serde_json::json!({ "format_version": 1, "workspace": empty });
+        manifest["workspace"]["sessions"] = serde_json::json!([{
+            "id": "session-1",
+            "label": "Default",
+            "tabs": [{
+                "id": "tab-1",
+                "label": "",
+                "layout": split(&editor, &changes),
+                "previous_layout": split(&changes, &editor),
+            }],
+        }]);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let file = |path: &str| ContentTab::File { path: path.into() };
+        let tab = &workspace.sessions[0].tabs[0];
+        let LayoutNode::Split { first, second, .. } = &tab.layout else {
+            panic!("the split survives");
+        };
+        let LayoutNode::Content { content, .. } = first.as_ref() else {
+            panic!("the editor stays a content pane");
+        };
+        assert_eq!(content.tabs, [file("/work/a.rs"), file("/work/b.rs")]);
+        assert_eq!(content.active, Some(file("/work/b.rs")));
+        let LayoutNode::Content { content, .. } = second.as_ref() else {
+            panic!("the Changes pane stays a content pane");
+        };
+        assert_eq!(content.root, "/home/user/repo");
+        assert!(content.tabs.is_empty() && content.active.is_none());
+        let Some(LayoutNode::Split { second, .. }) = tab.previous_layout.as_deref() else {
+            panic!("the previous arrangement survives");
+        };
+        assert!(
+            matches!(second.as_ref(), LayoutNode::Content { content, .. } if content.tabs.len() == 2)
+        );
+        // Saved again in the current format.
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["format_version"], FORMAT_VERSION);
+        let _ = fs::remove_file(path);
     }
 }

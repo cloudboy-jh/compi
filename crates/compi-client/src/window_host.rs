@@ -15,9 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Version 8 reports each content pane's `unsaved_files` in window listings, which
-// `pane close`, `tab close` and `workspace close` consult before closing.
-const VERSION: u32 = 8;
+// Version 9 adds `RevealDiff` and `ShowChanges`, which `compi diff` sends. Version 8
+// reports each content pane's `unsaved_files` in window listings, which `pane close`,
+// `tab close` and `workspace close` consult before closing.
+const VERSION: u32 = 9;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);

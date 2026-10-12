@@ -1,7 +1,7 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
-    ContentEnvironment, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES,
-    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId,
+    ContentEnvironment, ContentTab, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS,
+    MAX_TAB_PANES, MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId,
     PlannedLayoutNode, ProcessLifetimeId, ServerGeneration, SessionId, SplitAxis, SurfaceId,
     SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation, WorkspaceSession,
     WorkspaceSnapshot, WorkspaceTab,
@@ -1860,7 +1860,11 @@ fn validate_split_geometry(
 /// distribution, which only a Windows host can reach.
 fn validate_content(content: &PaneContent) -> Result<(), String> {
     content.validate()?;
-    let mut paths = std::iter::once(&content.root).chain(&content.files);
+    let mut paths =
+        std::iter::once(content.root.as_str()).chain(content.tabs.iter().map(|tab| match tab {
+            ContentTab::File { path } => path.as_str(),
+            ContentTab::Diff { repo, .. } => repo.as_str(),
+        }));
     match &content.environment {
         ContentEnvironment::Host => {
             if let Some(path) = paths.find(|path| !std::path::Path::new(path).is_absolute()) {
@@ -4204,13 +4208,14 @@ mod tests {
     /// A folder and files whose paths are absolute on every test host.
     fn host_content(files: &[&str]) -> PaneContent {
         let root = std::env::temp_dir().join("compi-content-project");
-        let path = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let file = |name: &str| ContentTab::File {
+            path: root.join(name).to_string_lossy().into_owned(),
+        };
         PaneContent {
             environment: ContentEnvironment::Host,
             root: root.to_string_lossy().into_owned(),
-            files: files.iter().map(|file| path(file)).collect(),
-            active_file: files.first().map(|file| path(file)),
-            view: compi_protocol::ContentView::Files,
+            tabs: files.iter().map(|name| file(name)).collect(),
+            active: files.first().map(|name| file(name)),
         }
     }
 
@@ -4386,7 +4391,9 @@ mod tests {
         assert!(message.contains("not absolute"), "{message}");
 
         let relative_file = PaneContent {
-            files: vec!["notes.txt".into()],
+            tabs: vec![ContentTab::File {
+                path: "notes.txt".into(),
+            }],
             ..host_content(&[])
         };
         let message = reject(open(
@@ -4396,23 +4403,22 @@ mod tests {
         assert!(message.contains("notes.txt"), "{message}");
 
         let unopened_active = PaneContent {
-            active_file: host_content(&["b.rs"]).active_file,
+            active: host_content(&["b.rs"]).active,
             ..host_content(&["a.rs"])
         };
         let message = reject(open(
             "content-unopened-active",
             open_content(&terminal, unopened_active),
         ));
-        assert!(message.contains("active file"), "{message}");
+        assert!(message.contains("active tab"), "{message}");
 
         let wsl = PaneContent {
             environment: ContentEnvironment::Wsl {
                 distribution: "Ubuntu".into(),
             },
             root: "/home/user/project".into(),
-            files: Vec::new(),
-            active_file: None,
-            view: compi_protocol::ContentView::Files,
+            tabs: Vec::new(),
+            active: None,
         };
         if cfg!(windows) {
             let relative = PaneContent {

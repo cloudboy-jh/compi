@@ -1,6 +1,7 @@
 //! Paths of content panes in their environment's syntax rather than this computer's:
 //! `/` paths for WSL and Unix hosts; drive or UNC roots with either slash for Windows
-//! hosts. `compi files`/`compi edit` and terminal file links resolve paths the same way.
+//! hosts. `compi files`/`compi edit`/`compi diff` and terminal file links resolve paths
+//! the same way.
 
 /// The root of an absolute `path` (`/`, `C:\` or `\\server\share\`) and the rest of it.
 fn root(path: &str, windows: bool) -> Option<(String, &str)> {
@@ -62,4 +63,68 @@ pub fn resolve(base: Option<&str>, path: &str, windows: bool) -> Result<String, 
         }
     }
     Ok(root + &parts.join(if windows { "\\" } else { "/" }))
+}
+
+/// `path`, absolute in a pane's environment, relative to the work tree `repo` with `/`
+/// separators; `None` outside it. Windows paths compare without case.
+pub fn repo_relative(repo: &str, path: &str) -> Option<String> {
+    let windows = repo.contains('\\');
+    let normal = |text: &str| {
+        let text = text.replace('\\', "/");
+        if windows {
+            text.to_ascii_lowercase()
+        } else {
+            text
+        }
+    };
+    let top = normal(repo);
+    let top = top.trim_end_matches('/');
+    let full = path.replace('\\', "/");
+    let rest = normal(&full).strip_prefix(top)?.strip_prefix('/')?.len();
+    let relative = &full[full.len() - rest..];
+    compi_protocol::is_repo_path(relative).then(|| relative.to_owned())
+}
+
+/// The work-tree file of repository path `path`, in `repo`'s path syntax.
+pub fn work_tree_path(repo: &str, path: &str) -> String {
+    if repo.contains('\\') {
+        format!(
+            "{}\\{}",
+            repo.trim_end_matches('\\'),
+            path.replace('/', "\\")
+        )
+    } else {
+        format!("{}/{path}", repo.trim_end_matches('/'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_paths_are_relative_to_the_top_level() {
+        assert_eq!(
+            repo_relative("/home/me/proj", "/home/me/proj/src/a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            repo_relative("/home/me/proj", "/home/me/project/a.rs"),
+            None
+        );
+        assert_eq!(repo_relative("/home/me/proj", "/home/me/proj"), None);
+        assert_eq!(repo_relative("/home/me/proj", "/home/me/Proj/a.rs"), None);
+        assert_eq!(
+            repo_relative(r"C:\Users\Me\Proj", r"c:\users\me\proj\Src\A.rs").as_deref(),
+            Some("Src/A.rs")
+        );
+        assert_eq!(
+            work_tree_path(r"C:\Users\Me\Proj", "src/a.rs"),
+            r"C:\Users\Me\Proj\src\a.rs"
+        );
+        assert_eq!(
+            work_tree_path("/home/me/proj/", "src/a.rs"),
+            "/home/me/proj/src/a.rs"
+        );
+    }
 }

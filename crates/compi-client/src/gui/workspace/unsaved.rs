@@ -584,7 +584,7 @@ impl CompiApp {
         };
         files.retain(|file| {
             let shown = content::find_content(workspace, &file.pane_id)
-                .is_some_and(|content| content.files.contains(&file.path));
+                .is_some_and(|content| content.files().any(|path| path == file.path));
             shown
                 && (!here.contains(&file.pane_id)
                     || live.contains(&(file.pane_id.clone(), file.path.clone())))
@@ -601,7 +601,9 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         match then {
-            AfterUnsaved::CloseFile { pane_id, path } => self.drop_content_file(&pane_id, &path),
+            AfterUnsaved::CloseFile { pane_id, path } => {
+                self.drop_content_tab(&pane_id, &compi_protocol::ContentTab::File { path })
+            }
             AfterUnsaved::Mutate(operation) => self.mutate(operation, false),
             AfterUnsaved::Transfer {
                 tab_id,
@@ -740,9 +742,8 @@ impl CompiApp {
             content_leaves(&tab.layout, &mut |_, content| {
                 open.extend(
                     content
-                        .files
-                        .iter()
-                        .map(|path| (content.environment.clone(), path.clone())),
+                        .files()
+                        .map(|path| (content.environment.clone(), path.to_owned())),
                 )
             });
         }
@@ -919,9 +920,8 @@ mod tests {
             content: PaneContent {
                 environment: ContentEnvironment::Host,
                 root: "/work".into(),
-                files: Vec::new(),
-                active_file: None,
-                view: compi_protocol::ContentView::Files,
+                tabs: Vec::new(),
+                active: None,
             },
         };
         let tab = |id: &str, layout| WorkspaceTab {

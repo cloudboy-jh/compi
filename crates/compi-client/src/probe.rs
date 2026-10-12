@@ -388,9 +388,11 @@ fn content_arguments(
     let content = PaneContent {
         environment,
         root,
-        files,
-        active_file,
-        view: compi_protocol::ContentView::Files,
+        tabs: files
+            .into_iter()
+            .map(|path| compi_protocol::ContentTab::File { path })
+            .collect(),
+        active: active_file.map(|path| compi_protocol::ContentTab::File { path }),
     };
     content.validate()?;
     Ok((content, down))

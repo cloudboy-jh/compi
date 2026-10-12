@@ -136,6 +136,9 @@ registry! {
     OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
     NewEditor, "new_editor", "New editor", None, None;
     ShowChanges, "show_changes", "Changes", None, None;
+    DiffThisFile, "diff_this_file", "Diff this file", None, None;
+    NextChange, "next_change", "Next change", Some("alt-f5"), Some("alt-f5");
+    PreviousChange, "previous_change", "Previous change", Some("alt-shift-f5"), Some("alt-shift-f5");
     RecoverUnsavedEdits, "recover_unsaved_edits", "Recover unsaved edits…", None, None;
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
@@ -229,6 +232,8 @@ pub struct CommandContext {
     pub has_pane: bool,
     /// The focused pane shows content, not a terminal.
     pub content_pane: bool,
+    /// The focused content pane shows a file tab.
+    pub file_tab: bool,
     /// Why the focused pane's folder cannot open in a content pane: a terminal that
     /// has not reported its directory.
     pub files_reason: Option<&'static str>,
@@ -276,9 +281,8 @@ impl Command {
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
             | SwapPaneDown | RemovePane => CommandCategory::Panes,
-            ShowFiles | ShowChanges | OpenFile | NewEditor | RecoverUnsavedEdits => {
-                CommandCategory::Files
-            }
+            ShowFiles | ShowChanges | DiffThisFile | NextChange | PreviousChange | OpenFile
+            | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
@@ -344,7 +348,13 @@ impl Command {
             ),
             NewEditor => Some("Opens this pane's folder in a new file pane beside it."),
             ShowChanges => Some(
-                "Reviews this repository's uncommitted Git changes beside the pane; nothing is staged or changed.",
+                "Shows this repository's uncommitted Git changes beside the folder; nothing is staged or changed.",
+            ),
+            DiffThisFile => Some(
+                "Opens the open file's uncommitted changes as a diff tab; nothing is staged or changed.",
+            ),
+            NextChange | PreviousChange => Some(
+                "Moves the cursor to the next or previous change against the Git index in the open file.",
             ),
             RecoverUnsavedEdits => Some(
                 "Reopens a file whose unsaved edits were kept when Compi closed, with the edits back.",
@@ -386,6 +396,8 @@ impl Command {
             OpenFile => "quick open find search fuzzy goto editor",
             NewEditor => "file folder pane content split",
             ShowChanges => "git diff review status staged unstaged uncommitted",
+            DiffThisFile => "git diff compare changes review index head",
+            NextChange | PreviousChange => "git diff hunk gutter jump navigate",
             RecoverUnsavedEdits => "backup restore crash lost unsaved changes editor",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
@@ -477,6 +489,7 @@ impl Command {
                         | MoveTabToWindow
                         | ShowFiles
                         | ShowChanges
+                        | DiffThisFile
                         | OpenFile
                         | RecoverUnsavedEdits
                 ))
@@ -695,6 +708,10 @@ impl Command {
                     c.files_reason
                 }
             }
+            DiffThisFile => (!c.file_tab).then_some("Open a file in the editor first"),
+            NextChange | PreviousChange => {
+                (!c.file_tab).then_some("Open a file in the editor first")
+            }
             OpenFile => {
                 if !c.has_pane {
                     Some("Select a pane first")
@@ -776,7 +793,14 @@ pub fn resolve_key(
     overrides: &HashMap<String, String>,
 ) -> KeyRoute {
     match owner {
-        InputOwner::Terminal => resolve_terminal_key(platform, key, context, overrides),
+        // Change navigation is the editor's; a terminal keeps those keys.
+        InputOwner::Terminal => match resolve_terminal_key(platform, key, context, overrides) {
+            KeyRoute::Command(Command::NextChange | Command::PreviousChange)
+            | KeyRoute::Disabled(Command::NextChange | Command::PreviousChange, _) => {
+                KeyRoute::Terminal
+            }
+            route => route,
+        },
         InputOwner::Editor => match resolve_terminal_key(platform, key, context, overrides) {
             KeyRoute::Command(Command::Copy | Command::Paste | Command::SelectAll)
             | KeyRoute::Disabled(Command::Copy | Command::Paste | Command::SelectAll, _)

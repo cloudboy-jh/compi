@@ -150,6 +150,11 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "Open FILE in a content pane beside the selected terminal and put the cursor on LINE (default 1; COL is accepted and ignored). Reuses a content pane in the tab whose folder holds FILE (or the --pane content pane); otherwise opens one rooted at the shell's directory when it holds FILE, else at FILE's folder. A missing or unreadable FILE is reported by the editor. An existing folder without :LINE, or no FILE, browses it like files. With no Compi window showing the tab the pane still opens and a note says it was not shown.",
             "compi edit src/main.rs:42",
         ),
+        ("diff", _) => (
+            "diff [PATH[:LINE[:COL]]]",
+            "Show PATH's uncommitted change as a diff tab in the content pane of its Git repository, scrolled to LINE of the new side (COL is accepted and ignored). The unstaged change (work tree against the index) wins over the staged one (index against HEAD). PATH resolves like edit; the pane is the one in the tab whose folder lies in the repository and holds PATH (or the --pane content pane), else a new one beside the selected terminal rooted at the repository's top level. Without PATH, the repository of the shell's directory lists its changes in the pane's Changes sidebar. Exits 1 with not_a_repository outside a Git work tree and no_changes when PATH has no uncommitted change. Git is only read: files, the index and other Git state never change.",
+            "compi diff src/layout.rs:40",
+        ),
         ("layout", _) => (
             "layout list | PRESET | mirror | flip | restore",
             "Arrange the selected tab without restarting processes. Presets come from built-ins and configured layout_presets. Restore returns to the previous arrangement, or restores original tabs immediately after a merge.",
@@ -192,7 +197,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         _ => (
             "[GLOBAL OPTIONS] COMMAND [ARGS]",
-            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
+            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
             "compi --instance dev --json workspace list",
         ),
     };

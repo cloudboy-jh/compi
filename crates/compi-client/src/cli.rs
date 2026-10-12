@@ -3,6 +3,7 @@
 mod capture;
 mod changes;
 mod content;
+mod diff;
 mod help;
 mod targets;
 #[cfg(any(windows, target_os = "macos"))]
@@ -28,6 +29,7 @@ const COMMANDS: &[&str] = &[
     "split",
     "files",
     "edit",
+    "diff",
     "layout",
     "run",
     "attach",
@@ -943,6 +945,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         }
         "split" => return split(&mut client, &mut state, options, &config),
         "files" | "edit" => return content::run(&mut client, &state, &target, options),
+        "diff" => return diff::run(&mut client, &state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
             let surface = pane_surface(&state, &surface_id)?.clone();
@@ -1542,7 +1545,7 @@ fn validate(
             &["--cwd", "--panes", "--layout"],
             &["--right", "--down"],
         ),
-        ("files" | "edit", _) => (1, 2, &[], &[]),
+        ("files" | "edit" | "diff", _) => (1, 2, &[], &[]),
         ("layout", Some(_)) => (2, 2, &[], &[]),
         ("run", _) => (2, usize::MAX, &[], &[]),
         ("attach" | "detach", _) => (1, 1, &[], &[]),
@@ -1831,6 +1834,7 @@ mod tests {
     fn unknown_commands_suggest_only_close_commands() {
         assert_eq!(suggestion("fiiles"), Some("files"));
         assert_eq!(suggestion("edti"), Some("edit"));
+        assert_eq!(suggestion("dif"), Some("diff"));
         assert_eq!(suggestion("workspce"), Some("workspace"));
         assert_eq!(suggestion("xyz"), None);
         assert_eq!(suggestion("elephant"), None);
@@ -1871,7 +1875,7 @@ mod tests {
         }
     }
     #[test]
-    fn files_and_edit_take_at_most_one_path() {
+    fn files_edit_and_diff_take_at_most_one_path() {
         let validated = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
             assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
@@ -1886,6 +1890,8 @@ mod tests {
             &["edit"],
             &["--json", "edit", "src/main.rs:12:5"],
             &["--pane", "pane-1", "edit", "--", "-notes.md"],
+            &["diff"],
+            &["--json", "diff", "src/layout.rs:40"],
         ] {
             assert!(validated(accepted).is_ok(), "{accepted:?}");
         }
@@ -1893,6 +1899,8 @@ mod tests {
             &["edit", "a.rs", "b.rs"][..],
             &["files", "--right"],
             &["edit", "a.rs", "--cwd", "/tmp"],
+            &["diff", "a.rs", "b.rs"],
+            &["diff", "--staged"],
         ] {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }

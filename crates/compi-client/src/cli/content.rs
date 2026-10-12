@@ -1,17 +1,47 @@
 //! `compi files` and `compi edit`: show a folder or file in a content pane beside the
-//! selected terminal, reusing a content pane its tab already has.
+//! selected terminal, reusing a content pane its tab already has. `compi diff` places its
+//! panes the same way.
 use super::{CliError, Options, Output, pane_surface, submit, targets};
 use crate::{DaemonClient, arrangement, cli_window::Action, connection::ConnectionTarget};
 use compi_protocol::{
-    ContentEnvironment, LayoutNode, PaneContent, PaneId, SplitAxis, SplitGeometry, SurfaceInfo,
-    WorkspaceMutation, WorkspaceSnapshot,
+    ContentEnvironment, ContentTab, LayoutNode, MutationReceipt, PaneContent, PaneId, SplitAxis,
+    SplitGeometry, SurfaceInfo, WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
-/// What the command shows: a folder in the browser, or a file at a 1-based line.
-enum Show {
+/// What a command shows: a folder in the browser, or a tab (a file or a diff).
+pub(super) enum Show {
     Folder(String),
-    File { path: String, line: Option<u32> },
+    Tab {
+        tab: ContentTab,
+        /// The absolute file the tab is about; a content pane whose root holds it is reused.
+        file: String,
+        /// When set, only a content pane rooted at this folder or below it is reused.
+        within: Option<String>,
+        /// The root of a new content pane for the tab.
+        root: String,
+    },
+}
+
+/// The pane a command runs from, and where its relative paths start.
+pub(super) struct Caller<'a> {
+    pub id: PaneId,
+    pub tab: &'a WorkspaceTab,
+    pub environment: ContentEnvironment,
+    /// The caller's terminal; `None` when the caller is a content pane.
+    pub surface: Option<&'a SurfaceInfo>,
+    /// The shell's directory (or a content pane's root), normalised.
+    pub directory: Option<String>,
+    /// Paths are in Windows syntax, which only a Windows host's are.
+    pub windows: bool,
+}
+
+/// The content pane a command shows something in.
+pub(super) struct Placed {
+    pub pane_id: PaneId,
+    pub receipt: Option<MutationReceipt>,
+    /// The pane was opened beside the caller rather than reused.
+    pub opened: bool,
 }
 
 /// Terminal grids measured in nominal 8x16-pixel cells, the scale content minimums are
@@ -33,12 +63,74 @@ pub(super) fn run(
     target: &ConnectionTarget,
     options: &Options,
 ) -> Result<Output, CliError> {
-    let (_, tab, caller) = targets::pane(state, options)?;
-    let caller_id = caller
+    let caller = caller(client, state, options)?;
+    let windows = caller.windows;
+    let directory = caller.directory.as_deref();
+    let (show, line) = match options.args.get(1) {
+        None => (Show::Folder(caller.directory()?.to_owned()), None),
+        Some(folder) if options.args[0] == "files" => (
+            Show::Folder(resolve_path(directory, folder, windows)?),
+            None,
+        ),
+        Some(argument) => {
+            let (path, line) = location(argument)?;
+            let path = resolve_path(directory, path, windows)?;
+            // Only a listable folder opens the browser; anything else is opened as a
+            // file, and the editor reports a missing or unreadable one.
+            if line.is_none()
+                && client
+                    .list_content_directory(caller.environment.clone(), path.clone())
+                    .is_ok()
+            {
+                (Show::Folder(path), None)
+            } else {
+                let root = match directory {
+                    Some(directory) if contains(directory, &path, windows) => directory.to_owned(),
+                    _ => resolve_path(None, &format!("{path}/.."), windows)?,
+                };
+                let show = Show::Tab {
+                    tab: ContentTab::File { path: path.clone() },
+                    file: path,
+                    within: None,
+                    root,
+                };
+                (show, line)
+            }
+        }
+    };
+    let placed = place(client, state, &caller, &show)?;
+    let (subject, action) = match &show {
+        Show::Folder(folder) => (
+            folder.clone(),
+            Action::FocusPane {
+                pane_id: placed.pane_id.clone(),
+            },
+        ),
+        Show::Tab { file, .. } => (
+            line.map_or_else(|| file.clone(), |line| format!("{file}:{line}")),
+            Action::RevealFile {
+                pane_id: placed.pane_id.clone(),
+                file: file.clone(),
+                line: line.unwrap_or(1),
+            },
+        ),
+    };
+    let (text, value) = report(client, target, options, &placed, &subject, action)?;
+    Ok(Output::Report { text, value })
+}
+
+/// The selected pane (the calling shell by default), its environment and directory.
+pub(super) fn caller<'a>(
+    client: &mut DaemonClient,
+    state: &'a WorkspaceSnapshot,
+    options: &Options,
+) -> Result<Caller<'a>, CliError> {
+    let (_, tab, leaf) = targets::pane(state, options)?;
+    let id = leaf
         .leaf_pane()
         .expect("targets resolve only leaf nodes")
         .clone();
-    let (environment, surface, base) = match &caller {
+    let (environment, surface, base) = match &leaf {
         LayoutNode::Pane { surface_id, .. } => {
             let surface = pane_surface(state, surface_id)?;
             let environment = ContentEnvironment::of_surface(surface);
@@ -55,145 +147,156 @@ pub(super) fn run(
     // Paths are in the environment's syntax, which is Windows only for a Windows host.
     let windows =
         environment == ContentEnvironment::Host && cfg!(windows) && options.connect.is_none();
-    let directory = base.and_then(|base| resolve_path(None, &base, windows).ok());
-    let show = match options.args.get(1) {
-        None => Show::Folder(directory.clone().ok_or_else(|| {
+    Ok(Caller {
+        directory: base.and_then(|base| resolve_path(None, &base, windows).ok()),
+        id,
+        tab,
+        environment,
+        surface,
+        windows,
+    })
+}
+
+impl Caller<'_> {
+    /// The directory relative paths start from, required.
+    pub(super) fn directory(&self) -> Result<&str, CliError> {
+        self.directory.as_deref().ok_or_else(|| {
             CliError::usage("the pane's current directory is unknown; name an absolute folder")
-        })?),
-        Some(folder) if options.args[0] == "files" => {
-            Show::Folder(resolve_path(directory.as_deref(), folder, windows)?)
-        }
-        Some(argument) => {
-            let (path, line) = location(argument)?;
-            let path = resolve_path(directory.as_deref(), path, windows)?;
-            // Only a listable folder opens the browser; anything else is opened as a
-            // file, and the editor reports a missing or unreadable one.
-            if line.is_none()
-                && client
-                    .list_content_directory(environment.clone(), path.clone())
-                    .is_ok()
-            {
-                Show::Folder(path)
-            } else {
-                Show::File { path, line }
-            }
-        }
-    };
-    let (pane_id, receipt, opened) =
-        match reusable(&tab.layout, &caller_id, &environment, &show, windows) {
-            Some((pane_id, current)) => {
-                let mut content = current.clone();
-                match &show {
-                    Show::Folder(folder) => {
-                        if resolve_path(None, &content.root, windows).ok().as_ref() != Some(folder)
-                        {
-                            content.root = folder.clone();
-                        }
-                    }
-                    Show::File { path, .. } => {
-                        if !content.files.contains(path) {
-                            content.files.push(path.clone());
-                        }
-                        content.active_file = Some(path.clone());
-                    }
+        })
+    }
+}
+
+/// Shows `show` in the content pane `reusable` picks, or in a new one beside the caller:
+/// a folder becomes the pane's root; a tab is added if missing and made active.
+pub(super) fn place(
+    client: &mut DaemonClient,
+    state: &WorkspaceSnapshot,
+    caller: &Caller,
+    show: &Show,
+) -> Result<Placed, CliError> {
+    let windows = caller.windows;
+    if let Some((pane_id, current)) = reusable(
+        &caller.tab.layout,
+        &caller.id,
+        &caller.environment,
+        show,
+        windows,
+    ) {
+        let mut content = current.clone();
+        match show {
+            Show::Folder(folder) => {
+                if resolve_path(None, &content.root, windows).ok().as_ref() != Some(folder) {
+                    content.root = folder.clone();
                 }
-                content.validate().map_err(CliError::usage)?;
-                let receipt = if content == current {
-                    None
-                } else {
-                    Some(submit(
-                        client,
-                        state,
-                        WorkspaceMutation::UpdateContent {
-                            pane_id: pane_id.clone(),
-                            content,
-                        },
-                        None,
-                    )?)
-                };
-                (pane_id, receipt, false)
             }
-            None => {
-                let surface = surface.expect("a content pane caller is always reused, never split");
-                let content = match &show {
-                    Show::Folder(folder) => PaneContent {
-                        environment,
-                        root: folder.clone(),
-                        files: Vec::new(),
-                        active_file: None,
-                        view: compi_protocol::ContentView::Files,
-                    },
-                    Show::File { path, .. } => PaneContent {
-                        root: match directory {
-                            Some(directory) if contains(&directory, path, windows) => directory,
-                            _ => resolve_path(None, &format!("{path}/.."), windows)?,
-                        },
-                        files: vec![path.clone()],
-                        active_file: Some(path.clone()),
-                        view: compi_protocol::ContentView::Files,
-                        environment,
-                    },
-                };
-                content.validate().map_err(CliError::usage)?;
-                let receipt = submit(
-                    client,
-                    state,
-                    WorkspaceMutation::OpenContent {
-                        pane_id: caller_id.clone(),
-                        axis: SplitAxis::Horizontal,
-                        geometry: geometry(surface)?,
-                        content,
-                    },
-                    None,
-                )?;
-                let pane_id = receipt
-                    .affected_panes
-                    .iter()
-                    .find(|pane| **pane != caller_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        CliError::new(
-                            1,
-                            "operation_failed",
-                            "the daemon did not report the new content pane",
-                        )
-                    })?;
-                (pane_id, Some(receipt), true)
+            Show::Tab { tab, .. } => {
+                if !content.tabs.contains(tab) {
+                    content.tabs.push(tab.clone());
+                }
+                content.active = Some(tab.clone());
             }
+        }
+        content.validate().map_err(CliError::usage)?;
+        let receipt = if content == current {
+            None
+        } else {
+            Some(submit(
+                client,
+                state,
+                WorkspaceMutation::UpdateContent {
+                    pane_id: pane_id.clone(),
+                    content,
+                },
+                None,
+            )?)
         };
-    let after = client.workspace()?;
-    let (subject, action) = match &show {
-        Show::Folder(folder) => (
-            folder.clone(),
-            Action::FocusPane {
-                pane_id: pane_id.clone(),
-            },
-        ),
-        Show::File { path, line } => (
-            line.map_or_else(|| path.clone(), |line| format!("{path}:{line}")),
-            Action::RevealFile {
-                pane_id: pane_id.clone(),
-                file: path.clone(),
-                line: line.unwrap_or(1),
-            },
-        ),
+        return Ok(Placed {
+            pane_id,
+            receipt,
+            opened: false,
+        });
+    }
+    let surface = caller
+        .surface
+        .expect("a content pane caller is always reused, never split");
+    let environment = caller.environment.clone();
+    let content = match show {
+        Show::Folder(folder) => PaneContent {
+            environment,
+            root: folder.clone(),
+            tabs: Vec::new(),
+            active: None,
+        },
+        Show::Tab { tab, root, .. } => PaneContent {
+            environment,
+            root: root.clone(),
+            tabs: vec![tab.clone()],
+            active: Some(tab.clone()),
+        },
     };
-    // The workspace change stands without a window; one that shows the tab is told.
+    content.validate().map_err(CliError::usage)?;
+    let receipt = submit(
+        client,
+        state,
+        WorkspaceMutation::OpenContent {
+            pane_id: caller.id.clone(),
+            axis: SplitAxis::Horizontal,
+            geometry: geometry(surface)?,
+            content,
+        },
+        None,
+    )?;
+    let pane_id = receipt
+        .affected_panes
+        .iter()
+        .find(|pane| **pane != caller.id)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::new(
+                1,
+                "operation_failed",
+                "the daemon did not report the new content pane",
+            )
+        })?;
+    Ok(Placed {
+        pane_id,
+        receipt: Some(receipt),
+        opened: true,
+    })
+}
+
+/// Hands `action` to a window showing the pane and reports what was opened: the text
+/// `Opened {subject} in pane …` and its JSON value. The workspace change stands without a
+/// window; one that shows the tab is told.
+pub(super) fn report(
+    client: &mut DaemonClient,
+    target: &ConnectionTarget,
+    options: &Options,
+    placed: &Placed,
+    subject: &str,
+    action: Action,
+) -> Result<(String, Value), CliError> {
+    let after = client.workspace()?;
     let not_shown = crate::cli_window::execute(target, options.window.as_deref(), action)
         .err()
         .map(|error| error.to_string());
+    let Placed {
+        pane_id,
+        receipt,
+        opened,
+    } = placed;
     let mut text = format!(
         "Opened {subject} in {}pane {pane_id}",
-        if opened { "new " } else { "" }
+        if *opened { "new " } else { "" }
     );
     if let Some(reason) = &not_shown {
         text.push_str(&format!(" · not shown: {reason}"));
     }
     text.push('\n');
-    Ok(Output::Report {
+    Ok((
         text,
-        value: json!({"pane_id":pane_id,"opened":opened,"shown":not_shown.is_none(),"not_shown":not_shown,"receipt":receipt,"workspace":after}),
-    })
+        json!({"pane_id":pane_id,"opened":opened,"shown":not_shown.is_none(),"not_shown":not_shown,"receipt":receipt,"workspace":after}),
+    ))
 }
 
 /// The folder relative paths start from: the calling shell's own directory when the
@@ -247,8 +350,9 @@ fn geometry(surface: &SurfaceInfo) -> Result<SplitGeometry, CliError> {
 }
 
 /// The content pane in `layout` to show `show` in: `caller` itself when it is a content
-/// pane; else one in `environment` whose root is the folder, or for a file the one whose
-/// root holds it, preferring one with the file open, then the deepest root.
+/// pane; else one in `environment` whose root is the folder, or for a tab the one whose
+/// root holds its file (and lies within its `within` folder), preferring one with the tab
+/// open, then the deepest root.
 fn reusable(
     layout: &LayoutNode,
     caller: &PaneId,
@@ -270,9 +374,16 @@ fn reusable(
         let root = resolve_path(None, &content.root, windows).ok();
         let rank = match show {
             Show::Folder(folder) => (root.as_ref() == Some(folder)).then_some((true, 0)),
-            Show::File { path, .. } => root
-                .filter(|root| contains(root, path, windows))
-                .map(|root| (content.files.contains(path), root.len())),
+            Show::Tab {
+                tab, file, within, ..
+            } => root
+                .filter(|root| contains(root, file, windows))
+                .filter(|root| {
+                    within
+                        .as_ref()
+                        .is_none_or(|within| within == root || contains(within, root, windows))
+                })
+                .map(|root| (content.tabs.contains(tab), root.len())),
         };
         if let Some(rank) = rank
             && best.as_ref().is_none_or(|(current, ..)| rank > *current)
@@ -284,7 +395,7 @@ fn reusable(
 }
 
 /// Whether normalised `path` lies below normalised folder `root`.
-fn contains(root: &str, path: &str, windows: bool) -> bool {
+pub(super) fn contains(root: &str, path: &str, windows: bool) -> bool {
     let separator = if windows { '\\' } else { '/' };
     path.strip_prefix(root).is_some_and(|rest| {
         !rest.is_empty() && (root.ends_with(separator) || rest.starts_with(separator))
@@ -293,7 +404,7 @@ fn contains(root: &str, path: &str, windows: bool) -> bool {
 
 /// `FILE[:LINE[:COL]]` as the file and its line. The column compilers print is accepted
 /// and ignored; the cursor goes to the start of the line.
-fn location(argument: &str) -> Result<(&str, Option<u32>), CliError> {
+pub(super) fn location(argument: &str) -> Result<(&str, Option<u32>), CliError> {
     fn number(value: &str) -> Option<(&str, &str)> {
         value.rsplit_once(':').filter(|(rest, digits)| {
             !rest.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
@@ -317,7 +428,11 @@ fn location(argument: &str) -> Result<(&str, Option<u32>), CliError> {
 }
 
 /// `path` made absolute against `base` in the environment's syntax; see `content_path`.
-fn resolve_path(base: Option<&str>, path: &str, windows: bool) -> Result<String, CliError> {
+pub(super) fn resolve_path(
+    base: Option<&str>,
+    path: &str,
+    windows: bool,
+) -> Result<String, CliError> {
     crate::content_path::resolve(base, path, windows).map_err(CliError::usage)
 }
 
@@ -385,9 +500,13 @@ mod tests {
                         }
                     }),
                     root: root.into(),
-                    files: files.iter().map(|file| (*file).to_owned()).collect(),
-                    active_file: None,
-                    view: compi_protocol::ContentView::Files,
+                    tabs: files
+                        .iter()
+                        .map(|file| ContentTab::File {
+                            path: (*file).to_owned(),
+                        })
+                        .collect(),
+                    active: None,
                 },
             }
         };
@@ -423,9 +542,21 @@ mod tests {
             )
             .map(|(pane, _)| pane.as_str().to_owned())
         };
-        let file = |path: &str| Show::File {
-            path: path.into(),
-            line: None,
+        let file = |path: &str| Show::Tab {
+            tab: ContentTab::File { path: path.into() },
+            file: path.into(),
+            within: None,
+            root: "/".into(),
+        };
+        let diff = |path: &str| Show::Tab {
+            tab: ContentTab::Diff {
+                repo: "/home/me/proj".into(),
+                path: path.into(),
+                scope: compi_protocol::GitScope::Unstaged,
+            },
+            file: format!("/home/me/proj/{path}"),
+            within: Some("/home/me/proj".into()),
+            root: "/home/me/proj".into(),
         };
         assert_eq!(
             pick("terminal", Show::Folder("/home/me/proj".into())).as_deref(),
@@ -450,5 +581,8 @@ mod tests {
         );
         assert_eq!(pick("terminal", file("/srv/x")), None);
         assert_eq!(pick("src", file("/srv/x")).as_deref(), Some("src"));
+        // A diff goes to a pane inside its repository, even when another has the file open.
+        assert_eq!(pick("terminal", diff("src/lib.rs")).as_deref(), Some("src"));
+        assert_eq!(pick("terminal", diff("README.md")).as_deref(), Some("proj"));
     }
 }

@@ -2,6 +2,7 @@ use super::*;
 use crate::cli_window::{
     Action, Applied, PaneInfo, PaneType, Request, Response, TargetIdentity, WindowInfo,
 };
+use compi_protocol::ContentTab;
 
 struct ResizeStep {
     tab_id: TabId,
@@ -20,8 +21,8 @@ type PendingResize = (gpui::WindowHandle<CompiApp>, Applied, VecDeque<ResizeStep
 
 enum Pending {
     Resize(PendingResize),
-    /// `compi edit` and `compi files` ask for the reveal or focus right after the workspace
-    /// change that adds the pane or file, so the window may not have received it yet.
+    /// `compi edit`, `compi files` and `compi diff` ask for the reveal or focus right after
+    /// the workspace change that adds the pane or tab, so the window may not have it yet.
     Polled(gpui::WindowHandle<CompiApp>, Applied),
 }
 
@@ -98,7 +99,10 @@ pub(in crate::gui) fn dispatch(
             .ok_or("Selected window closed before application")?;
         if matches!(
             request.action,
-            Action::RevealFile { .. } | Action::FocusPane { .. }
+            Action::RevealFile { .. }
+                | Action::RevealDiff { .. }
+                | Action::ShowChanges { .. }
+                | Action::FocusPane { .. }
         ) {
             let applied = Applied {
                 window_id: selected,
@@ -218,6 +222,8 @@ pub(in crate::gui) fn dispatch(
                         Ok(Ok(false)) => {
                             let _ = completion.sender.send(Err(match request.action {
                                 Action::RevealFile { .. } => "The pane did not show the file before the request expired; open it in the pane first",
+                                Action::RevealDiff { .. } => "The pane did not show the diff before the request expired; open it in the pane first",
+                                Action::ShowChanges { .. } => "The pane was not shown before the request expired; show its tab first",
                                 _ => "Pane ID does not exist in this window's daemon workspace",
                             }
                             .into()));
@@ -341,7 +347,9 @@ impl CompiApp {
             .ok_or("Window has no authoritative workspace")?;
         let tab_id = match action {
             Action::List => return Err("Listing is not a window mutation".into()),
-            Action::RevealFile { .. } => unreachable!("dispatch polls file reveals"),
+            Action::RevealFile { .. } | Action::RevealDiff { .. } | Action::ShowChanges { .. } => {
+                unreachable!("dispatch polls reveals")
+            }
             Action::FocusTab { tab_id } | Action::DetachTab { tab_id } => tab_id.clone(),
             Action::FocusPane { pane_id }
             | Action::ResizePane { pane_id, .. }
@@ -492,7 +500,10 @@ impl CompiApp {
                 self.rebuild_layout(window, true);
                 resize = self.resize_presentation(pane_id, *cols, *rows)?;
             }
-            Action::List | Action::RevealFile { .. } => unreachable!(),
+            Action::List
+            | Action::RevealFile { .. }
+            | Action::RevealDiff { .. }
+            | Action::ShowChanges { .. } => unreachable!(),
         }
         self.rebuild_layout(window, true);
         if let Action::ZoomPane { pane_id } = action
@@ -521,8 +532,10 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> crate::Result<bool> {
-        let Action::FocusPane { pane_id } = action else {
-            return self.reveal_presentation(action, window, cx);
+        let pane_id = match action {
+            Action::FocusPane { pane_id } => pane_id,
+            Action::RevealFile { .. } => return self.reveal_presentation(action, window, cx),
+            _ => return self.changes_presentation(action, window, cx),
         };
         let known = self.workspace.as_ref().is_some_and(|workspace| {
             workspace
@@ -592,7 +605,7 @@ impl CompiApp {
         let Some(LayoutNode::Content { content, .. }) = leaf_node(&tab.layout, pane_id) else {
             return Err("Pane shows a terminal, not files".into());
         };
-        if content.active_file.as_ref() != Some(file) {
+        if content.active_file() != Some(file.as_str()) {
             return Ok(false);
         }
         let environment = content.environment.clone();
@@ -617,6 +630,96 @@ impl CompiApp {
         self.rebuild_layout(window, true);
         self.save_state();
         window.focus(&self.focus_handle, cx);
+        cx.activate(true);
+        self.report_focus(window.is_window_active());
+        cx.notify();
+        Ok(true)
+    }
+
+    /// Applies `Action::RevealDiff` and `Action::ShowChanges`: `Ok(false)` until this window
+    /// has the pane, a diff tab as the active tab (the CLI's own change makes it so), and
+    /// for the Changes list the pane drawn.
+    fn changes_presentation(
+        &mut self,
+        action: &Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> crate::Result<bool> {
+        let (pane_id, diff) = match action {
+            Action::RevealDiff {
+                pane_id,
+                path,
+                scope,
+                line,
+            } => (pane_id, Some((path, *scope, *line))),
+            Action::ShowChanges { pane_id } => (pane_id, None),
+            _ => unreachable!("polled_presentation passes only diff reveals and Changes here"),
+        };
+        if self.overlay.is_some() {
+            return Err("Close the active GUI menu or dialog before controlling this window; CLI requests cannot bypass confirmation".into());
+        }
+        if self.mutation_pending
+            || self.daemon_restarting
+            || self.update_quiesced.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or("Window has no authoritative workspace")?;
+        let Some(tab) = workspace
+            .sessions
+            .iter()
+            .flat_map(|session| &session.tabs)
+            .find(|tab| layout_contains_pane(&tab.layout, pane_id))
+        else {
+            return Ok(false);
+        };
+        if !workspace
+            .sessions
+            .iter()
+            .flat_map(|session| self.state.visible_tabs(session))
+            .any(|visible| visible.id == tab.id)
+        {
+            return Err(
+                "Tab is not visible in the selected window; choose the window that owns it".into(),
+            );
+        }
+        let Some(LayoutNode::Content { content, .. }) = leaf_node(&tab.layout, pane_id) else {
+            return Err("Pane shows a terminal, not files".into());
+        };
+        if let Some((path, scope, _)) = diff
+            && !matches!(
+                &content.active,
+                Some(ContentTab::Diff { path: active, scope: shown, .. })
+                    if active == path && *shown == scope
+            )
+        {
+            return Ok(false);
+        }
+        let tab_id = tab.id.clone();
+        if !self.state.is_floating(pane_id) {
+            self.select_terminal(tab_id, false);
+        }
+        self.focus_pane(pane_id.clone());
+        if self.focused_pane() != Some(pane_id) {
+            return Err("Pane could not receive GUI focus".into());
+        }
+        match diff {
+            // `open_diff` waits for a pane not drawn yet, or for its first Git read.
+            Some((path, scope, line)) => {
+                self.open_diff(pane_id, path.clone(), Some(scope), line, window, cx)
+            }
+            None if !self.content.panes.contains_key(pane_id) => {
+                self.rebuild_layout(window, true);
+                cx.notify();
+                return Ok(false);
+            }
+            None => self.show_changes_list(pane_id, window, cx),
+        }
+        self.rebuild_layout(window, true);
+        self.save_state();
         cx.activate(true);
         self.report_focus(window.is_window_active());
         cx.notify();

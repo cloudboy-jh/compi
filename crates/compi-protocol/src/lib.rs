@@ -36,7 +36,8 @@ use std::fmt;
 // Version 21 says why a file is not shown as text, reports writability and checks a held
 // version against the file on disk.
 // Version 22 adds the review of a repository's uncommitted Git changes.
-pub const PROTOCOL_VERSION: u32 = 22;
+// Version 23 replaces a content pane's files and view with tabs holding files and diffs.
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -54,7 +55,7 @@ pub const MAX_IMAGE_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const IMAGE_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_DIRECTORY_PATH_BYTES: usize = 4096;
 pub const MAX_DIRECTORY_QUERY_BYTES: usize = 256;
-/// Open files one content pane may list.
+/// Tabs (files and diffs) one content pane may hold.
 pub const MAX_CONTENT_FILES: usize = 256;
 /// Largest file a content pane reads or saves, in bytes.
 pub const MAX_CONTENT_FILE_BYTES: usize = 1024 * 1024;
@@ -833,49 +834,43 @@ impl fmt::Display for ContentEnvironment {
     }
 }
 
-/// What a content pane shows: a folder in one environment and the files open from it.
+/// What a content pane shows: a folder in one environment and the tabs open from it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneContent {
     pub environment: ContentEnvironment,
     /// Absolute folder path in `environment`.
     pub root: String,
-    /// Absolute file paths in `environment`, in display order, each once.
+    /// Open tabs in display order, each once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<String>,
-    /// One of `files`, or `None` when no file is shown.
+    pub tabs: Vec<ContentTab>,
+    /// One of `tabs`, or `None` when the folder is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_file: Option<String>,
-    /// What the pane shows. Absent in older state = Files.
-    #[serde(default, skip_serializing_if = "ContentView::is_files")]
-    pub view: ContentView,
+    pub active: Option<ContentTab>,
 }
 
-/// What a content pane shows of its folder.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// One tab of a content pane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentView {
-    /// The folder's files, with `files` open.
-    #[default]
-    Files,
-    /// The repository's uncommitted changes; `root` is the repository top level.
-    Changes {
-        /// The change on screen: repository-relative path and scope.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selected: Option<GitFileRef>,
+pub enum ContentTab {
+    /// An open file: absolute path in the pane's environment.
+    File { path: String },
+    /// A changed file's diff: `repo` is the absolute repository top level in the pane's
+    /// environment, `path` repository-relative (`/`-separated), `scope` which comparison.
+    Diff {
+        repo: String,
+        path: String,
+        scope: GitScope,
     },
 }
 
-impl ContentView {
-    pub fn is_files(&self) -> bool {
-        matches!(self, Self::Files)
+impl ContentTab {
+    /// The file's path when this is a file tab.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::File { path } => Some(path),
+            Self::Diff { .. } => None,
+        }
     }
-}
-
-/// A changed file in one scope.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct GitFileRef {
-    pub path: String,
-    pub scope: GitScope,
 }
 
 impl PaneContent {
@@ -898,35 +893,47 @@ impl PaneContent {
             return Err("content environment names an invalid WSL distribution".into());
         }
         path(&self.root, "content root")?;
-        if let ContentView::Changes { selected } = &self.view {
-            if !self.files.is_empty() || self.active_file.is_some() {
-                return Err("a changes view has no open files".into());
-            }
-            if let Some(selected) = selected
-                && !is_repo_path(&selected.path)
-            {
-                return Err("the selected change must be a repository-relative path".into());
-            }
-            return Ok(());
-        }
-        if self.files.len() > MAX_CONTENT_FILES {
+        if self.tabs.len() > MAX_CONTENT_FILES {
             return Err(format!(
-                "a content pane can list at most {MAX_CONTENT_FILES} files"
+                "a content pane can list at most {MAX_CONTENT_FILES} tabs"
             ));
         }
-        let mut seen = std::collections::HashSet::with_capacity(self.files.len());
-        for file in &self.files {
-            path(file, "content file")?;
-            if !seen.insert(file.as_str()) {
-                return Err(format!("content file {file} is listed twice"));
+        let mut seen = std::collections::HashSet::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            match tab {
+                ContentTab::File { path: file } => path(file, "content file")?,
+                ContentTab::Diff {
+                    repo, path: file, ..
+                } => {
+                    path(repo, "diff repository")?;
+                    if !is_repo_path(file) {
+                        return Err("a diff tab's path must be repository-relative".into());
+                    }
+                }
+            }
+            if !seen.insert(tab) {
+                return Err(match tab {
+                    ContentTab::File { path } => format!("content file {path} is listed twice"),
+                    ContentTab::Diff { path, .. } => format!("the diff of {path} is listed twice"),
+                });
             }
         }
-        if let Some(active) = &self.active_file
-            && !seen.contains(active.as_str())
+        if let Some(active) = &self.active
+            && !seen.contains(active)
         {
-            return Err("the active file must be one of the open files".into());
+            return Err("the active tab must be one of the open tabs".into());
         }
         Ok(())
+    }
+
+    /// Open files' paths, in display order.
+    pub fn files(&self) -> impl Iterator<Item = &str> {
+        self.tabs.iter().filter_map(ContentTab::file)
+    }
+
+    /// The active tab's path when it is a file.
+    pub fn active_file(&self) -> Option<&str> {
+        self.active.as_ref().and_then(ContentTab::file)
     }
 
     /// The root folder's last component, for captions.
@@ -1348,15 +1355,18 @@ mod tests {
 mod content_tests {
     use super::*;
 
+    fn file(path: &str) -> ContentTab {
+        ContentTab::File { path: path.into() }
+    }
+
     fn content(files: &[&str], active: Option<&str>) -> PaneContent {
         PaneContent {
             environment: ContentEnvironment::Wsl {
                 distribution: "Ubuntu".into(),
             },
             root: "/home/user/project/".into(),
-            files: files.iter().map(|file| (*file).to_owned()).collect(),
-            active_file: active.map(str::to_owned),
-            view: ContentView::Files,
+            tabs: files.iter().map(|path| file(path)).collect(),
+            active: active.map(file),
         }
     }
 
@@ -1392,31 +1402,38 @@ mod content_tests {
     }
 
     #[test]
-    fn changes_view_has_no_files_and_a_relative_selection() {
-        let changes = |path: &str| PaneContent {
-            view: ContentView::Changes {
-                selected: Some(GitFileRef {
-                    path: path.into(),
-                    scope: GitScope::Staged,
-                }),
-            },
+    fn diff_tabs_sit_among_files_with_a_relative_path() {
+        let diff = |path: &str| ContentTab::Diff {
+            repo: "/home/user/project".into(),
+            path: path.into(),
+            scope: GitScope::Staged,
+        };
+        let shown = PaneContent {
+            tabs: vec![file("/a"), diff("src/main.rs")],
+            active: Some(diff("src/main.rs")),
             ..content(&[], None)
         };
-        let shown = changes("src/main.rs");
         assert!(shown.validate().is_ok());
+        assert_eq!(shown.files().collect::<Vec<_>>(), ["/a"]);
+        assert_eq!(shown.active_file(), None);
         let json = serde_json::to_value(&shown).unwrap();
-        assert_eq!(json["view"]["type"], "changes");
+        assert_eq!(json["tabs"][1]["type"], "diff");
+        assert_eq!(json["active"]["scope"], "staged");
         assert_eq!(serde_json::from_value::<PaneContent>(json).unwrap(), shown);
         for path in ["", "/etc/passwd", "a/../../b", "a\0b"] {
-            assert!(changes(path).validate().is_err(), "accepted {path:?}");
+            let bad = PaneContent {
+                tabs: vec![diff(path)],
+                ..content(&[], None)
+            };
+            assert!(bad.validate().is_err(), "accepted {path:?}");
         }
-        let with_files = PaneContent {
-            files: vec!["/a".into()],
-            ..changes("a")
+        let twice = PaneContent {
+            tabs: vec![diff("a"), diff("a")],
+            ..content(&[], None)
         };
-        assert!(with_files.validate().is_err());
-        // Files views omit the field, so older state loads unchanged.
-        let files = serde_json::to_value(content(&[], None)).unwrap();
-        assert!(files.get("view").is_none());
+        assert!(twice.validate().is_err());
+        // A folder with nothing open omits both fields.
+        let folder = serde_json::to_value(content(&[], None)).unwrap();
+        assert!(folder.get("tabs").is_none() && folder.get("active").is_none());
     }
 }
