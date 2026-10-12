@@ -10,8 +10,18 @@ Phase 2 left open: macOS qualification of the editor and the three macOS fixes, 
 
 ## Phase 3: File safety
 
-- Unsaved-changes prompts, save conflicts, read-only files, outside edits, binary and oversized files.
-- Remember whether a file came from local, WSL or SSH.
+Already there from phase 2: a save refuses when the file changed on disk, a pane with unsaved files refuses to close, and read errors show in the pane.
+
+1. **Line endings and encoding.** Check whether the GPUI Kit editor turns `\r\n` into `\n`; if so, keep each file's line endings, BOM and final newline on save. First, because it is silent damage today.
+2. **Unsaved-changes prompt** (Save / Don't save / Cancel) for closing a file tab, a pane or a tab, detaching a tab to another window, closing the window, quitting, restarting the daemon and the `compi update` restart. Replaces the flat refusal.
+3. **CLI close.** `compi pane close` / `tab close` ask the GUI host for unsaved files, list them and ask for confirmation; without an interactive terminal they exit 4, like close today.
+4. **Unsaved-edit backups.** Unsaved text is backed up to the data directory and restored after a crash or restart.
+5. **Save conflicts.** The banner offers Reload (drop my edits), Overwrite (deliberate, against the current disk version) and Save as…; Compare arrives with the diff view.
+6. **Read-only files.** The daemon reports whether a file is writable; the editor opens it read-only with a badge and offers Save as….
+7. **Outside edits.** Visible files are re-checked (size and time, then hash): an unchanged buffer reloads quietly and keeps the cursor; an edited one shows Changed on disk: Reload / Keep mine; a deleted file says so, and saving re-creates it.
+8. **Binary and oversized files.** Keep the 1 MiB limit. Instead of the editor, show the size, path, a Copy path button and why it will not open. Larger read-only views belong to file previews (feature 5). Turn off syntax highlighting above about 512 KB if large files stutter.
+9. **Where a file came from.** Tab tooltip and pane header name the environment: host, WSL distribution or SSH host. Reuse never mixes environments.
+10. **Verify.** Tests for CRLF/BOM preservation, conflicts, read-only, deleted and binary files; `cargo dev` smoke on the repo under `/mnt/c` and a CRLF file.
 
 **Done when:** saves never silently overwrite, and closing never silently loses edits.
 
