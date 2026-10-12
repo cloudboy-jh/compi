@@ -529,7 +529,7 @@ impl CompiApp {
             self.broadcast_global_appearance(window, cx);
         }
         self.dismiss_overlay();
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -1482,7 +1482,7 @@ impl CompiApp {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
                     this.dismiss_overlay();
-                    window.focus(&this.focus_handle);
+                    window.focus(&this.focus_handle, cx);
                     cx.notify();
                 }),
             )

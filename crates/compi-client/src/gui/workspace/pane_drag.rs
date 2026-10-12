@@ -206,7 +206,7 @@ impl CompiApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus_handle);
+                    window.focus(&this.focus_handle, cx);
                     this.focus_pane(pane_id.clone());
                     this.start_pane_drag(pane_id.clone(), event.position);
                     cx.stop_propagation();

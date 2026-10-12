@@ -116,7 +116,7 @@ pub(in crate::gui) fn dispatch(
                 let mut active: Option<ResizeStep> = None;
                 loop {
                     cx.background_executor().timer(Duration::from_millis(20)).await;
-                    let checked = cx.update(|cx| -> crate::Result<bool> {
+                    let checked = cx.update(|cx| {
                         handle.update(cx, |app, window, cx| -> crate::Result<bool> {
                             if Instant::now() >= completion.deadline {
                                 return Err("Pane resize deadline elapsed; inspect current pane dimensions before retrying".into());
@@ -146,14 +146,14 @@ pub(in crate::gui) fn dispatch(
                                 (view.cols, view.rows) == (cols, rows)
                                     && view.mirror.snapshot().is_some_and(|screen| (screen.cols, screen.rows) == (cols as u16, rows as u16))
                             }))
-                        })?
+                        })
                     });
                     match checked {
                         Ok(Ok(true)) => {
                             let response = cx.update(|cx| Response {
                                 windows: inventory(&request.target, cx), applied: Some(applied),
                             });
-                            let _ = completion.sender.send(response.map_err(|error| error.to_string()));
+                            let _ = completion.sender.send(Ok(response));
                             return;
                         }
                         Ok(Ok(false)) if Instant::now() < completion.deadline => {}
@@ -396,7 +396,7 @@ impl CompiApp {
         }
         self.save_state();
         if matches!(action, Action::FocusTab { .. } | Action::FocusPane { .. }) {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.activate(true);
             self.report_focus(window.is_window_active());
         }

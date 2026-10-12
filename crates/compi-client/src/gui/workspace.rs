@@ -679,7 +679,7 @@ fn open_window_mode(
     }
     if activate {
         window.update(cx, |view, window, cx| {
-            window.focus(&view.focus_handle);
+            window.focus(&view.focus_handle, cx);
             cx.activate(true);
         })?;
     }
@@ -3163,7 +3163,7 @@ impl CompiApp {
             match key.key.as_str() {
                 "escape" => {
                     self.dismiss_overlay();
-                    window.focus(&self.focus_handle);
+                    window.focus(&self.focus_handle, cx);
                 }
                 "enter" => {
                     self.activate_overlay(window, cx);
@@ -3913,7 +3913,7 @@ impl CompiApp {
                 }
             }
         }
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -3954,7 +3954,7 @@ impl CompiApp {
                     }
                     TextPurpose::SaveArrangement(tab_id) => {
                         self.save_arrangement(&tab_id, &label);
-                        window.focus(&self.focus_handle);
+                        window.focus(&self.focus_handle, cx);
                         cx.notify();
                         return;
                     }
@@ -4084,7 +4084,7 @@ impl CompiApp {
                 }
             }
         }
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 }
@@ -6091,7 +6091,7 @@ impl CompiApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 this.focus_pane(input_id.clone());
                                 this.on_terminal_mouse_down(event, window, cx);
                                 cx.stop_propagation();
@@ -7070,7 +7070,7 @@ impl CompiApp {
             other.save_state();
             other.rebuild_layout(target_window, true);
             if activate_destination {
-                target_window.focus(&other.focus_handle);
+                target_window.focus(&other.focus_handle, target_cx);
             }
             other.report_focus(target_window.is_window_active() && other.overlay.is_none());
             target_cx.notify();
@@ -7182,7 +7182,7 @@ impl CompiApp {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
                     this.overlay_focus = 0;
-                    window.focus(&this.focus_handle);
+                    window.focus(&this.focus_handle, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -7242,7 +7242,7 @@ impl CompiApp {
                                     color(colors.selection),
                                 ));
                             }
-                            let _ = line.paint(origin, px(20.0), window, cx);
+                            let _ = line.paint(origin, px(20.0), TextAlign::Left, None, window, cx);
                             if editor_focused {
                                 window.paint_quad(fill(
                                     Bounds::new(

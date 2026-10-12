@@ -23,17 +23,17 @@ libc = "0.2"
 async-channel.workspace = true
 base64.workspace = true
 smallvec.workspace = true
-gpui = { version = "0.2.2", default-features = false }
+gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Without font-kit, GPUI selects NoopTextSystem on macOS.
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit"] }
 objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

@@ -127,7 +127,7 @@ impl CompiApp {
                 .child(
                     div()
                         .id("whats-new-body")
-                        .flex_shrink()
+                        .flex_shrink(1.0)
                         .min_h_0()
                         .overflow_y_scroll()
                         .px_3()

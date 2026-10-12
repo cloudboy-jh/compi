@@ -32,12 +32,13 @@ use compi_protocol::{
     Row, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus,
 };
 use gpui::{
-    App, Application, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
+    App, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
     EntityInputHandler, FocusHandle, Focusable, FontId, FontStyle, FontWeight, GlyphId, Hsla,
     KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathBuilder, Pixels, Point, Render, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
-    Subscription, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowControlArea, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    Subscription, TextAlign, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window,
+    WindowBounds, WindowControlArea, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb,
+    size,
 };
 use image::{Frame as ImageFrame, RgbaImage};
 #[cfg(target_os = "macos")]
@@ -137,7 +138,7 @@ fn run_application(
     // Before any window claims (and so writes) its state slot.
     crate::release_notes::initialize();
     let empty_measurement = perf::empty_window_enabled();
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().run(move |cx: &mut App| {
         let mut config = config;
         if !empty_measurement
             && let Err(error) = crate::font_catalog::register_bundled(cx.text_system())
@@ -172,7 +173,7 @@ fn run_application(
                             Err(TryRecvError::Disconnected) => return,
                         };
                         let target = target.clone();
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             let completion = request.completion;
                             let result = match request.mode {
                                 crate::window_host::LaunchMode::Ordinary => open_compi_window(
@@ -212,7 +213,7 @@ fn run_application(
             })
             .detach();
         }
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -1017,7 +1018,7 @@ impl CompiApp {
             f32::from(delta.y)
         };
         let offset = self.tab_scroll_handle.offset();
-        let max_offset = f32::from(self.tab_scroll_handle.max_offset().width);
+        let max_offset = f32::from(self.tab_scroll_handle.max_offset().x);
         let x = (f32::from(offset.x) + delta).clamp(-max_offset, 0.0);
         self.tab_scroll_handle.set_offset(point(px(x), offset.y));
         cx.stop_propagation();
@@ -1132,7 +1133,7 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         let Some(point) = self.grid_point(event.position) else {
             return;
         };
@@ -2115,7 +2116,14 @@ fn paint_composition(
         ),
         color(theme.background),
     ));
-    let _ = line.paint(origin, px(typography.cell_height), window, cx);
+    let _ = line.paint(
+        origin,
+        px(typography.cell_height),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
 }
 
 fn shape_row(
@@ -2354,7 +2362,14 @@ fn paint_images(
                 px(f32::from(rows) * typography.cell_height),
             ),
         );
-        let _ = window.paint_image(image_bounds, Corners::default(), image, 0, false);
+        let _ = window.paint_image(
+            image_bounds,
+            image_bounds,
+            Corners::default(),
+            image,
+            0,
+            false,
+        );
     }
 }
 

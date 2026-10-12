@@ -455,7 +455,7 @@ impl CompiApp {
         match key.key.as_str() {
             "escape" => {
                 self.dismiss_overlay();
-                window.focus(&self.focus_handle);
+                window.focus(&self.focus_handle, cx);
             }
             "+" | "plus" | "=" | "equal" => self.zoom_inspector(Some(1.25), None),
             "-" | "minus" => self.zoom_inspector(Some(0.8), None),
@@ -615,6 +615,7 @@ impl CompiApp {
                     );
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         let _ = window.paint_image(
+                            bounds,
                             Bounds::new(origin, dimensions),
                             Corners::default(),
                             image.clone(),
@@ -791,7 +792,7 @@ impl CompiApp {
                                     .child("Close")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.dismiss_overlay();
-                                        window.focus(&this.focus_handle);
+                                        window.focus(&this.focus_handle, cx);
                                         cx.stop_propagation();
                                         cx.notify();
                                     })),
