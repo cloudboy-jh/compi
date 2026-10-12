@@ -891,6 +891,9 @@ impl Surface {
                     }
                 }
             }
+            // The output thread blocks in PTY reads, so this loop (woken at least
+            // every 50 ms by `pty.wait`) enforces the synchronized output timeout.
+            self.flush_synchronized_output(Some(std::time::Instant::now()));
             self.recover_screen(false);
 
             match pty.wait(50) {
@@ -924,6 +927,7 @@ impl Surface {
             failure = None;
         }
         let _ = output_thread.join();
+        self.flush_synchronized_output(None);
         self.recover_screen(true);
         if let Ok(mut input) = self.input.lock() {
             input.take();
@@ -1001,6 +1005,34 @@ impl Surface {
             .is_ok()
         {
             sink.needs_snapshot.store(false, Ordering::Release);
+        }
+    }
+
+    /// Publishes output held by synchronized output (DEC mode 2026): once it
+    /// expires at `now`, or unconditionally when `now` is `None`.
+    fn flush_synchronized_output(&self, now: Option<std::time::Instant>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let delta = match now {
+            Some(now) => state.terminal.expire_synchronized_output(now),
+            None => state.terminal.finish_synchronized_output(),
+        };
+        let Some(delta) = delta else { return };
+        let Some((sink, _)) = state.client.as_ref().filter(|_| state.client_ready) else {
+            return;
+        };
+        // Send under the state lock so the output thread's next delta cannot overtake it.
+        let sink = sink.clone();
+        let sent = sink.send_screen(&TerminalFrame {
+            identity: self.identity.clone(),
+            message: ScreenMessage::Delta {
+                delta: crate::screen::delta(delta),
+            },
+        });
+        drop(state);
+        if sent.is_err() {
+            self.detach_connection(sink.id);
         }
     }
 

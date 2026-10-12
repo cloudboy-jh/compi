@@ -11,6 +11,7 @@ use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::Read;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vte::{Params, Parser, Perform};
@@ -25,6 +26,8 @@ const MAX_UNSUPPORTED_SIGNATURES: usize = 128;
 const MAX_OSC52_DECODED_BYTES: usize = 1024 * 1024;
 const MAX_KEYBOARD_PROTOCOL_STACK: usize = 32;
 const KITTY_KEYBOARD_SUPPORTED_FLAGS: u16 = 1;
+/// Longest time synchronized output (DEC mode 2026) may hold back screen updates.
+pub const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -164,6 +167,9 @@ struct ChangeBaseline {
     rows: usize,
     active_alternate: bool,
     row_hashes: Vec<u64>,
+    /// Rows that differed from `row_hashes` at some point while updates were held;
+    /// a snapshot may have shown them, so they are resent even if they changed back.
+    dirty_rows: Vec<bool>,
     scrollback_generation: u64,
     graphics_generation: u64,
     image_generation: u64,
@@ -205,6 +211,10 @@ pub struct TerminalState {
     active_transfer: Option<u32>,
     diagnostics: UnsupportedDiagnostics,
     graphics_byte_limit: usize,
+    /// When DEC mode 2026 (synchronized output) was set, while it is set.
+    synchronized_output: Option<Instant>,
+    /// Baseline of the screen clients last saw, held while synchronized output defers updates.
+    held_change: Option<ChangeBaseline>,
 }
 
 impl TerminalState {
@@ -249,6 +259,8 @@ impl TerminalState {
             active_transfer: None,
             diagnostics: UnsupportedDiagnostics::default(),
             graphics_byte_limit: DEFAULT_GRAPHICS_BYTES,
+            synchronized_output: None,
+            held_change: None,
         }
     }
 
@@ -331,7 +343,10 @@ impl TerminalState {
     }
 
     pub fn advance(&mut self, bytes: &[u8]) -> (Option<Delta>, Vec<Vec<u8>>) {
-        let before = self.change_baseline();
+        let before = self
+            .held_change
+            .take()
+            .unwrap_or_else(|| self.change_baseline());
         let mut offset = 0;
         while offset < bytes.len() {
             if matches!(&self.input_state, InputState::Normal) {
@@ -372,7 +387,43 @@ impl TerminalState {
             self.advance_byte(bytes[offset]);
             offset += 1;
         }
+        if self.synchronized_output.is_some() {
+            self.hold_change(before);
+            return (None, std::mem::take(&mut self.replies));
+        }
         self.finish_change(before)
+    }
+
+    /// Ends synchronized output once it has held updates for
+    /// [`SYNCHRONIZED_OUTPUT_TIMEOUT`], so an app that never resets mode 2026
+    /// cannot freeze the screen.
+    pub fn expire_synchronized_output(&mut self, now: Instant) -> Option<Delta> {
+        let started = self.synchronized_output?;
+        if now.saturating_duration_since(started) < SYNCHRONIZED_OUTPUT_TIMEOUT {
+            return None;
+        }
+        self.finish_synchronized_output()
+    }
+
+    /// Ends synchronized output and returns the update it held back.
+    pub fn finish_synchronized_output(&mut self) -> Option<Delta> {
+        self.synchronized_output = None;
+        let before = self.held_change.take()?;
+        self.finish_change(before).0
+    }
+
+    fn hold_change(&mut self, mut before: ChangeBaseline) {
+        let rows = &self.buffer().rows;
+        before.dirty_rows.resize(before.row_hashes.len(), false);
+        for ((dirty, baseline), row) in before
+            .dirty_rows
+            .iter_mut()
+            .zip(&before.row_hashes)
+            .zip(rows)
+        {
+            *dirty |= *baseline != row_hash(row);
+        }
+        self.held_change = Some(before);
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Option<Delta> {
@@ -381,7 +432,11 @@ impl TerminalState {
         if cols == self.cols() && rows == self.rows() {
             return None;
         }
-        let before = self.change_baseline();
+        self.synchronized_output = None;
+        let before = self
+            .held_change
+            .take()
+            .unwrap_or_else(|| self.change_baseline());
         let old_scrollback = self.main.scrollback.len();
         let cursor_in_main = (!self.active_alternate).then(|| {
             (
@@ -459,6 +514,7 @@ impl TerminalState {
             rows: self.rows(),
             active_alternate: self.active_alternate,
             row_hashes: self.buffer().rows.iter().map(row_hash).collect(),
+            dirty_rows: Vec::new(),
             scrollback_generation: self.scrollback_generation,
             graphics_generation: self.graphics_generation,
             image_generation: self.image_generation,
@@ -481,6 +537,7 @@ impl TerminalState {
         let graphics_changed = before.graphics_generation != self.graphics_generation;
         let changed = all_rows
             || before.row_hashes != row_hashes
+            || before.dirty_rows.contains(&true)
             || scrollback_changed
             || graphics_changed
             || before.cursor != self.cursor
@@ -499,7 +556,9 @@ impl TerminalState {
             .iter()
             .enumerate()
             .filter(|(index, _)| {
-                all_rows || before.row_hashes.get(*index) != row_hashes.get(*index)
+                all_rows
+                    || before.dirty_rows.get(*index) == Some(&true)
+                    || before.row_hashes.get(*index) != row_hashes.get(*index)
             })
             .map(|(index, row)| RowUpdate {
                 index: index as u16,
@@ -996,6 +1055,10 @@ impl TerminalState {
                     1004 => self.modes.focus_events = enabled,
                     1006 => self.modes.sgr_mouse = enabled,
                     2004 => self.modes.bracketed_paste = enabled,
+                    2026 if enabled => {
+                        self.synchronized_output.get_or_insert_with(Instant::now);
+                    }
+                    2026 => self.synchronized_output = None,
                     _ => self.unsupported("DEC mode", value),
                 }
             }
@@ -1032,6 +1095,8 @@ impl TerminalState {
         } else if save_cursor {
             self.cursor = self.saved_cursor;
         }
+        // Show the switched screen rather than holding it behind synchronized output.
+        self.synchronized_output = None;
         self.active_alternate = enabled;
         self.modes.alternate_screen = enabled;
         self.scroll_top = 0;
@@ -2272,6 +2337,61 @@ mod tests {
         terminal.advance(b"\x1b[?1049l");
         assert!(!terminal.snapshot().modes.alternate_screen);
         assert_eq!(visible_text(&terminal.snapshot(), 1), "three");
+    }
+
+    #[test]
+    fn synchronized_output_publishes_one_frame() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.advance(b"old");
+        let (delta, replies) = terminal.advance(b"\x1b[?2026h\x1b[?25l\x1b[1;1Hne\x1b[5n");
+        assert!(delta.is_none(), "held frame leaked: {delta:?}");
+        assert_eq!(replies, [b"\x1b[0n".to_vec()]);
+        let delta = terminal
+            .advance(b"w\x1b[2;3H\x1b[?25h\x1b[?2026l")
+            .0
+            .expect("ending synchronized output publishes the frame");
+        assert!(delta.cursor.visible);
+        assert_eq!((delta.cursor.row, delta.cursor.col), (1, 2));
+        assert_eq!(delta.row_updates.len(), 1);
+        assert_eq!(row_text(&delta.row_updates[0].row), "new");
+        assert!(terminal.advance(b"").0.is_none());
+
+        // A row a snapshot may have shown mid-frame is resent even if it changed back.
+        assert!(terminal.advance(b"\x1b[?2026h\x1b[2;1HX").0.is_none());
+        let delta = terminal.advance(b"\x1b[2K\x1b[?2026l").0.unwrap();
+        assert!(delta.row_updates.iter().any(|update| update.index == 1));
+    }
+
+    #[test]
+    fn synchronized_output_expires_and_ends_with_screen_changes() {
+        let mut terminal = TerminalState::new(8, 2);
+        assert!(terminal.advance(b"\x1b[?2026h\x1b[?25lA").0.is_none());
+        let started = terminal.synchronized_output.expect("mode 2026 is set");
+        let early = started + SYNCHRONIZED_OUTPUT_TIMEOUT - Duration::from_millis(1);
+        assert!(terminal.expire_synchronized_output(early).is_none());
+        let delta = terminal
+            .expire_synchronized_output(started + SYNCHRONIZED_OUTPUT_TIMEOUT)
+            .expect("expiry publishes the held frame");
+        assert!(!delta.cursor.visible);
+        assert_eq!(row_text(&delta.row_updates[0].row), "A");
+        assert!(terminal.advance(b"B").0.is_some());
+
+        assert!(terminal.advance(b"\x1b[?2026hC").0.is_none());
+        let delta = terminal
+            .resize(10, 2)
+            .expect("resize publishes the held frame");
+        assert_eq!(row_text(&delta.row_updates[0].row), "ABC");
+        assert!(terminal.advance(b"D").0.is_some());
+
+        for ending in [b"\x1b[?1049h".as_slice(), b"\x1bc"] {
+            assert!(terminal.advance(b"\x1b[?2026hE").0.is_none());
+            assert!(terminal.advance(ending).0.is_some());
+            assert!(terminal.synchronized_output.is_none());
+        }
+
+        assert!(terminal.advance(b"\x1b[?2026hF").0.is_none());
+        assert!(terminal.finish_synchronized_output().is_some());
+        assert!(terminal.finish_synchronized_output().is_none());
     }
 
     #[test]
