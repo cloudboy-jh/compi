@@ -457,7 +457,7 @@ fn current_len(file: &File, root: &Root) -> Result<u64, Failure> {
 /// Like Git, a NUL byte near the start marks a binary file even when it is valid UTF-8.
 pub(crate) const BINARY_PROBE_BYTES: usize = 8 * 1024;
 
-fn version_of(bytes: &[u8]) -> FileVersion {
+pub(crate) fn version_of(bytes: &[u8]) -> FileVersion {
     FileVersion {
         len: bytes.len() as u64,
         sha256: Sha256::digest(bytes)

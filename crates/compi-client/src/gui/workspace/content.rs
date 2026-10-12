@@ -1416,7 +1416,8 @@ impl CompiApp {
     }
 
     /// Runs before the editor's own key bindings, so Compi shortcuts win over editor
-    /// bindings on the same keys; Ctrl/Cmd+S saves. Everything else goes to the editor.
+    /// bindings on the same keys; Ctrl/Cmd+S saves, and Ctrl/Cmd+Enter in a commit box
+    /// commits. Everything else goes to the editor.
     pub(super) fn intercept_editor_key(
         &mut self,
         key: &Keystroke,
@@ -1428,6 +1429,11 @@ impl CompiApp {
         }
         if is_save_key(key) {
             self.save_focused_file(cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.commit_box_key(key, window, cx) {
             cx.stop_propagation();
             cx.notify();
             return;

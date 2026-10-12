@@ -8,14 +8,14 @@
 use super::content::{HIGHLIGHT_LIMIT, human_size, language_for};
 use super::*;
 use crate::diff::{
-    self, DiffLine, Expand, FileDiff, Layout, LineKind, Match, Row, Side, Whitespace,
+    self, DiffLine, Expand, FileDiff, Hunk, Layout, LineKind, Match, Row, Side, Whitespace,
 };
 use base64::Engine as _;
 use compi_protocol::{GitFileContent, GitImageFormat};
 use gpui::{
-    BorderStyle, ClickEvent, Div, Entity, Font, HighlightStyle, Image, ImageFormat, ImageSource,
-    ListAlignment, ListOffset, ListState, ObjectFit, Size, StyledImage as _, StyledText, Task,
-    TextLayout, WeakEntity, img, list, quad,
+    BorderStyle, ClickEvent, Div, Entity, EventEmitter, Font, HighlightStyle, Image, ImageFormat,
+    ImageSource, ListAlignment, ListOffset, ListState, ObjectFit, Size, StyledImage as _,
+    StyledText, Task, TextLayout, WeakEntity, img, list, quad,
 };
 use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
 use gpui_component::input::{Input, InputEvent, InputState, Rope};
@@ -66,6 +66,30 @@ impl DiffStyle {
     fn same(&self, other: &DiffStyle) -> bool {
         self.colors == other.colors && Arc::ptr_eq(&self.typography, &other.typography)
     }
+}
+
+/// What the button on each hunk does, as the tab showing the diff decides: stage it from
+/// a diff of the work tree against the index, unstage it from a diff of the index against
+/// `HEAD`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HunkButton {
+    Stage,
+    Unstage,
+}
+
+impl HunkButton {
+    fn label(self) -> &'static str {
+        match self {
+            HunkButton::Stage => "Stage hunk",
+            HunkButton::Unstage => "Unstage hunk",
+        }
+    }
+}
+
+/// A hunk's button was clicked: the diff on screen and the hunk of it to move.
+pub(super) struct HunkClicked {
+    pub diff: FileDiff,
+    pub hunk: Hunk,
 }
 
 /// Both sides as read from the daemon.
@@ -145,7 +169,8 @@ struct TextBody {
     highlights: Arc<Highlights>,
     note: Option<&'static str>,
     rows: Rc<Vec<Row>>,
-    hunks: Vec<usize>,
+    /// The first row of each hunk with changes, and that hunk's index in the diff.
+    hunks: Rc<Vec<(usize, usize)>>,
     /// The row showing each old and new line, built on demand.
     line_rows: Option<Rc<LineRows>>,
 }
@@ -210,7 +235,11 @@ pub(super) struct DiffView {
     /// A line (0-based) asked for before it could be scrolled to: before the first build
     /// landed or the view was sized.
     reveal: Option<(Side, u32)>,
+    /// The button each hunk shows; `None` shows none.
+    hunk_button: Option<HunkButton>,
 }
+
+impl EventEmitter<HunkClicked> for DiffView {}
 
 impl DiffView {
     /// `path` is repository-relative (picks the grammar); sides as read from the daemon.
@@ -246,6 +275,7 @@ impl DiffView {
             size: None,
             find: None,
             reveal: None,
+            hunk_button: None,
         };
         view.start_build(cx);
         view
@@ -296,6 +326,31 @@ impl DiffView {
             self.relayout(cx);
         }
         cx.notify();
+    }
+
+    /// The button every hunk shows; cheap when unchanged.
+    pub(super) fn set_hunk_button(&mut self, button: Option<HunkButton>, cx: &mut Context<Self>) {
+        if self.hunk_button != button {
+            self.hunk_button = button;
+            cx.notify();
+        }
+    }
+
+    /// Hunk `index` of the diff on screen asks to move. Only exact diffs move hunks: under
+    /// an ignore mode a hunk would carry differences the diff does not show.
+    fn click_hunk(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Body::Text(text) = &self.body else {
+            return;
+        };
+        if self.hunk_button.is_none() || self.settings.whitespace != Whitespace::Exact {
+            return;
+        }
+        if let Some(hunk) = text.diff.hunks().get(index).cloned() {
+            cx.emit(HunkClicked {
+                diff: text.diff.clone(),
+                hunk,
+            });
+        }
     }
 
     /// The first build has landed: there is something to draw.
@@ -629,14 +684,11 @@ impl DiffView {
             return;
         };
         let reference = self.list.logical_scroll_top().item_ix + self.rows_above(1.0 / 3.0);
+        let mut starts = text.hunks.iter().map(|&(start, _)| start);
         let target = if forward {
-            text.hunks.iter().copied().find(|&start| start > reference)
+            starts.find(|&start| start > reference)
         } else {
-            text.hunks
-                .iter()
-                .rev()
-                .copied()
-                .find(|&start| start < reference)
+            starts.rev().find(|&start| start < reference)
         };
         if let Some(start) = target {
             self.scroll_row_to(start, 1.0 / 3.0);
@@ -712,7 +764,7 @@ impl DiffView {
                     highlights,
                     note,
                     rows: Rc::default(),
-                    hunks: Vec::new(),
+                    hunks: Rc::default(),
                     line_rows: None,
                 })
             }
@@ -782,7 +834,15 @@ impl DiffView {
             return;
         };
         let rows = diff::rows(&text.diff, &self.context, self.layout);
-        text.hunks = diff::hunk_starts(&rows);
+        // Formatting-only hunks have no first row; the others start rows in order.
+        let changed = text
+            .diff
+            .hunks()
+            .iter()
+            .enumerate()
+            .filter(|(_, hunk)| !hunk.formatting_only)
+            .map(|(index, _)| index);
+        text.hunks = Rc::new(diff::hunk_starts(&rows).into_iter().zip(changed).collect());
         text.rows = Rc::new(rows);
         text.line_rows = None;
         let count = text.rows.len();
@@ -1309,6 +1369,11 @@ struct Frame {
     /// Number columns before the marker of a row (two unified, one per split half).
     gutter: f32,
     eof: [Option<u32>; 2],
+    /// The first row of each hunk with changes and the hunk's index, as `TextBody` holds.
+    hunks: Rc<Vec<(usize, usize)>>,
+    /// The button hunks show, and whether it acts (the whitespace mode is exact).
+    hunk_button: Option<(HunkButton, bool)>,
+    colors: ThemeColors,
 }
 
 struct FrameFind {
@@ -1341,6 +1406,73 @@ impl Frame {
 }
 
 fn render_row(frame: &Frame, ix: usize) -> AnyElement {
+    let row = render_line_row(frame, ix);
+    let hunk = frame.hunk_button.and_then(|button| {
+        let at = frame
+            .hunks
+            .binary_search_by_key(&ix, |&(start, _)| start)
+            .ok()?;
+        Some((button, frame.hunks[at].1))
+    });
+    match hunk {
+        Some(((button, enabled), index)) => div()
+            .relative()
+            .w_full()
+            .child(row)
+            .child(hunk_button(frame, button, enabled, index))
+            .into_any_element(),
+        None => row,
+    }
+}
+
+/// The compact Stage hunk / Unstage hunk button at the right end of a hunk's first row.
+/// Under an ignore mode it stays visible but does nothing, and its tooltip says why.
+fn hunk_button(frame: &Frame, button: HunkButton, enabled: bool, index: usize) -> AnyElement {
+    let palette = frame.palette;
+    let colors = frame.colors;
+    let view = frame.view.clone();
+    let label = button.label();
+    div()
+        .id(("diff-hunk-button", index))
+        .absolute()
+        .top_0()
+        .right(px(frame.cell * 2.0))
+        .h(px(frame.line))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(palette.border)
+        .bg(palette.surface)
+        .text_size(px(UI_MICRO_TEXT_SIZE))
+        .text_color(palette.foreground)
+        .child(label)
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(move |style| style.bg(palette.hover))
+                .on_click(move |_: &ClickEvent, _, cx: &mut App| {
+                    cx.stop_propagation();
+                    view.update(cx, |this, cx| this.click_hunk(index, cx)).ok();
+                })
+        })
+        .when(!enabled, |this| {
+            this.opacity(0.5).tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: format!("{label} needs Exact whitespace"),
+                    reason: Some(
+                        "This diff ignores some whitespace, so the hunk would carry changes it does not show"
+                            .into(),
+                    ),
+                    colors,
+                })
+                .into()
+            })
+        })
+        .into_any_element()
+}
+
+fn render_line_row(frame: &Frame, ix: usize) -> AnyElement {
     match &frame.rows[ix] {
         Row::Fold {
             gap,
@@ -1796,6 +1928,11 @@ impl DiffView {
                 Layout::Split => number_width,
             },
             eof: eof_lines(&text.diff),
+            hunks: text.hunks.clone(),
+            hunk_button: self
+                .hunk_button
+                .map(|button| (button, self.settings.whitespace == Whitespace::Exact)),
+            colors: style.colors,
         });
         div()
             .relative()

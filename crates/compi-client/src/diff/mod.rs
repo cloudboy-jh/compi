@@ -4,6 +4,7 @@
 
 mod find;
 mod rows;
+mod stage;
 mod words;
 
 use std::hash::{Hash, Hasher};
@@ -14,6 +15,7 @@ use imara_diff::{Algorithm, Diff, InternedInput, Interner};
 
 pub use find::{Match, find};
 pub use rows::{Context, DiffLine, Expand, IndentGuides, Layout, LineKind, Row, hunk_starts, rows};
+pub use stage::{HunkWrite, set_index_lines, text_version};
 
 /// How whitespace counts when lines are compared.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]

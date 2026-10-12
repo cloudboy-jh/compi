@@ -1002,6 +1002,21 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
                     }
                 }
+                ClientMessage::GitWrite {
+                    environment,
+                    repo,
+                    action,
+                } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| crate::git::write(&environment, &repo, action))
+                    {
+                        Ok(result) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::GitWritten { result },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::Prompt {
                     distribution,
                     request,

@@ -633,6 +633,140 @@ impl CompiApp {
         )
     }
 
+    /// Discard changes: the files by name over their folder, untracked ones marked
+    /// `delete`. Cancel starts focused, so Enter and Escape both keep the files.
+    fn render_discard_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let Some(Overlay::ConfirmDiscard {
+            paths, untracked, ..
+        }) = &self.overlay
+        else {
+            return div().into_any_element();
+        };
+        let count = paths.len() + untracked.len();
+        let message = if count == 1 {
+            "Discard changes to 1 file? This can't be undone.".to_owned()
+        } else {
+            format!("Discard changes to {count} files? This can't be undone.")
+        };
+        let files = paths
+            .iter()
+            .map(|path| (path, false))
+            .chain(untracked.iter().map(|path| (path, true)));
+        let rows = files.enumerate().map(|(index, (path, delete))| {
+            let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
+            div()
+                .id(("discard-file", index))
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(UI_BODY_TEXT_SIZE))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(name.to_owned()),
+                        )
+                        .when(!folder.is_empty(), |file| {
+                            file.child(
+                                div()
+                                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                                    .text_color(color(colors.muted))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(folder.to_owned()),
+                            )
+                        }),
+                )
+                .when(delete, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(color(colors.surface_hover))
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.error))
+                            .child("delete"),
+                    )
+                })
+        });
+        self.render_centered_scrim(
+            div()
+                .w_full()
+                .max_w(px(460.0))
+                .flex()
+                .flex_col()
+                .rounded_md()
+                .border_1()
+                .border_color(color(colors.border))
+                .bg(color(colors.surface))
+                .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(self.render_dialog_header("Discard changes", cx))
+                .child(
+                    div()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .text_color(color(modal_text_color(colors.foreground, &colors)))
+                        .child(div().text_size(px(UI_BODY_TEXT_SIZE)).child(message))
+                        .child(
+                            div()
+                                .id("discard-files")
+                                .max_h(px(220.0))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_h(px(48.0))
+                        .flex_none()
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(color(colors.border))
+                        .child(self.settings_action_button(
+                            "discard-cancel",
+                            "Cancel",
+                            self.overlay_focus == 0,
+                            false,
+                            cx.listener(|this, _, _, cx| {
+                                this.dismiss_overlay();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(self.settings_action_button(
+                            "discard-apply",
+                            "Discard",
+                            self.overlay_focus == 1,
+                            true,
+                            cx.listener(|this, _, window, cx| {
+                                this.activate_overlay(window, cx);
+                                cx.stop_propagation();
+                            }),
+                        )),
+                ),
+            window,
+            cx,
+        )
+    }
+
     fn render_text_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let title = match &self.overlay {
@@ -1008,7 +1142,11 @@ impl CompiApp {
         }
         if matches!(
             self.overlay,
-            Some(Overlay::Confirm { .. } | Overlay::ConfirmDaemonRestart { .. })
+            Some(
+                Overlay::Confirm { .. }
+                    | Overlay::ConfirmDaemonRestart { .. }
+                    | Overlay::ConfirmDiscard { .. }
+            )
         ) {
             match key.key.as_str() {
                 "escape" => self.dismiss_overlay(),
@@ -1133,6 +1271,8 @@ impl CompiApp {
             self.render_confirmation_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Unsaved { .. })) {
             self.render_unsaved_dialog(window, cx)
+        } else if matches!(self.overlay, Some(Overlay::ConfirmDiscard { .. })) {
+            self.render_discard_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Text { .. })) {
             self.render_text_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Diagnostics)) {

@@ -2,10 +2,10 @@ use crate::Result;
 use crate::frame;
 use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, DirectoryEntry, ErrorCode,
-    FileContent, FileState, FileVersion, GitChanges, GitFileContent, GitRevision,
-    IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest,
-    PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId,
-    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
+    FileContent, FileState, FileVersion, GitAction, GitChanges, GitFileContent, GitRevision,
+    GitWriteResult, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt,
+    MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage,
+    SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
     decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
@@ -820,6 +820,24 @@ impl DaemonClient {
             revision,
         })? {
             ServerMessage::GitFileRead { content } => Ok(content),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// A Git write in the repository whose top level is `repo`. Git's failure text is the
+    /// error message.
+    pub fn git_write(
+        &mut self,
+        environment: ContentEnvironment,
+        repo: String,
+        action: GitAction,
+    ) -> Result<GitWriteResult> {
+        match self.request(ClientMessage::GitWrite {
+            environment,
+            repo,
+            action,
+        })? {
+            ServerMessage::GitWritten { result } => Ok(result),
             message => Err(unexpected_response(message)),
         }
     }

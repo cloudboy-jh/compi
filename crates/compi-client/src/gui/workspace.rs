@@ -351,6 +351,15 @@ pub(super) enum Overlay {
         action: &'static str,
         revision: u64,
     },
+    /// Discard the work-tree changes of files in the repository `repo` that `pane_id`
+    /// lists: `paths` go back to their index version, `untracked` are deleted. Cancel
+    /// starts focused.
+    ConfirmDiscard {
+        pane_id: PaneId,
+        repo: String,
+        paths: Vec<String>,
+        untracked: Vec<String>,
+    },
     Workspaces,
     ConfirmDaemonRestart {
         details: String,
@@ -3402,6 +3411,7 @@ impl CompiApp {
                     | Overlay::QuickAppearance
                     | Overlay::Settings
                     | Overlay::Confirm { .. }
+                    | Overlay::ConfirmDiscard { .. }
                     | Overlay::Unsaved { .. }
                     | Overlay::Diagnostics
                     | Overlay::Arrangements { .. }
@@ -4129,6 +4139,21 @@ impl CompiApp {
                 }
                 self.dismiss_overlay();
                 self.remove_work(operation, window, cx);
+            }
+            Overlay::ConfirmDiscard {
+                pane_id,
+                repo,
+                paths,
+                untracked,
+            } => {
+                self.dismiss_overlay();
+                self.git_write(
+                    &pane_id,
+                    repo,
+                    compi_protocol::GitAction::Discard { paths, untracked },
+                    window,
+                    cx,
+                );
             }
             Overlay::ConfirmDaemonRestart {
                 revision, consent, ..

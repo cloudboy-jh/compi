@@ -1,5 +1,9 @@
-//! Uncommitted Git changes of content-pane repositories. Git only reads here: no index
-//! refresh, no optional locks, no writes to the work tree or the repository.
+//! Uncommitted Git changes of content-pane repositories. Reads take no index refresh and
+//! no optional locks; the explicit writes of `write` run one at a time per repository.
+
+mod write;
+
+pub use write::write;
 
 use crate::content_files::{self, Failure};
 use base64::Engine;
@@ -23,12 +27,19 @@ const MAX_LISTING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOP_LEVEL_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
-/// Environment for every git command. Smudging LFS pointers could download objects.
+/// Environment for every git read. Smudging LFS pointers could download objects.
 const GIT_ENV: [(&str, &str); 4] = [
     ("LC_ALL", "C"),
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_OPTIONAL_LOCKS", "0"),
     ("GIT_LFS_SKIP_SMUDGE", "1"),
+];
+/// Environment for every git write: it takes the index lock, checks files out as the
+/// user's git would, and never waits for an editor or a prompt.
+const GIT_WRITE_ENV: [(&str, &str); 3] = [
+    ("LC_ALL", "C"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_EDITOR", "true"),
 ];
 
 const STATUS: &[&str] = &[
@@ -193,14 +204,7 @@ pub fn read_file(
     let repo = content_files::resolve(environment, repo)?.shell;
     let site = Site::of(environment, &repo);
     let (environment, repo) = (&site.environment, site.folder.as_str());
-    // Windows paths would also split at `\` and name alternate streams with `:`.
-    let windows_host = cfg!(windows) && *environment == ContentEnvironment::Host;
-    if !is_repo_path(path) || (windows_host && path.contains(['\\', ':'])) {
-        return Err((
-            ErrorCode::InvalidRequest,
-            format!("{path:?} is not a path inside the repository"),
-        ));
-    }
+    check_path(environment, path)?;
     let limit = read_limit(path);
     // Head and index blobs are filtered as a checkout would write them, so their line
     // endings match the work tree's.
@@ -669,6 +673,18 @@ fn listing(run: Run, context: &str) -> Result<Run, Failure> {
     }
 }
 
+/// How a git command runs.
+#[derive(Clone, Copy)]
+enum Access<'a> {
+    /// No optional locks, stdin closed, `TIMEOUT`; output past the limit stops it.
+    Read,
+    /// Locks allowed, `input` on stdin; output past the limit is drained and dropped.
+    Write {
+        input: Option<&'a [u8]>,
+        timeout: Duration,
+    },
+}
+
 /// Run git in `folder` with at most `limit` bytes of standard output; more stops it.
 fn git(
     environment: &ContentEnvironment,
@@ -676,74 +692,113 @@ fn git(
     args: &[&str],
     limit: usize,
 ) -> Result<Run, Failure> {
-    let mut command = git_command(environment)?;
+    run(environment, folder, args, limit, Access::Read)
+}
+
+fn run(
+    environment: &ContentEnvironment,
+    folder: &str,
+    args: &[&str],
+    limit: usize,
+    access: Access<'_>,
+) -> Result<Run, Failure> {
+    let (input, timeout) = match access {
+        Access::Read => (None, TIMEOUT),
+        Access::Write { input, timeout } => (input, timeout),
+    };
+    let reading = matches!(access, Access::Read);
+    let mut command = git_command(environment, reading)?;
+    if reading {
+        command.arg("--no-optional-locks");
+    }
     command
-        .args([
-            "--no-optional-locks",
-            "-c",
-            "core.quotepath=off",
-            "-C",
-            folder,
-        ])
+        .args(["-c", "core.quotepath=off", "-C", folder])
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| (ErrorCode::Internal, format!("could not run git: {error}")))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
+    let stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
     let mut reader = Some(thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.take(limit as u64 + 1).read_to_end(&mut bytes);
+        let _ = (&mut stdout).take(limit as u64 + 1).read_to_end(&mut bytes);
+        if !reading && bytes.len() > limit {
+            bytes.truncate(limit);
+            let _ = io::copy(&mut stdout, &mut io::sink());
+        }
         bytes
     }));
     let errors = thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stderr.take(MAX_STDERR_BYTES as u64).read_to_end(&mut bytes);
+        let _ = (&mut stderr)
+            .take(MAX_STDERR_BYTES as u64)
+            .read_to_end(&mut bytes);
+        let _ = io::copy(&mut stderr, &mut io::sink());
         bytes
     });
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut output = None;
-    let status = loop {
-        if let Some(finished) = reader.take_if(|reader| reader.is_finished()) {
-            let bytes = finished.join().unwrap_or_default();
-            if bytes.len() > limit {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(Run {
-                    success: false,
-                    stdout: bytes,
-                    cut: true,
-                    stderr: String::new(),
-                });
-            }
-            output = Some(bytes);
+    let status = thread::scope(|scope| {
+        // Writing on its own thread keeps the deadline even if git stops reading; killing
+        // git breaks the pipe and ends the writer.
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            scope.spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(input);
+            });
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            result => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err((
-                    ErrorCode::Internal,
-                    result.err().map_or_else(
-                        || format!("git did not finish within {} seconds", TIMEOUT.as_secs()),
-                        |error| error.to_string(),
-                    ),
-                ));
+        loop {
+            if let Some(finished) = reader.take_if(|reader| reader.is_finished()) {
+                let bytes = finished.join().unwrap_or_default();
+                if bytes.len() > limit {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(Err(bytes));
+                }
+                output = Some(bytes);
             }
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(Ok(status)),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err((
+                        ErrorCode::Internal,
+                        result.err().map_or_else(
+                            || format!("git did not finish within {} seconds", timeout.as_secs()),
+                            |error| error.to_string(),
+                        ),
+                    ));
+                }
+            }
+        }
+    })?;
+    let status = match status {
+        Ok(status) => status,
+        Err(bytes) => {
+            return Ok(Run {
+                success: false,
+                stdout: bytes,
+                cut: true,
+                stderr: String::new(),
+            });
         }
     };
-    let stdout = match output {
-        Some(bytes) => bytes,
-        None => reader
-            .map(|reader| reader.join().unwrap_or_default())
-            .unwrap_or_default(),
+    let stdout = match (output, reader) {
+        (Some(bytes), _) => bytes,
+        (None, Some(reader)) => collected(reader),
+        (None, None) => Vec::new(),
     };
-    let stderr = crate::prompt::target::decode(&errors.join().unwrap_or_default());
+    let stderr = crate::prompt::target::decode(&collected(errors));
     let cut = stdout.len() > limit;
     Ok(Run {
         success: status.success() && !cut,
@@ -753,12 +808,42 @@ fn git(
     })
 }
 
-/// Git on the daemon host, or inside a WSL distribution of a Windows daemon.
-fn git_command(environment: &ContentEnvironment) -> Result<Command, Failure> {
+/// What a pipe reader read once git exited. A process git started (a hook's background
+/// job) can hold the pipe open; after a short grace its output is given up rather than
+/// waited for.
+fn collected(reader: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    let grace = Instant::now() + Duration::from_secs(2);
+    while !reader.is_finished() && Instant::now() < grace {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if reader.is_finished() {
+        reader.join().unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Rejects `path` unless it names a file relative to a repository top level. Windows
+/// paths would also split at `\` and name alternate streams with `:`.
+fn check_path(environment: &ContentEnvironment, path: &str) -> Result<(), Failure> {
+    let windows_host = cfg!(windows) && *environment == ContentEnvironment::Host;
+    if !is_repo_path(path) || (windows_host && path.contains(['\\', ':'])) {
+        return Err((
+            ErrorCode::InvalidRequest,
+            format!("{path:?} is not a path inside the repository"),
+        ));
+    }
+    Ok(())
+}
+
+/// Git on the daemon host, or inside a WSL distribution of a Windows daemon, with the read
+/// or the write environment.
+fn git_command(environment: &ContentEnvironment, reading: bool) -> Result<Command, Failure> {
+    let env: &[(&str, &str)] = if reading { &GIT_ENV } else { &GIT_WRITE_ENV };
     match environment {
         ContentEnvironment::Host => {
             let mut command = Command::new("git");
-            command.envs(GIT_ENV);
+            command.envs(env.iter().copied());
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -773,7 +858,7 @@ fn git_command(environment: &ContentEnvironment) -> Result<Command, Failure> {
             command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
             command
                 .args(["--distribution", distribution, "--exec", "/usr/bin/env"])
-                .args(GIT_ENV.map(|(key, value)| format!("{key}={value}")))
+                .args(env.iter().map(|(key, value)| format!("{key}={value}")))
                 .arg("git");
             Ok(command)
         }

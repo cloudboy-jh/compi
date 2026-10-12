@@ -3,25 +3,30 @@
 //! them in two sections as `git status` does (Unstaged: the work tree against the index,
 //! untracked files included; Staged: the index against `HEAD`), and a change opens as a
 //! diff tab beside the file tabs (`open_diff`). An open diff is read again when its change's
-//! stamp moves and replaced in place, keeping scroll, context and find. Reviewing never
-//! writes: the daemon reads with Git's optional locks off, so neither files, the index nor
-//! any other Git state change.
+//! stamp moves and replaced in place, keeping scroll, context and find. Reading never
+//! writes: the daemon reads with Git's optional locks off.
+//!
+//! Writes are explicit actions only (`git_write`): stage, unstage and discard on list rows,
+//! section headers and diff tab headers, a hunk's button in a diff tab, and the commit box
+//! above the list. Discarding asks first, naming the files. After every write the folder
+//! is read again at once, so the list, open diffs and gutters follow.
 use super::content::{
     CHECK_INTERVAL, FILE_TAB_HEIGHT, PaneUi, TREE_INDENT, TREE_INSET, file_name, find_content,
     reusable_content, same_folder,
 };
-use super::diff_view::{DiffSettings, DiffStyle, DiffView, LayoutMode};
+use super::diff_view::{DiffSettings, DiffStyle, DiffView, HunkButton, HunkClicked, LayoutMode};
 use super::files::FileScope;
 use super::tree::join_path;
 use super::tree_ui::tree_entry_icon;
 use super::*;
 use crate::content_path::{repo_relative, work_tree_path};
-use crate::diff::{Side, Whitespace};
+use crate::diff::{HunkWrite, Side, Whitespace, set_index_lines};
 use compi_protocol::{
-    ContentEnvironment, ContentTab, GitChange, GitChangeKind, GitChanges, GitFileContent,
-    GitRevision, GitScope, PaneContent,
+    ContentEnvironment, ContentTab, GitAction, GitChange, GitChangeKind, GitChanges,
+    GitFileContent, GitRevision, GitScope, GitWriteResult, PaneContent,
 };
 use gpui::{AnyElement, Entity, ScrollStrategy, UniformListScrollHandle, uniform_list};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -36,6 +41,8 @@ const NOT_REPO_INTERVAL: Duration = Duration::from_secs(30);
 /// Rough glyph advance of the UI font at micro size, for eliding folders.
 const MICRO_GLYPH_WIDTH: f32 = UI_MICRO_TEXT_SIZE * 0.56;
 const SMALL_GLYPH_WIDTH: f32 = UI_SMALL_TEXT_SIZE * 0.56;
+/// How long a commit's or a refused hunk's line stays under the commit box.
+const NOTICE_DURATION: Duration = Duration::from_secs(8);
 
 /// How every Changes list and diff tab of a window shows changes. Not saved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,6 +87,62 @@ pub(super) struct RepoStatus {
     pub(super) pending_open: Option<(String, Option<GitScope>, Option<u32>)>,
     /// The folder tree's marks for the latest listing, by tree path; see `tree_marks`.
     marks: HashMap<String, TreeMark>,
+    /// The commit box above the list; built by the first frame that draws the list.
+    commit: Option<CommitBox>,
+    /// Git writes sent for this repository and not answered yet.
+    writing: usize,
+    /// A write finished while a listing read was out: read again once it lands.
+    reread: bool,
+    /// What the last write left under the commit box.
+    outcome: Option<Outcome>,
+}
+
+/// The commit message being written, and the Amend toggle.
+struct CommitBox {
+    summary: Entity<InputState>,
+    body: Entity<TextareaState>,
+    /// The summary holds more than whitespace.
+    has_summary: bool,
+    amend: bool,
+    /// What the box held before Amend loaded `HEAD`'s message; back when Amend goes off.
+    draft: Option<(String, String)>,
+    /// A commit is on its way.
+    committing: bool,
+    _events: Subscription,
+}
+
+/// What the last write left under the commit box.
+enum Outcome {
+    /// A quiet line that goes after `NOTICE_DURATION`: a commit made, the index moved.
+    Notice(String, Instant),
+    /// Git's message for a failed write, kept until the next write.
+    Error(String),
+}
+
+/// What the answer to a write means for the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteKind {
+    Index,
+    Commit,
+    LastMessage,
+}
+
+impl CommitBox {
+    /// Puts `summary` and `body` in the fields.
+    fn fill(&self, summary: &str, body: &str, window: &mut Window, cx: &mut App) {
+        self.summary
+            .update(cx, |input, cx| input.set_value(summary, window, cx));
+        self.body
+            .update(cx, |input, cx| input.set_value(body, window, cx));
+    }
+
+    /// Amend off: the draft set aside for `HEAD`'s message comes back.
+    fn restore_draft(&mut self, window: &mut Window, cx: &mut App) {
+        self.amend = false;
+        let (summary, body) = self.draft.take().unwrap_or_default();
+        self.has_summary = !summary.trim().is_empty();
+        self.fill(&summary, &body, window, cx);
+    }
 }
 
 /// What the folder tree shows beside a path.
@@ -114,14 +177,17 @@ pub(super) struct DiffTab {
 struct Shown {
     stamp: String,
     view: Entity<DiffView>,
+    /// Hunk buttons of the view.
+    _events: Subscription,
 }
 
 struct Pending {
     stamp: String,
     load: u64,
     started: Instant,
-    /// Built and waiting until it can draw; the subscription promotes it then.
-    view: Option<(Entity<DiffView>, Subscription)>,
+    /// Built and waiting until it can draw; the first subscription promotes it then, the
+    /// second hears its hunk buttons.
+    view: Option<(Entity<DiffView>, Subscription, Subscription)>,
 }
 
 #[derive(Default)]
@@ -167,6 +233,10 @@ impl RepoStatus {
             list_width: Cell::new(0.0),
             pending_open: None,
             marks: HashMap::new(),
+            commit: None,
+            writing: 0,
+            reread: false,
+            outcome: None,
         }
     }
 
@@ -282,7 +352,7 @@ impl DiffTab {
             self.pending
                 .as_ref()
                 .and_then(|pending| pending.view.as_ref())
-                .map(|(view, _)| view),
+                .map(|(view, _, _)| view),
         )
     }
 
@@ -480,6 +550,54 @@ fn sides(change: &GitChange) -> [Option<(&str, GitRevision)>; 2] {
     }
 }
 
+/// How hunks of `change`'s diff move, and the index path they change: staged from an
+/// unstaged diff, unstaged from a staged one. `None` when the diff does not compare two
+/// versions of one file in the index (added, deleted, untracked or conflicted files).
+fn hunk_target(change: &GitChange) -> Option<(HunkWrite, String)> {
+    if matches!(
+        change.kind,
+        GitChangeKind::Conflicted | GitChangeKind::Untracked
+    ) {
+        return None;
+    }
+    let [Some((old, _)), Some((new, _))] = sides(change) else {
+        return None;
+    };
+    Some(match change.scope {
+        GitScope::Unstaged => (HunkWrite::Stage, old.to_owned()),
+        GitScope::Staged => (HunkWrite::Unstage, new.to_owned()),
+    })
+}
+
+/// The paths staging or unstaging `change` names: a rename's old path too, so both of its
+/// sides move together.
+fn change_paths(change: &GitChange) -> impl Iterator<Item = String> + '_ {
+    std::iter::once(change.path.clone()).chain(change.old_path.clone())
+}
+
+/// `summary` and `body` as one commit message: the body after a blank line, when there
+/// is one.
+fn commit_message(summary: &str, body: &str) -> String {
+    let summary = summary.trim();
+    let body = body.trim_end().trim_start_matches(['\r', '\n']);
+    if body.trim().is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary}\n\n{body}")
+    }
+}
+
+/// A commit message as the box shows it: its first line as the summary, the rest without
+/// the blank lines after the summary as the body.
+fn split_message(message: &str) -> (String, String) {
+    let message = message.trim_end();
+    let (summary, body) = message.split_once('\n').unwrap_or((message, ""));
+    (
+        summary.trim_end_matches('\r').to_owned(),
+        body.trim_start_matches(['\r', '\n']).to_owned(),
+    )
+}
+
 /// What a change compares, in words.
 fn baseline(change: &GitChange) -> String {
     let comparison = match (change.kind, change.scope) {
@@ -665,6 +783,63 @@ fn context_icon(expanded: bool, tint: Hsla) -> impl IntoElement {
         },
     )
     .size(px(16.0))
+}
+
+/// A list row's compact action: `glyph` in a small square, `title` as its tooltip.
+fn row_button(
+    id: &'static str,
+    index: usize,
+    glyph: &'static str,
+    title: &'static str,
+    colors: ThemeColors,
+    on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id((id, index))
+        .flex_none()
+        .size(px(18.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .text_size(px(UI_SMALL_TEXT_SIZE))
+        .text_color(color(colors.foreground))
+        .hover(move |style| style.bg(color(colors.selection)))
+        .child(glyph)
+        .tooltip(move |_, cx| {
+            cx.new(|_| HeaderTooltip {
+                title: title.into(),
+                reason: None,
+                colors,
+            })
+            .into()
+        })
+        .on_mouse_down(MouseButton::Left, on_press)
+}
+
+/// A row's actions at its right end while it is hovered, over its line counts.
+fn row_actions(colors: ThemeColors, buttons: Vec<gpui::Stateful<gpui::Div>>) -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right(px(6.0))
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .px(px(2.0))
+        .invisible()
+        .group_hover("changes-row", |style| style.visible())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .rounded_sm()
+                .bg(color(colors.surface_hover))
+                .children(buttons),
+        )
 }
 
 impl CompiApp {
@@ -1037,7 +1212,8 @@ impl CompiApp {
     }
 
     /// Before drawing: the active diff tab of each shown pane is read when its change is
-    /// new or moved, and every diff takes the window's colors and font.
+    /// new or moved, every diff takes the window's colors and font and the hunk button its
+    /// change allows, and each shown Changes list gets its commit box.
     pub(super) fn prepare_diff_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active: Vec<(PaneId, ContentTab)> = match &self.workspace {
             Some(workspace) => self
@@ -1057,14 +1233,93 @@ impl CompiApp {
             colors: *self.colors(),
             typography: self.typography.clone(),
         };
-        for view in self
-            .content
-            .panes
-            .values()
-            .flat_map(|ui| ui.diffs.values())
-            .flat_map(DiffTab::views)
-        {
-            view.update(cx, |view, cx| view.set_style(style.clone(), cx));
+        for ui in self.content.panes.values() {
+            for (tab, state) in &ui.diffs {
+                let button = match tab {
+                    ContentTab::Diff { repo, path, scope } => ui
+                        .repo
+                        .change(repo, path, *scope)
+                        .and_then(hunk_target)
+                        .map(|(write, _)| match write {
+                            HunkWrite::Stage => HunkButton::Stage,
+                            HunkWrite::Unstage => HunkButton::Unstage,
+                        }),
+                    ContentTab::File { .. } => None,
+                };
+                for view in state.views() {
+                    view.update(cx, |view, cx| {
+                        view.set_style(style.clone(), cx);
+                        view.set_hunk_button(button, cx);
+                    });
+                }
+            }
+        }
+        let boxless: Vec<PaneId> = self
+            .shown_content_panes()
+            .filter(|pane_id| {
+                self.content.panes.get(*pane_id).is_some_and(|ui| {
+                    ui.mode == SidebarMode::Changes
+                        && ui.repo.commit.is_none()
+                        && ui.repo.listing().is_some()
+                })
+            })
+            .cloned()
+            .collect();
+        for pane_id in boxless {
+            let commit = self.new_commit_box(&pane_id, window, cx);
+            if let Some(ui) = self.content.panes.get_mut(&pane_id) {
+                ui.repo.commit = Some(commit);
+            }
+        }
+    }
+
+    /// The summary field, the body field and what their events do.
+    fn new_commit_box(
+        &mut self,
+        pane_id: &PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> CommitBox {
+        let summary = cx.new(|cx| InputState::new(window, cx).placeholder("Summary"));
+        let body = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Description")
+                .auto_grow(2, 8)
+        });
+        let (pane, next) = (pane_id.clone(), body.clone());
+        let events = cx.subscribe_in(
+            &summary,
+            window,
+            move |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let filled = !input.read(cx).value().trim().is_empty();
+                    if let Some(commit) = this
+                        .content
+                        .panes
+                        .get_mut(&pane)
+                        .and_then(|ui| ui.repo.commit.as_mut())
+                        && commit.has_summary != filled
+                    {
+                        commit.has_summary = filled;
+                        cx.notify();
+                    }
+                }
+                // Enter in the summary goes on to the description.
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } => next.update(cx, |body, cx| body.focus(window, cx)),
+                _ => {}
+            },
+        );
+        CommitBox {
+            summary,
+            body,
+            has_summary: false,
+            amend: false,
+            draft: None,
+            committing: false,
+            _events: events,
         }
     }
 
@@ -1215,8 +1470,16 @@ impl CompiApp {
         let subscription = cx.observe_in(&view, window, move |this, view, _, cx| {
             this.diff_view_changed(&pane, &waiting, &view, cx);
         });
+        let (pane, clicked) = (pane_id.clone(), tab.clone());
+        let events = cx.subscribe_in(
+            &view,
+            window,
+            move |this, _, event: &HunkClicked, window, cx| {
+                this.hunk_clicked(&pane, &clicked, event, window, cx);
+            },
+        );
         state.pending = Some(Pending {
-            view: Some((view, subscription)),
+            view: Some((view, subscription, events)),
             ..pending
         });
         cx.notify();
@@ -1245,13 +1508,17 @@ impl CompiApp {
             pending
                 .view
                 .as_ref()
-                .is_some_and(|(waiting, _)| waiting == view)
+                .is_some_and(|(waiting, _, _)| waiting == view)
         }) else {
+            return;
+        };
+        let Some((view, _, events)) = pending.view else {
             return;
         };
         state.shown = Some(Shown {
             stamp: pending.stamp,
-            view: view.clone(),
+            view,
+            _events: events,
         });
         cx.notify();
     }
@@ -1368,8 +1635,16 @@ impl CompiApp {
                 true
             }
         };
+        let reread = std::mem::take(&mut repo.reread);
         if let Some((path, scope, line)) = repo.pending_open.take() {
             self.open_diff(pane_id, path, scope, line, window, cx);
+        }
+        if reread {
+            self.request_repo_listing(pane_id, window, cx);
+        }
+        if changed {
+            // Gutters key their index reads by the listing; a write moves them at once.
+            self.refresh_gutters(cx);
         }
         if changed || marked {
             cx.notify();
@@ -1384,6 +1659,370 @@ impl CompiApp {
             }
         }
         self.request_repo_listing(pane_id, window, cx);
+    }
+
+    /// Sends `action` to the repository whose top level is `repo`, listed in `pane_id`.
+    /// When it is answered, every pane listing that repository reads it again at once.
+    pub(super) fn git_write(
+        &mut self,
+        pane_id: &PaneId,
+        repo: String,
+        action: GitAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = match action {
+            GitAction::Commit { .. } => WriteKind::Commit,
+            GitAction::LastMessage => WriteKind::LastMessage,
+            _ => WriteKind::Index,
+        };
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        ui.repo.writing += 1;
+        if kind != WriteKind::LastMessage {
+            ui.repo.outcome = None;
+        }
+        let environment = ui.environment.clone();
+        let target = self.target.clone();
+        let pane = pane_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = {
+                let (environment, repo) = (environment.clone(), repo.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        (|| -> crate::Result<_> {
+                            target.connect()?.git_write(environment, repo, action)
+                        })()
+                        .map_err(|error| error.to_string())
+                    })
+                    .await
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.git_written(&pane, &environment, &repo, kind, result, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn git_written(
+        &mut self,
+        pane_id: &PaneId,
+        environment: &ContentEnvironment,
+        repo: &str,
+        kind: WriteKind,
+        result: Result<GitWriteResult, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ui) = self.content.panes.get_mut(pane_id) {
+            let status = &mut ui.repo;
+            status.writing = status.writing.saturating_sub(1);
+            if kind == WriteKind::Commit
+                && let Some(commit) = &mut status.commit
+            {
+                commit.committing = false;
+            }
+            let mut notice = None;
+            match result {
+                Ok(GitWriteResult::Done) => {}
+                Ok(GitWriteResult::Committed { head, summary }) => {
+                    if let Some(commit) = &mut status.commit {
+                        commit.amend = false;
+                        commit.draft = None;
+                        commit.has_summary = false;
+                        commit.fill("", "", window, cx);
+                    }
+                    notice = Some(format!("Committed {head} {summary}"));
+                }
+                Ok(GitWriteResult::Message { text }) => {
+                    // Amend may have been turned off while the message was on its way.
+                    if let Some(commit) = status.commit.as_mut().filter(|commit| commit.amend) {
+                        let (summary, body) = split_message(&text);
+                        commit.has_summary = !summary.trim().is_empty();
+                        commit.fill(&summary, &body, window, cx);
+                    }
+                }
+                Ok(GitWriteResult::Stale) => {
+                    notice = Some("The index changed; refreshed".to_owned());
+                    // Read the diffs again even if their stamps look current.
+                    for state in ui.diffs.values_mut() {
+                        if let Some(shown) = &mut state.shown {
+                            shown.stamp.clear();
+                        }
+                    }
+                }
+                Err(error) => {
+                    if kind == WriteKind::LastMessage
+                        && let Some(commit) = status.commit.as_mut().filter(|commit| commit.amend)
+                    {
+                        commit.restore_draft(window, cx);
+                    }
+                    status.outcome = Some(Outcome::Error(error));
+                }
+            }
+            if let Some(text) = notice {
+                status.outcome = Some(Outcome::Notice(text, Instant::now()));
+                let pane = pane_id.clone();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(NOTICE_DURATION).await;
+                    this.update(cx, |this, cx| {
+                        if let Some(status) = this.content.panes.get_mut(&pane).map(|ui| &mut ui.repo)
+                            && matches!(&status.outcome, Some(Outcome::Notice(_, at)) if at.elapsed() >= NOTICE_DURATION)
+                        {
+                            status.outcome = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+        if kind != WriteKind::LastMessage {
+            let listing: Vec<PaneId> = self
+                .content
+                .panes
+                .iter()
+                .filter(|(_, ui)| {
+                    ui.environment == *environment
+                        && ui
+                            .repo
+                            .listing()
+                            .is_some_and(|listing| same_folder(&listing.repo, repo))
+                })
+                .map(|(pane_id, _)| pane_id.clone())
+                .collect();
+            for pane_id in listing {
+                self.refresh_repo_now(&pane_id, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reads `pane_id`'s folder now; a read already out is answered, then read again.
+    fn refresh_repo_now(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        if ui.repo.reading.is_some() {
+            ui.repo.reread = true;
+        } else {
+            self.request_repo_listing(pane_id, window, cx);
+        }
+    }
+
+    /// The top level of the repository `pane_id` lists, once read.
+    fn listed_repo(&self, pane_id: &PaneId) -> Option<String> {
+        self.repo_changes(pane_id)
+            .map(|listing| listing.repo.clone())
+    }
+
+    /// Stages (`Unstaged` changes) or unstages (`Staged` changes) `changes` of the
+    /// repository `pane_id` lists.
+    fn move_changes(
+        &mut self,
+        pane_id: &PaneId,
+        scope: GitScope,
+        paths: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.listed_repo(pane_id) else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let action = match scope {
+            GitScope::Unstaged => GitAction::Stage { paths },
+            GitScope::Staged => GitAction::Unstage { paths },
+        };
+        self.git_write(pane_id, repo, action, window, cx);
+    }
+
+    /// The paths of every listed change in `scope`, for a section's Stage / Unstage.
+    fn section_paths(&self, pane_id: &PaneId, scope: GitScope) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .repo_changes(pane_id)
+            .map(|listing| {
+                listing
+                    .changes
+                    .iter()
+                    .filter(|change| change.scope == scope)
+                    .flat_map(change_paths)
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    /// Asks before discarding the work-tree changes of `changes` (unstaged ones), naming
+    /// them; untracked files are deleted.
+    fn confirm_discard(&mut self, pane_id: &PaneId, changes: &[GitChange]) {
+        let Some(repo) = self.listed_repo(pane_id) else {
+            return;
+        };
+        let (mut paths, mut untracked) = (Vec::new(), Vec::new());
+        for change in changes {
+            match change.kind {
+                GitChangeKind::Untracked => untracked.push(change.path.clone()),
+                GitChangeKind::Conflicted => {}
+                _ => paths.push(change.path.clone()),
+            }
+        }
+        if paths.is_empty() && untracked.is_empty() {
+            return;
+        }
+        self.open_overlay(
+            Overlay::ConfirmDiscard {
+                pane_id: pane_id.clone(),
+                repo,
+                paths,
+                untracked,
+            },
+            "",
+        );
+    }
+
+    /// A diff tab's hunk button: the hunk moves into or out of the index, if the index
+    /// text still is the one the diff shows.
+    fn hunk_clicked(
+        &mut self,
+        pane_id: &PaneId,
+        tab: &ContentTab,
+        event: &HunkClicked,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ContentTab::Diff { repo, path, scope } = tab else {
+            return;
+        };
+        let Some((write, index_path)) = self
+            .content
+            .panes
+            .get(pane_id)
+            .and_then(|ui| ui.repo.change(repo, path, *scope))
+            .and_then(hunk_target)
+        else {
+            return;
+        };
+        let action = set_index_lines(&event.diff, &event.hunk, write, index_path);
+        self.git_write(pane_id, repo.clone(), action, window, cx);
+    }
+
+    /// Commits what is staged with the box's message, or amends `HEAD` with it.
+    fn commit(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let Listing::Ready(listing) = &ui.repo.listing else {
+            return;
+        };
+        let repo = listing.repo.clone();
+        let staged = listing
+            .changes
+            .iter()
+            .any(|change| change.scope == GitScope::Staged);
+        let Some(commit) = ui.repo.commit.as_mut() else {
+            return;
+        };
+        if commit.committing {
+            return;
+        }
+        let refusal = if !commit.has_summary {
+            Some("Write a summary first")
+        } else if !staged && !commit.amend {
+            Some("Nothing is staged to commit")
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            ui.repo.outcome = Some(Outcome::Notice(refusal.into(), Instant::now()));
+            cx.notify();
+            return;
+        }
+        let message = commit_message(
+            &commit.summary.read(cx).value(),
+            &commit.body.read(cx).value(),
+        );
+        let amend = commit.amend;
+        commit.committing = true;
+        self.git_write(
+            pane_id,
+            repo,
+            GitAction::Commit { message, amend },
+            window,
+            cx,
+        );
+    }
+
+    /// Amend on: `HEAD`'s message replaces the box's draft, which is kept. Off: the draft
+    /// comes back.
+    fn toggle_amend(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let Listing::Ready(listing) = &ui.repo.listing else {
+            return;
+        };
+        let (repo, born) = (listing.repo.clone(), listing.head.is_some());
+        let Some(commit) = ui.repo.commit.as_mut() else {
+            return;
+        };
+        if commit.amend {
+            commit.restore_draft(window, cx);
+            cx.notify();
+            return;
+        }
+        if !born {
+            return;
+        }
+        commit.amend = true;
+        commit.draft = Some((
+            commit.summary.read(cx).value().to_string(),
+            commit.body.read(cx).value().to_string(),
+        ));
+        self.git_write(pane_id, repo, GitAction::LastMessage, window, cx);
+    }
+
+    /// Ctrl/Cmd+Enter in a commit box's field commits. Whether the key was taken.
+    pub(super) fn commit_box_key(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let modifiers = &key.modifiers;
+        let primary = if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.control
+        } else {
+            modifiers.control && !modifiers.platform
+        };
+        if key.key != "enter" || !primary || modifiers.alt || modifiers.shift {
+            return false;
+        }
+        let Some(pane_id) = self.focused_pane().cloned() else {
+            return false;
+        };
+        let focused = self
+            .content
+            .panes
+            .get(&pane_id)
+            .and_then(|ui| ui.repo.commit.as_ref())
+            .is_some_and(|commit| {
+                commit.summary.focus_handle(cx).is_focused(window)
+                    || commit.body.focus_handle(cx).is_focused(window)
+            });
+        if focused {
+            self.commit(&pane_id, window, cx);
+        }
+        focused
     }
 
     fn set_changes_settings(&mut self, settings: ChangesSettings, cx: &mut Context<Self>) {
@@ -1489,8 +2128,9 @@ impl CompiApp {
     }
 
     /// Keys while a diff tab is active and the pane itself has the keyboard: `[`/`]` step
-    /// through the changes, Ctrl/Cmd+F finds in the diff, and the diff takes the rest it
-    /// knows.
+    /// through the changes, `s` stages the file of an unstaged diff and `u` unstages the
+    /// file of a staged one (the row the list selects), Ctrl/Cmd+F finds in the diff, and
+    /// the diff takes the rest it knows.
     pub(super) fn diff_tab_key_down(
         &mut self,
         pane_id: &PaneId,
@@ -1507,6 +2147,17 @@ impl CompiApp {
                 self.step_diff(pane_id, typed == "]");
                 return true;
             }
+            let wanted = match typed {
+                "s" => Some(GitScope::Unstaged),
+                "u" => Some(GitScope::Staged),
+                _ => None,
+            };
+            if let ContentTab::Diff { scope, .. } = tab
+                && wanted == Some(*scope)
+            {
+                self.move_tab_file(pane_id, tab, window, cx);
+                return true;
+            }
         }
         let view = self
             .content
@@ -1516,6 +2167,29 @@ impl CompiApp {
             .and_then(DiffTab::view)
             .cloned();
         view.is_some_and(|view| view.update(cx, |view, cx| view.key_down(event, window, cx)))
+    }
+
+    /// Stages the file of an unstaged diff tab, unstages the file of a staged one.
+    fn move_tab_file(
+        &mut self,
+        pane_id: &PaneId,
+        tab: &ContentTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ContentTab::Diff { repo, path, scope } = tab else {
+            return;
+        };
+        let Some(paths) = self
+            .content
+            .panes
+            .get(pane_id)
+            .and_then(|ui| ui.repo.change(repo, path, *scope))
+            .map(|change| change_paths(change).collect())
+        else {
+            return;
+        };
+        self.move_changes(pane_id, *scope, paths, window, cx);
     }
 
     /// The sidebar's Files | Changes switch, shown once the folder is known to be in a
@@ -1749,6 +2423,7 @@ impl CompiApp {
             .flex_col()
             .text_size(px(UI_SMALL_TEXT_SIZE))
             .child(header)
+            .children(self.render_commit_box(pane_id, repo, listing, cx))
             .child(body)
             .when(listing.truncated, |list| {
                 list.child(
@@ -1767,6 +2442,185 @@ impl CompiApp {
                 )
             })
             .into_any_element()
+    }
+
+    /// The commit box: summary, description, Amend, the staged count and Commit, then the
+    /// last write's line. Nothing until a frame has built its fields.
+    fn render_commit_box(
+        &self,
+        pane_id: &PaneId,
+        repo: &RepoStatus,
+        listing: &GitChanges,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let commit = repo.commit.as_ref()?;
+        let colors = *self.colors();
+        let staged = listing
+            .changes
+            .iter()
+            .filter(|change| change.scope == GitScope::Staged)
+            .count();
+        let born = listing.head.is_some();
+        let refusal = if commit.committing {
+            Some("Committing…")
+        } else if staged == 0 && !commit.amend {
+            Some("Stage changes to commit them")
+        } else if !commit.has_summary {
+            Some("Write a summary first")
+        } else {
+            None
+        };
+        let ready = refusal.is_none();
+        let shortcut = if cfg!(target_os = "macos") {
+            "⌘Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+        let pane = pane_id.clone();
+        let amend = div()
+            .id("commit-amend")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .h(px(22.0))
+            .rounded_sm()
+            .text_color(color(if commit.amend {
+                colors.foreground
+            } else {
+                colors.muted
+            }))
+            .child(
+                div()
+                    .size(px(12.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color(if commit.amend {
+                        colors.accent
+                    } else {
+                        colors.border
+                    }))
+                    .when(commit.amend, |check| check.bg(color(colors.accent))),
+            )
+            .child("Amend")
+            .when(born, |toggle| {
+                toggle
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.toggle_amend(&pane, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            })
+            .when(!born, |toggle| toggle.opacity(0.5))
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: "Amend the last commit".into(),
+                    reason: Some(
+                        if born {
+                            "Loads its message; staged changes join it"
+                        } else {
+                            "There is no commit yet"
+                        }
+                        .into(),
+                    ),
+                    colors,
+                })
+                .into()
+            });
+        let pane = pane_id.clone();
+        let label = match (commit.committing, commit.amend) {
+            (true, _) => "Committing…",
+            (false, true) => "Amend",
+            (false, false) => "Commit",
+        };
+        let button = div()
+            .id("commit-button")
+            .flex_none()
+            .h(px(22.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .rounded_sm()
+            .bg(color(colors.accent))
+            .text_color(color(ui_text_color(colors.background, colors.accent)))
+            .font_weight(FontWeight::MEDIUM)
+            .child(label)
+            .when(ready, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.9))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.commit(&pane, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            })
+            .when(!ready, |button| button.opacity(0.45))
+            .tooltip(move |_, cx| {
+                cx.new(|_| HeaderTooltip {
+                    title: refusal.unwrap_or(shortcut).into(),
+                    reason: None,
+                    colors,
+                })
+                .into()
+            });
+        let outcome = repo.outcome.as_ref().map(|outcome| {
+            let (text, tint, mono) = match outcome {
+                Outcome::Notice(text, _) => (text.clone(), colors.muted, false),
+                Outcome::Error(text) => (text.clone(), colors.error, true),
+            };
+            div()
+                .id("commit-outcome")
+                .max_h(px(96.0))
+                .overflow_y_scroll()
+                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .text_color(color(tint))
+                .when(mono, |line| {
+                    line.font_family(self.typography.font.family.clone())
+                })
+                .child(text)
+        });
+        Some(
+            div()
+                .flex_none()
+                .px_2()
+                .pt_1()
+                .pb_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .border_b_1()
+                .border_color(color(colors.border))
+                .child(Input::new(&commit.summary).appearance(true))
+                .child(Textarea::new(&commit.body).appearance(true))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .child(amend)
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(color(colors.muted))
+                                .child(format!("{staged} staged")),
+                        )
+                        .child(button),
+                )
+                .children(outcome)
+                .into_any_element(),
+        )
     }
 
     fn changes_message(
@@ -1875,6 +2729,23 @@ impl CompiApp {
                         collapsed,
                     } => {
                         let scope = *scope;
+                        let mover = pane.clone();
+                        let (glyph, title) = match scope {
+                            GitScope::Unstaged => ("+", "Stage all"),
+                            GitScope::Staged => ("−", "Unstage all"),
+                        };
+                        let move_all = row_button(
+                            "changes-section-move",
+                            index,
+                            glyph,
+                            title,
+                            colors,
+                            cx.listener(move |this, _, window, cx| {
+                                let paths = this.section_paths(&mover, scope);
+                                this.move_changes(&mover, scope, paths, window, cx);
+                                cx.stop_propagation();
+                            }),
+                        );
                         base.pl(px(TREE_INSET))
                             .text_size(px(UI_MICRO_TEXT_SIZE))
                             .text_color(color(colors.muted))
@@ -1896,6 +2767,7 @@ impl CompiApp {
                                     )
                                     .child(div().ml_2().child(count.to_string())),
                             )
+                            .child(row_actions(colors, vec![move_all]))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
@@ -1987,6 +2859,50 @@ impl CompiApp {
                         let (path, scope) = (change.path.clone(), change.scope);
                         let deleted = change.kind == GitChangeKind::Deleted;
                         let kind = change.kind;
+                        let mut actions = Vec::new();
+                        if scope == GitScope::Unstaged && kind != GitChangeKind::Conflicted {
+                            let (discarder, discarded) = (pane.clone(), change.clone());
+                            actions.push(row_button(
+                                "changes-row-discard",
+                                index,
+                                "↺",
+                                if kind == GitChangeKind::Untracked {
+                                    "Delete file…"
+                                } else {
+                                    "Discard changes…"
+                                },
+                                colors,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.confirm_discard(
+                                        &discarder,
+                                        std::slice::from_ref(&discarded),
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ));
+                        }
+                        let (mover, paths) =
+                            (pane.clone(), change_paths(change).collect::<Vec<_>>());
+                        actions.push(row_button(
+                            "changes-row-move",
+                            index,
+                            if scope == GitScope::Unstaged {
+                                "+"
+                            } else {
+                                "−"
+                            },
+                            match (scope, kind) {
+                                (GitScope::Staged, _) => "Unstage",
+                                (_, GitChangeKind::Conflicted) => "Stage (marks it resolved)",
+                                _ => "Stage",
+                            },
+                            colors,
+                            cx.listener(move |this, _, window, cx| {
+                                this.move_changes(&mover, scope, paths.clone(), window, cx);
+                                cx.stop_propagation();
+                            }),
+                        ));
                         base.pl(px(inset))
                             .when(tree, |row| {
                                 row.children(indent_guides(level, colors.border))
@@ -2052,6 +2968,7 @@ impl CompiApp {
                                         })
                                     })),
                             )
+                            .child(row_actions(colors, actions))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
@@ -2414,6 +3331,74 @@ impl CompiApp {
                 })
                 .into()
             });
+        let (move_label, move_reason) = match scope {
+            GitScope::Unstaged => ("Stage file", "Adds the whole file to the index · S"),
+            GitScope::Staged => ("Unstage file", "Takes the whole file out of the index · U"),
+        };
+        let (move_pane, move_tab) = (pane_id.clone(), tab.clone());
+        let move_button = change.map(|_| {
+            button("diff-move-file")
+                .px_2()
+                .border_1()
+                .border_color(color(colors.border))
+                .text_color(color(colors.foreground))
+                .cursor_pointer()
+                .hover(move |style| style.bg(color(colors.surface_hover)))
+                .child(move_label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.move_tab_file(&move_pane, &move_tab, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .tooltip(move |_, cx| {
+                    cx.new(|_| HeaderTooltip {
+                        title: move_label.into(),
+                        reason: Some(move_reason.into()),
+                        colors,
+                    })
+                    .into()
+                })
+        });
+        let discard_pane = pane_id.clone();
+        let discard_button = change
+            .filter(|change| {
+                change.scope == GitScope::Unstaged && change.kind != GitChangeKind::Conflicted
+            })
+            .cloned()
+            .map(|change| {
+                let untracked = change.kind == GitChangeKind::Untracked;
+                button("diff-discard")
+                    .px_2()
+                    .border_1()
+                    .border_color(color(colors.border))
+                    .text_color(color(colors.error))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                    .child("Discard")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.confirm_discard(&discard_pane, std::slice::from_ref(&change));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| HeaderTooltip {
+                            title: if untracked {
+                                "Delete file…"
+                            } else {
+                                "Discard changes…"
+                            }
+                            .into(),
+                            reason: Some("Asks first".into()),
+                            colors,
+                        })
+                        .into()
+                    })
+            });
         div()
             .flex_none()
             .min_h(px(FILE_TAB_HEIGHT))
@@ -2507,7 +3492,9 @@ impl CompiApp {
                     .child(layout)
                     .child(whitespace_button)
                     .child(context_button)
-                    .child(edit_button),
+                    .child(edit_button)
+                    .children(move_button)
+                    .children(discard_button),
             )
     }
 }
@@ -2742,6 +3729,65 @@ mod tests {
             sides(&change(GitScope::Unstaged, Conflicted, "a")),
             [Some(("a", Head)), Some(("a", WorkTree))]
         );
+    }
+
+    #[test]
+    fn commit_messages_join_and_split_at_the_blank_line() {
+        assert_eq!(commit_message("  Fix it  ", ""), "Fix it");
+        assert_eq!(commit_message("Fix it", " \n\n"), "Fix it");
+        assert_eq!(
+            commit_message("Fix it", "\nWhy:\n- because\n\n"),
+            "Fix it\n\nWhy:\n- because"
+        );
+        assert_eq!(
+            split_message("Fix it\n\nWhy:\n- because\n"),
+            ("Fix it".to_owned(), "Why:\n- because".to_owned())
+        );
+        assert_eq!(
+            split_message("Only a summary\n"),
+            ("Only a summary".to_owned(), String::new())
+        );
+        assert_eq!(
+            split_message("Windows\r\n\r\nbody\r\n"),
+            ("Windows".to_owned(), "body".to_owned())
+        );
+        let (summary, body) = split_message("Fix it\n\nWhy:\n- because\n");
+        assert_eq!(commit_message(&summary, &body), "Fix it\n\nWhy:\n- because");
+    }
+
+    #[test]
+    fn hunks_move_only_between_two_index_versions() {
+        use GitChangeKind::*;
+        use GitScope::{Staged, Unstaged};
+        assert_eq!(
+            hunk_target(&change(Unstaged, Modified, "a.rs")),
+            Some((HunkWrite::Stage, "a.rs".into()))
+        );
+        assert_eq!(
+            hunk_target(&change(Staged, Modified, "a.rs")),
+            Some((HunkWrite::Unstage, "a.rs".into()))
+        );
+        let renamed = GitChange {
+            old_path: Some("old.rs".into()),
+            ..change(Staged, Renamed, "new.rs")
+        };
+        assert_eq!(
+            hunk_target(&renamed),
+            Some((HunkWrite::Unstage, "new.rs".into()))
+        );
+        assert_eq!(
+            change_paths(&renamed).collect::<Vec<_>>(),
+            ["new.rs", "old.rs"]
+        );
+        for (scope, kind) in [
+            (Unstaged, Untracked),
+            (Unstaged, Conflicted),
+            (Unstaged, Deleted),
+            (Staged, Added),
+            (Staged, Deleted),
+        ] {
+            assert_eq!(hunk_target(&change(scope, kind, "a.rs")), None, "{kind:?}");
+        }
     }
 
     #[test]

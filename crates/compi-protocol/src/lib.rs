@@ -37,7 +37,8 @@ use std::fmt;
 // version against the file on disk.
 // Version 22 adds the review of a repository's uncommitted Git changes.
 // Version 23 replaces a content pane's files and view with tabs holding files and diffs.
-pub const PROTOCOL_VERSION: u32 = 23;
+// Version 24 adds Git writes: stage, unstage, hunk staging, discard and commit.
+pub const PROTOCOL_VERSION: u32 = 24;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -292,6 +293,13 @@ pub enum ClientMessage {
         path: String,
         revision: GitRevision,
     },
+    /// A Git write in the repository whose top level is `repo`; writes to one repository
+    /// run one at a time. Git's own failure text is the error message.
+    GitWrite {
+        environment: ContentEnvironment,
+        repo: String,
+        action: GitAction,
+    },
     Mutate {
         mutation: MutationRequest,
     },
@@ -391,6 +399,9 @@ pub enum ServerMessage {
     },
     GitFileRead {
         content: GitFileContent,
+    },
+    GitWritten {
+        result: GitWriteResult,
     },
     WorkspaceChanged {
         revision: u64,
@@ -627,6 +638,54 @@ pub enum GitImageFormat {
     Bmp,
     Ico,
     Svg,
+}
+
+/// A write to a repository. Paths are relative to its top level, as `ReadGitFile` checks them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GitAction {
+    /// `git add -A -- <paths>`: stages modifications, additions and deletions.
+    Stage { paths: Vec<String> },
+    /// `git restore --staged -- <paths>`; before the first commit `git rm --cached`.
+    Unstage { paths: Vec<String> },
+    /// Replace lines `lines` (0-based, half-open) of the path's index text with
+    /// `replacement` (exact text including line endings, as `ReadGitFile` shows the index
+    /// side), only if that text still has the version `expected`. Staging a hunk replaces
+    /// its index lines with its work-tree lines; unstaging one restores its `HEAD` lines.
+    /// The index changed since then: `GitWriteResult::Stale`.
+    SetIndexLines {
+        path: String,
+        expected: FileVersion,
+        lines: std::ops::Range<u32>,
+        replacement: String,
+    },
+    /// `git restore --worktree -- <paths>` for tracked paths, `git clean -f -q -- <untracked>`.
+    Discard {
+        paths: Vec<String>,
+        untracked: Vec<String>,
+    },
+    /// `git commit -F -` with `message` on standard input, `--amend` when asked.
+    Commit { message: String, amend: bool },
+    /// `HEAD`'s full message, to edit for an amend; writes nothing.
+    LastMessage,
+}
+
+/// What a Git write did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GitWriteResult {
+    Done,
+    /// The new `HEAD`, abbreviated, and its summary line.
+    Committed {
+        head: String,
+        summary: String,
+    },
+    /// `HEAD`'s message (`LastMessage`).
+    Message {
+        text: String,
+    },
+    /// The index text changed since the client read it; nothing was written.
+    Stale,
 }
 
 /// Whether `path` names a file relative to a repository top level: `/`-separated, not
@@ -1254,6 +1313,54 @@ mod tests {
             let response = ServerControl {
                 request_id: Some(7),
                 message,
+            };
+            assert_eq!(
+                decode_server(&encode_server(&response).unwrap()).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn git_writes_roundtrip_with_tagged_actions() {
+        let request = ClientControl {
+            request_id: 3,
+            target: None,
+            message: ClientMessage::GitWrite {
+                environment: ContentEnvironment::Host,
+                repo: "/home/user/project".into(),
+                action: GitAction::SetIndexLines {
+                    path: "src/main.rs".into(),
+                    expected: FileVersion {
+                        len: 4,
+                        sha256: "ab".into(),
+                    },
+                    lines: 1..3,
+                    replacement: "one\r\ntwo\n".into(),
+                },
+            },
+        };
+        let encoded = serde_json::to_value(&request.message).unwrap();
+        assert_eq!(encoded["action"]["type"], "set_index_lines");
+        assert_eq!(encoded["action"]["lines"]["start"], 1);
+        assert_eq!(
+            decode_client(&encode_client(&request).unwrap()).unwrap(),
+            request
+        );
+        for result in [
+            GitWriteResult::Done,
+            GitWriteResult::Stale,
+            GitWriteResult::Committed {
+                head: "a1b2c3d".into(),
+                summary: "Fix".into(),
+            },
+            GitWriteResult::Message {
+                text: "Fix\n".into(),
+            },
+        ] {
+            let response = ServerControl {
+                request_id: Some(3),
+                message: ServerMessage::GitWritten { result },
             };
             assert_eq!(
                 decode_server(&encode_server(&response).unwrap()).unwrap(),
