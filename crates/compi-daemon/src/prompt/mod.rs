@@ -147,6 +147,12 @@ if [ -z "$shell" ] && command -v dscl >/dev/null 2>&1; then
 fi
 printf 'login_shell\t%s\n' "${shell:-${SHELL:-}}"
 PATH="$PATH:$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/snap/bin"
+omp_themes() {
+    [ -n "$1" ] && [ -d "$1" ] || return 1
+    for theme in "$1"/*.omp.json "$1"/*.omp.yaml "$1"/*.omp.yml "$1"/*.omp.toml; do
+        if [ -f "$theme" ]; then printf 'theme\t%s\n' "$theme"; fi
+    done
+}
 for name in oh-my-posh starship; do
     for bin in $(command -v "$name.exe" 2>/dev/null); do printf 'windows\t%s\t%s\n' "$name" "$bin"; done
     bin=$(command -v "$name" 2>/dev/null) || continue
@@ -155,10 +161,26 @@ for name in oh-my-posh starship; do
     case $name in
         oh-my-posh)
             cache=$("$bin" cache path 2>/dev/null)
-            if [ -n "$cache" ]; then
-                for theme in "$cache"/themes/*.omp.json "$cache"/themes/*.omp.yaml "$cache"/themes/*.omp.yml "$cache"/themes/*.omp.toml; do
-                    if [ -f "$theme" ]; then printf 'theme\t%s\n' "$theme"; fi
-                done
+            omp_themes "${cache:+$cache/themes}"
+            omp_themes "${POSH_THEMES_PATH:-}"
+            # Homebrew links the binary into its bin directory; themes live in the install prefix.
+            real=$bin
+            hops=0
+            while [ -L "$real" ] && [ "$hops" -lt 32 ]; do
+                link=$(readlink "$real" 2>/dev/null) || break
+                case $link in /*) real=$link ;; *) real=${real%/*}/$link ;; esac
+                hops=$((hops + 1))
+            done
+            prefix=$(cd -P "${real%/*}/.." 2>/dev/null && pwd -P)
+            brewed=no
+            for themes in "${prefix:+$prefix/themes}" "${prefix:+$prefix/share/oh-my-posh/themes}" \
+                "${HOMEBREW_PREFIX:+$HOMEBREW_PREFIX/opt/oh-my-posh/themes}" \
+                /opt/homebrew/opt/oh-my-posh/themes /usr/local/opt/oh-my-posh/themes; do
+                if omp_themes "$themes"; then brewed=yes; fi
+            done
+            if [ "$brewed" = no ] && command -v brew >/dev/null 2>&1; then
+                brew_prefix=$(brew --prefix oh-my-posh 2>/dev/null)
+                omp_themes "${brew_prefix:+$brew_prefix/themes}"
             fi
             ;;
         starship)
@@ -250,10 +272,14 @@ fn parse_probe(output: &str) -> Facts {
             _ => {}
         }
     }
+    // The probe lists theme directories in priority order, and the sort is
+    // stable, so the first directory wins when a theme appears in several.
     facts
         .themes
         .sort_by_key(|path| style_label(path).to_lowercase());
-    facts.themes.dedup();
+    facts
+        .themes
+        .dedup_by_key(|path| style_label(path).to_lowercase());
     facts
         .backups
         .sort_by_key(|manifest| std::cmp::Reverse(manifest.created_ms));
@@ -1176,8 +1202,9 @@ mod tests {
 
     const SETUP: &str = r#"set -eu
 home=$1
-mkdir -p "$home/.local/bin" "$home/.cache/oh-my-posh/themes" "$home/themes"
-cat > "$home/.local/bin/oh-my-posh" <<'EOF'
+cellar=$home/brew/Cellar/oh-my-posh/9.9.9
+mkdir -p "$home/.local/bin" "$home/.cache/oh-my-posh/themes" "$home/themes" "$home/posh-themes" "$home/brew/bin" "$cellar/bin" "$cellar/themes"
+cat > "$cellar/bin/oh-my-posh" <<'EOF'
 #!/bin/sh
 case $1 in
     --version) echo 9.9.9 ;;
@@ -1198,9 +1225,15 @@ case $1 in
     prompt) shift; echo "STAR $* config=$(cat "$STARSHIP_CONFIG")" ;;
 esac
 EOF
-chmod +x "$home/.local/bin/oh-my-posh" "$home/.local/bin/starship"
+chmod +x "$cellar/bin/oh-my-posh" "$home/.local/bin/starship"
+# Linked like Homebrew does, through relative symlinks into the install prefix.
+ln -s ../Cellar/oh-my-posh/9.9.9/bin/oh-my-posh "$home/brew/bin/oh-my-posh"
+ln -s ../../brew/bin/oh-my-posh "$home/.local/bin/oh-my-posh"
 echo '{"blocks":[{"type":"prompt","segments":[{"type":"path"}]}]}' > "$home/themes/mine.omp.json"
 echo '{"blocks":[]}' > "$home/.cache/oh-my-posh/themes/cache-theme.omp.json"
+echo '{"blocks":[]}' > "$cellar/themes/cache-theme.omp.json"
+echo '{"blocks":[]}' > "$cellar/themes/brew-theme.omp.json"
+echo 'blocks: []' > "$home/posh-themes/posh-theme.omp.yaml"
 for rc in .bashrc .zshrc; do
     printf 'export KEEP=1\neval "$(oh-my-posh init sh --config ~/themes/mine.omp.json)"\n' > "$home/$rc"
 done"#;
@@ -1280,7 +1313,34 @@ done"#;
             PromptStyle::Existing { path: mine.clone() }
         );
         assert_eq!(omp.styles[0].label, "mine (yours)");
-        assert!(omp.styles.iter().any(|style| style.label == "cache-theme"));
+        // Themes come from the cache, POSH_THEMES_PATH and the Homebrew install
+        // prefix; a theme in several directories is listed once, from the first.
+        let theme = |label: &str| -> Vec<String> {
+            omp.styles
+                .iter()
+                .filter(|style| style.label == label)
+                .map(|style| match &style.style {
+                    PromptStyle::Theme { path } => path.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            theme("cache-theme"),
+            [format!(
+                "{home}/.cache/oh-my-posh/themes/cache-theme.omp.json"
+            )]
+        );
+        assert_eq!(
+            theme("posh-theme"),
+            [format!("{home}/posh-themes/posh-theme.omp.yaml")]
+        );
+        let brew = theme("brew-theme");
+        assert!(
+            brew.len() == 1
+                && brew[0].ends_with("/brew/Cellar/oh-my-posh/9.9.9/themes/brew-theme.omp.json"),
+            "{brew:?}"
+        );
         let starship = environment.provider(PromptProvider::Starship).unwrap();
         assert_eq!(starship.version.as_deref(), Some("1.2.3"));
         assert!(starship.styles.iter().any(|style| style.style
@@ -1469,6 +1529,7 @@ done"#;
         *target::TEST_ENV.lock() = vec![
             ("HOME".into(), home.clone()),
             ("PATH".into(), format!("{home}/.local/bin:/usr/bin:/bin")),
+            ("POSH_THEMES_PATH".into(), format!("{home}/posh-themes")),
         ];
         let result = std::panic::catch_unwind(|| scenario(&home));
         target::TEST_ENV.lock().clear();
@@ -1495,6 +1556,7 @@ done"#;
         let facts = parse_probe(
             "host\tbox\nhome\t/h\nlogin_shell\t/usr/bin/zsh\nprovider\tstarship\t/b/starship\tstarship 1.2.3\n\
              windows\toh-my-posh\t/mnt/c/x/oh-my-posh.exe\ntheme\t/t/b.omp.json\ntheme\t/t/a.omp.json\n\
+             theme\t/a/b.omp.yaml\n\
              startup\t/h/.zshrc\t12:eval \"$(starship init zsh)\"\nstate\tnot json\nnoise\n\
              backup\t{\"id\":\"1\",\"created_ms\":1,\"description\":\"d\",\"entries\":[]}\n\
              backup\t{\"id\":\"../x\",\"created_ms\":2,\"description\":\"d\",\"entries\":[]}\n",
@@ -1505,6 +1567,7 @@ done"#;
             facts.windows,
             [(PromptProvider::OhMyPosh, "/mnt/c/x/oh-my-posh.exe".into())]
         );
+        // Themes sort by name; a duplicate from a later directory is dropped.
         assert_eq!(facts.themes, ["/t/a.omp.json", "/t/b.omp.json"]);
         assert_eq!(
             facts.startup,
