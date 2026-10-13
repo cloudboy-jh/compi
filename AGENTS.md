@@ -1,5 +1,11 @@
 # AGENTS.md
 
+## Project notes vault
+
+- Before working on Compi, read the `jacksmainvault/Compi` notes, on Windows and macOS alike. Start with `feat and bugs.md` (scope, order, open items) and `References/` (UI references, scope rules). Then read `docs/dev/NEXT_STEPS.md` here.
+- Windows: `C:\Users\johns\OneDrive\Documents\jacksmainvault\Compi`. macOS: the same `Documents/jacksmainvault/Compi` folder inside the synced OneDrive directory.
+- The vault sets product scope and order; this repo's `docs/dev` holds the implementation detail. Borrow behaviour from references (Tern, Rex), never their layouts or look.
+
 ## One dev instance per checkout
 
 - Preview source changes only with `cargo dev`. Its instance is `compi-dev`, and it lives in `target/compi-dev`.

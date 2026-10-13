@@ -1,6 +1,6 @@
 //! The "Shell prompt" group in Settings → Terminal: detect the prompt providers in
 //! the daemon's shell environment, browse every style with its rendered prompt,
-//! and apply one from a dropdown that opens under it. Previews never touch the
+//! and apply one from a confirm popover on its row. Previews never touch the
 //! terminal theme, layout, or anything persisted; files change only through a
 //! plan the user confirmed.
 use super::*;
@@ -31,15 +31,12 @@ pub(super) enum PromptAction {
     Refresh,
     Distribution(usize),
     Provider(PromptProvider),
-    /// The whole style list; arrow keys move the selection, Enter opens its dropdown.
+    /// The whole style list; arrow keys move the selection, Enter opens its confirm.
     Styles,
     Outside,
     TurnOff,
     History,
     Restore(usize),
-    /// The open dropdown's Apply, Turn off or Restore button.
-    Confirm,
-    Cancel,
 }
 
 /// Distribution the render came from, provider, and style.
@@ -100,9 +97,9 @@ struct StyleRow {
     current: bool,
 }
 
-/// The confirm that opens under the clicked style row, Turn off, or a history
-/// row. Its operation says where: Apply under its style, Disable under Turn
-/// off, Restore under its backup.
+/// The confirm popover on the clicked style row, Turn off, or a history row's
+/// Restore. Its operation says which: Apply on its style, Disable on Turn off,
+/// Restore on its backup.
 struct PromptDropdown {
     operation: PromptOperation,
     /// Planned in the background; the confirm button waits for it.
@@ -127,20 +124,20 @@ pub(in crate::gui) struct PromptSettingsState {
     /// Bumped by Refresh so renders requested before it are dropped.
     render_generation: u64,
     pending_renders: Option<PendingRenders>,
-    /// At most one dropdown is open.
+    /// At most one confirm popover is open.
     dropdown: Option<PromptDropdown>,
+    /// The popover's focused button: its confirm (0) or Cancel (1).
+    popover_focus: usize,
     executing: bool,
-    /// The open dropdown's plan or execute request; other replies are stale.
+    /// The open popover's plan or execute request; other replies are stale.
     action_request: u64,
     /// Focused pane's distribution and directory when the section opened.
     cwd: Option<(Option<String>, String)>,
     error: Option<String>,
     /// Style rows of the selected provider, in list order.
     rows: Vec<StyleRow>,
-    /// Virtualized style list; item `i` is `rows[i]` plus any dropdown under it.
+    /// Virtualized style list; item `i` is `rows[i]`.
     style_list: ListState,
-    /// Row to scroll fully into view once the list has measured it again.
-    reveal_row: Option<usize>,
 }
 
 impl Default for PromptSettingsState {
@@ -159,13 +156,13 @@ impl Default for PromptSettingsState {
             render_generation: 0,
             pending_renders: None,
             dropdown: None,
+            popover_focus: 0,
             executing: false,
             action_request: 0,
             cwd: None,
             error: None,
             rows: Vec::new(),
             style_list: ListState::new(0, ListAlignment::Top, px(200.0)),
-            reveal_row: None,
         }
     }
 }
@@ -196,14 +193,7 @@ impl PromptSettingsState {
         self.rows.iter().position(|row| row.style == selected.style)
     }
 
-    /// Measures a row again after its height changed.
-    fn remeasure_row(&self, index: Option<usize>) {
-        if let Some(index) = index.filter(|index| *index < self.rows.len()) {
-            self.style_list.splice(index..index + 1, 1);
-        }
-    }
-
-    /// The style row an Apply dropdown sits under.
+    /// The style row an Apply popover is on.
     fn dropdown_row(&self) -> Option<usize> {
         let PromptOperation::Apply { config, .. } = &self.dropdown.as_ref()?.operation else {
             return None;
@@ -214,7 +204,7 @@ impl PromptSettingsState {
         self.rows.iter().position(|row| row.style == config.style)
     }
 
-    /// The control the dropdown opens under; `None` when that is not shown.
+    /// The control the popover is attached to; `None` when that is not shown.
     fn dropdown_anchor(&self) -> Option<PromptAction> {
         let environment = self.environment()?;
         Some(match &self.dropdown.as_ref()?.operation {
@@ -237,21 +227,6 @@ impl PromptSettingsState {
                 )
             }
         })
-    }
-
-    /// Changes the dropdown and re-measures the style rows it leaves and enters;
-    /// the row it is under is revealed after that measurement.
-    fn update_dropdown(&mut self, change: impl FnOnce(&mut Self)) {
-        let before = self.dropdown_row();
-        change(self);
-        let after = self.dropdown_row();
-        self.remeasure_row(before);
-        if after != before {
-            self.remeasure_row(after);
-        }
-        if after.is_some() {
-            self.reveal_row = after;
-        }
     }
 
     fn clear_renders(&mut self) {
@@ -832,19 +807,19 @@ impl CompiApp {
         );
     }
 
-    /// Opens the dropdown for `operation`, replacing any other, and plans it in
-    /// the background.
+    /// Opens the confirm popover for `operation` with its confirm focused, replacing
+    /// any other, and plans it in the background.
     fn open_prompt_dropdown(&mut self, operation: PromptOperation) {
         let request = NEXT_PROMPT_REQUEST.fetch_add(1, Ordering::Relaxed);
         let distribution = self.prompt_request_distribution();
         let state = &mut self.prompt_settings;
         state.action_request = request;
-        let dropdown = PromptDropdown {
+        state.popover_focus = 0;
+        state.dropdown = Some(PromptDropdown {
             operation: operation.clone(),
             plan: None,
             error: None,
-        };
-        state.update_dropdown(|state| state.dropdown = Some(dropdown));
+        });
         self.send_prompt_request(
             PromptJob::Plan,
             request,
@@ -853,8 +828,7 @@ impl CompiApp {
         );
     }
 
-    /// Opens the dropdown for `operation` with its confirm focused, or closes it
-    /// when it is already open there.
+    /// Opens the popover for `operation`, or closes it when it is already open there.
     fn toggle_prompt_dropdown(&mut self, operation: PromptOperation) {
         if self
             .prompt_settings
@@ -866,10 +840,9 @@ impl CompiApp {
             return;
         }
         self.open_prompt_dropdown(operation);
-        self.focus_prompt_action(PromptAction::Confirm);
     }
 
-    /// The dropdown under the selected style; none when applying it would change nothing.
+    /// The popover on the selected style; none when applying it would change nothing.
     fn toggle_style_dropdown(&mut self) {
         let state = &self.prompt_settings;
         let (Some(environment), Some(config)) = (state.environment(), state.selected.clone())
@@ -884,7 +857,7 @@ impl CompiApp {
         self.toggle_prompt_dropdown(PromptOperation::Apply { config, outside });
     }
 
-    /// Flips the outside toggle; an open Apply dropdown plans the new scope.
+    /// Flips the outside toggle; an open Apply popover plans the new scope.
     fn toggle_prompt_outside(&mut self) {
         let state = &mut self.prompt_settings;
         state.outside = !state.outside;
@@ -923,62 +896,58 @@ impl CompiApp {
         };
         let request = NEXT_PROMPT_REQUEST.fetch_add(1, Ordering::Relaxed);
         state.action_request = request;
-        state.update_dropdown(|state| {
-            state.executing = true;
-            if let Some(dropdown) = state.dropdown.as_mut() {
-                dropdown.error = None;
-            }
-        });
+        state.executing = true;
+        if let Some(dropdown) = state.dropdown.as_mut() {
+            dropdown.error = None;
+        }
         self.send_prompt_request(PromptJob::Execute, request, distribution, prompt);
     }
 
-    /// Closes the dropdown; nothing is written. False when none is open or its
-    /// change is being applied.
+    /// Closes the popover; nothing is written. False when none is open or its change
+    /// is being applied.
     pub(super) fn close_prompt_dropdown(&mut self) -> bool {
-        let focused = self.focused_prompt_action();
         let state = &mut self.prompt_settings;
         if state.executing || state.dropdown.is_none() {
             return false;
         }
-        let anchor = state.dropdown_anchor();
         state.action_request = 0;
-        state.update_dropdown(|state| state.dropdown = None);
-        // Its buttons leave the focus order: keep focus on the same control.
-        match focused {
-            Some(PromptAction::Confirm | PromptAction::Cancel) => {
-                if let Some(anchor) = anchor {
-                    self.focus_prompt_action(anchor);
-                }
-            }
-            Some(action) => {
-                if let Some(index) = self
-                    .prompt_actions()
-                    .iter()
-                    .position(|candidate| *candidate == action)
-                {
-                    self.overlay_focus = self.prompt_focus(index);
-                }
-            }
-            None => {}
-        }
+        state.dropdown = None;
         true
     }
 
+    /// The popover's confirm or Cancel; neither while its change is being applied.
+    fn activate_prompt_popover(&mut self, confirm: bool) {
+        if self.prompt_settings.executing {
+            self.prompt_settings.error = Some("Wait for the prompt change to finish.".into());
+            return;
+        }
+        self.prompt_settings.error = None;
+        if confirm {
+            self.execute_prompt_plan();
+        } else {
+            self.close_prompt_dropdown();
+        }
+    }
+
+    /// Keys in the confirm popover: any arrow or Tab moves between its two buttons,
+    /// Enter or Space presses the focused one. Escape closes it before reaching here.
+    fn prompt_popover_key(&mut self, key: &Keystroke) {
+        match key.key.as_str() {
+            "tab" | "left" | "right" | "up" | "down" => {
+                self.prompt_settings.popover_focus ^= 1;
+            }
+            "enter" => self.activate_prompt_popover(self.prompt_settings.popover_focus == 0),
+            _ => {}
+        }
+    }
+
     fn prompt_focus(&self, index: usize) -> usize {
-        self.settings_content_focus(self.prompt_offset_base() + index)
+        self.settings_content_focus(super::settings::PROMPT_FOCUS_OFFSET + index)
     }
 
     fn prompt_group_visible(&self) -> bool {
         matches!(self.overlay, Some(Overlay::Settings))
             && self.settings_section == SettingsSection::Terminal
-    }
-
-    fn focused_prompt_action(&self) -> Option<PromptAction> {
-        if !self.prompt_group_visible() {
-            return None;
-        }
-        let offset = self.overlay_focus.checked_sub(self.prompt_focus(0))?;
-        self.prompt_actions().get(offset).copied()
     }
 
     fn focus_prompt_action(&mut self, action: PromptAction) -> bool {
@@ -1096,18 +1065,16 @@ impl CompiApp {
                     Ok(PromptResponse::Planned { plan }) if plan.changes.is_empty() => {
                         self.close_prompt_dropdown();
                     }
-                    Ok(PromptResponse::Planned { plan }) => state.update_dropdown(|state| {
+                    Ok(PromptResponse::Planned { plan }) => {
                         if let Some(dropdown) = state.dropdown.as_mut() {
                             dropdown.plan = Some(plan);
                         }
-                    }),
+                    }
                     other => {
                         let error = other.err().unwrap_or(UNEXPECTED_RESPONSE.into());
-                        state.update_dropdown(|state| {
-                            if let Some(dropdown) = state.dropdown.as_mut() {
-                                dropdown.error = Some(error);
-                            }
-                        });
+                        if let Some(dropdown) = state.dropdown.as_mut() {
+                            dropdown.error = Some(error);
+                        }
                     }
                 }
             }
@@ -1127,20 +1094,17 @@ impl CompiApp {
                     }
                     other => {
                         let error = other.err().unwrap_or(UNEXPECTED_RESPONSE.into());
-                        state.update_dropdown(|state| {
-                            state.executing = false;
-                            if let Some(dropdown) = state.dropdown.as_mut() {
-                                dropdown.error = Some(error);
-                            }
-                        });
+                        state.executing = false;
+                        if let Some(dropdown) = state.dropdown.as_mut() {
+                            dropdown.error = Some(error);
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Focusable controls in render order; see `render_prompt_group`. An open
-    /// dropdown's confirm and Cancel follow the control it opened under.
+    /// Focusable controls in render order; see `render_prompt_group`.
     pub(super) fn prompt_actions(&self) -> Vec<PromptAction> {
         let state = &self.prompt_settings;
         let environment = state.environment();
@@ -1171,14 +1135,6 @@ impl CompiApp {
         actions.push(PromptAction::History);
         if state.history {
             actions.extend((0..environment.backups.len()).map(PromptAction::Restore));
-        }
-        if let Some(anchor) = state.dropdown_anchor()
-            && let Some(index) = actions.iter().position(|action| *action == anchor)
-        {
-            actions.splice(
-                index + 1..index + 1,
-                [PromptAction::Confirm, PromptAction::Cancel],
-            );
         }
         actions
     }
@@ -1238,21 +1194,8 @@ impl CompiApp {
                     self.toggle_prompt_dropdown(PromptOperation::Restore { backup });
                 }
             }
-            PromptAction::Cancel => {
-                self.close_prompt_dropdown();
-            }
-            PromptAction::Confirm => self.execute_prompt_plan(),
         }
-        if !matches!(
-            action,
-            PromptAction::Styles
-                | PromptAction::TurnOff
-                | PromptAction::Restore(_)
-                | PromptAction::Cancel
-                | PromptAction::Confirm
-        ) {
-            self.focus_prompt_action(action);
-        }
+        self.focus_prompt_action(action);
     }
 
     fn select_prompt_distribution(&mut self, index: usize) {
@@ -1405,24 +1348,95 @@ impl CompiApp {
         actions: &[PromptAction],
         action: PromptAction,
         label: impl Into<SharedString>,
-        primary: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let index = self.prompt_index(actions, action);
+        let focused = self.prompt_focused(index);
+        div()
+            .relative()
+            .flex_none()
+            .child(self.settings_action_button(
+                ("prompt-control", index.unwrap_or(usize::MAX)),
+                label,
+                focused,
+                false,
+                self.prompt_listener(index, action, cx),
+            ))
+            .child(self.settings_focus_anchor(focused, cx))
+            .into_any_element()
+    }
+
+    /// Turn off or a history row's Restore: a button with the confirm popover.
+    fn prompt_popover_button(
+        &self,
+        actions: &[PromptAction],
+        action: PromptAction,
+        label: &'static str,
         destructive: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let index = self.prompt_index(actions, action);
         let focused = self.prompt_focused(index);
-        let id = ("prompt-control", index.unwrap_or(usize::MAX));
-        let listener = self.prompt_listener(index, action, cx);
-        div()
+        let id = index.unwrap_or(usize::MAX);
+        let trigger = div()
             .relative()
             .flex_none()
-            .child(if primary && !destructive {
-                self.settings_primary_button(id, label, focused, listener)
-            } else {
-                self.settings_action_button(id, label, focused, destructive, listener)
-            })
+            .child(self.settings_popup_button(("prompt-control", id), label, focused, destructive))
             .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
+            .into_any_element();
+        self.prompt_popover(("prompt-popover", id), trigger, index, action, None, cx)
+    }
+
+    /// The confirm popover on `trigger`, open while the popover's operation belongs
+    /// to `action` (and, for the style list, to `row`). A click on the trigger selects
+    /// that row and opens it; Escape or a click outside cancels it. While open it
+    /// holds the keyboard; see `prompt_popover_key`.
+    fn prompt_popover(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        trigger: AnyElement,
+        index: Option<usize>,
+        action: PromptAction,
+        row: Option<usize>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let state = &self.prompt_settings;
+        let dropdown = state.dropdown.as_ref().filter(|_| {
+            state.dropdown_anchor() == Some(action)
+                && (row.is_none() || state.dropdown_row() == row)
+        });
+        let popover = controls::popover(id, trigger, dropdown.is_some())
+            .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                if *open {
+                    if let Some(index) = index {
+                        this.overlay_focus = this.prompt_focus(index);
+                    }
+                    if let Some(row) = row
+                        && this.prompt_action_reason(action).is_none()
+                    {
+                        this.select_prompt_style(row);
+                    }
+                    this.activate_prompt_action(action);
+                } else {
+                    this.close_prompt_dropdown();
+                }
+                cx.notify();
+            }))
+            .on_key(cx.listener(|this, key: &Keystroke, _, cx| {
+                this.prompt_popover_key(key);
+                cx.notify();
+            }));
+        let popover = if row.is_some() {
+            popover.full_width()
+        } else {
+            popover
+        };
+        match dropdown {
+            Some(dropdown) => popover
+                .content(self.render_prompt_popover(dropdown, cx))
+                .into_any_element(),
+            None => popover.into_any_element(),
+        }
     }
 
     /// The "Shell prompt" group at the bottom of Settings → Terminal. Focus
@@ -1441,8 +1455,6 @@ impl CompiApp {
                 } else {
                     "Details"
                 },
-                false,
-                false,
                 cx,
             ));
         }
@@ -1454,8 +1466,6 @@ impl CompiApp {
             } else {
                 "Refresh"
             },
-            false,
-            false,
             cx,
         ));
         if state.loading {
@@ -1674,11 +1684,10 @@ impl CompiApp {
         );
         let mut buttons = div().flex().flex_wrap().gap_2();
         if anything_applied(environment) {
-            buttons = buttons.child(self.prompt_button(
+            buttons = buttons.child(self.prompt_popover_button(
                 actions,
                 PromptAction::TurnOff,
                 "Turn off",
-                false,
                 true,
                 cx,
             ));
@@ -1691,16 +1700,9 @@ impl CompiApp {
             } else {
                 "History"
             },
-            false,
-            false,
             cx,
         ));
         form = form.child(buttons);
-        if state.dropdown_anchor() == Some(PromptAction::TurnOff)
-            && let Some(dropdown) = &state.dropdown
-        {
-            form = form.child(self.render_prompt_dropdown(actions, dropdown, cx));
-        }
         if let Some(error) = &state.error {
             form = form.child(self.prompt_error(error.clone()));
         }
@@ -1739,29 +1741,7 @@ impl CompiApp {
                 .size_full(),
             )
             .child(self.settings_focus_anchor(focused, cx))
-            .child(self.prompt_reveal_anchor(cx))
             .into_any_element()
-    }
-
-    /// Painted after the list, so a re-measured dropdown row is revealed with its
-    /// real height rather than the stale one `scroll_to_reveal_item` would see
-    /// right after the dropdown opens.
-    fn prompt_reveal_anchor(&self, cx: &Context<Self>) -> AnyElement {
-        let entity = cx.entity();
-        canvas(
-            |_, _, _| (),
-            move |_, _, window, cx| {
-                entity.update(cx, |this, _| {
-                    if let Some(row) = this.prompt_settings.reveal_row.take() {
-                        this.prompt_settings.style_list.scroll_to_reveal_item(row);
-                        window.refresh();
-                    }
-                });
-            },
-        )
-        .absolute()
-        .inset_0()
-        .into_any_element()
     }
 
     fn render_prompt_style_row(
@@ -1796,11 +1776,7 @@ impl CompiApp {
             Some(render) => self.render_prompt_block(&render.success, &palette),
             None => self.prompt_placeholder(&palette),
         };
-        let dropdown = state
-            .dropdown
-            .as_ref()
-            .filter(|_| state.dropdown_row() == Some(row_index));
-        div()
+        let row_element = div()
             .id(("prompt-style", row_index))
             .w_full()
             .min_w_0()
@@ -1821,17 +1797,6 @@ impl CompiApp {
                     }))
                     .cursor_pointer()
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(index) = focus_index {
-                    this.overlay_focus = this.prompt_focus(index);
-                }
-                if this.prompt_action_reason(PromptAction::Styles).is_none() {
-                    this.select_prompt_style(row_index);
-                }
-                this.activate_prompt_action(PromptAction::Styles);
-                cx.stop_propagation();
-                cx.notify();
-            }))
             .child(
                 div()
                     .min_w_0()
@@ -1867,10 +1832,15 @@ impl CompiApp {
                     }),
             )
             .child(success)
-            .when_some(dropdown, |row, dropdown| {
-                row.child(self.render_prompt_dropdown(&self.prompt_actions(), dropdown, cx))
-            })
-            .into_any_element()
+            .into_any_element();
+        self.prompt_popover(
+            ("prompt-style-popover", row_index),
+            row_element,
+            focus_index,
+            PromptAction::Styles,
+            Some(row_index),
+            cx,
+        )
     }
 
     fn prompt_block_frame(&self, palette: &TerminalPalette) -> gpui::Div {
@@ -1935,8 +1905,6 @@ impl CompiApp {
         if environment.backups.is_empty() {
             return self.prompt_note("No backups yet.");
         }
-        let state = &self.prompt_settings;
-        let anchor = state.dropdown_anchor();
         div()
             .min_w_0()
             .flex()
@@ -1947,10 +1915,6 @@ impl CompiApp {
                     .iter()
                     .enumerate()
                     .map(|(index, backup)| {
-                        let dropdown = state
-                            .dropdown
-                            .as_ref()
-                            .filter(|_| anchor == Some(PromptAction::Restore(index)));
                         div()
                             .min_w_0()
                             .py_2()
@@ -1980,18 +1944,14 @@ impl CompiApp {
                                             )
                                             .child(self.prompt_note(backup_age(backup.created_ms))),
                                     )
-                                    .child(self.prompt_button(
+                                    .child(self.prompt_popover_button(
                                         actions,
                                         PromptAction::Restore(index),
                                         "Restore",
                                         false,
-                                        false,
                                         cx,
                                     )),
                             )
-                            .when_some(dropdown, |row, dropdown| {
-                                row.child(self.render_prompt_dropdown(actions, dropdown, cx))
-                            })
                     }),
             )
             .into_any_element()
@@ -2043,16 +2003,9 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The confirm under a style row, Turn off, or a history row: the diff of
-    /// any user file the plan changes, then the confirm and Cancel buttons. The
-    /// confirm waits for the plan.
-    fn render_prompt_dropdown(
-        &self,
-        actions: &[PromptAction],
-        dropdown: &PromptDropdown,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let colors = *self.colors();
+    /// The confirm popover's content: the diff of any user file the plan changes, then
+    /// the confirm and Cancel buttons. The confirm waits for the plan.
+    fn render_prompt_popover(&self, dropdown: &PromptDropdown, cx: &Context<Self>) -> AnyElement {
         let state = &self.prompt_settings;
         let user_files: Vec<&PromptFileChange> = dropdown
             .plan
@@ -2066,20 +2019,33 @@ impl CompiApp {
             PromptOperation::Restore { .. } => ("Restore", !user_files.is_empty()),
         };
         let ready = dropdown.plan.is_some() && !state.executing;
-        let mut panel = div()
-            .min_w_0()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(colors.border))
-            .bg(color(colors.surface))
-            // Clicks inside must not reach the style row under it.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        for change in user_files {
-            panel = panel.child(self.render_prompt_diff(change));
+        let listener = |confirm: bool| {
+            cx.listener(move |this, _, _, cx| {
+                this.prompt_settings.popover_focus = usize::from(!confirm);
+                this.activate_prompt_popover(confirm);
+                cx.stop_propagation();
+                cx.notify();
+            })
+        };
+        let confirm_focused = state.popover_focus == 0;
+        let mut panel = div().w(px(420.0)).flex().flex_col().gap_2();
+        if !user_files.is_empty() {
+            panel = panel.child(
+                div()
+                    .id("prompt-plan")
+                    .max_h(px(320.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(
+                        user_files
+                            .into_iter()
+                            .map(|change| self.render_prompt_diff(change)),
+                    ),
+            );
+        } else if dropdown.plan.is_none() && dropdown.error.is_none() {
+            panel = panel.child(self.prompt_note("Checking what would change…"));
         }
         if state.executing {
             panel = panel.child(self.prompt_note("Applying…"));
@@ -2097,22 +2063,29 @@ impl CompiApp {
                         div()
                             .flex_none()
                             .when(!ready, |button| button.opacity(0.5))
-                            .child(self.prompt_button(
-                                actions,
-                                PromptAction::Confirm,
-                                label,
-                                true,
-                                destructive,
-                                cx,
-                            )),
+                            .child(if destructive {
+                                self.settings_action_button(
+                                    "prompt-confirm",
+                                    label,
+                                    confirm_focused,
+                                    true,
+                                    listener(true),
+                                )
+                            } else {
+                                self.settings_primary_button(
+                                    "prompt-confirm",
+                                    label,
+                                    confirm_focused,
+                                    listener(true),
+                                )
+                            }),
                     )
-                    .child(self.prompt_button(
-                        actions,
-                        PromptAction::Cancel,
+                    .child(self.settings_action_button(
+                        "prompt-cancel",
                         "Cancel",
+                        !confirm_focused,
                         false,
-                        false,
-                        cx,
+                        listener(false),
                     )),
             )
             .into_any_element()

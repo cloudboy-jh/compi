@@ -1,5 +1,6 @@
-//! Pane drag-and-drop. A grip at the top centre of each tiled pane opens the pane
-//! menu on click and moves the pane on drag:
+//! Pane drag-and-drop. A grip at the top centre of each tiled pane, shown on hover,
+//! opens the pane menu on click and moves the pane on drag; the × beside it closes
+//! the pane:
 //!
 //! - Over a pane of the same tab: four edge zones and a centre Swap; release
 //!   commits one `ArrangeTab`.
@@ -17,6 +18,8 @@ use crate::arrangement::{self, DropZone};
 /// The grip's hit area spans the top padding band, so it never covers a cell.
 const GRIP_WIDTH: f32 = 44.0;
 const GRIP_DOT: f32 = 3.0;
+/// The close button beside the grip, in the same band.
+const GRIP_CLOSE_WIDTH: f32 = 20.0;
 /// The centre Swap box spans at most this share of a target pane each way, and at
 /// most `SWAP_MAX` pixels. Panes of another tab cannot swap, so there the four edge
 /// zones meet in the centre.
@@ -168,8 +171,8 @@ fn placed(target: &LayoutNode, leaf: LayoutNode, placement: &Placement) -> Layou
 }
 
 impl CompiApp {
-    /// The `⋯` grip of tiled pane `index`, revealed while the pointer is over the
-    /// pane (`group`). `width` is the pane's width.
+    /// The `⋯` grip and `×` of tiled pane `index`, revealed while the pointer is over
+    /// the pane (`group`). `width` is the pane's width.
     pub(super) fn render_pane_grip(
         &self,
         index: usize,
@@ -185,34 +188,90 @@ impl CompiApp {
                 .rounded_full()
                 .bg(color(colors.muted))
         };
+        let close_id = pane_id.clone();
+        let close_title = self.close_pane_title(&pane_id);
+        let controls_width = GRIP_WIDTH + GRIP_CLOSE_WIDTH;
         div()
-            .id(("pane-grip", index))
             .absolute()
             .top_0()
-            .left(px(((width - GRIP_WIDTH) / 2.0).max(0.0)))
-            .w(px(GRIP_WIDTH))
+            .left(px(((width - controls_width) / 2.0).max(0.0)))
             .h(px(TERMINAL_PADDING))
             .flex()
             .items_center()
-            .justify_center()
-            .gap(px(GRIP_DOT))
-            .rounded_full()
             .invisible()
             .group_hover(group, |style| style.visible())
-            .hover(move |style| style.bg(color(colors.surface_hover)))
-            .cursor(gpui::CursorStyle::OpenHand)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                    this.focus_pane(pane_id.clone());
-                    this.start_pane_drag(pane_id.clone(), event.position);
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
+            .child(
+                div()
+                    .id(("pane-grip", index))
+                    .w(px(GRIP_WIDTH))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(GRIP_DOT))
+                    .rounded_full()
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                    .cursor(gpui::CursorStyle::OpenHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.focus_pane(pane_id.clone());
+                            this.start_pane_drag(pane_id.clone(), event.position);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .children([dot(), dot(), dot()]),
             )
-            .children([dot(), dot(), dot()])
+            .child(
+                div()
+                    .id(("pane-grip-close", index))
+                    .w(px(GRIP_CLOSE_WIDTH))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_pane(&close_id, window, cx);
+                        window.focus(&this.focus_handle, cx);
+                        this.rebuild_layout(window, true);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .tooltip(controls::tooltip(close_title, None, None))
+                    .child(
+                        controls::glyph(controls::IconName::X, color(colors.muted)).size(px(10.0)),
+                    ),
+            )
             .into_any_element()
+    }
+
+    /// The tiled pane's menu from its grip ⋯, hanging under the grip.
+    pub(super) fn open_grip_menu(
+        &mut self,
+        pane_id: &PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rect) = self
+            .visible_layout()
+            .and_then(|layout| layout.panes.iter().find(|pane| &pane.pane_id == pane_id))
+            .map(|pane| pane.rect)
+        else {
+            return;
+        };
+        // The grip's centre: the grip and its × are centred on the pane together.
+        let offset = self.workspace_scroll.offset();
+        let position = point(
+            px(rect.x + (rect.width - GRIP_CLOSE_WIDTH) / 2.0 + self.sidebar_extent()) + offset.x,
+            px(rect.y + TERMINAL_PADDING + CHROME_HEIGHT) + offset.y,
+        );
+        self.open_pane_menu(pane_id, position, Anchor::TopCenter, window, cx);
     }
 
     fn start_pane_drag(&mut self, pane_id: PaneId, origin: Point<Pixels>) {
@@ -369,18 +428,13 @@ impl CompiApp {
         })
     }
 
-    /// Release: a click opens the pane menu at the grip; a drag commits its target.
-    pub(in crate::gui) fn finish_pane_drag(&mut self, position: Point<Pixels>) {
+    /// Release: a click opens the pane menu under the grip; a drag commits its target.
+    pub(in crate::gui) fn finish_pane_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(drag) = self.pane_drag.take() else {
             return;
         };
         if !drag.moving {
-            self.open_overlay(
-                Overlay::PaneActions {
-                    position: Some(position),
-                },
-                "",
-            );
+            self.open_grip_menu(&drag.pane_id, window, cx);
             return;
         }
         let Some(target) = drag.target else {

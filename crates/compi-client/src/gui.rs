@@ -70,7 +70,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, PostMessageW, SW_RESTORE, ShowWindowAsync, WM_NCLBUTTONDOWN,
 };
 use workspace::pane_drag::PaneDrag;
-use workspace::{DividerDrag, FloatDrag, FloatLayout, Overlay, TransferSeed, open_compi_window};
+use workspace::{
+    CatalogReturn, DividerDrag, FloatDrag, FloatLayout, Overlay, Popup, TransferSeed,
+    open_compi_window,
+};
 
 const DEFAULT_COLS: i16 = 100;
 const DEFAULT_ROWS: i16 = 30;
@@ -929,7 +932,7 @@ struct CompiApp {
     settings_scope: SettingsScope,
     daemon_restarting: bool,
     zoom: f32,
-    overlay_return: Option<Overlay>,
+    catalog_return: Option<CatalogReturn>,
     overlay: Option<Overlay>,
     overlay_index: usize,
     overlay_scroll: ScrollHandle,
@@ -937,7 +940,11 @@ struct CompiApp {
     overlay_generation: u64,
     overlay_closing_since: Option<Instant>,
     settings_section: SettingsSection,
-    pub(in crate::gui) settings_font_picker: Option<SettingsSection>,
+    popup: Option<Popup>,
+    /// A menu at the pointer: a right-click, a pane's grip.
+    context_menu: Option<controls::ContextMenu>,
+    /// The tab menu, with its Panes group.
+    tab_menu: Option<workspace::menus::TabMenu>,
     pub(in crate::gui) settings_scroll_bounds: Option<Bounds<Pixels>>,
     pub(in crate::gui) settings_scroll_to_focus: bool,
     prompt_settings: workspace::prompt::PromptSettingsState,

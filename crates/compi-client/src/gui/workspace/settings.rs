@@ -2,6 +2,11 @@ use super::catalog::CatalogTarget;
 use super::*;
 
 const SETTINGS_NAV_ITEMS: usize = SettingsSection::ALL.len();
+/// Focus stops of Settings → Interface; see `interface_action`.
+const INTERFACE_ACTIONS: usize = 17;
+/// Focus stops of Settings → Terminal before the shell prompt group; see
+/// `terminal_action`.
+pub(super) const PROMPT_FOCUS_OFFSET: usize = 5;
 
 /// Focusable controls of Settings → Updates, in focus order. Which ones exist depends
 /// on the update state, so offsets are positions in `update_controls`.
@@ -26,11 +31,10 @@ enum SettingsAction {
     ToggleTransparency,
     ToggleBlur,
     FollowTheme,
-    ToggleFontPicker,
+    /// Opens a font select's list.
+    FontSelect(Popup),
     Opacity(f32),
     ResetWindowAppearance,
-    UiFont(UiFontPreset),
-    TerminalFont(TerminalFontPreset),
     ResetSidebar,
     ResetLayout,
     Zoom(Command),
@@ -64,30 +68,23 @@ impl CompiApp {
         SETTINGS_NAV_ITEMS + offset
     }
 
-    fn font_picker_open(&self) -> bool {
-        self.settings_font_picker == Some(self.settings_section)
-            && matches!(
-                self.settings_section,
-                SettingsSection::Interface | SettingsSection::Terminal
-            )
-    }
-
-    fn font_choice_count(&self) -> usize {
-        if !self.font_picker_open() {
-            return 0;
-        }
-        match self.settings_section {
-            SettingsSection::Interface => UiFontPreset::ALL.len(),
-            SettingsSection::Terminal => TerminalFontPreset::ALL.len(),
-            _ => 0,
+    /// Which surface the settings keyboard model serves: Settings (`true`) or Quick
+    /// Appearance (`false`).
+    fn settings_surface(&self) -> Option<bool> {
+        if matches!(self.overlay, Some(Overlay::Settings)) {
+            Some(true)
+        } else if self.popup == Some(Popup::QuickAppearance) {
+            Some(false)
+        } else {
+            None
         }
     }
 
     fn settings_action_count(&self) -> usize {
         match self.settings_section {
             SettingsSection::Appearance => self.appearance_action_count(),
-            SettingsSection::Interface => self.font_choice_count() + 17,
-            SettingsSection::Terminal => self.prompt_offset_base() + self.prompt_actions().len(),
+            SettingsSection::Interface => INTERFACE_ACTIONS,
+            SettingsSection::Terminal => PROMPT_FOCUS_OFFSET + self.prompt_actions().len(),
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
             SettingsSection::Updates => self.update_page().2.len(),
@@ -98,59 +95,13 @@ impl CompiApp {
     fn settings_action(&self, offset: usize) -> Option<SettingsAction> {
         match self.settings_section {
             SettingsSection::Appearance => self.appearance_action(offset),
-            SettingsSection::Interface | SettingsSection::Terminal => {
-                if offset == 0 {
-                    return Some(SettingsAction::ToggleFontPicker);
-                }
-                let choices = self.font_choice_count();
-                if offset <= choices {
-                    return match self.settings_section {
-                        SettingsSection::Interface => UiFontPreset::ALL
-                            .get(offset - 1)
-                            .copied()
-                            .map(SettingsAction::UiFont),
-                        _ => TerminalFontPreset::ALL
-                            .get(offset - 1)
-                            .copied()
-                            .map(SettingsAction::TerminalFont),
-                    };
-                }
-                match (self.settings_section, offset - choices - 1) {
-                    (SettingsSection::Interface, index @ 0..=1) => {
-                        crate::theme::WorkspaceDensity::ALL
-                            .get(index)
-                            .copied()
-                            .map(SettingsAction::Density)
-                    }
-                    (SettingsSection::Interface, 2) => Some(SettingsAction::ResetSidebar),
-                    (SettingsSection::Interface, 3) => Some(SettingsAction::ResetLayout),
-                    (SettingsSection::Interface, index @ 4..=7) => {
-                        Some(SettingsAction::Metadata(index - 4))
-                    }
-                    (SettingsSection::Interface, 8) => Some(SettingsAction::ToggleConfirmClose),
-                    (SettingsSection::Interface, index @ 9..=12) => {
-                        crate::theme::FocusIndicator::ALL
-                            .get(index - 9)
-                            .copied()
-                            .map(SettingsAction::FocusIndicator)
-                    }
-                    (SettingsSection::Interface, index @ 13..=15) => {
-                        Some(SettingsAction::ProgramStatus(index - 13))
-                    }
-                    (SettingsSection::Terminal, 0) => Some(SettingsAction::Zoom(Command::ZoomOut)),
-                    (SettingsSection::Terminal, 1) => {
-                        Some(SettingsAction::Zoom(Command::ZoomReset))
-                    }
-                    (SettingsSection::Terminal, 2) => Some(SettingsAction::Zoom(Command::ZoomIn)),
-                    (SettingsSection::Terminal, 3) => Some(SettingsAction::OpenConfiguration),
-                    (SettingsSection::Terminal, index) => self
-                        .prompt_actions()
-                        .get(index - 4)
-                        .copied()
-                        .map(SettingsAction::Prompt),
-                    _ => None,
-                }
-            }
+            SettingsSection::Interface => interface_action(offset),
+            SettingsSection::Terminal => terminal_action(offset).or_else(|| {
+                self.prompt_actions()
+                    .get(offset.checked_sub(PROMPT_FOCUS_OFFSET)?)
+                    .copied()
+                    .map(SettingsAction::Prompt)
+            }),
             SettingsSection::Keyboard => match offset {
                 0 => Some(SettingsAction::OpenPalette),
                 1 => Some(SettingsAction::OpenConfiguration),
@@ -183,28 +134,15 @@ impl CompiApp {
     }
 
     fn normalize_settings_focus(&mut self) {
-        if !matches!(
-            self.overlay,
-            Some(Overlay::Settings | Overlay::QuickAppearance)
-        ) {
+        let Some(full) = self.settings_surface() else {
             return;
-        }
-        let base = if matches!(self.overlay, Some(Overlay::Settings)) {
-            SETTINGS_NAV_ITEMS
-        } else {
-            0
         };
-        let count = if base == 0 {
-            self.appearance_action_count()
+        let (base, count) = if full {
+            (SETTINGS_NAV_ITEMS, self.settings_action_count())
         } else {
-            self.settings_action_count()
+            (0, self.appearance_action_count())
         };
         self.overlay_focus = self.overlay_focus.min(base + count.saturating_sub(1));
-    }
-
-    /// Terminal-section offset of the shell prompt group's first control.
-    pub(super) fn prompt_offset_base(&self) -> usize {
-        self.font_choice_count() + 5
     }
 
     pub(super) fn prompt_toggle(
@@ -217,43 +155,18 @@ impl CompiApp {
         self.render_settings_toggle(
             enabled,
             SettingsAction::Prompt(action),
-            self.prompt_offset_base() + index,
+            PROMPT_FOCUS_OFFSET + index,
             true,
             cx,
         )
     }
 
     fn select_settings_section(&mut self, section: SettingsSection) {
-        self.settings_font_picker = None;
         self.settings_section = section;
         self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
         if section == SettingsSection::Terminal {
             self.enter_prompt_settings();
         }
-    }
-
-    fn toggle_settings_font_picker(&mut self) {
-        self.settings_scroll_to_focus = true;
-        if self.font_picker_open() {
-            self.settings_font_picker = None;
-            self.overlay_focus = SETTINGS_NAV_ITEMS;
-            return;
-        }
-        self.settings_font_picker = Some(self.settings_section);
-        let selected = match self.settings_section {
-            SettingsSection::Interface => UiFontPreset::ALL
-                .iter()
-                .position(|preset| *preset == self.config.ui_font),
-            SettingsSection::Terminal => TerminalFontPreset::ALL.iter().position(|preset| {
-                self.config
-                    .configured_font
-                    .family
-                    .eq_ignore_ascii_case(preset.family())
-            }),
-            _ => None,
-        }
-        .unwrap_or(0);
-        self.overlay_focus = SETTINGS_NAV_ITEMS + selected + 1;
     }
 
     pub(super) fn handle_settings_key(
@@ -262,30 +175,41 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let full = matches!(self.overlay, Some(Overlay::Settings));
-        let quick = matches!(self.overlay, Some(Overlay::QuickAppearance));
-        if !full && !quick {
+        if !matches!(self.overlay, Some(Overlay::Settings)) {
             return false;
         }
         if key.key == "escape" {
-            if full
-                && self.settings_section == SettingsSection::Terminal
-                && self.close_prompt_dropdown()
-            {
-                cx.notify();
-                return true;
-            }
-            if full && self.font_picker_open() {
-                self.settings_font_picker = None;
-                self.overlay_focus = SETTINGS_NAV_ITEMS;
-                self.settings_scroll_to_focus = true;
-            } else {
-                self.settings_font_picker = None;
+            // An open popup holds the keyboard and closes on Escape itself; should the
+            // key still arrive here, it closes only the popup.
+            if self.popup.take().is_none() && !self.close_prompt_dropdown() {
                 self.dismiss_overlay();
             }
             cx.notify();
             return true;
         }
+        self.settings_navigation_key(key, true, window, cx);
+        true
+    }
+
+    /// Keys in the Quick Appearance popover; Escape closes it before reaching here.
+    pub(super) fn quick_appearance_key(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_navigation_key(key, false, window, cx);
+    }
+
+    /// Moves the focus through Settings (`full`) or Quick Appearance, and activates
+    /// the focused control.
+    fn settings_navigation_key(
+        &mut self,
+        key: &Keystroke,
+        full: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.normalize_settings_focus();
         let base = if full { SETTINGS_NAV_ITEMS } else { 0 };
         let offset = self.overlay_focus.saturating_sub(base);
@@ -304,45 +228,15 @@ impl CompiApp {
             self.move_prompt_style(key.key.as_str());
             self.settings_scroll_to_focus = true;
             cx.notify();
-            return true;
+            return;
         }
-        if full
-            && self.font_picker_open()
-            && self.overlay_focus >= base
-            && matches!(key.key.as_str(), "up" | "down" | "home" | "end")
-        {
-            let count = self.font_choice_count();
-            let selected = offset.saturating_sub(1).min(count - 1);
-            let next = match key.key.as_str() {
-                "up" => (selected + count - 1) % count,
-                "down" => (selected + 1) % count,
-                "home" => 0,
-                _ => count - 1,
-            };
-            self.overlay_focus = base + next + 1;
-            self.settings_scroll_to_focus = true;
-            cx.notify();
-            return true;
-        }
+        let count = if full {
+            self.settings_action_count()
+        } else {
+            self.appearance_action_count()
+        };
         match key.key.as_str() {
             "tab" => {
-                if full && self.font_picker_open() {
-                    let choices = self.font_choice_count();
-                    self.settings_font_picker = None;
-                    self.overlay_focus = if offset <= choices {
-                        base
-                    } else {
-                        base + offset.saturating_sub(match self.settings_section {
-                            SettingsSection::Interface => UiFontPreset::ALL.len(),
-                            _ => TerminalFontPreset::ALL.len(),
-                        })
-                    };
-                }
-                let count = if full {
-                    self.settings_action_count()
-                } else {
-                    self.appearance_action_count()
-                };
                 let total = base + count;
                 self.overlay_focus = if key.modifiers.shift {
                     (self.overlay_focus + total - 1) % total
@@ -369,15 +263,9 @@ impl CompiApp {
                 self.overlay_focus = SETTINGS_NAV_ITEMS;
             }
             "left" if full && self.overlay_focus >= SETTINGS_NAV_ITEMS => {
-                self.settings_font_picker = None;
                 self.overlay_focus = self.settings_section as usize;
             }
             "up" | "down" if self.overlay_focus >= base => {
-                let count = if full {
-                    self.settings_action_count()
-                } else {
-                    self.appearance_action_count()
-                };
                 self.overlay_focus = base
                     + if key.key == "up" {
                         (offset + count - 1) % count
@@ -392,18 +280,17 @@ impl CompiApp {
                     self.activate_settings_action(action, window, cx);
                 }
             }
-            _ => return true,
+            _ => return,
         }
         self.normalize_settings_focus();
         self.settings_scroll_to_focus = true;
         cx.notify();
-        true
     }
 
     fn appearance_action_count(&self) -> usize {
         4 + usize::from(self.scoped_appearance().transparent_background) * 2
             + usize::from(self.settings_scope == SettingsScope::Window)
-            + usize::from(matches!(self.overlay, Some(Overlay::QuickAppearance)))
+            + usize::from(self.settings_surface() == Some(false))
     }
 
     fn appearance_action(&self, offset: usize) -> Option<SettingsAction> {
@@ -426,7 +313,7 @@ impl CompiApp {
                 Some(SettingsAction::ResetWindowAppearance)
             }
             value
-                if matches!(self.overlay, Some(Overlay::QuickAppearance))
+                if self.settings_surface() == Some(false)
                     && value == self.appearance_action_count() - 1 =>
             {
                 Some(SettingsAction::OpenSettings)
@@ -495,19 +382,9 @@ impl CompiApp {
                 );
             }
             SettingsAction::FollowTheme => self.follow_theme_terminal_colors(window, cx),
-            SettingsAction::ToggleFontPicker => self.toggle_settings_font_picker(),
+            SettingsAction::FontSelect(popup) => self.popup = Some(popup),
             SettingsAction::Opacity(delta) => self.adjust_opacity(delta, window, cx),
             SettingsAction::ResetWindowAppearance => self.reset_window_appearance(window),
-            SettingsAction::UiFont(preset) => {
-                self.apply_ui_font(preset, window, cx);
-                self.settings_font_picker = None;
-                self.overlay_focus = SETTINGS_NAV_ITEMS;
-            }
-            SettingsAction::TerminalFont(preset) => {
-                self.apply_terminal_font(preset, window, cx);
-                self.settings_font_picker = None;
-                self.overlay_focus = SETTINGS_NAV_ITEMS;
-            }
             SettingsAction::ResetSidebar => self.execute(Command::ResetSidebarWidth, window, cx),
             SettingsAction::ResetLayout => self.execute(Command::ResetClientLayout, window, cx),
             SettingsAction::Zoom(command) => self.execute(command, window, cx),
@@ -526,10 +403,7 @@ impl CompiApp {
             SettingsAction::RestartDaemon => self.execute(Command::RestartDaemon, window, cx),
             SettingsAction::Prompt(action) => self.activate_prompt_action(action),
             SettingsAction::Density(density) => self.apply_density(density, window, cx),
-            SettingsAction::OpenSettings => {
-                self.settings_font_picker = None;
-                self.open_overlay(Overlay::Settings, "");
-            }
+            SettingsAction::OpenSettings => self.open_overlay(Overlay::Settings, ""),
         }
         self.normalize_settings_focus();
         self.settings_scroll_to_focus = true;
@@ -656,6 +530,40 @@ impl CompiApp {
         tone: SettingsButtonTone,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
+        self.settings_button_face(id, label, focused, tone)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(on_click)
+            .into_any_element()
+    }
+
+    /// A settings button that opens a popup: the popup's trigger takes its clicks.
+    pub(super) fn settings_popup_button(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        label: impl Into<SharedString>,
+        focused: bool,
+        destructive: bool,
+    ) -> AnyElement {
+        self.settings_button_face(
+            id,
+            label,
+            focused,
+            if destructive {
+                SettingsButtonTone::Destructive
+            } else {
+                SettingsButtonTone::Secondary
+            },
+        )
+        .into_any_element()
+    }
+
+    fn settings_button_face(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        label: impl Into<SharedString>,
+        focused: bool,
+        tone: SettingsButtonTone,
+    ) -> Stateful<Div> {
         let colors = *self.colors();
         let (background, hover, foreground) = match tone {
             SettingsButtonTone::Secondary => (
@@ -709,10 +617,7 @@ impl CompiApp {
             })
             .text_color(color(ui_text_color(foreground, background)))
             .hover(move |style| style.bg(color(hover)).cursor_pointer())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(on_click)
             .child(Into::<SharedString>::into(label))
-            .into_any_element()
     }
 
     pub(super) fn settings_action_button(
@@ -825,7 +730,6 @@ impl CompiApp {
             .hover(move |style| style.bg(color(hover)).cursor_pointer())
             .tooltip(controls::tooltip("Close", None, Some("escape")))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.settings_font_picker = None;
                 this.dismiss_overlay();
                 cx.stop_propagation();
                 cx.notify();
@@ -1146,118 +1050,82 @@ impl CompiApp {
         )
     }
 
-    fn render_font_selector(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = *self.colors();
+    /// Interface font or Terminal font: a select of the bundled presets, each shown in
+    /// its own font. A custom terminal family from the configuration file shows as the
+    /// value with no preset checked.
+    fn render_font_select(&self, cx: &Context<Self>) -> AnyElement {
         let focused = self.overlay_focus == self.settings_content_focus(0);
-        let label = match self.settings_section {
-            SettingsSection::Interface => self.config.ui_font.label().to_string(),
-            _ => self.config.configured_font.family.clone(),
-        };
+        let (popup, options, selected, value): (_, Vec<_>, _, SharedString) =
+            match self.settings_section {
+                SettingsSection::Interface => (
+                    Popup::UiFont,
+                    UiFontPreset::ALL
+                        .iter()
+                        .map(|preset| {
+                            controls::select_option(preset.label())
+                                .detail("Aa Bb 0123")
+                                .font(preset.family())
+                        })
+                        .collect(),
+                    UiFontPreset::ALL
+                        .iter()
+                        .position(|preset| *preset == self.config.ui_font),
+                    self.config.ui_font.label().into(),
+                ),
+                _ => (
+                    Popup::TerminalFont,
+                    TerminalFontPreset::ALL
+                        .iter()
+                        .map(|preset| {
+                            controls::select_option(preset.label())
+                                .detail("0O1l {} [] $ cargo")
+                                .font(preset.family())
+                        })
+                        .collect(),
+                    TerminalFontPreset::ALL.iter().position(|preset| {
+                        self.config
+                            .configured_font
+                            .family
+                            .eq_ignore_ascii_case(preset.family())
+                    }),
+                    self.config.configured_font.family.clone().into(),
+                ),
+            };
+        let select = controls::select(
+            match popup {
+                Popup::UiFont => "ui-font-select",
+                _ => "terminal-font-select",
+            },
+            options,
+            selected,
+            self.popup == Some(popup),
+        )
+        .placeholder(value)
+        .focused(focused)
+        .anchor(Anchor::TopRight)
+        .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+            this.overlay_focus = this.settings_content_focus(0);
+            this.set_popup(popup, *open);
+            cx.notify();
+        }))
+        .on_pick(cx.listener(move |this, index: &usize, window, cx| {
+            if popup == Popup::UiFont {
+                if let Some(preset) = UiFontPreset::ALL.get(*index) {
+                    this.apply_ui_font(*preset, window, cx);
+                }
+            } else if let Some(preset) = TerminalFontPreset::ALL.get(*index) {
+                this.apply_terminal_font(*preset, window, cx);
+            }
+            cx.notify();
+        }));
         div()
-            .id("settings-font-selector")
             .relative()
-            .min_w_0()
-            .w_full()
-            .min_h(px(38.0))
-            .px_3()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(if focused {
-                colors.accent
-            } else {
-                colors.border
-            }))
-            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.toggle_settings_font_picker();
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(label),
-            )
-            .child(div().flex_none().child(if self.font_picker_open() {
-                "▴"
-            } else {
-                "▾"
-            }))
+            .flex_none()
+            .child(select)
             .child(self.settings_focus_anchor(focused, cx))
             .into_any_element()
     }
 
-    fn render_font_option(
-        &self,
-        index: usize,
-        (label, family): (&'static str, &'static str),
-        sample: &'static str,
-        active: bool,
-        action: SettingsAction,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let colors = *self.colors();
-        let focused = self.overlay_focus == self.settings_content_focus(index + 1);
-        div()
-            .id(("settings-font-option", index))
-            .relative()
-            .min_w_0()
-            .min_h(px(52.0))
-            .px_3()
-            .py_2()
-            .flex()
-            .items_center()
-            .gap_3()
-            .border_1()
-            .border_color(color(if focused {
-                colors.accent
-            } else {
-                colors.surface
-            }))
-            .bg(color(if active {
-                blend_rgb(colors.surface, colors.accent, 0.08)
-            } else {
-                colors.surface
-            }))
-            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.activate_settings_action(action, window, cx);
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .font_family(family)
-                    .child(div().font_weight(FontWeight::MEDIUM).child(label))
-                    .child(
-                        div()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, &colors)))
-                            .child(sample),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(16.0))
-                    .flex_none()
-                    .child(if active { "✓" } else { "" }),
-            )
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
-    }
     fn render_settings_content(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
         match self.settings_section {
             SettingsSection::Appearance => self.render_appearance_controls(true, compact, cx),
@@ -1270,8 +1138,8 @@ impl CompiApp {
         }
     }
 
+    /// Focus offsets follow `interface_action`.
     fn render_interface_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
-        let choices = self.font_choice_count();
         div()
             .min_w_0()
             .flex()
@@ -1281,36 +1149,17 @@ impl CompiApp {
             .child(self.settings_row(
                 "Interface font",
                 String::new(),
-                self.render_font_selector(cx),
-                true,
+                self.render_font_select(cx),
+                compact,
             ))
-            .when(self.font_picker_open(), |section| {
-                section.child(
-                    div().flex().flex_col().children(
-                        UiFontPreset::ALL
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, preset)| {
-                                self.render_font_option(
-                                    index,
-                                    (preset.label(), preset.family()),
-                                    "Aa Bb 0123",
-                                    self.config.ui_font == preset,
-                                    SettingsAction::UiFont(preset),
-                                    cx,
-                                )
-                            }),
-                    ),
-                )
-            })
-            .child(self.render_density_setting(choices + 1, compact, cx))
+            .child(self.render_density_setting(1, compact, cx))
             .child(self.settings_row(
                 "Sidebar width",
                 format!("{:.0}px", self.sidebar_width),
                 self.settings_control_button(
                     "Reset width",
                     SettingsAction::ResetSidebar,
-                    choices + 3,
+                    3,
                     false,
                     cx,
                 ),
@@ -1322,7 +1171,7 @@ impl CompiApp {
                 self.settings_control_button(
                     "Reset layout",
                     SettingsAction::ResetLayout,
-                    choices + 4,
+                    4,
                     false,
                     cx,
                 ),
@@ -1361,7 +1210,7 @@ impl CompiApp {
                         self.render_settings_toggle(
                             enabled,
                             SettingsAction::Metadata(index),
-                            choices + 5 + index,
+                            5 + index,
                             true,
                             cx,
                         ),
@@ -1378,7 +1227,7 @@ impl CompiApp {
                     self.render_settings_toggle(
                         self.config.confirm_close,
                         SettingsAction::ToggleConfirmClose,
-                        choices + 9,
+                        9,
                         true,
                         cx,
                     ),
@@ -1386,7 +1235,7 @@ impl CompiApp {
                 ),
             )
             .child(self.settings_subheading("Focus"))
-            .child(self.render_focus_indicator_setting(choices + 10, compact, cx))
+            .child(self.render_focus_indicator_setting(10, compact, cx))
             .child(self.settings_subheading("Program status"))
             .children(
                 [
@@ -1415,7 +1264,7 @@ impl CompiApp {
                         self.render_settings_toggle(
                             enabled,
                             SettingsAction::ProgramStatus(index),
-                            choices + 14 + index,
+                            14 + index,
                             true,
                             cx,
                         ),
@@ -1544,29 +1393,29 @@ impl CompiApp {
         )
     }
 
+    /// Focus offsets follow `terminal_action`, then the shell prompt group's.
     fn render_terminal_settings(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
-        let choices = self.font_choice_count();
         let zoom = div()
             .flex()
             .gap_2()
             .child(self.settings_control_button(
                 "−",
                 SettingsAction::Zoom(Command::ZoomOut),
-                choices + 1,
+                1,
                 false,
                 cx,
             ))
             .child(self.settings_control_button(
                 "Reset",
                 SettingsAction::Zoom(Command::ZoomReset),
-                choices + 2,
+                2,
                 false,
                 cx,
             ))
             .child(self.settings_control_button(
                 "+",
                 SettingsAction::Zoom(Command::ZoomIn),
-                choices + 3,
+                3,
                 false,
                 cx,
             ))
@@ -1580,31 +1429,9 @@ impl CompiApp {
             .child(self.settings_row(
                 "Terminal font",
                 String::new(),
-                self.render_font_selector(cx),
-                true,
+                self.render_font_select(cx),
+                compact,
             ))
-            .when(self.font_picker_open(), |section| {
-                section.child(
-                    div().flex().flex_col().children(
-                        TerminalFontPreset::ALL
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, preset)| {
-                                self.render_font_option(
-                                    index,
-                                    (preset.label(), preset.family()),
-                                    "0O1l {} [] $ cargo",
-                                    self.config
-                                        .configured_font
-                                        .family
-                                        .eq_ignore_ascii_case(preset.family()),
-                                    SettingsAction::TerminalFont(preset),
-                                    cx,
-                                )
-                            }),
-                    ),
-                )
-            })
             .child(self.settings_row(
                 "Zoom",
                 format!(
@@ -1622,7 +1449,7 @@ impl CompiApp {
                 self.settings_control_button(
                     "Edit configuration",
                     SettingsAction::OpenConfiguration,
-                    choices + 4,
+                    4,
                     false,
                     cx,
                 ),
@@ -2409,27 +2236,13 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let full = matches!(self.overlay, Some(Overlay::Settings));
         let (responsive_width, responsive_height) = overlay_viewport_size(window);
         let compact = responsive_width < 620.0;
-        let panel_width = (responsive_width - 64.0).clamp(1.0, if full { 760.0 } else { 520.0 });
+        let panel_width = (responsive_width - 64.0).clamp(1.0, 760.0);
         let overlay_height = responsive_height.max(1.0);
-        let panel_height = (overlay_height - 48.0)
-            .max(1.0)
-            .min(if full { 560.0 } else { 500.0 });
-        let content_width = panel_width
-            - if full && !compact { 184.0 } else { 0.0 }
-            - if full { 32.0 } else { 24.0 };
+        let panel_height = (overlay_height - 48.0).clamp(1.0, 560.0);
+        let content_width = panel_width - if compact { 0.0 } else { 184.0 } - 32.0;
         let stacked = content_width < 480.0;
-        let scroll_entity = cx.entity();
-        let scroll_viewport = canvas(
-            |_, _, _| (),
-            move |bounds, _, _, cx| {
-                scroll_entity.update(cx, |this, _| this.settings_scroll_bounds = Some(bounds));
-            },
-        )
-        .absolute()
-        .inset_0();
         let panel = div()
             .w(px(panel_width))
             .h(px(panel_height))
@@ -2456,11 +2269,11 @@ impl CompiApp {
                         div()
                             .text_size(px(18.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(if full { "Settings" } else { "Quick Appearance" }),
+                            .child("Settings"),
                     )
                     .child(self.overlay_close_button("settings-dismiss", cx)),
             )
-            .when(full && compact, |panel| {
+            .when(compact, |panel| {
                 panel.child(self.render_settings_navigation(true, cx))
             })
             .child(
@@ -2470,7 +2283,7 @@ impl CompiApp {
                     .flex()
                     .min_h_0()
                     .flex_1()
-                    .when(full && !compact, |body| {
+                    .when(!compact, |body| {
                         body.child(self.render_settings_navigation(false, cx))
                     })
                     .child(
@@ -2482,43 +2295,11 @@ impl CompiApp {
                             .min_h_0()
                             .overflow_y_scroll()
                             .track_scroll(&self.overlay_scroll)
-                            .when(full, |content| content.p_4())
-                            .when(!full, |content| content.p_3())
-                            .child(if full {
-                                self.render_settings_content(stacked, cx)
-                            } else {
-                                self.render_appearance_controls(false, stacked, cx)
-                            }),
+                            .p_4()
+                            .child(self.render_settings_content(stacked, cx)),
                     )
-                    .child(scroll_viewport),
-            )
-            .when(!full, |panel| {
-                panel.child(
-                    div()
-                        .flex_none()
-                        .min_h(px(44.0))
-                        .px_4()
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .border_t_1()
-                        .border_color(color(colors.border))
-                        .child(self.settings_primary_button(
-                            "open-full-settings",
-                            "Open full settings",
-                            self.overlay_focus == self.appearance_action_count() - 1,
-                            cx.listener(|this, _, window, cx| {
-                                this.activate_settings_action(
-                                    SettingsAction::OpenSettings,
-                                    window,
-                                    cx,
-                                );
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        )),
-                )
-            });
+                    .child(self.settings_scroll_viewport(cx)),
+            );
         div()
             .absolute()
             .top_0()
@@ -2533,13 +2314,137 @@ impl CompiApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.settings_font_picker = None;
                     this.dismiss_overlay();
                     cx.notify();
                 }),
             )
             .child(panel)
             .into_any_element()
+    }
+
+    /// Records the scrolled settings area, so focus moves can scroll a control into it.
+    fn settings_scroll_viewport(&self, cx: &Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, _, cx| {
+                entity.update(cx, |this, _| this.settings_scroll_bounds = Some(bounds));
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
+    /// Quick Appearance: the Appearance controls in a popover on `trigger`, with a way
+    /// on to all settings. It holds the keyboard while open; see `quick_appearance_key`.
+    pub(super) fn render_quick_appearance(
+        &self,
+        id: &'static str,
+        trigger: AnyElement,
+        anchor: Anchor,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let open = self.popup == Some(Popup::QuickAppearance);
+        let popover = controls::popover(id, trigger, open)
+            .anchor(anchor)
+            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                if *open {
+                    this.open_quick_appearance();
+                } else {
+                    this.set_popup(Popup::QuickAppearance, false);
+                }
+                cx.notify();
+            }))
+            .on_key(cx.listener(|this, key: &Keystroke, window, cx| {
+                this.quick_appearance_key(key, window, cx);
+            }));
+        if !open {
+            return popover.into_any_element();
+        }
+        let (_, viewport_height) = overlay_viewport_size(window);
+        let last = self.appearance_action_count() - 1;
+        popover
+            .content(
+                div()
+                    .w(px(360.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Quick Appearance"),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .min_h_0()
+                            .child(
+                                div()
+                                    .id("quick-appearance-scroll")
+                                    .max_h(px((viewport_height - 160.0).max(160.0)))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.overlay_scroll)
+                                    .child(self.render_appearance_controls(false, false, cx)),
+                            )
+                            .child(self.settings_scroll_viewport(cx)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .child(self.settings_primary_button(
+                                "open-full-settings",
+                                "All settings…",
+                                self.overlay_focus == last,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.overlay_focus = last;
+                                    this.activate_settings_action(
+                                        SettingsAction::OpenSettings,
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+/// Settings → Interface, by focus offset.
+fn interface_action(offset: usize) -> Option<SettingsAction> {
+    match offset {
+        0 => Some(SettingsAction::FontSelect(Popup::UiFont)),
+        1..=2 => crate::theme::WorkspaceDensity::ALL
+            .get(offset - 1)
+            .copied()
+            .map(SettingsAction::Density),
+        3 => Some(SettingsAction::ResetSidebar),
+        4 => Some(SettingsAction::ResetLayout),
+        5..=8 => Some(SettingsAction::Metadata(offset - 5)),
+        9 => Some(SettingsAction::ToggleConfirmClose),
+        10..=13 => crate::theme::FocusIndicator::ALL
+            .get(offset - 10)
+            .copied()
+            .map(SettingsAction::FocusIndicator),
+        14..=16 => Some(SettingsAction::ProgramStatus(offset - 14)),
+        _ => None,
+    }
+}
+
+/// Settings → Terminal before the shell prompt group, by focus offset.
+fn terminal_action(offset: usize) -> Option<SettingsAction> {
+    match offset {
+        0 => Some(SettingsAction::FontSelect(Popup::TerminalFont)),
+        1 => Some(SettingsAction::Zoom(Command::ZoomOut)),
+        2 => Some(SettingsAction::Zoom(Command::ZoomReset)),
+        3 => Some(SettingsAction::Zoom(Command::ZoomIn)),
+        4 => Some(SettingsAction::OpenConfiguration),
+        _ => None,
     }
 }
 
@@ -2555,4 +2460,19 @@ fn open_update_log() -> Result<(), String> {
         .arg(&path)
         .spawn();
     result.map(|_| ()).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every Interface and fixed Terminal focus stop has an action and none lies past
+    /// the count, so Tab and the arrows visit each control once.
+    #[test]
+    fn every_settings_focus_stop_has_one_action() {
+        assert!((0..INTERFACE_ACTIONS).all(|offset| interface_action(offset).is_some()));
+        assert!(interface_action(INTERFACE_ACTIONS).is_none());
+        assert!((0..PROMPT_FOCUS_OFFSET).all(|offset| terminal_action(offset).is_some()));
+        assert!(terminal_action(PROMPT_FOCUS_OFFSET).is_none());
+    }
 }

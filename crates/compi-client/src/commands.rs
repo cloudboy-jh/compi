@@ -122,7 +122,7 @@ registry! {
     SwapPaneUp, "swap_pane_up", "Swap pane up", None, None;
     SwapPaneDown, "swap_pane_down", "Swap pane down", None, None;
     RemovePane, "remove_pane", "Close pane", None, Some("ctrl-shift-w");
-    EndSurface, "end_surface", "End terminal", None, None;
+    EndSurface, "end_surface", "End process…", None, None;
     RestartSurface, "restart_surface", "Restart terminal", None, None;
     ToggleSidebar, "toggle_sidebar", "Toggle workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");
     ResetSidebarWidth, "reset_sidebar_width", "Reset sidebar width", None, None;

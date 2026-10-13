@@ -213,6 +213,25 @@ impl CompiApp {
         }
     }
 
+    /// The glyph for `state`, in its color.
+    fn program_state_glyph(&self, state: ProgramState) -> gpui_component::Icon {
+        let icon = match state {
+            ProgramState::Idle => IconName::Circle,
+            ProgramState::Working => IconName::LoaderCircle,
+            ProgramState::Done => IconName::CircleCheck,
+            ProgramState::Blocked => IconName::CircleAlert,
+            ProgramState::Error => IconName::CircleX,
+        };
+        controls::glyph(icon, color(self.program_state_color(state)))
+    }
+
+    /// The surface's status glyph, when its program reports one: a pane row in the
+    /// tab menu.
+    pub(super) fn program_glyph(&self, surface_id: &SurfaceId) -> Option<gpui_component::Icon> {
+        let headline = status::headline(self.program_records(surface_id))?;
+        Some(self.program_state_glyph(headline.state))
+    }
+
     /// A static glyph for the state, with its progress when `show_progress` (narrow tab
     /// chips leave it to the tooltip), and the tooltip `title` and `detail`. Static, so
     /// status never makes the window repaint on its own.
@@ -224,21 +243,13 @@ impl CompiApp {
         title: String,
         detail: String,
     ) -> AnyElement {
-        let tint = color(self.program_state_color(headline.state));
-        let icon = match headline.state {
-            ProgramState::Idle => IconName::Circle,
-            ProgramState::Working => IconName::LoaderCircle,
-            ProgramState::Done => IconName::CircleCheck,
-            ProgramState::Blocked => IconName::CircleAlert,
-            ProgramState::Error => IconName::CircleX,
-        };
         div()
             .id(id)
             .flex_none()
             .flex()
             .items_center()
             .gap_1()
-            .child(controls::glyph(icon, tint))
+            .child(self.program_state_glyph(headline.state))
             .when_some(
                 headline.progress.filter(|_| show_progress),
                 |status, progress| {

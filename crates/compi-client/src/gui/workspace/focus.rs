@@ -12,7 +12,7 @@ const FLASH_DURATION: Duration = Duration::from_millis(800);
 const DIM_ALPHA: f32 = 0.12;
 
 /// The platform asks for reduced motion; read once at launch.
-static REDUCED_MOTION: LazyLock<bool> = LazyLock::new(reduced_motion);
+pub(super) static REDUCED_MOTION: LazyLock<bool> = LazyLock::new(reduced_motion);
 
 impl CompiApp {
     /// Marker: a short accent bar centred on the pane's bottom edge, inside the

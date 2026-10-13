@@ -992,6 +992,7 @@ dependencies = [
  "base64",
  "compi-protocol",
  "compi-update",
+ "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

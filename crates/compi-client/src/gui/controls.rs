@@ -21,29 +21,52 @@
 //! - **Activation.** Actions fire on click (mouse up, or Enter/Space on a focused
 //!   control) and stop there: the row or pane behind a control never sees its click. A
 //!   pointer press does not take the keyboard focus.
+//! - **Popups.** [`select`] picks one of a few options: the closed control is as wide as
+//!   its value, the list opens under it as wide as its longest option (up to 320 px),
+//!   scrolls past 320 px, checks the current option and takes arrows, typed letters,
+//!   Enter and Escape. [`menu`] is Kit's popup menu of a few actions under a button,
+//!   [`context_menu`] the same menu at a point (a right-click, a pane's grip). Menus
+//!   take [`MenuEntry`] rows: actions with a shortcut hint or a disabled reason,
+//!   separators, group labels and submenus, and are as wide as their longest row (up
+//!   to 320 px). [`popover`] anchors any content to its button (Quick Appearance, a
+//!   confirm). The caller owns each one's open state, so a command or a key can open
+//!   it, and Kit reports clicks on the trigger, clicks outside and Escape. While open,
+//!   a popup holds the keyboard: no key reaches the window behind it, and Escape
+//!   closes only the popup. They need no Kit `Root`, unlike Kit's own tooltips. A menu
+//!   Kit's popup menu cannot host draws its rows with [`menu_surface`], [`menu_row`],
+//!   [`menu_separator_row`] and [`menu_label_row`], which match Kit's.
 //!
-//! [`sync_theme`] completes the Kit theme from Compi's colors before a window draws.
+//! [`sync_theme`] completes the Kit theme from Compi's colors before a window draws;
+//! popups take the surface color, its text and the theme's border.
 use super::{
     UI_MICRO_TEXT_SIZE, UI_SMALL_TEXT_SIZE, blend_rgb, color, composite_rgb, ui_text_color,
     ui_text_color_for,
 };
 use crate::theme::ThemeColors;
 use gpui::{
-    AnyElement, AnyView, App, AssetSource, ClickEvent, ElementId, FocusHandle, FontWeight, Global,
-    IntoElement, Keystroke, ParentElement, RenderOnce, SharedString, Styled, Window, div,
-    prelude::*, px,
+    Anchor, AnyElement, AnyView, App, AssetSource, ClickEvent, Context, DismissEvent, Div,
+    ElementId, Entity, FocusHandle, Focusable as _, FontWeight, Global, IntoElement, KeyDownEvent,
+    Keystroke, ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Stateful,
+    StyleRefinement, Styled, Subscription, Window, anchored, deferred, div, prelude::*, px,
 };
+use gpui_base::actions::Confirm;
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::kbd::Kbd;
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::popover::Popover;
 use gpui_component::spinner::Spinner;
 use gpui_component::tag::Tag;
 use gpui_component::theme::Theme;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _, Size};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable, Sizable as _, Size, ThemeStyled as _,
+};
 pub(super) use gpui_kit_assets::IconName;
 use std::borrow::Cow;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Corner radius of controls, fields and tooltips: GPUI's `rounded_sm`, which the rest
 /// of Compi's chrome uses.
@@ -105,6 +128,10 @@ struct ControlPalette {
     primary_text: u32,
     danger: [u32; 3],
     danger_text: u32,
+    /// Text of a select's list on the popup surface, plain and muted, at rest and
+    /// highlighted.
+    popup_text: u32,
+    popup_muted: u32,
 }
 
 impl ControlPalette {
@@ -135,6 +162,8 @@ impl ControlPalette {
             blend_rgb(colors.accent, away, 0.22),
         ];
         let danger = [0.12, 0.2, 0.28].map(|amount| blend_rgb(background, colors.error, amount));
+        let surface = composite_rgb(colors.surface, opaque);
+        let popup_backdrops = [surface, composite_rgb(colors.surface_hover, surface)];
         Self {
             outline,
             outline_text: ui_text_color_for(colors.foreground, &outline),
@@ -147,6 +176,8 @@ impl ControlPalette {
             primary_text: ui_text_color_for(text_on_accent, &primary),
             danger,
             danger_text: ui_text_color_for(colors.error, &danger),
+            popup_text: ui_text_color_for(colors.foreground, &popup_backdrops),
+            popup_muted: ui_text_color_for(colors.muted, &popup_backdrops),
         }
     }
 }
@@ -171,17 +202,23 @@ fn control_theme(cx: &App) -> (ThemeColors, ControlPalette) {
     }
 }
 
-/// Completes GPUI Kit's theme with what its buttons, checkboxes and tooltips read, from
-/// `colors`: corner radius, focus ring, and the outline, primary and danger shades with
-/// their text. The caller resolves Kit's tokens afterwards.
+/// Completes GPUI Kit's theme with what its buttons, checkboxes, tooltips and popups
+/// read, from `colors`: corner radius, focus ring, the outline, primary and danger
+/// shades with their text, and the popup surface. The caller resolves Kit's tokens
+/// afterwards.
 pub(super) fn sync_theme(theme: &mut Theme, colors: &ThemeColors) {
     let palette = ControlPalette::derive(colors);
     theme.radius = px(CONTROL_RADIUS);
     theme.focus_ring = true;
     theme.ring = color(colors.accent);
     theme.input = color(colors.border);
-    theme.popover = color(colors.surface);
-    theme.popover_foreground = color(super::modal_text_color(colors.foreground, colors));
+    // Popups float over translucent panes and dialogs: an opaque surface keeps their
+    // text at the contrast `ControlPalette` checks.
+    theme.popover = color(composite_rgb(
+        colors.surface,
+        colors.background & 0x00ff_ffff,
+    ));
+    theme.popover_foreground = color(palette.popup_text);
     theme.button = color(palette.outline[0]);
     theme.button_hover = color(palette.outline[1]);
     theme.button_active = color(palette.outline[2]);
@@ -722,6 +759,12 @@ pub(super) fn kbd(key: &str) -> Option<Kbd> {
     Keystroke::parse(key).ok().map(Kbd::new)
 }
 
+/// A key in GPUI keystroke syntax as the platform writes it (Ctrl+Shift+W), for a
+/// title that carries its shortcut in text.
+pub(super) fn key_label(key: &str) -> String {
+    Keystroke::parse(key).map_or_else(|_| key.to_owned(), |key| Kbd::format(&key))
+}
+
 /// Moves the keyboard focus to the next (or previous) control inside `within`, wrapping
 /// around inside it; controls elsewhere in the window are skipped. Returns whether a
 /// control took the focus.
@@ -750,6 +793,914 @@ pub(super) fn cycle_focus(
         }
     }
     false
+}
+
+/// Widest a select's list or a menu grows; longer items truncate.
+const POPUP_MAX_WIDTH: f32 = 320.0;
+/// Tallest a select's list grows before it scrolls.
+const POPUP_MAX_HEIGHT: f32 = 320.0;
+/// How long typed letters keep extending a select's type-to-jump prefix.
+const TYPE_AHEAD_WINDOW: Duration = Duration::from_millis(800);
+
+type OpenHandler = Rc<dyn Fn(&bool, &mut Window, &mut App)>;
+type KeyHandler = Rc<dyn Fn(&Keystroke, &mut Window, &mut App)>;
+type PickHandler = Rc<dyn Fn(&usize, &mut Window, &mut App)>;
+
+/// What a popup opens from. Kit's popover takes a [`Selectable`] trigger; the caller
+/// already draws the open state.
+#[derive(IntoElement)]
+struct Trigger {
+    element: AnyElement,
+    open: bool,
+}
+
+impl Selectable for Trigger {
+    fn selected(mut self, selected: bool) -> Self {
+        self.open = selected;
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.open
+    }
+}
+
+impl RenderOnce for Trigger {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self.element
+    }
+}
+
+/// A child id of `id`, for the state a popup keeps beside Kit's.
+fn child_id(id: &ElementId, name: &'static str) -> ElementId {
+    ElementId::NamedChild(Arc::new(id.clone()), name.into())
+}
+
+/// The focus a popup's content takes while it is open; it lives as long as the
+/// control is drawn, so Kit's popover can move focus to it as it opens.
+fn popup_focus(id: &ElementId, window: &mut Window, cx: &mut App) -> FocusHandle {
+    window
+        .use_keyed_state(child_id(id, "focus"), cx, |_, cx| cx.focus_handle())
+        .read(cx)
+        .clone()
+}
+
+/// Kit's popover under `trigger`, controlled by `open`: a click on the trigger, a
+/// click outside and Escape report the new state through `on_open_change`.
+fn kit_popover(
+    id: ElementId,
+    trigger: AnyElement,
+    open: bool,
+    anchor: Anchor,
+    on_open_change: Option<OpenHandler>,
+) -> Popover {
+    Popover::new(id)
+        .anchor(anchor)
+        .open(open)
+        .trigger(Trigger {
+            element: trigger,
+            open,
+        })
+        .when_some(on_open_change, |popover, handler| {
+            popover.on_open_change(move |open, window, cx| handler(open, window, cx))
+        })
+}
+
+/// The content of a popup holding the keyboard: `on_key` sees every key except
+/// Escape, which closes the popup, and no key reaches the window behind it. Kit's
+/// popover turns Enter and Space into its Confirm action; it arrives as `enter`.
+fn popup_keys(focus: &FocusHandle, on_key: Option<KeyHandler>) -> Div {
+    let confirm = on_key.clone();
+    div()
+        .track_focus(focus)
+        .on_action(move |_: &Confirm, window, cx| {
+            if let (Some(on_key), Ok(enter)) = (&confirm, Keystroke::parse("enter")) {
+                on_key(&enter, window, cx);
+            }
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            cx.stop_propagation();
+            if let Some(on_key) = &on_key {
+                on_key(&event.keystroke, window, cx);
+            }
+        })
+}
+
+/// Content anchored to a trigger. Build with [`popover`].
+#[derive(IntoElement)]
+pub(super) struct PopoverControl {
+    id: ElementId,
+    trigger: AnyElement,
+    open: bool,
+    anchor: Anchor,
+    on_open_change: Option<OpenHandler>,
+    on_key: Option<KeyHandler>,
+    content: Option<AnyElement>,
+    full_width: bool,
+}
+
+/// A popover attached to `trigger`, open while `open`. The caller owns the state:
+/// commands and keys open it by setting `open`, and [`PopoverControl::on_open_change`]
+/// reports a click on the trigger, a click outside and Escape.
+pub(super) fn popover(
+    id: impl Into<ElementId>,
+    trigger: impl IntoElement,
+    open: bool,
+) -> PopoverControl {
+    PopoverControl {
+        id: id.into(),
+        trigger: trigger.into_any_element(),
+        open,
+        anchor: Anchor::TopLeft,
+        on_open_change: None,
+        on_key: None,
+        content: None,
+        full_width: false,
+    }
+}
+
+impl PopoverControl {
+    /// The popover's corner that meets the trigger; the default, top left, opens it
+    /// below the trigger.
+    pub(super) fn anchor(mut self, anchor: Anchor) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
+    pub(super) fn on_open_change(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_open_change = Some(Rc::new(handler));
+        self
+    }
+
+    /// Keys while the popover is open; see [`popup_keys`].
+    pub(super) fn on_key(
+        mut self,
+        handler: impl Fn(&Keystroke, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_key = Some(Rc::new(handler));
+        self
+    }
+
+    /// Lets the trigger fill its slot, as a list row does.
+    pub(super) fn full_width(mut self) -> Self {
+        self.full_width = true;
+        self
+    }
+
+    /// What the popover shows; built only while it is open.
+    pub(super) fn content(mut self, content: impl IntoElement) -> Self {
+        self.content = Some(content.into_any_element());
+        self
+    }
+}
+
+impl RenderOnce for PopoverControl {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = popup_focus(&self.id, window, cx);
+        let content = self.content.filter(|_| self.open);
+        kit_popover(
+            self.id,
+            self.trigger,
+            self.open,
+            self.anchor,
+            self.on_open_change,
+        )
+        .track_focus(&focus)
+        .when(self.full_width, |popover| {
+            popover.trigger_style(StyleRefinement::default().w_full())
+        })
+        .when_some(content, |popover, content| {
+            popover.child(popup_keys(&focus, self.on_key).child(content))
+        })
+    }
+}
+
+/// One choice of a [`select`].
+#[derive(Clone)]
+pub(super) struct SelectOption {
+    label: SharedString,
+    detail: Option<SharedString>,
+    font: Option<SharedString>,
+}
+
+pub(super) fn select_option(label: impl Into<SharedString>) -> SelectOption {
+    SelectOption {
+        label: label.into(),
+        detail: None,
+        font: None,
+    }
+}
+
+impl SelectOption {
+    /// A small muted line under the label.
+    pub(super) fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Draws the label and detail in `family`: a font list shows each font.
+    pub(super) fn font(mut self, family: impl Into<SharedString>) -> Self {
+        self.font = Some(family.into());
+        self
+    }
+}
+
+/// A choice among options. Build with [`select`].
+#[derive(IntoElement)]
+pub(super) struct Select {
+    id: ElementId,
+    placeholder: SharedString,
+    options: Rc<[SelectOption]>,
+    selected: Option<usize>,
+    open: bool,
+    focused: bool,
+    anchor: Anchor,
+    on_open_change: Option<OpenHandler>,
+    on_pick: Option<PickHandler>,
+}
+
+/// A select showing `options[selected]`, its list open while `open`. The closed
+/// control is as wide as its value; the list opens under it, as wide as its longest
+/// option up to a cap, with the current one checked. Arrows, Home and End move, typed
+/// letters jump to a matching option, Enter picks, Escape closes.
+pub(super) fn select(
+    id: impl Into<ElementId>,
+    options: impl IntoIterator<Item = SelectOption>,
+    selected: Option<usize>,
+    open: bool,
+) -> Select {
+    Select {
+        id: id.into(),
+        placeholder: SharedString::default(),
+        options: options.into_iter().collect(),
+        selected,
+        open,
+        focused: false,
+        anchor: Anchor::TopLeft,
+        on_open_change: None,
+        on_pick: None,
+    }
+}
+
+impl Select {
+    /// What the closed control shows while no option is selected.
+    pub(super) fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    /// The accent ring of a surface that tracks its own keyboard focus (Settings).
+    pub(super) fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    /// Which corner of the list meets the trigger; [`Anchor::TopRight`] for a select at
+    /// the right end of a row, so its list opens leftward instead of past the edge.
+    pub(super) fn anchor(mut self, anchor: Anchor) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
+    pub(super) fn on_open_change(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_open_change = Some(Rc::new(handler));
+        self
+    }
+
+    /// Runs with the picked option's index; the list closes after it.
+    pub(super) fn on_pick(
+        mut self,
+        handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_pick = Some(Rc::new(handler));
+        self
+    }
+}
+
+/// An open select list's keyboard position.
+struct SelectList {
+    highlight: usize,
+    typed: String,
+    typed_at: Option<Instant>,
+    scroll: ScrollHandle,
+}
+
+/// Where typing `typed` jumps from `from`: the next option starting with it, or for a
+/// repeated letter the next option starting with that letter.
+fn jump_target(labels: &[SharedString], from: usize, typed: &str) -> Option<usize> {
+    let mut letters = typed.chars();
+    let first = letters.next()?;
+    let (prefix, start) = if letters.all(|letter| letter == first) {
+        (first.to_string(), from + 1)
+    } else {
+        (typed.to_owned(), from)
+    };
+    (0..labels.len())
+        .map(|offset| (start + offset) % labels.len())
+        .find(|&index| labels[index].to_lowercase().starts_with(&prefix))
+}
+
+impl RenderOnce for Select {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (colors, palette) = control_theme(cx);
+        let focus = popup_focus(&self.id, window, cx);
+        let current = self
+            .selected
+            .and_then(|index| self.options.get(index))
+            .cloned();
+        let ring = self.open || self.focused;
+        let trigger = div()
+            .flex_none()
+            .h(px(ControlSize::Header.height()))
+            .max_w(px(POPUP_MAX_WIDTH))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(color(if ring { colors.accent } else { colors.border }))
+            .bg(color(palette.outline[0]))
+            .hover(move |style| style.bg(color(palette.outline[1])))
+            .cursor_pointer()
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .text_color(color(palette.outline_text))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .when_some(
+                        current.as_ref().and_then(|option| option.font.clone()),
+                        |label, font| label.font_family(font),
+                    )
+                    .child(current.map_or(self.placeholder.clone(), |option| option.label)),
+            )
+            .child(glyph(IconName::ChevronDown, color(palette.outline_text)))
+            .into_any_element();
+        let content = self
+            .open
+            .then(|| self.render_list(&focus, palette, window, cx));
+        kit_popover(
+            self.id,
+            trigger,
+            self.open,
+            self.anchor,
+            self.on_open_change,
+        )
+        .track_focus(&focus)
+        .p_1()
+        .when_some(content, |popover, content| popover.child(content))
+    }
+}
+
+impl Select {
+    fn render_list(
+        &self,
+        focus: &FocusHandle,
+        palette: ControlPalette,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Div {
+        let selected = self.selected;
+        let list = window.use_keyed_state(child_id(&self.id, "list"), cx, |_, _| {
+            let highlight = selected.unwrap_or(0);
+            let scroll = ScrollHandle::new();
+            scroll.scroll_to_item(highlight);
+            SelectList {
+                highlight,
+                typed: String::new(),
+                typed_at: None,
+                scroll,
+            }
+        });
+        let (highlight, scroll) = {
+            let list = list.read(cx);
+            (list.highlight, list.scroll.clone())
+        };
+        let pick: PickHandler = {
+            let on_pick = self.on_pick.clone();
+            let on_open_change = self.on_open_change.clone();
+            Rc::new(move |index, window, cx| {
+                if let Some(on_pick) = &on_pick {
+                    on_pick(index, window, cx);
+                }
+                if let Some(on_open_change) = &on_open_change {
+                    on_open_change(&false, window, cx);
+                }
+            })
+        };
+        let labels: Rc<[SharedString]> = self
+            .options
+            .iter()
+            .map(|option| option.label.clone())
+            .collect();
+        let on_key: KeyHandler = {
+            let list = list.clone();
+            let pick = pick.clone();
+            Rc::new(move |key, window, cx| {
+                let count = labels.len();
+                if count == 0 {
+                    return;
+                }
+                let current = list.read(cx).highlight;
+                let next = match key.key.as_str() {
+                    "up" => (current + count - 1) % count,
+                    "down" => (current + 1) % count,
+                    "home" | "pageup" => 0,
+                    "end" | "pagedown" => count - 1,
+                    "enter" => return pick(&current, window, cx),
+                    _ => {
+                        let modified =
+                            key.modifiers.control || key.modifiers.alt || key.modifiers.platform;
+                        let Some(letter) = key.key_char.as_deref().filter(|_| !modified) else {
+                            return;
+                        };
+                        let Some(next) = list.update(cx, |list, _| {
+                            let now = Instant::now();
+                            if list
+                                .typed_at
+                                .is_none_or(|at| now.duration_since(at) > TYPE_AHEAD_WINDOW)
+                            {
+                                list.typed.clear();
+                            }
+                            list.typed.push_str(&letter.to_lowercase());
+                            list.typed_at = Some(now);
+                            jump_target(&labels, current, &list.typed)
+                        }) else {
+                            return;
+                        };
+                        next
+                    }
+                };
+                list.update(cx, |list, cx| {
+                    list.highlight = next;
+                    list.scroll.scroll_to_item(next);
+                    cx.notify();
+                });
+            })
+        };
+        let rows = self.options.iter().enumerate().map(|(index, option)| {
+            let pick = pick.clone();
+            let list = list.clone();
+            div()
+                .id(index)
+                .min_h(px(ControlSize::Header.height()))
+                .px_2()
+                .py_0p5()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(CONTROL_RADIUS))
+                .when(index == highlight, |row| row.bg(color(palette.ghost_hover)))
+                .cursor_pointer()
+                .on_mouse_move(move |_, _, cx| {
+                    list.update(cx, |list, cx| {
+                        if list.highlight != index {
+                            list.highlight = index;
+                            cx.notify();
+                        }
+                    });
+                })
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    pick(&index, window, cx);
+                })
+                .child(
+                    div()
+                        .w(px(12.0))
+                        .flex_none()
+                        .when(selected == Some(index), |mark| {
+                            mark.child(glyph(IconName::Check, color(palette.popup_text)))
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .when_some(option.font.clone(), |text, font| text.font_family(font))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .text_color(color(palette.popup_text))
+                                .child(option.label.clone()),
+                        )
+                        .when_some(option.detail.clone(), |text, detail| {
+                            text.child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                                    .text_color(color(palette.popup_muted))
+                                    .child(detail),
+                            )
+                        }),
+                )
+        });
+        popup_keys(focus, Some(on_key)).child(
+            div()
+                .id(child_id(&self.id, "options"))
+                .min_w(px(160.0))
+                .max_w(px(POPUP_MAX_WIDTH))
+                .max_h(px(POPUP_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .track_scroll(&scroll)
+                .flex()
+                .flex_col()
+                .gap_px()
+                .children(rows),
+        )
+    }
+}
+
+/// One action of a menu.
+#[derive(Clone)]
+pub(super) struct MenuItem {
+    label: SharedString,
+    /// A shortcut hint, in GPUI keystroke syntax.
+    key: Option<SharedString>,
+    /// Why the action is unavailable; shown under its label.
+    reason: Option<SharedString>,
+    disabled: bool,
+    on_select: ClickHandler,
+}
+
+/// A menu action labeled `label`.
+pub(super) fn menu_item(
+    label: impl Into<SharedString>,
+    on_select: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> MenuItem {
+    MenuItem {
+        label: label.into(),
+        key: None,
+        reason: None,
+        disabled: false,
+        on_select: Rc::new(on_select),
+    }
+}
+
+impl MenuItem {
+    pub(super) fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Disables the action when `reason` is given, and shows the reason under it.
+    pub(super) fn disabled_because(mut self, reason: Option<impl Into<SharedString>>) -> Self {
+        if let Some(reason) = reason {
+            self.disabled = true;
+            self.reason = Some(reason.into());
+        }
+        self
+    }
+
+    /// The action's shortcut, in GPUI keystroke syntax, as a hint at the row's end.
+    pub(super) fn key(mut self, key: Option<&str>) -> Self {
+        self.key = key.map(|key| SharedString::from(key.to_owned()));
+        self
+    }
+}
+
+/// One row of a menu.
+#[derive(Clone)]
+pub(super) enum MenuEntry {
+    Item(MenuItem),
+    Separator,
+    /// A group's heading.
+    Label(SharedString),
+    /// A row opening more entries beside the menu.
+    Submenu(SharedString, Rc<[MenuEntry]>),
+}
+
+impl From<MenuItem> for MenuEntry {
+    fn from(item: MenuItem) -> Self {
+        Self::Item(item)
+    }
+}
+
+/// A row opening `entries` beside the menu.
+pub(super) fn submenu(
+    label: impl Into<SharedString>,
+    entries: impl IntoIterator<Item = MenuEntry>,
+) -> MenuEntry {
+    MenuEntry::Submenu(label.into(), entries.into_iter().collect())
+}
+
+/// Kit's menu row for `item`: a plain label, or the label with its shortcut and
+/// disabled reason.
+fn popup_menu_item(item: &MenuItem) -> PopupMenuItem {
+    let row = if item.key.is_none() && item.reason.is_none() {
+        PopupMenuItem::new(item.label.clone())
+    } else {
+        let (label, key, reason) = (item.label.clone(), item.key.clone(), item.reason.clone());
+        PopupMenuItem::element(move |_, cx| {
+            menu_item_body(label.clone(), key.as_deref(), reason.clone(), cx)
+        })
+    };
+    let on_select = item.on_select.clone();
+    row.disabled(item.disabled)
+        .on_click(move |event, window, cx| on_select(event, window, cx))
+}
+
+/// A menu row's label with its shortcut at the end and its disabled reason, muted,
+/// under it; Kit's rows and [`menu_row`]s share it.
+pub(super) fn menu_item_body(
+    label: SharedString,
+    key: Option<&str>,
+    reason: Option<SharedString>,
+    cx: &App,
+) -> Div {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(label)
+                .children(key.and_then(kbd).map(|key| {
+                    key.p_0()
+                        .flex_nowrap()
+                        .border_0()
+                        .bg(gpui::transparent_white())
+                })),
+        )
+        .children(reason.map(|reason| {
+            div()
+                .pb_0p5()
+                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .text_color(cx.theme().muted_foreground)
+                .child(reason)
+        }))
+}
+
+/// Fills Kit's `menu` with `entries`.
+fn fill_menu(
+    mut menu: PopupMenu,
+    entries: &[MenuEntry],
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    menu = menu.max_w(px(POPUP_MAX_WIDTH));
+    for entry in entries {
+        menu = match entry {
+            MenuEntry::Item(item) => menu.item(popup_menu_item(item)),
+            MenuEntry::Separator => menu.separator(),
+            MenuEntry::Label(label) => menu.label(label.clone()),
+            MenuEntry::Submenu(label, entries) => {
+                let entries = entries.clone();
+                menu.submenu(label.clone(), window, cx, move |menu, window, cx| {
+                    fill_menu(menu, &entries, window, cx)
+                })
+            }
+        };
+    }
+    menu
+}
+
+/// A short list of actions under a button. Build with [`menu`].
+#[derive(IntoElement)]
+pub(super) struct Menu {
+    id: ElementId,
+    trigger: AnyElement,
+    open: bool,
+    anchor: Anchor,
+    entries: Rc<[MenuEntry]>,
+    on_open_change: Option<OpenHandler>,
+}
+
+/// Kit's popup menu of `entries` under `trigger`, open while `open`; like
+/// [`popover`], the caller owns the state. Arrows move, Enter runs the item and
+/// closes the menu, Escape closes it.
+pub(super) fn menu(
+    id: impl Into<ElementId>,
+    trigger: impl IntoElement,
+    open: bool,
+    entries: impl IntoIterator<Item = impl Into<MenuEntry>>,
+) -> Menu {
+    Menu {
+        id: id.into(),
+        trigger: trigger.into_any_element(),
+        open,
+        anchor: Anchor::TopLeft,
+        entries: entries.into_iter().map(Into::into).collect(),
+        on_open_change: None,
+    }
+}
+
+impl Menu {
+    /// See [`PopoverControl::anchor`].
+    pub(super) fn anchor(mut self, anchor: Anchor) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
+    pub(super) fn on_open_change(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_open_change = Some(Rc::new(handler));
+        self
+    }
+}
+
+/// The menu an open [`Menu`] shows; built when it opens, dropped when it closes.
+#[derive(Default)]
+struct MenuState {
+    menu: Option<Entity<PopupMenu>>,
+}
+
+impl RenderOnce for Menu {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state =
+            window.use_keyed_state(child_id(&self.id, "menu"), cx, |_, _| MenuState::default());
+        if !self.open {
+            state.update(cx, |state, _| state.menu = None);
+        }
+        let entries = self.entries;
+        kit_popover(
+            self.id,
+            self.trigger,
+            self.open,
+            self.anchor,
+            self.on_open_change,
+        )
+        // The menu draws its own surface and closes itself on a click outside.
+        .appearance(false)
+        .overlay_closable(false)
+        .content(move |_, window, cx| {
+            let menu = match state.read(cx).menu.clone() {
+                Some(menu) => menu,
+                None => {
+                    let entries = entries.clone();
+                    let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                        fill_menu(menu, &entries, window, cx)
+                    });
+                    state.update(cx, |state, _| state.menu = Some(menu.clone()));
+                    menu.focus_handle(cx).focus(window, cx);
+                    // The menu closes itself (a pick, Escape, a click outside); the
+                    // popover follows and reports it.
+                    let popover = cx.entity().downgrade();
+                    window
+                        .subscribe(&menu, cx, move |_, _: &DismissEvent, window, cx| {
+                            if let Some(popover) = popover.upgrade() {
+                                popover.update(cx, |popover, cx| popover.dismiss(window, cx));
+                            }
+                        })
+                        .detach();
+                    menu
+                }
+            };
+            div()
+                .on_key_down(|_, _, cx| cx.stop_propagation())
+                .child(menu)
+        })
+    }
+}
+
+/// A menu at a point: what a right-click or a pane's grip opens. Its owner keeps it
+/// while it is open and draws it with [`ContextMenu::render`]; build one with
+/// [`context_menu`].
+pub(super) struct ContextMenu {
+    position: Point<Pixels>,
+    anchor: Anchor,
+    menu: Entity<PopupMenu>,
+    _dismissed: Subscription,
+}
+
+/// Kit's popup menu of `entries` with its `anchor` corner at `position` (window
+/// coordinates), kept inside the window. It takes the keyboard as it opens: arrows
+/// move, → opens a submenu and ← leaves it, Enter runs an item, Escape closes. It
+/// closes itself after an action, on Escape and on a click outside, then calls
+/// `on_dismiss` with its menu so the owner can drop it (see [`ContextMenu::is`]) and
+/// returns the keyboard to where it was, unless the action moved it.
+pub(super) fn context_menu<V: 'static>(
+    position: Point<Pixels>,
+    anchor: Anchor,
+    entries: impl IntoIterator<Item = MenuEntry>,
+    window: &mut Window,
+    cx: &mut Context<V>,
+    on_dismiss: impl Fn(&mut V, &Entity<PopupMenu>, &mut Window, &mut Context<V>) + 'static,
+) -> ContextMenu {
+    let entries: Vec<MenuEntry> = entries.into_iter().collect();
+    let previous = window.focused(cx);
+    let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+        let menu = fill_menu(menu, &entries, window, cx);
+        match previous {
+            Some(previous) => menu.action_context(previous),
+            None => menu,
+        }
+    });
+    menu.focus_handle(cx).focus(window, cx);
+    let dismissed = cx.subscribe_in(
+        &menu,
+        window,
+        move |owner, menu, _: &DismissEvent, window, cx| on_dismiss(owner, menu, window, cx),
+    );
+    ContextMenu {
+        position,
+        anchor,
+        menu,
+        _dismissed: dismissed,
+    }
+}
+
+impl ContextMenu {
+    /// Whether this is `menu`: a dismissal reported late, after another menu
+    /// opened, leaves that one open.
+    pub(super) fn is(&self, menu: &Entity<PopupMenu>) -> bool {
+        &self.menu == menu
+    }
+
+    /// The open menu, over everything else in the window.
+    pub(super) fn render(&self) -> AnyElement {
+        deferred(
+            anchored()
+                .position(self.position)
+                .anchor(self.anchor)
+                .snap_to_window_with_margin(px(8.0))
+                .child(
+                    div()
+                        .on_key_down(|_, _, cx| cx.stop_propagation())
+                        .child(self.menu.clone()),
+                ),
+        )
+        .with_priority(gpui_base::POPUP_PRIORITY)
+        .into_any_element()
+    }
+}
+
+/// The surface of a menu drawn with Compi rows, as Kit draws its popup menu: the
+/// popover's color, edge, shadow and radius, as wide as its longest row (from 128 px
+/// up to 320 px).
+pub(super) fn menu_surface(cx: &App) -> Div {
+    div()
+        .popover_style(cx)
+        .p_1()
+        .flex()
+        .flex_col()
+        .gap_y_0p5()
+        .min_w(px(128.0))
+        .max_w(px(POPUP_MAX_WIDTH))
+        .text_size(px(UI_SMALL_TEXT_SIZE))
+}
+
+/// A menu row as Kit draws one: 26 px, lit while `highlighted` or hovered, muted and
+/// inert while `disabled`.
+pub(super) fn menu_row(
+    id: impl Into<ElementId>,
+    highlighted: bool,
+    disabled: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let (accent, accent_text) = (theme.tokens.accent, theme.accent_foreground);
+    div()
+        .id(id)
+        .min_h(px(26.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_x_1()
+        .rounded(theme.radius.min(px(8.0)))
+        .text_color(if disabled {
+            theme.muted_foreground
+        } else {
+            theme.popover_foreground
+        })
+        .when(!disabled, |row| {
+            row.hover(move |style| style.bg(accent).text_color(accent_text))
+                .when(highlighted, |row| row.bg(accent).text_color(accent_text))
+        })
+}
+
+/// A line between groups of menu rows, as Kit draws it.
+pub(super) fn menu_separator_row(cx: &App) -> Div {
+    div()
+        .my_0p5()
+        .mx_neg_1()
+        .border_b(px(2.0))
+        .border_color(cx.theme().border)
+}
+
+/// A group's heading in a menu, as Kit draws a label row.
+pub(super) fn menu_label_row(label: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .min_h(px(26.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .text_color(cx.theme().muted_foreground)
+        .child(label.into())
 }
 
 #[cfg(test)]
@@ -796,7 +1747,18 @@ mod tests {
                             (palette.quiet_text, background, "segment"),
                         ]
                     }),
-                );
+                )
+                .chain({
+                    let surface = composite_rgb(colors.surface, opaque);
+                    [surface, composite_rgb(colors.surface_hover, surface)]
+                        .into_iter()
+                        .flat_map(|background| {
+                            [
+                                (palette.popup_text, background, "popup"),
+                                (palette.popup_muted, background, "popup detail"),
+                            ]
+                        })
+                });
             for (text, background, role) in checks {
                 let ratio = super::super::contrast_ratio(text, background);
                 if ratio < 4.5 {
@@ -808,6 +1770,21 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn typing_jumps_by_prefix_and_a_repeated_letter_cycles() {
+        let labels: Vec<SharedString> =
+            ["System", "JetBrains Mono", "IBM Plex", "Inter", "Iosevka"]
+                .map(SharedString::from)
+                .to_vec();
+        assert_eq!(jump_target(&labels, 0, "i"), Some(2));
+        assert_eq!(jump_target(&labels, 2, "i"), Some(3));
+        assert_eq!(jump_target(&labels, 2, "ii"), Some(3));
+        assert_eq!(jump_target(&labels, 4, "i"), Some(2));
+        assert_eq!(jump_target(&labels, 2, "io"), Some(4));
+        assert_eq!(jump_target(&labels, 2, "ib"), Some(2));
+        assert_eq!(jump_target(&labels, 0, "x"), None);
     }
 
     #[test]
@@ -826,6 +1803,7 @@ mod tests {
             IconName::Plus,
             IconName::Minus,
             IconName::ChevronDown,
+            IconName::Check,
             IconName::Loader,
             IconName::Circle,
             IconName::LoaderCircle,

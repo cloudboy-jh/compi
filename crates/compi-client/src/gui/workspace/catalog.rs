@@ -50,7 +50,6 @@ pub(in crate::gui) struct CatalogState {
     scope: SettingsScope,
     filter: ThemeFilter,
     licenses: bool,
-    menu_open: bool,
     previewed: bool,
     pending: bool,
     operation_id: u64,
@@ -71,10 +70,13 @@ impl CompiApp {
         scope: SettingsScope,
         target: CatalogTarget,
     ) {
-        let parent = self
-            .overlay
-            .clone()
-            .filter(|overlay| matches!(overlay, Overlay::Settings | Overlay::QuickAppearance));
+        let parent = if matches!(self.overlay, Some(Overlay::Settings)) {
+            Some(CatalogReturn::Settings)
+        } else if self.popup == Some(Popup::QuickAppearance) {
+            Some(CatalogReturn::QuickAppearance)
+        } else {
+            None
+        };
         let original = self.accepted_appearance();
         let accepted = if scope == SettingsScope::Global {
             self.config.configured_appearance.clone()
@@ -88,7 +90,7 @@ impl CompiApp {
         });
         let ordered_themes = self.catalog_ordered_themes();
         self.open_overlay(Overlay::ThemeCatalog, "");
-        self.overlay_return = parent;
+        self.catalog_return = parent;
         self.settings_scope = scope;
         self.theme_catalog = Some(CatalogState {
             original,
@@ -99,7 +101,6 @@ impl CompiApp {
             target,
             filter: ThemeFilter::All,
             licenses: false,
-            menu_open: false,
             previewed: false,
             pending: false,
             operation_id: 0,
@@ -289,20 +290,10 @@ impl CompiApp {
         if !matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
             return false;
         }
-        // Search/list, compact filters, import, menu, cancel, apply, selected star.
-        // An open menu adds attribution, export and local removal.
-        let menu_open = self
-            .theme_catalog
-            .as_ref()
-            .is_some_and(|catalog| catalog.menu_open);
-        let focus_count = if menu_open { 13 } else { 10 };
+        // Search/list, compact filters, import, More, cancel, apply, selected star. The
+        // More menu holds attribution, export and local removal; open, it has the keys.
+        let focus_count = 10;
         match key.key.as_str() {
-            "escape" if menu_open => {
-                if let Some(catalog) = &mut self.theme_catalog {
-                    catalog.menu_open = false;
-                }
-                self.overlay_focus = 6;
-            }
             "escape" => self.dismiss_overlay(),
             "tab" => {
                 self.overlay_focus = if key.modifiers.shift {
@@ -323,19 +314,6 @@ impl CompiApp {
             }
             "up" | "down" if self.overlay_focus == 0 || self.overlay_focus == 9 => {
                 self.move_catalog_selection(key.key == "up");
-            }
-            "up" | "down" if menu_open && (10..=12).contains(&self.overlay_focus) => {
-                self.overlay_focus = if key.key == "up" {
-                    if self.overlay_focus == 10 {
-                        12
-                    } else {
-                        self.overlay_focus - 1
-                    }
-                } else if self.overlay_focus == 12 {
-                    10
-                } else {
-                    self.overlay_focus + 1
-                };
             }
             "left" | "right" if (1..=4).contains(&self.overlay_focus) => {
                 let (first, last) = (1, 4);
@@ -410,44 +388,86 @@ impl CompiApp {
                     ][focus - 1];
                     catalog.licenses = false;
                     catalog.remove_mode = false;
-                    catalog.menu_open = false;
                     catalog.removal_confirmation = false;
                 }
                 self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
             }
             5 => self.import_catalog_theme(window, cx),
-            6 => {
-                if let Some(catalog) = &mut self.theme_catalog {
-                    catalog.menu_open = !catalog.menu_open;
-                    self.overlay_focus = if catalog.menu_open { 10 } else { 6 };
-                }
-            }
+            6 => self.popup = Some(Popup::CatalogMenu),
             7 => self.dismiss_overlay(),
-            10 => {
-                if let Some(catalog) = &mut self.theme_catalog {
-                    catalog.licenses = !catalog.licenses;
-                    catalog.menu_open = false;
-                    self.overlay_focus = 6;
-                }
-            }
             9 => {
                 if let Some(theme) = self.catalog_action_theme() {
                     self.toggle_theme_favorite(theme.theme_id().clone(), window, cx);
                 }
             }
-            11 => {
-                if let Some(catalog) = &mut self.theme_catalog {
-                    catalog.menu_open = false;
-                }
-                self.overlay_focus = 6;
-                self.export_catalog_theme(cx);
-            }
-            12 => {
-                self.toggle_catalog_removal();
-                self.overlay_focus = 0;
-            }
             _ => {}
         }
+    }
+
+    /// The More menu's actions: attribution, export and local removal. Like every
+    /// catalog control, they wait while a dialog or the theme store is busy.
+    fn catalog_menu(&self, cx: &Context<Self>) -> AnyElement {
+        let catalog = self.theme_catalog.as_ref();
+        let busy = catalog.is_some_and(|catalog| catalog.pending);
+        let licenses = catalog.is_some_and(|catalog| catalog.licenses);
+        let remove_mode = catalog.is_some_and(|catalog| catalog.remove_mode);
+        let open = self.popup == Some(Popup::CatalogMenu);
+        controls::menu(
+            "theme-menu",
+            self.settings_popup_button(
+                "theme-menu-button",
+                "More",
+                self.overlay_focus == 6 || open,
+                false,
+            ),
+            open,
+            [
+                controls::menu_item(
+                    if licenses {
+                        "Back to themes"
+                    } else {
+                        "Attribution"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(catalog) = &mut this.theme_catalog {
+                            catalog.licenses = !catalog.licenses;
+                        }
+                        cx.notify();
+                    }),
+                )
+                .disabled(busy),
+                controls::menu_item(
+                    "Export selected",
+                    cx.listener(|this, _, _, cx| {
+                        this.export_catalog_theme(cx);
+                        cx.notify();
+                    }),
+                )
+                .disabled(busy),
+                controls::menu_item(
+                    if remove_mode {
+                        "Back to themes"
+                    } else {
+                        "Remove local"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_catalog_removal();
+                        this.overlay_focus = 0;
+                        cx.notify();
+                    }),
+                )
+                .disabled(busy),
+            ],
+        )
+        .anchor(Anchor::TopRight)
+        .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+            if *open {
+                this.overlay_focus = 6;
+            }
+            this.set_popup(Popup::CatalogMenu, *open);
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     fn catalog_action_theme(&self) -> Option<Arc<ThemeDefinition>> {
@@ -472,7 +492,6 @@ impl CompiApp {
             }
             catalog.remove_mode = !catalog.remove_mode;
             catalog.licenses = false;
-            catalog.menu_open = false;
             catalog.removal_candidate = first;
             catalog.removal_confirmation = false;
             catalog.error = None;
@@ -1559,50 +1578,8 @@ impl CompiApp {
                                 false,
                                 cx,
                             ))
-                            .child(self.catalog_action_button("theme-menu", "More", 6, false, cx)),
+                            .child(self.catalog_menu(cx)),
                     )
-                    .when(catalog.menu_open, |panel| {
-                        panel.child(
-                            div()
-                                .flex_none()
-                                .px_3()
-                                .py_2()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .border_b_1()
-                                .border_color(color(colors.border))
-                                .child(self.catalog_action_button(
-                                    "theme-licenses",
-                                    if catalog.licenses {
-                                        "Back to themes"
-                                    } else {
-                                        "Attribution"
-                                    },
-                                    10,
-                                    false,
-                                    cx,
-                                ))
-                                .child(self.catalog_action_button(
-                                    "export-theme",
-                                    "Export selected",
-                                    11,
-                                    false,
-                                    cx,
-                                ))
-                                .child(self.catalog_action_button(
-                                    "remove-themes",
-                                    if catalog.remove_mode {
-                                        "Back to themes"
-                                    } else {
-                                        "Remove local"
-                                    },
-                                    12,
-                                    true,
-                                    cx,
-                                )),
-                        )
-                    })
                     .when(!catalog.licenses && !catalog.remove_mode, |panel| {
                         panel.child(
                             div()

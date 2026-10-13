@@ -2476,6 +2476,78 @@ impl CompiApp {
         }
     }
 
+    /// Right-click on a Files row: open it (a folder expands or collapses), open its
+    /// diff when it changed, copy its path or its path within the folder.
+    fn open_files_row_menu(
+        &mut self,
+        pane_id: &PaneId,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let Some(row) = ui.tree.rows.get(index) else {
+            return;
+        };
+        let (path, folder, expanded) = (row.path.clone(), row.directory, row.expanded);
+        ui.tree.selected = index;
+        let root = ui.root();
+        let relative = path
+            .strip_prefix(root)
+            .map(|rest| rest.trim_start_matches(['/', '\\']).to_owned())
+            .unwrap_or_else(|| path.clone());
+        let diff = match ui.repo.tree_mark(&path) {
+            Some(changes::TreeMark::File { path, .. }) => Some(path.clone()),
+            _ => None,
+        };
+        let (open_pane, diff_pane) = (pane_id.clone(), pane_id.clone());
+        let mut entries = vec![
+            controls::menu_item(
+                match (folder, expanded) {
+                    (false, _) => "Open",
+                    (true, false) => "Expand",
+                    (true, true) => "Collapse",
+                },
+                cx.listener(move |this, _, window, cx| {
+                    this.activate_content_row(&open_pane, index, window, cx);
+                    cx.notify();
+                }),
+            )
+            .into(),
+        ];
+        if let Some(diff) = diff {
+            entries.push(
+                controls::menu_item(
+                    "Open diff",
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_diff(&diff_pane, diff.clone(), None, None, window, cx);
+                        cx.notify();
+                    }),
+                )
+                .into(),
+            );
+        }
+        entries.push(controls::MenuEntry::Separator);
+        entries.push(
+            controls::menu_item("Copy path", move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+            })
+            .into(),
+        );
+        entries.push(
+            controls::menu_item("Copy relative path", move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()));
+            })
+            .into(),
+        );
+        entries.push(controls::MenuEntry::Separator);
+        entries.push(self.pane_submenu(pane_id, cx));
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
     /// Folder navigation while the pane itself has the keyboard: arrows move and
     /// expand, Enter opens, typing filters the names and Escape clears the filter.
     /// With a file open and the folder hidden, Enter returns to the editor.
@@ -2701,9 +2773,9 @@ impl CompiApp {
             }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, _, cx| {
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.focus_pane(menu_id.clone());
-                    this.open_overlay(Overlay::Palette, "");
+                    this.open_pane_menu(&menu_id, event.position, Anchor::TopLeft, window, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -2944,6 +3016,7 @@ impl CompiApp {
             let folder = row.directory;
             let level = row.depth.saturating_sub(1).min(31);
             let row_pane = pane_id.clone();
+            let menu_pane = pane_id.clone();
             let mark = ui.repo.tree_mark(&row.path);
             let tint = if selected || open {
                 colors.foreground
@@ -2971,6 +3044,13 @@ impl CompiApp {
                     cx.stop_propagation();
                     cx.notify();
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.open_files_row_menu(&menu_pane, index, event.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
                 // One guide per folder above, through the middle of its arrow.
                 .children((0..level).map(|guide| {
                     div()

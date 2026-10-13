@@ -1,6 +1,9 @@
 use super::*;
 use crate::theme::FocusIndicator;
-use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle};
+use gpui::{
+    Anchor, AnyElement, AnyWindowHandle, ClickEvent, Div, Stateful, WindowBackgroundAppearance,
+    WindowHandle,
+};
 use sha2::{Digest, Sha256};
 pub(in crate::gui) mod arrangements;
 pub(in crate::gui) mod branches;
@@ -13,6 +16,7 @@ mod files;
 mod focus;
 mod git_gutter;
 pub(super) mod media;
+pub(in crate::gui) mod menus;
 pub(in crate::gui) mod metadata;
 pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
@@ -313,33 +317,9 @@ pub(super) enum TextPurpose {
     SaveArrangement(TabId),
 }
 
-const STALE_TAB_MENU: &str =
-    "Workspace changed while the terminal menu was open. Reopen it to review the current panes.";
-
 #[derive(Clone)]
 pub(super) enum Overlay {
     Palette,
-    /// The focused pane's menu: under the header button, or at the pane's grip.
-    PaneActions {
-        position: Option<Point<Pixels>>,
-    },
-    /// Tab menus bind their target tab and the workspace `structure_key`, so size and
-    /// status observations never invalidate them; hierarchy changes do.
-    TabActions {
-        position: Point<Pixels>,
-        tab_id: TabId,
-        structure: u64,
-    },
-    TabPaneActions {
-        position: Point<Pixels>,
-        tab_id: TabId,
-        pane_id: PaneId,
-        structure: u64,
-    },
-    HeaderActions {
-        position: Point<Pixels>,
-    },
-    QuickAppearance,
     Settings,
     ThemeCatalog,
     ImageInspector,
@@ -393,6 +373,29 @@ pub(super) enum Overlay {
         /// Other tabs in this workspace to merge into `tab_id`, in tab order.
         merge: Vec<TabId>,
     },
+}
+
+/// The popup open on a control, at most one: a select's list, a menu or a popover
+/// (see `controls`). The shell prompt's confirm popover keeps its own state, with its
+/// plan, in `prompt::PromptSettingsState`. Menus at the pointer are kept apart, in
+/// `context_menu` and `tab_menu` (see `menus`); opening one closes the popup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Popup {
+    /// Settings → Interface → Interface font.
+    UiFont,
+    /// Settings → Terminal → Terminal font.
+    TerminalFont,
+    /// The theme catalog's More menu.
+    CatalogMenu,
+    /// The Appearance controls under the sidebar's Appearance button.
+    QuickAppearance,
+}
+
+/// Where closing the theme catalog returns to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CatalogReturn {
+    Settings,
+    QuickAppearance,
 }
 
 pub(super) const MODAL_SCRIM_OPACITY: f32 = 0.72;
@@ -896,7 +899,7 @@ impl CompiApp {
             settings_scope: SettingsScope::Global,
             daemon_restarting: false,
             zoom,
-            overlay_return: None,
+            catalog_return: None,
             overlay: None,
             overlay_index: 0,
             overlay_scroll: ScrollHandle::new(),
@@ -904,7 +907,9 @@ impl CompiApp {
             overlay_generation: 0,
             overlay_closing_since: None,
             settings_section: SettingsSection::Appearance,
-            settings_font_picker: None,
+            popup: None,
+            context_menu: None,
+            tab_menu: None,
             settings_scroll_bounds: None,
             settings_scroll_to_focus: false,
             prompt_settings: prompt::PromptSettingsState::default(),
@@ -3187,21 +3192,43 @@ impl CompiApp {
         }
     }
 
+    /// Opens Quick Appearance on its button. The palette it may be run from is
+    /// already closing.
+    fn open_quick_appearance(&mut self) {
+        if self.overlay.is_some() {
+            self.dismiss_overlay();
+        }
+        self.settings_scope = SettingsScope::Global;
+        self.overlay_focus = 0;
+        self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.popup = Some(Popup::QuickAppearance);
+    }
+
+    /// Follows a popup's open state as its control reports it; a close reported late,
+    /// after another popup opened, leaves that one open.
+    pub(super) fn set_popup(&mut self, popup: Popup, open: bool) {
+        if open {
+            self.popup = Some(popup);
+        } else if self.popup == Some(popup) {
+            self.popup = None;
+        }
+    }
+
     fn open_overlay(&mut self, overlay: Overlay, text: &str) {
         self.close_file_tree();
         self.finish_dismiss_overlay();
         self.report_focus(false);
         self.overlay_structure = self.workspace.as_ref().map(structure_key);
-        self.overlay_return = None;
+        self.catalog_return = None;
+        self.popup = None;
+        self.context_menu = None;
+        self.tab_menu = None;
         self.overlay = Some(overlay);
         self.overlay_index = 0;
         self.overlay_focus = 0;
         self.overlay_generation = self.overlay_generation.wrapping_add(1);
         self.overlay_closing_since = None;
-        if matches!(
-            self.overlay,
-            Some(Overlay::QuickAppearance | Overlay::Settings)
-        ) {
+        if matches!(self.overlay, Some(Overlay::Settings)) {
             self.settings_scope = SettingsScope::Global;
         }
         self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -3217,11 +3244,16 @@ impl CompiApp {
     }
 
     fn dismiss_overlay(&mut self) {
-        if matches!(self.overlay, Some(Overlay::ThemeCatalog))
-            && let Some(parent) = self.overlay_return.take()
-        {
+        if self.overlay.is_some() {
+            // Selects and menus inside the overlay go with it.
+            self.popup = None;
+        }
+        let parent = matches!(self.overlay, Some(Overlay::ThemeCatalog))
+            .then(|| self.catalog_return.take())
+            .flatten();
+        if parent == Some(CatalogReturn::Settings) {
             self.cancel_catalog_preview();
-            self.overlay = Some(parent);
+            self.overlay = Some(Overlay::Settings);
             self.overlay_generation = self.overlay_generation.wrapping_add(1);
             self.overlay_closing_since = None;
             self.overlay_focus = self.settings_section as usize;
@@ -3233,12 +3265,18 @@ impl CompiApp {
             self.cancel_catalog_preview();
             self.overlay_closing_since = Some(Instant::now());
         }
+        if parent == Some(CatalogReturn::QuickAppearance) {
+            // Back on the Theme row the catalog was opened from.
+            self.popup = Some(Popup::QuickAppearance);
+            self.overlay_focus = 2;
+            self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
     }
 
     fn finish_dismiss_overlay(&mut self) {
         self.cancel_catalog_preview();
         self.image_inspector = None;
-        self.overlay_return = None;
+        self.catalog_return = None;
         self.overlay = None;
         self.overlay_closing_since = None;
         self.ime_text.clear();
@@ -3343,16 +3381,7 @@ impl CompiApp {
                 "backspace" | "delete"
                     if !matches!(
                         self.overlay,
-                        Some(
-                            Overlay::PaneActions { .. }
-                                | Overlay::TabActions { .. }
-                                | Overlay::TabPaneActions { .. }
-                                | Overlay::HeaderActions { .. }
-                                | Overlay::QuickAppearance
-                                | Overlay::Settings
-                                | Overlay::Confirm { .. }
-                                | Overlay::Diagnostics
-                        )
+                        Some(Overlay::Settings | Overlay::Confirm { .. } | Overlay::Diagnostics)
                     ) =>
                 {
                     let mut range = self.ime_selected_range.clone();
@@ -3397,16 +3426,8 @@ impl CompiApp {
                 }
                 _ => {
                     // Printable and composing input belongs to native text fields, never menus.
-                    if !matches!(
-                        self.overlay,
-                        Some(
-                            Overlay::PaneActions { .. }
-                                | Overlay::TabActions { .. }
-                                | Overlay::TabPaneActions { .. }
-                                | Overlay::HeaderActions { .. }
-                                | Overlay::Arrangements { .. }
-                        )
-                    ) && key.key_char.is_some()
+                    if !matches!(self.overlay, Some(Overlay::Arrangements { .. }))
+                        && key.key_char.is_some()
                         && !key.modifiers.control
                         && !key.modifiers.platform
                     {
@@ -3463,12 +3484,7 @@ impl CompiApp {
         if matches!(
             self.overlay,
             Some(
-                Overlay::PaneActions { .. }
-                    | Overlay::TabActions { .. }
-                    | Overlay::TabPaneActions { .. }
-                    | Overlay::HeaderActions { .. }
-                    | Overlay::QuickAppearance
-                    | Overlay::Settings
+                Overlay::Settings
                     | Overlay::Confirm { .. }
                     | Overlay::ConfirmDiscard { .. }
                     | Overlay::Unsaved { .. }
@@ -3502,7 +3518,6 @@ impl CompiApp {
         }
         let tab_id = self.selected_tab().map(|tab| tab.id.clone());
         let pane_id = self.focused_pane().cloned();
-        let content_focused = self.focused_content().is_some();
         let surface = self
             .focused_view()
             .and_then(|view| self.workspace.as_ref()?.surface(&view.surface_id))
@@ -3808,29 +3823,12 @@ impl CompiApp {
             | Command::SwapPaneDown => self.run_arrangement_command(command, window),
             Command::RemovePane => {
                 if let Some(pane_id) = pane_id {
-                    if content_focused {
-                        // No process ends; only unsaved edits would be lost.
-                        self.remove_work(WorkspaceMutation::RemovePane { pane_id }, window, cx);
-                    } else {
-                        self.close_work(
-                            WorkspaceMutation::RemovePane { pane_id },
-                            "Close this pane and end its process tree?",
-                            "Close pane",
-                            window,
-                            cx,
-                        );
-                    }
+                    self.close_pane(&pane_id, window, cx);
                 }
             }
             Command::EndSurface => {
-                if let Some(surface) = surface {
-                    self.mutate(
-                        WorkspaceMutation::EndSurface {
-                            surface_id: surface.id,
-                            expected_lifetime: surface.process_lifetime_id,
-                        },
-                        false,
-                    );
+                if let Some(pane_id) = pane_id {
+                    self.end_process(&pane_id);
                 }
             }
             Command::RestartSurface => {
@@ -3926,9 +3924,7 @@ impl CompiApp {
                 self.refresh_typography(window);
                 self.save_state();
             }
-            Command::OpenQuickAppearance => {
-                self.open_overlay(Overlay::QuickAppearance, "");
-            }
+            Command::OpenQuickAppearance => self.open_quick_appearance(),
             Command::OpenSettings => self.open_overlay(Overlay::Settings, ""),
             Command::CheckForUpdates => {
                 self.settings_section = SettingsSection::Updates;
@@ -3937,7 +3933,6 @@ impl CompiApp {
             }
             Command::OpenPromptSettings => {
                 self.settings_section = SettingsSection::Terminal;
-                self.settings_font_picker = None;
                 self.open_overlay(Overlay::Settings, "");
                 self.focus_prompt_group();
             }
@@ -4066,118 +4061,13 @@ impl CompiApp {
         );
     }
 
-    fn pane_action_reason(
-        &self,
-        tab_id: &TabId,
-        pane_id: &PaneId,
-        action: PaneAction,
-    ) -> Option<&'static str> {
-        let Some((count, surface_id)) = self.tab_pane_target(tab_id, pane_id) else {
-            return Some("This pane is no longer in this tab");
-        };
-        match action {
-            PaneAction::Detach if count < 2 => Some("The tab has only one pane"),
-            PaneAction::Float
-                if !self.state.is_floating(pane_id)
-                    && self.state.floating.len() >= crate::client_state::MAX_FLOATING =>
-            {
-                Some("Dock a floating pane first")
-            }
-            PaneAction::End if surface_id.is_none() => Some("A content pane has no process"),
-            PaneAction::End
-                if self
-                    .workspace
-                    .as_ref()
-                    .and_then(|workspace| workspace.surface(surface_id.as_ref()?))
-                    .is_none_or(|surface| {
-                        !matches!(
-                            surface.status,
-                            SurfaceStatus::Running | SurfaceStatus::Starting
-                        )
-                    }) =>
-            {
-                Some("The terminal process is not running")
-            }
-            _ => None,
-        }
-    }
-
-    fn activate_tab_pane_action(
-        &mut self,
-        tab_id: TabId,
-        pane_id: PaneId,
-        action: PaneAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let valid_menu = matches!(
-            &self.overlay,
-            Some(Overlay::TabPaneActions {
-                tab_id: clicked,
-                pane_id: selected,
-                structure,
-                ..
-            }) if clicked == &tab_id && selected == &pane_id
-                && self.workspace.as_ref().is_some_and(|workspace| structure_key(workspace) == *structure)
-        );
-        if !valid_menu {
-            self.dismiss_overlay();
-            self.global_error = Some(STALE_TAB_MENU.into());
-        } else if let Some(reason) = self.pane_action_reason(&tab_id, &pane_id, action) {
-            self.global_error = Some(reason.into());
-        } else {
-            self.dismiss_overlay();
-            match action {
-                PaneAction::Detach => self.mutate(WorkspaceMutation::DetachPane { pane_id }, true),
-                PaneAction::Float => {
-                    if self.state.is_floating(&pane_id) {
-                        self.dock_pane(&pane_id);
-                    } else {
-                        self.float_pane(pane_id);
-                    }
-                }
-                PaneAction::End => {
-                    if let Some((_, Some(surface_id))) = self.tab_pane_target(&tab_id, &pane_id)
-                        && let Some(surface) = self
-                            .workspace
-                            .as_ref()
-                            .and_then(|workspace| workspace.surface(&surface_id))
-                    {
-                        self.mutate(
-                            WorkspaceMutation::EndSurface {
-                                surface_id: surface.id.clone(),
-                                expected_lifetime: surface.process_lifetime_id.clone(),
-                            },
-                            false,
-                        );
-                    }
-                }
-            }
-        }
-        window.focus(&self.focus_handle, cx);
-        cx.notify();
-    }
-
     fn activate_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(overlay) = self.overlay.clone() else {
             return;
         };
-        if let Overlay::TabActions { structure, .. } | Overlay::TabPaneActions { structure, .. } =
-            &overlay
-            && self
-                .workspace
-                .as_ref()
-                .is_none_or(|workspace| structure_key(workspace) != *structure)
-        {
-            self.dismiss_overlay();
-            self.global_error = Some(STALE_TAB_MENU.into());
-            return;
-        }
         match overlay {
             Overlay::ThemeCatalog => self.apply_catalog_theme(window, cx),
-            Overlay::QuickAppearance | Overlay::Settings | Overlay::ImageInspector => {
-                self.dismiss_overlay()
-            }
+            Overlay::Settings | Overlay::ImageInspector => self.dismiss_overlay(),
             Overlay::Text { purpose, .. } => {
                 let label = self.ime_text.trim().to_owned();
                 if label.is_empty() {
@@ -4260,33 +4150,12 @@ impl CompiApp {
             other => {
                 let choices = self.overlay_choices(cx);
                 if let Some(choice) = choices.get(self.overlay_index).cloned() {
-                    // A tab menu's command rows act on the clicked tab, which right-click
-                    // does not select; `execute` re-checks enablement after selecting it.
-                    let menu_tab = match (&other, &choice.action) {
-                        (
-                            Overlay::TabActions { tab_id, .. }
-                            | Overlay::TabPaneActions { tab_id, .. },
-                            ChoiceAction::Command(_),
-                        ) => Some(tab_id.clone()),
-                        _ => None,
-                    };
-                    if menu_tab.is_none()
-                        && let Some(reason) = choice.reason
-                    {
+                    if let Some(reason) = choice.reason {
                         self.global_error = Some(reason);
                         return;
                     }
-                    if !matches!(
-                        choice.action,
-                        ChoiceAction::Pane { .. } | ChoiceAction::ArrangementTab(_)
-                    ) {
+                    if !matches!(choice.action, ChoiceAction::ArrangementTab(_)) {
                         self.dismiss_overlay();
-                    }
-                    if let Some(tab_id) = menu_tab
-                        && self.selected_tab().is_none_or(|tab| tab.id != tab_id)
-                    {
-                        self.select_terminal(tab_id, false);
-                        self.rebuild_layout(window, true);
                     }
                     match choice.action {
                         ChoiceAction::Command(command) => self.execute(command, window, cx),
@@ -4298,29 +4167,6 @@ impl CompiApp {
                             self.save_state();
                         }
                         ChoiceAction::Tab(id) => self.select_terminal(id, true),
-                        ChoiceAction::Pane { tab_id, pane_id } => {
-                            if let Overlay::TabActions {
-                                position,
-                                structure,
-                                ..
-                            }
-                            | Overlay::TabPaneActions {
-                                position,
-                                structure,
-                                ..
-                            } = other
-                            {
-                                self.overlay = Some(Overlay::TabPaneActions {
-                                    position,
-                                    tab_id: tab_id.clone(),
-                                    pane_id: pane_id.clone(),
-                                    structure,
-                                });
-                                self.overlay_focus = self
-                                    .next_pane_action(&tab_id, &pane_id, None, true)
-                                    .unwrap_or(0);
-                            }
-                        }
                         ChoiceAction::Window(handle) => {
                             if let Some(tab) = self.selected_tab().map(|tab| tab.id.clone()) {
                                 self.transfer_tab(tab, Some(handle), window, cx);
@@ -4363,10 +4209,6 @@ enum ChoiceAction {
     Command(Command),
     Workspace(SessionId),
     Tab(TabId),
-    Pane {
-        tab_id: TabId,
-        pane_id: PaneId,
-    },
     Window(AnyWindowHandle),
     Arrangement(arrangements::ArrangementChoice),
     /// Toggles whether another tab is merged by the arrangement picker.
@@ -4374,42 +4216,6 @@ enum ChoiceAction {
     /// A backup in `Overlay::Recover`, by index.
     Recover(usize),
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PaneAction {
-    Detach,
-    Float,
-    End,
-}
-
-impl PaneAction {
-    /// Bubble order; `overlay_focus` indexes this list.
-    const ALL: [Self; 3] = [Self::Detach, Self::Float, Self::End];
-}
-
-impl CompiApp {
-    /// The next enabled bubble action after `from` (or the first when `None`),
-    /// wrapping in either direction; disabled actions are skipped.
-    fn next_pane_action(
-        &self,
-        tab_id: &TabId,
-        pane_id: &PaneId,
-        from: Option<usize>,
-        forward: bool,
-    ) -> Option<usize> {
-        let count = PaneAction::ALL.len();
-        (1..=count)
-            .map(|step| match (from, forward) {
-                (None, _) => step - 1,
-                (Some(start), true) => (start + step) % count,
-                (Some(start), false) => (start + count * 2 - step) % count,
-            })
-            .find(|&index| {
-                self.pane_action_reason(tab_id, pane_id, PaneAction::ALL[index])
-                    .is_none()
-            })
-    }
-}
-
 #[derive(Clone)]
 struct Choice {
     title: String,
@@ -4532,6 +4338,8 @@ struct TabPane {
     directory: Option<String>,
     /// Floating in this window; shown in the pane list.
     floating: bool,
+    /// The terminal's surface; `None` for a content pane.
+    surface_id: Option<SurfaceId>,
 }
 
 impl CompiApp {
@@ -4545,6 +4353,7 @@ impl CompiApp {
                     pane_id,
                     title: content.folder_name().to_owned(),
                     directory: Some(content.root),
+                    surface_id: None,
                 }),
                 LayoutNode::Pane {
                     pane_id,
@@ -4597,6 +4406,7 @@ impl CompiApp {
             pane_id,
             title,
             directory,
+            surface_id: Some(surface_id.clone()),
         }
     }
 
@@ -4703,87 +4513,7 @@ impl CompiApp {
         let query = self.ime_text.to_lowercase();
         let mut choices = Vec::new();
         match &self.overlay {
-            Some(
-                Overlay::PaneActions { .. }
-                | Overlay::TabActions { .. }
-                | Overlay::TabPaneActions { .. }
-                | Overlay::HeaderActions { .. },
-            ) => {
-                let context = self.command_context(cx);
-                let commands: &[Command] = match self.overlay.as_ref() {
-                    Some(Overlay::PaneActions { .. }) => &[
-                        Command::SplitRight,
-                        Command::SplitDown,
-                        Command::TogglePaneZoom,
-                        Command::TogglePaneFloat,
-                    ],
-                    Some(Overlay::TabActions { .. } | Overlay::TabPaneActions { .. }) => &[
-                        Command::NewTab,
-                        Command::RenameTab,
-                        Command::SplitRight,
-                        Command::SplitDown,
-                        Command::ArrangePanes,
-                        Command::RestoreArrangement,
-                        Command::MoveTabToNewWindow,
-                        Command::DetachTab,
-                        Command::RemoveTab,
-                    ],
-                    Some(Overlay::HeaderActions { .. }) => &[
-                        Command::NewTab,
-                        Command::CreateWorkspace,
-                        Command::SplitRight,
-                        Command::SplitDown,
-                        Command::ToggleSidebar,
-                    ],
-                    _ => unreachable!(),
-                };
-                for &command in commands {
-                    let title = match command {
-                        Command::NewTab => "New Tab",
-                        Command::CreateWorkspace => "New Workspace",
-                        Command::RenameTab => "Rename Tab",
-                        Command::SplitRight => "Split Right",
-                        Command::SplitDown => "Split Down",
-                        Command::ArrangePanes => "Arrange",
-                        Command::RestoreArrangement => "Restore Previous Arrangement",
-                        Command::MoveTabToNewWindow => "Move to New Window",
-                        Command::DetachTab => "Hide Tab",
-                        Command::RemoveTab => "Close Tab",
-                        Command::ToggleSidebar => "Toggle Sidebar",
-                        _ => self.command_label(command),
-                    };
-                    choices.push(Choice {
-                        title: title.into(),
-                        detail: self.configured_shortcut(command).unwrap_or("").into(),
-                        group: None,
-                        reason: command.disabled_reason(&context).map(str::to_owned),
-                        action: ChoiceAction::Command(command),
-                    });
-                }
-                if let Some(
-                    Overlay::TabActions { tab_id, .. } | Overlay::TabPaneActions { tab_id, .. },
-                ) = &self.overlay
-                    && let Some(tab) = self.tab_by_id(tab_id)
-                {
-                    for (index, pane) in self.tab_panes(tab).into_iter().enumerate() {
-                        choices.push(Choice {
-                            title: if pane.floating {
-                                format!("{}. {} · Floating", index + 1, pane.title)
-                            } else {
-                                format!("{}. {}", index + 1, pane.title)
-                            },
-                            detail: pane.directory.unwrap_or_default(),
-                            group: Some("Terminals"),
-                            reason: None,
-                            action: ChoiceAction::Pane {
-                                tab_id: tab_id.clone(),
-                                pane_id: pane.pane_id,
-                            },
-                        });
-                    }
-                }
-            }
-            Some(Overlay::QuickAppearance | Overlay::Settings | Overlay::ThemeCatalog) => {}
+            Some(Overlay::Settings | Overlay::ThemeCatalog) => {}
             Some(Overlay::Palette) => {
                 let context = self.command_context(cx);
                 for category in commands::CommandCategory::ALL {
@@ -4905,7 +4635,7 @@ impl CompiApp {
             window.on_next_frame(move |_, cx| cx.notify(view_id));
         }
         if let Some(started) = self.overlay_closing_since {
-            if started.elapsed() >= dialogs::OVERLAY_CLOSE_DURATION {
+            if started.elapsed() >= dialogs::overlay_close_duration() {
                 self.finish_dismiss_overlay();
             } else {
                 let view_id = cx.entity_id();
@@ -4928,6 +4658,7 @@ impl CompiApp {
             self.rebuild_layout(window, true);
         }
         self.restart_visible_lost_shell();
+        self.prune_tab_menu(window, cx);
         if self.rebuild_layout(window, false) {
             let view_id = cx.entity_id();
             window.on_next_frame(move |_, cx| cx.notify(view_id));
@@ -5085,7 +4816,9 @@ impl CompiApp {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .when(self.sidebar_open, |row| row.child(self.render_sidebar(cx)))
+                    .when(self.sidebar_open, |row| {
+                        row.child(self.render_sidebar(window, cx))
+                    })
                     .child(self.render_panes(cx)),
             )
             .when_some(notice, |root, (error, can_reconnect, dismissible)| {
@@ -5166,7 +4899,8 @@ impl CompiApp {
                     )
                 },
             )
-            .children(self.render_pane_drag_card());
+            .children(self.render_pane_drag_card())
+            .children(self.render_menus(window, cx));
         root.into_any_element()
     }
 
@@ -5177,6 +4911,25 @@ impl CompiApp {
         command: Command,
         cx: &Context<Self>,
     ) -> AnyElement {
+        self.command_button_face(id, label, command, false, cx)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.execute(command, window, cx);
+                cx.stop_propagation();
+            }))
+            .into_any_element()
+    }
+
+    /// A sidebar command button without its click: also the trigger of a popup that
+    /// is `open`.
+    fn command_button_face(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        label: &'static str,
+        command: Command,
+        open: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let colors = *self.colors();
         let reason = command.disabled_reason(&self.command_context(cx));
         div()
@@ -5190,14 +4943,9 @@ impl CompiApp {
             } else {
                 colors.foreground
             }))
+            .when(open, |button| button.bg(color(colors.surface_hover)))
             .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.execute(command, window, cx);
-                cx.stop_propagation();
-            }))
             .child(label)
-            .into_any_element()
     }
 
     fn command_icon_button(
@@ -5257,7 +5005,6 @@ impl CompiApp {
 
     fn pane_actions_menu_button(&self, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let active = matches!(self.overlay, Some(Overlay::PaneActions { position: None }));
         div()
             .id("pane-actions-menu")
             .size(px(32.0))
@@ -5265,19 +5012,15 @@ impl CompiApp {
             .flex()
             .items_center()
             .justify_center()
-            .when(active, |button| button.bg(color(colors.surface_hover)))
             .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.open_overlay(Overlay::PaneActions { position: None }, "");
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_header_pane_menu(window, cx);
                 cx.stop_propagation();
                 cx.notify();
             }))
             .tooltip(controls::tooltip("Pane actions", None, None))
-            .child(chrome_icon(
-                ChromeIcon::PaneActions,
-                color(if active { colors.accent } else { colors.muted }),
-            ))
+            .child(chrome_icon(ChromeIcon::PaneActions, color(colors.muted)))
             .into_any_element()
     }
 
@@ -5304,7 +5047,7 @@ impl CompiApp {
             let context_id = id.clone();
             let close_id = id.clone();
             let close_title = match self.configured_shortcut(Command::RemoveTab) {
-                Some(shortcut) => format!("Close tab · {shortcut}"),
+                Some(shortcut) => format!("Close tab · {}", controls::key_label(shortcut)),
                 None => "Close tab".to_owned(),
             };
             let selected = self
@@ -5381,17 +5124,10 @@ impl CompiApp {
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         // The menu targets this tab without switching to it; its pane
-                        // actions (including Float) apply to the clicked tab's panes.
-                        this.open_overlay(
-                            Overlay::TabActions {
-                                position: event.position,
-                                tab_id: context_id.clone(),
-                                structure: this.workspace.as_ref().map_or(0, structure_key),
-                            },
-                            "",
-                        );
+                        // actions apply to the clicked tab's panes.
+                        this.open_tab_menu(context_id.clone(), event.position, window, cx);
                         cx.stop_propagation();
                         cx.notify();
                     }),
@@ -5484,13 +5220,8 @@ impl CompiApp {
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.open_overlay(
-                        Overlay::HeaderActions {
-                            position: event.position,
-                        },
-                        "",
-                    );
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.open_header_menu(event.position, window, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -5519,13 +5250,27 @@ impl CompiApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(self.command_icon_button(
-                        "sidebar-toggle",
-                        ChromeIcon::Sidebar,
-                        Command::ToggleSidebar,
-                        self.sidebar_open,
-                        cx,
-                    ))
+                    .child({
+                        let toggle = self.command_icon_button(
+                            "sidebar-toggle",
+                            ChromeIcon::Sidebar,
+                            Command::ToggleSidebar,
+                            self.sidebar_open,
+                            cx,
+                        );
+                        // With the sidebar hidden, Quick Appearance opens from here.
+                        if !self.sidebar_open && self.popup == Some(Popup::QuickAppearance) {
+                            self.render_quick_appearance(
+                                "quick-appearance-header",
+                                toggle,
+                                Anchor::TopLeft,
+                                window,
+                                cx,
+                            )
+                        } else {
+                            toggle
+                        }
+                    })
                     .when(self.whats_new_dot() || self.update_dot, |slot| {
                         slot.child(
                             div()
@@ -5697,7 +5442,7 @@ impl CompiApp {
             .into_any_element()
     }
 
-    fn render_sidebar(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_sidebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let mut rows = Vec::new();
         if let Some(workspace) = &self.workspace {
@@ -5870,12 +5615,22 @@ impl CompiApp {
                                 Command::OpenPalette,
                                 cx,
                             ))
-                            .child(self.command_button(
-                                "appearance-sidebar",
-                                "Appearance",
-                                Command::OpenQuickAppearance,
-                                cx,
-                            ))
+                            .child(
+                                self.render_quick_appearance(
+                                    "quick-appearance",
+                                    self.command_button_face(
+                                        "appearance-sidebar",
+                                        "Appearance",
+                                        Command::OpenQuickAppearance,
+                                        self.popup == Some(Popup::QuickAppearance),
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                    Anchor::BottomLeft,
+                                    window,
+                                    cx,
+                                ),
+                            )
                             .child(self.command_button(
                                 "settings-sidebar",
                                 "Settings",
@@ -6381,9 +6136,8 @@ impl CompiApp {
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, _, cx| {
-                    this.focus_pane(focus_id.clone());
-                    this.open_overlay(Overlay::Palette, "");
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.open_terminal_menu(&focus_id, event.position, window, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -6552,8 +6306,13 @@ impl CompiApp {
         let raise_id = pane_id.clone();
         let move_id = pane_id.clone();
         let menu_id = pane_id.clone();
+        let actions_id = pane_id.clone();
+        let close_id = pane_id.clone();
+        let group = SharedString::from(format!("floating-{index}"));
+        let close_title = self.close_pane_title(&pane_id);
         div()
             .id(("floating-frame", index))
+            .group(group.clone())
             .absolute()
             .left(px(frame.x))
             .top(px(frame.y))
@@ -6605,9 +6364,15 @@ impl CompiApp {
                     )
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             this.focus_pane(menu_id.clone());
-                            this.open_overlay(Overlay::Palette, "");
+                            this.open_pane_menu(
+                                &menu_id,
+                                event.position,
+                                Anchor::TopLeft,
+                                window,
+                                cx,
+                            );
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -6641,13 +6406,48 @@ impl CompiApp {
                                 .child("Keyboard"),
                         )
                     })
-                    .child(self.pane_command_button(
-                        ("floating-dock", index),
-                        "Dock",
-                        Command::TogglePaneFloat,
-                        &pane_id,
-                        cx,
-                    )),
+                    .child(
+                        // Hidden until the pointer is over the float; Dock is in the menu.
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .invisible()
+                            .group_hover(group, |style| style.visible())
+                            .child(
+                                controls::icon_button(
+                                    ("floating-actions", index),
+                                    controls::IconName::Ellipsis,
+                                    "Pane actions",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        this.open_pane_menu(
+                                            &actions_id,
+                                            event.position(),
+                                            Anchor::TopLeft,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                controls::icon_button(
+                                    ("floating-close", index),
+                                    controls::IconName::X,
+                                    close_title,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.close_pane(&close_id, window, cx);
+                                        window.focus(&this.focus_handle, cx);
+                                        this.rebuild_layout(window, true);
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
             )
             .child(
                 self.render_pane(("floating-pane", index), &float.pane, body, cx)
@@ -7090,7 +6890,7 @@ impl CompiApp {
             return;
         }
         if self.pane_drag.is_some() {
-            self.finish_pane_drag(event.position);
+            self.finish_pane_drag(window, cx);
             cx.notify();
             return;
         }

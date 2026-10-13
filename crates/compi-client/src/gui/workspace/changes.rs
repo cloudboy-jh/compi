@@ -2143,6 +2143,105 @@ impl CompiApp {
         );
     }
 
+    /// Right-click on a Changes row. A file: open its diff or the file, stage or
+    /// unstage it, discard it (asking first). A section or folder row: the pane's
+    /// actions.
+    fn open_change_row_menu(
+        &mut self,
+        pane_id: &PaneId,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let change = match (&ui.repo.listing, ui.repo.rows.get(index)) {
+            (Listing::Ready(listing), Some(ListRow::File { change, .. })) => listing
+                .changes
+                .get(*change)
+                .map(|change| (listing.repo.clone(), change.clone())),
+            _ => None,
+        };
+        let Some((repo, change)) = change else {
+            self.open_pane_menu(pane_id, position, Anchor::TopLeft, window, cx);
+            return;
+        };
+        ui.repo.select_row(index);
+        let environment = ui.environment.clone();
+        let (scope, kind) = (change.scope, change.kind);
+        let mut entries: Vec<controls::MenuEntry> = Vec::new();
+        let (pane, path) = (pane_id.clone(), change.path.clone());
+        entries.push(
+            controls::menu_item(
+                "Open diff",
+                cx.listener(move |this, _, window, cx| {
+                    this.open_diff(&pane, path.clone(), Some(scope), None, window, cx);
+                    cx.notify();
+                }),
+            )
+            .into(),
+        );
+        if kind != GitChangeKind::Deleted {
+            let (pane, file) = (pane_id.clone(), work_tree_path(&repo, &change.path));
+            entries.push(
+                controls::menu_item(
+                    "Open file",
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_content_file(
+                            &pane,
+                            environment.clone(),
+                            None,
+                            Some(file.clone()),
+                            None,
+                            false,
+                            window,
+                            cx,
+                        );
+                        cx.notify();
+                    }),
+                )
+                .into(),
+            );
+        }
+        entries.push(controls::MenuEntry::Separator);
+        let (pane, paths) = (pane_id.clone(), change_paths(&change).collect::<Vec<_>>());
+        entries.push(
+            controls::menu_item(
+                match (scope, kind) {
+                    (GitScope::Staged, _) => "Unstage",
+                    (_, GitChangeKind::Conflicted) => "Stage (marks it resolved)",
+                    _ => "Stage",
+                },
+                cx.listener(move |this, _, window, cx| {
+                    this.move_changes(&pane, scope, paths.clone(), false, window, cx);
+                }),
+            )
+            .into(),
+        );
+        if scope == GitScope::Unstaged && kind != GitChangeKind::Conflicted {
+            let pane = pane_id.clone();
+            entries.push(
+                controls::menu_item(
+                    if kind == GitChangeKind::Untracked {
+                        "Delete file…"
+                    } else {
+                        "Discard changes…"
+                    },
+                    cx.listener(move |this, _, _, cx| {
+                        this.confirm_discard(&pane, std::slice::from_ref(&change));
+                        cx.notify();
+                    }),
+                )
+                .into(),
+            );
+        }
+        entries.push(controls::MenuEntry::Separator);
+        entries.push(self.pane_submenu(pane_id, cx));
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
     /// A diff tab's hunk button: the hunk moves into or out of the index, if the index
     /// text still is the one the diff shows.
     fn hunk_clicked(
@@ -2999,6 +3098,7 @@ impl CompiApp {
                     gpui::transparent_black()
                 };
                 let pane = pane_id.clone();
+                let menu_pane = pane_id.clone();
                 let base = div()
                     .id(("changes-row", index))
                     .group("changes-row")
@@ -3017,7 +3117,20 @@ impl CompiApp {
                         this.release_editor(&pane, window, cx);
                         this.activate_change_row(&pane, index, window, cx);
                         cx.notify();
-                    }));
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_change_row_menu(
+                                &menu_pane,
+                                index,
+                                event.position,
+                                window,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    );
                 let item = div()
                     .h(px(row_height - 2.0))
                     .flex_1()
