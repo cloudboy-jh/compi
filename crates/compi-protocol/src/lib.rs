@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod paths;
 pub mod perf;
 pub mod pipe;
+pub mod program_status;
 pub mod prompt;
 mod screen;
 #[cfg(windows)]
@@ -39,7 +40,9 @@ use std::fmt;
 // Version 23 replaces a content pane's files and view with tabs holding files and diffs.
 // Version 24 adds Git writes: stage, unstage, hunk staging, discard and commit.
 // Version 25 adds Git branches: upstream and ahead/behind, the branch list, switch and create.
-pub const PROTOCOL_VERSION: u32 = 25;
+// Version 26 adds program status (OSC 7501): watching every terminal's records and
+// acknowledging finished ones.
+pub const PROTOCOL_VERSION: u32 = 26;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -350,6 +353,14 @@ pub enum ClientMessage {
         distribution: Option<String>,
         request: Box<prompt::PromptRequest>,
     },
+    /// Sends each terminal's current program status as `ProgramStatusChanged`, answers
+    /// `ProgramStatusWatching`, then sends every later change on this connection.
+    WatchProgramStatus,
+    /// The user has seen the surface's results: removes its `done` and `error` records.
+    AcknowledgeProgramStatus {
+        surface_id: SurfaceId,
+        expected_lifetime: ProcessLifetimeId,
+    },
     ShutdownDaemon,
 }
 
@@ -458,6 +469,12 @@ pub enum ServerMessage {
         identity: TerminalIdentity,
         exit_code: u32,
     },
+    /// Unsolicited, after `WatchProgramStatus`: the terminal's complete current records.
+    ProgramStatusChanged {
+        status: program_status::SurfaceProgramStatus,
+    },
+    ProgramStatusWatching,
+    ProgramStatusAcknowledged,
     Error {
         code: ErrorCode,
         message: String,

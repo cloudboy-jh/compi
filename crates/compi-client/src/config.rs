@@ -212,6 +212,28 @@ impl Default for MetadataSettings {
     }
 }
 
+/// Where program status (OSC 7501) is shown. Status is still followed when hidden.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProgramStatusSettings {
+    /// The glyph on tab chips.
+    pub tabs: bool,
+    /// The dot on tiled panes and the glyph in floating title strips.
+    pub panes: bool,
+    /// The state at the start of the sidebar and palette status line.
+    pub sidebar: bool,
+}
+
+impl Default for ProgramStatusSettings {
+    fn default() -> Self {
+        Self {
+            tabs: true,
+            panes: true,
+            sidebar: true,
+        }
+    }
+}
+
 static CONFIG_WRITES: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -237,6 +259,8 @@ pub struct LoadedConfig {
     pub updates: UpdateSettings,
     #[serde(default)]
     pub metadata: MetadataSettings,
+    #[serde(default)]
+    pub program_status: ProgramStatusSettings,
     /// Ask before closing a tab or pane ends its processes. Off: one click closes.
     #[serde(default)]
     pub confirm_close: bool,
@@ -269,6 +293,7 @@ impl Default for LoadedConfig {
             clipboard_policy: ClipboardPolicy::default(),
             updates: UpdateSettings::default(),
             metadata: MetadataSettings::default(),
+            program_status: ProgramStatusSettings::default(),
             confirm_close: false,
             focus_indicator: FocusIndicator::default(),
             provenance: ConfigProvenance::default(),
@@ -288,6 +313,19 @@ impl LoadedConfig {
             set_table_value(table, "dimensions", metadata.dimensions.into());
         })?;
         self.metadata = metadata;
+        Ok(())
+    }
+
+    pub fn save_program_status_settings(
+        &mut self,
+        settings: ProgramStatusSettings,
+    ) -> Result<(), String> {
+        update_table(&self.path, "program_status", |table| {
+            set_table_value(table, "tabs", settings.tabs.into());
+            set_table_value(table, "panes", settings.panes.into());
+            set_table_value(table, "sidebar", settings.sidebar.into());
+        })?;
+        self.program_status = settings;
         Ok(())
     }
 
@@ -1320,6 +1358,26 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
             }
         }
     }
+    if let Some(program_status) = table(&document, "program_status", loaded) {
+        for key in ["tabs", "panes", "sidebar"] {
+            let Some(value) = program_status.get(key) else {
+                continue;
+            };
+            match value.as_bool() {
+                Some(enabled) => match key {
+                    "tabs" => loaded.program_status.tabs = enabled,
+                    "panes" => loaded.program_status.panes = enabled,
+                    _ => loaded.program_status.sidebar = enabled,
+                },
+                None => invalid(
+                    loaded,
+                    &format!("program_status.{key}"),
+                    "true or false",
+                    "configuration",
+                ),
+            }
+        }
+    }
     if let Some(workspace) = table(&document, "workspace", loaded) {
         if let Some(value) = workspace.get("confirm_close") {
             match value.as_bool() {
@@ -2017,6 +2075,49 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("workspace.confirm_close"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn program_status_displays_default_on_round_trip_and_reject_non_booleans() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-program-status-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n# retain me\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.program_status, ProgramStatusSettings::default());
+        let hidden = ProgramStatusSettings {
+            tabs: false,
+            panes: true,
+            sidebar: false,
+        };
+        loaded.save_program_status_settings(hidden.clone()).unwrap();
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).program_status,
+            hidden
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("# retain me"));
+
+        let invalid = parse(
+            "version = 1\n[program_status]\ntabs = 'no'\npanes = false",
+            FontOverrides::default(),
+        );
+        assert!(invalid.program_status.tabs);
+        assert!(!invalid.program_status.panes);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("program_status.tabs"))
         );
         fs::remove_dir_all(root).unwrap();
     }

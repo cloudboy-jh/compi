@@ -6,6 +6,7 @@ pub mod file_tree;
 mod git;
 pub mod launch;
 pub mod metadata;
+mod program_status;
 mod prompt;
 pub mod pty;
 pub mod screen;

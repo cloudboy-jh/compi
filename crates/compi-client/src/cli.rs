@@ -744,6 +744,10 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
             _ => unreachable!(),
         },
         "pane" => {
+            if matches!(action, Some("list" | "show")) {
+                // Pane rows carry each terminal's current program status.
+                client.watch_program_status()?;
+            }
             if action == Some("list") {
                 let selected_tab =
                     if options.tab.is_some() || options.pane.is_some() || options.surface.is_some()
@@ -1096,8 +1100,9 @@ fn pane_surface<'a>(
         .ok_or_else(|| CliError::target("pane surface is missing"))
 }
 
-/// One `pane list`/`pane show` entry. Terminals report their surface and fresh runtime
-/// metadata; content panes have no process and report the folder and files they show.
+/// One `pane list`/`pane show` entry. Terminals report their surface, fresh runtime
+/// metadata and program status; content panes have no process and report the folder
+/// and files they show.
 fn pane_row(
     client: &mut DaemonClient,
     state: &WorkspaceSnapshot,
@@ -1112,7 +1117,13 @@ fn pane_row(
             surface_id,
         } => {
             let surface = pane_surface(state, surface_id)?;
-            json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Terminal,"surface":surface,"metadata":client.surface_metadata(surface)?})
+            let program_status = client
+                .program_status()
+                .get(surface_id)
+                .filter(|status| status.process_lifetime_id == surface.process_lifetime_id)
+                .map_or(&[][..], |status| &status.records)
+                .to_vec();
+            json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Terminal,"surface":surface,"metadata":client.surface_metadata(surface)?,"program_status":program_status})
         }
         LayoutNode::Content { pane_id, content } => {
             json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Content,"content":content})

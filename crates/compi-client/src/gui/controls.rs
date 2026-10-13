@@ -62,6 +62,7 @@ gpui_kit_assets::icon_assets!(
         GitBranch,
         Columns2,
         Rows2,
+        Circle,
     ]
 );
 
@@ -826,6 +827,11 @@ mod tests {
             IconName::Minus,
             IconName::ChevronDown,
             IconName::Loader,
+            IconName::Circle,
+            IconName::LoaderCircle,
+            IconName::CircleCheck,
+            IconName::CircleAlert,
+            IconName::CircleX,
         ] {
             let path = icon.path();
             assert!(

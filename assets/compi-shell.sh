@@ -49,6 +49,10 @@ _compi_prompt_cwd() {
     if [[ -z ${_compi_pid_reported-} ]] && [[ -t 0 || -t 1 || -t 2 ]]; then
         printf '\033]777;compi;pid;%s\a' "$$" > /dev/tty && _compi_pid_reported=1
     fi
+    # A new prompt (OSC 133 A) ends the work programs reported through OSC 7501.
+    if [[ -t 0 || -t 1 || -t 2 ]]; then
+        printf '\033]133;A\a' > /dev/tty
+    fi
     if [[ -n ${ZSH_VERSION-} ]]; then
         _compi_prompt_sync "$compi_status"
     elif [[ -z ${BLE_VERSION-} && -z ${_compi_prompt_native_dispatching-} &&

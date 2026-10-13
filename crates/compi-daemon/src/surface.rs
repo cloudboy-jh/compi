@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::launch::{self, LaunchDescription};
+use crate::program_status::ProgramStatusHub;
 use crate::pty::{PtySession, PtyWriter};
 use crate::terminal::TerminalState;
 use crate::terminal::trace::TerminalTraceRecorder;
@@ -51,6 +52,7 @@ pub struct SurfaceManager {
     daemon_executable: std::result::Result<String, String>,
     lifecycle_clients: Mutex<BTreeSet<u64>>,
     runtime_stopping: Arc<Mutex<bool>>,
+    program_status: Arc<ProgramStatusHub>,
 }
 
 pub struct Surface {
@@ -76,6 +78,7 @@ pub struct Surface {
     distribution: Option<String>,
     #[cfg(unix)]
     metadata_fd: std::fs::File,
+    program_status: Arc<ProgramStatusHub>,
 }
 
 struct SurfaceRuntime {
@@ -88,6 +91,8 @@ struct SurfaceRuntime {
     client: Option<(ConnectionSink, AttachmentId)>,
     client_ready: bool,
     client_console: bool,
+    /// Generation of the terminal's program status last given to the hub.
+    published_program_status: u64,
 }
 
 struct PendingLatency {
@@ -188,6 +193,8 @@ impl SurfaceManager {
         let runtime_stopping = Arc::new(Mutex::new(false));
         let worker_stopping = runtime_stopping.clone();
         let worker_instance = instance.map(str::to_owned);
+        let program_status = Arc::new(ProgramStatusHub::default());
+        let worker_program_status = program_status.clone();
         thread::spawn(move || {
             let mut pending_effects = VecDeque::new();
             while let Some(effect) = pending_effects.pop_front().or_else(|| effects.recv().ok()) {
@@ -257,6 +264,7 @@ impl SurfaceManager {
                             launch,
                             context.as_deref(),
                             worker_actor.clone(),
+                            worker_program_status.clone(),
                             worker_instance.as_deref(),
                             startup_started,
                         ) {
@@ -332,11 +340,17 @@ impl SurfaceManager {
             daemon_executable,
             lifecycle_clients: Mutex::new(BTreeSet::new()),
             runtime_stopping,
+            program_status,
         }
     }
 
     pub fn actor(&self) -> &WorkspaceActor {
         &self.actor
+    }
+
+    /// Program status of every terminal.
+    pub fn program_status(&self) -> &ProgramStatusHub {
+        &self.program_status
     }
 
     pub fn register_client(&self, id: u64, stopping: &AtomicBool) -> Result<()> {
@@ -510,6 +524,7 @@ impl Surface {
         mut launch: LaunchDescription,
         context: Option<&compi_protocol::LaunchContext>,
         actor: WorkspaceActor,
+        program_status: Arc<ProgramStatusHub>,
         instance: Option<&str>,
         startup_started: Option<Instant>,
     ) -> Result<Arc<Self>> {
@@ -657,6 +672,7 @@ impl Surface {
                 client: None,
                 client_ready: false,
                 client_console: false,
+                published_program_status: 0,
             }),
             input: Mutex::new(Some(input)),
             trace: Mutex::new(trace),
@@ -672,6 +688,7 @@ impl Surface {
             distribution,
             #[cfg(unix)]
             metadata_fd,
+            program_status,
         });
 
         let output_surface = surface.clone();
@@ -716,6 +733,7 @@ impl Surface {
                         break;
                     };
                     let (delta, replies) = state.terminal.advance(&buffer[..read]);
+                    output_surface.publish_program_status(&mut state);
                     let directory = state
                         .terminal
                         .current_directory()
@@ -939,6 +957,10 @@ impl Surface {
         }
 
         let client = if let Ok(mut state) = self.state.lock() {
+            // Only finished results outlive the process; they go when the pane is closed
+            // and this runtime retired.
+            state.terminal.program_status_mut().end_activity();
+            self.publish_program_status(&mut state);
             state.exit_code = Some(exit_code);
             state.status = if cleanup_failed {
                 SurfaceStatus::Ending
@@ -1194,6 +1216,36 @@ impl Surface {
         } else {
             Ok(())
         }
+    }
+
+    /// The user has seen this terminal's results: removes its `done` and `error` records.
+    pub fn acknowledge_program_status(
+        &self,
+        expected: &ProcessLifetimeId,
+    ) -> std::result::Result<(), SurfaceError> {
+        self.validate_lifetime(expected)?;
+        let mut state = self.state.lock().map_err(|_| SurfaceError::Unavailable)?;
+        if state.terminal.program_status_mut().acknowledge() {
+            self.publish_program_status(&mut state);
+        }
+        Ok(())
+    }
+
+    /// Gives the hub the terminal's records if they changed. Runs under the state lock,
+    /// so publications keep the order of the changes.
+    fn publish_program_status(&self, state: &mut SurfaceRuntime) {
+        let program_status = state.terminal.program_status();
+        if state.published_program_status == program_status.generation()
+            || self.retired.load(Ordering::Acquire)
+        {
+            return;
+        }
+        state.published_program_status = program_status.generation();
+        self.program_status.publish(
+            &self.id,
+            &self.process_lifetime_id,
+            program_status.records(),
+        );
     }
 
     pub fn metadata(
@@ -1604,6 +1656,8 @@ impl Surface {
     fn retire(&self) {
         let _state = self.state.lock();
         self.retired.store(true, Ordering::Release);
+        self.program_status
+            .remove(&self.id, &self.process_lifetime_id);
     }
 
     fn validate_target(&self, target: &TerminalTarget) -> std::result::Result<(), SurfaceError> {
@@ -1743,6 +1797,24 @@ impl ConnectionSink {
     pub fn send_control(&self, message: &ServerControl) -> Result<()> {
         let payload = encode_server(message)?;
         self.send(CONTROL_FRAME, payload)
+    }
+
+    /// Sends a control message unless the client is behind on reading; latest-wins
+    /// updates such as program status are then sent later instead of failing the
+    /// connection.
+    pub fn send_control_if_room(&self, message: &ServerControl) -> Result<bool> {
+        if self.queued_frames.load(Ordering::Acquire) >= CLIENT_SCREEN_QUEUE_FRAMES {
+            return Ok(false);
+        }
+        let payload = encode_server(message)?;
+        self.enqueue(
+            Outgoing {
+                kind: CONTROL_FRAME,
+                payload,
+                acknowledgement: None,
+            },
+            CLIENT_SCREEN_QUEUE_BYTES,
+        )
     }
 
     pub fn send_control_sync(&self, message: &ServerControl) -> Result<()> {

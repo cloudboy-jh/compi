@@ -20,6 +20,7 @@ pub mod input;
 pub mod layout;
 pub mod metadata;
 pub mod probe;
+pub mod program_status;
 pub mod project_history;
 pub mod release_notes;
 mod replica;

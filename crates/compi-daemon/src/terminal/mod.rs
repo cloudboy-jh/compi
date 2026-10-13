@@ -1,3 +1,4 @@
+pub mod program_status;
 pub mod trace;
 
 use base64::Engine;
@@ -24,6 +25,9 @@ const MAX_APC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OSC8_URI_BYTES: usize = 2048;
 const MAX_UNSUPPORTED_SIGNATURES: usize = 128;
 const MAX_OSC52_DECODED_BYTES: usize = 1024 * 1024;
+/// Longest OSC string kept while vte collects it: the largest OSC 52 payload and its
+/// prefix. vte grows its buffer without bound, so longer strings are dropped unparsed.
+const MAX_OSC_BYTES: usize = MAX_OSC52_DECODED_BYTES.div_ceil(3) * 4 + 4096;
 const MAX_KEYBOARD_PROTOCOL_STACK: usize = 32;
 const KITTY_KEYBOARD_SUPPORTED_FLAGS: u16 = 1;
 /// Longest time synchronized output (DEC mode 2026) may hold back screen updates.
@@ -115,12 +119,51 @@ struct KittyTransfer {
 enum InputState {
     Normal,
     Escape,
+    /// vte is collecting an OSC string.
+    Osc(OscInput),
+    /// ESC inside an OSC string: it ends the string, and the next byte decides what follows.
+    OscEscape,
+    OscDiscard,
+    OscDiscardEscape,
 
     Apc(Vec<u8>),
     ApcEscape(Vec<u8>),
     ApcDiscard,
     ApcDiscardEscape,
 }
+
+/// Size of the OSC string vte is collecting, `ESC ]` included.
+struct OscInput {
+    bytes: usize,
+    /// The first bytes of the string, enough to recognise `7501;`.
+    head: [u8; 5],
+    head_len: usize,
+}
+
+impl OscInput {
+    fn new() -> Self {
+        Self {
+            bytes: 2,
+            head: [0; 5],
+            head_len: 0,
+        }
+    }
+
+    /// Counts `chunk`; false once the string is longer than its command allows.
+    fn accept(&mut self, chunk: &[u8]) -> bool {
+        let take = (self.head.len() - self.head_len).min(chunk.len());
+        self.head[self.head_len..self.head_len + take].copy_from_slice(&chunk[..take]);
+        self.head_len += take;
+        self.bytes += chunk.len();
+        let limit = if self.head[..self.head_len] == *b"7501;" {
+            program_status::MAX_SEQUENCE_BYTES
+        } else {
+            MAX_OSC_BYTES
+        };
+        self.bytes <= limit
+    }
+}
+
 #[derive(Default)]
 struct UnsupportedDiagnostics {
     context: String,
@@ -192,6 +235,7 @@ pub struct TerminalState {
     title: String,
     current_directory: Option<String>,
     shell_pid: Option<u32>,
+    program_status: program_status::ProgramStatusSet,
     modes: TerminalModes,
     keyboard_protocol_stack: Vec<u8>,
     scroll_top: usize,
@@ -237,6 +281,7 @@ impl TerminalState {
             title: String::new(),
             current_directory: None,
             shell_pid: None,
+            program_status: program_status::ProgramStatusSet::default(),
             modes: TerminalModes {
                 auto_wrap: true,
                 ..TerminalModes::default()
@@ -294,6 +339,15 @@ impl TerminalState {
 
     pub fn current_directory(&self) -> Option<&str> {
         self.current_directory.as_deref()
+    }
+
+    /// Records programs reported through OSC 7501.
+    pub fn program_status(&self) -> &program_status::ProgramStatusSet {
+        &self.program_status
+    }
+
+    pub fn program_status_mut(&mut self) -> &mut program_status::ProgramStatusSet {
+        &mut self.program_status
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -357,6 +411,24 @@ impl TerminalState {
                 if run_length > 0 {
                     self.feed_vte(&bytes[offset..offset + run_length]);
                     offset += run_length;
+                    continue;
+                }
+            } else if matches!(&self.input_state, InputState::Osc(_)) {
+                let run_length = bytes[offset..]
+                    .iter()
+                    .position(|byte| matches!(*byte, 0x07 | 0x18 | 0x1a | 0x1b))
+                    .unwrap_or(bytes.len() - offset);
+                if run_length > 0 {
+                    let run = &bytes[offset..offset + run_length];
+                    offset += run_length;
+                    let InputState::Osc(osc) = &mut self.input_state else {
+                        unreachable!("checked OSC input state");
+                    };
+                    if osc.accept(run) {
+                        self.feed_vte(run);
+                    } else {
+                        self.reject_oversized_osc();
+                    }
                     continue;
                 }
             } else if matches!(&self.input_state, InputState::Apc(_)) {
@@ -606,7 +678,38 @@ impl TerminalState {
             InputState::Normal if byte == 0x1b => self.input_state = InputState::Escape,
             InputState::Normal => self.feed_vte(&[byte]),
             InputState::Escape if byte == b'_' => self.input_state = InputState::Apc(Vec::new()),
+            InputState::Escape if byte == b']' => {
+                self.feed_vte(&[0x1b, b']']);
+                self.input_state = InputState::Osc(OscInput::new());
+            }
             InputState::Escape => self.feed_vte(&[0x1b, byte]),
+            InputState::Osc(_) if byte == 0x1b => self.input_state = InputState::OscEscape,
+            InputState::Osc(_) if matches!(byte, 0x07 | 0x18 | 0x1a) => self.feed_vte(&[byte]),
+            InputState::Osc(mut osc) => {
+                if osc.accept(&[byte]) {
+                    self.feed_vte(&[byte]);
+                    self.input_state = InputState::Osc(osc);
+                } else {
+                    self.reject_oversized_osc();
+                }
+            }
+            InputState::OscEscape if byte == b'_' => {
+                // ESC ends the OSC string; the APC that follows is parsed here, not by vte.
+                self.feed_vte(&[0x1b]);
+                self.parser = Parser::new();
+                self.input_state = InputState::Apc(Vec::new());
+            }
+            InputState::OscDiscardEscape if byte == b'\\' => {}
+            // Any other byte after ESC begins the next sequence, as it does for vte.
+            InputState::OscEscape | InputState::OscDiscardEscape => {
+                self.input_state = InputState::Escape;
+                self.advance_byte(byte);
+            }
+            InputState::OscDiscard if byte == 0x1b => {
+                self.input_state = InputState::OscDiscardEscape
+            }
+            InputState::OscDiscard if matches!(byte, 0x07 | 0x18 | 0x1a) => {}
+            InputState::OscDiscard => self.input_state = InputState::OscDiscard,
             InputState::Apc(payload) if byte == 0x1b => {
                 self.input_state = InputState::ApcEscape(payload)
             }
@@ -637,6 +740,14 @@ impl TerminalState {
             InputState::ApcDiscardEscape if byte == b'\\' => {}
             InputState::ApcDiscardEscape => self.input_state = InputState::ApcDiscard,
         }
+    }
+
+    /// Drops an OSC string over its limit: vte forgets it unparsed, and the rest of it is
+    /// skipped up to its terminator.
+    fn reject_oversized_osc(&mut self) {
+        self.diagnostics.record("OSC:oversized");
+        self.parser = Parser::new();
+        self.input_state = InputState::OscDiscard;
     }
 
     fn reject_oversized_apc(&mut self, payload: &[u8]) {
@@ -1625,7 +1736,7 @@ impl Perform for TerminalState {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let Some(command) = params
             .first()
             .and_then(|value| std::str::from_utf8(value).ok())
@@ -1665,6 +1776,17 @@ impl Perform for TerminalState {
                 } else if params[2] == b"jump" {
                     self.shell_action = Some(ShellAction::JumpProject);
                 }
+            }
+            "7501" => match program_status::parse(params, bell_terminated) {
+                Some(program_status::Command::Query) => self
+                    .replies
+                    .push(program_status::capability_reply(bell_terminated)),
+                Some(program_status::Command::Report(report)) => self.program_status.apply(report),
+                None => {}
+            },
+            // A new shell prompt: semantic prompt mark `A`.
+            "133" if params.get(1).is_some_and(|mark| *mark == b"A") => {
+                self.program_status.end_activity()
             }
             _ => {}
         }
@@ -1811,9 +1933,14 @@ impl Perform for TerminalState {
                 let rows = self.rows() as u16;
                 let diagnostics = std::mem::take(&mut self.diagnostics);
                 let shell_pid = self.shell_pid;
+                // A full reset removes every record; the set lives on so its generation
+                // keeps counting and watchers see the change.
+                let mut program_status = std::mem::take(&mut self.program_status);
+                program_status.clear();
                 *self = Self::new(cols, rows);
                 self.diagnostics = diagnostics;
                 self.shell_pid = shell_pid;
+                self.program_status = program_status;
             }
             b'=' => self.modes.application_keypad = true,
             b'>' => self.modes.application_keypad = false,
@@ -2169,6 +2296,7 @@ fn decoded_base64_size(encoded: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compi_protocol::program_status::ProgramState;
 
     fn row_text(row: &Row) -> String {
         row.cells
@@ -2297,6 +2425,76 @@ mod tests {
                 .shell_action,
             Some(ShellAction::BrowseFiles)
         );
+    }
+
+    fn program_states(terminal: &TerminalState) -> Vec<(Option<String>, ProgramState)> {
+        terminal
+            .program_status()
+            .records()
+            .into_iter()
+            .map(|record| (record.id, record.state))
+            .collect()
+    }
+
+    #[test]
+    fn program_status_reports_queries_and_prompt_lifecycle() {
+        let mut terminal = TerminalState::new(20, 3);
+        let (_, replies) = terminal.advance(b"\x1b]7501;state=work");
+        assert!(replies.is_empty());
+        terminal.advance(b"ing:app=cargo\x1b\\\x1b]7501;state=done:id=build\x07");
+        assert_eq!(
+            program_states(&terminal),
+            [
+                (None, ProgramState::Working),
+                (Some("build".into()), ProgramState::Done)
+            ]
+        );
+
+        let (_, replies) = terminal.advance(b"\x1b]7501;?\x07");
+        assert_eq!(replies, [program_status::capability_reply(true)]);
+        let (_, replies) = terminal.advance(b"\x1b]7501;?\x1b\\");
+        assert_eq!(replies, [program_status::capability_reply(false)]);
+
+        // Records belong to the terminal, not a screen; other prompt marks change nothing.
+        terminal.advance(b"\x1b[?1049h\x1b]133;B\x07\x1b[?1049l\x1b]133;D;0\x07");
+        assert_eq!(program_states(&terminal).len(), 2);
+        terminal.advance(b"\x1b]133;A\x1b\\");
+        assert_eq!(
+            program_states(&terminal),
+            [(Some("build".into()), ProgramState::Done)]
+        );
+
+        let generation = terminal.program_status().generation();
+        terminal.advance(b"\x1bc");
+        assert!(program_states(&terminal).is_empty());
+        assert!(terminal.program_status().generation() > generation);
+    }
+
+    #[test]
+    fn oversized_osc_strings_are_dropped_without_swallowing_later_output() {
+        let mut terminal = TerminalState::new(20, 3);
+        let body = format!("state=working:pad={}", "a".repeat(4096));
+        let (head, tail) = body.as_bytes().split_at(2000);
+        terminal.advance(&[b"\x1b]7501;".as_slice(), head].concat());
+        terminal.advance(&[tail, b"\x07one\r\n".as_slice()].concat());
+        assert!(program_states(&terminal).is_empty());
+
+        let mut clipboard = b"\x1b]52;c;".to_vec();
+        clipboard.resize(MAX_OSC_BYTES + 1, b'A');
+        clipboard.extend_from_slice(b"\x1b\\two\r\n");
+        let (delta, _) = terminal.advance(&clipboard);
+        assert!(delta.unwrap().clipboard_writes.is_empty());
+
+        // ESC ends an OSC string even when an APC follows it.
+        terminal.advance(b"\x1b]2;Title\x1b_Ga=q,i=31\x1b\\three");
+        let snapshot = terminal.snapshot();
+        assert_eq!(
+            (0..3)
+                .map(|row| visible_text(&snapshot, row))
+                .collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
+        assert_eq!(snapshot.title, "Title");
     }
 
     #[test]

@@ -112,6 +112,22 @@ Compi 0.1.7 · 0.1.8 available
 
 Collection runs in the terminal's actual environment: native Unix, the selected WSL distribution, or the SSH daemon host. The process is the foreground job, not the Windows launcher. Git uses the reported cwd; unavailable and stale fields are explicit rather than fabricated. Refresh is cached and bounded, runs off the UI thread, and never attaches or resizes a pane. `compi --json pane list/show` exposes the same environment, process, Git, directory, dimensions, and per-field state.
 
+## Program status
+
+Programs that support the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501) report whether they are idle, working, blocked on you, done or failed. Compi answers their feature query, so programs that report only after asking work too.
+
+- A tab shows a glyph for the state that most needs you across its panes: blocked, then error, working, done and idle. Background tabs and other workspaces are included. A tiled pane shows a dot in its top edge, and a floating pane shows the glyph and progress in its title strip. The sidebar and palette put the state first in the tab's status line. Each of the three can be turned off under **Settings → Interface → Program status** ([configuration](CONFIGURATION.md#program-status)).
+- Hover a glyph or dot for each pane's name and every record it reported: program, title, state, what it waits for, progress and message.
+- Work in progress ends at the next shell prompt or when the process exits; finished and failed results stay until you press a key in that pane or close it.
+- `compi --json pane list/show` includes each terminal's `program_status` records.
+
+A shell function can report status too:
+
+```sh
+status() { printf '\e]7501;state=%s:msg=%s\e\\' "$1" "$(printf '%s' "$2" | base64 | tr -d '\n')"; }
+status working "Syncing photos"; rsync -a ~/Photos backup:/photos && status done "Photos synced" || status error "rsync failed"
+```
+
 ## Remote connections
 
 Compi starts its sibling server automatically, and relaunching with the same instance name reconnects to that workspace. Use `--working-directory PATH` when you intentionally want new work to start in a specific directory.

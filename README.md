@@ -36,6 +36,8 @@ Shells that keep running when you close the window, with an editor, diffs and Gi
 
 The `compi` command opens panes, sends input, reads output, and opens files and diffs, so an agent can drive the same workspace you're looking at.
 
+Programs that speak the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501) tell Compi what they're doing. The tab shows when an agent or build is blocked on you, still working, done or failed, even in a background tab, and hovering it says why.
+
 ## Download
 
 Get Compi from [GitHub Releases](https://github.com/cloudboy-jh/compi/releases).

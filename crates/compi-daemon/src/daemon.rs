@@ -2,6 +2,7 @@ use crate::Result;
 use crate::content_files;
 use crate::file_tree;
 use crate::launch;
+use crate::program_status::ProgramStatusWatch;
 use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
 use compi_protocol::frame;
 #[cfg(windows)]
@@ -666,10 +667,19 @@ fn handle_connection(
 
     let mut attached: Option<Arc<Surface>> = None;
     let mut workspace_events = manager.subscribe();
+    let mut program_status_watch: Option<ProgramStatusWatch> = None;
+    let mut workspace_changed = false;
     let mut uploads = HashMap::<UploadId, ImageUpload>::new();
     let result = (|| -> Result<()> {
         while !stopping.load(Ordering::Acquire) && sink.is_alive() {
-            send_workspace_events(&sink, &mut workspace_events, &manager)?;
+            workspace_changed |= send_workspace_events(&sink, &mut workspace_events, &manager)?;
+            if let Some(watch) = program_status_watch.as_mut() {
+                if std::mem::take(&mut workspace_changed) {
+                    // Retires the runtimes of closed panes, which removes their status.
+                    let _ = manager.snapshot();
+                }
+                send_program_status(&sink, watch, &manager)?;
+            }
             let Some(incoming) = reader.poll(&connection)? else {
                 thread::sleep(Duration::from_millis(5));
                 continue;
@@ -770,6 +780,30 @@ fn handle_connection(
                         Ok(()) => sink.send_control(&ServerControl {
                             request_id: Some(request_id),
                             message: ServerMessage::Detached { surface_id },
+                        })?,
+                        Err(error) => send_surface_error(&sink, request_id, &error),
+                    }
+                }
+                ClientMessage::WatchProgramStatus => {
+                    let watch = program_status_watch.insert(ProgramStatusWatch::default());
+                    send_program_status(&sink, watch, &manager)?;
+                    sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::ProgramStatusWatching,
+                    })?;
+                }
+                ClientMessage::AcknowledgeProgramStatus {
+                    surface_id,
+                    expected_lifetime,
+                } => {
+                    let Some(surface) = manager.get(&surface_id) else {
+                        send_unavailable_surface(&sink, request_id, &manager, &surface_id);
+                        continue;
+                    };
+                    match surface.acknowledge_program_status(&expected_lifetime) {
+                        Ok(()) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ProgramStatusAcknowledged,
                         })?,
                         Err(error) => send_surface_error(&sink, request_id, &error),
                     }
@@ -1052,7 +1086,8 @@ fn handle_connection(
                 }
                 ClientMessage::Mutate { mutation } => match manager.mutate(mutation) {
                     Ok(receipt) => {
-                        send_workspace_events(&sink, &mut workspace_events, &manager)?;
+                        workspace_changed |=
+                            send_workspace_events(&sink, &mut workspace_events, &manager)?;
                         sink.send_control(&ServerControl {
                             request_id: Some(request_id),
                             message: ServerMessage::MutationCommitted { receipt },
@@ -1390,11 +1425,13 @@ fn read_next(
     Ok(None)
 }
 
+/// Forwards workspace revisions; returns whether there were any.
 fn send_workspace_events(
     sink: &ConnectionSink,
     events: &mut std::sync::mpsc::Receiver<crate::workspace::WorkspaceEvent>,
     manager: &SurfaceManager,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut changed = false;
     loop {
         match events.try_recv() {
             Ok(crate::workspace::WorkspaceEvent::Revision(revision)) => {
@@ -1402,8 +1439,9 @@ fn send_workspace_events(
                     request_id: None,
                     message: ServerMessage::WorkspaceChanged { revision },
                 })?;
+                changed = true;
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(changed),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 let revision = manager.snapshot()?.revision;
                 sink.send_control(&ServerControl {
@@ -1411,10 +1449,33 @@ fn send_workspace_events(
                     message: ServerMessage::WorkspaceChanged { revision },
                 })?;
                 *events = manager.subscribe();
-                return Ok(());
+                return Ok(true);
             }
         }
     }
+}
+
+/// Sends the program status this connection has not been sent yet. A client that is
+/// behind on reading gets it in a later round.
+fn send_program_status(
+    sink: &ConnectionSink,
+    watch: &mut ProgramStatusWatch,
+    manager: &SurfaceManager,
+) -> Result<()> {
+    for pending in watch.pending(manager.program_status(), Instant::now()) {
+        let sent = sink.send_control_if_room(&ServerControl {
+            request_id: None,
+            message: ServerMessage::ProgramStatusChanged {
+                status: pending.status.clone(),
+            },
+        })?;
+        if !sent {
+            watch.retry();
+            break;
+        }
+        watch.delivered(&pending);
+    }
+    Ok(())
 }
 
 fn attached_target<'a>(

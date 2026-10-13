@@ -622,6 +622,9 @@ enum UiEvent {
         tab_id: u64,
         message: ServerMessage,
     },
+    /// Every terminal's program status, replacing what was known.
+    ProgramStatusWatched(Vec<compi_protocol::program_status::SurfaceProgramStatus>),
+    ProgramStatusChanged(compi_protocol::program_status::SurfaceProgramStatus),
     PerformanceSample(Result<workspace::performance::PerformanceSample, String>),
     TabDisconnected {
         tab_id: u64,
@@ -864,6 +867,7 @@ struct CompiApp {
     surface_views: Vec<SurfaceView>,
     surface_names: HashMap<SurfaceId, (compi_protocol::ProcessLifetimeId, String, Option<String>)>,
     metadata: workspace::metadata::MetadataUi,
+    program_status: workspace::program_status::ProgramStatusUi,
     focused_view: Option<u64>,
     file_tree: Option<workspace::tree::FileTree>,
     tree_scroll: ScrollHandle,
@@ -1065,6 +1069,8 @@ impl CompiApp {
                 data: bytes,
                 latency_id,
             });
+            let (surface_id, lifetime) = (tab.surface_id.clone(), tab.lifetime.clone());
+            self.acknowledge_program_results(&surface_id, &lifetime);
             return true;
         }
         false
@@ -1774,6 +1780,8 @@ impl EntityInputHandler for CompiApp {
                 data: text.as_bytes().to_vec(),
                 latency_id: None,
             });
+            let (surface_id, lifetime) = (tab.surface_id.clone(), tab.lifetime.clone());
+            self.acknowledge_program_results(&surface_id, &lifetime);
         }
         cx.notify();
     }

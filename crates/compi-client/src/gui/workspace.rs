@@ -17,6 +17,7 @@ pub(in crate::gui) mod metadata;
 pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
 pub(in crate::gui) mod presentation;
+pub(in crate::gui) mod program_status;
 pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod remote;
 pub(in crate::gui) mod settings;
@@ -810,12 +811,20 @@ impl CompiApp {
                 snapshot.server_generation.clone(),
             ),
         );
+        let update_quiesced = Arc::new(AtomicBool::new(false));
+        let update_connection_guard = Arc::new(Mutex::new(()));
+        let program_status = program_status::ProgramStatusUi::start(
+            target.clone(),
+            UiEventSender(tx.clone()),
+            update_quiesced.clone(),
+            update_connection_guard.clone(),
+        );
         let mut this = Self {
             started_at,
             target,
             updates,
-            update_quiesced: Arc::new(AtomicBool::new(false)),
-            update_connection_guard: Arc::new(Mutex::new(())),
+            update_quiesced,
+            update_connection_guard,
             restore_session,
             restore_ready: false,
             initial_working_directory,
@@ -835,6 +844,7 @@ impl CompiApp {
             surface_views: Vec::new(),
             surface_names: HashMap::new(),
             metadata: metadata::MetadataUi::default(),
+            program_status,
             focused_view: None,
             file_tree: None,
             tree_scroll: ScrollHandle::new(),
@@ -1984,6 +1994,8 @@ impl CompiApp {
                 request,
                 result,
             } => self.prompt_responded(job, request, result),
+            UiEvent::ProgramStatusWatched(statuses) => self.program_status.replace_all(statuses),
+            UiEvent::ProgramStatusChanged(status) => self.program_status.update(status),
             UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.connection_error = None;
                 self.accept_workspace(workspace);
@@ -4645,6 +4657,15 @@ impl CompiApp {
             }
         }
         let mut status = statuses.join(", ");
+        if let Some(headline) = self
+            .tab_program_headline(tab)
+            .filter(|_| self.config.program_status.sidebar)
+        {
+            status = format!(
+                "{} · {status}",
+                crate::program_status::headline_label(headline)
+            );
+        }
         if self.state.hidden_tabs.contains(&tab.id) {
             status.push_str(" · Hidden");
         }
@@ -5292,6 +5313,18 @@ impl CompiApp {
             let panes = self.tab_panes(tab);
             let (primary, secondary) = self.metadata_tab_caption(tab, &panes);
             let drop_here = pane_drop.is_some_and(|tab| tab == Some(&id));
+            let program_status = (self.config.program_status.tabs)
+                .then(|| self.tab_program_headline(tab))
+                .flatten()
+                .map(|headline| {
+                    self.render_program_status(
+                        ("tab-program-status", index),
+                        headline,
+                        false,
+                        primary.clone(),
+                        self.tab_program_detail(tab),
+                    )
+                });
             div()
                 .id(("terminal-tab", index))
                 .group("terminal-tab")
@@ -5363,6 +5396,7 @@ impl CompiApp {
                         cx.notify();
                     }),
                 )
+                .children(program_status)
                 .child(
                     div()
                         .min_w_0()
@@ -6083,6 +6117,14 @@ impl CompiApp {
                     cx,
                 ))
             })
+            .when(
+                self.pane_drag.is_none() && self.config.program_status.panes,
+                |pane| {
+                    pane.children(geometry.surface_id.as_ref().and_then(|surface| {
+                        self.render_pane_program_status(index, &geometry.pane_id, surface)
+                    }))
+                },
+            )
             .when_some(edge, |pane, edge| {
                 // Drawn last so the outline is never covered; it has no hitbox.
                 pane.child(
@@ -6472,6 +6514,12 @@ impl CompiApp {
             + self.float_layouts.len()
             > 1;
         let (title, tab_label) = self.floating_caption(&pane_id);
+        let program_status = float
+            .pane
+            .surface_id
+            .as_ref()
+            .filter(|_| self.config.program_status.panes)
+            .and_then(|surface| self.render_floating_program_status(index, surface, &title));
         let body = layout::Rect {
             x: 0.0,
             y: FLOAT_TITLE_HEIGHT,
@@ -6564,6 +6612,7 @@ impl CompiApp {
                             cx.notify();
                         }),
                     )
+                    .children(program_status)
                     .child(
                         div()
                             .flex_1()

@@ -58,6 +58,17 @@ dimensions = false
 
 A manual tab label takes precedence over automatic names. Enabled fields follow the focused pane, with a first-layout-pane fallback; pane count and dirty/stale indicators remain separate from truncated text. The hover card lists every pane in layout order. Collection uses the shell's actual Unix/WSL/SSH environment, caches results for five seconds, and marks stale/unavailable data explicitly. Disabling every field stops GUI metadata queries; CLI inspection remains available on demand.
 
+## Program status
+
+**Settings → Interface → Program status** chooses where Compi shows what programs report through OSC 7501. Each place can be turned off on its own; status is still followed, so turning one back on shows the current state at once.
+
+```toml
+[program_status]
+tabs = true     # glyph on tab chips
+panes = true    # dot on tiled panes, glyph and progress on floating title strips
+sidebar = true  # state at the start of the sidebar and palette status line
+```
+
 ## Closing tabs and panes
 
 Closing a tab (its ×, **Close terminal tab**) or a pane (**Close pane**) ends its processes in one click. **Settings → Interface → Confirm before closing** asks first instead; Enter closes and Esc cancels. To keep a tab's processes running, hide it instead.

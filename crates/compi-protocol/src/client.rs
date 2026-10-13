@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::frame;
+use crate::program_status::SurfaceProgramStatus;
 use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, DirectoryEntry, ErrorCode,
     FileContent, FileState, FileVersion, GitAction, GitBranches, GitChanges, GitFileContent,
@@ -10,7 +11,7 @@ use crate::{
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -308,6 +309,8 @@ pub struct DaemonClient {
     poll_reader: pipe::PipeReader,
     target: Option<TerminalTarget>,
     workspace: Option<WorkspaceSnapshot>,
+    /// Kept current by `ProgramStatusChanged` after `watch_program_status`.
+    program_status: BTreeMap<SurfaceId, SurfaceProgramStatus>,
 }
 
 impl DaemonClient {
@@ -667,6 +670,36 @@ impl DaemonClient {
             Duration::from_secs(5),
         )? {
             ServerMessage::SurfaceMetadata { metadata } => Ok(*metadata),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Starts receiving program status on this connection. When this returns,
+    /// `program_status` holds every terminal's current records; later changes arrive as
+    /// events and keep it current.
+    pub fn watch_program_status(&mut self) -> Result<()> {
+        self.program_status.clear();
+        match self.request_bounded(ClientMessage::WatchProgramStatus, Duration::from_secs(5))? {
+            ServerMessage::ProgramStatusWatching => Ok(()),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Program status of every terminal that reports any, by surface.
+    pub fn program_status(&self) -> &BTreeMap<SurfaceId, SurfaceProgramStatus> {
+        &self.program_status
+    }
+
+    /// Removes the surface's `done` and `error` records once the user has seen them.
+    pub fn acknowledge_program_status(&mut self, surface: &SurfaceInfo) -> Result<()> {
+        match self.request_bounded(
+            ClientMessage::AcknowledgeProgramStatus {
+                surface_id: surface.id.clone(),
+                expected_lifetime: surface.process_lifetime_id.clone(),
+            },
+            Duration::from_secs(5),
+        )? {
+            ServerMessage::ProgramStatusAcknowledged => Ok(()),
             message => Err(unexpected_response(message)),
         }
     }
@@ -1262,6 +1295,7 @@ impl DaemonClient {
             poll_reader: pipe::PipeReader::default(),
             target: None,
             workspace: None,
+            program_status: BTreeMap::new(),
         }
     }
 
@@ -1281,6 +1315,7 @@ impl DaemonClient {
             poll_reader: pipe::PipeReader::default(),
             target: Some(target),
             workspace,
+            program_status: BTreeMap::new(),
         }
     }
 
@@ -1338,6 +1373,14 @@ impl DaemonClient {
                 });
             }
             ServerMessage::Detached { .. } => self.target = None,
+            ServerMessage::ProgramStatusChanged { status } => {
+                if status.records.is_empty() {
+                    self.program_status.remove(&status.surface_id);
+                } else {
+                    self.program_status
+                        .insert(status.surface_id.clone(), status.clone());
+                }
+            }
             ServerMessage::SurfaceExited { identity, .. }
                 if self
                     .target

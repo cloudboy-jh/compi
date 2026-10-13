@@ -5,10 +5,11 @@ mod kitty;
 
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::frame;
+use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
 use compi_protocol::{
-    CONTROL_FRAME, ClientControl, ClientMessage, Color, DaemonError, ErrorCode, MutationId,
-    MutationRequest, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus,
-    WorkspaceMutation, decode_server, encode_client,
+    CONTROL_FRAME, ClientControl, ClientMessage, Color, DaemonError, ErrorCode, LayoutNode,
+    MutationId, MutationRequest, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId,
+    SurfaceStatus, WorkspaceMutation, decode_server, encode_client,
 };
 use compi_protocol::{DaemonClient, ServerEvent, identity, pipe};
 use std::fs;
@@ -950,6 +951,176 @@ fn mutation_publication_precedes_ack_and_restart_changes_lifetime() {
     drop(client);
     daemon.shutdown();
     cleanup_metadata(&instance);
+}
+
+#[test]
+fn program_status_reaches_watchers_through_the_pty_and_follows_its_lifecycle() {
+    let mut daemon = DaemonGuard::start();
+    let instance = daemon.instance.clone();
+    let mut control = daemon.client();
+    let surface = control.create_surface(80, 24, None).unwrap();
+    let mut watcher = daemon.client();
+    watcher.watch_program_status().unwrap();
+    assert!(watcher.program_status().is_empty());
+    let mut attached = daemon.client();
+    attached.attach_surface(&surface, 80, 24).unwrap();
+
+    // Feature detection: the reply travels back into the program.
+    run_command(
+        &mut attached,
+        r#"printf '\e]7501;?\e\\'; IFS= read -rs -d '\' -t 5 reply; r=${reply#*7501;}; echo "REPLY<${r%$'\e'}>""#,
+    );
+    collect_until_marker(
+        &mut attached,
+        b"REPLY<?:states=idle,working,done,blocked,error:kinds=permission,question,auth>",
+    );
+
+    // The bridge's next prompt ends work in progress.
+    run_command(
+        &mut attached,
+        r"printf '\e]7501;state=working:app=fixture\e\\'; sleep 1",
+    );
+    let seen = wait_for_program_status(&mut watcher, &surface.id, "prompt clears", |records| {
+        records.is_empty()
+    });
+    assert_eq!(root_states(&seen), [Some(ProgramState::Working), None]);
+
+    run_command(
+        &mut attached,
+        concat!(
+            r"printf '\e]7501;state=blocked:kind=permission:app=fixture:msg=QXBwcm92ZT8=\e\\'; sleep 1; ",
+            r"printf '\e]7501;state=working:app=fixture:progress=50\e\\'; sleep 1; ",
+            r"printf '\e]7501;state=done:app=fixture:msg=RG9uZQ==\e\\'",
+        ),
+    );
+    let seen = wait_for_program_status(&mut watcher, &surface.id, "done", |records| {
+        records
+            .first()
+            .is_some_and(|record| record.state == ProgramState::Done)
+    });
+    assert_eq!(
+        root_states(&seen),
+        [
+            Some(ProgramState::Blocked),
+            Some(ProgramState::Working),
+            Some(ProgramState::Done)
+        ]
+    );
+    let blocked = &seen[0][0];
+    assert_eq!(blocked.kind, Some(BlockedKind::Permission));
+    assert_eq!(blocked.message.as_deref(), Some("Approve?"));
+    assert_eq!(seen[1][0].progress, Some(50));
+
+    // A client connecting later is given what is current, which outlived the prompt.
+    let mut reconnected = daemon.client();
+    reconnected.watch_program_status().unwrap();
+    let current = &reconnected.program_status()[&surface.id];
+    assert_eq!(current.process_lifetime_id, surface.process_lifetime_id);
+    assert_eq!(
+        current.records,
+        [ProgramStatusRecord {
+            id: None,
+            state: ProgramState::Done,
+            kind: None,
+            progress: None,
+            app: Some("fixture".into()),
+            title: None,
+            message: Some("Done".into()),
+        }]
+    );
+    reconnected.acknowledge_program_status(&surface).unwrap();
+    wait_for_program_status(&mut watcher, &surface.id, "acknowledged", |records| {
+        records.is_empty()
+    });
+
+    // Exit drops work in progress and keeps the failure for the user to find.
+    run_command(
+        &mut attached,
+        r"printf '\e]7501;state=error:app=fixture\e\\\e]7501;state=working:id=worker\e\\'; sleep 1; exit",
+    );
+    let seen = wait_for_program_status(&mut watcher, &surface.id, "exit", |records| {
+        records.len() == 1
+    });
+    assert_eq!(seen.first().map(Vec::len), Some(2));
+    assert_eq!(root_states(&seen).last(), Some(&Some(ProgramState::Error)));
+    drop(attached);
+
+    // Closing the pane removes what is left, even for a connection that never asks
+    // for the workspace.
+    let tab_id = control
+        .workspace()
+        .unwrap()
+        .sessions
+        .iter()
+        .flat_map(|session| &session.tabs)
+        .find(|tab| {
+            matches!(&tab.layout, LayoutNode::Pane { surface_id, .. } if surface_id == &surface.id)
+        })
+        .unwrap()
+        .id
+        .clone();
+    control
+        .mutate(WorkspaceMutation::RemoveTab { tab_id })
+        .unwrap();
+    wait_for_program_status(&mut watcher, &surface.id, "pane closed", |records| {
+        records.is_empty()
+    });
+
+    drop((control, watcher, reconnected));
+    daemon.shutdown();
+    cleanup_metadata(&instance);
+}
+
+fn run_command(client: &mut DaemonClient, command: &str) {
+    client
+        .request(ClientMessage::Input {
+            data: format!("{command}\r").into_bytes(),
+            latency_id: None,
+        })
+        .unwrap();
+}
+
+/// Every change to `surface_id`'s records, until `done` accepts one.
+fn wait_for_program_status(
+    client: &mut DaemonClient,
+    surface_id: &SurfaceId,
+    condition: &str,
+    done: impl Fn(&[ProgramStatusRecord]) -> bool,
+) -> Vec<Vec<ProgramStatusRecord>> {
+    let started = Instant::now();
+    let mut seen = Vec::new();
+    loop {
+        match poll_event(client, started, condition) {
+            Some(ServerEvent::Control {
+                message: ServerMessage::ProgramStatusChanged { status },
+                ..
+            }) if &status.surface_id == surface_id => {
+                let finished = done(&status.records);
+                seen.push(status.records);
+                if finished {
+                    return seen;
+                }
+            }
+            Some(_) => {}
+            None => thread::sleep(POLL_INTERVAL),
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "missing program status {condition} after {:?}; saw {seen:?}",
+            started.elapsed()
+        );
+    }
+}
+
+fn root_states(seen: &[Vec<ProgramStatusRecord>]) -> Vec<Option<ProgramState>> {
+    seen.iter()
+        .map(|records| {
+            records
+                .iter()
+                .find(|record| record.id.is_none())
+                .map(|record| record.state)
+        })
+        .collect()
 }
 
 fn wait_for_surface_status(

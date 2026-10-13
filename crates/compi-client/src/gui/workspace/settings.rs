@@ -49,6 +49,7 @@ enum SettingsAction {
     Density(crate::theme::WorkspaceDensity),
     ToggleConfirmClose,
     FocusIndicator(crate::theme::FocusIndicator),
+    ProgramStatus(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -85,7 +86,7 @@ impl CompiApp {
     fn settings_action_count(&self) -> usize {
         match self.settings_section {
             SettingsSection::Appearance => self.appearance_action_count(),
-            SettingsSection::Interface => self.font_choice_count() + 14,
+            SettingsSection::Interface => self.font_choice_count() + 17,
             SettingsSection::Terminal => self.prompt_offset_base() + self.prompt_actions().len(),
             SettingsSection::Keyboard => 2,
             SettingsSection::Performance => 3,
@@ -132,6 +133,9 @@ impl CompiApp {
                             .get(index - 9)
                             .copied()
                             .map(SettingsAction::FocusIndicator)
+                    }
+                    (SettingsSection::Interface, index @ 13..=15) => {
+                        Some(SettingsAction::ProgramStatus(index - 13))
                     }
                     (SettingsSection::Terminal, 0) => Some(SettingsAction::Zoom(Command::ZoomOut)),
                     (SettingsSection::Terminal, 1) => {
@@ -458,6 +462,17 @@ impl CompiApp {
             }
             SettingsAction::FocusIndicator(indicator) => {
                 if let Err(error) = self.config.save_focus_indicator(indicator) {
+                    self.global_error = Some(error);
+                }
+            }
+            SettingsAction::ProgramStatus(index) => {
+                let mut settings = self.config.program_status.clone();
+                match index {
+                    0 => settings.tabs = !settings.tabs,
+                    1 => settings.panes = !settings.panes,
+                    _ => settings.sidebar = !settings.sidebar,
+                }
+                if let Err(error) = self.config.save_program_status_settings(settings) {
                     self.global_error = Some(error);
                 }
             }
@@ -1372,6 +1387,42 @@ impl CompiApp {
             )
             .child(self.settings_subheading("Focus"))
             .child(self.render_focus_indicator_setting(choices + 10, compact, cx))
+            .child(self.settings_subheading("Program status"))
+            .children(
+                [
+                    (
+                        "Tabs",
+                        "Show what programs report on each tab: blocked, failed, working, done or idle.",
+                        self.config.program_status.tabs,
+                    ),
+                    (
+                        "Panes",
+                        "Show it on each pane's top edge and floating title strip.",
+                        self.config.program_status.panes,
+                    ),
+                    (
+                        "Sidebar and palette",
+                        "Start each tab's status line with it.",
+                        self.config.program_status.sidebar,
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (label, description, enabled))| {
+                    self.settings_row(
+                        label,
+                        description.into(),
+                        self.render_settings_toggle(
+                            enabled,
+                            SettingsAction::ProgramStatus(index),
+                            choices + 14 + index,
+                            true,
+                            cx,
+                        ),
+                        compact,
+                    )
+                }),
+            )
             .into_any_element()
     }
 
