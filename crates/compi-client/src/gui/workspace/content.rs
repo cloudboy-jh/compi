@@ -2984,6 +2984,7 @@ impl CompiApp {
                 .child(
                     div()
                         .h(px(row_height - 2.0))
+                        .flex_1()
                         .min_w_0()
                         .px_1()
                         .flex()
@@ -3026,13 +3027,14 @@ impl CompiApp {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .child(row.name.clone()),
-                        ),
+                        )
+                        .child(div().flex_1())
+                        .when_some(mark, |item, mark| {
+                            let mark = self
+                                .render_tree_mark(pane_id, index, mark, row_height, selected, cx);
+                            item.child(mark)
+                        }),
                 )
-                .when_some(mark, |item, mark| {
-                    item.child(div().flex_1()).child(
-                        self.render_tree_mark(pane_id, index, mark, row_height, selected, cx),
-                    )
-                })
         });
         let focus_pane = pane_id.clone();
         let clear_pane = pane_id.clone();
