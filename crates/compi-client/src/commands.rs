@@ -136,9 +136,14 @@ registry! {
     OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
     NewEditor, "new_editor", "New editor", None, None;
     ShowChanges, "show_changes", "Changes", None, None;
-    DiffThisFile, "diff_this_file", "Diff this file", None, None;
+    DiffThisFile, "diff_this_file", "Diff this file", Some("ctrl-shift-d"), Some("ctrl-shift-d");
     NextChange, "next_change", "Next change", Some("alt-f5"), Some("alt-f5");
     PreviousChange, "previous_change", "Previous change", Some("alt-shift-f5"), Some("alt-shift-f5");
+    GitFetch, "git_fetch", "Fetch", None, None;
+    GitPull, "git_pull", "Pull", None, None;
+    GitPush, "git_push", "Push", None, None;
+    SwitchBranch, "switch_branch", "Switch branch…", None, None;
+    CreateBranch, "create_branch", "Create branch…", None, None;
     RecoverUnsavedEdits, "recover_unsaved_edits", "Recover unsaved edits…", None, None;
     ZoomIn, "zoom_in", "Increase font size", Some("cmd-equal"), Some("ctrl-plus");
     ZoomOut, "zoom_out", "Decrease font size", Some("cmd-minus"), Some("ctrl-minus");
@@ -232,13 +237,21 @@ pub struct CommandContext {
     pub has_pane: bool,
     /// The focused pane shows content, not a terminal.
     pub content_pane: bool,
-    /// The focused content pane shows a file tab.
+    /// The focused content pane shows a file tab in Edit mode.
     pub file_tab: bool,
+    /// The focused content pane shows a file tab in Diff mode.
+    pub diff_tab: bool,
     /// Why the focused pane's folder cannot open in a content pane: a terminal that
     /// has not reported its directory.
     pub files_reason: Option<&'static str>,
     /// Why the focused pane's folder cannot be searched for a file to open.
     pub file_search_reason: Option<&'static str>,
+    /// Why Git commands cannot run from the focused pane: it is not a content pane whose
+    /// folder is in a read Git repository.
+    pub git_reason: Option<&'static str>,
+    /// Why that repository cannot pull, or push: no branch, no upstream, no commit.
+    pub pull_reason: Option<&'static str>,
+    pub push_reason: Option<&'static str>,
     pub tab_index: usize,
     pub has_selection: bool,
     pub terminal_available: bool,
@@ -281,8 +294,9 @@ impl Command {
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
             | SwapPaneDown | RemovePane => CommandCategory::Panes,
-            ShowFiles | ShowChanges | DiffThisFile | NextChange | PreviousChange | OpenFile
-            | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
+            ShowFiles | ShowChanges | DiffThisFile | NextChange | PreviousChange | GitFetch
+            | GitPull | GitPush | SwitchBranch | CreateBranch | OpenFile | NewEditor
+            | RecoverUnsavedEdits => CommandCategory::Files,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
@@ -351,11 +365,26 @@ impl Command {
                 "Shows this repository's uncommitted Git changes beside the folder; nothing is staged or changed.",
             ),
             DiffThisFile => Some(
-                "Opens the open file's uncommitted changes as a diff tab; nothing is staged or changed.",
+                "Switches the open file's tab between Edit and Diff (its uncommitted changes) at the same line; nothing is staged or changed.",
             ),
             NextChange | PreviousChange => Some(
                 "Moves the cursor to the next or previous change against the Git index in the open file.",
             ),
+            GitFetch => Some(
+                "Runs git fetch for this repository in a terminal beside the editor, opened or reused.",
+            ),
+            GitPull => Some(
+                "Runs git pull for this repository in a terminal beside the editor, opened or reused.",
+            ),
+            GitPush => Some(
+                "Runs git push in a terminal beside the editor; a branch without an upstream pushes with -u origin. Never forces.",
+            ),
+            SwitchBranch => Some(
+                "Lists this repository's branches to switch to. Git refuses if uncommitted changes would be overwritten.",
+            ),
+            CreateBranch => {
+                Some("Creates a branch at HEAD and switches to it; uncommitted changes come along.")
+            }
             RecoverUnsavedEdits => Some(
                 "Reopens a file whose unsaved edits were kept when Compi closed, with the edits back.",
             ),
@@ -398,6 +427,11 @@ impl Command {
             ShowChanges => "git diff review status staged unstaged uncommitted",
             DiffThisFile => "git diff compare changes review index head",
             NextChange | PreviousChange => "git diff hunk gutter jump navigate",
+            GitFetch => "git remote download update origin",
+            GitPull => "git remote merge rebase update origin",
+            GitPush => "git remote upload publish upstream origin",
+            SwitchBranch => "git branch checkout switch branches",
+            CreateBranch => "git branch new checkout switch",
             RecoverUnsavedEdits => "backup restore crash lost unsaved changes editor",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
@@ -492,6 +526,11 @@ impl Command {
                         | DiffThisFile
                         | OpenFile
                         | RecoverUnsavedEdits
+                        | GitFetch
+                        | GitPull
+                        | GitPush
+                        | SwitchBranch
+                        | CreateBranch
                 ))
         {
             return Some("Reconnect to the server first");
@@ -708,7 +747,9 @@ impl Command {
                     c.files_reason
                 }
             }
-            DiffThisFile => (!c.file_tab).then_some("Open a file in the editor first"),
+            DiffThisFile => {
+                (!c.file_tab && !c.diff_tab).then_some("Open a file in the editor first")
+            }
             NextChange | PreviousChange => {
                 (!c.file_tab).then_some("Open a file in the editor first")
             }
@@ -719,6 +760,9 @@ impl Command {
                     c.files_reason.or(c.file_search_reason)
                 }
             }
+            GitFetch | SwitchBranch | CreateBranch => c.git_reason,
+            GitPull => c.git_reason.or(c.pull_reason),
+            GitPush => c.git_reason.or(c.push_reason),
             RecoverUnsavedEdits => (!c.has_pane).then_some("Select a pane first"),
             Copy => (!c.has_selection).then_some("Select terminal text to copy"),
             Paste | SelectAll | ClearScrollback if c.content_pane => Some(CONTENT_PANE_REASON),
@@ -752,6 +796,8 @@ pub struct ShortcutKey<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputOwner {
     Terminal,
+    /// A content pane itself (its folder, Changes list or diff), not a text field in it.
+    Content,
     /// A content pane's code editor, or its search field.
     Editor,
     Palette,
@@ -793,14 +839,18 @@ pub fn resolve_key(
     overrides: &HashMap<String, String>,
 ) -> KeyRoute {
     match owner {
-        // Change navigation is the editor's; a terminal keeps those keys.
+        // Change navigation and Edit / Diff are the editor's; a terminal keeps those keys.
         InputOwner::Terminal => match resolve_terminal_key(platform, key, context, overrides) {
-            KeyRoute::Command(Command::NextChange | Command::PreviousChange)
-            | KeyRoute::Disabled(Command::NextChange | Command::PreviousChange, _) => {
-                KeyRoute::Terminal
-            }
+            KeyRoute::Command(
+                Command::NextChange | Command::PreviousChange | Command::DiffThisFile,
+            )
+            | KeyRoute::Disabled(
+                Command::NextChange | Command::PreviousChange | Command::DiffThisFile,
+                _,
+            ) => KeyRoute::Terminal,
             route => route,
         },
+        InputOwner::Content => resolve_terminal_key(platform, key, context, overrides),
         InputOwner::Editor => match resolve_terminal_key(platform, key, context, overrides) {
             KeyRoute::Command(Command::Copy | Command::Paste | Command::SelectAll)
             | KeyRoute::Disabled(Command::Copy | Command::Paste | Command::SelectAll, _)

@@ -390,9 +390,9 @@ fn content_arguments(
         root,
         tabs: files
             .into_iter()
-            .map(|path| compi_protocol::ContentTab::File { path })
+            .map(compi_protocol::ContentTab::edit)
             .collect(),
-        active: active_file.map(|path| compi_protocol::ContentTab::File { path }),
+        active: active_file.map(compi_protocol::ContentTab::edit),
     };
     content.validate()?;
     Ok((content, down))

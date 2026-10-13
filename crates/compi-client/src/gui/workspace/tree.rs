@@ -31,6 +31,8 @@ pub(in crate::gui) struct FileTree {
     /// Open file…: a chosen file opens in a content pane of this environment.
     pub opens_in: Option<ContentEnvironment>,
     pub error: Option<String>,
+    /// Switch branch…: the picker lists a repository's branches instead of files.
+    pub branches: Option<super::branches::BranchPicker>,
     pub request: u64,
     pub search_request: u64,
 }
@@ -61,6 +63,7 @@ impl FileTree {
             surface_id: None,
             opens_in: None,
             error: None,
+            branches: None,
             request: 1,
             search_request: 0,
         }
@@ -159,7 +162,10 @@ impl FileTree {
     }
 
     pub fn move_selection(&mut self, step: isize) {
-        let len = self.display_rows().len();
+        let len = match &self.branches {
+            Some(branches) => branches.matches.len(),
+            None => self.display_rows().len(),
+        };
         if len > 0 {
             self.selected = self.selected.saturating_add_signed(step).min(len - 1);
         }

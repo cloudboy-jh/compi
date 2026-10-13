@@ -1,5 +1,6 @@
-//! Uncommitted Git changes of content-pane repositories. Reads take no index refresh and
-//! no optional locks; the explicit writes of `write` run one at a time per repository.
+//! Git state of content-pane repositories: uncommitted changes and branches. Reads take no
+//! index refresh and no optional locks; the explicit writes of `write` run one at a time per
+//! repository.
 
 mod write;
 
@@ -8,10 +9,11 @@ pub use write::write;
 use crate::content_files::{self, Failure};
 use base64::Engine;
 use compi_protocol::{
-    ContentEnvironment, ErrorCode, GitChange, GitChangeKind, GitChanges, GitFileContent,
-    GitImageFormat, GitRevision, GitScope, MAX_CONTENT_FILE_BYTES, MAX_GIT_CHANGES,
-    MAX_GIT_IMAGE_BYTES, is_repo_path,
+    ContentEnvironment, ErrorCode, GitBranch, GitBranches, GitChange, GitChangeKind, GitChanges,
+    GitFileContent, GitImageFormat, GitRevision, GitScope, MAX_CONTENT_FILE_BYTES,
+    MAX_GIT_BRANCHES, MAX_GIT_CHANGES, MAX_GIT_IMAGE_BYTES, is_repo_path,
 };
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
@@ -66,6 +68,14 @@ const STAGED_NUMSTAT: &[&str] = &[
     "--no-ext-diff",
     "--no-textconv",
     "-M",
+];
+/// Per branch: `*` when checked out here, the full ref name, its upstream and its commit
+/// time, NUL-separated, one branch per line (ref names hold neither).
+const BRANCHES: &[&str] = &[
+    "for-each-ref",
+    "--format=%(HEAD)%00%(refname)%00%(upstream:short)%00%(committerdate:unix)",
+    "refs/heads",
+    "refs/remotes",
 ];
 
 /// Errors of `cat-file` for a path that does not exist at the revision.
@@ -183,9 +193,72 @@ pub fn read_changes(
         repo,
         branch: parsed.branch,
         head: parsed.head,
+        upstream: parsed.upstream,
+        ahead: parsed.ahead,
+        behind: parsed.behind,
         changes,
         truncated,
     }))
+}
+
+/// The local and remote-tracking branches of the repository whose top level is `repo`.
+pub fn read_branches(environment: &ContentEnvironment, repo: &str) -> Result<GitBranches, Failure> {
+    let repo = content_files::resolve(environment, repo)?.shell;
+    let site = Site::of(environment, &repo);
+    let listed = listing(
+        git(&site.environment, &site.folder, BRANCHES, MAX_LISTING_BYTES)?,
+        "could not list the branches",
+    )?;
+    let mut branches = parse_branches(&listed.stdout);
+    branches.sort_by(|(a, a_time), (b, b_time)| {
+        let rank = |branch: &GitBranch| match (branch.current, branch.remote) {
+            (true, _) => 0,
+            (false, false) => 1,
+            (false, true) => 2,
+        };
+        (rank(a), Reverse(a_time), &a.name).cmp(&(rank(b), Reverse(b_time), &b.name))
+    });
+    let truncated = listed.cut || branches.len() > MAX_GIT_BRANCHES;
+    branches.truncate(MAX_GIT_BRANCHES);
+    Ok(GitBranches {
+        branches: branches.into_iter().map(|(branch, _)| branch).collect(),
+        truncated,
+    })
+}
+
+/// Branches and their commit times from `BRANCHES` output, without remotes' `HEAD`
+/// aliases. Output cut short loses its last, partial line.
+fn parse_branches(output: &[u8]) -> Vec<(GitBranch, i64)> {
+    let complete = output
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(&output[..0], |end| &output[..end]);
+    String::from_utf8_lossy(complete)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\0');
+            let (head, refname, upstream, time) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            let (name, remote) = match refname.strip_prefix("refs/heads/") {
+                Some(name) => (name, false),
+                None => (refname.strip_prefix("refs/remotes/")?, true),
+            };
+            if remote && (name == "HEAD" || name.ends_with("/HEAD")) {
+                return None;
+            }
+            let branch = GitBranch {
+                name: name.to_owned(),
+                current: head == "*",
+                upstream: (!upstream.is_empty()).then(|| upstream.to_owned()),
+                remote,
+            };
+            Some((branch, time.trim().parse().unwrap_or(0)))
+        })
+        .collect()
 }
 
 fn joined(handle: thread::ScopedJoinHandle<'_, Result<Run, Failure>>) -> Result<Run, Failure> {
@@ -477,6 +550,9 @@ struct Entry {
 struct Status {
     branch: Option<String>,
     head: Option<String>,
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
     entries: Vec<Entry>,
 }
 
@@ -486,6 +562,9 @@ fn parse_status(output: &[u8]) -> Status {
     let mut status = Status {
         branch: None,
         head: None,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
         entries: Vec::new(),
     };
     let mut oid = "";
@@ -505,6 +584,14 @@ fn parse_status(output: &[u8]) -> Status {
                     }
                 } else if let Some(name) = rest.strip_prefix("branch.head ") {
                     status.branch = (name != "(detached)").then(|| name.to_owned());
+                } else if let Some(upstream) = rest.strip_prefix("branch.upstream ") {
+                    status.upstream = Some(upstream.to_owned());
+                } else if let Some(counts) = rest.strip_prefix("branch.ab ") {
+                    // `+<ahead> -<behind>`; absent when the upstream branch is gone.
+                    if let Some((ahead, behind)) = counts.split_once(' ') {
+                        status.ahead = ahead.trim_start_matches('+').parse().unwrap_or(0);
+                        status.behind = behind.trim_start_matches('-').parse().unwrap_or(0);
+                    }
                 }
             }
             "1" => {
@@ -939,6 +1026,27 @@ mod tests {
 
         let unborn = parse_status(b"# branch.oid (initial)\0# branch.head main\0");
         assert_eq!((unborn.branch, unborn.head), (None, None));
+        assert_eq!((unborn.upstream, unborn.ahead, unborn.behind), (None, 0, 0));
+
+        let tracking = parse_status(
+            b"# branch.oid 0123\0# branch.head main\0# branch.upstream origin/main\0\
+            # branch.ab +3 -1\0",
+        );
+        assert_eq!(
+            (
+                tracking.upstream.as_deref(),
+                tracking.ahead,
+                tracking.behind
+            ),
+            (Some("origin/main"), 3, 1)
+        );
+        // An upstream whose branch is gone has no counts.
+        let gone =
+            parse_status(b"# branch.oid 0123\0# branch.head main\0# branch.upstream origin/old\0");
+        assert_eq!(
+            (gone.upstream.as_deref(), gone.ahead, gone.behind),
+            (Some("origin/old"), 0, 0)
+        );
 
         let counts = parse_numstat(b"1\t2\ta.rs\0-\t-\timage.png\x003\t0\t\0old.rs\0new.rs\0");
         assert_eq!(counts["a.rs"], (Some(1), Some(2)));
@@ -946,11 +1054,45 @@ mod tests {
         assert_eq!(counts["new.rs"], (Some(3), Some(0)));
     }
 
+    #[test]
+    fn branch_records_skip_remote_heads_and_a_cut_line() {
+        let output = b"*\0refs/heads/main\0origin/main\x00200\n\
+             \0refs/heads/topic\0\x00100\n\
+             \0refs/remotes/origin/HEAD\0\x00200\n\
+             \0refs/remotes/origin/main\0\x00200\n\
+             \0refs/heads/cu";
+        let branches: Vec<_> = parse_branches(output)
+            .into_iter()
+            .map(|(branch, time)| {
+                (
+                    branch.name,
+                    branch.current,
+                    branch.upstream,
+                    branch.remote,
+                    time,
+                )
+            })
+            .collect();
+        assert_eq!(
+            branches,
+            [
+                ("main".into(), true, Some("origin/main".into()), false, 200),
+                ("topic".into(), false, None, false, 100),
+                ("origin/main".into(), false, None, true, 200),
+            ]
+        );
+    }
+
     /// A fresh repository in a temporary folder, or `None` without git.
     struct Repo(PathBuf);
 
     impl Repo {
         fn new() -> Option<Self> {
+            Self::init(&["init", "-q"])
+        }
+
+        /// A repository made by `args` (`init`, `clone … .`) in a fresh temporary folder.
+        fn init(args: &[&str]) -> Option<Self> {
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "compi-git-{}-{}",
@@ -959,20 +1101,45 @@ mod tests {
             ));
             fs::create_dir(&path).ok()?;
             let repo = Self(path);
-            repo.git(&["init", "-q"])?;
+            repo.git(args)?;
             repo.git(&["config", "core.autocrlf", "false"])?;
             Some(repo)
         }
 
-        fn git(&self, args: &[&str]) -> Option<()> {
-            Command::new("git")
+        /// An empty commit made at `time` (seconds since the epoch).
+        fn commit_at(&self, message: &str, time: u64) {
+            let date = format!("{time} +0000");
+            let output = self
+                .command(&[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "--no-gpg-sign",
+                    "-m",
+                    message,
+                ])
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+
+        fn command(&self, args: &[&str]) -> Command {
+            let mut command = Command::new("git");
+            command
                 .arg("-C")
                 .arg(&self.0)
                 .args(args)
                 .env("GIT_AUTHOR_NAME", "Compi")
                 .env("GIT_AUTHOR_EMAIL", "compi@example.com")
                 .env("GIT_COMMITTER_NAME", "Compi")
-                .env("GIT_COMMITTER_EMAIL", "compi@example.com")
+                .env("GIT_COMMITTER_EMAIL", "compi@example.com");
+            command
+        }
+
+        fn git(&self, args: &[&str]) -> Option<()> {
+            self.command(args)
                 .output()
                 .ok()
                 .filter(|output| output.status.success())
@@ -1115,5 +1282,86 @@ mod tests {
         let second = repo.changes();
         assert_ne!(first.changes[0].stamp, second.changes[0].stamp);
         assert_eq!(first.changes[1].stamp, second.changes[1].stamp);
+    }
+
+    #[test]
+    fn branches_list_the_current_first_and_count_ahead_and_behind() {
+        let Some(work) = Repo::new() else {
+            return;
+        };
+        let origin = Repo::init(&["init", "-q", "--bare"]).unwrap();
+        origin
+            .git(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .unwrap();
+        work.git(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .unwrap();
+        work.commit_at("one", 1_000_000_000);
+        work.git(&["remote", "add", "origin", &origin.root()])
+            .unwrap();
+        work.git(&["push", "-q", "origin", "main"]).unwrap();
+        work.git(&["switch", "-q", "-c", "feature"]).unwrap();
+        work.commit_at("feature", 1_000_000_100);
+        work.git(&["push", "-q", "origin", "feature"]).unwrap();
+        work.git(&["switch", "-q", "main"]).unwrap();
+
+        let clone = Repo::init(&["clone", "-q", &origin.root(), "."]).unwrap();
+        clone
+            .git(&["branch", "-q", "--no-track", "recent", "origin/feature"])
+            .unwrap();
+        clone.git(&["branch", "-q", "old"]).unwrap();
+        // The clone's `origin/HEAD` alias exists, and is not listed.
+        clone
+            .git(&["show-ref", "--verify", "-q", "refs/remotes/origin/HEAD"])
+            .unwrap();
+        let listing = read_branches(&ContentEnvironment::Host, &clone.root()).unwrap();
+        let summary: Vec<_> = listing
+            .branches
+            .iter()
+            .map(|branch| {
+                (
+                    branch.name.as_str(),
+                    branch.current,
+                    branch.upstream.as_deref(),
+                    branch.remote,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("main", true, Some("origin/main"), false),
+                ("recent", false, None, false),
+                ("old", false, None, false),
+                ("origin/feature", false, None, true),
+                ("origin/main", false, None, true),
+            ]
+        );
+        assert!(!listing.truncated);
+
+        let counts = |repo: &Repo| {
+            let changes = repo.changes();
+            (changes.upstream, changes.ahead, changes.behind)
+        };
+        let upstream = Some("origin/main".to_owned());
+        assert_eq!(counts(&clone), (upstream.clone(), 0, 0));
+        clone.commit_at("mine", 1_000_000_200);
+        work.commit_at("theirs", 1_000_000_300);
+        work.git(&["push", "-q", "origin", "main"]).unwrap();
+        // The upstream's new commit counts once fetched.
+        assert_eq!(counts(&clone), (upstream.clone(), 1, 0));
+        clone.git(&["fetch", "-q"]).unwrap();
+        assert_eq!(counts(&clone), (upstream, 1, 1));
+
+        // A branch without an upstream, and a detached `HEAD`, have no counts.
+        clone.git(&["switch", "-q", "old"]).unwrap();
+        assert_eq!(counts(&clone), (None, 0, 0));
+        clone.git(&["switch", "-q", "--detach", "main"]).unwrap();
+        let detached = clone.changes();
+        assert_eq!(
+            (detached.branch, detached.upstream, detached.ahead),
+            (None, None, 0)
+        );
+        let listing = read_branches(&ContentEnvironment::Host, &clone.root()).unwrap();
+        assert!(listing.branches.iter().all(|branch| !branch.current));
     }
 }

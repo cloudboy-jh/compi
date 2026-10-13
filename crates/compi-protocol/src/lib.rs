@@ -38,7 +38,8 @@ use std::fmt;
 // Version 22 adds the review of a repository's uncommitted Git changes.
 // Version 23 replaces a content pane's files and view with tabs holding files and diffs.
 // Version 24 adds Git writes: stage, unstage, hunk staging, discard and commit.
-pub const PROTOCOL_VERSION: u32 = 24;
+// Version 25 adds Git branches: upstream and ahead/behind, the branch list, switch and create.
+pub const PROTOCOL_VERSION: u32 = 25;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -62,6 +63,8 @@ pub const MAX_CONTENT_FILES: usize = 256;
 pub const MAX_CONTENT_FILE_BYTES: usize = 1024 * 1024;
 /// Changes one Git changes listing returns.
 pub const MAX_GIT_CHANGES: usize = 5000;
+/// Branches one Git branch listing returns.
+pub const MAX_GIT_BRANCHES: usize = 2000;
 /// Largest image a Git file read returns as an image, in bytes.
 pub const MAX_GIT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -293,6 +296,11 @@ pub enum ClientMessage {
         path: String,
         revision: GitRevision,
     },
+    /// The local and remote-tracking branches of the repository whose top level is `repo`.
+    ReadGitBranches {
+        environment: ContentEnvironment,
+        repo: String,
+    },
     /// A Git write in the repository whose top level is `repo`; writes to one repository
     /// run one at a time. Git's own failure text is the error message.
     GitWrite {
@@ -399,6 +407,9 @@ pub enum ServerMessage {
     },
     GitFileRead {
         content: GitFileContent,
+    },
+    GitBranchesRead {
+        listing: GitBranches,
     },
     GitWritten {
         result: GitWriteResult,
@@ -593,7 +604,7 @@ pub struct GitChange {
 }
 
 /// A repository's uncommitted changes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitChanges {
     /// Absolute repository top level in the request's environment.
     pub repo: String,
@@ -601,10 +612,37 @@ pub struct GitChanges {
     pub branch: Option<String>,
     /// Abbreviated HEAD commit, `None` before the first commit.
     pub head: Option<String>,
+    /// The current branch's upstream, such as `origin/main`; `None` when it has none.
+    pub upstream: Option<String>,
+    /// Commits on the current branch and not on its upstream, and the reverse; 0 without an
+    /// upstream or when the upstream branch is gone.
+    pub ahead: u32,
+    pub behind: u32,
     /// Unstaged entries first, then staged; each group sorted by path.
     pub changes: Vec<GitChange>,
     /// More than `MAX_GIT_CHANGES` entries; the list was cut.
     pub truncated: bool,
+}
+
+/// A repository's branches: the current one first, then local branches by most recent
+/// commit, then remote-tracking branches by most recent commit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBranches {
+    pub branches: Vec<GitBranch>,
+    /// More than `MAX_GIT_BRANCHES` branches; the list was cut.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBranch {
+    /// `main` for a local branch, `origin/main` for a remote-tracking one.
+    pub name: String,
+    /// Checked out in this work tree.
+    pub current: bool,
+    /// A local branch's upstream, such as `origin/main`.
+    pub upstream: Option<String>,
+    /// A remote-tracking branch; switching to it creates a local branch tracking it.
+    pub remote: bool,
 }
 
 /// One side of a changed file.
@@ -668,6 +706,14 @@ pub enum GitAction {
     Commit { message: String, amend: bool },
     /// `HEAD`'s full message, to edit for an amend; writes nothing.
     LastMessage,
+    /// `git switch <name>` to the local branch `name`; when there is none but a
+    /// remote-tracking branch `name` (`origin/x`), `git switch --track <name>`, which creates
+    /// the local branch `x` tracking it (git refuses if `x` exists). Never forced: local
+    /// changes the switch would overwrite make git refuse, and its refusal is the error.
+    SwitchBranch { name: String },
+    /// `git switch -c <name>`: a new branch at `HEAD`, checked out. The name must be a valid
+    /// branch name (`git check-ref-format --branch`) not starting with `-`.
+    CreateBranch { name: String },
 }
 
 /// What a Git write did.
@@ -907,27 +953,54 @@ pub struct PaneContent {
     pub active: Option<ContentTab>,
 }
 
-/// One tab of a content pane.
+/// One tab of a content pane: one per file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentTab {
-    /// An open file: absolute path in the pane's environment.
-    File { path: String },
-    /// A changed file's diff: `repo` is the absolute repository top level in the pane's
-    /// environment, `path` repository-relative (`/`-separated), `scope` which comparison.
-    Diff {
-        repo: String,
+    /// An open file: absolute path in the pane's environment. `diff` set shows the file's
+    /// change against that baseline (Diff mode) instead of the editor (Edit mode); a deleted
+    /// file is a tab in Diff mode whose path no longer exists.
+    File {
         path: String,
-        scope: GitScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<GitScope>,
     },
 }
 
 impl ContentTab {
-    /// The file's path when this is a file tab.
-    pub fn file(&self) -> Option<&str> {
-        match self {
-            Self::File { path } => Some(path),
-            Self::Diff { .. } => None,
+    /// The file in Edit mode.
+    pub fn edit(path: impl Into<String>) -> Self {
+        Self::File {
+            path: path.into(),
+            diff: None,
+        }
+    }
+
+    /// The file in Diff mode against `scope`'s baseline.
+    pub fn diff(path: impl Into<String>, scope: GitScope) -> Self {
+        Self::File {
+            path: path.into(),
+            diff: Some(scope),
+        }
+    }
+
+    /// The file's absolute path.
+    pub fn path(&self) -> &str {
+        let Self::File { path, .. } = self;
+        path
+    }
+
+    /// The comparison shown in Diff mode, `None` in Edit mode.
+    pub fn diff_scope(&self) -> Option<GitScope> {
+        let Self::File { diff, .. } = self;
+        *diff
+    }
+
+    /// The same file in another mode.
+    pub fn with_diff(&self, diff: Option<GitScope>) -> Self {
+        Self::File {
+            path: self.path().to_owned(),
+            diff,
         }
     }
 }
@@ -959,40 +1032,51 @@ impl PaneContent {
         }
         let mut seen = std::collections::HashSet::with_capacity(self.tabs.len());
         for tab in &self.tabs {
-            match tab {
-                ContentTab::File { path: file } => path(file, "content file")?,
-                ContentTab::Diff {
-                    repo, path: file, ..
-                } => {
-                    path(repo, "diff repository")?;
-                    if !is_repo_path(file) {
-                        return Err("a diff tab's path must be repository-relative".into());
-                    }
-                }
-            }
-            if !seen.insert(tab) {
-                return Err(match tab {
-                    ContentTab::File { path } => format!("content file {path} is listed twice"),
-                    ContentTab::Diff { path, .. } => format!("the diff of {path} is listed twice"),
-                });
+            path(tab.path(), "content file")?;
+            if !seen.insert(tab.path()) {
+                return Err(format!("content file {} is listed twice", tab.path()));
             }
         }
         if let Some(active) = &self.active
-            && !seen.contains(active)
+            && !self.tabs.contains(active)
         {
             return Err("the active tab must be one of the open tabs".into());
         }
         Ok(())
     }
 
-    /// Open files' paths, in display order.
+    /// Open files' paths in display order, in either mode.
     pub fn files(&self) -> impl Iterator<Item = &str> {
-        self.tabs.iter().filter_map(ContentTab::file)
+        self.tabs.iter().map(ContentTab::path)
     }
 
-    /// The active tab's path when it is a file.
+    /// The open tab of `path`, in whichever mode it is.
+    pub fn tab(&self, path: &str) -> Option<&ContentTab> {
+        self.tabs.iter().find(|tab| tab.path() == path)
+    }
+
+    /// The active tab's path when it shows the editor (Edit mode).
     pub fn active_file(&self) -> Option<&str> {
-        self.active.as_ref().and_then(ContentTab::file)
+        self.active
+            .as_ref()
+            .filter(|tab| tab.diff_scope().is_none())
+            .map(ContentTab::path)
+    }
+
+    /// The active tab's path and comparison when it shows a diff (Diff mode).
+    pub fn active_diff(&self) -> Option<(&str, GitScope)> {
+        let tab = self.active.as_ref()?;
+        Some((tab.path(), tab.diff_scope()?))
+    }
+
+    /// Opens `tab` (its file's tab moves to that mode in place, else it is appended) and makes
+    /// it active.
+    pub fn show(&mut self, tab: ContentTab) {
+        match self.tabs.iter_mut().find(|open| open.path() == tab.path()) {
+            Some(open) => *open = tab.clone(),
+            None => self.tabs.push(tab.clone()),
+        }
+        self.active = Some(tab);
     }
 
     /// The root folder's last component, for captions.
@@ -1370,6 +1454,90 @@ mod tests {
     }
 
     #[test]
+    fn git_branches_roundtrip() {
+        let requests = [
+            ClientMessage::ReadGitBranches {
+                environment: ContentEnvironment::Host,
+                repo: "/home/user/project".into(),
+            },
+            ClientMessage::GitWrite {
+                environment: ContentEnvironment::Host,
+                repo: "/home/user/project".into(),
+                action: GitAction::SwitchBranch {
+                    name: "origin/feature".into(),
+                },
+            },
+            ClientMessage::GitWrite {
+                environment: ContentEnvironment::Host,
+                repo: "/home/user/project".into(),
+                action: GitAction::CreateBranch {
+                    name: "topic".into(),
+                },
+            },
+        ];
+        for message in requests {
+            let request = ClientControl {
+                request_id: 4,
+                target: None,
+                message,
+            };
+            assert_eq!(
+                decode_client(&encode_client(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+        let encoded = serde_json::to_value(GitAction::SwitchBranch {
+            name: "main".into(),
+        })
+        .unwrap();
+        assert_eq!(encoded["type"], "switch_branch");
+
+        let replies = [
+            ServerMessage::GitBranchesRead {
+                listing: GitBranches {
+                    branches: vec![
+                        GitBranch {
+                            name: "main".into(),
+                            current: true,
+                            upstream: Some("origin/main".into()),
+                            remote: false,
+                        },
+                        GitBranch {
+                            name: "origin/main".into(),
+                            current: false,
+                            upstream: None,
+                            remote: true,
+                        },
+                    ],
+                    truncated: false,
+                },
+            },
+            ServerMessage::GitChangesRead {
+                changes: Some(GitChanges {
+                    repo: "/home/user/project".into(),
+                    branch: Some("main".into()),
+                    head: Some("a1b2c3d".into()),
+                    upstream: Some("origin/main".into()),
+                    ahead: 2,
+                    behind: 1,
+                    changes: Vec::new(),
+                    truncated: false,
+                }),
+            },
+        ];
+        for message in replies {
+            let response = ServerControl {
+                request_id: Some(4),
+                message,
+            };
+            assert_eq!(
+                decode_server(&encode_server(&response).unwrap()).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
     fn workspace_finds_first_surface_in_nested_layout() {
         let surface = SurfaceInfo {
             id: SurfaceId::new("surface-1"),
@@ -1463,7 +1631,7 @@ mod content_tests {
     use super::*;
 
     fn file(path: &str) -> ContentTab {
-        ContentTab::File { path: path.into() }
+        ContentTab::edit(path)
     }
 
     fn content(files: &[&str], active: Option<&str>) -> PaneContent {
@@ -1509,36 +1677,50 @@ mod content_tests {
     }
 
     #[test]
-    fn diff_tabs_sit_among_files_with_a_relative_path() {
-        let diff = |path: &str| ContentTab::Diff {
-            repo: "/home/user/project".into(),
-            path: path.into(),
-            scope: GitScope::Staged,
-        };
-        let shown = PaneContent {
-            tabs: vec![file("/a"), diff("src/main.rs")],
-            active: Some(diff("src/main.rs")),
+    fn a_file_tab_in_diff_mode_is_still_the_files_one_tab() {
+        let diff = |path: &str| ContentTab::diff(path, GitScope::Staged);
+        let mut shown = PaneContent {
+            tabs: vec![file("/a"), diff("/home/user/project/src/main.rs")],
+            active: Some(diff("/home/user/project/src/main.rs")),
             ..content(&[], None)
         };
         assert!(shown.validate().is_ok());
-        assert_eq!(shown.files().collect::<Vec<_>>(), ["/a"]);
+        assert_eq!(
+            shown.files().collect::<Vec<_>>(),
+            ["/a", "/home/user/project/src/main.rs"]
+        );
         assert_eq!(shown.active_file(), None);
+        assert_eq!(
+            shown.active_diff(),
+            Some(("/home/user/project/src/main.rs", GitScope::Staged))
+        );
         let json = serde_json::to_value(&shown).unwrap();
-        assert_eq!(json["tabs"][1]["type"], "diff");
-        assert_eq!(json["active"]["scope"], "staged");
+        assert_eq!(
+            json["tabs"][0],
+            serde_json::json!({"type": "file", "path": "/a"})
+        );
+        assert_eq!(json["tabs"][1]["type"], "file");
+        assert_eq!(json["active"]["diff"], "staged");
         assert_eq!(serde_json::from_value::<PaneContent>(json).unwrap(), shown);
-        for path in ["", "/etc/passwd", "a/../../b", "a\0b"] {
-            let bad = PaneContent {
-                tabs: vec![diff(path)],
-                ..content(&[], None)
-            };
-            assert!(bad.validate().is_err(), "accepted {path:?}");
-        }
+        // The same file in both modes is one file listed twice.
         let twice = PaneContent {
-            tabs: vec![diff("a"), diff("a")],
+            tabs: vec![file("/a"), diff("/a")],
             ..content(&[], None)
         };
         assert!(twice.validate().is_err());
+        // The active tab names the mode its file's tab is in.
+        let stray = PaneContent {
+            active: Some(file("/home/user/project/src/main.rs")),
+            ..shown.clone()
+        };
+        assert!(stray.validate().is_err());
+        // Showing a mode switches the file's tab in place.
+        shown.show(file("/home/user/project/src/main.rs"));
+        assert_eq!(shown.tabs.len(), 2);
+        assert_eq!(shown.active_file(), Some("/home/user/project/src/main.rs"));
+        shown.show(diff("/b"));
+        assert_eq!(shown.files().collect::<Vec<_>>().len(), 3);
+        assert!(shown.validate().is_ok());
         // A folder with nothing open omits both fields.
         let folder = serde_json::to_value(content(&[], None)).unwrap();
         assert!(folder.get("tabs").is_none() && folder.get("active").is_none());

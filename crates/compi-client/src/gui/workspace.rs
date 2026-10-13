@@ -3,6 +3,7 @@ use crate::theme::FocusIndicator;
 use gpui::{AnyElement, AnyWindowHandle, WindowBackgroundAppearance, WindowHandle};
 use sha2::{Digest, Sha256};
 pub(in crate::gui) mod arrangements;
+pub(in crate::gui) mod branches;
 pub(super) mod catalog;
 mod changes;
 pub(in crate::gui) mod content;
@@ -17,6 +18,7 @@ pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
 pub(in crate::gui) mod presentation;
 pub(in crate::gui) mod prompt;
+pub(in crate::gui) mod remote;
 pub(in crate::gui) mod settings;
 pub(super) mod tree;
 mod tree_ui;
@@ -836,6 +838,8 @@ impl CompiApp {
             focused_view: None,
             file_tree: None,
             tree_scroll: ScrollHandle::new(),
+            branch_write: None,
+            remote: Default::default(),
             tab_scroll_handle: ScrollHandle::new(),
             workspace_scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
@@ -1591,16 +1595,25 @@ impl CompiApp {
     }
 
     fn mutate(&mut self, operation: WorkspaceMutation, select_created: bool) {
+        self.mutate_in(operation, select_created, None);
+    }
+
+    /// `mutate`, starting any new shell in the WSL distribution `distribution` when given.
+    /// The mutation's id once it is sent; `None` when it was not.
+    fn mutate_in(
+        &mut self,
+        operation: WorkspaceMutation,
+        select_created: bool,
+        distribution: Option<String>,
+    ) -> Option<MutationId> {
         if self.update_quiesced.load(Ordering::Acquire) {
-            return;
+            return None;
         }
         if self.mutation_pending {
             self.global_error = Some("A workspace change is still pending".into());
-            return;
+            return None;
         }
-        let Some(workspace) = &self.workspace else {
-            return;
-        };
+        let workspace = self.workspace.as_ref()?;
         let launches = matches!(
             operation,
             WorkspaceMutation::Initialize { .. }
@@ -1611,10 +1624,16 @@ impl CompiApp {
         );
         let launch = if launches {
             match &self.config.launch {
-                Ok(launch) => Some(launch.clone()),
+                Ok(launch) => {
+                    let mut launch = launch.clone();
+                    if distribution.is_some() {
+                        launch.profile.distribution = distribution;
+                    }
+                    Some(launch)
+                }
                 Err(error) => {
                     self.global_error = Some(error.clone());
-                    return;
+                    return None;
                 }
             }
         } else {
@@ -1645,6 +1664,7 @@ impl CompiApp {
             operation,
             launch: launch.map(Box::new),
         };
+        let mutation_id = mutation.mutation_id.clone();
         self.mutation_pending = true;
         let sender = self.event_tx.clone();
         let target = self.target.clone();
@@ -1664,6 +1684,7 @@ impl CompiApp {
                 select_created,
             });
         });
+        Some(mutation_id)
     }
 
     fn commit_divider(
@@ -1999,6 +2020,7 @@ impl CompiApp {
                     Ok((workspace, receipt)) => {
                         self.global_error = None;
                         self.accept_workspace(workspace);
+                        self.remote_split_finished(Some(&receipt));
                         if select_created {
                             if let Some(tab) = receipt.affected_tabs.first() {
                                 self.select_terminal(tab.clone(), true);
@@ -2019,6 +2041,7 @@ impl CompiApp {
                             "Workspace change outcome is unconfirmed: {error}. Refreshing authoritative state; the operation will not be retried automatically."
                         ));
                         self.refresh_surfaces(false);
+                        self.remote_split_finished(None);
                     }
                 }
             }
@@ -2036,6 +2059,7 @@ impl CompiApp {
                 if ready_probe.is_some() {
                     self.ready_probe_sent_at = Some(Instant::now());
                 }
+                let remote_input = self.take_remote_input(tab_id);
                 if let Some(view) = self.surface_view_mut(tab_id) {
                     if view.stop.load(Ordering::Acquire) {
                         transport.close();
@@ -2058,6 +2082,12 @@ impl CompiApp {
                     if let Some(marker) = ready_probe {
                         view.send(ClientMessage::Input {
                             data: format!("printf '%s\\n' '{marker}'\n").into_bytes(),
+                            latency_id: None,
+                        });
+                    }
+                    if let Some(data) = remote_input {
+                        view.send(ClientMessage::Input {
+                            data,
                             latency_id: None,
                         });
                     }
@@ -3056,6 +3086,12 @@ impl CompiApp {
             .map(|session| self.state.visible_tabs(session).collect())
             .unwrap_or_default();
         let file_scope = self.file_scope();
+        let git = self.git_pane();
+        let git_refusal = |command: remote::RemoteCommand| {
+            git.as_ref()
+                .ok()
+                .and_then(|(_, listing)| command.refusal(listing))
+        };
         commands::CommandContext {
             connected: workspace.is_some() && !self.loading_surfaces,
             workspace_count: workspace.map_or(0, |workspace| workspace.sessions.len()),
@@ -3083,11 +3119,17 @@ impl CompiApp {
             file_tab: self
                 .focused_content()
                 .is_some_and(|content| content.active_file().is_some()),
+            diff_tab: self
+                .focused_content()
+                .is_some_and(|content| content.active_diff().is_some()),
             files_reason: file_scope.as_ref().err().copied(),
             file_search_reason: file_scope
                 .as_ref()
                 .ok()
                 .and_then(|scope| scope.search.as_ref().err().copied()),
+            git_reason: git.as_ref().err().copied(),
+            pull_reason: git_refusal(remote::RemoteCommand::Pull),
+            push_reason: git_refusal(remote::RemoteCommand::Push),
             tab_index: tab
                 .and_then(|tab| visible.iter().position(|item| item.id == tab.id))
                 .unwrap_or(0),
@@ -3381,7 +3423,12 @@ impl CompiApp {
                 alt: key.modifiers.alt,
                 command: key.modifiers.platform,
             },
-            commands::InputOwner::Terminal,
+            // A content pane keeps the shortcuts a terminal leaves to the shell.
+            if self.focused_content().is_some() {
+                commands::InputOwner::Content
+            } else {
+                commands::InputOwner::Terminal
+            },
             &self.command_context(cx),
             &self.config.keybindings,
         );
@@ -3807,6 +3854,25 @@ impl CompiApp {
             Command::NextChange => self.step_editor_change(true, window, cx),
             Command::PreviousChange => self.step_editor_change(false, window, cx),
             Command::OpenFile => self.open_file_picker(),
+            Command::GitFetch | Command::GitPull | Command::GitPush => {
+                let remote = match command {
+                    Command::GitFetch => remote::RemoteCommand::Fetch,
+                    Command::GitPull => remote::RemoteCommand::Pull,
+                    _ => remote::RemoteCommand::Push,
+                };
+                match self.git_pane().map(|(pane, _)| pane) {
+                    Ok(pane) => self.run_remote(&pane, remote, window),
+                    Err(reason) => self.global_error = Some(reason.into()),
+                }
+            }
+            Command::SwitchBranch | Command::CreateBranch => {
+                match self.git_pane().map(|(pane, _)| pane) {
+                    Ok(pane) => {
+                        self.open_branch_picker(&pane, command == Command::CreateBranch, window, cx)
+                    }
+                    Err(reason) => self.global_error = Some(reason.into()),
+                }
+            }
             Command::Copy => self.copy_selection(cx),
             Command::Paste => self.paste_clipboard(cx),
             Command::SelectAll => {
@@ -5160,14 +5226,7 @@ impl CompiApp {
                     cx.stop_propagation();
                 }))
             })
-            .tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: title.clone(),
-                    reason: reason.clone(),
-                    colors,
-                })
-                .into()
-            })
+            .tooltip(controls::tooltip(title, reason.map(Into::into), None))
             .child(chrome_icon(
                 icon,
                 color(if active { colors.accent } else { colors.muted }),
@@ -5193,14 +5252,7 @@ impl CompiApp {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            .tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: "Pane actions".into(),
-                    reason: None,
-                    colors,
-                })
-                .into()
-            })
+            .tooltip(controls::tooltip("Pane actions", None, None))
             .child(chrome_icon(
                 ChromeIcon::PaneActions,
                 color(if active { colors.accent } else { colors.muted }),
@@ -5361,14 +5413,11 @@ impl CompiApp {
                             this.execute(Command::RemoveTab, window, cx);
                             cx.stop_propagation();
                         }))
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| HeaderTooltip {
-                                title: close_title.clone(),
-                                reason: Some("Ends the processes in its panes".into()),
-                                colors,
-                            })
-                            .into()
-                        })
+                        .tooltip(controls::tooltip(
+                            close_title.clone(),
+                            Some("Ends the processes in its panes".into()),
+                            None,
+                        ))
                         .child(chrome_icon(ChromeIcon::Close, color(colors.muted))),
                 )
         });

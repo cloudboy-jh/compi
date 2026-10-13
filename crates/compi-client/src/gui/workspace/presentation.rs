@@ -2,7 +2,6 @@ use super::*;
 use crate::cli_window::{
     Action, Applied, PaneInfo, PaneType, Request, Response, TargetIdentity, WindowInfo,
 };
-use compi_protocol::ContentTab;
 
 struct ResizeStep {
     tab_id: TabId,
@@ -689,12 +688,12 @@ impl CompiApp {
         let Some(LayoutNode::Content { content, .. }) = leaf_node(&tab.layout, pane_id) else {
             return Err("Pane shows a terminal, not files".into());
         };
+        // The CLI's change put the file's tab in Diff mode at `scope`; `path` is
+        // repository-relative, the tab's path absolute.
         if let Some((path, scope, _)) = diff
-            && !matches!(
-                &content.active,
-                Some(ContentTab::Diff { path: active, scope: shown, .. })
-                    if active == path && *shown == scope
-            )
+            && !content.active_diff().is_some_and(|(active, shown)| {
+                shown == scope && active.replace('\\', "/").ends_with(&format!("/{path}"))
+            })
         {
             return Ok(false);
         }

@@ -601,9 +601,7 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         match then {
-            AfterUnsaved::CloseFile { pane_id, path } => {
-                self.drop_content_tab(&pane_id, &compi_protocol::ContentTab::File { path })
-            }
+            AfterUnsaved::CloseFile { pane_id, path } => self.drop_content_tab(&pane_id, &path),
             AfterUnsaved::Mutate(operation) => self.mutate(operation, false),
             AfterUnsaved::Transfer {
                 tab_id,

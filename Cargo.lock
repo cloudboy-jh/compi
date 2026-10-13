@@ -993,6 +993,7 @@ dependencies = [
  "compi-protocol",
  "compi-update",
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "image",

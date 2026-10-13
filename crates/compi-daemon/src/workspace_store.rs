@@ -22,8 +22,9 @@ use windows::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows::core::PCWSTR;
 
-/// Format 2 (protocol 23) holds a content pane's open files and diffs as `tabs`.
-const FORMAT_VERSION: u32 = 2;
+/// Format 2 (protocol 23) holds a content pane's open files and diffs as `tabs`; format 3
+/// (protocol 25) holds one tab per file, a diff being that tab's mode.
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -129,6 +130,10 @@ impl WorkspaceStore {
                 serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|mut value| {
                     if value.get("format_version") == Some(&serde_json::Value::from(1)) {
                         migrate_content_tabs(&mut value);
+                        value["format_version"] = 2.into();
+                    }
+                    if value.get("format_version") == Some(&serde_json::Value::from(2)) {
+                        migrate_diff_tabs(&mut value);
                         value["format_version"] = FORMAT_VERSION.into();
                     }
                     serde_json::from_value::<Manifest>(value)
@@ -352,6 +357,80 @@ fn migrate_content_tabs(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+/// Format 2 gave a changed file's diff its own tab: `{ type: "diff", repo, path, scope }`
+/// with `path` repository-relative. Each becomes its file's tab (`repo/path`) in Diff mode,
+/// merged with that file's tab when one is open: the merged tab keeps the first one's place
+/// and the active one's mode, else Edit. Every layout copy is walked, as in format 1.
+fn migrate_diff_tabs(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(migrate_diff_tabs),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("content")
+                && let Some(Value::Object(content)) = object.get_mut("content")
+            {
+                let active = content.remove("active").and_then(|tab| file_tab(&tab));
+                let mut merged: Vec<(String, Value)> = Vec::new();
+                if let Some(Value::Array(tabs)) = content.remove("tabs") {
+                    for tab in tabs.iter().filter_map(file_tab) {
+                        let key = same_file_key(&tab);
+                        let is_active = active.as_ref() == Some(&tab);
+                        match merged.iter_mut().find(|(open, _)| *open == key) {
+                            Some((_, open)) => {
+                                let open_is_active = active.as_ref() == Some(&*open);
+                                let edit = tab.get("diff").is_none();
+                                if is_active || (!open_is_active && edit) {
+                                    *open = tab;
+                                }
+                            }
+                            None => merged.push((key, tab)),
+                        }
+                    }
+                }
+                let active = active.and_then(|active| {
+                    let key = same_file_key(&active);
+                    merged
+                        .iter()
+                        .find(|(open, _)| *open == key)
+                        .map(|(_, tab)| tab.clone())
+                });
+                if !merged.is_empty() {
+                    let tabs = merged.into_iter().map(|(_, tab)| tab).collect();
+                    content.insert("tabs".into(), Value::Array(tabs));
+                }
+                if let Some(active) = active {
+                    content.insert("active".into(), active);
+                }
+                return;
+            }
+            object.values_mut().for_each(migrate_diff_tabs);
+        }
+        _ => {}
+    }
+}
+
+/// A format-2 tab as a format-3 file tab; anything else is dropped.
+fn file_tab(tab: &serde_json::Value) -> Option<serde_json::Value> {
+    let text = |key: &str| tab.get(key).and_then(serde_json::Value::as_str);
+    match text("type")? {
+        "file" => Some(serde_json::json!({ "type": "file", "path": text("path")? })),
+        "diff" => {
+            let repo = text("repo")?.trim_end_matches('/');
+            Some(serde_json::json!({
+                "type": "file",
+                "path": format!("{repo}/{}", text("path")?),
+                "diff": text("scope")?,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Which file a tab is, matching a Windows path whichever separator either side used.
+fn same_file_key(tab: &serde_json::Value) -> String {
+    tab["path"].as_str().unwrap_or_default().replace('\\', "/")
 }
 
 fn recover_lost_surfaces(workspace: &mut StoredWorkspace) {
@@ -624,7 +703,7 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::{ContentEnvironment, ContentTab, PaneContent, SplitAxis};
+    use compi_protocol::{ContentEnvironment, ContentTab, GitScope, PaneContent, SplitAxis};
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -836,12 +915,8 @@ mod tests {
                     distribution: "Ubuntu".into(),
                 },
                 root: "/home/user/project".into(),
-                tabs: vec![ContentTab::File {
-                    path: "/home/user/project/a.rs".into(),
-                }],
-                active: Some(ContentTab::File {
-                    path: "/home/user/project/a.rs".into(),
-                }),
+                tabs: vec![ContentTab::edit("/home/user/project/a.rs")],
+                active: Some(ContentTab::edit("/home/user/project/a.rs")),
             },
         };
         let terminal = LayoutNode::Pane {
@@ -913,9 +988,7 @@ mod tests {
         **second = LayoutNode::Content {
             pane_id,
             content: PaneContent {
-                active: Some(ContentTab::File {
-                    path: "/home/user/project/missing.rs".into(),
-                }),
+                active: Some(ContentTab::edit("/home/user/project/missing.rs")),
                 ..shown
             },
         };
@@ -965,7 +1038,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
         let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
-        let file = |path: &str| ContentTab::File { path: path.into() };
+        let file = |path: &str| ContentTab::edit(path);
         let tab = &workspace.sessions[0].tabs[0];
         let LayoutNode::Split { first, second, .. } = &tab.layout else {
             panic!("the split survives");
@@ -987,6 +1060,81 @@ mod tests {
             matches!(second.as_ref(), LayoutNode::Content { content, .. } if content.tabs.len() == 2)
         );
         // Saved again in the current format.
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["format_version"], FORMAT_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn protocol_24_diff_tabs_become_their_files_tab_in_diff_mode() {
+        let path = test_path("format-2");
+        let leaf = |pane: &str, content: serde_json::Value| serde_json::json!({ "type": "content", "pane_id": pane, "content": content });
+        let diff = |path: &str, scope: &str| serde_json::json!({ "type": "diff", "repo": "/work/", "path": path, "scope": scope });
+        let file = |path: &str| serde_json::json!({ "type": "file", "path": path });
+        // A diff beside its file's tab, active: the merged tab keeps the file's place in Diff mode.
+        let merged = leaf(
+            "pane-1",
+            serde_json::json!({
+                "environment": { "type": "host" },
+                "root": "/work",
+                "tabs": [file("/work/a.rs"), file("/work/b.rs"), diff("a.rs", "unstaged"), diff("c.rs", "staged")],
+                "active": diff("a.rs", "unstaged"),
+            }),
+        );
+        // Both scopes of one file and its file tab, none active: one tab, in Edit mode, where
+        // the first of them was.
+        let edited = leaf(
+            "pane-2",
+            serde_json::json!({
+                "environment": { "type": "host" },
+                "root": "/work",
+                "tabs": [diff("a.rs", "staged"), file("/work/b.rs"), diff("a.rs", "unstaged"), file("/work/a.rs")],
+                "active": file("/work/b.rs"),
+            }),
+        );
+        let split = serde_json::json!({
+            "type": "split", "axis": "horizontal", "ratio": 0.5,
+            "first": merged, "second": edited,
+        });
+        let (_, mut empty) = WorkspaceStore::memory();
+        empty.initialized = true;
+        let mut manifest = serde_json::json!({ "format_version": 2, "workspace": empty });
+        manifest["workspace"]["sessions"] = serde_json::json!([{
+            "id": "session-1",
+            "label": "Default",
+            "tabs": [{ "id": "tab-1", "label": "", "layout": split, "previous_layout": merged }],
+        }]);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let edit = |path: &str| ContentTab::edit(path);
+        let diff = |path: &str, scope| ContentTab::diff(path, scope);
+        let tab = &workspace.sessions[0].tabs[0];
+        let LayoutNode::Split { first, second, .. } = &tab.layout else {
+            panic!("the split survives");
+        };
+        let LayoutNode::Content { content, .. } = first.as_ref() else {
+            panic!("a content pane");
+        };
+        let a = diff("/work/a.rs", GitScope::Unstaged);
+        assert_eq!(
+            content.tabs,
+            [
+                a.clone(),
+                edit("/work/b.rs"),
+                diff("/work/c.rs", GitScope::Staged)
+            ]
+        );
+        assert_eq!(content.active, Some(a));
+        let LayoutNode::Content { content, .. } = second.as_ref() else {
+            panic!("a content pane");
+        };
+        assert_eq!(content.tabs, [edit("/work/a.rs"), edit("/work/b.rs")]);
+        assert_eq!(content.active, Some(edit("/work/b.rs")));
+        assert!(matches!(
+            tab.previous_layout.as_deref(),
+            Some(LayoutNode::Content { content, .. }) if content.tabs.len() == 3
+        ));
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["format_version"], FORMAT_VERSION);
         let _ = fs::remove_file(path);

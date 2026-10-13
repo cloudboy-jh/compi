@@ -1,4 +1,4 @@
-//! `compi diff [PATH[:LINE]]`: a changed file's diff as a tab of the content pane of its
+//! `compi diff [PATH[:LINE]]`: a changed file's tab, in Diff mode, in the content pane of its
 //! repository, or with no PATH that pane's Changes list. Panes are found or opened as
 //! `compi edit` does; Git is only read, never written.
 use super::content::{self, Placed, Show};
@@ -76,11 +76,7 @@ pub(super) fn run(
         )));
     }
     let show = Show::Tab {
-        tab: ContentTab::Diff {
-            repo: listing.repo.clone(),
-            path: relative.clone(),
-            scope,
-        },
+        tab: ContentTab::diff(path.clone(), scope),
         file: path,
         within: Some(within),
         root: listing.repo.clone(),
@@ -164,6 +160,7 @@ mod tests {
                 change(GitScope::Staged, "staged.rs"),
             ],
             truncated: false,
+            ..Default::default()
         };
         assert_eq!(
             unstaged_first(&listing, "both.rs"),

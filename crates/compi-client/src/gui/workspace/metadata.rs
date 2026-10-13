@@ -213,6 +213,19 @@ impl CompiApp {
         Some(value)
     }
 
+    /// `pane_metadata`, only when a query started at or after `since` has answered it.
+    pub(super) fn pane_metadata_since(
+        &self,
+        id: &SurfaceId,
+        since: Instant,
+    ) -> Option<&PaneMetadata> {
+        let started = *self.metadata.attempted.get(id)?;
+        let (received, _) = self.metadata.entries.get(id)?;
+        (started >= since && *received >= started)
+            .then(|| self.pane_metadata(id))
+            .flatten()
+    }
+
     pub(super) fn metadata_tab_caption(
         &self,
         tab: &WorkspaceTab,

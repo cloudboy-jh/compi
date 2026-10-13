@@ -1,5 +1,6 @@
-//! Explicit Git writes: stage, unstage, hunk staging through the index text, discard and
-//! commit. Writes to one repository run one at a time; git's own output is the error.
+//! Explicit Git writes: stage, unstage, hunk staging through the index text, discard,
+//! commit, and switching and creating branches. Writes to one repository run one at a time;
+//! git's own output is the error.
 
 use super::{Access, Run, Site, check_path, git, records, run};
 use crate::content_files::{self, Failure};
@@ -14,8 +15,8 @@ use std::time::Duration;
 
 /// How long one write may run.
 const TIMEOUT: Duration = Duration::from_secs(30);
-/// A commit runs hooks.
-const COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// A commit or a switch runs hooks.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(120);
 /// Standard output kept of a write; the rest is drained.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// Characters of git's output kept in an error; hook output can be long, and its end
@@ -40,21 +41,33 @@ pub fn write(
         GitAction::Discard { paths, untracked } => {
             paths.iter().chain(untracked).map(String::as_str).collect()
         }
-        GitAction::Commit { .. } | GitAction::LastMessage => Vec::new(),
+        GitAction::Commit { .. }
+        | GitAction::LastMessage
+        | GitAction::SwitchBranch { .. }
+        | GitAction::CreateBranch { .. } => Vec::new(),
     };
     for path in &paths {
         check_path(&site.environment, path)?;
     }
-    let needs_paths = !matches!(action, GitAction::Commit { .. } | GitAction::LastMessage);
+    let needs_paths = matches!(
+        action,
+        GitAction::Stage { .. }
+            | GitAction::Unstage { .. }
+            | GitAction::SetIndexLines { .. }
+            | GitAction::Discard { .. }
+    );
     if needs_paths && paths.is_empty() {
         return Err((ErrorCode::InvalidRequest, "no paths to write".into()));
     }
-    let lock = repo_lock(&site);
-    let _held = lock.lock();
     let repo = Repo {
         environment: &site.environment,
         folder: &site.folder,
     };
+    if let GitAction::SwitchBranch { name } | GitAction::CreateBranch { name } = &action {
+        repo.check_branch_name(name)?;
+    }
+    let lock = repo_lock(&site);
+    let _held = lock.lock();
     match action {
         GitAction::Stage { paths } => {
             repo.each(&["add", "-A", "--"], &paths)?;
@@ -84,7 +97,7 @@ pub fn write(
             if amend {
                 args.push("--amend");
             }
-            repo.checked(&args, Some(message.as_bytes()), COMMIT_TIMEOUT)?;
+            repo.checked(&args, Some(message.as_bytes()), HOOK_TIMEOUT)?;
             let head = repo.read(&["log", "-1", "--format=%h%x00%s"], MAX_OUTPUT_BYTES)?;
             let head = String::from_utf8_lossy(&head.stdout);
             let (head, summary) = head
@@ -103,6 +116,17 @@ pub fn write(
                     .trim_end()
                     .to_owned(),
             });
+        }
+        GitAction::SwitchBranch { name } => {
+            // A local branch of that name wins over a remote-tracking one; `--no-guess`
+            // keeps git from creating a local branch the client did not name.
+            let remote = !repo.has_ref(&format!("refs/heads/{name}"))?
+                && repo.has_ref(&format!("refs/remotes/{name}"))?;
+            let mode = if remote { "--track" } else { "--no-guess" };
+            repo.checked(&["switch", mode, &name], None, HOOK_TIMEOUT)?;
+        }
+        GitAction::CreateBranch { name } => {
+            repo.checked(&["switch", "-c", &name], None, HOOK_TIMEOUT)?;
         }
     }
     Ok(GitWriteResult::Done)
@@ -206,6 +230,48 @@ impl Repo<'_> {
             // `-q` is silent about a missing `HEAD` and only that.
             (false, true) => Ok(true),
             (false, false) => Err(failed(&head)),
+        }
+    }
+
+    /// Whether the ref `full_name` (`refs/heads/main`) exists.
+    fn has_ref(&self, full_name: &str) -> Result<bool, Failure> {
+        let shown = git(
+            self.environment,
+            self.folder,
+            &["show-ref", "--verify", "--quiet", full_name],
+            MAX_OUTPUT_BYTES,
+        )?;
+        match (shown.success, shown.stderr.trim().is_empty()) {
+            (true, _) => Ok(true),
+            // `--quiet` is silent about a missing ref and only that.
+            (false, true) => Ok(false),
+            (false, false) => Err(failed(&shown)),
+        }
+    }
+
+    /// Rejects `name` unless git takes it as a branch name as it stands: not an option,
+    /// and not shorthand such as `@{-1}` that git would expand to another name.
+    fn check_branch_name(&self, name: &str) -> Result<(), Failure> {
+        let invalid = || {
+            Err((
+                ErrorCode::InvalidRequest,
+                format!("{name:?} is not a valid branch name"),
+            ))
+        };
+        if name.is_empty() || name.starts_with('-') {
+            return invalid();
+        }
+        let checked = git(
+            self.environment,
+            self.folder,
+            &["check-ref-format", "--branch", name],
+            MAX_OUTPUT_BYTES,
+        )?;
+        let expanded = String::from_utf8_lossy(&checked.stdout);
+        if checked.success && expanded.trim_end_matches(['\n', '\r']) == name {
+            Ok(())
+        } else {
+            invalid()
         }
     }
 
@@ -805,5 +871,134 @@ mod tests {
         assert_eq!(repo.read("staged.txt").as_deref(), Some("staged\n"));
         assert_eq!(repo.read("loose.txt"), None);
         assert_eq!(repo.status(), "M  staged.txt\n?? kept.txt\n");
+    }
+
+    impl Scratch {
+        /// The checked-out branch.
+        fn current(&self) -> String {
+            self.git(&["symbolic-ref", "--short", "HEAD"])
+                .trim()
+                .to_owned()
+        }
+
+        /// A repository on `main` with `file.txt` committed.
+        fn on_main() -> Option<Self> {
+            let repo = Self::new()?;
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+            repo.write("file.txt", "base\n");
+            repo.git(&["add", "file.txt"]);
+            repo.git(&["commit", "-qm", "base"]);
+            Some(repo)
+        }
+    }
+
+    fn switch(name: &str) -> GitAction {
+        GitAction::SwitchBranch { name: name.into() }
+    }
+
+    fn create(name: &str) -> GitAction {
+        GitAction::CreateBranch { name: name.into() }
+    }
+
+    #[test]
+    fn creates_and_switches_branches_without_forcing() {
+        let Some(repo) = Scratch::on_main() else {
+            return;
+        };
+        repo.done(create("topic"));
+        assert_eq!(repo.current(), "topic");
+        repo.write("file.txt", "topic\n");
+        repo.git(&["commit", "-qam", "topic"]);
+        let exists = repo.act(create("main")).unwrap_err();
+        assert!(exists.1.contains("already exists"), "{exists:?}");
+
+        repo.done(switch("main"));
+        assert_eq!(repo.current(), "main");
+        assert_eq!(repo.read("file.txt").as_deref(), Some("base\n"));
+
+        // A change the switch would overwrite: git refuses and the work tree stays.
+        repo.write("file.txt", "uncommitted\n");
+        let refused = repo.act(switch("topic")).unwrap_err();
+        assert!(refused.1.contains("would be overwritten"), "{refused:?}");
+        assert_eq!(repo.current(), "main");
+        assert_eq!(repo.read("file.txt").as_deref(), Some("uncommitted\n"));
+        assert_eq!(repo.status(), " M file.txt\n");
+
+        // A change the switch keeps does not stop it.
+        repo.git(&["checkout", "--", "file.txt"]);
+        repo.write("other.txt", "untracked\n");
+        repo.done(switch("topic"));
+        assert_eq!(repo.current(), "topic");
+        assert_eq!(repo.read("other.txt").as_deref(), Some("untracked\n"));
+
+        let missing = repo.act(switch("nowhere")).unwrap_err();
+        assert!(missing.1.contains("nowhere"), "{missing:?}");
+        assert_eq!(repo.current(), "topic");
+    }
+
+    #[test]
+    fn creates_a_branch_before_the_first_commit() {
+        let Some(repo) = Scratch::new() else {
+            return;
+        };
+        repo.done(create("fresh"));
+        assert_eq!(repo.current(), "fresh");
+    }
+
+    #[test]
+    fn switching_to_a_remote_branch_creates_a_tracking_branch() {
+        let Some(repo) = Scratch::on_main() else {
+            return;
+        };
+        // A remote-tracking branch as a fetch would leave it; nothing is fetched.
+        repo.git(&["remote", "add", "origin", "../nowhere.git"]);
+        repo.git(&["update-ref", "refs/remotes/origin/feature", "HEAD"]);
+        repo.git(&["update-ref", "refs/remotes/origin/other", "HEAD"]);
+
+        repo.done(switch("origin/feature"));
+        assert_eq!(repo.current(), "feature");
+        assert_eq!(
+            repo.git(&["rev-parse", "--abbrev-ref", "feature@{upstream}"])
+                .trim(),
+            "origin/feature"
+        );
+        repo.done(switch("main"));
+        // Its local branch exists now: git refuses to create it twice.
+        let twice = repo.act(switch("origin/feature")).unwrap_err();
+        assert!(twice.1.contains("already exists"), "{twice:?}");
+        repo.done(switch("feature"));
+        assert_eq!(repo.current(), "feature");
+
+        // A bare name switches only to a local branch; git does not guess the remote one.
+        assert!(repo.act(switch("other")).is_err());
+        assert!(
+            repo.try_git(&["show-ref", "--verify", "--quiet", "refs/heads/other"])
+                .is_none()
+        );
+        assert_eq!(repo.current(), "feature");
+    }
+
+    #[test]
+    fn rejects_names_git_would_not_take_as_given() {
+        let Some(repo) = Scratch::on_main() else {
+            return;
+        };
+        // `@{-1}` names the previous branch, which exists: it is still not taken.
+        repo.git(&["switch", "-q", "-c", "previous"]);
+        repo.git(&["switch", "-q", "main"]);
+        let branches = repo.git(&["for-each-ref", "refs/heads"]);
+        for name in [
+            "", "-", "-f", "--force", "a..b", "bad name", "x.lock", "HEAD", "@{-1}", "a/", "~1",
+        ] {
+            for action in [switch(name), create(name)] {
+                assert_eq!(
+                    repo.act(action).unwrap_err().0,
+                    ErrorCode::InvalidRequest,
+                    "accepted {name:?}"
+                );
+            }
+        }
+        assert_eq!(repo.git(&["for-each-ref", "refs/heads"]), branches);
+        assert_eq!(repo.current(), "main");
     }
 }

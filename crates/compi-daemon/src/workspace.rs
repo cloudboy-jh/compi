@@ -1,7 +1,7 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
-    ContentEnvironment, ContentTab, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS,
-    MAX_TAB_PANES, MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId,
+    ContentEnvironment, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES,
+    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId,
     PlannedLayoutNode, ProcessLifetimeId, ServerGeneration, SessionId, SplitAxis, SurfaceId,
     SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation, WorkspaceSession,
     WorkspaceSnapshot, WorkspaceTab,
@@ -1860,11 +1860,7 @@ fn validate_split_geometry(
 /// distribution, which only a Windows host can reach.
 fn validate_content(content: &PaneContent) -> Result<(), String> {
     content.validate()?;
-    let mut paths =
-        std::iter::once(content.root.as_str()).chain(content.tabs.iter().map(|tab| match tab {
-            ContentTab::File { path } => path.as_str(),
-            ContentTab::Diff { repo, .. } => repo.as_str(),
-        }));
+    let mut paths = std::iter::once(content.root.as_str()).chain(content.files());
     match &content.environment {
         ContentEnvironment::Host => {
             if let Some(path) = paths.find(|path| !std::path::Path::new(path).is_absolute()) {
@@ -2228,6 +2224,7 @@ fn disconnected(_: mpsc::RecvError) -> ActorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compi_protocol::ContentTab;
     use std::time::Instant;
 
     fn lifecycle_consent(actor: &WorkspaceActor) -> compi_protocol::LifecycleConsent {
@@ -4208,9 +4205,7 @@ mod tests {
     /// A folder and files whose paths are absolute on every test host.
     fn host_content(files: &[&str]) -> PaneContent {
         let root = std::env::temp_dir().join("compi-content-project");
-        let file = |name: &str| ContentTab::File {
-            path: root.join(name).to_string_lossy().into_owned(),
-        };
+        let file = |name: &str| ContentTab::edit(root.join(name).to_string_lossy());
         PaneContent {
             environment: ContentEnvironment::Host,
             root: root.to_string_lossy().into_owned(),
@@ -4391,9 +4386,7 @@ mod tests {
         assert!(message.contains("not absolute"), "{message}");
 
         let relative_file = PaneContent {
-            tabs: vec![ContentTab::File {
-                path: "notes.txt".into(),
-            }],
+            tabs: vec![ContentTab::edit("notes.txt")],
             ..host_content(&[])
         };
         let message = reject(open(

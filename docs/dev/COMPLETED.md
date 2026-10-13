@@ -4,6 +4,7 @@ This is an implementation history with dated verification evidence, not a claim 
 
 ## Latest completed handoff
 
+- Editor controls, one tab per file, remote and branches, phase 6b: every editor-surface control comes from one GPUI Kit vocabulary (`gui/controls.rs`) with hover, pressed, focus, disabled-with-reason and loading states, real Lucide icons and full keyboard operation. Each file has one tab with an Edit / Diff switch (Ctrl+Shift+D). The Changes header shows the branch and ahead/behind. Fetch, Pull and Push run in a terminal beside the editor, and a picker switches or creates branches. Protocol 25, workspace file format 3. See [Editor controls, tabs, remote and branches](#editor-controls-tabs-remote-and-branches-phase-6b--2026-10-12).
 - Stage, commit, discard, phase 6a: the Changes list stages and unstages files (rows and section headers) and discards them after a confirmation dialog. Diff tabs stage or unstage single hunks, line-ending safe. A commit box with summary, description and Amend commits with Ctrl/Cmd+Enter. Protocol 24. See [Stage, commit, discard](#stage-commit-discard-phase-6a--2026-10-12).
 - Editor ↔ diff, phase 5: diffs open as tabs in the editor pane. Its sidebar switches between Files and Changes, and the standalone Changes pane is gone. The editor has a Git gutter against the index with a `vs index` baseline. Next/Previous change is Alt+F5 / Alt+Shift+F5. Changed files are marked in the folder tree. A diff opens from a gutter mark, `vs index`, the tree, the palette (**Changes**, **Diff this file**) or `compi diff [PATH[:LINE]]`. Protocol 23, GUI handoff 9, workspace file format 2. See [Editor and diff](#editor-and-diff-phase-5--2026-10-12).
 - Diff view, phase 4: the palette's **Changes** opens a review pane beside the terminal, listing unstaged and staged changes as a list or tree. Diffs show in unified or split layout (split automatically above 112 cells), with changed words, syntax highlighting, folds showing the enclosing function, expandable context, find, whitespace modes, indent guides, image compare and live refresh. Git runs read-only in the repository's environment. Protocol 22. See [Diff view](#diff-view-phase-4--2026-10-12).
@@ -19,7 +20,7 @@ This is an implementation history with dated verification evidence, not a claim 
 - Pane density: Comfy (default) draws tiled panes as 8 px-radius islands with 6 px gutters on a darkened-terminal canvas (window material when translucent), no header rule, gutter-as-divider, and an accent outline on the focused pane when several are visible; Compact keeps edge-to-edge panes with one-device-pixel seams. Global `appearance.density`, Settings → Interface. See [Pane density](#pane-density--2026-10-08).
 - WSL shells reach Windows commands through a local launcher index (`~/.compi/wincmd.<digest>`) instead of WSL's appended `/mnt` directories, and a runtime-registry race that left blank, unclosable tabs is fixed. See [WSL Windows command index and startup](#wsl-windows-command-index-and-startup--2026-10-08).
 - Quiet shell lifecycle presentation retains final output and stable captions without Starting UI, reserved space, recovery overlays, status buttons, or diagnostic hover cards. Existing explicit menu actions remain. Windows/WSL native smoke is recorded below.
-- Features 4 and 5 are implemented: the public agent-friendly CLI shares the existing workspace/PTY model, and configurable captions plus CLI inspection expose environment-correct pane metadata. Current client/daemon protocol is 24 (19 adds content panes, 20 content files, 21 file states and checks, 22 Git changes, 23 unified file/diff tabs, 24 Git writes); native GUI launch/control handoff is version 9 (5 added the `compi update` restart handoff, 6 adds pane types to window control, 7 `reveal_file`, 8 `unsaved_files`, 9 `reveal_diff`/`show_changes`). Windows/WSL smoke evidence is recorded below; native Mac, Unix CLI attachment, and SSH runtime qualification remain separate.
+- Features 4 and 5 are implemented: the public agent-friendly CLI shares the existing workspace/PTY model, and configurable captions plus CLI inspection expose environment-correct pane metadata. Current client/daemon protocol is 25 (19 adds content panes, 20 content files, 21 file states and checks, 22 Git changes, 23 unified file/diff tabs, 24 Git writes, 25 branches, ahead/behind and one tab per file); native GUI launch/control handoff is version 9 (5 added the `compi update` restart handoff, 6 adds pane types to window control, 7 `reveal_file`, 8 `unsaved_files`, 9 `reveal_diff`/`show_changes`). Windows/WSL smoke evidence is recorded below; native Mac, Unix CLI attachment, and SSH runtime qualification remain separate.
 - Release notes have one source, `docs/user/release-notes.md` (`# <version>`, summary bullets, `##` details). The client embeds it; after an update it shows once as a **What's new** card at the bottom of the sidebar (summary, **More** dropdown, **Release notes** link) with an accent dot on the sidebar button until the sidebar is first opened; only × dismisses the card. **Settings → Updates** always shows **What's new in <version>**, and an available update's notes are labelled with its version. The Release workflow now signs that file into the update metadata and uses it as the draft release body, and fails the Windows job if its heading does not match the tag. See [What's new](#whats-new--2026-10-06).
 - Feature 3, shell prompt settings, is implemented: **Settings → Terminal → Shell prompt** detects the target's shells, Oh My Posh/Starship installs, styles, and existing startup lines; lists every style with its real rendered prompt; and applies the chosen style unchanged to Compi shells, optionally also to the login shell, from a dropdown under the clicked style backed by token-checked, backed-up plans, with turn-off and restore confirmed the same way. Running Compi shells switch at their next prompt. Protocol 16. See [Shell prompt settings](#shell-prompt-settings--2026-10-05); Mac and SSH remain unqualified.
 - `cargo dev` is the source development loop for the native client: rebuild on save, swap the preview only after a successful build, and keep the isolated `compi-dev` daemon and its shells. See [`cargo dev` source loop](#cargo-dev-source-loop--2026-10-05); Mac remains unqualified.
@@ -31,6 +32,57 @@ This is an implementation history with dated verification evidence, not a claim 
 - The final Windows preview showed a small, one-line Detach/End bubble beneath only the selected terminal's name inside the compact list; selecting another pane moved it instead of duplicating it. Lone-pane Detach was disabled. Clicking compact Detach on a split created a tab while keeping its surface running, and compact End opened confirmation with both buttons fully visible. An earlier native run confirmed End changed only the selected surface to exited while retaining its tab and pane. A stale menu rejected selection after a workspace revision change. `cargo check -p compi-client`, the focused caption test, the isolated native build, and Rust formatting passed.
 - Windows visual polish reduced the selected-pane row to one muted highlight with a compact action pair; only the focused action uses the accent outline. Tab hover now omits the redundant header for a single pane and shows a count, numbered names, and directories for splits. Native preview exercised one- and two-pane hover cards, a custom-named tab, Tab focus switching to End, End confirmation, and Detach moving the selected pane to a new tab without stopping its surface.
 - An isolated Windows `compi-latest.exe` release bundle launched a native Compi window with a running WSL terminal and matching sibling daemon; its disposable instance shut down without touching the installed or active development daemons. Windows CI-equivalent formatting, dependency-boundary, warning-denied Clippy, workspace unit/binary tests, and all current client/protocol/daemon integration tests passed. Removed the CI-only reference to the nonexistent `wire_v7` target; protocol tests already run through the workspace test step. WSL Linux all-target workspace Clippy passed after using read-only Unix paths for file-tree scanning; hosted macOS/Linux CI and installer smoke remain unverified on this change. A third-party `proc-macro-error2` future-incompatibility advisory remains outside the workspace warning gate.
+
+### Editor controls, tabs, remote and branches (phase 6b) — 2026-10-12
+
+- Controls (`gui/controls.rs`), built over GPUI Kit 0.7.1:
+  - **Components:** `icon_button`, `text_button` and `Control`, with variants ghost, outline, primary and danger, plus `.key()`, `.disabled_because()`, `.loading()`, `.selected()` and `.tab_stop()`. Also `segmented`, `checkbox`, `chip`, `tooltip`, `kbd` and `cycle_focus`.
+  - **Sizes:** two only, Row (20 px, Kit XSmall) and Header (24 px, Kit Small). Every action fires on click.
+  - **Icons:** `gpui-kit-assets` 0.7.2 is registered with an `icon_assets!` extra set (x, rotate-ccw, chevrons-down-up, list, list-tree, square-pen, file-diff, git-branch, columns-2, rows-2).
+  - **Theme:** `sync_editor_theme` also sets the Kit theme. Radius is 4 px, the focus ring is the accent, and hover and pressed shades are derived from Compi colours. A test checks AA contrast of button text on every bundled theme; it caught material-light primary text at 4.17:1, now fixed.
+  - **Tooltips:** Kit tooltips need `Root`, so each control wraps Kit's `Tooltip` view in GPUI's tooltip. Disabled controls show their reason, and keys are drawn in AA colour. `HeaderTooltip` is removed, leaving one tooltip look.
+  - Segmented switches are Kit buttons in a bordered strip, since `ButtonGroup` tooltips need `Root`.
+  - The hand-built row, header, banner and diff buttons and the canvas list/diff/context icons are gone.
+- Keyboard:
+  - Tab and Shift+Tab move through a pane's controls with accent focus rings; the editor still indents. Escape returns to the editor or the list.
+  - The Changes list has a selection: ↑/↓, Enter opens, `s`/`u` stage/unstage, Delete discards after confirming. The selected row shows its actions.
+  - The commit box and find bar take Tab.
+  - Hunk buttons show only for the hovered hunk or the `n`/`p` current hunk, in a reserved spot at the end of the hunk's first row, so code wraps before it and is never covered. Shift+S / Shift+U stage the current hunk.
+- Protocol 25, one tab per file:
+  - `ContentTab::File { path, diff: Option<GitScope> }` is the only kind. `PaneContent::show` switches a file's tab in place.
+  - Workspace file format 3 migrates format-2 diff tabs into their file's tab in Diff mode, keeping order and active state.
+  - The Edit / Diff segmented switch and **Diff this file** (Ctrl+Shift+D, a toggle) keep the line. Diff → Edit uses the line in view; Edit → Diff uses the cursor line.
+  - A file deleted by the change is Diff-only, with the reason on the disabled Edit. A dirty editor shows `Unsaved edits not shown` in Diff mode.
+  - A Diff-mode tab shows a muted file-diff icon, and its tooltip names the baseline.
+- Protocol 25, Git:
+  - `GitChanges` gains `upstream`, `ahead` and `behind`.
+  - `ReadGitBranches` returns `GitBranches`: current first, locals then remotes newest first, `origin/HEAD` skipped, capped at 2000.
+  - `GitAction::SwitchBranch` uses `switch --no-guess`, or `--track` for a remote-tracking branch. `CreateBranch` uses `switch -c`. Names are checked with `check-ref-format --branch`, plus leading `-` and `@{-1}`. Nothing is forced, and Git's refusal is returned as is.
+- Remote and branches (`branches.rs`, `remote.rs`):
+  - The header shows a branch button, `↑N ↓M`, `no upstream` or `detached at <id>`.
+  - Fetch, Pull and Push type `git fetch` / `git pull` / `git push` into an idle terminal in the editor's tab at the repository, or a new split there in its WSL distribution. Push uses `-u origin <branch>` without an upstream. A terminal Compi typed into counts as busy until metadata says its shell is idle again.
+  - The branch picker reuses the Open file… overlay with fuzzy matching. Remotes are hidden when a local branch exists, and a `Create branch "…"` row appears for new names. Palette: Fetch, Pull, Push, Switch branch…, Create branch….
+- Windows/WSL `cargo dev` on `~/compi-review` with a local bare origin:
+  - **Tabs:** three changes opened as three tabs; a file open in Edit switched to Diff in place; the deleted file was Diff-only with its reason; Edit ↔ Diff by the switch and Ctrl+Shift+D landed on the same line; the dirty chip appeared.
+  - **Hunk buttons:** hidden at rest, shown on hover and on `n`/`p`, never over a wrapped long line; Shift+S staged only hunk 2.
+  - **Keyboard:** a full Tab tour with focus rings; list ↑/↓, Enter, `s`/`u`, and Delete → confirmation → Cancel.
+  - **Commit box:** Ctrl+Enter showed the spinner and `Committed <id>`, then Amend.
+  - **Disabled reasons:** shown on Diff, Pull and Edit.
+  - **Folds and find:** fold hover with Show all; find 2/2 with chevrons and close.
+  - **Branches:** header `↑1`, Push typed into an idle terminal and `↑1` cleared after the poll. Fetch split a new terminal when the old one had left the repo, and Pull reused it. The picker created a branch (`no upstream` chip) and switched back. A conflicting switch showed Git's refusal with nothing changed.
+  - **Fixed during the smoke:**
+    - `n`/`p` now step from the current hunk;
+    - the commit row's spinner no longer overflows;
+    - row counts hide behind the row's actions;
+    - the diff header's control group wraps in narrow panes.
+- Checks: `cargo fmt --check`, warning-denied workspace all-target Clippy, `cargo test --workspace --lib` (client 285, daemon 122, protocol 34) and the Windows dependency-boundary check passed.
+- Light theme and narrow pane, checked afterwards on material-light: nothing was invisible; body text 8.4:1, segment labels 4.1:1. At about 385 and 349 px wide the diff header wraps onto two lines with nothing clipped. Outside a repository, the Changes switch and Fetch/Pull/Push are left out.
+- Known limits:
+  - Material-light's muted text is 4.2:1 on its opaque background and 2.8:1 over the transparent window. That is a theme colour, below AA for small text.
+  - Tooltips can linger after a click changes the layout (GPUI).
+  - The Files tree's selection fill stops at the name, and very long folder names squeeze their icon in a narrow sidebar.
+  - The tab strip scrolls sideways without a visible indicator.
+  - Zoom and the sidebar mode reset when the client rebuilds.
 
 ### Stage, commit, discard (phase 6a) — 2026-10-12
 

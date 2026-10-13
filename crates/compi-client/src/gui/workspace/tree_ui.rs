@@ -235,7 +235,10 @@ impl CompiApp {
         let Some(tree) = self.file_tree.as_mut() else {
             return;
         };
-        if tree.project_mode {
+        if tree.branches.is_some() {
+            tree.query.push_str(text);
+            self.refresh_branch_matches();
+        } else if tree.project_mode {
             tree.query.push_str(text);
             self.refresh_project_matches();
         } else if tree.searching {
@@ -461,10 +464,14 @@ impl CompiApp {
         if key.key_char.is_some()
             && !key.modifiers.control
             && !key.modifiers.platform
-            && (tree.project_mode || tree.searching)
+            && (tree.project_mode || tree.searching || tree.branches.is_some())
         {
             // AppKit supplies composed text and IME through EntityInputHandler.
             return false;
+        }
+        if tree.branches.is_some() {
+            self.handle_branch_key(key, window, cx);
+            return true;
         }
         if tree.project_mode {
             self.handle_project_key(key, cx);
@@ -656,6 +663,25 @@ impl CompiApp {
                         .child(div().ml_1().child(label)),
                 )
         });
+        let branch_rows = tree
+            .branches
+            .as_ref()
+            .map(|picker| self.render_branch_rows(tree, picker, line_height, cx));
+        let branch_note = tree.branches.as_ref().and_then(|picker| {
+            if picker.listing.is_none() && tree.error.is_none() {
+                Some("Reading the branches…".to_owned())
+            } else if picker.listing.is_some() && picker.matches.is_empty() {
+                Some(format!("No branch matches “{}”", tree.query.trim()))
+            } else {
+                None
+            }
+        });
+        let title = match &tree.branches {
+            Some(picker) if picker.create => format!("Create branch in {}", picker.repo),
+            Some(picker) => format!("Switch branch in {}", picker.repo),
+            None if tree.project_mode => "Jump to project".to_owned(),
+            None => tree.rows[0].path.clone(),
+        };
         div()
             .id("file-tree")
             .size_full()
@@ -688,44 +714,67 @@ impl CompiApp {
                     .justify_between()
                     .border_b_1()
                     .border_color(color(colors.border))
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(color(colors.muted)).child(if tree.project_mode { "Jump to project".to_owned() } else { tree.rows[0].path.clone() }))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("tree-copy-path")
-                                    .cursor_pointer()
-                                    .text_color(color(colors.accent))
-                                    .child("Copy path")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.copy_tree_path(cx);
-                                        cx.stop_propagation();
-                                    })),
-                            )
-                            .when(can_enter, |actions| {
-                                actions.child(
+                    .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(color(colors.muted)).child(title))
+                    .when_some(tree.branches.as_ref(), |header, picker| {
+                        header.child(self.render_branch_action(tree, picker, cx))
+                    })
+                    .when(tree.branches.is_none(), |header| {
+                        header.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
                                     div()
-                                        .id("tree-enter-folder")
+                                        .id("tree-copy-path")
                                         .cursor_pointer()
                                         .text_color(color(colors.accent))
-                                        .child("Enter folder")
+                                        .child("Copy path")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.enter_tree_directory();
+                                            this.copy_tree_path(cx);
                                             cx.stop_propagation();
-                                            cx.notify();
                                         })),
                                 )
-                            }),
-                    ),
+                                .when(can_enter, |actions| {
+                                    actions.child(
+                                        div()
+                                            .id("tree-enter-folder")
+                                            .cursor_pointer()
+                                            .text_color(color(colors.accent))
+                                            .child("Enter folder")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.enter_tree_directory();
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        )
+                    }),
             )
-            .child(div().id("file-tree-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.tree_scroll).children(rows))
+            .child(
+                div()
+                    .id("file-tree-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.tree_scroll)
+                    .map(|list| match branch_rows {
+                        Some(branch_rows) => list.children(branch_rows),
+                        None => list.children(rows),
+                    }),
+            )
+            .when_some(branch_note, |view, note| {
+                view.child(div().px_2().py_1().text_color(color(colors.muted)).child(note))
+            })
             .when(tree.project_mode && tree.search_results.is_empty(), |view| {
                 view.child(div().px_2().py_1().text_color(color(colors.muted)).child("No visited directories match. Browse a project first."))
             })
             .when_some(tree.error.as_deref(), |view, error| view.child(div().px_2().text_color(color(colors.error)).child(error.to_owned())))
-            .child(div().flex_none().px_2().py_1().text_color(color(colors.muted)).child(if tree.project_mode {
+            .child(div().flex_none().px_2().py_1().text_color(color(colors.muted)).child(if let Some(write) = self.branch_write.as_ref().filter(|_| tree.branches.is_some()) {
+                write.label.clone()
+            } else if let Some(picker) = &tree.branches {
+                format!("Branch: {}  ·  type to filter · ↑↓ choose · Enter {} · Esc close", tree.query, if picker.create { "create" } else { "switch" })
+            } else if tree.project_mode {
                 format!("Jump: {}  ·  ↑↓ choose · Enter {} · Esc close", tree.query, if tree.pending_shell { "cd" } else { "copy path" })
             } else if tree.opens_in.is_some() {
                 format!("Open file: {}  ·  type to search · ↑↓ choose · Enter open · Esc close", tree.query)

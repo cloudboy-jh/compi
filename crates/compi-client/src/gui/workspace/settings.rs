@@ -808,14 +808,7 @@ impl CompiApp {
             .items_center()
             .justify_center()
             .hover(move |style| style.bg(color(hover)).cursor_pointer())
-            .tooltip(move |_, cx| {
-                cx.new(move |_| HeaderTooltip {
-                    title: "Close · Esc".into(),
-                    reason: None,
-                    colors,
-                })
-                .into()
-            })
+            .tooltip(controls::tooltip("Close", None, Some("escape")))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.settings_font_picker = None;
                 this.dismiss_overlay();

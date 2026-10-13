@@ -689,10 +689,8 @@ fn content_pane_survives_daemon_restart_and_closes_without_a_process() {
     let content = PaneContent {
         environment: ContentEnvironment::Host,
         root: project.to_string_lossy().into_owned(),
-        tabs: vec![compi_protocol::ContentTab::File {
-            path: notes.clone(),
-        }],
-        active: Some(compi_protocol::ContentTab::File { path: notes }),
+        tabs: vec![compi_protocol::ContentTab::edit(notes.clone())],
+        active: Some(compi_protocol::ContentTab::edit(notes)),
     };
     let opened = control
         .mutate(WorkspaceMutation::OpenContent {

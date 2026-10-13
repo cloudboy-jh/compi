@@ -14,6 +14,7 @@ use super::tree::{Entry, FileTree, filter_rows};
 use super::tree_ui::tree_entry_icon;
 use super::unsaved::{self, Backup, Backups, SaveTicket};
 use super::*;
+use crate::gui::controls::{self, ChipTone, IconName, icon_button, text_button};
 use compi_protocol::{
     ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
     GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent, ServerGeneration, ServerId,
@@ -164,7 +165,7 @@ pub(super) struct FileEditor {
     version: FileVersion,
     /// The text last read or saved. The file is dirty while the editor differs.
     saved: Rope,
-    dirty: bool,
+    pub(super) dirty: bool,
     /// The text being saved, until the daemon answers.
     saving: Option<Rope>,
     /// How the file ended its lines when read; saves keep it.
@@ -878,8 +879,6 @@ impl CompiApp {
         theme.background = color(colors.background);
         theme.foreground = color(colors.foreground);
         theme.border = color(colors.border);
-        theme.input = color(colors.border);
-        theme.ring = color(colors.accent);
         theme.selection = color(colors.selection);
         theme.caret = color(colors.accent);
         theme.accent = color(colors.surface_hover);
@@ -887,19 +886,14 @@ impl CompiApp {
         theme.muted = color(colors.surface);
         // Line numbers paint in this; reduced, they recede behind the code.
         theme.muted_foreground = color(colors.muted).opacity(0.7);
-        theme.popover = color(colors.surface);
-        theme.popover_foreground = color(colors.foreground);
         theme.list_hover = color(colors.surface_hover);
-        theme.primary = color(colors.accent);
-        theme.primary_hover = color(colors.accent);
-        theme.primary_foreground = color(colors.background);
         theme.secondary = color(colors.surface);
         theme.secondary_hover = color(colors.surface_hover);
         theme.secondary_foreground = color(colors.foreground);
-        theme.danger = color(colors.error);
         theme.scrollbar = gpui::transparent_black();
         theme.scrollbar_thumb = color(colors.muted).opacity(0.4);
         theme.scrollbar_thumb_hover = color(colors.muted);
+        controls::sync_theme(theme, &colors);
         theme.tokens = ThemeTokens::from(&theme.colors);
         let mut highlight = if applied.dark {
             HighlightTheme::default_dark()
@@ -927,6 +921,7 @@ impl CompiApp {
         highlight.style.editor_active_line = Some(color(colors.foreground).opacity(0.05));
         theme.highlight_theme = Arc::new(highlight);
         Theme::sync_base(cx);
+        controls::install_colors(colors, cx);
         cx.set_global(applied);
     }
 
@@ -1206,7 +1201,8 @@ impl CompiApp {
                         }
                         open
                     });
-                    ui.diffs.retain(|tab, _| content.tabs.contains(tab));
+                    // A diff stays while its file is open, so Edit and Diff switch back fast.
+                    ui.diffs.retain(|tab, _| content.tab(tab.path()).is_some());
                     true
                 }
                 None => {
@@ -1508,13 +1504,10 @@ impl CompiApp {
         self.content.released = None;
         if let Some((pane_id, mut content)) = reuse {
             if let Some(file) = &file {
-                let tab = ContentTab::File { path: file.clone() };
-                let listed = content.tabs.contains(&tab);
-                if !listed || content.active.as_ref() != Some(&tab) {
-                    if !listed {
-                        content.tabs.push(tab.clone());
-                    }
-                    content.active = Some(tab);
+                // The file's tab, in whichever mode, returns to editing.
+                let tab = ContentTab::edit(file.clone());
+                if content.active.as_ref() != Some(&tab) {
+                    content.show(tab);
                     self.mutate(
                         WorkspaceMutation::UpdateContent {
                             pane_id: pane_id.clone(),
@@ -1537,11 +1530,8 @@ impl CompiApp {
         let content = PaneContent {
             environment: environment.clone(),
             root,
-            tabs: file
-                .iter()
-                .map(|path| ContentTab::File { path: path.clone() })
-                .collect(),
-            active: file.clone().map(|path| ContentTab::File { path }),
+            tabs: file.iter().map(ContentTab::edit).collect(),
+            active: file.clone().map(ContentTab::edit),
         };
         if self.open_content_beside(beside, content)
             && let (Some(path), Some(line)) = (file, line)
@@ -1683,9 +1673,9 @@ impl CompiApp {
         );
     }
 
-    /// Closes `tab`, its editor or diff going once the pane no longer lists it. The tab
-    /// after it becomes active, else the one before.
-    pub(super) fn drop_content_tab(&mut self, pane_id: &PaneId, tab: &ContentTab) {
+    /// Closes `path`'s tab, its editor and diff going once the pane no longer lists it. The
+    /// tab after it becomes active, else the one before.
+    pub(super) fn drop_content_tab(&mut self, pane_id: &PaneId, path: &str) {
         let Some(mut content) = self
             .workspace
             .as_ref()
@@ -1694,11 +1684,11 @@ impl CompiApp {
         else {
             return;
         };
-        let Some(index) = content.tabs.iter().position(|open| open == tab) else {
+        let Some(index) = content.tabs.iter().position(|open| open.path() == path) else {
             return;
         };
-        content.tabs.remove(index);
-        if content.active.as_ref() == Some(tab) {
+        let tab = content.tabs.remove(index);
+        if content.active.as_ref() == Some(&tab) {
             content.active = content
                 .tabs
                 .get(index)
@@ -2394,9 +2384,10 @@ impl CompiApp {
         else {
             return;
         };
-        let (source, target) = (ContentTab::File { path }, ContentTab::File { path: target });
-        content.tabs.retain(|tab| *tab != target);
-        match content.tabs.iter().position(|tab| *tab == source) {
+        // The new file is edited, so its tab is in Edit mode.
+        let target = ContentTab::edit(target);
+        content.tabs.retain(|tab| tab.path() != target.path());
+        match content.tabs.iter().position(|tab| tab.path() == path) {
             Some(index) => content.tabs[index] = target.clone(),
             None => content.tabs.push(target.clone()),
         }
@@ -2602,11 +2593,23 @@ impl CompiApp {
         let Some(ui) = self.content.panes.get(pane_id) else {
             return;
         };
+        let key = &event.keystroke;
+        let plain = !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform;
+        if key.key == "tab" && plain {
+            // Reaches here only when nothing focused took it (the editor indents):
+            // the pane or one of its controls moves through the pane's controls.
+            let focus = ui.focus.clone();
+            controls::cycle_focus(&focus, !key.modifiers.shift, window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if !ui.focus.is_focused(window) {
-            // A key the editor or its search field left alone. Text input still needs
-            // it, so only Escape stops here: it closes Save as, or hands the keyboard
-            // to the pane.
-            if event.keystroke.key == "escape" {
+            // A key the editor, a field or a control left alone. Text input still
+            // needs it, so only Escape stops here: it closes Save as; from the editor
+            // it hands the keyboard to the pane, from a control or field it goes back
+            // to the editor, or to the pane when there is none.
+            if key.key == "escape" {
                 let saving_as = ui.files.iter().find_map(|(path, file)| match &file.body {
                     FileBody::Ready(editor) => editor
                         .save_as
@@ -2615,10 +2618,23 @@ impl CompiApp {
                         .map(|_| path.clone()),
                     _ => None,
                 });
+                let editor = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| find_content(workspace, pane_id))
+                    .and_then(|content| content.active_file())
+                    .and_then(|active| ui.editor(active))
+                    .map(|editor| editor.state.focus_handle(cx));
                 if let Some(path) = saving_as {
                     self.close_save_as(pane_id, &path, window, cx);
                 } else if !self.handle_app_key(event, window, cx) {
-                    self.release_editor(pane_id, window, cx);
+                    match editor {
+                        Some(editor) if !editor.contains_focused(window, cx) => {
+                            self.content.released = None;
+                            window.focus(&editor, cx);
+                        }
+                        _ => self.release_editor(pane_id, window, cx),
+                    }
                 }
                 cx.stop_propagation();
                 cx.notify();
@@ -2626,16 +2642,17 @@ impl CompiApp {
             return;
         }
         // Compi shortcuts still run; every other key stops here, so nothing typed in
-        // a content pane reaches a shell. A diff tab takes the keys it knows first.
+        // a content pane reaches a shell. The Changes list takes its keys first, then
+        // a tab in Diff mode the keys it knows.
         let diff = self
             .workspace
             .as_ref()
             .and_then(|workspace| find_content(workspace, pane_id))
             .and_then(|content| content.active.clone())
-            .filter(|tab| matches!(tab, ContentTab::Diff { .. }));
-        let handled = diff
-            .is_some_and(|tab| self.diff_tab_key_down(pane_id, &tab, event, window, cx))
-            || self.content_tree_key(pane_id, &event.keystroke, window, cx);
+            .filter(|tab| tab.diff_scope().is_some());
+        let handled = self.changes_list_key(pane_id, key, window, cx)
+            || diff.is_some_and(|tab| self.diff_tab_key_down(pane_id, &tab, event, window, cx))
+            || self.content_tree_key(pane_id, key, window, cx);
         if !handled {
             self.handle_app_key(event, window, cx);
         }
@@ -2761,11 +2778,11 @@ impl CompiApp {
                                                     cx,
                                                 ))
                                             })
-                                            .child(match tab {
-                                                ContentTab::File { path } => self
-                                                    .render_file_body(&pane_id, path, ui, cx)
+                                            .child(match tab.diff_scope() {
+                                                None => self
+                                                    .render_file_body(&pane_id, tab.path(), ui, cx)
                                                     .into_any_element(),
-                                                ContentTab::Diff { .. } => {
+                                                Some(_) => {
                                                     self.render_diff_tab(&pane_id, ui, tab, cx)
                                                 }
                                             }),
@@ -2868,16 +2885,10 @@ impl CompiApp {
                                     .text_size(px(UI_BODY_TEXT_SIZE))
                                     .child(content.folder_name().to_owned()),
                             )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .px_1()
-                                    .rounded_sm()
-                                    .bg(color(colors.surface_hover))
-                                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                                    .text_color(color(colors.muted))
-                                    .child(self.environment_label(&content.environment)),
-                            ),
+                            .child(controls::chip(
+                                self.environment_label(&content.environment),
+                                ChipTone::Neutral,
+                            )),
                     )
                     .child(
                         div()
@@ -2888,14 +2899,7 @@ impl CompiApp {
                             .text_size(px(UI_MICRO_TEXT_SIZE))
                             .text_color(color(colors.muted))
                             .child(caption_path(&content.root, home, fits))
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| HeaderTooltip {
-                                    title: root.clone(),
-                                    reason: None,
-                                    colors,
-                                })
-                                .into()
-                            }),
+                            .tooltip(controls::tooltip(root, None, None)),
                     ),
             )
             .children(self.render_sidebar_switch(pane_id, ui, cx))
@@ -2959,17 +2963,14 @@ impl CompiApp {
                 .flex()
                 .items_center()
                 .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        if folder {
-                            this.release_editor(&row_pane, window, cx);
-                        }
-                        this.activate_content_row(&row_pane, index, window, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if folder {
+                        this.release_editor(&row_pane, window, cx);
+                    }
+                    this.activate_content_row(&row_pane, index, window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
                 // One guide per folder above, through the middle of its arrow.
                 .children((0..level).map(|guide| {
                     div()
@@ -3004,12 +3005,18 @@ impl CompiApp {
                             div()
                                 .w(px(14.0))
                                 .flex_none()
-                                .text_color(color(colors.muted))
-                                .child(match (folder, row.expanded) {
-                                    (false, _) => "",
-                                    (true, true) => "▾",
-                                    (true, false) => "▸",
-                                }),
+                                .flex()
+                                .items_center()
+                                .children(folder.then(|| {
+                                    controls::glyph(
+                                        if row.expanded {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        },
+                                        color(colors.muted),
+                                    )
+                                })),
                         )
                         .child(tree_entry_icon(folder, row.expanded, color(tint)))
                         .child(
@@ -3022,8 +3029,9 @@ impl CompiApp {
                         ),
                 )
                 .when_some(mark, |item, mark| {
-                    item.child(div().flex_1())
-                        .child(self.render_tree_mark(pane_id, index, mark, row_height, cx))
+                    item.child(div().flex_1()).child(
+                        self.render_tree_mark(pane_id, index, mark, row_height, selected, cx),
+                    )
                 })
         });
         let focus_pane = pane_id.clone();
@@ -3060,14 +3068,11 @@ impl CompiApp {
                     cx.notify();
                 }),
             )
-            .tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: "Type to filter the listed names".into(),
-                    reason: Some("↑↓ select · ←→ fold · Enter open · Esc clear".into()),
-                    colors,
-                })
-                .into()
-            })
+            .tooltip(controls::tooltip(
+                "Type to filter the listed names",
+                Some("↑↓ select · ←→ fold · Enter open · Esc clear".into()),
+                None,
+            ))
             .map(|field| {
                 if ui.filter.is_empty() {
                     field
@@ -3086,35 +3091,17 @@ impl CompiApp {
                         .children(caret)
                         .child(div().flex_1())
                         .child(
-                            div()
-                                .id("content-tree-filter-clear")
-                                .flex_none()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_color(color(colors.muted))
-                                .hover(move |style| {
-                                    style
-                                        .bg(color(colors.surface_hover))
-                                        .text_color(color(colors.foreground))
-                                })
-                                .child("×")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        if let Some(ui) = this.content.panes.get_mut(&clear_pane) {
-                                            ui.filter.clear();
-                                            ui.scroll_to_selected();
-                                        }
-                                        this.release_editor(&clear_pane, window, cx);
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    }),
-                                ),
+                            icon_button("content-tree-filter-clear", IconName::X, "Clear filter")
+                                .key("escape")
+                                .tab_stop(false)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(ui) = this.content.panes.get_mut(&clear_pane) {
+                                        ui.filter.clear();
+                                        ui.scroll_to_selected();
+                                    }
+                                    this.release_editor(&clear_pane, window, cx);
+                                    cx.notify();
+                                })),
                         )
                 }
             });
@@ -3156,8 +3143,8 @@ impl CompiApp {
             )
     }
 
-    /// The tab strip: the sidebar toggle, the file and diff tabs in order, and where the
-    /// files live.
+    /// The tab strip: the sidebar toggle, the file tabs in order, the Edit / Diff switch of
+    /// a file in Edit mode, and where the files live.
     fn render_content_tabs(
         &self,
         pane_id: &PaneId,
@@ -3170,21 +3157,20 @@ impl CompiApp {
         let environment = self.environment_label(&ui.environment);
         let tabs = content.tabs.iter().enumerate().map(|(index, tab)| {
             let active = content.active.as_ref() == Some(tab);
-            let (name, glyph, hint, title) = match tab {
-                ContentTab::File { path } => {
-                    (file_name(path).to_owned(), false, None, path.clone())
-                }
-                ContentTab::Diff { .. } => {
-                    let (name, hint, title) = Self::diff_tab_caption(ui, tab).unwrap_or_default();
-                    (name, true, hint, title)
-                }
-            };
-            let editor = tab.file().and_then(|path| ui.editor(path));
+            let name = file_name(tab.path()).to_owned();
+            // In Diff mode the tooltip names what the diff compares.
+            let glyph = tab.diff_scope().is_some();
+            let title = Self::diff_tab_baseline(ui, tab).unwrap_or_else(|| tab.path().to_owned());
+            let editor = ui.editor(tab.path());
             let dirty = editor.is_some_and(|editor| editor.dirty);
             let read_only = editor.is_some_and(|editor| !editor.writable);
             let (open_pane, open_tab) = (pane_id.clone(), tab.clone());
             let (close_pane, close_tab) = (pane_id.clone(), tab.clone());
-            let reason = environment.clone();
+            let reason: SharedString = if dirty {
+                format!("{environment} · unsaved changes").into()
+            } else {
+                environment.clone().into()
+            };
             div()
                 .id(("content-file-tab", index))
                 .flex_none()
@@ -3211,30 +3197,14 @@ impl CompiApp {
                 .when(!active, |tab| {
                     tab.hover(move |style| style.bg(color(colors.surface_hover)))
                 })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.activate_content_tab(&open_pane, &open_tab);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                )
-                .tooltip(move |_, cx| {
-                    cx.new(|_| HeaderTooltip {
-                        title: title.clone(),
-                        reason: Some(reason.clone()),
-                        colors,
-                    })
-                    .into()
-                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.activate_content_tab(&open_pane, &open_tab);
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .tooltip(controls::tooltip(title, Some(reason), None))
                 .when(glyph, |tab| {
-                    tab.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(colors.muted))
-                            .child("Δ"),
-                    )
+                    tab.child(controls::glyph(IconName::FileDiff, color(colors.muted)))
                 })
                 .child(
                     div()
@@ -3244,26 +3214,8 @@ impl CompiApp {
                         .whitespace_nowrap()
                         .child(name),
                 )
-                .when_some(hint, |tab, hint| {
-                    tab.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(colors.muted))
-                            .child(hint),
-                    )
-                })
                 .when(read_only, |tab| {
-                    tab.child(
-                        div()
-                            .flex_none()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(color(colors.surface_hover))
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(colors.muted))
-                            .child("Read-only"),
-                    )
+                    tab.child(controls::chip("Read-only", ChipTone::Neutral))
                 })
                 .when(dirty, |tab| {
                     tab.child(
@@ -3274,37 +3226,12 @@ impl CompiApp {
                     )
                 })
                 .child(
-                    div()
-                        .id(("content-file-close", index))
-                        .flex_none()
-                        .w(px(18.0))
-                        .h(px(18.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .text_color(color(colors.muted))
-                        .hover(move |style| {
-                            style
-                                .bg(color(colors.surface_hover))
-                                .text_color(color(colors.foreground))
-                        })
-                        .child("×")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                match &close_tab {
-                                    ContentTab::File { path } => {
-                                        this.close_content_file(&close_pane, path, window, cx)
-                                    }
-                                    ContentTab::Diff { .. } => {
-                                        this.drop_content_tab(&close_pane, &close_tab)
-                                    }
-                                }
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        ),
+                    icon_button(("content-file-close", index), IconName::X, "Close").on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.close_content_file(&close_pane, close_tab.path(), window, cx);
+                            cx.notify();
+                        }),
+                    ),
                 )
         });
         div()
@@ -3316,7 +3243,6 @@ impl CompiApp {
             .text_size(px(UI_SMALL_TEXT_SIZE))
             .child(
                 div()
-                    .id("content-sidebar-toggle")
                     .flex_none()
                     .w(px(FILE_TAB_HEIGHT))
                     .h_full()
@@ -3325,24 +3251,25 @@ impl CompiApp {
                     .justify_center()
                     .border_r_1()
                     .border_color(color(colors.border))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(color(colors.surface_hover)))
-                    .child(tree_entry_icon(
-                        true,
-                        ui.sidebar,
-                        color(if ui.sidebar {
-                            colors.accent
-                        } else {
-                            colors.muted
-                        }),
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                    .child(
+                        icon_button(
+                            "content-sidebar-toggle",
+                            if ui.sidebar {
+                                IconName::PanelLeftClose
+                            } else {
+                                IconName::PanelLeftOpen
+                            },
+                            if ui.sidebar {
+                                "Hide sidebar"
+                            } else {
+                                "Show sidebar"
+                            },
+                        )
+                        .header()
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_content_sidebar(&toggle_pane);
-                            cx.stop_propagation();
                             cx.notify();
-                        }),
+                        })),
                     ),
             )
             .child(
@@ -3354,6 +3281,20 @@ impl CompiApp {
                     .flex()
                     .overflow_x_scroll()
                     .children(tabs),
+            )
+            .children(
+                content
+                    .active
+                    .as_ref()
+                    .filter(|tab| tab.diff_scope().is_none())
+                    .map(|tab| {
+                        div()
+                            .flex_none()
+                            .pl_2()
+                            .flex()
+                            .items_center()
+                            .child(self.render_mode_switch(pane_id, ui, tab, cx))
+                    }),
             )
             .children(
                 content
@@ -3391,47 +3332,40 @@ impl CompiApp {
     ) -> impl IntoElement {
         let colors = *self.colors();
         let name = file_name(path);
-        let action =
-            |id: &'static str,
-             label: &'static str,
+        // Banner and Save as actions run on this file of this pane.
+        let bind =
+            |control: controls::Control,
              run: fn(&mut Self, &PaneId, &str, &mut Window, &mut Context<Self>)| {
                 let (pane_id, path) = (pane_id.clone(), path.to_owned());
-                div()
-                    .id(id)
-                    .flex_none()
-                    .px_2()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_color(color(colors.accent))
-                    .hover(move |style| style.bg(color(colors.surface_hover)))
-                    .child(label)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            run(this, &pane_id, &path, window, cx);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    )
+                control
+                    .header()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        run(this, &pane_id, &path, window, cx);
+                        cx.notify();
+                    }))
             };
         let reload = || {
-            action(
-                "content-banner-reload",
-                "Reload",
+            let button = text_button("content-banner-reload", "Reload");
+            bind(
+                if editor.reload_armed {
+                    button.danger().detail("Your edits are discarded")
+                } else {
+                    button
+                },
                 |this, pane, path, _, _| this.reload_content_file(pane, path),
             )
         };
         let save_as = || {
-            action(
-                "content-banner-save-as",
-                "Save as…",
+            bind(
+                text_button("content-banner-save-as", "Save as…"),
                 |this, pane, path, window, cx| this.open_save_as(pane, path, window, cx),
             )
         };
         let dismiss = || {
-            action("content-banner-dismiss", "×", |this, pane, path, _, _| {
-                this.dismiss_banner(pane, path)
-            })
+            bind(
+                icon_button("content-banner-dismiss", IconName::X, "Dismiss"),
+                |this, pane, path, _, _| this.dismiss_banner(pane, path),
+            )
         };
         let restored = editor.restored.map(|saved_at| {
             div()
@@ -3450,9 +3384,8 @@ impl CompiApp {
                         .text_color(color(colors.muted))
                         .child(unsaved::restored_note(saved_at)),
                 )
-                .child(action(
-                    "content-restored-dismiss",
-                    "×",
+                .child(bind(
+                    icon_button("content-restored-dismiss", IconName::X, "Dismiss"),
                     |this, pane, path, _, _| {
                         if let Some(editor) = this
                             .content
@@ -3477,9 +3410,10 @@ impl CompiApp {
                     },
                     vec![
                         reload(),
-                        action(
-                            "content-banner-overwrite",
-                            "Overwrite",
+                        bind(
+                            text_button("content-banner-overwrite", "Overwrite")
+                                .danger()
+                                .detail("Replaces the file on disk with your version"),
                             |this, pane, path, _, cx| this.overwrite_content_file(pane, path, cx),
                         ),
                         save_as(),
@@ -3495,9 +3429,8 @@ impl CompiApp {
                     },
                     vec![
                         reload(),
-                        action(
-                            "content-banner-keep",
-                            "Keep mine",
+                        bind(
+                            text_button("content-banner-keep", "Keep mine"),
                             |this, pane, path, _, _| this.dismiss_banner(pane, path),
                         ),
                     ],
@@ -3526,13 +3459,12 @@ impl CompiApp {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_color(color(tone))
+                        .text_color(color(ui_text_color(tone, colors.background)))
                         .child(message),
                 )
                 .children(actions)
         });
         let field = editor.save_as.as_ref().map(|field| {
-            let (pane, file) = (pane_id.clone(), path.to_owned());
             div()
                 .flex_none()
                 .px_3()
@@ -3555,35 +3487,22 @@ impl CompiApp {
                                 .child(Input::new(&field.input).appearance(true)),
                         )
                         .child(
-                            div()
-                                .id("content-save-as-submit")
-                                .flex_none()
-                                .px_2()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_color(color(colors.accent))
-                                .hover(move |style| style.bg(color(colors.surface_hover)))
-                                .child(if editor.saving.is_some() {
-                                    "Saving…"
-                                } else {
-                                    "Save"
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.submit_save_as(&pane, &file, cx);
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    }),
-                                ),
+                            bind(
+                                text_button("content-save-as-submit", "Save").primary(),
+                                |this, pane, path, _, cx| this.submit_save_as(pane, path, cx),
+                            )
+                            .key("enter")
+                            .loading(editor.saving.is_some()),
                         )
-                        .child(action(
-                            "content-save-as-cancel",
-                            "Cancel",
-                            |this, pane, path, window, cx| {
-                                this.close_save_as(pane, path, window, cx)
-                            },
-                        )),
+                        .child(
+                            bind(
+                                text_button("content-save-as-cancel", "Cancel"),
+                                |this, pane, path, window, cx| {
+                                    this.close_save_as(pane, path, window, cx)
+                                },
+                            )
+                            .key("escape"),
+                        ),
                 )
                 .when_some(field.error.clone(), |row, error| {
                     row.child(div().text_color(color(colors.error)).child(error))
@@ -3617,24 +3536,17 @@ impl CompiApp {
             .border_b_1()
             .border_color(color(colors.error))
             .text_size(px(UI_SMALL_TEXT_SIZE))
-            .text_color(color(colors.error))
+            .text_color(color(ui_text_color(colors.error, colors.background)))
             .child(div().flex_1().min_w_0().child(notice.to_owned()))
             .child(
-                div()
-                    .id("content-notice-dismiss")
-                    .flex_none()
-                    .cursor_pointer()
-                    .child("×")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            if let Some(ui) = this.content.panes.get_mut(&dismiss_pane) {
-                                ui.notice = None;
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
+                icon_button("content-notice-dismiss", IconName::X, "Dismiss")
+                    .header()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(ui) = this.content.panes.get_mut(&dismiss_pane) {
+                            ui.notice = None;
+                        }
+                        cx.notify();
+                    })),
             )
     }
 
@@ -3693,16 +3605,16 @@ impl CompiApp {
                             .child(path.to_owned()),
                     )
                     .child(
-                        div()
-                            .id("content-file-copy-path")
-                            .mt_1()
-                            .cursor_pointer()
-                            .text_color(color(colors.accent))
-                            .child("Copy path")
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
-                                cx.stop_propagation();
-                            }),
+                        div().mt_1().flex().child(
+                            text_button("content-file-copy-path", "Copy path")
+                                .icon(IconName::Copy)
+                                .header()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copied.clone(),
+                                    ));
+                                }),
+                        ),
                     )
                     .into_any_element()
             }
@@ -3714,7 +3626,11 @@ impl CompiApp {
                     .gap_1()
                     .text_size(px(UI_SMALL_TEXT_SIZE))
                     .child(format!("Cannot open {}", file_name(path)))
-                    .child(div().text_color(color(colors.error)).child(error.clone()))
+                    .child(
+                        div()
+                            .text_color(color(ui_text_color(colors.error, colors.background)))
+                            .child(error.clone()),
+                    )
                     .child(
                         div()
                             .text_size(px(UI_MICRO_TEXT_SIZE))
@@ -3722,20 +3638,14 @@ impl CompiApp {
                             .child(path.to_owned()),
                     )
                     .child(
-                        div()
-                            .id("content-file-retry")
-                            .mt_1()
-                            .cursor_pointer()
-                            .text_color(color(colors.accent))
-                            .child("Try again")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
+                        div().mt_1().flex().child(
+                            text_button("content-file-retry", "Try again")
+                                .header()
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.retry_content_file(&retry_pane, &retry_path);
-                                    cx.stop_propagation();
                                     cx.notify();
-                                }),
-                            ),
+                                })),
+                        ),
                     )
                     .into_any_element()
             }
@@ -3805,12 +3715,7 @@ mod tests {
             content: PaneContent {
                 environment: wsl.clone(),
                 root: root.into(),
-                tabs: files
-                    .iter()
-                    .map(|file| ContentTab::File {
-                        path: (*file).into(),
-                    })
-                    .collect(),
+                tabs: files.iter().map(|file| ContentTab::edit(*file)).collect(),
                 active: None,
             },
         };

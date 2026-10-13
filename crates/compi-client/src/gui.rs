@@ -17,6 +17,7 @@ use compi_protocol::{
     WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
 mod brand;
+mod controls;
 mod lifecycle;
 use lifecycle::PaneError;
 mod workspace;
@@ -141,7 +142,8 @@ fn run_application(
     // Before any window claims (and so writes) its state slot.
     crate::release_notes::initialize();
     let empty_measurement = perf::empty_window_enabled();
-    gpui_platform::application().run(move |cx: &mut App| {
+    let application = gpui_platform::application().with_assets(controls::Assets);
+    application.run(move |cx: &mut App| {
         let mut config = config;
         if !empty_measurement {
             gpui_component::init(cx);
@@ -865,6 +867,10 @@ struct CompiApp {
     focused_view: Option<u64>,
     file_tree: Option<workspace::tree::FileTree>,
     tree_scroll: ScrollHandle,
+    /// A branch switch or create the daemon has not answered yet.
+    branch_write: Option<workspace::branches::BranchWrite>,
+    /// Fetch, Pull and Push: one waiting for its terminal, and the terminal typed into last.
+    remote: workspace::remote::RemoteState,
     tab_scroll_handle: ScrollHandle,
     workspace_scroll: ScrollHandle,
     sidebar_scroll: ScrollHandle,
@@ -1447,41 +1453,6 @@ impl CompiApp {
             self.save_state();
             cx.notify();
         }
-    }
-}
-
-struct HeaderTooltip {
-    title: String,
-    reason: Option<String>,
-    colors: ThemeColors,
-}
-
-impl Render for HeaderTooltip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(self.colors.border))
-            .bg(color(self.colors.surface))
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(color(modal_text_color(
-                self.colors.foreground,
-                &self.colors,
-            )))
-            .child(self.title.clone())
-            .when_some(self.reason.clone(), |tooltip, reason| {
-                tooltip.child(
-                    div()
-                        .text_color(color(modal_text_color(self.colors.muted, &self.colors)))
-                        .child(reason),
-                )
-            })
     }
 }
 

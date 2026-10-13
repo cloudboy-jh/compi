@@ -1002,6 +1002,17 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
                     }
                 }
+                ClientMessage::ReadGitBranches { environment, repo } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| crate::git::read_branches(&environment, &repo))
+                    {
+                        Ok(listing) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::GitBranchesRead { listing },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::GitWrite {
                     environment,
                     repo,

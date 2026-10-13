@@ -162,7 +162,9 @@ fn valid_path(path: &str) -> bool {
     path.starts_with('/') && path.len() <= MAX_PATH_BYTES && !path.chars().any(char::is_control)
 }
 
-fn fuzzy_score(path: &[u8], query: &[u8]) -> Option<i32> {
+/// How well `query` (not empty) matches `path` as an ordered subsequence, ignoring ASCII
+/// case: higher for matches at word starts and in runs; `None` when it does not match.
+pub(crate) fn fuzzy_score(path: &[u8], query: &[u8]) -> Option<i32> {
     let mut matched = 0;
     let mut previous_match = None;
     let mut score = 0;

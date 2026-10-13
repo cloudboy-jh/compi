@@ -89,7 +89,7 @@ pub(super) fn run(
                     _ => resolve_path(None, &format!("{path}/.."), windows)?,
                 };
                 let show = Show::Tab {
-                    tab: ContentTab::File { path: path.clone() },
+                    tab: ContentTab::edit(path.clone()),
                     file: path,
                     within: None,
                     root,
@@ -189,11 +189,20 @@ pub(super) fn place(
                     content.root = folder.clone();
                 }
             }
-            Show::Tab { tab, .. } => {
-                if !content.tabs.contains(tab) {
-                    content.tabs.push(tab.clone());
-                }
-                content.active = Some(tab.clone());
+            Show::Tab { tab, file, .. } => {
+                // The file's one tab takes the mode asked for, keeping its place and path.
+                let tab = match open_tab(&content, file, windows) {
+                    Some(index) => {
+                        let shown = content.tabs[index].with_diff(tab.diff_scope());
+                        content.tabs[index] = shown.clone();
+                        shown
+                    }
+                    None => {
+                        content.tabs.push(tab.clone());
+                        tab.clone()
+                    }
+                };
+                content.active = Some(tab);
             }
         }
         content.validate().map_err(CliError::usage)?;
@@ -374,16 +383,14 @@ fn reusable(
         let root = resolve_path(None, &content.root, windows).ok();
         let rank = match show {
             Show::Folder(folder) => (root.as_ref() == Some(folder)).then_some((true, 0)),
-            Show::Tab {
-                tab, file, within, ..
-            } => root
+            Show::Tab { file, within, .. } => root
                 .filter(|root| contains(root, file, windows))
                 .filter(|root| {
                     within
                         .as_ref()
                         .is_none_or(|within| within == root || contains(within, root, windows))
                 })
-                .map(|root| (content.tabs.contains(tab), root.len())),
+                .map(|root| (open_tab(&content, file, windows).is_some(), root.len())),
         };
         if let Some(rank) = rank
             && best.as_ref().is_none_or(|(current, ..)| rank > *current)
@@ -392,6 +399,14 @@ fn reusable(
         }
     }
     best.map(|(_, pane_id, content)| (pane_id, content))
+}
+
+/// Where normalised `file` is open among `content`'s tabs, in either mode.
+fn open_tab(content: &PaneContent, file: &str, windows: bool) -> Option<usize> {
+    content
+        .tabs
+        .iter()
+        .position(|tab| resolve_path(None, tab.path(), windows).ok().as_deref() == Some(file))
 }
 
 /// Whether normalised `path` lies below normalised folder `root`.
@@ -500,12 +515,7 @@ mod tests {
                         }
                     }),
                     root: root.into(),
-                    tabs: files
-                        .iter()
-                        .map(|file| ContentTab::File {
-                            path: (*file).to_owned(),
-                        })
-                        .collect(),
+                    tabs: files.iter().map(|file| ContentTab::edit(*file)).collect(),
                     active: None,
                 },
             }
@@ -543,17 +553,16 @@ mod tests {
             .map(|(pane, _)| pane.as_str().to_owned())
         };
         let file = |path: &str| Show::Tab {
-            tab: ContentTab::File { path: path.into() },
+            tab: ContentTab::edit(path),
             file: path.into(),
             within: None,
             root: "/".into(),
         };
         let diff = |path: &str| Show::Tab {
-            tab: ContentTab::Diff {
-                repo: "/home/me/proj".into(),
-                path: path.into(),
-                scope: compi_protocol::GitScope::Unstaged,
-            },
+            tab: ContentTab::diff(
+                format!("/home/me/proj/{path}"),
+                compi_protocol::GitScope::Unstaged,
+            ),
             file: format!("/home/me/proj/{path}"),
             within: Some("/home/me/proj".into()),
             root: "/home/me/proj".into(),

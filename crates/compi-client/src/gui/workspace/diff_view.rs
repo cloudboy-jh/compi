@@ -10,6 +10,7 @@ use super::*;
 use crate::diff::{
     self, DiffLine, Expand, FileDiff, Hunk, Layout, LineKind, Match, Row, Side, Whitespace,
 };
+use crate::gui::controls::{self, IconName, icon_button, text_button};
 use base64::Engine as _;
 use compi_protocol::{GitFileContent, GitImageFormat};
 use gpui::{
@@ -82,6 +83,13 @@ impl HunkButton {
         match self {
             HunkButton::Stage => "Stage hunk",
             HunkButton::Unstage => "Unstage hunk",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            HunkButton::Stage => "Adds this hunk to the index",
+            HunkButton::Unstage => "Takes this hunk out of the index",
         }
     }
 }
@@ -208,6 +216,8 @@ struct Find {
     current: Option<usize>,
     /// Focus to return to when find closes.
     return_focus: Option<FocusHandle>,
+    /// The find bar: Tab moves between its field and buttons inside it.
+    bar: FocusHandle,
 }
 
 pub(super) struct DiffView {
@@ -235,8 +245,15 @@ pub(super) struct DiffView {
     /// A line (0-based) asked for before it could be scrolled to: before the first build
     /// landed or the view was sized.
     reveal: Option<(Side, u32)>,
-    /// The button each hunk shows; `None` shows none.
+    /// The button a hunk shows while it is under the pointer or current; `None` shows none.
     hunk_button: Option<HunkButton>,
+    /// The hunk (index in the diff) whose write is in flight: its button shows a spinner.
+    pending_hunk: Option<usize>,
+    /// The row under the pointer: its hunk shows its button.
+    hovered_row: Option<usize>,
+    /// The hunk (index in the diff) `n`/`p` moved to: it shows its button, and Shift+S or
+    /// Shift+U (the button's direction) clicks it.
+    current_hunk: Option<usize>,
 }
 
 impl EventEmitter<HunkClicked> for DiffView {}
@@ -276,6 +293,9 @@ impl DiffView {
             find: None,
             reveal: None,
             hunk_button: None,
+            pending_hunk: None,
+            hovered_row: None,
+            current_hunk: None,
         };
         view.start_build(cx);
         view
@@ -328,7 +348,7 @@ impl DiffView {
         cx.notify();
     }
 
-    /// The button every hunk shows; cheap when unchanged.
+    /// The button a hunk under the pointer or current shows; cheap when unchanged.
     pub(super) fn set_hunk_button(&mut self, button: Option<HunkButton>, cx: &mut Context<Self>) {
         if self.hunk_button != button {
             self.hunk_button = button;
@@ -346,11 +366,52 @@ impl DiffView {
             return;
         }
         if let Some(hunk) = text.diff.hunks().get(index).cloned() {
-            cx.emit(HunkClicked {
-                diff: text.diff.clone(),
-                hunk,
-            });
+            let diff = text.diff.clone();
+            self.pending_hunk = Some(index);
+            cx.emit(HunkClicked { diff, hunk });
+            cx.notify();
         }
+    }
+
+    /// The write a hunk's button started has answered: its button acts again.
+    pub(super) fn finish_hunk_write(&mut self, cx: &mut Context<Self>) {
+        if self.pending_hunk.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The pointer entered (`hovered`) or left row `ix`; the hunk under it shows its button.
+    fn hover_row(&mut self, ix: usize, hovered: bool, cx: &mut Context<Self>) {
+        let row = if hovered {
+            Some(ix)
+        } else if self.hovered_row == Some(ix) {
+            None
+        } else {
+            return;
+        };
+        if self.hovered_row != row {
+            let before = self.hunk_at_row(self.hovered_row);
+            self.hovered_row = row;
+            if self.hunk_at_row(row) != before {
+                cx.notify();
+            }
+        }
+    }
+
+    /// The hunk (index in the diff) row `row` belongs to: from a hunk's first row to the next
+    /// hunk or fold.
+    fn hunk_at_row(&self, row: Option<usize>) -> Option<usize> {
+        let (Body::Text(text), Some(row)) = (&self.body, row) else {
+            return None;
+        };
+        let at = text.hunks.partition_point(|&(start, _)| start <= row);
+        let &(start, index) = text.hunks.get(at.checked_sub(1)?)?;
+        let folded = text
+            .rows
+            .get(start..=row)?
+            .iter()
+            .any(|row| matches!(row, Row::Fold { .. }));
+        (!folded).then_some(index)
     }
 
     /// The first build has landed: there is something to draw.
@@ -478,6 +539,18 @@ impl DiffView {
         match (key, modifiers.shift) {
             ("n", false) => self.step_hunk(true),
             ("p", false) => self.step_hunk(false),
+            // The current hunk's button: Shift+S stages it, Shift+U unstages it.
+            ("s", true) | ("u", true) => {
+                let wanted = if key == "s" {
+                    HunkButton::Stage
+                } else {
+                    HunkButton::Unstage
+                };
+                match self.current_hunk {
+                    Some(index) if self.hunk_button == Some(wanted) => self.click_hunk(index, cx),
+                    _ => return false,
+                }
+            }
             ("e", false) => {
                 let all = !self.context.is_all();
                 self.set_context_expanded(all, cx);
@@ -515,6 +588,7 @@ impl DiffView {
                     by_line: Rc::default(),
                     current: None,
                     return_focus: None,
+                    bar: cx.focus_handle(),
                 })
             }
         };
@@ -535,22 +609,29 @@ impl DiffView {
             .is_some_and(|find| find.input.read(cx).focus_handle(cx).is_focused(window))
     }
 
-    /// Enter, Shift+Enter and Escape while find is open.
+    /// Enter, Shift+Enter and Escape while find is open, and Tab/Shift+Tab inside the find
+    /// bar. Plain Enter on one of the bar's buttons is the button's: it clicks it.
     fn find_key(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.find.is_none() {
+        let Some(find) = &self.find else {
             return false;
-        }
+        };
         let modifiers = &event.keystroke.modifiers;
         if modifiers.control || modifiers.alt || modifiers.platform {
             return false;
         }
+        let bar = find.bar.clone();
+        let in_bar = bar.contains_focused(window, cx);
+        let on_button = in_bar && !find.input.read(cx).focus_handle(cx).is_focused(window);
         match event.keystroke.key.as_str() {
-            "enter" => self.step_match(!modifiers.shift, cx),
+            "tab" if in_bar => {
+                controls::cycle_focus(&bar, !modifiers.shift, window, cx);
+            }
+            "enter" if modifiers.shift || !on_button => self.step_match(!modifiers.shift, cx),
             "escape" => self.close_find(window, cx),
             _ => return false,
         }
@@ -678,19 +759,21 @@ impl DiffView {
         row >= top && row + 1 < top + visible
     }
 
-    /// n / p: the next or previous hunk, a third of the way down the view.
+    /// n / p: the next or previous hunk, a third of the way down the view; it becomes the
+    /// current hunk.
     fn step_hunk(&mut self, forward: bool) {
         let Body::Text(text) = &self.body else {
             return;
         };
-        let reference = self.list.logical_scroll_top().item_ix + self.rows_above(1.0 / 3.0);
-        let mut starts = text.hunks.iter().map(|&(start, _)| start);
-        let target = if forward {
-            starts.find(|&start| start > reference)
-        } else {
-            starts.rev().find(|&start| start < reference)
-        };
-        if let Some(start) = target {
+        let current = self
+            .current_hunk
+            .and_then(|current| text.hunks.iter().find(|&&(_, index)| index == current))
+            .map(|&(start, _)| start)
+            .filter(|&start| self.row_in_view(start));
+        let top = self.list.logical_scroll_top().item_ix;
+        let reference = top + self.rows_above(1.0 / 3.0);
+        if let Some((start, index)) = next_hunk(&text.hunks, current, top, reference, forward) {
+            self.current_hunk = Some(index);
             self.scroll_row_to(start, 1.0 / 3.0);
         }
     }
@@ -744,6 +827,10 @@ impl DiffView {
             return;
         }
         self.build = None;
+        // The hunks on screen change: a spinner would no longer mark the hunk it started on,
+        // nor the current hunk the one `n`/`p` reached.
+        self.pending_hunk = None;
+        self.current_hunk = None;
         let anchor = self.anchor();
         let body = match built {
             Built::Text {
@@ -830,6 +917,8 @@ impl DiffView {
     /// Rows for the current diff, context and layout, scrolled back to `anchor`.
     fn rebuild_rows(&mut self, anchor: Option<Anchor>) {
         let line_height = self.line_height();
+        // Rows move: the pointer's row is known again once it moves.
+        self.hovered_row = None;
         let Body::Text(text) = &mut self.body else {
             return;
         };
@@ -1373,7 +1462,12 @@ struct Frame {
     hunks: Rc<Vec<(usize, usize)>>,
     /// The button hunks show, and whether it acts (the whitespace mode is exact).
     hunk_button: Option<(HunkButton, bool)>,
-    colors: ThemeColors,
+    /// The hunk whose write is in flight.
+    pending_hunk: Option<usize>,
+    /// The hunks whose button shows: the one under the pointer and the current one.
+    shown_hunks: [Option<usize>; 2],
+    /// The current hunk, whose button takes Shift+S or Shift+U.
+    current_hunk: Option<usize>,
 }
 
 struct FrameFind {
@@ -1405,74 +1499,90 @@ impl Frame {
     }
 }
 
-fn render_row(frame: &Frame, ix: usize) -> AnyElement {
-    let row = render_line_row(frame, ix);
-    let hunk = frame.hunk_button.and_then(|button| {
-        let at = frame
-            .hunks
-            .binary_search_by_key(&ix, |&(start, _)| start)
-            .ok()?;
-        Some((button, frame.hunks[at].1))
-    });
-    match hunk {
-        Some(((button, enabled), index)) => div()
-            .relative()
-            .w_full()
-            .child(row)
-            .child(hunk_button(frame, button, enabled, index))
-            .into_any_element(),
-        None => row,
+/// The hunk n (`forward`) or p moves to, from `hunks` (first row, index): next to the
+/// current hunk's first row `current` while it is in view; else forward the first hunk at
+/// or below the view's `top` row, back the last one above `reference` (a third of the way
+/// down the view), so the hunks of a diff that fits the view are all reachable.
+fn next_hunk(
+    hunks: &[(usize, usize)],
+    current: Option<usize>,
+    top: usize,
+    reference: usize,
+    forward: bool,
+) -> Option<(usize, usize)> {
+    let mut starts = hunks.iter().copied();
+    match (current, forward) {
+        (Some(from), true) => starts.find(|&(start, _)| start > from),
+        (Some(from), false) => starts.rev().find(|&(start, _)| start < from),
+        (None, true) => starts.find(|&(start, _)| start >= top),
+        (None, false) => starts.rev().find(|&(start, _)| start < reference),
     }
 }
 
-/// The compact Stage hunk / Unstage hunk button at the right end of a hunk's first row.
-/// Under an ignore mode it stays visible but does nothing, and its tooltip says why.
-fn hunk_button(frame: &Frame, button: HunkButton, enabled: bool, index: usize) -> AnyElement {
-    let palette = frame.palette;
-    let colors = frame.colors;
+/// A list row, telling the view when the pointer enters or leaves it.
+fn render_row(frame: &Frame, ix: usize) -> AnyElement {
     let view = frame.view.clone();
-    let label = button.label();
     div()
-        .id(("diff-hunk-button", index))
-        .absolute()
-        .top_0()
-        .right(px(frame.cell * 2.0))
-        .h(px(frame.line))
-        .px(px(6.0))
-        .flex()
-        .items_center()
-        .rounded_sm()
-        .border_1()
-        .border_color(palette.border)
-        .bg(palette.surface)
-        .text_size(px(UI_MICRO_TEXT_SIZE))
-        .text_color(palette.foreground)
-        .child(label)
-        .when(enabled, |this| {
-            this.cursor_pointer()
-                .hover(move |style| style.bg(palette.hover))
-                .on_click(move |_: &ClickEvent, _, cx: &mut App| {
-                    cx.stop_propagation();
-                    view.update(cx, |this, cx| this.click_hunk(index, cx)).ok();
-                })
+        .id(("diff-row", ix))
+        .w_full()
+        .on_hover(move |hovered, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| this.hover_row(ix, *hovered, cx))
+                .ok();
         })
-        .when(!enabled, |this| {
-            this.opacity(0.5).tooltip(move |_, cx| {
-                cx.new(|_| HeaderTooltip {
-                    title: format!("{label} needs Exact whitespace"),
-                    reason: Some(
-                        "This diff ignores some whitespace, so the hunk would carry changes it does not show"
-                            .into(),
-                    ),
-                    colors,
-                })
-                .into()
-            })
-        })
+        .child(render_line_row(frame, ix, hunk_slot(frame, ix)))
         .into_any_element()
 }
 
-fn render_line_row(frame: &Frame, ix: usize) -> AnyElement {
+/// The Stage hunk / Unstage hunk button's place at the right end of a hunk's first row,
+/// beside the text so it never covers it. The place is kept on every hunk's first row so
+/// nothing reflows; the button shows only for the hunk under the pointer, the current hunk
+/// and a hunk whose write is in flight. Under an ignore mode it is disabled and its
+/// tooltip says why.
+fn hunk_slot(frame: &Frame, ix: usize) -> Option<AnyElement> {
+    let (button, enabled) = frame.hunk_button?;
+    let at = frame
+        .hunks
+        .binary_search_by_key(&ix, |&(start, _)| start)
+        .ok()?;
+    let index = frame.hunks[at].1;
+    let pending = frame.pending_hunk == Some(index);
+    let shown = pending || frame.shown_hunks.contains(&Some(index));
+    let view = frame.view.clone();
+    let mut control = text_button(("hunk-button", index), button.label())
+        .tab_stop(false)
+        .loading(pending)
+        .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| this.click_hunk(index, cx)).ok();
+        });
+    if frame.current_hunk == Some(index) {
+        control = control.key(match button {
+            HunkButton::Stage => "shift-s",
+            HunkButton::Unstage => "shift-u",
+        });
+    }
+    let control = if enabled {
+        control.detail(button.detail())
+    } else {
+        control.tooltip("Needs exact whitespace").disabled_because(Some(
+            "This diff ignores some whitespace, so the hunk would carry changes it does not show",
+        ))
+    };
+    Some(
+        div()
+            .flex_none()
+            .h(px(frame.line))
+            .pl(px(frame.cell))
+            .pr(px(frame.cell))
+            .flex()
+            .items_center()
+            .when(!shown, |slot| slot.invisible())
+            .child(control)
+            .into_any_element(),
+    )
+}
+
+/// Row `ix`; `slot` (a hunk's button place) goes at the right end of its new side.
+fn render_line_row(frame: &Frame, ix: usize, slot: Option<AnyElement>) -> AnyElement {
     match &frame.rows[ix] {
         Row::Fold {
             gap,
@@ -1498,6 +1608,7 @@ fn render_line_row(frame: &Frame, ix: usize) -> AnyElement {
                 .child(number(frame, *new))
                 .child(marker(frame, line.kind))
                 .child(line_text(frame, line, None, eof))
+                .children(slot)
                 .into_any_element()
         }
         Row::Split { old, new } => {
@@ -1508,9 +1619,9 @@ fn render_line_row(frame: &Frame, ix: usize) -> AnyElement {
             div()
                 .flex()
                 .w_full()
-                .child(half(frame, old.as_ref(), mirror))
+                .child(half(frame, old.as_ref(), mirror, None))
                 .child(div().flex_none().w(px(1.0)).bg(frame.palette.border))
-                .child(half(frame, new.as_ref(), None))
+                .child(half(frame, new.as_ref(), None, slot))
                 .into_any_element()
         }
     }
@@ -1542,10 +1653,22 @@ fn line_shell(frame: &Frame, kind: LineKind) -> Div {
         })
 }
 
-/// One side of a split row; `None` is the blank side of an unpaired line.
-fn half(frame: &Frame, line: Option<&DiffLine>, mirror: Option<u32>) -> Div {
+/// One side of a split row, `slot` at its right end; `None` is the blank side of an
+/// unpaired line.
+fn half(
+    frame: &Frame,
+    line: Option<&DiffLine>,
+    mirror: Option<u32>,
+    slot: Option<AnyElement>,
+) -> Div {
     let Some(line) = line else {
-        return div().flex_1().min_w_0().bg(frame.palette.shade);
+        return div()
+            .flex_1()
+            .min_w_0()
+            .bg(frame.palette.shade)
+            .flex()
+            .justify_end()
+            .children(slot);
     };
     line_shell(frame, line.kind)
         .flex_1()
@@ -1557,6 +1680,7 @@ fn half(frame: &Frame, line: Option<&DiffLine>, mirror: Option<u32>) -> Div {
             mirror,
             frame.eof_at(line.side, line.ix),
         ))
+        .children(slot)
 }
 
 fn number(frame: &Frame, line: Option<u32>) -> Div {
@@ -1754,9 +1878,10 @@ fn paint_line(layout: &TextLayout, paint: &LinePaint, window: &mut Window) {
     }
 }
 
-/// `⋯ N unchanged lines` and the enclosing function, with a hairline to the right edge. A click
-/// reveals EXPAND_STEP lines toward the hunk below (or above, at the end of the file); on hover
-/// arrows pick the direction and `all` (or Alt/Shift+click) reveals the whole gap.
+/// `N unchanged lines` after an ellipsis and the enclosing function, with a hairline to the
+/// right edge. A click reveals EXPAND_STEP lines toward the hunk below (or above, at the end
+/// of the file); on hover chevrons pick the direction and Show all (or Alt/Shift+click)
+/// reveals the whole gap.
 fn fold_row(
     frame: &Frame,
     gap: usize,
@@ -1783,24 +1908,36 @@ fn fold_row(
                 .ok();
         }
     };
-    let button = |id: &'static str, label: &'static str, direction: Expand| {
+    // Hidden until the row is hovered; hovering a button hovers its row, so it stays.
+    let on_hover = |control: controls::Control| {
         div()
-            .id((id, gap))
             .flex_none()
-            .px(px(4.0))
-            .rounded_sm()
             .opacity(0.0)
             .group_hover(group.clone(), |style| style.opacity(1.0))
-            .hover(move |style| style.bg(palette.hover).text_color(palette.foreground))
-            .child(label)
-            .on_click(click(direction))
+            .child(control.tab_stop(false))
     };
     let mut arrows = Vec::new();
     if partial && down {
-        arrows.push(button("diff-fold-down", "↓", Expand::Down));
+        arrows.push(on_hover(
+            icon_button(
+                ("fold-down", gap),
+                IconName::ChevronDown,
+                format!("Show {EXPAND_STEP} more lines below"),
+            )
+            .detail("After the hunk above. Alt+click shows all lines.")
+            .on_click(click(Expand::Down)),
+        ));
     }
     if partial && up {
-        arrows.push(button("diff-fold-up", "↑", Expand::Up));
+        arrows.push(on_hover(
+            icon_button(
+                ("fold-up", gap),
+                IconName::ChevronUp,
+                format!("Show {EXPAND_STEP} more lines above"),
+            )
+            .detail("Before the hunk below. Alt+click shows all lines.")
+            .on_click(click(Expand::Up)),
+        ));
     }
     let default = match (partial, up) {
         (false, _) => Expand::All,
@@ -1821,9 +1958,10 @@ fn fold_row(
         .child(
             div()
                 .flex_none()
-                .w(px(frame.gutter))
+                .min_w(px(frame.gutter))
                 .pr(px(frame.cell * 0.5))
                 .flex()
+                .items_center()
                 .justify_end()
                 .gap(px(2.0))
                 .children(arrows),
@@ -1831,8 +1969,12 @@ fn fold_row(
         .child(
             div()
                 .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
                 .whitespace_nowrap()
-                .child(format!("⋯ {hidden} unchanged lines")),
+                .child(controls::glyph(IconName::Ellipsis, palette.muted))
+                .child(format!("{hidden} unchanged lines")),
         )
         .when_some(function, |row, function| {
             row.child(
@@ -1855,7 +1997,15 @@ fn fold_row(
                 .bg(palette.border),
         )
         .when(partial, |row| {
-            row.child(button("diff-fold-all", "all", Expand::All).mr(px(frame.cell)))
+            row.child(
+                on_hover(
+                    text_button(("fold-all", gap), "Show all")
+                        .ghost()
+                        .detail(format!("Shows all {hidden} unchanged lines"))
+                        .on_click(click(Expand::All)),
+                )
+                .mr(px(frame.cell)),
+            )
         })
         .into_any_element()
 }
@@ -1932,7 +2082,9 @@ impl DiffView {
             hunk_button: self
                 .hunk_button
                 .map(|button| (button, self.settings.whitespace == Whitespace::Exact)),
-            colors: style.colors,
+            pending_hunk: self.pending_hunk,
+            shown_hunks: [self.hunk_at_row(self.hovered_row), self.current_hunk],
+            current_hunk: self.current_hunk,
         });
         div()
             .relative()
@@ -1996,22 +2148,15 @@ impl DiffView {
             Some(current) => format!("{}/{}", current + 1, find.matches.len()),
             None => "No results".to_owned(),
         };
-        let button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .flex_none()
-                .w(px(20.0))
-                .h(px(20.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_sm()
-                .cursor_pointer()
-                .text_color(palette.muted)
-                .hover(move |style| style.bg(palette.hover).text_color(palette.foreground))
-                .child(label)
+        let step_blocked = if find.query.is_empty() {
+            Some("Type text to find")
+        } else if find.matches.is_empty() {
+            Some("No matches")
+        } else {
+            None
         };
         div()
+            .track_focus(&find.bar)
             .absolute()
             .top(px(6.0))
             .right(px(18.0))
@@ -2021,12 +2166,13 @@ impl DiffView {
             .pl_2()
             .pr_1()
             .py(px(2.0))
-            .rounded_md()
+            .rounded(px(controls::CONTROL_RADIUS))
             .border_1()
             .border_color(palette.border)
             .bg(palette.surface)
             .shadow_md()
             .text_size(px(UI_SMALL_TEXT_SIZE))
+            // Also keeps a press on the bar itself from taking the focus from the field.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.find_key(event, window, cx) {
@@ -2051,17 +2197,26 @@ impl DiffView {
                     .child(count),
             )
             .child(
-                button("diff-find-previous", "↑").on_click(
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.step_match(false, cx)),
-                ),
+                icon_button("diff-find-previous", IconName::ChevronUp, "Previous match")
+                    .key("shift-enter")
+                    .disabled_because(step_blocked)
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.step_match(false, cx)),
+                    ),
             )
             .child(
-                button("diff-find-next", "↓")
+                icon_button("diff-find-next", IconName::ChevronDown, "Next match")
+                    .key("enter")
+                    .disabled_because(step_blocked)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.step_match(true, cx))),
             )
-            .child(button("diff-find-close", "×").on_click(
-                cx.listener(|this, _: &ClickEvent, window, cx| this.close_find(window, cx)),
-            ))
+            .child(
+                icon_button("diff-find-close", IconName::X, "Close")
+                    .key("escape")
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| this.close_find(window, cx)),
+                    ),
+            )
             .into_any_element()
     }
 }
@@ -2242,6 +2397,21 @@ mod tests {
             decide_layout(LayoutMode::Unified, Some(5000.0), Some(8.0)),
             Layout::Unified
         );
+    }
+
+    #[test]
+    fn hunk_steps_follow_the_current_hunk_else_the_view() {
+        let hunks = [(2, 0), (10, 1), (40, 2)];
+        // Nothing current, the whole diff in view: n starts at the first hunk.
+        assert_eq!(next_hunk(&hunks, None, 0, 12, true), Some((2, 0)));
+        assert_eq!(next_hunk(&hunks, Some(2), 0, 12, true), Some((10, 1)));
+        assert_eq!(next_hunk(&hunks, Some(10), 0, 12, true), Some((40, 2)));
+        assert_eq!(next_hunk(&hunks, Some(40), 30, 42, true), None);
+        assert_eq!(next_hunk(&hunks, Some(40), 30, 42, false), Some((10, 1)));
+        assert_eq!(next_hunk(&hunks, Some(2), 0, 12, false), None);
+        // Scrolled away from the current hunk: from the view.
+        assert_eq!(next_hunk(&hunks, None, 5, 17, true), Some((10, 1)));
+        assert_eq!(next_hunk(&hunks, None, 5, 17, false), Some((10, 1)));
     }
 
     #[test]

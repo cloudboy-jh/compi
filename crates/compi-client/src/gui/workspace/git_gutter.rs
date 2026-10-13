@@ -15,6 +15,7 @@ use super::content::{CHECK_INTERVAL, HIGHLIGHT_LIMIT, find_content, reveal_in_ed
 use super::*;
 use crate::content_path::repo_relative;
 use crate::diff::{FileDiff, Hunk, Whitespace};
+use crate::gui::controls::{self, ChipTone, text_button};
 use compi_protocol::{GitChangeKind, GitChanges, GitFileContent, GitRevision, GitScope};
 use gpui::{
     ContentMask, CursorStyle, DispatchPhase, HitboxBehavior, MouseDownEvent, MouseMoveEvent,
@@ -557,16 +558,8 @@ impl CompiApp {
         path: &str,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let colors = *self.colors();
         let editor = self.content.panes.get(pane_id)?.editor(path)?;
         let gutter = &editor.gutter;
-        let label = div()
-            .flex_none()
-            .px_1()
-            .flex()
-            .items_center()
-            .whitespace_nowrap()
-            .text_size(px(UI_MICRO_TEXT_SIZE));
         Some(match gutter.baseline? {
             Baseline::Index => {
                 let (pane, rel, state) = (
@@ -574,51 +567,30 @@ impl CompiApp {
                     gutter.rel_path.clone()?,
                     editor.state.clone(),
                 );
-                label
-                    .id("content-file-baseline")
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_color(color(colors.muted))
-                    .hover(move |style| {
-                        style
-                            .bg(color(colors.surface_hover))
-                            .text_color(color(colors.foreground))
-                    })
-                    .child("vs index")
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| HeaderTooltip {
-                            title: "Compared with the Git index".into(),
-                            reason: Some("Opens the file's diff".into()),
-                            colors,
-                        })
-                        .into()
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            let line = state.read(cx).cursor_position().line + 1;
-                            this.open_diff(
-                                &pane,
-                                rel.clone(),
-                                Some(GitScope::Unstaged),
-                                Some(line),
-                                window,
-                                cx,
-                            );
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    )
+                text_button("gutter-baseline", "vs index")
+                    .ghost()
+                    .tooltip("Compared with the Git index")
+                    .detail("Opens the file's diff")
+                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                        let line = state.read(cx).cursor_position().line + 1;
+                        this.open_diff(
+                            &pane,
+                            rel.clone(),
+                            Some(GitScope::Unstaged),
+                            Some(line),
+                            window,
+                            cx,
+                        );
+                        cx.notify();
+                    }))
                     .into_any_element()
             }
-            Baseline::Untracked => label
-                .text_color(color(colors.muted))
-                .child("untracked")
-                .into_any_element(),
-            Baseline::Conflicted => label
-                .text_color(color(colors.error))
-                .child("conflicted")
-                .into_any_element(),
+            Baseline::Untracked => {
+                controls::chip("untracked", ChipTone::Neutral).into_any_element()
+            }
+            Baseline::Conflicted => {
+                controls::chip("conflicted", ChipTone::Danger).into_any_element()
+            }
         })
     }
 
@@ -930,6 +902,7 @@ mod tests {
                 ),
             ],
             truncated: false,
+            ..Default::default()
         };
         let index = |key: &str| Status::Index { key: key.into() };
         // A second save of a modified file keeps its index key.
