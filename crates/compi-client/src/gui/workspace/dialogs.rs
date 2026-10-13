@@ -955,8 +955,6 @@ impl CompiApp {
             self.render_image_inspector(cx)
         } else if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
             self.render_theme_catalog(window, cx)
-        } else if matches!(self.overlay, Some(Overlay::Settings)) {
-            self.render_settings_overlay(window, cx)
         } else if matches!(
             self.overlay,
             Some(Overlay::Confirm { .. } | Overlay::ConfirmDaemonRestart { .. })

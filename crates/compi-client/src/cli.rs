@@ -1101,8 +1101,8 @@ fn pane_surface<'a>(
 }
 
 /// One `pane list`/`pane show` entry. Terminals report their surface, fresh runtime
-/// metadata and program status; content panes have no process and report the folder
-/// and files they show.
+/// metadata and program status; content panes have no process and report what they
+/// show: files or Settings.
 fn pane_row(
     client: &mut DaemonClient,
     state: &WorkspaceSnapshot,
@@ -1125,11 +1125,20 @@ fn pane_row(
                 .to_vec();
             json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Terminal,"surface":surface,"metadata":client.surface_metadata(surface)?,"program_status":program_status})
         }
-        LayoutNode::Content { pane_id, content } => {
-            json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Content,"content":content})
-        }
+        LayoutNode::Content { pane_id, content } => content_row(session, tab, pane_id, content),
         LayoutNode::Split { .. } => unreachable!("pane rows are built only for leaf nodes"),
     })
+}
+
+/// A content pane's `pane list`/`pane show` entry.
+fn content_row(
+    session: &WorkspaceSession,
+    tab: &WorkspaceTab,
+    pane_id: &PaneId,
+    content: &compi_protocol::PaneContent,
+) -> Value {
+    let pane_type = crate::cli_window::PaneType::of_content(content);
+    json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":pane_type,"content":content})
 }
 
 fn presentation(
@@ -1994,5 +2003,55 @@ mod tests {
             vec![pane("term", PaneType::Terminal, &["/src/t.rs"])],
         )];
         assert!(unsaved_files(&closing, &terminal).is_empty());
+    }
+
+    #[test]
+    fn content_rows_report_files_and_settings_panes() {
+        use compi_protocol::{
+            ContentEnvironment, FolderContent, PaneContent, SessionId, SettingsContent,
+            SettingsSection, TabId,
+        };
+        let files = PaneContent::Files(FolderContent {
+            environment: ContentEnvironment::Host,
+            root: "/work".into(),
+            tabs: Vec::new(),
+            active: None,
+        });
+        let settings = PaneContent::Settings(SettingsContent {
+            section: SettingsSection::Terminal,
+        });
+        let leaf = |pane: &str, content: &PaneContent| LayoutNode::Content {
+            pane_id: PaneId::new(pane),
+            content: content.clone(),
+        };
+        let tab = WorkspaceTab {
+            id: TabId::new("tab-1"),
+            label: String::new(),
+            layout: LayoutNode::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(leaf("files", &files)),
+                second: Box::new(leaf("settings", &settings)),
+            },
+            previous_layout: None,
+            merge: None,
+        };
+        let session = WorkspaceSession {
+            id: SessionId::new("session-1"),
+            label: "Default".into(),
+            tabs: vec![tab.clone()],
+        };
+
+        let row = content_row(&session, &tab, &PaneId::new("files"), &files);
+        assert_eq!(row["type"], "content");
+        assert_eq!(row["content"]["kind"], "files");
+        assert_eq!(row["content"]["root"], "/work");
+        let row = content_row(&session, &tab, &PaneId::new("settings"), &settings);
+        assert_eq!(row["type"], "settings");
+        assert_eq!(row["pane_id"], "settings");
+        assert_eq!(
+            row["content"],
+            json!({"kind": "settings", "section": "terminal"})
+        );
     }
 }

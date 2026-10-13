@@ -898,12 +898,12 @@ mod tests {
         let m = metrics();
         let content = LayoutNode::Content {
             pane_id: "notes".into(),
-            content: compi_protocol::PaneContent {
+            content: compi_protocol::PaneContent::Files(compi_protocol::FolderContent {
                 environment: compi_protocol::ContentEnvironment::Host,
                 root: "/work".into(),
                 tabs: Vec::new(),
                 active: None,
-            },
+            }),
         };
         let tree = split(SplitAxis::Horizontal, 0.5, leaf("a"), content);
         let required = combine(

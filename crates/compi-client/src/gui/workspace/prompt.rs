@@ -3,6 +3,7 @@
 //! and apply one from a confirm popover on its row. Previews never touch the
 //! terminal theme, layout, or anything persisted; files change only through a
 //! plan the user confirmed.
+use super::settings::{RowCx, SettingsAction};
 use super::*;
 use compi_protocol::prompt::{
     MAX_PREVIEW_STYLES, PromptConfig, PromptEnvironment, PromptFileChange, PromptOperation,
@@ -23,8 +24,8 @@ pub(in crate::gui) enum PromptJob {
     Execute,
 }
 
-/// One focusable control. `prompt_actions` lists them in render order, so a
-/// control's position is its offset after the Terminal section's own controls.
+/// One focusable control. `prompt_actions` lists them in render order, which is
+/// their keyboard order within the Shell prompt row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PromptAction {
     Details,
@@ -37,6 +38,26 @@ pub(super) enum PromptAction {
     TurnOff,
     History,
     Restore(usize),
+}
+
+/// A stable element id for `action`'s control.
+fn prompt_control_id(action: PromptAction) -> usize {
+    match action {
+        PromptAction::Details => 0,
+        PromptAction::Refresh => 1,
+        PromptAction::Styles => 2,
+        PromptAction::Outside => 3,
+        PromptAction::TurnOff => 4,
+        PromptAction::History => 5,
+        PromptAction::Provider(provider) => {
+            16 + PromptProvider::ALL
+                .iter()
+                .position(|candidate| *candidate == provider)
+                .unwrap_or(0)
+        }
+        PromptAction::Distribution(index) => 1024 + index,
+        PromptAction::Restore(index) => 1_048_576 + index,
+    }
 }
 
 /// Distribution the render came from, provider, and style.
@@ -642,7 +663,7 @@ fn ansi_text(spans: &[AnsiSpan], palette: &TerminalPalette) -> StyledText {
 }
 
 impl CompiApp {
-    /// Detects the prompt environment the first time Settings → Terminal opens
+    /// Detects the prompt environment the first time the shell prompt group shows
     /// for a distribution; Refresh detects again.
     pub(super) fn enter_prompt_settings(&mut self) {
         let (distribution, cwd) = self.focused_prompt_location();
@@ -656,14 +677,25 @@ impl CompiApp {
         }
     }
 
-    /// Focuses the first control of the group and scrolls it into view.
-    pub(super) fn focus_prompt_group(&mut self) {
-        self.overlay_focus = self.prompt_focus(0);
-        self.settings_scroll_to_focus = true;
+    /// The first control of the group, for a command that opens Settings on it.
+    pub(super) fn prompt_group_stop(&self) -> Option<super::settings::Stop> {
+        self.prompt_actions()
+            .first()
+            .map(|action| super::settings::Stop::Control {
+                row: super::settings::PROMPT_ROW,
+                action: super::settings::SettingsAction::Prompt(*action),
+            })
     }
 
+    /// The terminal whose prompt the group configures: the focused one, else the one
+    /// Settings was opened from.
     fn focused_prompt_location(&self) -> (Option<String>, Option<String>) {
-        let Some(view) = self.focused_view() else {
+        let Some(view) = self.focused_view().or_else(|| {
+            let origin = self.settings.origin.as_ref()?;
+            self.surface_views
+                .iter()
+                .find(|view| &view.pane_id == origin)
+        }) else {
             return (None, None);
         };
         let surface = self
@@ -941,28 +973,15 @@ impl CompiApp {
         }
     }
 
-    fn prompt_focus(&self, index: usize) -> usize {
-        self.settings_content_focus(super::settings::PROMPT_FOCUS_OFFSET + index)
-    }
-
-    fn prompt_group_visible(&self) -> bool {
-        matches!(self.overlay, Some(Overlay::Settings))
-            && self.settings_section == SettingsSection::Terminal
-    }
-
+    /// Keeps the highlight on `action` after it ran; `false` when it no longer shows.
     fn focus_prompt_action(&mut self, action: PromptAction) -> bool {
-        if !self.prompt_group_visible() {
+        if !self.prompt_actions().contains(&action) {
             return false;
         }
-        let Some(index) = self
-            .prompt_actions()
-            .iter()
-            .position(|candidate| *candidate == action)
-        else {
+        let Some(row) = self.prompt_row_cx() else {
             return false;
         };
-        self.overlay_focus = self.prompt_focus(index);
-        self.settings_scroll_to_focus = true;
+        self.focus_settings_control(&row, SettingsAction::Prompt(action));
         true
     }
 
@@ -1295,24 +1314,20 @@ impl CompiApp {
             .into_any_element()
     }
 
-    fn prompt_index(&self, actions: &[PromptAction], action: PromptAction) -> Option<usize> {
-        actions.iter().position(|candidate| *candidate == action)
-    }
-
-    fn prompt_focused(&self, index: Option<usize>) -> bool {
-        index.is_some_and(|index| self.overlay_focus == self.prompt_focus(index))
+    /// Whether `action` has the keyboard highlight in `group`.
+    fn prompt_focused(&self, group: &RowCx, action: PromptAction) -> bool {
+        self.settings_focused(group, SettingsAction::Prompt(action))
     }
 
     fn prompt_listener(
         &self,
-        index: Option<usize>,
+        group: &RowCx,
         action: PromptAction,
         cx: &Context<Self>,
     ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let group = group.clone();
         cx.listener(move |this, _, _, cx| {
-            if let Some(index) = index {
-                this.overlay_focus = this.prompt_focus(index);
-            }
+            this.focus_settings_control(&group, SettingsAction::Prompt(action));
             this.activate_prompt_action(action);
             cx.stop_propagation();
             cx.notify();
@@ -1321,23 +1336,22 @@ impl CompiApp {
 
     fn prompt_segment(
         &self,
-        actions: &[PromptAction],
+        group: &RowCx,
         action: PromptAction,
         label: impl Into<SharedString>,
         active: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let index = self.prompt_index(actions, action);
-        let focused = self.prompt_focused(index);
+        let focused = self.prompt_focused(group, action);
         div()
             .relative()
             .flex_none()
             .child(self.settings_segment_button(
-                ("prompt-control", index.unwrap_or(usize::MAX)),
+                ("prompt-control", prompt_control_id(action)),
                 label,
                 active,
                 focused,
-                self.prompt_listener(index, action, cx),
+                self.prompt_listener(group, action, cx),
             ))
             .child(self.settings_focus_anchor(focused, cx))
             .into_any_element()
@@ -1345,22 +1359,21 @@ impl CompiApp {
 
     fn prompt_button(
         &self,
-        actions: &[PromptAction],
+        group: &RowCx,
         action: PromptAction,
         label: impl Into<SharedString>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let index = self.prompt_index(actions, action);
-        let focused = self.prompt_focused(index);
+        let focused = self.prompt_focused(group, action);
         div()
             .relative()
             .flex_none()
             .child(self.settings_action_button(
-                ("prompt-control", index.unwrap_or(usize::MAX)),
+                ("prompt-control", prompt_control_id(action)),
                 label,
                 focused,
                 false,
-                self.prompt_listener(index, action, cx),
+                self.prompt_listener(group, action, cx),
             ))
             .child(self.settings_focus_anchor(focused, cx))
             .into_any_element()
@@ -1369,22 +1382,21 @@ impl CompiApp {
     /// Turn off or a history row's Restore: a button with the confirm popover.
     fn prompt_popover_button(
         &self,
-        actions: &[PromptAction],
+        group: &RowCx,
         action: PromptAction,
         label: &'static str,
         destructive: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let index = self.prompt_index(actions, action);
-        let focused = self.prompt_focused(index);
-        let id = index.unwrap_or(usize::MAX);
+        let focused = self.prompt_focused(group, action);
+        let id = prompt_control_id(action);
         let trigger = div()
             .relative()
             .flex_none()
             .child(self.settings_popup_button(("prompt-control", id), label, focused, destructive))
             .child(self.settings_focus_anchor(focused, cx))
             .into_any_element();
-        self.prompt_popover(("prompt-popover", id), trigger, index, action, None, cx)
+        self.prompt_popover(("prompt-popover", id), trigger, group, action, None, cx)
     }
 
     /// The confirm popover on `trigger`, open while the popover's operation belongs
@@ -1395,7 +1407,7 @@ impl CompiApp {
         &self,
         id: impl Into<gpui::ElementId>,
         trigger: AnyElement,
-        index: Option<usize>,
+        group: &RowCx,
         action: PromptAction,
         row: Option<usize>,
         cx: &Context<Self>,
@@ -1405,12 +1417,11 @@ impl CompiApp {
             state.dropdown_anchor() == Some(action)
                 && (row.is_none() || state.dropdown_row() == row)
         });
+        let group = group.clone();
         let popover = controls::popover(id, trigger, dropdown.is_some())
             .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
                 if *open {
-                    if let Some(index) = index {
-                        this.overlay_focus = this.prompt_focus(index);
-                    }
+                    this.focus_settings_control(&group, SettingsAction::Prompt(action));
                     if let Some(row) = row
                         && this.prompt_action_reason(action).is_none()
                     {
@@ -1439,16 +1450,16 @@ impl CompiApp {
         }
     }
 
-    /// The "Shell prompt" group at the bottom of Settings → Terminal. Focus
-    /// offsets follow `prompt_actions`.
-    pub(super) fn render_prompt_group(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
-        let actions = self.prompt_actions();
+    /// The "Shell prompt" group: one Settings row (`group`) holding every prompt
+    /// control; its keyboard order is `prompt_actions`.
+    pub(super) fn render_prompt_group(&self, group: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let compact = group.compact;
         let state = &self.prompt_settings;
         let environment = state.environment();
         let mut header = div().min_w_0().flex().flex_wrap().items_center().gap_2();
         if environment.is_some() {
             header = header.child(self.prompt_button(
-                &actions,
+                group,
                 PromptAction::Details,
                 if state.details {
                     "Hide details"
@@ -1459,7 +1470,7 @@ impl CompiApp {
             ));
         }
         header = header.child(self.prompt_button(
-            &actions,
+            group,
             PromptAction::Refresh,
             if matches!(state.environment, Some(Err(_))) {
                 "Retry"
@@ -1475,7 +1486,7 @@ impl CompiApp {
                 "Detecting…"
             }));
         }
-        let mut group = div()
+        let mut column = div()
             .min_w_0()
             .pt_3()
             .flex()
@@ -1484,28 +1495,28 @@ impl CompiApp {
             .child(self.settings_subheading("Shell prompt"))
             .child(header);
         if let Some(Err(error)) = &state.environment {
-            group =
-                group.child(self.prompt_error(format!("Cannot inspect the shell prompt: {error}")));
+            column = column
+                .child(self.prompt_error(format!("Cannot inspect the shell prompt: {error}")));
         }
         if let Some(environment) = environment
             && state.details
         {
-            group = group.child(self.render_prompt_details(environment));
+            column = column.child(self.render_prompt_details(environment));
         }
         if state.distributions.len() > 1 {
-            group = group.child(self.render_prompt_distributions(&actions, compact, cx));
+            column = column.child(self.render_prompt_distributions(group, compact, cx));
         }
         if let Some(environment) = environment {
-            group = group.child(self.render_prompt_form(&actions, environment, compact, cx));
+            column = column.child(self.render_prompt_form(group, environment, compact, cx));
         } else if let Some(error) = &state.error {
-            group = group.child(self.prompt_error(error.clone()));
+            column = column.child(self.prompt_error(error.clone()));
         }
-        group.into_any_element()
+        column.into_any_element()
     }
 
     fn render_prompt_distributions(
         &self,
-        actions: &[PromptAction],
+        group: &RowCx,
         compact: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -1518,7 +1529,7 @@ impl CompiApp {
                 .children(self.prompt_settings.distributions.iter().enumerate().map(
                     |(index, name)| {
                         self.prompt_segment(
-                            actions,
+                            group,
                             PromptAction::Distribution(index),
                             name.clone(),
                             active.as_ref() == Some(name),
@@ -1624,7 +1635,7 @@ impl CompiApp {
 
     fn render_prompt_form(
         &self,
-        actions: &[PromptAction],
+        group: &RowCx,
         environment: &PromptEnvironment,
         compact: bool,
         cx: &Context<Self>,
@@ -1641,7 +1652,7 @@ impl CompiApp {
                 .gap_2()
                 .children(PromptProvider::ALL.map(|provider| {
                     self.prompt_segment(
-                        actions,
+                        group,
                         PromptAction::Provider(provider),
                         provider.label(),
                         state
@@ -1658,11 +1669,10 @@ impl CompiApp {
             Some(selected) if !installed(environment, selected.provider) => self.prompt_note(
                 format!("{} is not installed here.", selected.provider.label()),
             ),
-            Some(_) if !state.rows.is_empty() => self.render_prompt_styles(actions, cx),
+            Some(_) if !state.rows.is_empty() => self.render_prompt_styles(group, cx),
             Some(_) => self.prompt_note("No styles found."),
             None => self.prompt_note("Install Oh My Posh or Starship here, then Refresh."),
         });
-        let outside_index = self.prompt_index(actions, PromptAction::Outside);
         form = form.child(
             self.settings_row(
                 "Also use outside Compi",
@@ -1671,11 +1681,10 @@ impl CompiApp {
                     .when(environment.login_shell.shell.is_none(), |toggle| {
                         toggle.opacity(0.5)
                     })
-                    .child(self.prompt_toggle(
+                    .child(self.render_settings_toggle(
+                        group,
                         state.outside,
-                        PromptAction::Outside,
-                        // Never index 0: a missing index must not claim another control's focus.
-                        outside_index.unwrap_or(actions.len()),
+                        SettingsAction::Prompt(PromptAction::Outside),
                         cx,
                     ))
                     .into_any_element(),
@@ -1685,7 +1694,7 @@ impl CompiApp {
         let mut buttons = div().flex().flex_wrap().gap_2();
         if anything_applied(environment) {
             buttons = buttons.child(self.prompt_popover_button(
-                actions,
+                group,
                 PromptAction::TurnOff,
                 "Turn off",
                 true,
@@ -1693,7 +1702,7 @@ impl CompiApp {
             ));
         }
         buttons = buttons.child(self.prompt_button(
-            actions,
+            group,
             PromptAction::History,
             if state.history {
                 "Hide history"
@@ -1707,16 +1716,16 @@ impl CompiApp {
             form = form.child(self.prompt_error(error.clone()));
         }
         if state.history {
-            form = form.child(self.render_prompt_history(actions, environment, cx));
+            form = form.child(self.render_prompt_history(group, environment, cx));
         }
         form.into_any_element()
     }
 
     /// Only rows in view are laid out; see `PromptSettingsState::style_list`.
-    fn render_prompt_styles(&self, actions: &[PromptAction], cx: &Context<Self>) -> AnyElement {
+    fn render_prompt_styles(&self, group: &RowCx, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let index = self.prompt_index(actions, PromptAction::Styles);
-        let focused = self.prompt_focused(index);
+        let focused = self.prompt_focused(group, PromptAction::Styles);
+        let rows = group.clone();
         div()
             .relative()
             .min_w_0()
@@ -1735,7 +1744,7 @@ impl CompiApp {
                 list(
                     self.prompt_settings.style_list.clone(),
                     cx.processor(move |this, row: usize, _, cx| {
-                        this.render_prompt_style_row(row, index, cx)
+                        this.render_prompt_style_row(row, &rows, cx)
                     }),
                 )
                 .size_full(),
@@ -1747,7 +1756,7 @@ impl CompiApp {
     fn render_prompt_style_row(
         &self,
         row_index: usize,
-        focus_index: Option<usize>,
+        group: &RowCx,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
@@ -1836,7 +1845,7 @@ impl CompiApp {
         self.prompt_popover(
             ("prompt-style-popover", row_index),
             row_element,
-            focus_index,
+            group,
             PromptAction::Styles,
             Some(row_index),
             cx,
@@ -1897,7 +1906,7 @@ impl CompiApp {
 
     fn render_prompt_history(
         &self,
-        actions: &[PromptAction],
+        group: &RowCx,
         environment: &PromptEnvironment,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -1945,7 +1954,7 @@ impl CompiApp {
                                             .child(self.prompt_note(backup_age(backup.created_ms))),
                                     )
                                     .child(self.prompt_popover_button(
-                                        actions,
+                                        group,
                                         PromptAction::Restore(index),
                                         "Restore",
                                         false,

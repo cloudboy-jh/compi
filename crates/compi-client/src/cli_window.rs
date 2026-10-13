@@ -1,6 +1,6 @@
 //! Explicit, acknowledged presentation control through the same-user GUI host.
 use crate::connection::ConnectionTarget;
-use compi_protocol::{GitScope, PaneId, Result, SurfaceId, TabId};
+use compi_protocol::{GitScope, PaneContent, PaneId, Result, SurfaceId, TabId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,12 +103,25 @@ impl Request {
     }
 }
 
-/// What a pane holds; reported as `"type": "terminal" | "content"`.
+/// What a pane holds; reported as `"type": "terminal" | "content" | "settings"`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneType {
     Terminal,
+    /// A content pane showing files.
     Content,
+    /// A content pane showing Settings.
+    Settings,
+}
+
+impl PaneType {
+    /// The type of a content pane showing `content`.
+    pub fn of_content(content: &PaneContent) -> Self {
+        match content {
+            PaneContent::Files(_) => Self::Content,
+            PaneContent::Settings(_) => Self::Settings,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

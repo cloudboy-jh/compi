@@ -23,8 +23,9 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::PCWSTR;
 
 /// Format 2 (protocol 23) holds a content pane's open files and diffs as `tabs`; format 3
-/// (protocol 25) holds one tab per file, a diff being that tab's mode.
-const FORMAT_VERSION: u32 = 3;
+/// (protocol 25) holds one tab per file, a diff being that tab's mode. Format 4 (protocol
+/// 27) tags every content leaf with its `kind`, so a content pane may show Settings.
+const FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -134,6 +135,10 @@ impl WorkspaceStore {
                     }
                     if value.get("format_version") == Some(&serde_json::Value::from(2)) {
                         migrate_diff_tabs(&mut value);
+                        value["format_version"] = 3.into();
+                    }
+                    if value.get("format_version") == Some(&serde_json::Value::from(3)) {
+                        migrate_content_kinds(&mut value);
                         value["format_version"] = FORMAT_VERSION.into();
                     }
                     serde_json::from_value::<Manifest>(value)
@@ -203,10 +208,12 @@ impl WorkspaceStore {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        let bytes = serde_json::to_vec(&Manifest {
+        let mut manifest = serde_json::to_value(Manifest {
             format_version: FORMAT_VERSION,
             workspace: workspace.clone(),
         })?;
+        readable_by_format_3(&mut manifest);
+        let bytes = serde_json::to_vec(&manifest)?;
         let temporary = path.with_extension("json.tmp");
         let mut file = OpenOptions::new()
             .create(true)
@@ -431,6 +438,54 @@ fn file_tab(tab: &serde_json::Value) -> Option<serde_json::Value> {
 /// Which file a tab is, matching a Windows path whichever separator either side used.
 fn same_file_key(tab: &serde_json::Value) -> String {
     tab["path"].as_str().unwrap_or_default().replace('\\', "/")
+}
+
+/// Format 3 content leaves were all files and carried no `kind`; each becomes a files leaf.
+/// Every layout copy is walked, as in format 1.
+fn migrate_content_kinds(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(migrate_content_kinds),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("content")
+                && let Some(Value::Object(content)) = object.get_mut("content")
+            {
+                content
+                    .entry("kind")
+                    .or_insert_with(|| Value::from("files"));
+                return;
+            }
+            object.values_mut().for_each(migrate_content_kinds);
+        }
+        _ => {}
+    }
+}
+
+/// A format-3 daemon (protocol 26) reads every content leaf as a folder: it needs an
+/// `environment` and a `root` and ignores other keys. A Settings leaf has neither, so that
+/// daemon would fail to parse the file and quarantine it, dropping every pane, before it
+/// reached its format check. Writing placeholders beside a Settings leaf's `section` lets
+/// it parse far enough to refuse format 4 and keep the file. Loading ignores them.
+fn readable_by_format_3(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(readable_by_format_3),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("content")
+                && let Some(Value::Object(content)) = object.get_mut("content")
+            {
+                if content.get("kind").and_then(Value::as_str) == Some("settings") {
+                    content
+                        .entry("environment")
+                        .or_insert_with(|| serde_json::json!({ "type": "host" }));
+                    content.entry("root").or_insert_with(|| Value::from("/"));
+                }
+                return;
+            }
+            object.values_mut().for_each(readable_by_format_3);
+        }
+        _ => {}
+    }
 }
 
 fn recover_lost_surfaces(workspace: &mut StoredWorkspace) {
@@ -703,7 +758,10 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::{ContentEnvironment, ContentTab, GitScope, PaneContent, SplitAxis};
+    use compi_protocol::{
+        ContentEnvironment, ContentTab, FolderContent, GitScope, PaneContent, SettingsContent,
+        SettingsSection, SplitAxis,
+    };
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -711,6 +769,17 @@ mod tests {
             std::process::id(),
             now_ms()
         ))
+    }
+
+    /// The folder a files content leaf shows.
+    fn folder(node: &LayoutNode) -> &FolderContent {
+        match node {
+            LayoutNode::Content {
+                content: PaneContent::Files(folder),
+                ..
+            } => folder,
+            other => panic!("expected a files content pane, found {other:?}"),
+        }
     }
 
     #[test]
@@ -910,14 +979,14 @@ mod tests {
         // WSL paths load on every host: loading applies no host path rules.
         let content = LayoutNode::Content {
             pane_id: PaneId::new("pane-2"),
-            content: PaneContent {
+            content: PaneContent::Files(FolderContent {
                 environment: ContentEnvironment::Wsl {
                     distribution: "Ubuntu".into(),
                 },
                 root: "/home/user/project".into(),
                 tabs: vec![ContentTab::edit("/home/user/project/a.rs")],
                 active: Some(ContentTab::edit("/home/user/project/a.rs")),
-            },
+            }),
         };
         let terminal = LayoutNode::Pane {
             pane_id: PaneId::new("pane-1"),
@@ -961,7 +1030,7 @@ mod tests {
         validate(&workspace).unwrap();
         let LayoutNode::Content {
             pane_id,
-            content: shown,
+            content: PaneContent::Files(shown),
         } = content
         else {
             unreachable!()
@@ -972,11 +1041,11 @@ mod tests {
         };
         **first = LayoutNode::Content {
             pane_id: pane_id.clone(),
-            content: PaneContent {
+            content: PaneContent::Files(FolderContent {
                 tabs: Vec::new(),
                 active: None,
                 ..shown.clone()
-            },
+            }),
         };
         assert!(validate(&workspace).is_err());
 
@@ -987,10 +1056,10 @@ mod tests {
         };
         **second = LayoutNode::Content {
             pane_id,
-            content: PaneContent {
+            content: PaneContent::Files(FolderContent {
                 active: Some(ContentTab::edit("/home/user/project/missing.rs")),
                 ..shown
-            },
+            }),
         };
         assert!(validate(&workspace).is_err());
     }
@@ -1043,22 +1112,16 @@ mod tests {
         let LayoutNode::Split { first, second, .. } = &tab.layout else {
             panic!("the split survives");
         };
-        let LayoutNode::Content { content, .. } = first.as_ref() else {
-            panic!("the editor stays a content pane");
-        };
+        let content = folder(first);
         assert_eq!(content.tabs, [file("/work/a.rs"), file("/work/b.rs")]);
         assert_eq!(content.active, Some(file("/work/b.rs")));
-        let LayoutNode::Content { content, .. } = second.as_ref() else {
-            panic!("the Changes pane stays a content pane");
-        };
+        let content = folder(second);
         assert_eq!(content.root, "/home/user/repo");
         assert!(content.tabs.is_empty() && content.active.is_none());
         let Some(LayoutNode::Split { second, .. }) = tab.previous_layout.as_deref() else {
             panic!("the previous arrangement survives");
         };
-        assert!(
-            matches!(second.as_ref(), LayoutNode::Content { content, .. } if content.tabs.len() == 2)
-        );
+        assert_eq!(folder(second).tabs.len(), 2);
         // Saved again in the current format.
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["format_version"], FORMAT_VERSION);
@@ -1113,9 +1176,7 @@ mod tests {
         let LayoutNode::Split { first, second, .. } = &tab.layout else {
             panic!("the split survives");
         };
-        let LayoutNode::Content { content, .. } = first.as_ref() else {
-            panic!("a content pane");
-        };
+        let content = folder(first);
         let a = diff("/work/a.rs", GitScope::Unstaged);
         assert_eq!(
             content.tabs,
@@ -1126,17 +1187,159 @@ mod tests {
             ]
         );
         assert_eq!(content.active, Some(a));
-        let LayoutNode::Content { content, .. } = second.as_ref() else {
-            panic!("a content pane");
-        };
+        let content = folder(second);
         assert_eq!(content.tabs, [edit("/work/a.rs"), edit("/work/b.rs")]);
         assert_eq!(content.active, Some(edit("/work/b.rs")));
-        assert!(matches!(
-            tab.previous_layout.as_deref(),
-            Some(LayoutNode::Content { content, .. }) if content.tabs.len() == 3
-        ));
+        assert_eq!(
+            folder(tab.previous_layout.as_deref().unwrap()).tabs.len(),
+            3
+        );
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["format_version"], FORMAT_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn protocol_26_content_leaves_load_as_files() {
+        let path = test_path("format-3");
+        let (expected, _) = content_workspace(SurfaceStatus::Lost);
+        let file = serde_json::json!({ "type": "file", "path": "/home/user/project/a.rs" });
+        let content = serde_json::json!({
+            "type": "content",
+            "pane_id": "pane-2",
+            "content": {
+                "environment": { "type": "wsl", "distribution": "Ubuntu" },
+                "root": "/home/user/project",
+                "tabs": [file],
+                "active": file,
+            },
+        });
+        let terminal =
+            serde_json::json!({ "type": "pane", "pane_id": "pane-1", "surface_id": "surface-1" });
+        let split = |first: &serde_json::Value, second: &serde_json::Value| {
+            serde_json::json!({
+                "type": "split", "axis": "horizontal", "ratio": 0.5,
+                "first": first, "second": second,
+            })
+        };
+        let mut manifest = serde_json::json!({ "format_version": 3, "workspace": expected });
+        let stored = &mut manifest["workspace"]["sessions"][0]["tabs"][0];
+        stored["layout"] = split(&terminal, &content);
+        stored["previous_layout"] = split(&content, &terminal);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(workspace.sessions, expected.sessions);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["format_version"], 4);
+        let tab = &saved["workspace"]["sessions"][0]["tabs"][0];
+        assert_eq!(tab["layout"]["second"]["content"]["kind"], "files");
+        assert_eq!(tab["previous_layout"]["first"]["content"]["kind"], "files");
+        let _ = fs::remove_file(path);
+    }
+
+    /// `content_workspace` with a Settings pane beside the files pane, in both arrangements.
+    fn settings_workspace() -> StoredWorkspace {
+        let (mut workspace, files) = content_workspace(SurfaceStatus::Lost);
+        let settings = LayoutNode::Content {
+            pane_id: PaneId::new("pane-3"),
+            content: PaneContent::Settings(SettingsContent {
+                section: SettingsSection::Terminal,
+            }),
+        };
+        let terminal = LayoutNode::Pane {
+            pane_id: PaneId::new("pane-1"),
+            surface_id: SurfaceId::new("surface-1"),
+        };
+        let split = |first: &LayoutNode, second: &LayoutNode| LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(first.clone()),
+            second: Box::new(second.clone()),
+        };
+        let tab = &mut workspace.sessions[0].tabs[0];
+        tab.layout = split(&terminal, &split(&files, &settings));
+        tab.previous_layout = Some(Box::new(split(&split(&settings, &files), &terminal)));
+        workspace
+    }
+
+    #[test]
+    fn settings_panes_survive_reopen() {
+        let path = test_path("settings");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let workspace = settings_workspace();
+        store.commit(&workspace).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let settings =
+            &saved["workspace"]["sessions"][0]["tabs"][0]["layout"]["second"]["second"]["content"];
+        assert_eq!(settings["kind"], "settings");
+        assert_eq!(settings["section"], "terminal");
+        // The placeholders written for format-3 daemons are ignored when loading.
+        assert_eq!(settings["root"], "/");
+        let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.sessions, workspace.sessions);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_format_3_daemon_reaches_its_version_check_on_settings_panes() {
+        // Protocol 26's shapes, as far as a format-3 daemon parses a layout.
+        #[derive(Deserialize)]
+        struct OldManifest {
+            format_version: u32,
+            workspace: OldWorkspace,
+        }
+        #[derive(Deserialize)]
+        struct OldWorkspace {
+            sessions: Vec<OldSession>,
+        }
+        #[derive(Deserialize)]
+        struct OldSession {
+            tabs: Vec<OldTab>,
+        }
+        #[derive(Deserialize)]
+        struct OldTab {
+            layout: OldLayout,
+            previous_layout: Option<OldLayout>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldLayout {
+            Pane {},
+            Content {
+                content: OldContent,
+            },
+            Split {
+                first: Box<OldLayout>,
+                second: Box<OldLayout>,
+            },
+        }
+        #[derive(Deserialize)]
+        struct OldContent {
+            #[allow(dead_code)]
+            environment: ContentEnvironment,
+            root: String,
+        }
+        /// Each content leaf's root, in order.
+        fn roots(node: &OldLayout) -> Vec<&str> {
+            match node {
+                OldLayout::Pane {} => Vec::new(),
+                OldLayout::Content { content } => vec![content.root.as_str()],
+                OldLayout::Split { first, second } => [roots(first), roots(second)].concat(),
+            }
+        }
+
+        let path = test_path("settings-downgrade");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        store.commit(&settings_workspace()).unwrap();
+        let old: OldManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old.format_version, 4);
+        let tab = &old.workspace.sessions[0].tabs[0];
+        assert_eq!(roots(&tab.layout), ["/home/user/project", "/"]);
+        assert_eq!(
+            roots(tab.previous_layout.as_ref().unwrap()),
+            ["/", "/home/user/project"]
+        );
         let _ = fs::remove_file(path);
     }
 }

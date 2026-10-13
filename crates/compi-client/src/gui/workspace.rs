@@ -320,7 +320,6 @@ pub(super) enum TextPurpose {
 #[derive(Clone)]
 pub(super) enum Overlay {
     Palette,
-    Settings,
     ThemeCatalog,
     ImageInspector,
     Text {
@@ -391,10 +390,11 @@ pub(super) enum Popup {
     QuickAppearance,
 }
 
-/// Where closing the theme catalog returns to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where closing the theme catalog returns to: the Settings pane it was opened from,
+/// or Quick Appearance.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CatalogReturn {
-    Settings,
+    Settings(PaneId),
     QuickAppearance,
 }
 
@@ -906,12 +906,10 @@ impl CompiApp {
             overlay_focus: 0,
             overlay_generation: 0,
             overlay_closing_since: None,
-            settings_section: SettingsSection::Appearance,
+            settings: settings::SettingsUi::default(),
             popup: None,
             context_menu: None,
             tab_menu: None,
-            settings_scroll_bounds: None,
-            settings_scroll_to_focus: false,
             prompt_settings: prompt::PromptSettingsState::default(),
             performance_enabled: performance_enabled.clone(),
             performance: performance::PerformanceMonitor::default(),
@@ -3132,7 +3130,7 @@ impl CompiApp {
             has_workspace: session.is_some(),
             has_tab: tab.is_some(),
             has_pane: pane.is_some(),
-            content_pane: self.focused_content().is_some(),
+            content_pane: self.focused_pane_content().is_some(),
             file_tab: self
                 .focused_content()
                 .is_some_and(|content| content.active_file().is_some()),
@@ -3192,18 +3190,6 @@ impl CompiApp {
         }
     }
 
-    /// Opens Quick Appearance on its button. The palette it may be run from is
-    /// already closing.
-    fn open_quick_appearance(&mut self) {
-        if self.overlay.is_some() {
-            self.dismiss_overlay();
-        }
-        self.settings_scope = SettingsScope::Global;
-        self.overlay_focus = 0;
-        self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
-        self.popup = Some(Popup::QuickAppearance);
-    }
-
     /// Follows a popup's open state as its control reports it; a close reported late,
     /// after another popup opened, leaves that one open.
     pub(super) fn set_popup(&mut self, popup: Popup, open: bool) {
@@ -3228,19 +3214,11 @@ impl CompiApp {
         self.overlay_focus = 0;
         self.overlay_generation = self.overlay_generation.wrapping_add(1);
         self.overlay_closing_since = None;
-        if matches!(self.overlay, Some(Overlay::Settings)) {
-            self.settings_scope = SettingsScope::Global;
-        }
         self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
         self.ime_text = text.to_owned();
         self.ime_marked_range = None;
         let end = text.encode_utf16().count();
         self.ime_selected_range = end..end;
-        if matches!(self.overlay, Some(Overlay::Settings))
-            && self.settings_section == SettingsSection::Terminal
-        {
-            self.enter_prompt_settings();
-        }
     }
 
     fn dismiss_overlay(&mut self) {
@@ -3251,25 +3229,15 @@ impl CompiApp {
         let parent = matches!(self.overlay, Some(Overlay::ThemeCatalog))
             .then(|| self.catalog_return.take())
             .flatten();
-        if parent == Some(CatalogReturn::Settings) {
-            self.cancel_catalog_preview();
-            self.overlay = Some(Overlay::Settings);
-            self.overlay_generation = self.overlay_generation.wrapping_add(1);
-            self.overlay_closing_since = None;
-            self.overlay_focus = self.settings_section as usize;
-            self.ime_text.clear();
-            self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
-            return;
-        }
         if self.overlay.is_some() && self.overlay_closing_since.is_none() {
             self.cancel_catalog_preview();
             self.overlay_closing_since = Some(Instant::now());
         }
-        if parent == Some(CatalogReturn::QuickAppearance) {
-            // Back on the Theme row the catalog was opened from.
-            self.popup = Some(Popup::QuickAppearance);
-            self.overlay_focus = 2;
-            self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
+        match parent {
+            // Back in the Settings pane, on the control that opened the catalog.
+            Some(CatalogReturn::Settings(pane)) => self.focus_pane(pane),
+            Some(CatalogReturn::QuickAppearance) => self.return_to_quick_appearance(),
+            None => {}
         }
     }
 
@@ -3346,10 +3314,7 @@ impl CompiApp {
             if self.overlay_closing_since.is_some() {
                 return true;
             }
-            if self.handle_settings_key(key, window, cx)
-                || self.handle_dialog_key(key, window, cx)
-                || self.handle_catalog_key(key, window, cx)
-            {
+            if self.handle_dialog_key(key, window, cx) || self.handle_catalog_key(key, window, cx) {
                 return true;
             }
             match key.key.as_str() {
@@ -3381,7 +3346,7 @@ impl CompiApp {
                 "backspace" | "delete"
                     if !matches!(
                         self.overlay,
-                        Some(Overlay::Settings | Overlay::Confirm { .. } | Overlay::Diagnostics)
+                        Some(Overlay::Confirm { .. } | Overlay::Diagnostics)
                     ) =>
                 {
                     let mut range = self.ime_selected_range.clone();
@@ -3457,7 +3422,7 @@ impl CompiApp {
                 command: key.modifiers.platform,
             },
             // A content pane keeps the shortcuts a terminal leaves to the shell.
-            if self.focused_content().is_some() {
+            if self.focused_pane_content().is_some() {
                 commands::InputOwner::Content
             } else {
                 commands::InputOwner::Terminal
@@ -3484,8 +3449,7 @@ impl CompiApp {
         if matches!(
             self.overlay,
             Some(
-                Overlay::Settings
-                    | Overlay::Confirm { .. }
+                Overlay::Confirm { .. }
                     | Overlay::ConfirmDiscard { .. }
                     | Overlay::Unsaved { .. }
                     | Overlay::Diagnostics
@@ -3925,16 +3889,14 @@ impl CompiApp {
                 self.save_state();
             }
             Command::OpenQuickAppearance => self.open_quick_appearance(),
-            Command::OpenSettings => self.open_overlay(Overlay::Settings, ""),
+            Command::OpenSettings => self.open_settings(None, None, window, cx),
             Command::CheckForUpdates => {
-                self.settings_section = SettingsSection::Updates;
-                self.open_overlay(Overlay::Settings, "");
+                self.open_settings(Some(SettingsSection::Updates), None, window, cx);
                 self.updates.check();
             }
             Command::OpenPromptSettings => {
-                self.settings_section = SettingsSection::Terminal;
-                self.open_overlay(Overlay::Settings, "");
-                self.focus_prompt_group();
+                let stop = self.prompt_group_stop();
+                self.open_settings(Some(SettingsSection::Terminal), stop, window, cx);
             }
             Command::OpenThemeCatalog => self.open_theme_catalog(SettingsScope::Global),
             Command::OpenConfiguration => {
@@ -4067,7 +4029,7 @@ impl CompiApp {
         };
         match overlay {
             Overlay::ThemeCatalog => self.apply_catalog_theme(window, cx),
-            Overlay::Settings | Overlay::ImageInspector => self.dismiss_overlay(),
+            Overlay::ImageInspector => self.dismiss_overlay(),
             Overlay::Text { purpose, .. } => {
                 let label = self.ime_text.trim().to_owned();
                 if label.is_empty() {
@@ -4348,13 +4310,21 @@ impl CompiApp {
             .into_iter()
             .enumerate()
             .filter_map(|(index, leaf)| match leaf {
-                LayoutNode::Content { pane_id, content } => Some(TabPane {
-                    floating: self.state.is_floating(&pane_id),
-                    pane_id,
-                    title: content.folder_name().to_owned(),
-                    directory: Some(content.root),
-                    surface_id: None,
-                }),
+                LayoutNode::Content { pane_id, content } => {
+                    let (title, directory) = match content {
+                        compi_protocol::PaneContent::Files(folder) => {
+                            (folder.folder_name().to_owned(), Some(folder.root))
+                        }
+                        compi_protocol::PaneContent::Settings(_) => ("Settings".to_owned(), None),
+                    };
+                    Some(TabPane {
+                        floating: self.state.is_floating(&pane_id),
+                        pane_id,
+                        title,
+                        directory,
+                        surface_id: None,
+                    })
+                }
                 LayoutNode::Pane {
                     pane_id,
                     surface_id,
@@ -4513,7 +4483,7 @@ impl CompiApp {
         let query = self.ime_text.to_lowercase();
         let mut choices = Vec::new();
         match &self.overlay {
-            Some(Overlay::Settings | Overlay::ThemeCatalog) => {}
+            Some(Overlay::ThemeCatalog) => {}
             Some(Overlay::Palette) => {
                 let context = self.command_context(cx);
                 for category in commands::CommandCategory::ALL {
@@ -4625,8 +4595,7 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         record_frame_metrics();
-        let performance_visible = matches!(self.overlay, Some(Overlay::Settings))
-            && self.settings_section == SettingsSection::Performance;
+        let performance_visible = self.settings_row_shown("performance");
         let sample_fps = self.state.show_fps || performance_visible;
         self.performance_enabled
             .store(sample_fps, Ordering::Release);
@@ -4665,6 +4634,7 @@ impl CompiApp {
         }
         self.sync_editor_theme(cx);
         self.prepare_content(window, cx);
+        self.prepare_settings(window, cx);
         self.reconcile_keyboard_focus(window, cx);
         for view in &mut self.surface_views {
             if !view.stop.load(Ordering::Acquire) {
@@ -5019,7 +4989,9 @@ impl CompiApp {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            .tooltip(controls::tooltip("Pane actions", None, None))
+            .when(self.context_menu.is_none(), |button| {
+                button.tooltip(controls::tooltip("Pane actions", None, None))
+            })
             .child(chrome_icon(ChromeIcon::PaneActions, color(colors.muted)))
             .into_any_element()
     }
@@ -5823,7 +5795,13 @@ impl CompiApp {
                                             Command::RestoreHiddenTab,
                                             cx,
                                         ))
-                                    }),
+                                    })
+                                    .child(self.command_button(
+                                        "empty-settings",
+                                        "Settings",
+                                        Command::OpenSettings,
+                                        cx,
+                                    )),
                             ),
                     ),
             );
@@ -6420,6 +6398,7 @@ impl CompiApp {
                                     controls::IconName::Ellipsis,
                                     "Pane actions",
                                 )
+                                .menu_open(self.context_menu.is_some())
                                 .on_click(cx.listener(
                                     move |this, event: &ClickEvent, window, cx| {
                                         this.open_pane_menu(

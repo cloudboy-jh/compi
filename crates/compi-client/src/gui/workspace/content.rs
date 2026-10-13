@@ -17,7 +17,8 @@ use super::*;
 use crate::gui::controls::{self, ChipTone, IconName, icon_button, text_button};
 use compi_protocol::{
     ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
-    GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent, ServerGeneration, ServerId,
+    FolderContent, GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent, ServerGeneration,
+    ServerId,
 };
 use gpui::Entity;
 use gpui_component::highlighter::HighlightTheme;
@@ -529,8 +530,8 @@ impl PaneUi {
     }
 }
 
-/// The content `pane` shows, if it is a content pane.
-pub(in crate::gui) fn find_content<'a>(
+/// What `pane` shows, if it is a content pane of any kind.
+pub(in crate::gui) fn find_pane_content<'a>(
     workspace: &'a WorkspaceSnapshot,
     pane: &PaneId,
 ) -> Option<&'a PaneContent> {
@@ -544,13 +545,25 @@ pub(in crate::gui) fn find_content<'a>(
         })
 }
 
+/// The folder and files `pane` shows, if it is a content pane showing files.
+pub(in crate::gui) fn find_content<'a>(
+    workspace: &'a WorkspaceSnapshot,
+    pane: &PaneId,
+) -> Option<&'a FolderContent> {
+    find_pane_content(workspace, pane)?.folder()
+}
+
+/// The content panes of `node` that show files.
 pub(super) fn content_leaves<'a>(
     node: &'a LayoutNode,
-    visit: &mut impl FnMut(&'a PaneId, &'a PaneContent),
+    visit: &mut impl FnMut(&'a PaneId, &'a FolderContent),
 ) {
     match node {
-        LayoutNode::Content { pane_id, content } => visit(pane_id, content),
-        LayoutNode::Pane { .. } => {}
+        LayoutNode::Content {
+            pane_id,
+            content: PaneContent::Files(folder),
+        } => visit(pane_id, folder),
+        LayoutNode::Content { .. } | LayoutNode::Pane { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             content_leaves(first, visit);
             content_leaves(second, visit);
@@ -567,8 +580,8 @@ pub(super) fn reusable_content<'a>(
     environment: &ContentEnvironment,
     root: Option<&str>,
     file: Option<&str>,
-) -> Option<(&'a PaneId, &'a PaneContent)> {
-    let mut best: Option<((bool, bool, usize), &PaneId, &PaneContent)> = None;
+) -> Option<(&'a PaneId, &'a FolderContent)> {
+    let mut best: Option<((bool, bool, usize), &PaneId, &FolderContent)> = None;
     content_leaves(layout, &mut |pane_id, content| {
         if &content.environment != environment {
             return;
@@ -995,7 +1008,7 @@ impl CompiApp {
         self.apply_reveals(window, cx);
     }
 
-    fn prepare_pane(&mut self, pane_id: PaneId, content: PaneContent, cx: &mut Context<Self>) {
+    fn prepare_pane(&mut self, pane_id: PaneId, content: FolderContent, cx: &mut Context<Self>) {
         let created = match self.content.panes.get_mut(&pane_id) {
             Some(ui) if ui.environment != content.environment => {
                 // Its editors go with the old environment; their edits stay in backups.
@@ -1347,9 +1360,10 @@ impl CompiApp {
     }
 
     /// Keyboard focus follows the focused pane: a content pane keeps it on its editor
-    /// (or on the pane while it has no editor, or the user left it), while terminals,
-    /// overlays and the file tree use `focus_handle`, which carries their text input.
-    /// Focus held by anything else is left alone.
+    /// (or on the pane while it has no editor, or the user left it), a Settings pane on
+    /// its search field or highlighted control, while terminals, overlays and the file
+    /// tree use `focus_handle`, which carries their text input. Focus held by anything
+    /// else is left alone.
     pub(super) fn reconcile_keyboard_focus(&mut self, window: &mut Window, cx: &mut App) {
         let ours = window.focused(cx).is_none_or(|focused| {
             focused == self.focus_handle
@@ -1358,6 +1372,7 @@ impl CompiApp {
                     .panes
                     .values()
                     .any(|ui| ui.owns(&focused, window, cx))
+                || self.settings_owns(&focused, window, cx)
         });
         if !ours {
             return;
@@ -1371,6 +1386,19 @@ impl CompiApp {
             self.content.released = None;
         }
         let wanted = match self.keyboard_content_pane() {
+            Some(pane_id) if self.settings_pane_focus(pane_id).is_some() => {
+                if self
+                    .settings_pane_focus(pane_id)
+                    .is_some_and(|focus| focus.contains_focused(window, cx))
+                {
+                    // Its search field or the pane already has the keyboard.
+                    return;
+                }
+                let Some(wanted) = self.settings_keyboard(pane_id, cx) else {
+                    return;
+                };
+                wanted
+            }
             Some(pane_id) => {
                 let Some(ui) = self.content.panes.get(pane_id) else {
                     return;
@@ -1392,23 +1420,26 @@ impl CompiApp {
         }
     }
 
-    /// The focused pane when it is a content pane that should have the keyboard: no
-    /// overlay or terminal file tree is open.
+    /// The focused pane when it is a content pane (of any kind) that should have the
+    /// keyboard: no overlay or terminal file tree is open.
     fn keyboard_content_pane(&self) -> Option<&PaneId> {
         self.focused_pane().filter(|_| {
-            self.overlay.is_none() && self.file_tree.is_none() && self.focused_content().is_some()
+            self.overlay.is_none()
+                && self.file_tree.is_none()
+                && self.focused_pane_content().is_some()
         })
     }
 
-    /// The focused content pane's editor or its search field has the keyboard.
+    /// The focused content pane's editor or a search field in it has the keyboard.
     pub(super) fn editor_has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.overlay.is_none()
-            && self
-                .focused_pane()
-                .and_then(|pane| self.content.panes.get(pane))
-                .is_some_and(|ui| {
-                    !ui.focus.is_focused(window) && ui.focus.contains_focused(window, cx)
-                })
+            && (self.settings_search_has_keyboard(window, cx)
+                || self
+                    .focused_pane()
+                    .and_then(|pane| self.content.panes.get(pane))
+                    .is_some_and(|ui| {
+                        !ui.focus.is_focused(window) && ui.focus.contains_focused(window, cx)
+                    }))
     }
 
     /// Runs before the editor's own key bindings, so Compi shortcuts win over editor
@@ -1421,6 +1452,11 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         if !self.editor_has_keyboard(window, cx) {
+            return;
+        }
+        if self.settings_search_key(key, window, cx) {
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
         if is_save_key(key) {
@@ -1508,13 +1544,7 @@ impl CompiApp {
                 let tab = ContentTab::edit(file.clone());
                 if content.active.as_ref() != Some(&tab) {
                     content.show(tab);
-                    self.mutate(
-                        WorkspaceMutation::UpdateContent {
-                            pane_id: pane_id.clone(),
-                            content,
-                        },
-                        false,
-                    );
+                    self.update_content(&pane_id, content);
                 }
                 if let Some(line) = line {
                     self.reveal_line(&pane_id, &environment, file, line, window, cx);
@@ -1527,12 +1557,12 @@ impl CompiApp {
         let Some(root) = root.or_else(|| file.as_deref().map(parent_folder)) else {
             return;
         };
-        let content = PaneContent {
+        let content = PaneContent::Files(FolderContent {
             environment: environment.clone(),
             root,
             tabs: file.iter().map(ContentTab::edit).collect(),
             active: file.clone().map(ContentTab::edit),
-        };
+        });
         if self.open_content_beside(beside, content)
             && let (Some(path), Some(line)) = (file, line)
         {
@@ -1626,11 +1656,12 @@ impl CompiApp {
         }
     }
 
-    pub(super) fn update_content(&mut self, pane_id: &PaneId, content: PaneContent) {
+    /// Shows `content` in the files pane `pane_id`.
+    pub(super) fn update_content(&mut self, pane_id: &PaneId, content: FolderContent) {
         self.mutate(
             WorkspaceMutation::UpdateContent {
                 pane_id: pane_id.clone(),
-                content,
+                content: PaneContent::Files(content),
             },
             false,
         );
@@ -2748,6 +2779,11 @@ impl CompiApp {
             .as_ref()
             .and_then(|workspace| find_content(workspace, &pane_id));
         let ui = self.content.panes.get(&pane_id);
+        let settings = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_pane_content(workspace, &pane_id))
+            .is_some_and(|content| content.settings().is_some());
         let menu_id = pane_id.clone();
         let focus_id = pane_id.clone();
         let click_id = pane_id.clone();
@@ -2786,6 +2822,9 @@ impl CompiApp {
                     .is_some_and(|tree| tree.pane_id == pane_id),
                 |pane| pane.child(self.render_file_tree(cx)),
             )
+            .when(settings, |pane| {
+                pane.child(self.render_settings_pane(&pane_id, rect.width, cx))
+            })
             .when_some(
                 content.zip(ui).filter(|_| {
                     self.file_tree
@@ -2873,7 +2912,7 @@ impl CompiApp {
     fn render_content_sidebar(
         &self,
         pane_id: &PaneId,
-        content: &PaneContent,
+        content: &FolderContent,
         ui: &PaneUi,
         width: f32,
         cx: &Context<Self>,
@@ -2916,7 +2955,7 @@ impl CompiApp {
     fn render_folder_view(
         &self,
         pane_id: &PaneId,
-        content: &PaneContent,
+        content: &FolderContent,
         ui: &PaneUi,
         width: f32,
         cx: &Context<Self>,
@@ -3230,7 +3269,7 @@ impl CompiApp {
     fn render_content_tabs(
         &self,
         pane_id: &PaneId,
-        content: &PaneContent,
+        content: &FolderContent,
         ui: &PaneUi,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -3794,12 +3833,12 @@ mod tests {
         };
         let pane = |id: &str, root: &str, files: &[&str]| LayoutNode::Content {
             pane_id: PaneId::new(id),
-            content: PaneContent {
+            content: PaneContent::Files(FolderContent {
                 environment: wsl.clone(),
                 root: root.into(),
                 tabs: files.iter().map(|file| ContentTab::edit(*file)).collect(),
                 active: None,
-            },
+            }),
         };
         let split = |first, second| LayoutNode::Split {
             axis: SplitAxis::Horizontal,
@@ -3807,8 +3846,12 @@ mod tests {
             first: Box::new(first),
             second: Box::new(second),
         };
+        let settings = LayoutNode::Content {
+            pane_id: PaneId::new("settings"),
+            content: PaneContent::Settings(compi_protocol::SettingsContent::default()),
+        };
         let layout = split(
-            pane("outer", "/work", &[]),
+            split(pane("outer", "/work", &[]), settings),
             split(
                 pane("inner", "/work/src", &[]),
                 pane("open", "/work", &["/work/src/a.rs"]),
@@ -3835,6 +3878,14 @@ mod tests {
             target("terminal", "/work/src/b.rs", &ContentEnvironment::Host),
             None
         );
+        // A Settings pane never shows files, not even beside itself.
+        assert_eq!(
+            target("settings", "/work/src/b.rs", &wsl).as_deref(),
+            Some("inner")
+        );
+        let mut leaves = Vec::new();
+        content_leaves(&layout, &mut |pane_id, _| leaves.push(pane_id.as_str()));
+        assert_eq!(leaves, ["outer", "inner", "open"]);
     }
 
     #[test]

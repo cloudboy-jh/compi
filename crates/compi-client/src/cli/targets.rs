@@ -285,7 +285,8 @@ pub fn validate_context(state: &WorkspaceSnapshot, options: &Options) -> Result<
 mod tests {
     use super::*;
     use compi_protocol::{
-        ContentEnvironment, PaneContent, ServerGeneration, ServerId, SessionId, TabId,
+        ContentEnvironment, FolderContent, PaneContent, ServerGeneration, ServerId, SessionId,
+        TabId,
     };
 
     fn state() -> WorkspaceSnapshot {
@@ -383,12 +384,12 @@ mod tests {
         let mut state = state();
         state.sessions[1].tabs[0].layout = LayoutNode::Content {
             pane_id: PaneId::new("pane-b"),
-            content: PaneContent {
+            content: PaneContent::Files(FolderContent {
                 environment: ContentEnvironment::Host,
                 root: "/work".into(),
                 tabs: Vec::new(),
                 active: None,
-            },
+            }),
         };
         let content = Options {
             pane: Some("pane-b".into()),

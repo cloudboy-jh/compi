@@ -42,7 +42,9 @@ use std::fmt;
 // Version 25 adds Git branches: upstream and ahead/behind, the branch list, switch and create.
 // Version 26 adds program status (OSC 7501): watching every terminal's records and
 // acknowledging finished ones.
-pub const PROTOCOL_VERSION: u32 = 26;
+// Version 27 makes a content pane's content a kind: files (a folder and its tabs) or
+// Settings, and opens a tab holding only a content pane.
+pub const PROTOCOL_VERSION: u32 = 27;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -886,7 +888,8 @@ pub enum LayoutNode {
         pane_id: PaneId,
         surface_id: SurfaceId,
     },
-    /// A pane that shows files instead of a terminal. It has no surface or process.
+    /// A pane that shows files or Settings instead of a terminal. It has no surface or
+    /// process.
     Content {
         pane_id: PaneId,
         content: PaneContent,
@@ -956,9 +959,53 @@ impl fmt::Display for ContentEnvironment {
     }
 }
 
-/// What a content pane shows: a folder in one environment and the tabs open from it.
+/// What a content pane shows. Every kind tiles, floats, moves and closes alike; only
+/// what is drawn inside differs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneContent {
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaneContent {
+    /// A folder in one environment and the files open from it.
+    Files(FolderContent),
+    /// The client's Settings. Only the section shown is kept; what the settings hold
+    /// lives in each client's configuration.
+    Settings(SettingsContent),
+}
+
+impl PaneContent {
+    /// Shape checks every host applies. Whether a path is absolute on the daemon's host
+    /// is checked by the daemon, which knows its own path rules.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Files(folder) => folder.validate(),
+            Self::Settings(_) => Ok(()),
+        }
+    }
+
+    /// The folder and files shown, when this shows files.
+    pub fn folder(&self) -> Option<&FolderContent> {
+        match self {
+            Self::Files(folder) => Some(folder),
+            Self::Settings(_) => None,
+        }
+    }
+
+    /// The Settings shown, when this shows Settings.
+    pub fn settings(&self) -> Option<&SettingsContent> {
+        match self {
+            Self::Settings(settings) => Some(settings),
+            Self::Files(_) => None,
+        }
+    }
+
+    /// Whether `other` is the same kind of content, which an update must keep.
+    pub fn same_kind(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+/// A content pane showing files: a folder in one environment and the tabs open from it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FolderContent {
     pub environment: ContentEnvironment,
     /// Absolute folder path in `environment`.
     pub root: String,
@@ -970,7 +1017,52 @@ pub struct PaneContent {
     pub active: Option<ContentTab>,
 }
 
-/// One tab of a content pane: one per file.
+/// A content pane showing Settings, open at `section`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SettingsContent {
+    pub section: SettingsSection,
+}
+
+/// The sections of Settings, in the order they are listed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsSection {
+    #[default]
+    Appearance,
+    Interface,
+    Terminal,
+    Keyboard,
+    Performance,
+    Updates,
+    Advanced,
+}
+
+impl SettingsSection {
+    pub const ALL: [Self; 7] = [
+        Self::Appearance,
+        Self::Interface,
+        Self::Terminal,
+        Self::Keyboard,
+        Self::Performance,
+        Self::Updates,
+        Self::Advanced,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Interface => "Interface",
+            Self::Terminal => "Terminal",
+            Self::Keyboard => "Keyboard",
+            Self::Performance => "Performance",
+            Self::Updates => "Updates",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
+
+/// One tab of a files content pane: one per file. Only `FolderContent` holds tabs, so
+/// every tab is a file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentTab {
@@ -1022,9 +1114,8 @@ impl ContentTab {
     }
 }
 
-impl PaneContent {
-    /// Shape checks every host applies. Whether a path is absolute on the daemon's host
-    /// is checked by the daemon, which knows its own path rules.
+impl FolderContent {
+    /// Shape checks every host applies; see `PaneContent::validate`.
     pub fn validate(&self) -> Result<(), String> {
         fn path(value: &str, what: &str) -> Result<(), String> {
             if value.is_empty() || value.len() > MAX_DIRECTORY_PATH_BYTES || value.contains('\0') {
@@ -1247,6 +1338,12 @@ pub enum WorkspaceMutation {
         cols: i16,
         rows: i16,
         working_directory: Option<String>,
+    },
+    /// A new tab holding one content pane and no shell.
+    CreateContentTab {
+        session_id: SessionId,
+        label: String,
+        content: PaneContent,
     },
     RenameTab {
         tab_id: TabId,
@@ -1651,8 +1748,8 @@ mod content_tests {
         ContentTab::edit(path)
     }
 
-    fn content(files: &[&str], active: Option<&str>) -> PaneContent {
-        PaneContent {
+    fn content(files: &[&str], active: Option<&str>) -> FolderContent {
+        FolderContent {
             environment: ContentEnvironment::Wsl {
                 distribution: "Ubuntu".into(),
             },
@@ -1666,20 +1763,56 @@ mod content_tests {
     fn content_leaf_roundtrips_and_has_no_surface() {
         let leaf = LayoutNode::Content {
             pane_id: PaneId::new("pane-2"),
-            content: content(
+            content: PaneContent::Files(content(
                 &["/home/user/project/a.rs"],
                 Some("/home/user/project/a.rs"),
-            ),
+            )),
         };
-        let json = serde_json::to_string(&leaf).unwrap();
-        assert_eq!(serde_json::from_str::<LayoutNode>(&json).unwrap(), leaf);
+        let json = serde_json::to_value(&leaf).unwrap();
+        assert_eq!(json["content"]["kind"], "files");
+        assert_eq!(json["content"]["root"], "/home/user/project/");
+        assert_eq!(serde_json::from_value::<LayoutNode>(json).unwrap(), leaf);
         assert_eq!(leaf.leaf_pane(), Some(&PaneId::new("pane-2")));
         assert_eq!(leaf.surface_id(), None);
         assert!(leaf.has_content());
         if let LayoutNode::Content { content, .. } = &leaf {
-            assert_eq!(content.folder_name(), "project");
-            assert_eq!(content.environment.to_string(), "WSL: Ubuntu");
+            let folder = content.folder().unwrap();
+            assert_eq!(folder.folder_name(), "project");
+            assert_eq!(folder.environment.to_string(), "WSL: Ubuntu");
+            assert!(content.settings().is_none());
         }
+    }
+
+    #[test]
+    fn a_settings_leaf_carries_only_its_section() {
+        let settings = PaneContent::Settings(SettingsContent {
+            section: SettingsSection::Terminal,
+        });
+        let leaf = LayoutNode::Content {
+            pane_id: PaneId::new("pane-3"),
+            content: settings.clone(),
+        };
+        let json = serde_json::to_value(&leaf).unwrap();
+        assert_eq!(
+            json["content"],
+            serde_json::json!({"kind": "settings", "section": "terminal"})
+        );
+        assert_eq!(serde_json::from_value::<LayoutNode>(json).unwrap(), leaf);
+        assert!(leaf.has_content() && leaf.surface_id().is_none());
+        assert!(settings.validate().is_ok());
+        assert!(settings.folder().is_none());
+        assert_eq!(settings.settings().unwrap().section.label(), "Terminal");
+        // Content without a kind, or of a kind this version does not know, is refused.
+        let untagged = serde_json::json!({"environment": {"type": "host"}, "root": "/work"});
+        assert!(serde_json::from_value::<PaneContent>(untagged).is_err());
+        let unknown = serde_json::json!({"kind": "notes"});
+        assert!(serde_json::from_value::<PaneContent>(unknown).is_err());
+        let section = serde_json::json!({"kind": "settings", "section": "fonts"});
+        assert!(serde_json::from_value::<PaneContent>(section).is_err());
+        // An update keeps the kind.
+        let files = PaneContent::Files(content(&[], None));
+        assert!(!settings.same_kind(&files));
+        assert!(settings.same_kind(&PaneContent::Settings(SettingsContent::default())));
     }
 
     #[test]
@@ -1696,7 +1829,7 @@ mod content_tests {
     #[test]
     fn a_file_tab_in_diff_mode_is_still_the_files_one_tab() {
         let diff = |path: &str| ContentTab::diff(path, GitScope::Staged);
-        let mut shown = PaneContent {
+        let mut shown = FolderContent {
             tabs: vec![file("/a"), diff("/home/user/project/src/main.rs")],
             active: Some(diff("/home/user/project/src/main.rs")),
             ..content(&[], None)
@@ -1718,15 +1851,18 @@ mod content_tests {
         );
         assert_eq!(json["tabs"][1]["type"], "file");
         assert_eq!(json["active"]["diff"], "staged");
-        assert_eq!(serde_json::from_value::<PaneContent>(json).unwrap(), shown);
+        assert_eq!(
+            serde_json::from_value::<FolderContent>(json).unwrap(),
+            shown
+        );
         // The same file in both modes is one file listed twice.
-        let twice = PaneContent {
+        let twice = FolderContent {
             tabs: vec![file("/a"), diff("/a")],
             ..content(&[], None)
         };
         assert!(twice.validate().is_err());
         // The active tab names the mode its file's tab is in.
-        let stray = PaneContent {
+        let stray = FolderContent {
             active: Some(file("/home/user/project/src/main.rs")),
             ..shown.clone()
         };

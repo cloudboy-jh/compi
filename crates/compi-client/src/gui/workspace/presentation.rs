@@ -289,7 +289,11 @@ impl CompiApp {
                     // Content panes have no view; list the ones this window shows.
                     shown_content.iter().map(|pane_id| PaneInfo {
                         pane_id: (*pane_id).clone(),
-                        pane_type: PaneType::Content,
+                        pane_type: self
+                            .workspace
+                            .as_ref()
+                            .and_then(|workspace| content::find_pane_content(workspace, pane_id))
+                            .map_or(PaneType::Content, PaneType::of_content),
                         surface_id: None,
                         cols: None,
                         rows: None,
@@ -601,7 +605,11 @@ impl CompiApp {
                 "Tab is not visible in the selected window; choose the window that owns it".into(),
             );
         }
-        let Some(LayoutNode::Content { content, .. }) = leaf_node(&tab.layout, pane_id) else {
+        let Some(LayoutNode::Content {
+            content: compi_protocol::PaneContent::Files(content),
+            ..
+        }) = leaf_node(&tab.layout, pane_id)
+        else {
             return Err("Pane shows a terminal, not files".into());
         };
         if content.active_file() != Some(file.as_str()) {
@@ -685,7 +693,11 @@ impl CompiApp {
                 "Tab is not visible in the selected window; choose the window that owns it".into(),
             );
         }
-        let Some(LayoutNode::Content { content, .. }) = leaf_node(&tab.layout, pane_id) else {
+        let Some(LayoutNode::Content {
+            content: compi_protocol::PaneContent::Files(content),
+            ..
+        }) = leaf_node(&tab.layout, pane_id)
+        else {
             return Err("Pane shows a terminal, not files".into());
         };
         // The CLI's change put the file's tab in Diff mode at `scope`; `path` is

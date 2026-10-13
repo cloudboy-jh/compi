@@ -111,6 +111,9 @@ impl CompiApp {
                 content: true,
             });
         }
+        if self.focused_pane_content().is_some() {
+            return Err("Settings has no folder; select a terminal or a files pane");
+        }
         let view = self.focused_view().ok_or("Select a pane first")?;
         let surface = self
             .workspace

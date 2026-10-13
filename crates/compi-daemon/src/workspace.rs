@@ -855,6 +855,35 @@ fn apply_mutation(
             workspace.surfaces.push(surface);
             Ok("starting".into())
         }
+        WorkspaceMutation::CreateContentTab {
+            session_id,
+            label,
+            content,
+        } => {
+            validate_label(label, false).map_err(invalid)?;
+            validate_content(content).map_err(invalid)?;
+            let tab_id = TabId::new(allocate("tab", ordinal));
+            let pane_id = PaneId::new(allocate("pane", ordinal));
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| &session.id == session_id)
+                .ok_or_else(|| invalid(format!("session {session_id} was not found")))?;
+            session.tabs.push(WorkspaceTab {
+                id: tab_id.clone(),
+                label: label.clone(),
+                layout: LayoutNode::Content {
+                    pane_id: pane_id.clone(),
+                    content: content.clone(),
+                },
+                previous_layout: None,
+                merge: None,
+            });
+            affected_sessions.push(session_id.clone());
+            affected_tabs.push(tab_id);
+            affected_panes.push(pane_id);
+            Ok("committed".into())
+        }
         WorkspaceMutation::RenameTab { tab_id, label } => {
             validate_label(label, false).map_err(invalid)?;
             let tab = find_tab_mut(&mut workspace.sessions, tab_id)
@@ -955,6 +984,12 @@ fn apply_mutation(
                     "pane {pane_id} is a terminal, not a content pane"
                 )));
             };
+            if !current.same_kind(content) {
+                return Err(invalid(format!(
+                    "pane {pane_id} shows {}; an update cannot change what kind of content it shows",
+                    content_kind(current)
+                )));
+            }
             affected_tabs.push(tab.id.clone());
             if current == content {
                 return Ok("unchanged".into());
@@ -1857,11 +1892,14 @@ fn validate_split_geometry(
 }
 
 /// Content paths must be absolute where they live: on this host, or inside a WSL
-/// distribution, which only a Windows host can reach.
+/// distribution, which only a Windows host can reach. Settings carries no paths.
 fn validate_content(content: &PaneContent) -> Result<(), String> {
     content.validate()?;
-    let mut paths = std::iter::once(content.root.as_str()).chain(content.files());
-    match &content.environment {
+    let PaneContent::Files(folder) = content else {
+        return Ok(());
+    };
+    let mut paths = std::iter::once(folder.root.as_str()).chain(folder.files());
+    match &folder.environment {
         ContentEnvironment::Host => {
             if let Some(path) = paths.find(|path| !std::path::Path::new(path).is_absolute()) {
                 return Err(format!("content path {path} is not absolute on this host"));
@@ -1877,6 +1915,14 @@ fn validate_content(content: &PaneContent) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The wire name of what `content` shows, for messages.
+fn content_kind(content: &PaneContent) -> &'static str {
+    match content {
+        PaneContent::Files(_) => "files",
+        PaneContent::Settings(_) => "settings",
+    }
 }
 
 fn validate_launch_context(context: &compi_protocol::LaunchContext) -> Result<(), String> {
@@ -2224,7 +2270,7 @@ fn disconnected(_: mpsc::RecvError) -> ActorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::ContentTab;
+    use compi_protocol::{ContentTab, FolderContent, SettingsContent, SettingsSection};
     use std::time::Instant;
 
     fn lifecycle_consent(actor: &WorkspaceActor) -> compi_protocol::LifecycleConsent {
@@ -4203,15 +4249,23 @@ mod tests {
     }
 
     /// A folder and files whose paths are absolute on every test host.
-    fn host_content(files: &[&str]) -> PaneContent {
+    fn host_folder(files: &[&str]) -> FolderContent {
         let root = std::env::temp_dir().join("compi-content-project");
         let file = |name: &str| ContentTab::edit(root.join(name).to_string_lossy());
-        PaneContent {
+        FolderContent {
             environment: ContentEnvironment::Host,
             root: root.to_string_lossy().into_owned(),
             tabs: files.iter().map(|name| file(name)).collect(),
             active: files.first().map(|name| file(name)),
         }
+    }
+
+    fn host_content(files: &[&str]) -> PaneContent {
+        PaneContent::Files(host_folder(files))
+    }
+
+    fn settings_content(section: SettingsSection) -> PaneContent {
+        PaneContent::Settings(SettingsContent { section })
     }
 
     fn open_content(pane_id: &PaneId, content: PaneContent) -> WorkspaceMutation {
@@ -4375,37 +4429,37 @@ mod tests {
         ));
         assert!(message.contains("minimum-sized"), "{message}");
 
-        let relative_root = PaneContent {
+        let relative_root = PaneContent::Files(FolderContent {
             root: "relative/project".into(),
-            ..host_content(&[])
-        };
+            ..host_folder(&[])
+        });
         let message = reject(open(
             "content-relative-root",
             open_content(&terminal, relative_root),
         ));
         assert!(message.contains("not absolute"), "{message}");
 
-        let relative_file = PaneContent {
+        let relative_file = PaneContent::Files(FolderContent {
             tabs: vec![ContentTab::edit("notes.txt")],
-            ..host_content(&[])
-        };
+            ..host_folder(&[])
+        });
         let message = reject(open(
             "content-relative-file",
             open_content(&terminal, relative_file),
         ));
         assert!(message.contains("notes.txt"), "{message}");
 
-        let unopened_active = PaneContent {
-            active: host_content(&["b.rs"]).active,
-            ..host_content(&["a.rs"])
-        };
+        let unopened_active = PaneContent::Files(FolderContent {
+            active: host_folder(&["b.rs"]).active,
+            ..host_folder(&["a.rs"])
+        });
         let message = reject(open(
             "content-unopened-active",
             open_content(&terminal, unopened_active),
         ));
         assert!(message.contains("active tab"), "{message}");
 
-        let wsl = PaneContent {
+        let wsl = FolderContent {
             environment: ContentEnvironment::Wsl {
                 distribution: "Ubuntu".into(),
             },
@@ -4414,14 +4468,17 @@ mod tests {
             active: None,
         };
         if cfg!(windows) {
-            let relative = PaneContent {
+            let relative = PaneContent::Files(FolderContent {
                 root: "home/user/project".into(),
                 ..wsl
-            };
+            });
             let message = reject(open("content-wsl", open_content(&terminal, relative)));
             assert!(message.contains("must start with '/'"), "{message}");
         } else {
-            let message = reject(open("content-wsl", open_content(&terminal, wsl)));
+            let message = reject(open(
+                "content-wsl",
+                open_content(&terminal, PaneContent::Files(wsl)),
+            ));
             assert_eq!(message, "WSL content is only available on Windows hosts");
         }
 
@@ -4521,10 +4578,10 @@ mod tests {
         let error = update(
             "update-invalid",
             &content_pane,
-            &PaneContent {
+            &PaneContent::Files(FolderContent {
                 root: "relative".into(),
-                ..two_files.clone()
-            },
+                ..host_folder(&["a.rs", "b.rs"])
+            }),
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
@@ -4808,6 +4865,181 @@ mod tests {
                 "tab {tab_id} holds a content pane; growing a tab sizes panes in terminal cells, so close or move the content pane first"
             )
         );
+        assert_eq!(actor.snapshot().unwrap(), before);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn settings_opens_as_a_content_pane_and_changes_section() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let before = actor.snapshot().unwrap();
+        let terminal_leaf = before.sessions[0].tabs[0].layout.clone();
+        let appearance = settings_content(SettingsSection::Appearance);
+        let receipt = mutate_current(
+            &actor,
+            "open-settings",
+            open_content(&terminal, appearance.clone()),
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert!(receipt.affected_surfaces.is_empty());
+        let settings_pane = receipt.affected_panes[1].clone();
+        let shown = |content: &PaneContent| LayoutNode::Content {
+            pane_id: settings_pane.clone(),
+            content: content.clone(),
+        };
+        let opened = actor.snapshot().unwrap();
+        assert_eq!(
+            opened.sessions[0].tabs[0].layout,
+            LayoutNode::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(terminal_leaf),
+                second: Box::new(shown(&appearance)),
+            }
+        );
+        assert_eq!(opened.surfaces, before.surfaces);
+        assert_eq!(
+            opened.surface(&surface.id).unwrap().status,
+            SurfaceStatus::Running
+        );
+
+        let terminal_section = settings_content(SettingsSection::Terminal);
+        let receipt = mutate_current(
+            &actor,
+            "settings-section",
+            WorkspaceMutation::UpdateContent {
+                pane_id: settings_pane.clone(),
+                content: terminal_section.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(receipt.affected_panes, vec![settings_pane.clone()]);
+        assert_eq!(
+            leaf_node(
+                &actor.snapshot().unwrap().sessions[0].tabs[0].layout,
+                &settings_pane
+            ),
+            shown(&terminal_section)
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_content_tab_holds_one_content_pane_and_starts_no_shell() {
+        let (actor, effects, _, _) = running_terminal();
+        let before = actor.snapshot().unwrap();
+        let session_id = before.sessions[0].id.clone();
+        let content = settings_content(SettingsSection::Interface);
+        let receipt = mutate_current(
+            &actor,
+            "settings-tab",
+            WorkspaceMutation::CreateContentTab {
+                session_id,
+                label: String::new(),
+                content: content.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert!(receipt.affected_surfaces.is_empty());
+        let after = actor.snapshot().unwrap();
+        let tab = after.sessions[0].tabs.last().unwrap();
+        assert_eq!(receipt.affected_tabs, vec![tab.id.clone()]);
+        assert_eq!(
+            tab.layout,
+            LayoutNode::Content {
+                pane_id: receipt.affected_panes[0].clone(),
+                content,
+            }
+        );
+        assert_eq!(after.surfaces, before.surfaces);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn updates_cannot_change_what_kind_of_content_a_pane_shows() {
+        let (actor, effects, _, terminal) = running_terminal();
+        let files_pane = mutate_current(
+            &actor,
+            "open-files",
+            open_content(&terminal, host_content(&["a.rs"])),
+        )
+        .unwrap()
+        .affected_panes[1]
+            .clone();
+        let settings_pane = mutate_current(
+            &actor,
+            "open-settings",
+            open_content(&terminal, settings_content(SettingsSection::Keyboard)),
+        )
+        .unwrap()
+        .affected_panes[1]
+            .clone();
+        let before = actor.snapshot().unwrap();
+        for (id, pane_id, content, shows) in [
+            (
+                "files-to-settings",
+                &files_pane,
+                settings_content(SettingsSection::Appearance),
+                "files",
+            ),
+            (
+                "settings-to-files",
+                &settings_pane,
+                host_content(&["a.rs"]),
+                "settings",
+            ),
+        ] {
+            let error = actor
+                .mutate(request(
+                    &actor,
+                    id,
+                    before.revision,
+                    WorkspaceMutation::UpdateContent {
+                        pane_id: pane_id.clone(),
+                        content,
+                    },
+                ))
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{id}");
+            assert_eq!(
+                error.message,
+                format!(
+                    "pane {pane_id} shows {shows}; an update cannot change what kind of content it shows"
+                )
+            );
+            assert_eq!(actor.snapshot().unwrap(), before, "{id}");
+        }
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn growing_a_tab_with_settings_is_refused() {
+        let (actor, effects, _, terminal) = running_terminal();
+        mutate_current(
+            &actor,
+            "open-settings",
+            open_content(&terminal, settings_content(SettingsSection::Appearance)),
+        )
+        .unwrap();
+        let before = actor.snapshot().unwrap();
+        let tab_id = before.sessions[0].tabs[0].id.clone();
+        let error = actor
+            .mutate(request(
+                &actor,
+                "grow-settings",
+                before.revision,
+                WorkspaceMutation::GrowTab {
+                    tab_id: tab_id.clone(),
+                    layout: PlannedLayoutNode::NewPane,
+                    working_directory: None,
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("holds a content pane"), "{error}");
         assert_eq!(actor.snapshot().unwrap(), before);
         assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
     }

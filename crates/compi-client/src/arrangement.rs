@@ -692,7 +692,7 @@ fn equalize_shape(shape: &Shape) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::{ContentEnvironment, PaneContent, SurfaceId};
+    use compi_protocol::{ContentEnvironment, FolderContent, PaneContent, SurfaceId};
 
     fn pane(id: &str) -> LayoutNode {
         LayoutNode::Pane {
@@ -1038,12 +1038,12 @@ mod tests {
     fn content_panes_keep_their_content_when_swapped_and_arranged() {
         let content = LayoutNode::Content {
             pane_id: PaneId::new("notes"),
-            content: PaneContent {
+            content: PaneContent::Files(FolderContent {
                 environment: ContentEnvironment::Host,
                 root: "/work".into(),
                 tabs: vec![compi_protocol::ContentTab::edit("/work/a.md")],
                 active: Some(compi_protocol::ContentTab::edit("/work/a.md")),
-            },
+            }),
         };
         let tree = split(SplitAxis::Horizontal, 0.5, pane("a"), content.clone());
         let swapped = swap(&tree, &PaneId::new("a"), &PaneId::new("notes")).unwrap();

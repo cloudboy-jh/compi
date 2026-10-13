@@ -34,7 +34,7 @@ enum ThemeFilter {
     Favorites,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum CatalogTarget {
     Terminal,
     #[default]
@@ -70,12 +70,12 @@ impl CompiApp {
         scope: SettingsScope,
         target: CatalogTarget,
     ) {
-        let parent = if matches!(self.overlay, Some(Overlay::Settings)) {
-            Some(CatalogReturn::Settings)
-        } else if self.popup == Some(Popup::QuickAppearance) {
+        let parent = if self.popup == Some(Popup::QuickAppearance) {
             Some(CatalogReturn::QuickAppearance)
         } else {
-            None
+            self.focused_pane()
+                .filter(|pane| self.settings_content(pane).is_some())
+                .map(|pane| CatalogReturn::Settings(pane.clone()))
         };
         let original = self.accepted_appearance();
         let accepted = if scope == SettingsScope::Global {

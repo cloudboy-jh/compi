@@ -5,9 +5,9 @@ mod kitty;
 
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::{
-    ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, LayoutNode,
-    PROTOCOL_VERSION, PaneContent, ScreenSnapshot, ServerEvent, ServerMessage, SplitAxis,
-    SplitGeometry, SurfaceId, SurfaceInfo, SurfaceStatus, WorkspaceMutation,
+    ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, FolderContent,
+    LayoutNode, PROTOCOL_VERSION, PaneContent, ScreenSnapshot, ServerEvent, ServerMessage,
+    SplitAxis, SplitGeometry, SurfaceId, SurfaceInfo, SurfaceStatus, WorkspaceMutation,
 };
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -686,12 +686,12 @@ fn content_pane_survives_daemon_restart_and_closes_without_a_process() {
         .clone();
     let project = daemon.directory.join("project");
     let notes = project.join("notes.md").to_string_lossy().into_owned();
-    let content = PaneContent {
+    let content = PaneContent::Files(FolderContent {
         environment: ContentEnvironment::Host,
         root: project.to_string_lossy().into_owned(),
         tabs: vec![compi_protocol::ContentTab::edit(notes.clone())],
         active: Some(compi_protocol::ContentTab::edit(notes)),
-    };
+    });
     let opened = control
         .mutate(WorkspaceMutation::OpenContent {
             pane_id: terminal.clone(),

@@ -915,12 +915,12 @@ mod tests {
     fn close_actions_cover_the_dirty_files_they_drop() {
         let pane = |id: &str| LayoutNode::Content {
             pane_id: PaneId::new(id),
-            content: PaneContent {
+            content: PaneContent::Files(compi_protocol::FolderContent {
                 environment: ContentEnvironment::Host,
                 root: "/work".into(),
                 tabs: Vec::new(),
                 active: None,
-            },
+            }),
         };
         let tab = |id: &str, layout| WorkspaceTab {
             id: TabId::new(id),

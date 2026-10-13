@@ -4,9 +4,9 @@ use crate::connection::ConnectionTarget;
 use crate::console;
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use compi_protocol::{
-    ClientMessage, ContentEnvironment, LayoutNode, PaneContent, PaneId, ScreenMessage,
-    ServerMessage, SessionId, SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabId,
-    WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
+    ClientMessage, ContentEnvironment, FolderContent, LayoutNode, PaneContent, PaneId,
+    ScreenMessage, ServerMessage, SessionId, SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus,
+    TabId, WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -256,7 +256,15 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
                         .surface(&surface_id)
                         .ok_or("pane surface is missing")?,
                 ),
-                LayoutNode::Content { content, .. } => content.environment,
+                LayoutNode::Content {
+                    content: PaneContent::Files(folder),
+                    ..
+                } => folder.environment,
+                // Settings has no folder; files beside it are the daemon host's.
+                LayoutNode::Content {
+                    content: PaneContent::Settings(_),
+                    ..
+                } => ContentEnvironment::Host,
                 LayoutNode::Split { .. } => unreachable!("leaves holds only leaf nodes"),
             };
             let (content, down) = content_arguments(&args[2..], environment, true)?;
@@ -280,13 +288,28 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
         }
         Some("update-content") if args.len() >= 3 => {
             let pane_id = PaneId::new(args[1].clone());
-            let LayoutNode::Content { content, .. } = find_leaf(&workspace, &pane_id)? else {
-                return Err(format!(
-                    "pane {pane_id} is a terminal pane; update-content needs a content pane"
-                )
-                .into());
+            let folder = match find_leaf(&workspace, &pane_id)? {
+                LayoutNode::Content {
+                    content: PaneContent::Files(folder),
+                    ..
+                } => folder,
+                LayoutNode::Content {
+                    content: PaneContent::Settings(_),
+                    ..
+                } => {
+                    return Err(format!(
+                        "pane {pane_id} shows Settings; update-content needs a content pane showing files"
+                    )
+                    .into());
+                }
+                _ => {
+                    return Err(format!(
+                        "pane {pane_id} is a terminal pane; update-content needs a content pane"
+                    )
+                    .into());
+                }
             };
-            let (content, _) = content_arguments(&args[2..], content.environment, false)?;
+            let (content, _) = content_arguments(&args[2..], folder.environment, false)?;
             WorkspaceMutation::UpdateContent { pane_id, content }
         }
         Some("remove") if args.len() == 2 => WorkspaceMutation::RemovePane {
@@ -385,7 +408,7 @@ fn content_arguments(
             _ => return Err(format!("unknown or repeated content option {option:?}").into()),
         }
     }
-    let content = PaneContent {
+    let content = PaneContent::Files(FolderContent {
         environment,
         root,
         tabs: files
@@ -393,7 +416,7 @@ fn content_arguments(
             .map(compi_protocol::ContentTab::edit)
             .collect(),
         active: active_file.map(compi_protocol::ContentTab::edit),
-    };
+    });
     content.validate()?;
     Ok((content, down))
 }

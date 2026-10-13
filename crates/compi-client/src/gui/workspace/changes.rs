@@ -1217,12 +1217,12 @@ impl CompiApp {
             self.show_changes_list(&pane_id, window, cx);
             return;
         }
-        let content = PaneContent {
+        let content = PaneContent::Files(compi_protocol::FolderContent {
             environment: environment.clone(),
             root: listing.repo.clone(),
             tabs: Vec::new(),
             active: None,
-        };
+        });
         if self.open_content_beside(beside, content) {
             self.content.changes_seed = Some((environment, listing));
         }

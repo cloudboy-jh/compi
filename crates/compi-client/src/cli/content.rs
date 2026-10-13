@@ -4,8 +4,9 @@
 use super::{CliError, Options, Output, pane_surface, submit, targets};
 use crate::{DaemonClient, arrangement, cli_window::Action, connection::ConnectionTarget};
 use compi_protocol::{
-    ContentEnvironment, ContentTab, LayoutNode, MutationReceipt, PaneContent, PaneId, SplitAxis,
-    SplitGeometry, SurfaceInfo, WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
+    ContentEnvironment, ContentTab, FolderContent, LayoutNode, MutationReceipt, PaneContent,
+    PaneId, SplitAxis, SplitGeometry, SurfaceInfo, WorkspaceMutation, WorkspaceSnapshot,
+    WorkspaceTab,
 };
 use serde_json::{Value, json};
 
@@ -28,7 +29,7 @@ pub(super) struct Caller<'a> {
     pub id: PaneId,
     pub tab: &'a WorkspaceTab,
     pub environment: ContentEnvironment,
-    /// The caller's terminal; `None` when the caller is a content pane.
+    /// The caller's terminal; `None` when the caller is a files content pane.
     pub surface: Option<&'a SurfaceInfo>,
     /// The shell's directory (or a content pane's root), normalised.
     pub directory: Option<String>,
@@ -119,7 +120,8 @@ pub(super) fn run(
     Ok(Output::Report { text, value })
 }
 
-/// The selected pane (the calling shell by default), its environment and directory.
+/// The selected pane (the calling shell by default), its environment and directory. A
+/// Settings pane has neither, so it cannot be the caller.
 pub(super) fn caller<'a>(
     client: &mut DaemonClient,
     state: &'a WorkspaceSnapshot,
@@ -137,11 +139,23 @@ pub(super) fn caller<'a>(
             let base = shell_directory(client, options, surface, &environment)?;
             (environment, Some(surface), base)
         }
-        LayoutNode::Content { content, .. } => (
-            content.environment.clone(),
-            None,
-            Some(content.root.clone()),
-        ),
+        LayoutNode::Content {
+            content: PaneContent::Files(folder),
+            ..
+        } => (folder.environment.clone(), None, Some(folder.root.clone())),
+        LayoutNode::Content {
+            content: PaneContent::Settings(_),
+            ..
+        } => {
+            let command = options.args.first().map_or("this command", String::as_str);
+            return Err(CliError::new(
+                3,
+                "files_pane_required",
+                format!(
+                    "pane {id} shows Settings; {command} needs a terminal pane or a content pane showing files"
+                ),
+            ));
+        }
         LayoutNode::Split { .. } => unreachable!("targets resolve only leaf nodes"),
     };
     // Paths are in the environment's syntax, which is Windows only for a Windows host.
@@ -214,7 +228,7 @@ pub(super) fn place(
                 state,
                 WorkspaceMutation::UpdateContent {
                     pane_id: pane_id.clone(),
-                    content,
+                    content: PaneContent::Files(content),
                 },
                 None,
             )?)
@@ -230,13 +244,13 @@ pub(super) fn place(
         .expect("a content pane caller is always reused, never split");
     let environment = caller.environment.clone();
     let content = match show {
-        Show::Folder(folder) => PaneContent {
+        Show::Folder(folder) => FolderContent {
             environment,
             root: folder.clone(),
             tabs: Vec::new(),
             active: None,
         },
-        Show::Tab { tab, root, .. } => PaneContent {
+        Show::Tab { tab, root, .. } => FolderContent {
             environment,
             root: root.clone(),
             tabs: vec![tab.clone()],
@@ -251,7 +265,7 @@ pub(super) fn place(
             pane_id: caller.id.clone(),
             axis: SplitAxis::Horizontal,
             geometry: geometry(surface)?,
-            content,
+            content: PaneContent::Files(content),
         },
         None,
     )?;
@@ -358,20 +372,24 @@ fn geometry(surface: &SurfaceInfo) -> Result<SplitGeometry, CliError> {
     Ok(geometry)
 }
 
-/// The content pane in `layout` to show `show` in: `caller` itself when it is a content
-/// pane; else one in `environment` whose root is the folder, or for a tab the one whose
-/// root holds its file (and lies within its `within` folder), preferring one with the tab
-/// open, then the deepest root.
+/// The files content pane in `layout` to show `show` in: `caller` itself when it is one;
+/// else one in `environment` whose root is the folder, or for a tab the one whose root
+/// holds its file (and lies within its `within` folder), preferring one with the tab open,
+/// then the deepest root. A Settings pane never shows files.
 fn reusable(
     layout: &LayoutNode,
     caller: &PaneId,
     environment: &ContentEnvironment,
     show: &Show,
     windows: bool,
-) -> Option<(PaneId, PaneContent)> {
-    let mut best: Option<((bool, usize), PaneId, PaneContent)> = None;
+) -> Option<(PaneId, FolderContent)> {
+    let mut best: Option<((bool, usize), PaneId, FolderContent)> = None;
     for leaf in arrangement::leaves(layout) {
-        let LayoutNode::Content { pane_id, content } = leaf else {
+        let LayoutNode::Content {
+            pane_id,
+            content: PaneContent::Files(content),
+        } = leaf
+        else {
             continue;
         };
         if &pane_id == caller {
@@ -402,7 +420,7 @@ fn reusable(
 }
 
 /// Where normalised `file` is open among `content`'s tabs, in either mode.
-fn open_tab(content: &PaneContent, file: &str, windows: bool) -> Option<usize> {
+fn open_tab(content: &FolderContent, file: &str, windows: bool) -> Option<usize> {
     content
         .tabs
         .iter()
@@ -508,7 +526,7 @@ mod tests {
         let content = |pane: &str, root: &str, files: &[&str], distribution: Option<&str>| {
             LayoutNode::Content {
                 pane_id: PaneId::new(pane),
-                content: PaneContent {
+                content: PaneContent::Files(FolderContent {
                     environment: distribution.map_or(ContentEnvironment::Host, |name| {
                         ContentEnvironment::Wsl {
                             distribution: name.into(),
@@ -517,7 +535,7 @@ mod tests {
                     root: root.into(),
                     tabs: files.iter().map(|file| ContentTab::edit(*file)).collect(),
                     active: None,
-                },
+                }),
             }
         };
         let split = |first, second| LayoutNode::Split {
@@ -526,12 +544,19 @@ mod tests {
             first: Box::new(first),
             second: Box::new(second),
         };
+        let settings = LayoutNode::Content {
+            pane_id: PaneId::new("settings"),
+            content: PaneContent::Settings(compi_protocol::SettingsContent::default()),
+        };
         let layout = split(
             split(
-                LayoutNode::Pane {
-                    pane_id: PaneId::new("terminal"),
-                    surface_id: SurfaceId::new("surface"),
-                },
+                split(
+                    LayoutNode::Pane {
+                        pane_id: PaneId::new("terminal"),
+                        surface_id: SurfaceId::new("surface"),
+                    },
+                    settings,
+                ),
                 content("wsl", "/home/me/proj", &[], Some("Ubuntu")),
             ),
             split(
@@ -593,5 +618,11 @@ mod tests {
         // A diff goes to a pane inside its repository, even when another has the file open.
         assert_eq!(pick("terminal", diff("src/lib.rs")).as_deref(), Some("src"));
         assert_eq!(pick("terminal", diff("README.md")).as_deref(), Some("proj"));
+        // Settings never shows files, even when it is the caller.
+        assert_eq!(pick("settings", file("/srv/x")), None);
+        assert_eq!(
+            pick("settings", Show::Folder("/home/me/proj".into())).as_deref(),
+            Some("proj")
+        );
     }
 }

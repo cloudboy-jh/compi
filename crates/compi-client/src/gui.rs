@@ -13,7 +13,7 @@ use crate::selection::{GridPoint, Selection, line_selection, selected_text, word
 use crate::theme::{BackgroundEffect, TerminalPalette, ThemeColors, ThemeDefinition, ThemeId};
 use crate::theme_store::ThemeLibrary;
 use compi_protocol::{
-    LayoutNode, MutationId, MutationRequest, PaneId, SessionId, SplitAxis, TabId,
+    LayoutNode, MutationId, MutationRequest, PaneId, SessionId, SettingsSection, SplitAxis, TabId,
     WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
 mod brand;
@@ -808,42 +808,6 @@ enum SettingsScope {
     Global,
     Window,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SettingsSection {
-    #[default]
-    Appearance,
-    Interface,
-    Terminal,
-    Keyboard,
-    Performance,
-    Updates,
-    Advanced,
-}
-
-impl SettingsSection {
-    const ALL: [Self; 7] = [
-        Self::Appearance,
-        Self::Interface,
-        Self::Terminal,
-        Self::Keyboard,
-        Self::Performance,
-        Self::Updates,
-        Self::Advanced,
-    ];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Appearance => "Appearance",
-            Self::Interface => "Interface",
-            Self::Terminal => "Terminal",
-            Self::Keyboard => "Keyboard",
-            Self::Performance => "Performance",
-            Self::Updates => "Updates",
-            Self::Advanced => "Advanced",
-        }
-    }
-}
-
 struct CompiApp {
     started_at: Instant,
     target: ConnectionTarget,
@@ -939,14 +903,13 @@ struct CompiApp {
     overlay_focus: usize,
     overlay_generation: u64,
     overlay_closing_since: Option<Instant>,
-    settings_section: SettingsSection,
+    /// Settings panes, Quick Appearance and their keyboard highlight; see `settings`.
+    settings: workspace::settings::SettingsUi,
     popup: Option<Popup>,
     /// A menu at the pointer: a right-click, a pane's grip.
     context_menu: Option<controls::ContextMenu>,
     /// The tab menu, with its Panes group.
     tab_menu: Option<workspace::menus::TabMenu>,
-    pub(in crate::gui) settings_scroll_bounds: Option<Bounds<Pixels>>,
-    pub(in crate::gui) settings_scroll_to_focus: bool,
     prompt_settings: workspace::prompt::PromptSettingsState,
     performance_enabled: Arc<AtomicBool>,
     performance: workspace::performance::PerformanceMonitor,
@@ -1006,9 +969,14 @@ impl CompiApp {
         self.state.focused_pane(self.workspace.as_ref()?)
     }
 
-    /// The focused pane's content, if it is a content pane.
-    fn focused_content(&self) -> Option<&compi_protocol::PaneContent> {
+    /// The focused pane's folder and files, if it is a content pane showing files.
+    fn focused_content(&self) -> Option<&compi_protocol::FolderContent> {
         workspace::content::find_content(self.workspace.as_ref()?, self.focused_pane()?)
+    }
+
+    /// What the focused pane shows, if it is a content pane of any kind.
+    fn focused_pane_content(&self) -> Option<&compi_protocol::PaneContent> {
+        workspace::content::find_pane_content(self.workspace.as_ref()?, self.focused_pane()?)
     }
     fn refresh_typography(&mut self, window: &Window) -> bool {
         let scale = window.scale_factor();

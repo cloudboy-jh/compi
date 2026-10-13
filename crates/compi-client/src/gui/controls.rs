@@ -310,6 +310,8 @@ pub(super) struct Control {
     /// An unselected option of a segmented switch: muted text.
     quiet: bool,
     tab_stop: bool,
+    /// The menu this button opened is showing: its tooltip would cover the menu.
+    menu_open: bool,
     on_click: Option<ClickHandler>,
 }
 
@@ -347,6 +349,7 @@ impl Control {
             selected: false,
             quiet: false,
             tab_stop: true,
+            menu_open: false,
             on_click: None,
         }
     }
@@ -384,6 +387,12 @@ impl Control {
     /// The tooltip's title. Icon buttons take it as their accessible name.
     pub(super) fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
         self.tooltip = Some(tooltip.into());
+        self
+    }
+
+    /// Hides the tooltip while the menu this button opened is showing.
+    pub(super) fn menu_open(mut self, open: bool) -> Self {
+        self.menu_open = open;
         self
     }
 
@@ -502,6 +511,7 @@ impl RenderOnce for Control {
                 .then(|| self.label.clone())
                 .flatten()
         });
+        let title = title.filter(|_| !self.menu_open);
         let detail = self.disabled.or(self.detail);
         let key = self.key;
         div()

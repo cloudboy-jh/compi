@@ -207,7 +207,13 @@ impl CompiApp {
             .into_any_element()
     }
 
-    pub(super) fn render_performance_section(&self, cx: &Context<Self>) -> AnyElement {
+    /// Settings → Performance: one row holding the measurements and their controls.
+    pub(super) fn render_performance_section(
+        &self,
+        row: &super::settings::RowCx,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use super::settings::SettingsAction;
         let colors = *self.colors();
         let cache = self.cache_metrics();
         let latest = self.performance.latest.as_ref();
@@ -237,7 +243,10 @@ impl CompiApp {
         let render = latest.map(|latest| &latest.render);
         let client = latest.map(|latest| &latest.client);
         let daemon = latest.map(|latest| &latest.daemon);
-        let fps_focused = self.overlay_focus == self.settings_content_focus(0);
+        let fps_focused = self.settings_focused(row, SettingsAction::ToggleFps);
+        let rebuild_focused = self.settings_focused(row, SettingsAction::RebuildRenderer);
+        let copy_focused = self.settings_focused(row, SettingsAction::CopyPerformance);
+        let (fps_row, rebuild_row, copy_row) = (row.clone(), row.clone(), row.clone());
         let cpu_label = |value: Option<f32>| {
             value.map_or_else(|| "Unavailable".into(), |value| format!("{value:.1}%"))
         };
@@ -261,7 +270,6 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_4()
-            .child(self.settings_heading("Performance"))
             .child(metric(
                 "Frame rate",
                 render.map_or_else(
@@ -333,7 +341,9 @@ impl CompiApp {
                     }))
                     .bg(color(toggle_background))
                     .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.focus_settings_control(&fps_row, SettingsAction::ToggleFps);
                         this.state.show_fps = !this.state.show_fps;
                         this.save_state();
                         cx.stop_propagation();
@@ -377,18 +387,19 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-rebuild-renderer",
                         "Rebuild renderer",
-                        self.overlay_focus == self.settings_content_focus(1),
+                        rebuild_focused,
                         false,
-                        cx.listener(|this, _, window, cx| {
+                        cx.listener(move |this, _, window, cx| {
+                            this.focus_settings_control(
+                                &rebuild_row,
+                                SettingsAction::RebuildRenderer,
+                            );
                             this.rebuild_renderer(window);
                             cx.stop_propagation();
                             cx.notify();
                         }),
                     ))
-                    .child(self.settings_focus_anchor(
-                        self.overlay_focus == self.settings_content_focus(1),
-                        cx,
-                    ))
+                    .child(self.settings_focus_anchor(rebuild_focused, cx))
                     .child(
                         div()
                             .w_full()
@@ -403,18 +414,16 @@ impl CompiApp {
                     .child(self.settings_action_button(
                         "settings-copy-performance",
                         "Copy diagnostics",
-                        self.overlay_focus == self.settings_content_focus(2),
+                        copy_focused,
                         false,
-                        cx.listener(|this, _, _, cx| {
+                        cx.listener(move |this, _, _, cx| {
+                            this.focus_settings_control(&copy_row, SettingsAction::CopyPerformance);
                             this.copy_performance_diagnostics(cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
                     ))
-                    .child(self.settings_focus_anchor(
-                        self.overlay_focus == self.settings_content_focus(2),
-                        cx,
-                    )),
+                    .child(self.settings_focus_anchor(copy_focused, cx)),
             )
             .when_some(self.performance_notice.clone(), |section, notice| {
                 section.child(
