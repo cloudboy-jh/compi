@@ -10,11 +10,10 @@ Done: phase 0, GPUI upgrade (`2e2b9fe`); phase 1, content panes (`4b458be`); pha
 
 - macOS qualification of the editor, file safety, the diff and Git work, and the three earlier macOS fixes; Windows-host and SSH file environments; IME in the editor; live TUI redraws through ConPTY with synchronized output.
 - Not seen live: the Recover unsaved edits list; moving a tab with unsaved edits to another window; the `e` expand-all key; the `conflicted` gutter label; the Stale notice; a hook error under the commit box; a confirmed discard; hunk staging through the UI on a `/mnt/c` repo.
-- Gaps to keep or drop: text selection in diffs; diff settings are not saved between sessions; tooltips can linger after a click changes the layout (GPUI); the Files tree's selection fill stops at the name and long folder names squeeze their icon; the tab strip scrolls sideways without an indicator; material-light's muted text is below AA (4.2:1 opaque, 2.8:1 with transparency).
+- Gaps to keep or drop: text selection in diffs; diff settings are not saved between sessions; tooltips can linger after a click changes the layout (GPUI); long folder names squeeze their icon in the Files tree; the tab strip scrolls sideways without an indicator; material-light's muted text is below AA (4.2:1 opaque, 2.8:1 with transparency).
 
 ## Next
 
-1. **README hero screenshot.** The text is rewritten ("The terminal you can live in.", sections in workflow order). The screenshot is still the old terminal-only one: replace `assets/compi-workspace.png` with Compi working on itself (an agent in a terminal, the editor with gutter marks, a split diff and the Changes list with the commit box) and update its alt text.
-2. **Program Status Protocol (OSC 7501)**, the next feature in the features doc.
+1. **Program Status Protocol (OSC 7501)**, the next feature in the features doc.
 
 Out of scope for Git: history graphs, interactive rebase, a stash UI, force-push, line-level staging.
