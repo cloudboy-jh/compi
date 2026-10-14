@@ -3834,12 +3834,21 @@ mod tests {
         let revision = actor.snapshot().unwrap().revision;
         observe_directory("/home/me/first");
         observe_directory(&project);
-        thread::sleep(Duration::from_millis(50));
+        // Each observation is its own write-through save, and the second waits behind the
+        // first. Wait for it on disk: dropping the actor discards anything still queued.
+        let saved = serde_json::to_string(&project).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&path).is_ok_and(|text| text.contains(&saved)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "last directory never saved"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         // Directory changes are saved without a client-visible revision.
         assert_eq!(actor.snapshot().unwrap().revision, revision);
         drop(actor);
         drop(effects);
-        thread::sleep(Duration::from_millis(50));
 
         // Restarting the daemon loses the shell; restarting it resumes in /home/me/project.
         let (store, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
