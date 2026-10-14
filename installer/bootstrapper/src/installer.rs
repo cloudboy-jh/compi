@@ -5,9 +5,9 @@ use crate::plain;
 use crate::transaction::{self, Event, Outcome, Readiness};
 use compi_client::theme::{ThemeColors, ThemePreset};
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div,
-    img, prelude::*, px, rgb, size,
+    App, Bounds, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render, SharedString,
+    Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img, prelude::*,
+    px, rgb, size,
 };
 use std::env;
 use std::mem::size_of;
@@ -203,7 +203,7 @@ fn shown(error: &crate::Error, log: &std::path::Path) -> String {
 }
 
 fn run_mode(launch: LaunchMode) {
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().run(move |cx: &mut App| {
         cx.bind_keys([
             gpui::KeyBinding::new("enter", PrimaryAction, Some("CompiInstaller")),
             gpui::KeyBinding::new("escape", CloseInstaller, Some("CompiInstaller")),
@@ -230,11 +230,11 @@ fn run_mode(launch: LaunchMode) {
         window
             .update(cx, |view, window, cx| {
                 window.on_window_should_close(cx, move |_, _| !close_guard.load(Ordering::Acquire));
-                window.focus(&view.focus_handle);
+                window.focus(&view.focus_handle, cx);
                 cx.activate(true);
             })
             .expect("failed to activate Compi Setup window");
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        cx.on_window_closed(|cx, _| cx.quit()).detach();
     });
 }
 
