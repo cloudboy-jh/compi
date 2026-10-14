@@ -8,12 +8,17 @@
 //!   holding still switches to the tab so an edge of one of its panes can be picked.
 //! - Over empty tab-bar space: release makes the pane its own tab.
 //!
+//! Only the zone under the pointer is drawn: the half an edge drop gives the pane,
+//! or the Swap box. A float moved by its title docks the same way into a pane of
+//! its own tab.
+//!
 //! Moving into another tab detaches the pane into its own tab first (unless it
 //! already is one), then merges that tab in; no process starts or ends, and a
 //! failure between the steps leaves the pane in its own tab. Escape cancels, and
-//! no PTY is resized until a move commits.
+//! no PTY is resized until a move commits and its landing (`motion`) ends.
 use super::*;
 use crate::arrangement::{self, DropZone};
+use gpui::{Animation, AnimationExt as _, ease_out_quint};
 
 /// The grip's hit area spans the top padding band, so it never covers a cell.
 const GRIP_WIDTH: f32 = 44.0;
@@ -25,6 +30,14 @@ const SWAP_SHARE: f32 = 0.3;
 const SWAP_MAX: f32 = 160.0;
 /// How long the pointer rests on a tab before the drag switches to it.
 const SPRING_LOAD_DELAY: Duration = Duration::from_millis(400);
+/// How long the drag card takes to lift off at pickup.
+const PICKUP_DURATION: Duration = Duration::from_millis(120);
+/// How far the drag card rises as it lifts.
+const PICKUP_RISE: f32 = 6.0;
+/// The accent fill of the zone under the pointer.
+const ZONE_FILL_ALPHA: f32 = 0.16;
+/// Numbers each pickup, so the drag card's lift plays once per drag.
+static NEXT_PICKUP: AtomicU64 = AtomicU64::new(0);
 
 pub(in crate::gui) struct PaneDrag {
     pane_id: PaneId,
@@ -40,18 +53,23 @@ pub(in crate::gui) struct PaneDrag {
     target: Option<DropTarget>,
     /// The unselected tab under the pointer, waiting for `SPRING_LOAD_DELAY`.
     spring: Option<TabId>,
+    pickup: u64,
 }
 
 enum DropTarget {
-    Pane {
-        pane_id: PaneId,
-        zone: DropZone,
-        /// Within the dragged pane's tab: the arrangement to commit. Across tabs the
-        /// tree is rebuilt from fresh state when the move commits.
-        layout: LayoutNode,
-    },
+    Pane(PaneTarget),
     Tab(TabId),
     NewTab,
+}
+
+/// A tiled pane under a dragged pane or float, the zone the pointer is in, and
+/// what a release there commits.
+pub(in crate::gui) struct PaneTarget {
+    pane_id: PaneId,
+    zone: DropZone,
+    /// Within the dragged pane's tab: the arrangement to commit. Across tabs the
+    /// tree is rebuilt from fresh state when the move commits.
+    layout: LayoutNode,
 }
 
 /// Where a pane moved into another tab goes.
@@ -168,6 +186,38 @@ fn placed(target: &LayoutNode, leaf: LayoutNode, placement: &Placement) -> Layou
     }
 }
 
+/// The tiled pane at `(x, y)` in terminal-area coordinates, other than `skip`,
+/// and the zone of it the point is in. `None` over gutters and empty space.
+fn pane_zone_at<'a>(
+    panes: &'a [layout::PaneLayout],
+    x: f32,
+    y: f32,
+    skip: &PaneId,
+    swap: bool,
+) -> Option<(&'a layout::PaneLayout, DropZone)> {
+    let target = panes
+        .iter()
+        .find(|pane| &pane.pane_id != skip && pane.rect.contains(layout::Point { x, y }))?;
+    let rect = target.rect;
+    let zone = zone_at(x - rect.x, y - rect.y, rect.width, rect.height, swap);
+    Some((target, zone))
+}
+
+/// `tree` with floating pane `float` docked at `zone` of `target`. An edge drop
+/// that would leave the tree as it is docks the float into its current tile;
+/// `None` when `float` is not in `tree` (it floats from another tab).
+fn dock_layout(
+    tree: &LayoutNode,
+    float: &PaneId,
+    target: &PaneId,
+    zone: DropZone,
+) -> Option<LayoutNode> {
+    if !layout_contains_pane(tree, float) || !layout_contains_pane(tree, target) {
+        return None;
+    }
+    Some(arrangement::drop_pane(tree, float, target, zone).unwrap_or_else(|| tree.clone()))
+}
+
 impl CompiApp {
     /// The `⋯` grip of tiled pane `index`, revealed while the pointer is over the pane
     /// (`group`). `width` is the pane's width.
@@ -265,6 +315,7 @@ impl CompiApp {
             moving: false,
             target: None,
             spring: None,
+            pickup: NEXT_PICKUP.fetch_add(1, Ordering::Relaxed),
         });
     }
 
@@ -281,11 +332,25 @@ impl CompiApp {
             return;
         }
         let hovered = self.tab_bar_target(position, window);
-        let target = match &hovered {
-            Some(Some(tab_id)) if tab_id == &drag.tab_id => None,
-            Some(Some(tab_id)) => Some(DropTarget::Tab(tab_id.clone())),
-            Some(None) => self.can_detach(drag).then_some(DropTarget::NewTab),
-            None => self.pane_drop_target(drag, position),
+        // Over the same pane and zone the target stands; nothing is recomputed.
+        let hit = if hovered.is_none() {
+            let across = self.selected_tab().is_some_and(|tab| tab.id != drag.tab_id);
+            self.zone_under(position, &drag.pane_id, !across)
+        } else {
+            None
+        };
+        let keep = hit
+            .as_ref()
+            .is_some_and(|hit| same_target(drag.target.as_ref(), hit));
+        let target = if keep {
+            None
+        } else {
+            match &hovered {
+                Some(Some(tab_id)) if tab_id == &drag.tab_id => None,
+                Some(Some(tab_id)) => Some(DropTarget::Tab(tab_id.clone())),
+                Some(None) => self.can_detach(drag).then_some(DropTarget::NewTab),
+                None => hit.and_then(|hit| self.pane_drop_target(drag, hit)),
+            }
         };
         let selected = self.selected_tab().map(|tab| tab.id.clone());
         let spring = match hovered {
@@ -297,7 +362,9 @@ impl CompiApp {
         };
         drag.moving = true;
         drag.position = position;
-        drag.target = target;
+        if !keep {
+            drag.target = target;
+        }
         if drag.spring != spring {
             drag.spring = spring.clone();
             if let Some(tab_id) = spring {
@@ -363,40 +430,107 @@ impl CompiApp {
             .is_some_and(|tab| matches!(tab.layout, LayoutNode::Split { .. }))
     }
 
-    /// The tiled pane under `position` (not the dragged one), the zone the pointer
-    /// is in, and the arrangement a drop there would commit.
-    fn pane_drop_target(&self, drag: &PaneDrag, position: Point<Pixels>) -> Option<DropTarget> {
-        let layout = self.visible_layout()?;
+    /// `position` in terminal-area coordinates: those of the tiled pane rects.
+    fn canvas_point(&self, position: Point<Pixels>) -> (f32, f32) {
         let offset = self.workspace_scroll.offset();
-        let x = f32::from(position.x - offset.x) - self.sidebar_extent();
-        let y = f32::from(position.y - offset.y) - CHROME_HEIGHT;
-        let target = layout.panes.iter().find(|pane| {
-            let rect = pane.rect;
-            pane.pane_id != drag.pane_id
-                && x >= rect.x
-                && x < rect.x + rect.width
-                && y >= rect.y
-                && y < rect.y + rect.height
-        })?;
+        (
+            f32::from(position.x - offset.x) - self.sidebar_extent(),
+            f32::from(position.y - offset.y) - CHROME_HEIGHT,
+        )
+    }
+
+    /// The visible tiled pane under `position` (not `skip`) and the zone the
+    /// pointer is in.
+    fn zone_under(
+        &self,
+        position: Point<Pixels>,
+        skip: &PaneId,
+        swap: bool,
+    ) -> Option<(PaneId, DropZone)> {
+        let layout = self.visible_layout()?;
+        let (x, y) = self.canvas_point(position);
+        pane_zone_at(&layout.panes, x, y, skip, swap)
+            .map(|(pane, zone)| (pane.pane_id.clone(), zone))
+    }
+
+    /// A drop of the dragged pane at `zone` of tiled pane `pane_id`, with the
+    /// arrangement it would commit.
+    fn pane_drop_target(
+        &self,
+        drag: &PaneDrag,
+        (pane_id, zone): (PaneId, DropZone),
+    ) -> Option<DropTarget> {
         let tab = self.selected_tab()?;
-        let across = tab.id != drag.tab_id;
-        let rect = target.rect;
-        let zone = zone_at(x - rect.x, y - rect.y, rect.width, rect.height, !across);
-        let layout = if across {
-            let leaf = drag.leaf.clone();
+        let layout = if tab.id != drag.tab_id {
             placed(
                 &tab.layout,
-                leaf,
-                &Placement::Beside(target.pane_id.clone(), zone),
+                drag.leaf.clone(),
+                &Placement::Beside(pane_id.clone(), zone),
             )
         } else {
-            arrangement::drop_pane(&tab.layout, &drag.pane_id, &target.pane_id, zone)?
+            arrangement::drop_pane(&tab.layout, &drag.pane_id, &pane_id, zone)?
         };
-        Some(DropTarget::Pane {
-            pane_id: target.pane_id.clone(),
+        Some(DropTarget::Pane(PaneTarget {
+            pane_id,
             zone,
             layout,
-        })
+        }))
+    }
+
+    /// While floating pane `float` is moved by its title: the pane of its own,
+    /// selected tab under the pointer that it would dock into. Floats of other
+    /// tabs never dock here.
+    pub(super) fn refresh_float_dock(&mut self, float: &PaneId, position: Point<Pixels>) {
+        let hit = self.zone_under(position, float, true);
+        let current = self.float_drag.as_ref().and_then(|drag| drag.dock.as_ref());
+        if let (Some(hit), Some(current)) = (&hit, current)
+            && current.pane_id == hit.0
+            && current.zone == hit.1
+        {
+            return;
+        }
+        let dock = hit.and_then(|(pane_id, zone)| {
+            let tab = self.selected_tab()?;
+            let layout = dock_layout(&tab.layout, float, &pane_id, zone)?;
+            Some(PaneTarget {
+                pane_id,
+                zone,
+                layout,
+            })
+        });
+        if let Some(drag) = &mut self.float_drag {
+            drag.dock = dock;
+        }
+    }
+
+    /// Release over a dock target: the float leaves its frame and takes its place
+    /// in the tab in one step, gliding there. The tree is rebuilt from the tab as
+    /// it is now; when the commit cannot be sent the float stays where it was let go.
+    pub(super) fn dock_float(&mut self, float: PaneId, target: PaneTarget) {
+        let Some(tab) = self.selected_tab() else {
+            return;
+        };
+        let Some(layout) = dock_layout(&tab.layout, &float, &target.pane_id, target.zone) else {
+            self.save_state();
+            return;
+        };
+        if layout != tab.layout {
+            let tab_id = tab.id.clone();
+            let arranged = self.mutate_in(
+                WorkspaceMutation::ArrangeTab {
+                    tab_id,
+                    layout: layout.clone(),
+                },
+                false,
+                None,
+            );
+            if arranged.is_none() {
+                self.save_state();
+                return;
+            }
+            self.preview_layout = Some(layout);
+        }
+        self.dock_pane(&float);
     }
 
     /// Release: a click opens the pane menu under the grip; a drag commits its target.
@@ -413,7 +547,7 @@ impl CompiApp {
         };
         let selected = self.selected_tab().map(|tab| tab.id.clone());
         match target {
-            DropTarget::Pane { layout, .. } if selected.as_ref() == Some(&drag.tab_id) => {
+            DropTarget::Pane(target) if selected.as_ref() == Some(&drag.tab_id) => {
                 if self
                     .tab_by_id(&drag.tab_id)
                     .is_none_or(|tab| tab.layout != drag.tree)
@@ -422,17 +556,28 @@ impl CompiApp {
                         Some("The tab changed while dragging; the move was cancelled".into());
                     return;
                 }
-                self.mutate(
+                let arranged = self.mutate_in(
                     WorkspaceMutation::ArrangeTab {
                         tab_id: drag.tab_id,
-                        layout,
+                        layout: target.layout.clone(),
                     },
                     false,
+                    None,
                 );
+                // Shown at once and landed while the daemon confirms it.
+                if arranged.is_some() {
+                    self.arm_landing();
+                    self.preview_layout = Some(target.layout);
+                    self.rebuild_layout(window, true);
+                }
             }
-            DropTarget::Pane { pane_id, zone, .. } => {
+            DropTarget::Pane(target) => {
                 if let Some(tab_id) = selected {
-                    self.move_pane_to_tab(drag.pane_id, tab_id, Placement::Beside(pane_id, zone));
+                    self.move_pane_to_tab(
+                        drag.pane_id,
+                        tab_id,
+                        Placement::Beside(target.pane_id, target.zone),
+                    );
                 }
             }
             DropTarget::Tab(tab_id) => {
@@ -460,6 +605,10 @@ impl CompiApp {
             return;
         }
         self.mutation_pending = true;
+        // Beside a pane of the shown tab, its panes glide aside when the merge lands.
+        if matches!(placement, Placement::Beside(..)) {
+            self.arm_landing();
+        }
         let sender = self.event_tx.clone();
         let target = self.target.clone();
         thread::spawn(move || {
@@ -535,7 +684,7 @@ impl CompiApp {
         match self.pane_drag.as_ref()?.target.as_ref()? {
             DropTarget::Tab(tab_id) => Some(Some(tab_id)),
             DropTarget::NewTab => Some(None),
-            DropTarget::Pane { .. } => None,
+            DropTarget::Pane(_) => None,
         }
     }
 
@@ -544,146 +693,135 @@ impl CompiApp {
         self.pane_drag.as_ref().is_some_and(|drag| drag.moving)
     }
 
-    /// While a pane is being moved: dim it where it was, and show the zones over
-    /// the pane under the pointer.
+    /// While a pane is being moved, its spot is dimmed under a veil.
     pub(super) fn decorate_dragged_pane(
         &self,
         pane: gpui::Stateful<gpui::Div>,
         pane_id: &PaneId,
-        width: f32,
-        height: f32,
     ) -> gpui::Stateful<gpui::Div> {
-        let Some(drag) = self.pane_drag.as_ref().filter(|drag| drag.moving) else {
+        if !self
+            .pane_drag
+            .as_ref()
+            .is_some_and(|drag| drag.moving && &drag.pane_id == pane_id)
+        {
             return pane;
-        };
-        if &drag.pane_id == pane_id {
-            return pane.child(div().absolute().inset_0().bg(material_color(
-                self.terminal_theme.terminal().background,
-                0.6,
-            )));
         }
-        let across = self.selected_tab().is_some_and(|tab| tab.id != drag.tab_id);
-        match &drag.target {
-            Some(DropTarget::Pane {
-                pane_id: target,
-                zone,
-                ..
-            }) if target == pane_id => {
-                pane.child(self.render_drop_zones(*zone, width, height, across))
-            }
-            _ => pane,
-        }
+        pane.child(div().absolute().inset_0().bg(material_color(
+            self.terminal_theme.terminal().background,
+            0.6,
+        )))
     }
 
-    /// Thin seams between the edge zones, the half an edge drop fills, and, within
-    /// the dragged pane's own tab, the Swap box. Only the hovered zone is filled.
-    fn render_drop_zones(
+    /// Over the split canvas while a pane or float is dragged onto a pane: only the
+    /// zone under the pointer, the half an edge drop gives it or the Swap box.
+    pub(super) fn render_drop_preview(
         &self,
-        hovered: DropZone,
-        width: f32,
-        height: f32,
-        across: bool,
-    ) -> AnyElement {
+        layout: &layout::WorkspaceLayout,
+    ) -> Option<AnyElement> {
+        let (target, swap) = match self.pane_drag.as_ref() {
+            Some(drag) => {
+                let Some(DropTarget::Pane(target)) = drag.target.as_ref().filter(|_| drag.moving)
+                else {
+                    return None;
+                };
+                let across = self.selected_tab().is_some_and(|tab| tab.id != drag.tab_id);
+                (target, !across)
+            }
+            None => {
+                let drag = self.float_drag.as_ref()?;
+                (drag.dock.as_ref()?, true)
+            }
+        };
+        let rect = layout.pane(&target.pane_id)?.rect;
         let colors = *self.colors();
         let accent = color(colors.accent);
-        let inner = swap_box(width, height, !across);
-        let swap = hovered == DropZone::Swap;
         let radius = if self.comfy() { PANE_RADIUS } else { 0.0 };
-        div()
-            .absolute()
-            .inset_0()
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, _| {
-                        let at =
-                            |x: f32, y: f32| point(bounds.left() + px(x), bounds.top() + px(y));
-                        // Each corner of the pane joins the matching Swap-box corner.
-                        let (w, h) = (width, height);
-                        let (l, t) = (inner.x, inner.y);
-                        let (r, b) = (inner.x + inner.width, inner.y + inner.height);
-                        let mut seams = PathBuilder::stroke(px(1.0));
-                        for ((ox, oy), (ix, iy)) in [
-                            ((0.0, 0.0), (l, t)),
-                            ((w, 0.0), (r, t)),
-                            ((0.0, h), (l, b)),
-                            ((w, h), (r, b)),
-                        ] {
-                            seams.move_to(at(ox, oy));
-                            seams.line_to(at(ix, iy));
-                        }
-                        if let Ok(path) = seams.build() {
-                            window.paint_path(path, accent.opacity(0.35));
-                        }
-                    },
-                )
-                .size_full(),
-            )
-            .when_some(landing_half(hovered, width, height), |zones, half| {
-                zones.child(
-                    div()
-                        .absolute()
-                        .left(px(half.x))
-                        .top(px(half.y))
-                        .w(px(half.width))
-                        .h(px(half.height))
-                        .rounded(px(radius))
+        let place = |area: layout::Rect| {
+            div()
+                .absolute()
+                .left(px(area.x))
+                .top(px(area.y))
+                .w(px(area.width))
+                .h(px(area.height))
+        };
+        let swapping = target.zone == DropZone::Swap;
+        let zone = landing_half(target.zone, rect.width, rect.height)
+            .unwrap_or_else(|| swap_box(rect.width, rect.height, swap));
+        let zone = layout::Rect {
+            x: rect.x + zone.x,
+            y: rect.y + zone.y,
+            ..zone
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(
+                    place(zone)
+                        .when(swapping, |zone| zone.rounded_md())
+                        .when(!swapping, |zone| zone.rounded(px(radius)))
                         .border_2()
                         .border_color(accent)
-                        .bg(accent.opacity(0.18)),
+                        .bg(accent.opacity(ZONE_FILL_ALPHA))
+                        .when(swapping, |zone| {
+                            zone.flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .text_color(color(colors.foreground))
+                                .child("Swap")
+                        }),
                 )
-            })
-            .when(!across, |zones| {
-                zones.child(
-                    div()
-                        .absolute()
-                        .left(px(inner.x))
-                        .top(px(inner.y))
-                        .w(px(inner.width))
-                        .h(px(inner.height))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(accent.opacity(if swap { 1.0 } else { 0.5 }))
-                        .when(swap, |swap_box| swap_box.bg(accent.opacity(0.3)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(UI_SMALL_TEXT_SIZE))
-                        .text_color(color(colors.foreground))
-                        .child("Swap"),
-                )
-            })
-            .into_any_element()
+                .into_any_element(),
+        )
     }
 
-    /// The card that follows the pointer while a pane is moved.
+    /// The card that follows the pointer while a pane is moved. It lifts off at
+    /// pickup, fading in as it rises; with reduced motion it is simply there.
     pub(super) fn render_pane_drag_card(&self) -> Option<AnyElement> {
         let drag = self.pane_drag.as_ref().filter(|drag| drag.moving)?;
         let colors = *self.colors();
         let (title, _) = self.floating_caption(&drag.pane_id);
+        // Below and right of the pointer, clear of the zone it is over.
+        let top = drag.position.y + px(22.0);
+        let card = div()
+            .absolute()
+            .left(drag.position.x + px(18.0))
+            .top(top)
+            .max_w(px(280.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .shadow_xl()
+            .bg(color(colors.surface))
+            .border_1()
+            .border_color(color(colors.accent))
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .text_color(color(colors.foreground))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(title);
+        if *focus::REDUCED_MOTION {
+            return Some(card.into_any_element());
+        }
         Some(
-            div()
-                .absolute()
-                // Below and right of the pointer, clear of the zone it is over.
-                .left(drag.position.x + px(18.0))
-                .top(drag.position.y + px(22.0))
-                .max_w(px(280.0))
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .shadow_lg()
-                .bg(color(colors.surface))
-                .border_1()
-                .border_color(color(colors.accent))
-                .text_size(px(UI_SMALL_TEXT_SIZE))
-                .text_color(color(colors.foreground))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .child(title)
-                .into_any_element(),
+            card.with_animation(
+                ("pane-drag-card", drag.pickup as usize),
+                Animation::new(PICKUP_DURATION).with_easing(ease_out_quint()),
+                move |card, progress| {
+                    card.opacity(0.4 + 0.6 * progress)
+                        .top(top + px(PICKUP_RISE * (1.0 - progress)))
+                },
+            )
+            .into_any_element(),
         )
     }
+}
+
+/// `target` already stands for the pane and zone in `hit`.
+fn same_target(target: Option<&DropTarget>, (pane_id, zone): &(PaneId, DropZone)) -> bool {
+    matches!(target, Some(DropTarget::Pane(target)) if &target.pane_id == pane_id && target.zone == *zone)
 }
 
 #[cfg(test)]
@@ -723,5 +861,88 @@ mod tests {
         assert_eq!(half(DropZone::Top), Some((0.0, 0.0, 800.0, 200.0)));
         assert_eq!(half(DropZone::Bottom), Some((0.0, 200.0, 800.0, 200.0)));
         assert_eq!(half(DropZone::Swap), None);
+    }
+
+    fn pane(id: &str) -> LayoutNode {
+        LayoutNode::Pane {
+            pane_id: PaneId::new(id),
+            surface_id: SurfaceId::new(format!("{id}-surface")),
+        }
+    }
+
+    fn tiled(id: &str, x: f32, width: f32) -> layout::PaneLayout {
+        let rect = layout::Rect {
+            x,
+            y: 0.0,
+            width,
+            height: 400.0,
+        };
+        layout::PaneLayout {
+            pane_id: PaneId::new(id),
+            surface_id: None,
+            rect,
+            canvas: rect,
+            parent_divider: None,
+        }
+    }
+
+    #[test]
+    fn the_zone_under_the_pointer_skips_the_moved_pane_and_gutters() {
+        // Two 500 px panes with a 6 px gutter between them.
+        let panes = [tiled("a", 0.0, 500.0), tiled("b", 506.0, 500.0)];
+        let at = |x, skip: &str| {
+            pane_zone_at(&panes, x, 200.0, &PaneId::new(skip), true)
+                .map(|(pane, zone)| (pane.pane_id.as_str().to_owned(), zone))
+        };
+        assert_eq!(at(756.0, "a"), Some(("b".into(), DropZone::Swap)));
+        assert_eq!(at(520.0, "a"), Some(("b".into(), DropZone::Left)));
+        assert_eq!(at(990.0, "a"), Some(("b".into(), DropZone::Right)));
+        // Over the moved pane itself, a gutter, or nothing: no target.
+        assert_eq!(at(250.0, "a"), None);
+        assert_eq!(at(503.0, "a"), None);
+        assert_eq!(at(2000.0, "a"), None);
+        assert_eq!(at(250.0, "b"), Some(("a".into(), DropZone::Swap)));
+    }
+
+    #[test]
+    fn a_float_docks_beside_or_in_place_of_a_pane_of_its_own_tab() {
+        let (a, b, f) = (PaneId::new("a"), PaneId::new("b"), PaneId::new("f"));
+        let split = |axis, first, second| LayoutNode::Split {
+            axis,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        // `f` floats out of the tab's right half; `a` and `b` share the rest.
+        let tree = split(
+            SplitAxis::Horizontal,
+            split(SplitAxis::Vertical, pane("a"), pane("b")),
+            pane("f"),
+        );
+        assert_eq!(
+            dock_layout(&tree, &f, &a, DropZone::Left),
+            Some(split(
+                SplitAxis::Vertical,
+                split(SplitAxis::Horizontal, pane("f"), pane("a")),
+                pane("b"),
+            ))
+        );
+        assert_eq!(
+            dock_layout(&tree, &f, &b, DropZone::Swap),
+            Some(split(
+                SplitAxis::Horizontal,
+                split(SplitAxis::Vertical, pane("a"), pane("f")),
+                pane("b"),
+            ))
+        );
+        // A drop that changes nothing still docks, into the float's own tile.
+        let pair = split(SplitAxis::Horizontal, pane("a"), pane("f"));
+        assert_eq!(
+            dock_layout(&pair, &f, &a, DropZone::Right),
+            Some(pair.clone())
+        );
+        // A float from another tab never docks here.
+        let other = split(SplitAxis::Horizontal, pane("a"), pane("b"));
+        assert_eq!(dock_layout(&other, &f, &a, DropZone::Left), None);
     }
 }

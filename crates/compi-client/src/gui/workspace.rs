@@ -18,6 +18,7 @@ mod git_gutter;
 pub(super) mod media;
 pub(in crate::gui) mod menus;
 pub(in crate::gui) mod metadata;
+pub(in crate::gui) mod motion;
 pub(in crate::gui) mod palette;
 pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
@@ -521,6 +522,10 @@ const PANE_GUTTER: f32 = 6.0;
 const PANE_RADIUS: f32 = 8.0;
 /// Floating panes' corner radius in Compact (GPUI `rounded_md`).
 const FLOAT_RADIUS_COMPACT: f32 = 6.0;
+/// The keyboard owner float's accent border.
+const FLOAT_FOCUS_BORDER: f32 = 1.5;
+/// A float held over a dock target is see-through, so the zone under it shows.
+const FLOAT_DOCKING_OPACITY: f32 = 0.55;
 // Text starts `TERMINAL_PADDING` inside every edge, so rounding never reaches a cell.
 const _: () = assert!(PANE_RADIUS <= TERMINAL_PADDING);
 
@@ -546,6 +551,8 @@ pub(super) struct FloatDrag {
     start: layout::Rect,
     /// Placement before the drag; Escape restores it.
     before: FloatRect,
+    /// While moving: the tiled pane under the pointer a release would dock into.
+    dock: Option<pane_drag::PaneTarget>,
 }
 
 pub(super) fn open_compi_window(
@@ -918,6 +925,7 @@ impl CompiApp {
             float_area: layout::Size::default(),
             float_drag: None,
             pane_drag: None,
+            motion: Default::default(),
             mutation_pending: false,
             lost_restart: None,
             global_error: None,
@@ -2848,8 +2856,35 @@ impl CompiApp {
         {
             self.pane_zoom.clear(&tab_id);
         }
-        let resize_due = force || self.last_resize.elapsed() >= Duration::from_millis(32);
-        let mut needs_frame = false;
+        // A landing interpolates drawn rects only; shells resize once, as it ends.
+        let float_layouts = &self.float_layouts;
+        let motion = self.motion.advance(
+            || {
+                zoom_layout
+                    .as_ref()
+                    .or(tiled.as_ref().map(|(_, layout)| layout))
+                    .into_iter()
+                    .flat_map(|layout| {
+                        layout
+                            .panes
+                            .iter()
+                            .map(|pane| (pane.pane_id.clone(), pane.rect))
+                    })
+                    .chain(
+                        float_layouts
+                            .iter()
+                            .map(|float| (float.pane.pane_id.clone(), float.frame)),
+                    )
+                    .collect()
+            },
+            Instant::now(),
+        );
+        let landing = motion == motion::MotionStep::Landing;
+        let resize_due = !landing
+            && (force
+                || motion == motion::MotionStep::Landed
+                || self.last_resize.elapsed() >= Duration::from_millis(32));
+        let mut needs_frame = landing;
         let tiled_panes = tiled.as_ref().map_or(&[][..], |(_, layout)| &layout.panes);
         let geometries = tiled_panes
             .iter()
@@ -5791,57 +5826,53 @@ impl CompiApp {
                 comfy.then(|| self.seam_color())
             };
             let group = SharedString::from(format!("pane-{index}"));
+            let rect = self.drawn_rect(&geometry.pane_id, geometry.rect);
             let pane = self
-                .render_pane(("pane", index), geometry, geometry.rect, cx)
+                .render_pane(("pane", index), geometry, rect, cx)
                 .group(group.clone())
                 .when(comfy, |pane| pane.rounded(px(PANE_RADIUS)));
-            self.decorate_dragged_pane(
-                pane,
-                &geometry.pane_id,
-                geometry.rect.width,
-                geometry.rect.height,
-            )
-            .when(
-                marking && !focused && indicator == FocusIndicator::Dim,
-                |pane| pane.child(self.render_focus_dim(radius)),
-            )
-            .when(
-                marking && focused && indicator == FocusIndicator::Marker,
-                |pane| pane.child(self.render_focus_marker(geometry.rect.width)),
-            )
-            .when(self.pane_drag.is_none(), |pane| {
-                pane.child(self.render_pane_grip(
-                    index,
-                    group,
-                    geometry.pane_id.clone(),
-                    geometry.rect.width,
-                    cx,
-                ))
-            })
-            .when(
-                self.pane_drag.is_none() && self.config.program_status.panes,
-                |pane| {
-                    pane.children(geometry.surface_id.as_ref().and_then(|surface| {
-                        self.render_pane_program_status(index, &geometry.pane_id, surface)
-                    }))
-                },
-            )
-            .when_some(edge, |pane, edge| {
-                // Drawn last so the outline is never covered; it has no hitbox.
-                pane.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .when(comfy, |outline| outline.rounded(px(PANE_RADIUS)))
-                        .border_1()
-                        .border_color(color(edge)),
+            self.decorate_dragged_pane(pane, &geometry.pane_id)
+                .when(
+                    marking && !focused && indicator == FocusIndicator::Dim,
+                    |pane| pane.child(self.render_focus_dim(radius)),
                 )
-            })
-            // Over the seam outline, which would otherwise hide the arrival outline.
-            .when(
-                marking && focused && indicator == FocusIndicator::Marker,
-                |pane| pane.child(self.render_focus_flash(&geometry.pane_id, radius)),
-            )
+                .when(
+                    marking && focused && indicator == FocusIndicator::Marker,
+                    |pane| pane.child(self.render_focus_marker(rect.width)),
+                )
+                .when(self.pane_drag.is_none(), |pane| {
+                    pane.child(self.render_pane_grip(
+                        index,
+                        group,
+                        geometry.pane_id.clone(),
+                        rect.width,
+                        cx,
+                    ))
+                })
+                .when(
+                    self.pane_drag.is_none() && self.config.program_status.panes,
+                    |pane| {
+                        pane.children(geometry.surface_id.as_ref().and_then(|surface| {
+                            self.render_pane_program_status(index, &geometry.pane_id, surface)
+                        }))
+                    },
+                )
+                .when_some(edge, |pane, edge| {
+                    // Drawn last so the outline is never covered; it has no hitbox.
+                    pane.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .when(comfy, |outline| outline.rounded(px(PANE_RADIUS)))
+                            .border_1()
+                            .border_color(color(edge)),
+                    )
+                })
+                // Over the seam outline, which would otherwise hide the arrival outline.
+                .when(
+                    marking && focused && indicator == FocusIndicator::Marker,
+                    |pane| pane.child(self.render_focus_flash(&geometry.pane_id, radius)),
+                )
         });
         let dividers = layout.dividers.iter().enumerate().map(|(index, divider)| {
             let dragging = self
@@ -5961,8 +5992,11 @@ impl CompiApp {
                             .w(px(layout.canvas.width))
                             .h(px(layout.canvas.height))
                             .when(comfy, |canvas| {
-                                let islands: Vec<_> =
-                                    layout.panes.iter().map(|pane| pane.rect).collect();
+                                let islands: Vec<_> = layout
+                                    .panes
+                                    .iter()
+                                    .map(|pane| self.drawn_rect(&pane.pane_id, pane.rect))
+                                    .collect();
                                 canvas.child(self.comfy_canvas(move |bounds| {
                                     islands
                                         .iter()
@@ -5979,7 +6013,9 @@ impl CompiApp {
                                 }))
                             })
                             .children(panes)
-                            .children(dividers),
+                            // Seams sit where panes are going; they show once panes land.
+                            .when(!self.motion.landing(), |canvas| canvas.children(dividers))
+                            .children(self.render_drop_preview(layout)),
                     ),
             )
             .when(layout.canvas.width > layout.viewport.width, |pane| {
@@ -6192,8 +6228,9 @@ impl CompiApp {
             )
     }
 
-    /// A floating pane: title strip with explicit keyboard ownership and Dock,
-    /// the shared pane body, and edge/corner resize handles.
+    /// A floating pane: a title strip (program status, name, and on hover the pane
+    /// menu and close) that moves the float, the shared pane body, and edge/corner
+    /// resize handles. The keyboard owner has an accent border.
     fn render_floating_pane(
         &self,
         index: usize,
@@ -6206,13 +6243,20 @@ impl CompiApp {
         } else {
             FLOAT_RADIUS_COMPACT
         };
-        let frame = float.frame;
         let pane_id = float.pane.pane_id.clone();
+        let frame = self.drawn_rect(&pane_id, float.frame);
         let focused = self.focused_pane() == Some(&pane_id);
         let indicator = self.config.focus_indicator;
         let marking = self.visible_layout().map_or(0, |layout| layout.panes.len())
             + self.float_layouts.len()
             > 1;
+        let drag = self
+            .float_drag
+            .as_ref()
+            .filter(|drag| drag.pane_id == pane_id && drag.mode == FloatDragMode::Move);
+        // Lifted while moved; see-through over a dock target so its zone shows.
+        let moving = drag.is_some();
+        let docking = drag.is_some_and(|drag| drag.dock.is_some());
         let (title, tab_label) = self.floating_caption(&pane_id);
         let program_status = float
             .pane
@@ -6269,7 +6313,12 @@ impl CompiApp {
             // float; drags (move/resize, selections) must still see every event.
             .on_mouse_move(cx.listener(Self::on_workspace_mouse_move))
             .rounded(px(radius))
-            .shadow_lg()
+            .map(|frame| match (moving, focused) {
+                (true, _) => frame.shadow_2xl(),
+                (false, true) => frame.shadow_xl(),
+                (false, false) => frame.shadow_lg(),
+            })
+            .when(docking, |frame| frame.opacity(FLOAT_DOCKING_OPACITY))
             .bg(color(colors.surface))
             .on_mouse_down(
                 MouseButton::Left,
@@ -6341,17 +6390,6 @@ impl CompiApp {
                                 None => title,
                             }),
                     )
-                    .when(focused, |strip| {
-                        // Keyboard ownership is explicit: only this pane receives typing.
-                        strip.child(
-                            div()
-                                .flex_none()
-                                .px_1()
-                                .rounded_sm()
-                                .text_color(color(colors.accent))
-                                .child("Keyboard"),
-                        )
-                    })
                     .child(
                         // Hidden until the pointer is over the float; Dock is in the menu.
                         div()
@@ -6436,23 +6474,20 @@ impl CompiApp {
             )
             .child(
                 // Drawn last so the outline is never covered; it has no hitbox. The
-                // Keyboard label marks focus; the accent outline is the Outline option.
+                // keyboard owner's accent border is its focus mark under every
+                // focus-indicator setting.
                 div()
                     .absolute()
                     .inset_0()
                     .rounded(px(radius))
-                    .border_1()
-                    .border_color(color(
-                        if marking && focused && indicator == FocusIndicator::Outline {
-                            colors.accent
-                        } else {
-                            colors.border
-                        },
-                    )),
-            )
-            .when(
-                marking && focused && indicator == FocusIndicator::Marker,
-                |frame| frame.child(self.render_focus_flash(&pane_id, radius)),
+                    .when(focused, |outline| {
+                        outline
+                            .border(px(FLOAT_FOCUS_BORDER))
+                            .border_color(color(colors.accent))
+                    })
+                    .when(!focused, |outline| {
+                        outline.border_1().border_color(color(colors.border))
+                    }),
             )
             .into_any_element()
     }
@@ -6603,6 +6638,7 @@ impl CompiApp {
             origin,
             start: float.frame,
             before,
+            dock: None,
         });
     }
 
@@ -6633,6 +6669,9 @@ impl CompiApp {
         }
         let fraction = layout::float_fraction(frame, self.float_area);
         let pane_id = drag.pane_id.clone();
+        // A move past the drag threshold may end docked; a nudge never does.
+        let docking =
+            drag.mode == FloatDragMode::Move && drag_threshold_crossed(drag.origin, position);
         self.state.set_float_rect(
             &pane_id,
             FloatRect {
@@ -6642,6 +6681,11 @@ impl CompiApp {
                 height: fraction.height,
             },
         );
+        if docking {
+            self.refresh_float_dock(&pane_id, position);
+        } else if let Some(drag) = &mut self.float_drag {
+            drag.dock = None;
+        }
     }
 
     fn render_workspace_scrollbar(&self, horizontal: bool, cx: &Context<Self>) -> AnyElement {
@@ -6851,8 +6895,11 @@ impl CompiApp {
             cx.notify();
             return;
         }
-        if self.float_drag.take().is_some() {
-            self.save_state();
+        if let Some(drag) = self.float_drag.take() {
+            match drag.dock {
+                Some(target) => self.dock_float(drag.pane_id, target),
+                None => self.save_state(),
+            }
             self.rebuild_layout(window, true);
             cx.notify();
             return;
@@ -7545,6 +7592,7 @@ impl CompiApp {
             self.global_error = Some("This pane can no longer float".into());
             return;
         }
+        self.arm_landing();
         self.divider_drag = None;
         self.preview_layout = None;
         self.sync_visible_views();
@@ -7568,6 +7616,7 @@ impl CompiApp {
         {
             self.float_drag = None;
         }
+        self.arm_landing();
         self.report_focus(false);
         self.sync_visible_views();
         self.report_focus(self.overlay.is_none());

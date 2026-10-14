@@ -59,6 +59,22 @@ impl Rect {
     pub fn contains(self, point: Point) -> bool {
         point.x >= self.x && point.x < self.right() && point.y >= self.y && point.y < self.bottom()
     }
+    /// The rect `t` of the way from `self` to `to`; exactly `self` at 0 and `to` at 1.
+    pub fn lerp(self, to: Rect, t: f32) -> Rect {
+        if t <= 0.0 {
+            return self;
+        }
+        if t >= 1.0 {
+            return to;
+        }
+        let mix = |from: f32, to: f32| from + (to - from) * t;
+        Rect {
+            x: mix(self.x, to.x),
+            y: mix(self.y, to.y),
+            width: mix(self.width, to.width),
+            height: mix(self.height, to.height),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

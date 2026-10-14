@@ -932,6 +932,8 @@ struct CompiApp {
     float_drag: Option<FloatDrag>,
     /// A tiled pane picked up by its grip; see `workspace::pane_drag`.
     pane_drag: Option<PaneDrag>,
+    /// Pane frames gliding to a committed arrangement; see `workspace::motion`.
+    motion: workspace::motion::PaneMotion,
     mutation_pending: bool,
     /// The last lost shell this window restarted automatically, and when; retried only
     /// after a pause if the restart did not take effect.
