@@ -8,7 +8,7 @@ Shells that keep running when you close the window, with an editor, diffs and Gi
 
 [![Core CI](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml/badge.svg?branch=main)](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml)
 
-![Compi working on itself: an agent in a terminal pane edits Compi's Files tree code while the editor pane beside it shows the Changes list, the commit box and the diff of that edit](assets/compi-workspace.png)
+![Compi working on itself: omp in a terminal pane checks the 0.1.9 release notes against the Git log, beside the Settings pane with its theme grid and an editor pane showing the diff of those notes](assets/compi-workspace.png)
 
 ## Terminal
 
