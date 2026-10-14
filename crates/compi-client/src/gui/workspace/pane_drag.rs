@@ -18,8 +18,6 @@ use crate::arrangement::{self, DropZone};
 /// The grip's hit area spans the top padding band, so it never covers a cell.
 const GRIP_WIDTH: f32 = 44.0;
 const GRIP_DOT: f32 = 3.0;
-/// The close button beside the grip, in the same band.
-const GRIP_CLOSE_WIDTH: f32 = 20.0;
 /// The centre Swap box spans at most this share of a target pane each way, and at
 /// most `SWAP_MAX` pixels. Panes of another tab cannot swap, so there the four edge
 /// zones meet in the centre.
@@ -171,8 +169,8 @@ fn placed(target: &LayoutNode, leaf: LayoutNode, placement: &Placement) -> Layou
 }
 
 impl CompiApp {
-    /// The `⋯` grip and `×` of tiled pane `index`, revealed while the pointer is over
-    /// the pane (`group`). `width` is the pane's width.
+    /// The `⋯` grip of tiled pane `index`, revealed while the pointer is over the pane
+    /// (`group`). `width` is the pane's width.
     pub(super) fn render_pane_grip(
         &self,
         index: usize,
@@ -188,13 +186,10 @@ impl CompiApp {
                 .rounded_full()
                 .bg(color(colors.muted))
         };
-        let close_id = pane_id.clone();
-        let close_title = self.close_pane_title(&pane_id);
-        let controls_width = GRIP_WIDTH + GRIP_CLOSE_WIDTH;
         div()
             .absolute()
             .top_0()
-            .left(px(((width - controls_width) / 2.0).max(0.0)))
+            .left(px(((width - GRIP_WIDTH) / 2.0).max(0.0)))
             .h(px(TERMINAL_PADDING))
             .flex()
             .items_center()
@@ -224,30 +219,6 @@ impl CompiApp {
                     )
                     .children([dot(), dot(), dot()]),
             )
-            .child(
-                div()
-                    .id(("pane-grip-close", index))
-                    .w(px(GRIP_CLOSE_WIDTH))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .hover(move |style| style.bg(color(colors.surface_hover)))
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.close_pane(&close_id, window, cx);
-                        window.focus(&this.focus_handle, cx);
-                        this.rebuild_layout(window, true);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .tooltip(controls::tooltip(close_title, None, None))
-                    .child(
-                        controls::glyph(controls::IconName::X, color(colors.muted)).size(px(10.0)),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -265,10 +236,10 @@ impl CompiApp {
         else {
             return;
         };
-        // The grip's centre: the grip and its × are centred on the pane together.
+        // The grip's centre: it is centred on the pane.
         let offset = self.workspace_scroll.offset();
         let position = point(
-            px(rect.x + (rect.width - GRIP_CLOSE_WIDTH) / 2.0 + self.sidebar_extent()) + offset.x,
+            px(rect.x + rect.width / 2.0 + self.sidebar_extent()) + offset.x,
             px(rect.y + TERMINAL_PADDING + CHROME_HEIGHT) + offset.y,
         );
         self.open_pane_menu(pane_id, position, Anchor::TopCenter, window, cx);

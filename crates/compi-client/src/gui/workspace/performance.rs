@@ -243,10 +243,10 @@ impl CompiApp {
         let render = latest.map(|latest| &latest.render);
         let client = latest.map(|latest| &latest.client);
         let daemon = latest.map(|latest| &latest.daemon);
-        let fps_focused = self.settings_focused(row, SettingsAction::ToggleFps);
-        let rebuild_focused = self.settings_focused(row, SettingsAction::RebuildRenderer);
-        let copy_focused = self.settings_focused(row, SettingsAction::CopyPerformance);
-        let (fps_row, rebuild_row, copy_row) = (row.clone(), row.clone(), row.clone());
+        let fps_row = super::settings::RowCx {
+            title: "Show FPS",
+            ..row.clone()
+        };
         let cpu_label = |value: Option<f32>| {
             value.map_or_else(|| "Unavailable".into(), |value| format!("{value:.1}%"))
         };
@@ -258,15 +258,10 @@ impl CompiApp {
                 resource_count_label(process),
             )
         };
-        let toggle_background = blend_rgb(colors.surface, colors.foreground, 0.06);
-        let switch_background = if self.state.show_fps {
-            blend_rgb(colors.surface, colors.accent, 0.45)
-        } else {
-            blend_rgb(colors.surface, colors.foreground, 0.16)
-        };
         div()
             .w_full()
             .min_w_0()
+            .py_3()
             .flex()
             .flex_col()
             .gap_4()
@@ -319,112 +314,31 @@ impl CompiApp {
                 "Images waiting to decode",
                 cache.pending_decodes.to_string(),
             ))
-            .child(
-                div()
-                    .id("settings-show-fps")
-                    .relative()
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(48.0))
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .gap_3()
-                    .items_center()
-                    .justify_between()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(color(if fps_focused {
-                        colors.accent
-                    } else {
-                        toggle_background
-                    }))
-                    .bg(color(toggle_background))
-                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.focus_settings_control(&fps_row, SettingsAction::ToggleFps);
-                        this.state.show_fps = !this.state.show_fps;
-                        this.save_state();
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Show FPS"),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(44.0))
-                            .h(px(24.0))
-                            .p(px(3.0))
-                            .flex()
-                            .items_center()
-                            .rounded_full()
-                            .bg(color(switch_background))
-                            .when(self.state.show_fps, |toggle| toggle.justify_end())
-                            .child(
-                                div()
-                                    .size(px(18.0))
-                                    .rounded_full()
-                                    .bg(color(ui_text_color(colors.foreground, switch_background))),
-                            ),
-                    )
-                    .child(self.settings_focus_anchor(fps_focused, cx)),
-            )
-            .child(
-                div()
-                    .relative()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap_2()
-                    .child(self.settings_action_button(
-                        "settings-rebuild-renderer",
-                        "Rebuild renderer",
-                        rebuild_focused,
-                        false,
-                        cx.listener(move |this, _, window, cx| {
-                            this.focus_settings_control(
-                                &rebuild_row,
-                                SettingsAction::RebuildRenderer,
-                            );
-                            this.rebuild_renderer(window);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.settings_focus_anchor(rebuild_focused, cx))
-                    .child(
-                        div()
-                            .w_full()
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, &colors)))
-                            .child("Clears rendering caches without stopping your terminals."),
-                    ),
-            )
-            .child(
-                div()
-                    .relative()
-                    .child(self.settings_action_button(
-                        "settings-copy-performance",
-                        "Copy diagnostics",
-                        copy_focused,
-                        false,
-                        cx.listener(move |this, _, _, cx| {
-                            this.focus_settings_control(&copy_row, SettingsAction::CopyPerformance);
-                            this.copy_performance_diagnostics(cx);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.settings_focus_anchor(copy_focused, cx)),
-            )
+            .child(self.settings_row(
+                "Show FPS",
+                "Show the frame rate on screen.".into(),
+                self.settings_switch(&fps_row, self.state.show_fps, SettingsAction::ToggleFps, cx),
+                false,
+            ))
+            .child(self.settings_row(
+                "Rebuild renderer",
+                "Clears rendering caches without stopping your terminals.".into(),
+                self.settings_button(
+                    row,
+                    1,
+                    "Rebuild renderer",
+                    SettingsAction::RebuildRenderer,
+                    cx,
+                ),
+                row.compact,
+            ))
+            .child(div().flex().child(self.settings_button(
+                row,
+                2,
+                "Copy diagnostics",
+                SettingsAction::CopyPerformance,
+                cx,
+            )))
             .when_some(self.performance_notice.clone(), |section, notice| {
                 section.child(
                     div()
@@ -449,7 +363,10 @@ impl CompiApp {
     fn render_sparkline(&self, values: &VecDeque<f32>) -> AnyElement {
         let colors = *self.colors();
         let max = values.iter().copied().fold(1.0_f32, f32::max);
+        // Newest samples sit on the right; a narrow card clips the oldest.
         div()
+            .min_w_0()
+            .overflow_hidden()
             .h(px(24.0))
             .pt_2()
             .flex()

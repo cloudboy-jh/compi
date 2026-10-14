@@ -7,19 +7,39 @@
 //! The section a pane shows lives in the daemon (`PaneContent::Settings`), so it
 //! persists with the pane; the search, scroll and keyboard highlight are this
 //! window's.
-use super::catalog::CatalogTarget;
+//!
+//! A pane draws a one-line header (title, section icons, search); the selected icon
+//! names the section, so a page is just its cards of rows, each under its group's
+//! label when the section has more than one group, with the header rows (the scope
+//! switch) at the right end of the first label line. The Appearance page and
+//! Advanced's terminal colors page end in the theme grid (`catalog`), which fills the
+//! pane and previews on the real panes until the Apply / Cancel bar decides.
+use super::catalog::{CatalogTarget, GridStep};
 use super::*;
+use crate::gui::controls::IconName;
 use compi_protocol::{PaneContent, SettingsContent, SettingsSection};
 use gpui::Entity;
+use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 
-/// Narrower than this, the section list wraps above the rows instead of beside them.
-const SECTION_LIST_MIN_WIDTH: f32 = 620.0;
-const SECTION_LIST_WIDTH: f32 = 184.0;
+/// Widest a section page grows; a wider pane centres it.
+const PAGE_MAX_WIDTH: f32 = 1280.0;
+/// The Appearance row of the theme grid.
+pub(super) const THEME_ROW: &str = "theme";
 /// Narrower than this, a row's control goes below its title.
-const STACKED_ROW_WIDTH: f32 = 480.0;
+const STACKED_ROW_WIDTH: f32 = 440.0;
+/// Narrower than this, the header drops its title so the section icons fit.
+const HEADER_TITLE_MIN_WIDTH: f32 = 380.0;
+/// The width of a drawn choice (pane density, focus indicator).
+const OPTION_CARD_WIDTH: f32 = 120.0;
 /// The row holding the shell prompt group; see `prompt`.
 pub(super) const PROMPT_ROW: &str = "shell-prompt";
+/// The theme list's controls, as one row of the keyboard order; see `catalog`.
+pub(super) const THEME_LIST_ROW: &str = "theme-list";
+/// The theme preview's Apply / Cancel bar, as one row of the keyboard order.
+pub(super) const THEME_BAR_ROW: &str = "theme-bar";
+/// Advanced's group of the configuration file and the terminal server.
+const RECOVERY_GROUP: &str = "Configuration and recovery";
 
 /// Focusable controls of Settings → Updates. Which ones exist depends on the update
 /// state; see `update_stops`.
@@ -40,8 +60,25 @@ pub(super) enum UpdateControl {
 /// What a Settings control does when pressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsAction {
-    Scope(SettingsScope),
-    BrowseThemes(CatalogTarget),
+    /// Global defaults or this window: one switch, Left and Right or Enter flip it.
+    Scope,
+    /// Opens the theme list for `CatalogTarget`, in the Settings pane.
+    AllThemes(CatalogTarget),
+    /// The theme list's back control.
+    ThemeBack,
+    /// The theme list's search field.
+    ThemeSearch,
+    /// The theme list's filter: Left and Right or Enter move it.
+    ThemeFilter,
+    /// The theme list's More menu.
+    ThemeMore,
+    /// The theme list's rows: Up and Down preview the next one, Enter applies.
+    ThemeList,
+    /// The star of the list's selected theme.
+    ThemeFavorite,
+    ThemeCancel,
+    /// Apply the preview, or in removal remove the selected theme.
+    ThemeApply,
     ToggleTransparency,
     ToggleBlur,
     FollowTheme,
@@ -99,13 +136,6 @@ pub(super) struct SettingsFocus {
     stop: Stop,
 }
 
-#[derive(Clone, Copy)]
-enum SettingsButtonTone {
-    Secondary,
-    Primary,
-    Destructive,
-}
-
 /// A scrolled settings area: its handle, where it was last drawn, and whether the
 /// focused control should be scrolled into it.
 pub(super) struct SettingsScroll {
@@ -129,6 +159,8 @@ struct SettingsPane {
     /// Keyboard focus of the pane itself; its search field sits inside it.
     focus: FocusHandle,
     search: Entity<InputState>,
+    /// The theme list's search field; its text is the theme session's query.
+    theme_search: Entity<InputState>,
     /// The search, lowercased; empty shows `section`.
     query: String,
     /// The section shown. It is sent to the daemon when it differs from `persisted`,
@@ -137,7 +169,12 @@ struct SettingsPane {
     persisted: SettingsSection,
     sent: Option<SettingsSection>,
     scroll: SettingsScroll,
+    /// The theme grid's own scroll, on the Appearance and terminal colors pages.
+    grid: SettingsScroll,
+    /// How many columns the theme grid had when last drawn; Up and Down move by it.
+    grid_columns: std::cell::Cell<usize>,
     _events: gpui::Subscription,
+    _theme_events: gpui::Subscription,
 }
 
 /// Settings in this window: each Settings pane's state, Quick Appearance's scroll
@@ -149,6 +186,8 @@ pub(in crate::gui) struct SettingsUi {
     quick: SettingsScroll,
     /// The stop the next Settings pane drawn starts on: set when a command opens one.
     pending: Option<Stop>,
+    /// The theme list the next Settings pane drawn opens, for the same command.
+    pending_themes: Option<CatalogTarget>,
     /// The terminal Settings was last opened from; the shell prompt group configures
     /// the prompt of its environment.
     pub(super) origin: Option<PaneId>,
@@ -161,8 +200,10 @@ pub(in crate::gui) struct SettingsUi {
 pub(super) struct RowCx {
     pub(super) host: SettingsHost,
     pub(super) row: &'static str,
-    title: &'static str,
+    pub(super) title: &'static str,
     pub(super) compact: bool,
+    /// Drawn on the page's first label line rather than as a row.
+    pub(super) header: bool,
 }
 
 /// One setting: its place, the words search matches, the controls it holds in
@@ -170,11 +211,14 @@ pub(super) struct RowCx {
 pub(super) struct Row {
     id: &'static str,
     section: SettingsSection,
-    /// The subheading it sits under within its section.
+    /// The group it sits in within its section; its label heads the group's card.
     group: Option<&'static str>,
     title: &'static str,
     description: &'static str,
     keywords: &'static str,
+    /// Drawn at the right end of the page's first label line rather than in a card;
+    /// search results show it as a row.
+    header: bool,
     /// Whether it shows now; some rows depend on other settings.
     shown: fn(&CompiApp) -> bool,
     stops: fn(&CompiApp) -> Vec<SettingsAction>,
@@ -224,6 +268,7 @@ const fn row(
         title,
         description,
         keywords,
+        header: false,
         shown: |_| true,
         stops,
         render,
@@ -239,6 +284,13 @@ const fn grouped(group: &'static str, row: Row) -> Row {
 
 const fn shown_when(shown: fn(&CompiApp) -> bool, row: Row) -> Row {
     Row { shown, ..row }
+}
+
+const fn in_header(row: Row) -> Row {
+    Row {
+        header: true,
+        ..row
+    }
 }
 
 /// A Tab metadata toggle; `stops` and `render` name its index.
@@ -288,92 +340,135 @@ const fn status_row(
 /// Every setting, in section order and, within a section, in display order.
 static ROWS: &[Row] = &[
     // Appearance; Quick Appearance shows these too.
-    row(
+    in_header(row(
         "scope",
         SettingsSection::Appearance,
         "Scope",
         "Change the global defaults or only this window.",
         "global window override",
-        |_| scope_stops(),
+        |_| vec![SettingsAction::Scope],
         |app, row, cx| app.render_scope_row(row, cx),
+    )),
+    grouped(
+        "Window",
+        row(
+            "transparency",
+            SettingsSection::Appearance,
+            "Transparent background",
+            "Let the desktop show through the window.",
+            "opacity translucent glass",
+            |_| vec![SettingsAction::ToggleTransparency],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.scoped_appearance().transparent_background,
+                    SettingsAction::ToggleTransparency,
+                    "",
+                    cx,
+                )
+            },
+        ),
     ),
-    row(
-        "theme",
-        SettingsSection::Appearance,
-        "Theme",
-        "The color theme of the interface and terminals.",
-        "colors color scheme dark light catalog browse",
-        |_| vec![SettingsAction::BrowseThemes(CatalogTarget::Both)],
-        |app, row, cx| app.render_theme_row(row, cx),
-    ),
-    row(
-        "transparency",
-        SettingsSection::Appearance,
-        "Transparent background",
-        "Let the desktop show through the window.",
-        "opacity translucent glass",
-        |_| vec![SettingsAction::ToggleTransparency],
-        |app, row, cx| {
-            app.render_toggle_row(
-                row,
-                app.scoped_appearance().transparent_background,
-                SettingsAction::ToggleTransparency,
-                "",
-                cx,
-            )
-        },
-    ),
-    shown_when(
-        |app| app.scoped_appearance().transparent_background,
+    // Opacity and blur only act on a transparent background; otherwise they show
+    // greyed and the keyboard passes them by.
+    grouped(
+        "Window",
         row(
             "opacity",
             SettingsSection::Appearance,
             "Opacity",
             "How much of the desktop shows through.",
             "transparency translucent",
-            |_| vec![SettingsAction::Opacity],
+            |app| {
+                if app.scoped_appearance().transparent_background {
+                    vec![SettingsAction::Opacity]
+                } else {
+                    Vec::new()
+                }
+            },
             |app, row, cx| app.render_opacity_row(row, cx),
         ),
     ),
-    shown_when(
-        |app| app.scoped_appearance().transparent_background,
+    grouped(
+        "Window",
         row(
             "blur",
             SettingsSection::Appearance,
             "Blur background",
             "Soften what's behind the window.",
             "transparency translucent glass acrylic",
-            |_| vec![SettingsAction::ToggleBlur],
+            |app| {
+                if app.scoped_appearance().transparent_background {
+                    vec![SettingsAction::ToggleBlur]
+                } else {
+                    Vec::new()
+                }
+            },
             |app, row, cx| {
-                app.render_toggle_row(
-                    row,
-                    app.scoped_appearance().background_effect == BackgroundEffect::Blurred,
-                    SettingsAction::ToggleBlur,
-                    "Soften what's behind the window.",
-                    cx,
-                )
+                let appearance = app.scoped_appearance();
+                let blurred = appearance.background_effect == BackgroundEffect::Blurred;
+                if appearance.transparent_background {
+                    app.render_toggle_row(row, blurred, SettingsAction::ToggleBlur, "", cx)
+                } else {
+                    app.settings_row(
+                        row.title,
+                        "Needs a transparent background.".into(),
+                        div()
+                            .opacity(0.45)
+                            .child(controls::switch((row.row, 0_usize), blurred).label(row.title))
+                            .into_any_element(),
+                        false,
+                    )
+                }
             },
         ),
     ),
     shown_when(
         |app| app.settings_scope == SettingsScope::Window,
+        grouped(
+            "Window",
+            row(
+                "window-overrides",
+                SettingsSection::Appearance,
+                "Window overrides",
+                "Reset this window's appearance to the global defaults.",
+                "reset scope",
+                |_| vec![SettingsAction::ResetWindowAppearance],
+                |app, row, cx| {
+                    app.render_button_row(
+                        row,
+                        "Reset this window's appearance to the global defaults.".into(),
+                        "Use global defaults",
+                        SettingsAction::ResetWindowAppearance,
+                        false,
+                        cx,
+                    )
+                },
+            ),
+        ),
+    ),
+    // The theme grid; on the Appearance page it fills the rest of the pane under its
+    // own header line.
+    grouped(
+        "Theme",
         row(
-            "window-overrides",
+            THEME_ROW,
             SettingsSection::Appearance,
-            "Window overrides",
-            "Reset this window's appearance to the global defaults.",
-            "reset scope",
-            |_| vec![SettingsAction::ResetWindowAppearance],
-            |app, row, cx| {
-                app.render_button_row(
-                    row,
-                    "Reset this window's appearance to the global defaults.".into(),
-                    "Use global defaults",
-                    SettingsAction::ResetWindowAppearance,
-                    false,
-                    cx,
-                )
+            "Theme",
+            "The color theme of the interface and terminals.",
+            "colors color scheme dark light catalog browse favorites",
+            |app| {
+                if app
+                    .theme_catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.target == CatalogTarget::Both)
+                {
+                    theme_grid_stops()
+                } else {
+                    vec![SettingsAction::AllThemes(CatalogTarget::Both)]
+                }
             },
+            |app, row, cx| app.render_theme_row(row, cx),
         ),
     ),
     // Interface.
@@ -739,106 +834,145 @@ static ROWS: &[Row] = &[
         |app, row, cx| app.render_update_advanced(row, cx),
     ),
     // Advanced.
-    row(
+    in_header(row(
         "advanced-scope",
         SettingsSection::Advanced,
         "Scope",
         "Change the global defaults or only this window.",
         "global window override",
-        |_| scope_stops(),
+        |_| vec![SettingsAction::Scope],
         |app, row, cx| app.render_scope_row(row, cx),
+    )),
+    grouped(
+        "Colors",
+        row(
+            "terminal-colors",
+            SettingsSection::Advanced,
+            "Terminal colors",
+            "Override the theme's terminal colors; colors set by programs stay unchanged.",
+            "theme palette ansi override follow",
+            |app| {
+                let mut stops = Vec::with_capacity(2);
+                if app.scoped_appearance().terminal_theme_override {
+                    stops.push(SettingsAction::FollowTheme);
+                }
+                stops.push(SettingsAction::AllThemes(CatalogTarget::Terminal));
+                stops
+            },
+            |app, row, cx| app.render_terminal_colors_row(row, cx),
+        ),
     ),
-    row(
-        "terminal-colors",
-        SettingsSection::Advanced,
-        "Terminal colors",
-        "Override the theme's terminal colors; colors set by programs stay unchanged.",
-        "theme palette ansi override follow",
-        |_| {
-            vec![
-                SettingsAction::FollowTheme,
-                SettingsAction::BrowseThemes(CatalogTarget::Terminal),
-            ]
-        },
-        |app, row, cx| app.render_terminal_colors_row(row, cx),
+    grouped(
+        RECOVERY_GROUP,
+        row(
+            "configuration",
+            SettingsSection::Advanced,
+            "Configuration",
+            "Open the configuration file.",
+            "toml config file edit",
+            |_| vec![SettingsAction::OpenConfiguration],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    String::new(),
+                    "Open file",
+                    SettingsAction::OpenConfiguration,
+                    false,
+                    cx,
+                )
+            },
+        ),
     ),
-    row(
-        "configuration",
-        SettingsSection::Advanced,
-        "Configuration",
-        "Open the configuration file.",
-        "toml config file edit",
-        |_| vec![SettingsAction::OpenConfiguration],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                String::new(),
-                "Open file",
-                SettingsAction::OpenConfiguration,
-                false,
-                cx,
-            )
-        },
+    grouped(
+        RECOVERY_GROUP,
+        row(
+            "connection",
+            SettingsSection::Advanced,
+            "Connection",
+            "Reconnect without stopping running processes.",
+            "reconnect daemon server",
+            |_| vec![SettingsAction::Reconnect],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    row_description("connection").into(),
+                    "Reconnect",
+                    SettingsAction::Reconnect,
+                    false,
+                    cx,
+                )
+            },
+        ),
     ),
-    row(
-        "connection",
-        SettingsSection::Advanced,
-        "Connection",
-        "Reconnect without stopping running processes.",
-        "reconnect daemon server",
-        |_| vec![SettingsAction::Reconnect],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                row_description("connection").into(),
-                "Reconnect",
-                SettingsAction::Reconnect,
-                false,
-                cx,
-            )
-        },
+    grouped(
+        RECOVERY_GROUP,
+        row(
+            "diagnostics",
+            SettingsSection::Advanced,
+            "Diagnostics",
+            "Inspect connection and rendering details.",
+            "debug connection rendering",
+            |_| vec![SettingsAction::OpenDiagnostics],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    row_description("diagnostics").into(),
+                    "Open diagnostics",
+                    SettingsAction::OpenDiagnostics,
+                    false,
+                    cx,
+                )
+            },
+        ),
     ),
-    row(
-        "diagnostics",
-        SettingsSection::Advanced,
-        "Diagnostics",
-        "Inspect connection and rendering details.",
-        "debug connection rendering",
-        |_| vec![SettingsAction::OpenDiagnostics],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                row_description("diagnostics").into(),
-                "Open diagnostics",
-                SettingsAction::OpenDiagnostics,
-                false,
-                cx,
-            )
-        },
-    ),
-    row(
-        "restart-daemon",
-        SettingsSection::Advanced,
-        "Restart daemon",
-        "Restart the terminal server; running terminals stop.",
-        "daemon server restart stop terminals",
-        |_| vec![SettingsAction::RestartDaemon],
-        |app, row, cx| app.render_restart_daemon_row(row, cx),
+    grouped(
+        RECOVERY_GROUP,
+        row(
+            "restart-daemon",
+            SettingsSection::Advanced,
+            "Restart daemon",
+            "Restart the terminal server; running terminals stop.",
+            "daemon server restart stop terminals",
+            |_| vec![SettingsAction::RestartDaemon],
+            |app, row, cx| app.render_restart_daemon_row(row, cx),
+        ),
     ),
 ];
-
-fn scope_stops() -> Vec<SettingsAction> {
-    vec![
-        SettingsAction::Scope(SettingsScope::Global),
-        SettingsAction::Scope(SettingsScope::Window),
-    ]
-}
 
 /// The registered description of the row `id`, for rows that show it as is.
 fn row_description(id: &str) -> &'static str {
     ROWS.iter()
         .find(|row| row.id == id)
         .map_or("", |row| row.description)
+}
+
+/// The theme grid's keyboard order: its search, filter, More, the tiles, the star.
+fn theme_grid_stops() -> Vec<SettingsAction> {
+    vec![
+        SettingsAction::ThemeSearch,
+        SettingsAction::ThemeFilter,
+        SettingsAction::ThemeMore,
+        SettingsAction::ThemeList,
+        SettingsAction::ThemeFavorite,
+    ]
+}
+
+/// The terminal colors page's keyboard order, before the preview bar's.
+fn theme_list_stops() -> Vec<SettingsAction> {
+    let mut stops = vec![SettingsAction::ThemeBack];
+    stops.extend(theme_grid_stops());
+    stops
+}
+
+/// Whether `stop` sits in the theme grid, which scrolls on its own.
+fn in_theme_grid(stop: Stop) -> bool {
+    matches!(
+        stop,
+        Stop::Control {
+            action: SettingsAction::ThemeList | SettingsAction::ThemeFavorite,
+            ..
+        }
+    )
 }
 
 /// The rows a pane shows for `section` and the lowercased `query`, before `shown`:
@@ -852,6 +986,18 @@ fn rows_for(section: SettingsSection, query: &str) -> impl Iterator<Item = &'sta
             row.section == section
         }
     })
+}
+
+/// Whether `section`'s rows (header rows aside) fall into more than one group, so its
+/// cards show their group's label; one group shows just the card.
+fn section_grouped(section: SettingsSection) -> bool {
+    let mut groups = ROWS
+        .iter()
+        .filter(|row| row.section == section && !row.header)
+        .map(|row| row.group);
+    groups
+        .next()
+        .is_some_and(|first| groups.any(|group| group != first))
 }
 
 /// Keyboard order: the search field and section list when `pane`, then each row's
@@ -907,13 +1053,6 @@ fn settings_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<&'a PaneId>) {
 }
 
 impl CompiApp {
-    /// The Settings content `pane` shows, if it is a Settings pane.
-    pub(super) fn settings_content(&self, pane: &PaneId) -> Option<SettingsContent> {
-        content::find_pane_content(self.workspace.as_ref()?, pane)?
-            .settings()
-            .copied()
-    }
-
     /// The rows the Settings pane `pane` shows now.
     fn pane_rows(&self, pane: &SettingsPane) -> Vec<&'static Row> {
         rows_for(pane.section, &pane.query)
@@ -930,21 +1069,85 @@ impl CompiApp {
 
     /// The keyboard order where `host` draws.
     fn settings_order(&self, host: &SettingsHost) -> Vec<Stop> {
-        let (pane, rows) = match host {
-            SettingsHost::Quick => (false, self.quick_rows()),
-            SettingsHost::Pane(pane_id) => match self.settings.panes.get(pane_id) {
-                Some(pane) => (true, self.pane_rows(pane)),
-                None => return Vec::new(),
-            },
+        let pane_id = match host {
+            SettingsHost::Quick => {
+                // Quick Appearance draws the theme as one button on to Settings.
+                let rows = self.quick_rows();
+                let mut order = focus_order(
+                    false,
+                    rows.iter().map(|row| {
+                        if row.id == THEME_ROW {
+                            (row.id, vec![SettingsAction::AllThemes(CatalogTarget::Both)])
+                        } else {
+                            (row.id, (row.stops)(self))
+                        }
+                    }),
+                );
+                order.push(Stop::Control {
+                    row: "all-settings",
+                    action: SettingsAction::OpenSettings,
+                });
+                return order;
+            }
+            SettingsHost::Pane(pane_id) => pane_id,
         };
-        let mut order = focus_order(pane, rows.iter().map(|row| (row.id, (row.stops)(self))));
-        if *host == SettingsHost::Quick {
-            order.push(Stop::Control {
-                row: "all-settings",
-                action: SettingsAction::OpenSettings,
-            });
+        let Some(pane) = self.settings.panes.get(pane_id) else {
+            return Vec::new();
+        };
+        let mut order = if self.theme_list_shown(pane_id) {
+            focus_order(true, [(THEME_LIST_ROW, theme_list_stops())])
+        } else {
+            let rows = self.pane_rows(pane);
+            focus_order(true, rows.iter().map(|row| (row.id, (row.stops)(self))))
+        };
+        if self.theme_bar_shown(pane_id) {
+            order.extend(
+                [SettingsAction::ThemeCancel, SettingsAction::ThemeApply].map(|action| {
+                    Stop::Control {
+                        row: THEME_BAR_ROW,
+                        action,
+                    }
+                }),
+            );
         }
         order
+    }
+
+    /// Whether the Settings pane `pane_id` shows the terminal colors page (a theme grid
+    /// for the terminal colors override) in place of Advanced.
+    fn theme_list_shown(&self, pane_id: &PaneId) -> bool {
+        self.theme_catalog.as_ref().is_some_and(|catalog| {
+            &catalog.pane == pane_id && catalog.list && catalog.target == CatalogTarget::Terminal
+        }) && self
+            .settings
+            .panes
+            .get(pane_id)
+            .is_some_and(|pane| pane.query.trim().is_empty())
+    }
+
+    /// The row the theme grid's controls belong to in `pane_id`: the terminal colors
+    /// page's, or Appearance's theme row.
+    fn theme_stop_row(&self, pane_id: &PaneId) -> &'static str {
+        if self.theme_list_shown(pane_id) {
+            THEME_LIST_ROW
+        } else {
+            THEME_ROW
+        }
+    }
+
+    /// Whether the Settings pane `pane_id` shows the theme preview's Apply / Cancel bar.
+    fn theme_bar_shown(&self, pane_id: &PaneId) -> bool {
+        self.theme_catalog
+            .as_ref()
+            .is_some_and(|catalog| &catalog.pane == pane_id && catalog.awaiting_decision())
+    }
+
+    /// The Settings pane whose control has the keyboard highlight.
+    fn highlighted_pane(&self) -> Option<PaneId> {
+        match &self.settings.focus.as_ref()?.host {
+            SettingsHost::Pane(pane) => Some(pane.clone()),
+            SettingsHost::Quick => None,
+        }
     }
 
     /// Rows shown in any Settings pane this window draws.
@@ -974,20 +1177,27 @@ impl CompiApp {
             .any(|row| row.section == section)
     }
 
-    fn settings_scroll_mut(&mut self, host: &SettingsHost) -> Option<&mut SettingsScroll> {
+    /// The scroll `host` keeps; with `grid`, a pane's theme grid scroll.
+    fn settings_scroll_mut(
+        &mut self,
+        host: &SettingsHost,
+        grid: bool,
+    ) -> Option<&mut SettingsScroll> {
         match host {
             SettingsHost::Quick => Some(&mut self.settings.quick),
-            SettingsHost::Pane(pane) => self
-                .settings
-                .panes
-                .get_mut(pane)
-                .map(|pane| &mut pane.scroll),
+            SettingsHost::Pane(pane) => self.settings.panes.get_mut(pane).map(|pane| {
+                if grid {
+                    &mut pane.grid
+                } else {
+                    &mut pane.scroll
+                }
+            }),
         }
     }
 
     /// Moves the keyboard highlight to `stop` where `host` draws, scrolling it into view.
     fn set_settings_focus(&mut self, host: SettingsHost, stop: Stop) {
-        if let Some(scroll) = self.settings_scroll_mut(&host) {
+        if let Some(scroll) = self.settings_scroll_mut(&host, in_theme_grid(stop)) {
             scroll.to_focus = true;
         }
         self.settings.focus = Some(SettingsFocus { host, stop });
@@ -1018,6 +1228,7 @@ impl CompiApp {
             row: PROMPT_ROW,
             title: "Shell prompt",
             compact: false,
+            header: false,
         })
     }
 
@@ -1033,7 +1244,7 @@ impl CompiApp {
     }
 
     /// A click on a control: it takes the highlight and does what it does.
-    fn settings_click(
+    pub(super) fn settings_click(
         &self,
         row: &RowCx,
         action: SettingsAction,
@@ -1050,7 +1261,7 @@ impl CompiApp {
 
     /// Opens Settings: focuses this window's Settings pane, at `section` when given,
     /// or opens one beside the focused pane. The keyboard starts on `stop`, else on
-    /// the search field.
+    /// the section; the search field stays behind its icon until wanted.
     pub(super) fn open_settings(
         &mut self,
         section: Option<SettingsSection>,
@@ -1075,6 +1286,7 @@ impl CompiApp {
                 self.select_terminal(tab, false);
             }
             self.focus_pane(pane_id.clone());
+            let mut current = section.unwrap_or_default();
             if let Some(pane) = self.settings.panes.get_mut(&pane_id) {
                 if let Some(section) = section {
                     pane.section = section;
@@ -1082,9 +1294,13 @@ impl CompiApp {
                     pane.search
                         .update(cx, |search, cx| search.set_value("", window, cx));
                 }
+                current = pane.section;
                 pane.scroll.handle.set_offset(point(px(0.0), px(0.0)));
             }
-            self.set_settings_focus(SettingsHost::Pane(pane_id), stop.unwrap_or(Stop::Search));
+            self.set_settings_focus(
+                SettingsHost::Pane(pane_id),
+                stop.unwrap_or(Stop::Section(current)),
+            );
             return;
         }
         let content = PaneContent::Settings(SettingsContent {
@@ -1096,7 +1312,7 @@ impl CompiApp {
             leaves.into_iter().next().map(|(pane, _)| pane)
         });
         self.settings_scope = SettingsScope::Global;
-        self.settings.pending = Some(stop.unwrap_or(Stop::Search));
+        self.settings.pending = Some(stop.unwrap_or(Stop::Section(section.unwrap_or_default())));
         match beside {
             Some(beside) => {
                 self.open_content_beside(&beside, content);
@@ -1122,6 +1338,32 @@ impl CompiApp {
                     true,
                 );
             }
+        }
+    }
+
+    /// Opens Settings on the theme grid for `target`: Appearance's, or Advanced's
+    /// terminal colors page. Quick Appearance's theme and Browse themes come here.
+    pub(super) fn open_theme_settings(
+        &mut self,
+        target: CatalogTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (section, row) = match target {
+            CatalogTarget::Both => (SettingsSection::Appearance, THEME_ROW),
+            CatalogTarget::Terminal => (SettingsSection::Advanced, THEME_LIST_ROW),
+        };
+        let stop = Stop::Control {
+            row,
+            action: SettingsAction::ThemeList,
+        };
+        self.settings.pending = None;
+        self.open_settings(Some(section), Some(stop), window, cx);
+        if self.settings.pending.is_some() {
+            // The pane opens with the next workspace update.
+            self.settings.pending_themes = Some(target);
+        } else if let Some((_, _, pane)) = self.window_settings_pane() {
+            self.start_theme_session(pane, target, true);
         }
     }
 
@@ -1188,25 +1430,82 @@ impl CompiApp {
                                         stop: Stop::Search,
                                     });
                                 }
-                                InputEvent::PressEnter { .. } | InputEvent::Blur => return,
+                                // Leaving an empty field folds it back behind its icon.
+                                InputEvent::Blur => {
+                                    let Some(pane) = this.settings.panes.get(&changed) else {
+                                        return;
+                                    };
+                                    let host = SettingsHost::Pane(changed.clone());
+                                    if !pane.query.trim().is_empty()
+                                        || this.settings.focus.as_ref()
+                                            != Some(&SettingsFocus {
+                                                host: host.clone(),
+                                                stop: Stop::Search,
+                                            })
+                                    {
+                                        return;
+                                    }
+                                    let section = pane.section;
+                                    this.settings.focus = Some(SettingsFocus {
+                                        host,
+                                        stop: Stop::Section(section),
+                                    });
+                                }
+                                InputEvent::PressEnter { .. } => return,
                             }
                             cx.notify();
                         });
+                    let theme_search =
+                        cx.new(|cx| InputState::new(window, cx).placeholder("Search themes"));
+                    let changed = pane_id.clone();
+                    let theme_events = cx.subscribe(
+                        &theme_search,
+                        move |this, search, event: &InputEvent, cx| {
+                            match event {
+                                InputEvent::Change => {
+                                    let query = search.read(cx).value().to_lowercase();
+                                    if let Some(catalog) = &mut this.theme_catalog
+                                        && catalog.pane == changed
+                                    {
+                                        catalog.query = query;
+                                    }
+                                }
+                                InputEvent::Focus => {
+                                    this.settings.focus = Some(SettingsFocus {
+                                        host: SettingsHost::Pane(changed.clone()),
+                                        stop: Stop::Control {
+                                            row: this.theme_stop_row(&changed),
+                                            action: SettingsAction::ThemeSearch,
+                                        },
+                                    });
+                                }
+                                InputEvent::PressEnter { .. } | InputEvent::Blur => return,
+                            }
+                            cx.notify();
+                        },
+                    );
                     self.settings.panes.insert(
                         pane_id.clone(),
                         SettingsPane {
                             focus: cx.focus_handle(),
                             search,
+                            theme_search,
                             query: String::new(),
                             section: daemon,
                             persisted: daemon,
                             sent: None,
                             scroll: SettingsScroll::default(),
+                            grid: SettingsScroll::default(),
+                            grid_columns: std::cell::Cell::new(1),
                             _events: events,
+                            _theme_events: theme_events,
                         },
                     );
                     if let Some(stop) = self.settings.pending.take() {
                         self.set_settings_focus(SettingsHost::Pane(pane_id.clone()), stop);
+                    }
+                    if let Some(target) = self.settings.pending_themes.take() {
+                        self.start_theme_session(pane_id.clone(), target, true);
                     }
                 }
                 Some(pane) => {
@@ -1252,15 +1551,61 @@ impl CompiApp {
         {
             self.settings.focus = None;
         }
-        // A control clicked while the search field had the keyboard takes it.
-        if let Some(pane_id) = self.focused_pane().cloned()
-            && self.settings.focus.as_ref().is_some_and(|focus| {
-                focus.host == SettingsHost::Pane(pane_id.clone()) && focus.stop != Stop::Search
-            })
-            && let Some(pane) = self.settings.panes.get(&pane_id)
-            && pane.search.focus_handle(cx).is_focused(window)
+        // The theme session lasts while its pane shows its section and, once the pane
+        // had the keyboard, while it keeps it.
+        if let Some((pane_id, section)) = self
+            .theme_catalog
+            .as_ref()
+            .map(|catalog| (catalog.pane.clone(), catalog.section()))
         {
-            window.focus(&pane.focus, cx);
+            let focused = self.focused_pane() == Some(&pane_id);
+            let shows = self
+                .settings
+                .panes
+                .get(&pane_id)
+                .is_some_and(|pane| pane.section == section && pane.query.trim().is_empty());
+            let held = self.theme_catalog.as_mut().is_some_and(|catalog| {
+                catalog.held |= focused;
+                catalog.held
+            });
+            if !shows || (held && !focused) {
+                self.cancel_catalog_preview();
+                if self.popup == Some(Popup::CatalogMenu) {
+                    self.popup = None;
+                }
+            }
+        }
+        // The Appearance page always shows the theme grid, so it always has a session.
+        let appearance = self
+            .shown_content_panes()
+            .find(|pane| {
+                self.settings.panes.get(*pane).is_some_and(|ui| {
+                    ui.section == SettingsSection::Appearance && ui.query.trim().is_empty()
+                })
+            })
+            .cloned();
+        if self.theme_catalog.is_none()
+            && let Some(pane_id) = appearance
+        {
+            self.start_theme_session(pane_id.clone(), CatalogTarget::Both, true);
+            let query = self
+                .settings
+                .panes
+                .get(&pane_id)
+                .map(|ui| ui.theme_search.read(cx).value().to_lowercase());
+            if let (Some(catalog), Some(query)) = (&mut self.theme_catalog, query) {
+                catalog.query = query;
+            }
+        }
+        // A control clicked while a search field had the keyboard takes it.
+        if let Some(pane_id) = self.focused_pane().cloned()
+            && let Some(pane) = self.settings.panes.get(&pane_id)
+            && (pane.search.focus_handle(cx).is_focused(window)
+                || pane.theme_search.focus_handle(cx).is_focused(window))
+            && let Some(keyboard) = self.settings_keyboard(&pane_id, cx)
+            && !keyboard.is_focused(window)
+        {
+            window.focus(&keyboard, cx);
         }
         let prompt = self.settings_row_shown(PROMPT_ROW);
         if prompt && !self.settings.prompt_shown {
@@ -1280,32 +1625,44 @@ impl CompiApp {
             *focused == pane.focus
                 || pane.focus.contains_focused(window, cx)
                 || pane.search.focus_handle(cx) == *focused
+                || pane.theme_search.focus_handle(cx) == *focused
         })
     }
 
     /// Where the keyboard goes in the focused Settings pane `pane`: its search field
-    /// unless a control has the highlight there.
+    /// unless a control has the highlight there, the theme list's search field when
+    /// that has it.
     pub(super) fn settings_keyboard(&self, pane: &PaneId, cx: &App) -> Option<FocusHandle> {
         let ui = self.settings.panes.get(pane)?;
-        let control = self.settings.focus.as_ref().is_some_and(|focus| {
-            focus.host == SettingsHost::Pane(pane.clone()) && focus.stop != Stop::Search
-        });
-        Some(if control {
-            ui.focus.clone()
-        } else {
-            ui.search.focus_handle(cx)
+        let stop = self
+            .settings
+            .focus
+            .as_ref()
+            .filter(|focus| focus.host == SettingsHost::Pane(pane.clone()))
+            .map(|focus| focus.stop);
+        Some(match stop {
+            None | Some(Stop::Search) => ui.search.focus_handle(cx),
+            Some(Stop::Control {
+                action: SettingsAction::ThemeSearch,
+                ..
+            }) => ui.theme_search.focus_handle(cx),
+            Some(_) => ui.focus.clone(),
         })
     }
 
-    /// The focused Settings pane's search field has the keyboard.
+    /// The focused Settings pane's search field, or its theme list's, has the keyboard.
     pub(super) fn settings_search_has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.focused_pane()
             .and_then(|pane| self.settings.panes.get(pane))
-            .is_some_and(|pane| pane.search.focus_handle(cx).is_focused(window))
+            .is_some_and(|pane| {
+                pane.search.focus_handle(cx).is_focused(window)
+                    || pane.theme_search.focus_handle(cx).is_focused(window)
+            })
     }
 
-    /// Keys in the focused Settings pane's search field, before the field's own: Tab
-    /// and Down move on to the controls, Escape clears the search or leaves Settings.
+    /// Keys in the focused Settings pane's search fields, before the field's own: Tab
+    /// and Down move on to the controls, Escape clears the search or leaves (Settings,
+    /// or the theme list).
     pub(super) fn settings_search_key(
         &mut self,
         key: &Keystroke,
@@ -1322,13 +1679,32 @@ impl CompiApp {
         if modifiers.control || modifiers.alt || modifiers.platform {
             return false;
         }
+        let themes = self
+            .settings
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| pane.theme_search.focus_handle(cx).is_focused(window));
         let host = SettingsHost::Pane(pane_id.clone());
+        let field = if themes {
+            Stop::Control {
+                row: self.theme_stop_row(&pane_id),
+                action: SettingsAction::ThemeSearch,
+            }
+        } else {
+            Stop::Search
+        };
         match key.key.as_str() {
             "tab" | "down" | "enter" => {
                 let order = self.settings_order(&host);
                 let forward = !(key.key == "tab" && modifiers.shift);
                 let next = if key.key == "tab" {
-                    step(&order, Some(Stop::Search), forward)
+                    step(&order, Some(field), forward)
+                } else if themes {
+                    // Down and Enter go to the theme rows.
+                    Some(Stop::Control {
+                        row: self.theme_stop_row(&pane_id),
+                        action: SettingsAction::ThemeList,
+                    })
                 } else {
                     // Down and Enter go to the first result.
                     order
@@ -1342,12 +1718,29 @@ impl CompiApp {
                 }
                 true
             }
+            "escape" if themes => {
+                let Some(pane) = self.settings.panes.get(&pane_id) else {
+                    return false;
+                };
+                if pane.theme_search.read(cx).value().is_empty() {
+                    self.settings_escape(&pane_id);
+                } else {
+                    pane.theme_search
+                        .update(cx, |search, cx| search.set_value("", window, cx));
+                    if let Some(catalog) = &mut self.theme_catalog {
+                        catalog.query.clear();
+                    }
+                }
+                self.apply_settings_focus(&pane_id, window, cx);
+                true
+            }
             "escape" => {
                 let Some(pane) = self.settings.panes.get_mut(&pane_id) else {
                     return false;
                 };
                 if pane.query.is_empty() {
-                    self.leave_settings(&pane_id);
+                    // An empty field folds back into the search icon.
+                    self.collapse_settings_search(&pane_id, window, cx);
                 } else {
                     pane.query.clear();
                     pane.search
@@ -1357,6 +1750,61 @@ impl CompiApp {
             }
             _ => false,
         }
+    }
+
+    /// Escape in a Settings pane's controls: a waiting theme preview is cancelled, else
+    /// the theme list closes, else the highlight goes up to the section shown, and from
+    /// there the keyboard goes back to the terminal.
+    fn settings_escape(&mut self, pane_id: &PaneId) {
+        let host = SettingsHost::Pane(pane_id.clone());
+        if self.theme_bar_shown(pane_id) {
+            self.cancel_theme_preview();
+            self.settle_theme_focus(pane_id);
+        } else if self.theme_list_shown(pane_id) {
+            self.close_theme_list();
+            self.focus_theme_origin(pane_id);
+        } else if self
+            .settings
+            .focus
+            .as_ref()
+            .is_some_and(|focus| focus.host == host && matches!(focus.stop, Stop::Section(_)))
+        {
+            self.leave_settings(pane_id);
+        } else if let Some(section) = self.settings.panes.get(pane_id).map(|pane| pane.section) {
+            self.set_settings_focus(host, Stop::Section(section));
+        }
+    }
+
+    /// After a theme decision: a highlight on a control that went away (the bar's)
+    /// goes back to the control that opened the theme list.
+    fn settle_theme_focus(&mut self, pane_id: &PaneId) {
+        let host = SettingsHost::Pane(pane_id.clone());
+        let order = self.settings_order(&host);
+        if self
+            .settings
+            .focus
+            .as_ref()
+            .is_some_and(|focus| focus.host == host && !order.contains(&focus.stop))
+        {
+            self.focus_theme_origin(pane_id);
+        }
+    }
+
+    /// The highlight back on the control that opened the terminal colors page, or on
+    /// the theme grid.
+    fn focus_theme_origin(&mut self, pane_id: &PaneId) {
+        let section = self.settings.panes.get(pane_id).map(|pane| pane.section);
+        let stop = match section {
+            Some(SettingsSection::Advanced) => Stop::Control {
+                row: "terminal-colors",
+                action: SettingsAction::AllThemes(CatalogTarget::Terminal),
+            },
+            _ => Stop::Control {
+                row: THEME_ROW,
+                action: SettingsAction::ThemeList,
+            },
+        };
+        self.set_settings_focus(SettingsHost::Pane(pane_id.clone()), stop);
     }
 
     /// Gives the keyboard to the search field or the pane, following the highlight.
@@ -1406,7 +1854,9 @@ impl CompiApp {
         let Some(pane) = self.settings.panes.get(pane_id) else {
             return;
         };
-        if pane.search.focus_handle(cx).is_focused(window) {
+        if pane.search.focus_handle(cx).is_focused(window)
+            || pane.theme_search.focus_handle(cx).is_focused(window)
+        {
             // Text belongs to the field; Tab, Down and Escape were taken before it.
             return;
         }
@@ -1415,8 +1865,16 @@ impl CompiApp {
         let plain = !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform;
         let handled = if key.key == "escape" && plain {
             if self.popup.take().is_none() && !self.close_prompt_dropdown() {
-                self.set_settings_focus(host, Stop::Search);
+                self.settings_escape(pane_id);
             }
+            true
+        } else if key.key == "f"
+            && (key.modifiers.control || key.modifiers.platform)
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+        {
+            // Ctrl/Cmd+F opens the search field behind its icon.
+            self.set_settings_focus(host, Stop::Search);
             true
         } else if self.settings_navigation_key(key, &host, window, cx) {
             true
@@ -1425,18 +1883,37 @@ impl CompiApp {
             .as_deref()
             .filter(|text| plain && !text.is_empty() && !text.chars().any(char::is_control))
         {
-            // Typing searches.
+            // Typing searches: the theme list's themes while it shows, else settings.
             let text = text.to_owned();
+            let themes = self.theme_list_shown(pane_id);
             if let Some(pane) = self.settings.panes.get(pane_id) {
-                let query = format!("{}{text}", pane.search.read(cx).value());
-                pane.search
-                    .update(cx, |search, cx| search.set_value(query, window, cx));
-                let lowered = pane.search.read(cx).value().to_lowercase();
-                if let Some(pane) = self.settings.panes.get_mut(pane_id) {
+                let field = if themes {
+                    &pane.theme_search
+                } else {
+                    &pane.search
+                };
+                let query = format!("{}{text}", field.read(cx).value());
+                field.update(cx, |search, cx| search.set_value(query, window, cx));
+                let lowered = field.read(cx).value().to_lowercase();
+                if themes {
+                    if let Some(catalog) = &mut self.theme_catalog {
+                        catalog.query = lowered;
+                    }
+                } else if let Some(pane) = self.settings.panes.get_mut(pane_id) {
                     pane.query = lowered;
                 }
             }
-            self.set_settings_focus(host, Stop::Search);
+            self.set_settings_focus(
+                host,
+                if themes {
+                    Stop::Control {
+                        row: self.theme_stop_row(pane_id),
+                        action: SettingsAction::ThemeSearch,
+                    }
+                } else {
+                    Stop::Search
+                },
+            );
             true
         } else {
             self.handle_app_key(event, window, cx)
@@ -1501,14 +1978,61 @@ impl CompiApp {
                 self.move_prompt_style(key.key.as_str());
                 current
             }
+            (
+                "up" | "down" | "left" | "right",
+                Some(Stop::Control {
+                    action: SettingsAction::ThemeList,
+                    ..
+                }),
+            ) => {
+                // Arrows move the preview across the grid: a tile, or a row of them.
+                let columns = pane
+                    .as_ref()
+                    .and_then(|pane| self.settings.panes.get(pane))
+                    .map_or(1, |ui| ui.grid_columns.get());
+                self.move_catalog_selection(
+                    match key.key.as_str() {
+                        "up" => GridStep::Up,
+                        "down" => GridStep::Down,
+                        "left" => GridStep::Previous,
+                        _ => GridStep::Next,
+                    },
+                    columns,
+                );
+                current
+            }
+            (
+                "left" | "right",
+                Some(Stop::Control {
+                    action: SettingsAction::ThemeFilter,
+                    ..
+                }),
+            ) => {
+                self.step_catalog_filter(key.key == "right");
+                current
+            }
+            (
+                "left" | "right",
+                Some(Stop::Control {
+                    action: SettingsAction::Scope,
+                    ..
+                }),
+            ) => {
+                self.set_settings_scope(if key.key == "left" {
+                    SettingsScope::Global
+                } else {
+                    SettingsScope::Window
+                });
+                current
+            }
             ("tab", _) => step(&order, current, !modifiers.shift),
-            ("up" | "down", Some(Stop::Section(section))) => {
+            ("left" | "right", Some(Stop::Section(section))) => {
                 let index = SettingsSection::ALL
                     .iter()
                     .position(|candidate| *candidate == section)
                     .unwrap_or(0);
                 let count = SettingsSection::ALL.len();
-                let next = SettingsSection::ALL[if key.key == "up" {
+                let next = SettingsSection::ALL[if key.key == "left" {
                     (index + count - 1) % count
                 } else {
                     (index + 1) % count
@@ -1518,6 +2042,8 @@ impl CompiApp {
                 }
                 Some(Stop::Section(next))
             }
+            ("down", Some(Stop::Section(_))) => controls.first().copied().or(current),
+            ("up", Some(Stop::Section(_))) => Some(Stop::Search),
             ("up" | "down", _) => step(&controls, current, key.key == "down"),
             (
                 "left" | "right",
@@ -1529,7 +2055,6 @@ impl CompiApp {
                 self.adjust_opacity(if key.key == "left" { -0.05 } else { 0.05 }, window, cx);
                 current
             }
-            ("right", Some(Stop::Section(_))) => controls.first().copied().or(current),
             ("left", Some(Stop::Control { .. })) if pane.is_some() => pane
                 .as_ref()
                 .and_then(|pane| self.settings.panes.get(pane))
@@ -1560,6 +2085,10 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if self.theme_list_shown(pane_id) {
+            // The current section again: back from the theme list.
+            self.close_theme_list();
+        }
         let Some(pane) = self.settings.panes.get_mut(pane_id) else {
             return;
         };
@@ -1613,9 +2142,66 @@ impl CompiApp {
                     self.global_error = Some(error);
                 }
             }
-            SettingsAction::Scope(scope) => self.settings_scope = scope,
-            SettingsAction::BrowseThemes(target) => {
-                self.open_theme_catalog_target(self.settings_scope, target)
+            SettingsAction::Scope => self.set_settings_scope(match self.settings_scope {
+                SettingsScope::Global => SettingsScope::Window,
+                SettingsScope::Window => SettingsScope::Global,
+            }),
+            SettingsAction::AllThemes(target) => match self.highlighted_pane() {
+                // From search results: the Appearance page and its grid.
+                Some(pane) if target == CatalogTarget::Both => {
+                    self.select_settings_section(&pane, SettingsSection::Appearance, window, cx);
+                    self.set_settings_focus(
+                        SettingsHost::Pane(pane),
+                        Stop::Control {
+                            row: THEME_ROW,
+                            action: SettingsAction::ThemeList,
+                        },
+                    );
+                }
+                Some(pane) => {
+                    self.start_theme_session(pane.clone(), target, true);
+                    self.set_settings_focus(
+                        SettingsHost::Pane(pane),
+                        Stop::Control {
+                            row: THEME_LIST_ROW,
+                            action: SettingsAction::ThemeList,
+                        },
+                    );
+                }
+                // Quick Appearance goes on to the Settings pane.
+                None => self.open_theme_settings(target, window, cx),
+            },
+            SettingsAction::ThemeBack => {
+                self.close_theme_list();
+                if let Some(pane) = self.highlighted_pane() {
+                    self.focus_theme_origin(&pane);
+                }
+            }
+            SettingsAction::ThemeSearch => {
+                if let Some(pane) = self.highlighted_pane() {
+                    self.apply_settings_focus(&pane, window, cx);
+                }
+            }
+            SettingsAction::ThemeFilter => self.step_catalog_filter(true),
+            SettingsAction::ThemeMore => self.popup = Some(Popup::CatalogMenu),
+            SettingsAction::ThemeList => {
+                if self
+                    .highlighted_pane()
+                    .is_some_and(|pane| self.theme_bar_shown(&pane))
+                {
+                    self.decide_theme(window, cx);
+                }
+            }
+            SettingsAction::ThemeFavorite => self.toggle_selected_favorite(window, cx),
+            SettingsAction::ThemeCancel | SettingsAction::ThemeApply => {
+                if action == SettingsAction::ThemeCancel {
+                    self.cancel_theme_preview();
+                } else {
+                    self.decide_theme(window, cx);
+                }
+                if let Some(pane) = self.highlighted_pane() {
+                    self.settle_theme_focus(&pane);
+                }
             }
             SettingsAction::ToggleTransparency => {
                 self.set_transparent_background(
@@ -1657,6 +2243,34 @@ impl CompiApp {
                 self.open_settings(Some(SettingsSection::Appearance), None, window, cx)
             }
         }
+    }
+
+    /// Global defaults or this window; a theme preview of the other scope ends.
+    fn set_settings_scope(&mut self, scope: SettingsScope) {
+        if self.settings_scope != scope {
+            self.cancel_catalog_preview();
+            self.settings_scope = scope;
+        }
+    }
+
+    /// The theme list's next (or previous) filter.
+    fn step_catalog_filter(&mut self, forward: bool) {
+        let Some(catalog) = &self.theme_catalog else {
+            return;
+        };
+        let filters = super::catalog::ThemeFilter::ALL;
+        let index = filters
+            .iter()
+            .position(|filter| *filter == catalog.filter)
+            .unwrap_or(0);
+        let count = filters.len();
+        self.set_catalog_filter(
+            filters[if forward {
+                (index + 1) % count
+            } else {
+                (index + count - 1) % count
+            }],
+        );
     }
 
     fn adjust_opacity(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -1753,14 +2367,6 @@ impl CompiApp {
             Some("Renderer rebuilt. Visual caches will repopulate as needed.".into());
     }
 
-    pub(super) fn settings_heading(&self, title: &'static str) -> AnyElement {
-        div()
-            .text_size(px(18.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(title)
-            .into_any_element()
-    }
-
     pub(super) fn settings_subheading(&self, label: &str) -> AnyElement {
         let colors = *self.colors();
         div()
@@ -1772,330 +2378,224 @@ impl CompiApp {
             .into_any_element()
     }
 
-    fn settings_button(
+    /// `control` as `action` of `row`: a click takes the highlight and acts, and the
+    /// highlight draws a ring around it.
+    pub(super) fn settings_control(
         &self,
-        id: impl Into<gpui::ElementId>,
-        label: impl Into<SharedString>,
-        focused: bool,
-        tone: SettingsButtonTone,
-        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+        row: &RowCx,
+        action: SettingsAction,
+        control: controls::Control,
+        cx: &Context<Self>,
     ) -> AnyElement {
-        self.settings_button_face(id, label, focused, tone)
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(on_click)
-            .into_any_element()
-    }
-
-    /// A settings button that opens a popup: the popup's trigger takes its clicks.
-    pub(super) fn settings_popup_button(
-        &self,
-        id: impl Into<gpui::ElementId>,
-        label: impl Into<SharedString>,
-        focused: bool,
-        destructive: bool,
-    ) -> AnyElement {
-        self.settings_button_face(
-            id,
-            label,
+        let focused = self.settings_focused(row, action);
+        controls::highlight(
             focused,
-            if destructive {
-                SettingsButtonTone::Destructive
-            } else {
-                SettingsButtonTone::Secondary
-            },
+            control.on_click(self.settings_click(row, action, cx)),
+            cx,
         )
+        .child(self.settings_focus_anchor(focused, cx))
         .into_any_element()
     }
 
-    fn settings_button_face(
+    /// An outline text button for `action` of `row`, its `index`-th control.
+    pub(super) fn settings_button(
         &self,
-        id: impl Into<gpui::ElementId>,
+        row: &RowCx,
+        index: usize,
         label: impl Into<SharedString>,
-        focused: bool,
-        tone: SettingsButtonTone,
-    ) -> Stateful<Div> {
-        let colors = *self.colors();
-        let (background, hover, foreground) = match tone {
-            SettingsButtonTone::Secondary => (
-                blend_rgb(colors.surface, colors.foreground, 0.04),
-                blend_rgb(colors.surface, colors.foreground, 0.09),
-                colors.foreground,
-            ),
-            SettingsButtonTone::Primary => (
-                blend_rgb(colors.surface, colors.accent, 0.12),
-                blend_rgb(colors.surface, colors.accent, 0.20),
-                colors.foreground,
-            ),
-            SettingsButtonTone::Destructive => (
-                blend_rgb(colors.surface, colors.error, 0.06),
-                blend_rgb(colors.surface, colors.error, 0.12),
-                colors.error,
-            ),
-        };
-        let border = if focused {
-            if matches!(tone, SettingsButtonTone::Primary) {
-                colors.foreground
-            } else {
-                colors.accent
-            }
-        } else if matches!(tone, SettingsButtonTone::Primary) {
-            colors.accent
-        } else {
-            background
-        };
-        div()
-            .id(id)
-            .h(px(32.0))
-            .min_w(px(72.0))
-            .flex_none()
-            .px_3()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(UI_BODY_TEXT_SIZE))
-            .line_height(px(UI_BODY_LINE_HEIGHT))
-            .text_center()
-            .whitespace_nowrap()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(border))
-            .bg(color(background))
-            .font_weight(if matches!(tone, SettingsButtonTone::Secondary) {
-                FontWeight::MEDIUM
-            } else {
-                FontWeight::SEMIBOLD
-            })
-            .text_color(color(ui_text_color(foreground, background)))
-            .hover(move |style| style.bg(color(hover)).cursor_pointer())
-            .child(Into::<SharedString>::into(label))
-    }
-
-    pub(super) fn settings_action_button(
-        &self,
-        id: impl Into<gpui::ElementId>,
-        label: impl Into<SharedString>,
-        focused: bool,
-        destructive: bool,
-        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+        action: SettingsAction,
+        cx: &Context<Self>,
     ) -> AnyElement {
-        self.settings_button(
-            id,
-            label,
-            focused,
-            if destructive {
-                SettingsButtonTone::Destructive
-            } else {
-                SettingsButtonTone::Secondary
-            },
-            on_click,
+        self.settings_control(
+            row,
+            action,
+            controls::text_button((row.row, index), label).header(),
+            cx,
         )
     }
 
-    pub(super) fn settings_primary_button(
+    /// The on/off switch of `action` in `row`, on when `enabled`.
+    pub(super) fn settings_switch(
         &self,
-        id: impl Into<gpui::ElementId>,
-        label: impl Into<SharedString>,
-        focused: bool,
-        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        self.settings_button(id, label, focused, SettingsButtonTone::Primary, on_click)
-    }
-
-    pub(super) fn settings_segment_button(
-        &self,
-        id: impl Into<gpui::ElementId>,
-        label: impl Into<SharedString>,
-        active: bool,
-        focused: bool,
-        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        let colors = *self.colors();
-        let group = colors.surface;
-        let selected = blend_rgb(colors.surface, colors.accent, 0.08);
-        let background = if active { selected } else { group };
-        div()
-            .id(id)
-            .h(px(32.0))
-            .min_w(px(72.0))
-            .flex_none()
-            .px_3()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(if focused || active {
-                colors.accent
-            } else {
-                colors.border
-            }))
-            .bg(color(background))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(UI_BODY_TEXT_SIZE))
-            .line_height(px(UI_BODY_LINE_HEIGHT))
-            .text_center()
-            .whitespace_nowrap()
-            .font_weight(if active {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::MEDIUM
-            })
-            .text_color(color(ui_text_color(
-                if active {
-                    colors.foreground
-                } else {
-                    colors.muted
-                },
-                background,
-            )))
-            .hover(move |style| {
-                style
-                    .bg(color(if active {
-                        selected
-                    } else {
-                        colors.surface_hover
-                    }))
-                    .cursor_pointer()
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(on_click)
-            .child(Into::<SharedString>::into(label))
-            .into_any_element()
-    }
-
-    pub(super) fn overlay_close_button(
-        &self,
-        id: impl Into<gpui::ElementId>,
+        row: &RowCx,
+        enabled: bool,
+        action: SettingsAction,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = *self.colors();
-        let background = blend_rgb(colors.surface, colors.foreground, 0.07);
-        let hover = blend_rgb(colors.surface, colors.foreground, 0.13);
-        div()
-            .id(id)
-            .size(px(36.0))
-            .rounded_sm()
-            .flex()
-            .items_center()
-            .justify_center()
-            .hover(move |style| style.bg(color(hover)).cursor_pointer())
-            .tooltip(controls::tooltip("Close", None, Some("escape")))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.dismiss_overlay();
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .size(px(28.0))
-                    .rounded_sm()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(color(background))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(px(16.0))
-                    .text_color(color(ui_text_color(colors.foreground, background)))
-                    .child("×"),
-            )
-            .into_any_element()
+        let focused = self.settings_focused(row, action);
+        let toggled = row.clone();
+        controls::highlight(
+            focused,
+            controls::switch((row.row, 0_usize), enabled)
+                .label(row.title)
+                .on_toggle(cx.listener(move |this, _: &bool, window, cx| {
+                    this.focus_settings_control(&toggled, action);
+                    this.activate_settings_action(action, window, cx);
+                    cx.notify();
+                })),
+            cx,
+        )
+        .child(self.settings_focus_anchor(focused, cx))
+        .into_any_element()
     }
 
-    /// The section list of the Settings pane `pane_id`: a column beside the rows, or
-    /// when `compact` a wrapped row above them. No entry is current while searching.
-    fn render_settings_navigation(
+    /// Whether the Settings pane `pane_id` shows its search field: while it has the
+    /// highlight or holds a query. Otherwise the header shows the search icon.
+    fn settings_search_open(&self, pane_id: &PaneId, pane: &SettingsPane) -> bool {
+        !pane.query.is_empty()
+            || self.settings.focus.as_ref()
+                == Some(&SettingsFocus {
+                    host: SettingsHost::Pane(pane_id.clone()),
+                    stop: Stop::Search,
+                })
+    }
+
+    /// Closes the search field of the Settings pane `pane_id`: the query goes and the
+    /// highlight returns to the section shown.
+    fn collapse_settings_search(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut App) {
+        let Some(pane) = self.settings.panes.get_mut(pane_id) else {
+            return;
+        };
+        if !pane.query.is_empty() {
+            pane.query.clear();
+            pane.search
+                .update(cx, |search, cx| search.set_value("", window, cx));
+        }
+        let section = pane.section;
+        self.set_settings_focus(SettingsHost::Pane(pane_id.clone()), Stop::Section(section));
+        self.apply_settings_focus(pane_id, window, cx);
+    }
+
+    /// The header line of the Settings pane `pane_id`: the title, the section icons
+    /// (the current one filled and underlined in the accent) and the search icon; or
+    /// while searching, the title and the search field in their place.
+    fn render_settings_header(
         &self,
         pane_id: &PaneId,
         pane: &SettingsPane,
-        compact: bool,
+        width: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let searching = !pane.query.trim().is_empty();
+        // Narrow panes give the title's room to the section icons.
+        let titled = width >= HEADER_TITLE_MIN_WIDTH;
+        let header = div()
+            .flex_none()
+            .h(px(44.0))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(color(colors.border))
+            .when(titled, |header| {
+                header.child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Settings"),
+                )
+            });
+        if self.settings_search_open(pane_id, pane) {
+            let close = pane_id.clone();
+            return header
+                .child(
+                    div().flex_1().min_w_0().max_w(px(420.0)).child(
+                        Input::new(&pane.search)
+                            .appearance(true)
+                            .with_size(gpui_component::Size::Small),
+                    ),
+                )
+                .child(
+                    controls::icon_button("settings-search-close", IconName::X, "Close search")
+                        .header()
+                        .key("escape")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.collapse_settings_search(&close, window, cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element();
+        }
         let host = SettingsHost::Pane(pane_id.clone());
-        let items = SettingsSection::ALL
+        let entries = SettingsSection::ALL
             .into_iter()
             .enumerate()
             .map(|(index, section)| {
-                let active = !searching && pane.section == section;
+                let active = pane.section == section;
                 let focused = self.settings.focus.as_ref()
                     == Some(&SettingsFocus {
                         host: host.clone(),
                         stop: Stop::Section(section),
                     });
-                // Only the current section has a fill; the others sit on the pane.
-                let background = blend_rgb(colors.surface, colors.foreground, 0.06);
                 let pane_id = pane_id.clone();
+                let entry = controls::icon_button(
+                    ("settings-section", index),
+                    section_icon(section),
+                    section.label(),
+                )
+                .header()
+                .selected(active)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_settings_section(&pane_id, section, window, cx);
+                    this.set_settings_focus(
+                        SettingsHost::Pane(pane_id.clone()),
+                        Stop::Section(section),
+                    );
+                    this.apply_settings_focus(&pane_id, window, cx);
+                    cx.notify();
+                }));
+                // The entry fills the header's height: the icon centred, its ring clear of
+                // the edges, and the underline on the header's bottom edge.
                 div()
-                    .id(("settings-nav", index))
                     .relative()
-                    .min_h(px(36.0))
                     .flex_none()
-                    .px_2()
+                    .h_full()
                     .flex()
                     .items_center()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if focused {
-                        color(colors.accent)
-                    } else if active {
-                        color(background)
-                    } else {
-                        gpui::transparent_black()
+                    .child(
+                        controls::highlight(focused, entry, cx)
+                            .child(self.settings_focus_anchor(focused, cx)),
+                    )
+                    .when(active, |entry| {
+                        entry.child(
+                            div()
+                                .absolute()
+                                .left(px(2.0))
+                                .right(px(2.0))
+                                .bottom_0()
+                                .h(px(2.0))
+                                .rounded_full()
+                                .bg(color(colors.accent)),
+                        )
                     })
-                    .when(active, |item| item.bg(color(background)))
-                    .text_color(color(modal_text_color(
-                        if active {
-                            colors.foreground
-                        } else {
-                            colors.muted
-                        },
-                        &colors,
-                    )))
-                    .font_weight(if active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_settings_section(&pane_id, section, window, cx);
-                        this.set_settings_focus(
-                            SettingsHost::Pane(pane_id.clone()),
-                            Stop::Section(section),
-                        );
-                        this.apply_settings_focus(&pane_id, window, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .child(section.label())
-                    .child(self.settings_focus_anchor(focused, cx))
             });
-        if compact {
-            div()
-                .flex_none()
-                .px_4()
-                .py_2()
-                .flex()
-                .flex_wrap()
-                .gap_1()
-                .border_b_1()
-                .border_color(color(colors.border))
-                .children(items)
-                .into_any_element()
-        } else {
-            div()
-                .w(px(SECTION_LIST_WIDTH))
-                .flex_none()
-                .p_3()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .border_r_1()
-                .border_color(color(colors.border))
-                .children(items)
-                .into_any_element()
-        }
+        let open = pane_id.clone();
+        header
+            .child(
+                div()
+                    .id("settings-sections")
+                    .h_full()
+                    .min_w_0()
+                    // The strip scrolls, so it clips: room for the end icons' rings.
+                    .px(px(4.0))
+                    .flex()
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .children(entries),
+            )
+            .child(div().flex_1())
+            .child(
+                controls::icon_button("settings-search", IconName::Search, "Search settings")
+                    .header()
+                    .key("secondary-f")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_settings_focus(SettingsHost::Pane(open.clone()), Stop::Search);
+                        this.apply_settings_focus(&open, window, cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
     }
 
     /// Scrolls the highlighted control into its settings area once, after a keyboard
@@ -2109,11 +2609,15 @@ impl CompiApp {
                     return;
                 }
                 entity.update(cx, |this, _| {
-                    let Some(host) = this.settings.focus.as_ref().map(|focus| focus.host.clone())
+                    let Some((host, stop)) = this
+                        .settings
+                        .focus
+                        .as_ref()
+                        .map(|focus| (focus.host.clone(), focus.stop))
                     else {
                         return;
                     };
-                    let Some(scroll) = this.settings_scroll_mut(&host) else {
+                    let Some(scroll) = this.settings_scroll_mut(&host, in_theme_grid(stop)) else {
                         return;
                     };
                     if !scroll.to_focus {
@@ -2145,14 +2649,20 @@ impl CompiApp {
         .into_any_element()
     }
 
-    /// Records where `host`'s settings area is, so keyboard moves can scroll into it.
-    fn settings_scroll_viewport(&self, host: SettingsHost, cx: &Context<Self>) -> impl IntoElement {
+    /// Records where `host`'s settings area (with `grid`, its theme grid) is, so
+    /// keyboard moves can scroll into it.
+    fn settings_scroll_viewport(
+        &self,
+        host: SettingsHost,
+        grid: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let entity = cx.entity();
         canvas(
             |_, _, _| (),
             move |bounds, _, _, cx| {
                 entity.update(cx, |this, _| {
-                    if let Some(scroll) = this.settings_scroll_mut(&host) {
+                    if let Some(scroll) = this.settings_scroll_mut(&host, grid) {
                         scroll.bounds = Some(bounds);
                     }
                 });
@@ -2160,64 +2670,11 @@ impl CompiApp {
         )
         .absolute()
         .inset_0()
+        .into_any_element()
     }
 
-    pub(super) fn render_settings_toggle(
-        &self,
-        row: &RowCx,
-        enabled: bool,
-        action: SettingsAction,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let focused = self.settings_focused(row, action);
-        let colors = *self.colors();
-        div()
-            .id((row.row, 0_usize))
-            .relative()
-            .flex_none()
-            .min_w(px(92.0))
-            .min_h(px(36.0))
-            .px_2()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(if focused {
-                colors.accent
-            } else {
-                colors.border
-            }))
-            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(self.settings_click(row, action, cx))
-            .child(if enabled { "On" } else { "Off" })
-            .child(
-                div()
-                    .w(px(32.0))
-                    .h(px(18.0))
-                    .p(px(2.0))
-                    .flex()
-                    .items_center()
-                    .rounded_full()
-                    .bg(color(if enabled {
-                        colors.accent
-                    } else {
-                        colors.border
-                    }))
-                    .when(enabled, |switch| switch.justify_end())
-                    .child(
-                        div()
-                            .size(px(14.0))
-                            .rounded_full()
-                            .bg(color(colors.foreground)),
-                    ),
-            )
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
-    }
-
+    /// One setting inside its card: title and description on the left, the control on
+    /// the right (below them when `compact`).
     pub(super) fn settings_row(
         &self,
         label: &'static str,
@@ -2225,14 +2682,26 @@ impl CompiApp {
         control: AnyElement,
         compact: bool,
     ) -> AnyElement {
+        let muted = self.colors().muted;
+        self.tinted_settings_row(label.into(), detail, muted, control, compact)
+    }
+
+    /// A settings row whose description is in `tint` (a theme color, made legible).
+    fn tinted_settings_row(
+        &self,
+        label: SharedString,
+        detail: String,
+        tint: u32,
+        control: AnyElement,
+        compact: bool,
+    ) -> AnyElement {
         let colors = *self.colors();
         div()
             .min_w_0()
+            .min_h(px(52.0))
+            .py_3()
             .flex()
             .gap_3()
-            .py_3()
-            .border_b_1()
-            .border_color(color(colors.border))
             .when(compact, |row| row.flex_col().items_start())
             .when(!compact, |row| row.items_center().justify_between())
             .child(
@@ -2241,16 +2710,17 @@ impl CompiApp {
                     // Basis auto, not `flex_1`'s zero basis: with a zero basis Taffy sizes
                     // the row as if every character wrapped, which leaves blank scroll space
                     // below rows nested deeper in a column (the shell prompt group).
-                    .when(!compact, |label| label.flex_auto())
+                    .when(!compact, |label| label.flex_auto().min_w(px(72.0)))
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(2.0))
                     .child(div().font_weight(FontWeight::MEDIUM).child(label))
                     .when(!detail.is_empty(), |label| {
                         label.child(
                             div()
                                 .text_size(px(UI_SMALL_TEXT_SIZE))
-                                .text_color(color(modal_text_color(colors.muted, &colors)))
+                                .line_height(px(UI_SMALL_LINE_HEIGHT))
+                                .text_color(color(modal_text_color(tint, &colors)))
                                 .child(detail),
                         )
                     }),
@@ -2258,68 +2728,11 @@ impl CompiApp {
             .child(
                 div()
                     .min_w_0()
-                    .flex_none()
                     .when(compact, |control| control.w_full())
+                    .when(!compact, |control| control.flex_none())
+                    .flex()
+                    .items_center()
                     .child(control),
-            )
-            .into_any_element()
-    }
-
-    /// One button for `action` of `row`.
-    fn settings_control_button(
-        &self,
-        row: &RowCx,
-        index: usize,
-        label: &'static str,
-        action: SettingsAction,
-        destructive: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let focused = self.settings_focused(row, action);
-        div()
-            .relative()
-            .flex_none()
-            .child(self.settings_action_button(
-                (row.row, index),
-                label,
-                focused,
-                destructive,
-                self.settings_click(row, action, cx),
-            ))
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
-    }
-
-    /// Segment buttons for `choices`: label, whether it is the current one, and what
-    /// it does.
-    fn settings_segments(
-        &self,
-        row: &RowCx,
-        choices: impl IntoIterator<Item = (&'static str, bool, SettingsAction)>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        div()
-            .flex()
-            .when(row.compact, |controls| controls.flex_col().items_start())
-            .gap_2()
-            .children(
-                choices
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (label, active, action))| {
-                        let focused = self.settings_focused(row, action);
-                        div()
-                            .relative()
-                            .flex_none()
-                            .child(self.settings_segment_button(
-                                (row.row, index),
-                                label,
-                                active,
-                                focused,
-                                self.settings_click(row, action, cx),
-                            ))
-                            .child(self.settings_focus_anchor(focused, cx))
-                    }),
             )
             .into_any_element()
     }
@@ -2335,8 +2748,8 @@ impl CompiApp {
         self.settings_row(
             row.title,
             detail.into(),
-            self.render_settings_toggle(row, enabled, action, cx),
-            row.compact,
+            self.settings_switch(row, enabled, action, cx),
+            false,
         )
     }
 
@@ -2349,26 +2762,59 @@ impl CompiApp {
         destructive: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let button = controls::text_button((row.row, 0_usize), label).header();
         self.settings_row(
             row.title,
             detail,
-            self.settings_control_button(row, 0, label, action, destructive, cx),
+            self.settings_control(
+                row,
+                action,
+                if destructive { button.danger() } else { button },
+                cx,
+            ),
             row.compact,
         )
     }
 
+    /// Global defaults or This window: a small switch, at the right end of the page's
+    /// first label line or, in search results and Quick Appearance, as a row.
     fn render_scope_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let choices = [
-            (SettingsScope::Global, "Global defaults"),
-            (SettingsScope::Window, "This window"),
-        ]
-        .map(|(scope, label)| {
+        let focused = self.settings_focused(row, SettingsAction::Scope);
+        let options = [
             (
-                label,
-                self.settings_scope == scope,
-                SettingsAction::Scope(scope),
-            )
+                SettingsScope::Global,
+                "Global",
+                "Defaults for windows without an override.",
+            ),
+            (
+                SettingsScope::Window,
+                "This window",
+                "Only this window; global defaults stay unchanged.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (scope, label, detail))| {
+            let row = row.clone();
+            controls::text_button((row.row, index), label)
+                .selected(self.settings_scope == scope)
+                .detail(detail)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.focus_settings_control(&row, SettingsAction::Scope);
+                    this.set_settings_scope(scope);
+                    cx.notify();
+                }))
         });
+        let switch = controls::highlight(
+            focused,
+            controls::segmented((row.row, 9_usize), options),
+            cx,
+        )
+        .child(self.settings_focus_anchor(focused, cx))
+        .into_any_element();
+        if row.header {
+            return switch;
+        }
         self.settings_row(
             row.title,
             match self.settings_scope {
@@ -2376,52 +2822,28 @@ impl CompiApp {
                 SettingsScope::Window => "Only this window; global defaults stay unchanged.",
             }
             .into(),
-            self.settings_segments(row, choices, cx),
-            row.compact,
+            switch,
+            false,
         )
     }
 
+    /// Theme outside the Appearance page (search results, Quick Appearance): the
+    /// current theme and the way on to the grid in Settings. The page draws the grid
+    /// itself; see `render_theme_section`.
     fn render_theme_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let colors = *self.colors();
-        let appearance = self.scoped_appearance();
-        let theme_locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
-        let action = SettingsAction::BrowseThemes(CatalogTarget::Both);
-        let focused = self.settings_focused(row, action);
-        let theme_control = div()
-            .relative()
-            .min_w_0()
-            .child(self.render_theme_catalog_entry_target(
-                self.resolve_theme(&appearance.theme),
-                CatalogTarget::Both,
-                focused,
+        let theme = self.resolve_theme(&self.scoped_appearance().theme);
+        self.settings_row(
+            row.title,
+            theme.label().to_owned(),
+            self.settings_button(
+                row,
+                0,
+                "Browse themes…",
+                SettingsAction::AllThemes(CatalogTarget::Both),
                 cx,
-            ))
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element();
-        div()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(self.settings_row(
-                row.title,
-                if theme_locked {
-                    "Colors are fixed by --theme.".into()
-                } else {
-                    String::new()
-                },
-                theme_control,
-                true,
-            ))
-            .when(appearance.terminal_theme_override, |section| {
-                section.child(
-                    div()
-                        .text_size(px(UI_SMALL_TEXT_SIZE))
-                        .text_color(color(modal_text_color(colors.muted, &colors)))
-                        .child("Terminal colors overridden. Change or reset in Advanced."),
-                )
-            })
-            .into_any_element()
+            ),
+            false,
+        )
     }
 
     fn render_opacity_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
@@ -2430,7 +2852,8 @@ impl CompiApp {
         if self.opacity_drag_origin.is_some() {
             appearance.terminal_opacity = self.terminal_opacity;
         }
-        let focused = self.settings_focused(row, SettingsAction::Opacity);
+        let enabled = appearance.transparent_background;
+        let focused = enabled && self.settings_focused(row, SettingsAction::Opacity);
         let opacity_progress = ((appearance.terminal_opacity
             - crate::config::MIN_TERMINAL_OPACITY)
             / (crate::config::MAX_TERMINAL_OPACITY - crate::config::MIN_TERMINAL_OPACITY))
@@ -2476,70 +2899,78 @@ impl CompiApp {
         )
         .absolute()
         .inset_0();
-        div()
+        let slider = div()
+            .id((row.row, 0_usize))
             .relative()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_1()
+            .when(row.compact, |slider| slider.w_full())
+            .when(!row.compact, |slider| slider.w(px(180.0)))
+            .h(px(24.0))
+            .when(enabled, |slider| {
+                slider.cursor(gpui::CursorStyle::ResizeLeftRight)
+            })
             .child(
                 div()
-                    .flex()
-                    .justify_between()
-                    .gap_3()
-                    .child(row.title)
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(10.0))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(color(colors.border)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(10.0))
+                    .w(gpui::relative(opacity_progress))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(color(colors.accent)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(gpui::relative(opacity_progress))
+                    .top(px(5.0))
+                    .ml(px(-7.0))
+                    .size(px(14.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(color(colors.foreground))
+                    .bg(color(colors.accent)),
+            )
+            .when(enabled, |slider| slider.child(opacity_slider_input));
+        let control = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .when(row.compact, |control| control.w_full())
+            .when(!enabled, |control| control.opacity(0.45))
+            .child(
+                controls::highlight(focused, slider, cx)
+                    .when(row.compact, |slider| slider.flex_1().min_w_0())
+                    .child(self.settings_focus_anchor(focused, cx)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(40.0))
+                    .text_right()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
                     .child(format!("{:.0}%", appearance.terminal_opacity * 100.0)),
             )
-            .child(
-                div()
-                    .id((row.row, 0_usize))
-                    .relative()
-                    .mx_2()
-                    .h(px(44.0))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color(if focused {
-                        colors.accent
-                    } else {
-                        colors.surface
-                    }))
-                    .cursor(gpui::CursorStyle::ResizeLeftRight)
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .top(px(20.0))
-                            .h(px(4.0))
-                            .rounded_full()
-                            .bg(color(colors.border)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top(px(20.0))
-                            .w(gpui::relative(opacity_progress))
-                            .h(px(4.0))
-                            .rounded_full()
-                            .bg(color(colors.accent)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(gpui::relative(opacity_progress))
-                            .top(px(14.0))
-                            .ml(px(-7.0))
-                            .size(px(14.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(color(colors.foreground))
-                            .bg(color(colors.accent)),
-                    )
-                    .child(opacity_slider_input),
-            )
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
+            .into_any_element();
+        self.settings_row(
+            row.title,
+            if enabled {
+                String::new()
+            } else {
+                "Needs a transparent background.".into()
+            },
+            control,
+            row.compact,
+        )
     }
 
     /// Interface font or Terminal font: a select of the bundled presets, each shown in
@@ -2617,27 +3048,143 @@ impl CompiApp {
             .into_any_element()
     }
 
-    fn render_density_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let choices = crate::theme::WorkspaceDensity::ALL.map(|density| {
-            (
-                density.label(),
-                self.config.density == density,
-                SettingsAction::Density(density),
+    /// One drawn choice of a setting: `preview` above its `label`, an accent edge when
+    /// `selected`.
+    fn option_card(
+        &self,
+        row: &RowCx,
+        (index, action): (usize, SettingsAction),
+        selected: bool,
+        label: &'static str,
+        preview: Div,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let focused = self.settings_focused(row, action);
+        let card = div()
+            .id((row.row, index))
+            .w(px(OPTION_CARD_WIDTH))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(self.settings_click(row, action, cx))
+            .child(
+                preview
+                    .h(px(58.0))
+                    .w_full()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(material_color(colors.background, 1.0))
+                    .when(selected, |preview| {
+                        preview.border_2().border_color(color(colors.accent))
+                    })
+                    .when(!selected, |preview| {
+                        preview.border_1().border_color(color(colors.border))
+                    }),
             )
-        });
+            .child(
+                div()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .line_height(px(UI_SMALL_LINE_HEIGHT))
+                    .text_color(color(modal_text_color(
+                        if selected {
+                            colors.foreground
+                        } else {
+                            colors.muted
+                        },
+                        &colors,
+                    )))
+                    .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
+                    .child(label),
+            );
+        controls::highlight(focused, card, cx)
+            .child(self.settings_focus_anchor(focused, cx))
+            .into_any_element()
+    }
+
+    /// A pane of an option drawing: the surface with two lines of text.
+    fn sketch_pane(&self) -> Div {
+        let colors = *self.colors();
+        let line = |width: f32| {
+            div()
+                .h(px(3.0))
+                .w(px(width))
+                .rounded_full()
+                .bg(color(colors.muted).opacity(0.5))
+        };
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .p(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .bg(color(colors.surface))
+            .child(line(22.0))
+            .child(line(14.0))
+    }
+
+    fn render_density_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        use crate::theme::WorkspaceDensity;
+        let colors = *self.colors();
+        let cards = WorkspaceDensity::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, density)| {
+                let comfy = density == WorkspaceDensity::Comfy;
+                let pane = |sketch: Div| {
+                    if comfy {
+                        sketch
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(color(colors.border))
+                    } else {
+                        sketch
+                    }
+                };
+                let seam = color(colors.border);
+                let preview = div()
+                    .flex()
+                    .when(comfy, |preview| preview.p(px(5.0)).gap(px(4.0)))
+                    .child(pane(self.sketch_pane()).flex_none().w(px(28.0)))
+                    .when(!comfy, |preview| preview.child(div().w(px(1.0)).bg(seam)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .when(comfy, |column| column.gap(px(4.0)))
+                            .child(pane(self.sketch_pane()))
+                            .when(!comfy, |column| column.child(div().h(px(1.0)).bg(seam)))
+                            .child(pane(self.sketch_pane())),
+                    );
+                self.option_card(
+                    row,
+                    (index, SettingsAction::Density(density)),
+                    self.config.density == density,
+                    density.label(),
+                    preview,
+                    cx,
+                )
+            });
         self.settings_row(
             row.title,
             match self.config.density {
-                crate::theme::WorkspaceDensity::Comfy => {
-                    "Rounded panes with gaps between them, in every window."
-                }
-                crate::theme::WorkspaceDensity::Compact => {
+                WorkspaceDensity::Comfy => "Rounded panes with gaps between them, in every window.",
+                WorkspaceDensity::Compact => {
                     "Edge-to-edge panes for the most terminal space, in every window."
                 }
             }
             .into(),
-            self.settings_segments(row, choices, cx),
-            row.compact,
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .children(cards)
+                .into_any_element(),
+            true,
         )
     }
 
@@ -2671,59 +3218,96 @@ impl CompiApp {
     }
 
     fn render_focus_indicator_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let choices = crate::theme::FocusIndicator::ALL.map(|indicator| {
-            (
-                indicator.label(),
-                self.config.focus_indicator == indicator,
-                SettingsAction::FocusIndicator(indicator),
-            )
-        });
+        use crate::theme::FocusIndicator;
+        let colors = *self.colors();
+        let cards = FocusIndicator::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, indicator)| {
+                let island = |sketch: Div| {
+                    sketch
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(color(colors.border))
+                };
+                let focused = match indicator {
+                    FocusIndicator::Marker => island(self.sketch_pane()).child(
+                        div()
+                            .absolute()
+                            .top(px(-1.0))
+                            .left(px(6.0))
+                            .w(px(14.0))
+                            .h(px(2.0))
+                            .rounded_full()
+                            .bg(color(colors.accent)),
+                    ),
+                    FocusIndicator::Outline => {
+                        island(self.sketch_pane()).border_color(color(colors.accent))
+                    }
+                    FocusIndicator::Dim | FocusIndicator::None => island(self.sketch_pane()),
+                }
+                // Every indicator keeps the focused pane's cursor.
+                .child(div().w(px(5.0)).h(px(7.0)).bg(color(colors.foreground)));
+                let other = island(self.sketch_pane())
+                    .when(indicator == FocusIndicator::Dim, |pane| pane.opacity(0.4));
+                let preview = div()
+                    .flex()
+                    .p(px(5.0))
+                    .gap(px(4.0))
+                    .child(focused)
+                    .child(other);
+                self.option_card(
+                    row,
+                    (index, SettingsAction::FocusIndicator(indicator)),
+                    self.config.focus_indicator == indicator,
+                    indicator.label(),
+                    preview,
+                    cx,
+                )
+            });
         self.settings_row(
             row.title,
             match self.config.focus_indicator {
-                crate::theme::FocusIndicator::Marker => {
+                FocusIndicator::Marker => {
                     "A short accent bar on the focused pane; an outline flashes when focus moves."
                 }
-                crate::theme::FocusIndicator::Outline => {
-                    "An accent outline around the focused pane."
-                }
-                crate::theme::FocusIndicator::Dim => "Other panes are dimmed.",
-                crate::theme::FocusIndicator::None => {
-                    "Only the cursor, which unfocused panes do not draw."
-                }
+                FocusIndicator::Outline => "An accent outline around the focused pane.",
+                FocusIndicator::Dim => "Other panes are dimmed.",
+                FocusIndicator::None => "Only the cursor, which unfocused panes do not draw.",
             }
             .into(),
-            self.settings_segments(row, choices, cx),
-            row.compact,
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .children(cards)
+                .into_any_element(),
+            true,
         )
     }
 
     fn render_zoom_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let zoom = div()
             .flex()
-            .gap_2()
-            .child(self.settings_control_button(
+            .items_center()
+            .gap_1()
+            .child(self.settings_control(
                 row,
-                0,
-                "−",
                 SettingsAction::Zoom(Command::ZoomOut),
-                false,
+                controls::icon_button((row.row, 0_usize), IconName::Minus, "Zoom out").header(),
                 cx,
             ))
-            .child(self.settings_control_button(
+            .child(self.settings_button(
                 row,
                 1,
                 "Reset",
                 SettingsAction::Zoom(Command::ZoomReset),
-                false,
                 cx,
             ))
-            .child(self.settings_control_button(
+            .child(self.settings_control(
                 row,
-                2,
-                "+",
                 SettingsAction::Zoom(Command::ZoomIn),
-                false,
+                controls::icon_button((row.row, 2_usize), IconName::Plus, "Zoom in").header(),
                 cx,
             ))
             .into_any_element();
@@ -2743,84 +3327,78 @@ impl CompiApp {
     fn render_terminal_colors_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let appearance = self.scoped_appearance();
         let theme_locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
-        let terminal_colors = div()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().font_weight(FontWeight::MEDIUM).child(
-                if appearance.terminal_theme_override {
-                    self.resolve_theme(&appearance.terminal_theme)
-                        .label()
-                        .to_string()
-                } else {
-                    "Follow theme".into()
-                },
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(self.settings_control_button(
-                        row,
-                        0,
-                        "Follow theme",
-                        SettingsAction::FollowTheme,
-                        false,
-                        cx,
-                    ))
-                    .child(self.settings_control_button(
-                        row,
-                        1,
-                        "Choose override",
-                        SettingsAction::BrowseThemes(CatalogTarget::Terminal),
-                        false,
-                        cx,
-                    )),
+        let current = if appearance.terminal_theme_override {
+            format!(
+                "Override: {}.",
+                self.resolve_theme(&appearance.terminal_theme).label()
             )
+        } else {
+            "Following the theme.".into()
+        };
+        let buttons = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .when(appearance.terminal_theme_override, |buttons| {
+                buttons.child(self.settings_button(
+                    row,
+                    0,
+                    "Follow theme",
+                    SettingsAction::FollowTheme,
+                    cx,
+                ))
+            })
+            .child(self.settings_button(
+                row,
+                1,
+                "Choose override ›",
+                SettingsAction::AllThemes(CatalogTarget::Terminal),
+                cx,
+            ))
             .into_any_element();
         self.settings_row(
             row.title,
             if theme_locked {
                 "Colors are fixed by --theme.".into()
             } else {
-                row_description(row.row).into()
+                format!("{} {current}", row_description(row.row))
             },
-            terminal_colors,
-            true,
+            buttons,
+            row.compact,
         )
     }
 
     fn render_restart_daemon_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let colors = *self.colors();
         let live_processes = self.command_context(cx).live_surface_count;
-        div()
-            .pt_3()
-            .border_t_1()
-            .border_color(color(colors.error).opacity(0.55))
-            .child(self.settings_row(
-                row.title,
-                format!(
-                    "{} running terminal{}. Restarting stops all running terminals.",
-                    live_processes,
-                    if live_processes == 1 { "" } else { "s" }
-                ),
-                self.settings_control_button(
-                    row,
-                    0,
-                    if live_processes == 0 {
-                        "Restart"
-                    } else {
-                        "Review restart"
-                    },
-                    SettingsAction::RestartDaemon,
-                    live_processes > 0,
-                    cx,
-                ),
-                row.compact,
-            ))
-            .into_any_element()
+        let button = controls::text_button(
+            (row.row, 0_usize),
+            if live_processes == 0 {
+                "Restart"
+            } else {
+                "Review restart"
+            },
+        )
+        .header();
+        self.settings_row(
+            row.title,
+            format!(
+                "{} running terminal{}. Restarting stops all running terminals.",
+                live_processes,
+                if live_processes == 1 { "" } else { "s" }
+            ),
+            self.settings_control(
+                row,
+                SettingsAction::RestartDaemon,
+                if live_processes > 0 {
+                    button.danger()
+                } else {
+                    button
+                },
+                cx,
+            ),
+            row.compact,
+        )
     }
 
     /// Pane or tab label of a shell this window shows.
@@ -2992,84 +3570,65 @@ impl CompiApp {
         }
     }
 
-    /// The installed version, the updater's status and its one primary button.
+    /// The installed version as a row: the updater's status under it and its one
+    /// primary button on the right, the download's progress below while it runs.
     fn render_update_status(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         use crate::updates::UpdateButton;
         let colors = *self.colors();
         let view = self.update_view();
-        let primary = view.button.map(|button| {
-            let action = SettingsAction::Update(UpdateControl::Primary(button));
-            let focused = self.settings_focused(row, action);
-            let tone = match button {
-                UpdateButton::RestartEndShells => SettingsButtonTone::Destructive,
-                UpdateButton::Cancel => SettingsButtonTone::Secondary,
-                _ => SettingsButtonTone::Primary,
-            };
-            div()
-                .relative()
-                .flex_none()
-                .child(self.settings_button(
-                    (row.row, 0_usize),
-                    button.label(),
-                    focused,
-                    tone,
-                    self.settings_click(row, action, cx),
-                ))
-                .child(self.settings_focus_anchor(focused, cx))
-        });
-        let header = div()
+        let primary = view.button.map_or_else(
+            || div().into_any_element(),
+            |button| {
+                let action = SettingsAction::Update(UpdateControl::Primary(button));
+                let control = controls::text_button((row.row, 0_usize), button.label()).header();
+                self.settings_control(
+                    row,
+                    action,
+                    match button {
+                        UpdateButton::RestartEndShells => control.danger(),
+                        UpdateButton::Cancel => control,
+                        _ => control.primary(),
+                    },
+                    cx,
+                )
+            },
+        );
+        div()
             .min_w_0()
-            .min_h(px(32.0))
             .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("Compi {}", env!("CARGO_PKG_VERSION"))),
-            )
-            .children(primary);
-        let status = div()
-            .min_w_0()
-            .text_color(color(modal_text_color(
+            .flex_col()
+            .child(self.tinted_settings_row(
+                format!("Compi {}", env!("CARGO_PKG_VERSION")).into(),
+                view.status,
                 if view.failed {
                     colors.error
                 } else {
                     colors.muted
                 },
-                &colors,
-            )))
-            .child(view.status);
-        div()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .pb_3()
-            .border_b_1()
-            .border_color(color(colors.border))
-            .child(header)
-            .child(status)
+                primary,
+                row.compact,
+            ))
             .when_some(view.progress, |summary, fraction| {
                 summary.child(
-                    div()
-                        .h(px(4.0))
-                        .rounded_full()
-                        .bg(color(colors.border))
-                        .child(
-                            div()
-                                .h(px(4.0))
-                                .rounded_full()
-                                .bg(color(colors.accent))
-                                .w(gpui::relative(fraction)),
-                        ),
+                    div().pb_3().child(
+                        div()
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(color(colors.border))
+                            .child(
+                                div()
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(color(colors.accent))
+                                    .w(gpui::relative(fraction)),
+                            ),
+                    ),
                 )
             })
             .into_any_element()
     }
 
-    /// Release notes with More/Less and a link, under their version.
+    /// Release notes with More/Less and a link, titled with their version.
     fn render_notes_row(
         &self,
         row: &RowCx,
@@ -3083,29 +3642,26 @@ impl CompiApp {
         let more = if notes.details.is_empty() && more == UpdateControl::CandidateMore {
             div().into_any_element()
         } else {
-            self.settings_control_button(
+            self.settings_button(
                 row,
                 0,
                 if expanded { "Less" } else { "More" },
                 more_action,
-                false,
                 cx,
             )
         };
-        let link = self.settings_control_button(
-            row,
-            1,
-            "Release notes",
-            SettingsAction::Update(link),
-            false,
-            cx,
-        );
+        let link = self.settings_button(row, 1, "Release notes", SettingsAction::Update(link), cx);
         div()
             .min_w_0()
+            .py_3()
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.settings_subheading(&format!("What's new in {}", notes.version)))
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(format!("What's new in {}", notes.version)),
+            )
             .child(self.render_release_notes_view(notes, expanded, more, link))
             .into_any_element()
     }
@@ -3141,61 +3697,48 @@ impl CompiApp {
     }
 
     fn render_update_advanced(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let colors = *self.colors();
-        let action = SettingsAction::Update(UpdateControl::Advanced);
-        let focused = self.settings_focused(row, action);
-        let disclosure = div()
-            .id((row.row, 0_usize))
-            .relative()
-            .min_h(px(32.0))
-            .px_2()
-            .flex()
-            .items_center()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(if focused {
-                colors.accent
-            } else {
-                colors.surface
-            }))
-            .font_weight(FontWeight::MEDIUM)
-            .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(self.settings_click(row, action, cx))
-            .child(if self.settings_update_advanced {
-                "Advanced ▾"
-            } else {
-                "Advanced ▸"
-            })
-            .child(self.settings_focus_anchor(focused, cx));
+        let open = self.settings_update_advanced;
+        let disclosure = self.settings_control(
+            row,
+            SettingsAction::Update(UpdateControl::Advanced),
+            controls::text_button((row.row, 0_usize), "Advanced")
+                .icon(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .header()
+                .ghost(),
+            cx,
+        );
         div()
             .min_w_0()
+            .py_3()
             .flex()
             .flex_col()
+            .items_start()
             .gap_2()
-            .child(div().flex().child(disclosure))
-            .when(self.settings_update_advanced, |content| {
+            .child(disclosure)
+            .when(open, |content| {
                 content.child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap_2()
                         .when(cfg!(windows), |buttons| {
-                            buttons.child(self.settings_control_button(
+                            buttons.child(self.settings_button(
                                 row,
                                 1,
                                 "Repair Compi",
                                 SettingsAction::Update(UpdateControl::Repair),
-                                false,
                                 cx,
                             ))
                         })
-                        .child(self.settings_control_button(
+                        .child(self.settings_button(
                             row,
                             2,
                             "Open update log",
                             SettingsAction::Update(UpdateControl::OpenLog),
-                            false,
                             cx,
                         )),
                 )
@@ -3203,53 +3746,86 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// `rows` as a section shows them (`searching` false): a heading, then each row
-    /// under its group's subheading; or as search results, each under its section.
-    fn render_settings_rows(
+    /// `rows` in cards: consecutive rows of one section and group share a card, with
+    /// hairlines between its rows. A label above a card names its group when the
+    /// section has more than one; in search results (`search`) every card has one,
+    /// "Section · Group" or just the section. `header` rows (the scope switch) sit at
+    /// the right end of the first label line.
+    fn render_settings_cards(
         &self,
         host: &SettingsHost,
         rows: &[&'static Row],
-        heading: Option<SettingsSection>,
-        searching: bool,
+        header: &[&'static Row],
+        search: bool,
         compact: bool,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
-        let mut elements = Vec::with_capacity(rows.len() * 2 + 1);
-        if let Some(section) = heading {
-            elements.push(self.settings_heading(section.label()));
-        }
-        let mut section = None;
-        let mut group = None;
-        for row in rows {
-            if searching {
-                if section != Some(row.section) {
-                    section = Some(row.section);
-                    elements.push(
-                        div()
-                            .pt_2()
-                            .child(self.settings_heading(row.section.label()))
-                            .into_any_element(),
-                    );
-                }
-            } else if row.group != group {
-                group = row.group;
-                if let Some(group) = group {
-                    elements.push(self.settings_subheading(group));
-                }
-            }
-            let row_cx = RowCx {
-                host: host.clone(),
-                row: row.id,
-                title: row.title,
-                compact,
+        let colors = *self.colors();
+        let mut header = (!header.is_empty()).then(|| {
+            header
+                .iter()
+                .map(|row| {
+                    let row_cx = RowCx {
+                        host: host.clone(),
+                        row: row.id,
+                        title: row.title,
+                        compact: false,
+                        header: true,
+                    };
+                    (row.render)(self, &row_cx, cx)
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut elements = Vec::new();
+        for run in rows.chunk_by(|a, b| a.section == b.section && a.group == b.group) {
+            let first = run[0];
+            let group = first.group.filter(|_| section_grouped(first.section));
+            let label: Option<SharedString> = match (search, group) {
+                (true, Some(group)) => Some(format!("{} · {group}", first.section.label()).into()),
+                (true, None) => Some(first.section.label().into()),
+                (false, group) => group.map(SharedString::from),
             };
-            elements.push((row.render)(self, &row_cx, cx));
+            let card =
+                settings_card(&colors).children(run.iter().enumerate().map(|(index, row)| {
+                    let row_cx = RowCx {
+                        host: host.clone(),
+                        row: row.id,
+                        title: row.title,
+                        compact,
+                        header: false,
+                    };
+                    div()
+                        .min_w_0()
+                        .px_4()
+                        .when(index > 0, |line| {
+                            line.border_t_1().border_color(color(colors.border))
+                        })
+                        .child((row.render)(self, &row_cx, cx))
+                }));
+            let trailing = header.take();
+            elements.push(if label.is_some() || trailing.is_some() {
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(settings_label_line(label, trailing))
+                    .child(card)
+                    .into_any_element()
+            } else {
+                card.into_any_element()
+            });
+        }
+        if let Some(trailing) = header {
+            elements.push(settings_label_line(None, Some(trailing)).into_any_element());
         }
         elements
     }
 
-    /// A Settings pane: a header with the search field, the section list beside the
-    /// rows (above them when narrow), and the section's rows or the search results.
+    /// A Settings pane: the header line, then the section's page, the search results
+    /// or the terminal colors page, and the theme preview's bar at the foot. Pages with
+    /// the theme grid (Appearance, terminal colors) fill the pane, the grid taking the
+    /// height left in its own scroll; the others scroll as a column of cards.
     pub(super) fn render_settings_pane(
         &self,
         pane_id: &PaneId,
@@ -3261,37 +3837,132 @@ impl CompiApp {
         };
         let colors = *self.colors();
         let host = SettingsHost::Pane(pane_id.clone());
-        let wide = width >= SECTION_LIST_MIN_WIDTH;
-        let content_width = width - if wide { SECTION_LIST_WIDTH } else { 0.0 } - 32.0;
-        let stacked = content_width < STACKED_ROW_WIDTH;
+        let page_width = (width - 48.0).clamp(1.0, PAGE_MAX_WIDTH);
+        let stacked = page_width < STACKED_ROW_WIDTH;
         let searching = !pane.query.trim().is_empty();
         let rows = self.pane_rows(pane);
-        let body = if searching && rows.is_empty() {
-            vec![
-                div()
-                    .pt_4()
-                    .text_color(color(modal_text_color(colors.muted, &colors)))
-                    .child(format!(
-                        "No settings match “{}”.",
-                        pane.search.read(cx).value().trim()
-                    ))
-                    .into_any_element(),
-            ]
-        } else {
-            self.render_settings_rows(
-                &host,
-                &rows,
-                (!searching).then_some(pane.section),
-                searching,
-                stacked,
+        let terminal_page = self.theme_list_shown(pane_id);
+        let appearance_page = !searching
+            && !terminal_page
+            && pane.section == SettingsSection::Appearance
+            && self.theme_catalog.as_ref().is_some_and(|catalog| {
+                &catalog.pane == pane_id && catalog.target == CatalogTarget::Both
+            });
+        let page = if terminal_page || appearance_page {
+            // The grid's own padding (room for a tile's ring) comes off the page width.
+            let columns = super::catalog::theme_grid_columns(page_width - 8.0);
+            pane.grid_columns.set(columns);
+            let grid_row = RowCx {
+                host: host.clone(),
+                row: if terminal_page {
+                    THEME_LIST_ROW
+                } else {
+                    THEME_ROW
+                },
+                title: "Theme",
+                compact: stacked,
+                header: false,
+            };
+            let grid = self.render_theme_section(
+                &grid_row,
+                &pane.theme_search,
+                (
+                    &pane.grid.handle,
+                    self.settings_scroll_viewport(host.clone(), true, cx),
+                ),
+                columns,
+                terminal_page,
                 cx,
-            )
+            );
+            // No `min_h_0`: the page is at least its cards plus the grid's minimum, so a
+            // short pane scrolls the page instead of drawing past its bottom.
+            let mut page = div().flex_1().min_w_0().flex().flex_col().gap_4();
+            if !terminal_page {
+                let (header, rows): (Vec<_>, Vec<_>) = rows
+                    .into_iter()
+                    .filter(|row| row.id != THEME_ROW)
+                    .partition(|row| row.header);
+                page = page.children(
+                    self.render_settings_cards(&host, &rows, &header, false, stacked, cx)
+                        .into_iter()
+                        .map(|card| div().flex_none().child(card)),
+                );
+            }
+            // Short panes scroll the whole page; the grid keeps a usable height.
+            div()
+                .id("settings-theme-page")
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .px_6()
+                .py_5()
+                .child(
+                    page.w_full()
+                        .max_w(px(PAGE_MAX_WIDTH))
+                        .mx_auto()
+                        .child(grid),
+                )
+                .into_any_element()
+        } else {
+            let body = if searching && rows.is_empty() {
+                vec![
+                    div()
+                        .text_color(color(modal_text_color(colors.muted, &colors)))
+                        .child(format!(
+                            "No settings match “{}”.",
+                            pane.search.read(cx).value().trim()
+                        ))
+                        .into_any_element(),
+                ]
+            } else if searching {
+                self.render_settings_cards(&host, &rows, &[], true, stacked, cx)
+            } else {
+                let (header, rows): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.header);
+                self.render_settings_cards(&host, &rows, &header, false, stacked, cx)
+            };
+            div()
+                .relative()
+                .min_w_0()
+                .flex()
+                .min_h_0()
+                .flex_1()
+                .child(
+                    div()
+                        .id("settings-scroll")
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&pane.scroll.handle)
+                        .px_6()
+                        .py_5()
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(px(PAGE_MAX_WIDTH))
+                                .mx_auto()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_5()
+                                .children(body),
+                        ),
+                )
+                .child(self.settings_scroll_viewport(host.clone(), false, cx))
+                .into_any_element()
         };
         let key_pane = pane_id.clone();
         let click_pane = pane_id.clone();
         div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
             .flex()
             .flex_col()
             .track_focus(&pane.focus)
@@ -3312,58 +3983,9 @@ impl CompiApp {
                     cx.notify();
                 }),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(color(colors.border))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(UI_BODY_TEXT_SIZE))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Settings"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .max_w(px(360.0))
-                            .child(Input::new(&pane.search).appearance(true).cleanable(true)),
-                    ),
-            )
-            .when(!wide, |column| {
-                column.child(self.render_settings_navigation(pane_id, pane, true, cx))
-            })
-            .child(
-                div()
-                    .relative()
-                    .min_w_0()
-                    .flex()
-                    .min_h_0()
-                    .flex_1()
-                    .when(wide, |body| {
-                        body.child(self.render_settings_navigation(pane_id, pane, false, cx))
-                    })
-                    .child(
-                        div()
-                            .id("settings-scroll")
-                            .relative()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&pane.scroll.handle)
-                            .p_4()
-                            .child(div().min_w_0().flex().flex_col().gap_3().children(body)),
-                    )
-                    .child(self.settings_scroll_viewport(host, cx)),
-            )
+            .child(self.render_settings_header(pane_id, pane, width, cx))
+            .child(page)
+            .children(self.render_theme_bar(pane_id, cx))
             .into_any_element()
     }
 
@@ -3380,22 +4002,6 @@ impl CompiApp {
             .handle
             .set_offset(point(px(0.0), px(0.0)));
         self.popup = Some(Popup::QuickAppearance);
-    }
-
-    /// Back in Quick Appearance on the Theme row, after the theme catalog it opened.
-    pub(super) fn return_to_quick_appearance(&mut self) {
-        self.popup = Some(Popup::QuickAppearance);
-        self.settings
-            .quick
-            .handle
-            .set_offset(point(px(0.0), px(0.0)));
-        self.set_settings_focus(
-            SettingsHost::Quick,
-            Stop::Control {
-                row: "theme",
-                action: SettingsAction::BrowseThemes(CatalogTarget::Both),
-            },
-        );
     }
 
     /// Quick Appearance: the Appearance rows in a popover on `trigger`, with a way on
@@ -3432,15 +4038,16 @@ impl CompiApp {
             row: "all-settings",
             title: "All settings…",
             compact: false,
+            header: false,
         };
         let rows = self.quick_rows();
         popover
             .content(
                 div()
-                    .w(px(360.0))
+                    .w(px(380.0))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_3()
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -3457,27 +4064,88 @@ impl CompiApp {
                                     .overflow_y_scroll()
                                     .track_scroll(&self.settings.quick.handle)
                                     .child(div().min_w_0().flex().flex_col().gap_3().children(
-                                        self.render_settings_rows(
-                                            &host, &rows, None, false, false, cx,
+                                        self.render_settings_cards(
+                                            &host,
+                                            &rows,
+                                            &[],
+                                            false,
+                                            false,
+                                            cx,
                                         ),
                                     )),
                             )
-                            .child(self.settings_scroll_viewport(host, cx)),
+                            .child(self.settings_scroll_viewport(host, false, cx)),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .child(self.settings_primary_button(
-                                "open-full-settings",
-                                all.title,
-                                self.settings_focused(&all, SettingsAction::OpenSettings),
-                                self.settings_click(&all, SettingsAction::OpenSettings, cx),
-                            )),
+                        div().flex().justify_end().child(
+                            self.settings_control(
+                                &all,
+                                SettingsAction::OpenSettings,
+                                controls::text_button("open-full-settings", all.title)
+                                    .header()
+                                    .primary(),
+                                cx,
+                            ),
+                        ),
                     ),
             )
             .into_any_element()
     }
+}
+
+/// A card of settings: one rounded, bordered surface per topic.
+pub(super) fn settings_card(colors: &ThemeColors) -> Div {
+    div()
+        .min_w_0()
+        .w_full()
+        .flex()
+        .flex_col()
+        .rounded_md()
+        .border_1()
+        .border_color(color(colors.border))
+        .bg(color(colors.surface))
+}
+
+/// The section bar icon of `section`.
+fn section_icon(section: SettingsSection) -> IconName {
+    match section {
+        SettingsSection::Appearance => IconName::Palette,
+        SettingsSection::Interface => IconName::LayoutPanelLeft,
+        SettingsSection::Terminal => IconName::SquareTerminal,
+        SettingsSection::Keyboard => IconName::Keyboard,
+        SettingsSection::Performance => IconName::Gauge,
+        SettingsSection::Updates => IconName::CircleArrowDown,
+        SettingsSection::Advanced => IconName::SlidersHorizontal,
+    }
+}
+
+/// The line above a card: its `label` on the left and `trailing` controls (the scope
+/// switch) at the right end, wrapping under the label when the page is narrow.
+fn settings_label_line(label: Option<SharedString>, trailing: Option<Vec<AnyElement>>) -> Div {
+    div()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x_3()
+        .gap_y_2()
+        .children(label.map(|label| {
+            div()
+                .min_w_0()
+                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(label)
+        }))
+        .when_some(trailing, |line, trailing| {
+            line.child(
+                div()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(trailing),
+            )
+        })
 }
 
 fn open_update_log() -> Result<(), String> {
@@ -3527,11 +4195,11 @@ mod tests {
             ids(""),
             [
                 "scope",
-                "theme",
                 "transparency",
                 "opacity",
                 "blur",
-                "window-overrides"
+                "window-overrides",
+                THEME_ROW
             ]
         );
         assert_eq!(ids("   "), ids(""));
@@ -3641,6 +4309,66 @@ mod tests {
                 row: "confirm-close",
                 action: toggle
             }]
+        );
+    }
+
+    #[test]
+    fn the_theme_list_reaches_every_control_once_and_header_rows_lead_their_section() {
+        let order = focus_order(true, [(THEME_LIST_ROW, theme_list_stops())]);
+        let controls = &order[1 + SettingsSection::ALL.len()..];
+        assert_eq!(controls.len(), theme_list_stops().len());
+        assert!(
+            controls
+                .iter()
+                .enumerate()
+                .all(|(index, stop)| !controls[..index].contains(stop))
+        );
+        // Back first, the rows after the search field and the filter, the star last.
+        assert_eq!(
+            controls.first(),
+            Some(&Stop::Control {
+                row: THEME_LIST_ROW,
+                action: SettingsAction::ThemeBack
+            })
+        );
+        assert_eq!(
+            controls.last(),
+            Some(&Stop::Control {
+                row: THEME_LIST_ROW,
+                action: SettingsAction::ThemeFavorite
+            })
+        );
+        // The scope switch sits on the first label line, so it comes first in its
+        // sections; that line is its first group's: Window, and Colors in Advanced.
+        for (section, group) in [
+            (SettingsSection::Appearance, "Window"),
+            (SettingsSection::Advanced, "Colors"),
+        ] {
+            let mut rows = rows_for(section, "");
+            assert!(rows.next().unwrap().header);
+            assert_eq!(rows.next().unwrap().group, Some(group));
+            assert!(section_grouped(section));
+        }
+        assert_eq!(ROWS.iter().filter(|row| row.header).count(), 2);
+    }
+
+    #[test]
+    fn cards_are_labelled_only_in_sections_of_several_groups() {
+        assert!(section_grouped(SettingsSection::Interface));
+        for section in [
+            SettingsSection::Terminal,
+            SettingsSection::Keyboard,
+            SettingsSection::Performance,
+            SettingsSection::Updates,
+        ] {
+            assert!(!section_grouped(section), "{section:?}");
+        }
+        // Updates' one card opens on the installed version.
+        assert_eq!(
+            rows_for(SettingsSection::Updates, "")
+                .next()
+                .map(|row| row.id),
+            Some("update-status")
         );
     }
 }

@@ -1,4 +1,4 @@
-use compi_protocol::{ContentEnvironment, PaneId, SurfaceId};
+use compi_protocol::{PaneId, SurfaceId};
 
 #[derive(Clone, Debug)]
 pub(in crate::gui) struct Entry {
@@ -28,8 +28,6 @@ pub(in crate::gui) struct FileTree {
     pub project_mode: bool,
     /// The terminal surface the daemon lists and searches folders through.
     pub surface_id: Option<SurfaceId>,
-    /// Open file…: a chosen file opens in a content pane of this environment.
-    pub opens_in: Option<ContentEnvironment>,
     pub error: Option<String>,
     /// Switch branch…: the picker lists a repository's branches instead of files.
     pub branches: Option<super::branches::BranchPicker>,
@@ -61,7 +59,6 @@ impl FileTree {
             pending_shell: false,
             project_mode: false,
             surface_id: None,
-            opens_in: None,
             error: None,
             branches: None,
             request: 1,

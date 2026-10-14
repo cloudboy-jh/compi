@@ -63,66 +63,6 @@ impl CompiApp {
         self.request_tree_directory(pane_id, surface_id, root, request);
     }
 
-    /// Open file…: the focused pane's folder, searched as you type, where a chosen file
-    /// opens in the editor. Nothing reaches the terminal.
-    pub(super) fn open_file_picker(&mut self) {
-        let scope = match self.file_scope() {
-            Ok(scope) => scope,
-            Err(reason) => {
-                self.global_error = Some(reason.into());
-                return;
-            }
-        };
-        let surface_id = match scope.search {
-            Ok(surface_id) => surface_id,
-            Err(reason) => {
-                self.global_error = Some(reason.into());
-                return;
-            }
-        };
-        if self.file_tree.is_some() {
-            self.close_file_tree();
-        }
-        let mut picker = tree::FileTree::new(scope.pane_id.clone(), scope.folder.clone());
-        picker.surface_id = Some(surface_id.clone());
-        picker.opens_in = Some(scope.environment);
-        picker.searching = true;
-        picker.request = NEXT_TREE_REQUEST.fetch_add(1, Ordering::Relaxed);
-        let request = picker.request;
-        self.report_focus(false);
-        self.file_tree = Some(picker);
-        self.tree_scroll.set_offset(point(px(0.0), px(0.0)));
-        self.request_tree_directory(scope.pane_id, surface_id, scope.folder, request);
-    }
-
-    /// Opens the selected file of an Open file… picker beside the pane it was opened from.
-    fn open_picked_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tree) = self.file_tree.as_ref() else {
-            return;
-        };
-        let (Some(environment), Some(path)) = (
-            tree.opens_in.clone(),
-            tree.selected()
-                .filter(|row| !row.directory)
-                .map(|row| row.path.clone()),
-        ) else {
-            return;
-        };
-        let pane_id = tree.pane_id.clone();
-        let root = tree.rows[0].path.clone();
-        self.close_file_tree();
-        self.open_content_file(
-            &pane_id,
-            environment,
-            Some(root),
-            Some(path),
-            None,
-            false,
-            window,
-            cx,
-        );
-    }
-
     pub(super) fn reply_to_shell(&mut self, pane_id: &PaneId, path: Option<&str>) {
         let data = path
             .map(|path| {
@@ -159,14 +99,8 @@ impl CompiApp {
             return;
         };
         if !tree.pending_shell {
-            let command = if tree.project_mode {
-                "compi z"
-            } else {
-                "compi tree"
-            };
-            self.global_error = Some(format!(
-                "To change this shell's directory, run {command} from its prompt."
-            ));
+            self.global_error =
+                Some("To change this shell's directory, run compi tree from its prompt.".into());
             return;
         }
         let Some(path) = tree
@@ -182,11 +116,9 @@ impl CompiApp {
         self.report_focus(true);
     }
 
-    pub(super) fn open_project_jump(&mut self) {
-        self.open_project_jump_with_shell(false);
-    }
-
-    pub(super) fn open_project_jump_with_shell(&mut self, pending_shell: bool) {
+    /// `compi z`: the shell's visited directories, searched as you type; Enter replies
+    /// to the shell with the chosen one to cd into.
+    pub(super) fn open_shell_project_jump(&mut self) {
         let Some(view) = self.focused_view() else {
             self.global_error = Some("Select a terminal pane to jump to a project".into());
             return;
@@ -206,7 +138,7 @@ impl CompiApp {
         }
         let mut picker = tree::FileTree::new(pane_id, current.unwrap_or_else(|| "/".into()));
         picker.project_mode = true;
-        picker.pending_shell = pending_shell;
+        picker.pending_shell = true;
         self.report_focus(false);
         self.file_tree = Some(picker);
         self.tree_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -393,8 +325,6 @@ impl CompiApp {
                 std::mem::replace(tree, tree::FileTree::new(pane_id.clone(), path.clone()));
             tree.pending_shell = previous.pending_shell;
             tree.surface_id = previous.surface_id;
-            tree.searching = previous.opens_in.is_some();
-            tree.opens_in = previous.opens_in;
             tree.request = request;
             if let Some(surface_id) = tree.surface_id.clone() {
                 self.request_tree_directory(pane_id, surface_id, path, request);
@@ -428,13 +358,7 @@ impl CompiApp {
             "escape" => self.close_file_tree(),
             "up" => self.file_tree.as_mut().unwrap().move_selection(-1),
             "down" => self.file_tree.as_mut().unwrap().move_selection(1),
-            "enter" => {
-                if self.file_tree.as_ref().unwrap().pending_shell {
-                    self.enter_tree_directory();
-                } else {
-                    self.copy_tree_path(cx);
-                }
-            }
+            "enter" => self.enter_tree_directory(),
             "c" if key.modifiers.control || key.modifiers.platform => self.copy_tree_path(cx),
             "backspace" => {
                 self.file_tree.as_mut().unwrap().query.pop();
@@ -490,8 +414,6 @@ impl CompiApp {
                 let index = tree.selected;
                 if tree.selected().is_some_and(|row| row.directory) {
                     self.toggle_tree_row(index);
-                } else if key.key == "enter" && tree.opens_in.is_some() {
-                    self.open_picked_file(window, cx);
                 } else if key.key == "enter" {
                     self.copy_tree_path(cx);
                 }
@@ -591,17 +513,13 @@ impl CompiApp {
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         if let Some(tree) = this.file_tree.as_mut() {
                             tree.selected = index;
                         }
                         this.scroll_to_selected_tree_row();
-                        if event.click_count >= 2 {
-                            if folder {
-                                this.toggle_tree_row(index);
-                            } else {
-                                this.open_picked_file(window, cx);
-                            }
+                        if event.click_count >= 2 && folder {
+                            this.toggle_tree_row(index);
                         }
                         cx.stop_propagation();
                         cx.notify();
@@ -775,9 +693,7 @@ impl CompiApp {
             } else if let Some(picker) = &tree.branches {
                 format!("Branch: {}  ·  type to filter · ↑↓ choose · Enter {} · Esc close", tree.query, if picker.create { "create" } else { "switch" })
             } else if tree.project_mode {
-                format!("Jump: {}  ·  ↑↓ choose · Enter {} · Esc close", tree.query, if tree.pending_shell { "cd" } else { "copy path" })
-            } else if tree.opens_in.is_some() {
-                format!("Open file: {}  ·  type to search · ↑↓ choose · Enter open · Esc close", tree.query)
+                format!("Jump: {}  ·  ↑↓ choose · Enter cd · Esc close", tree.query)
             } else if tree.searching {
                 format!("Search: {}  ·  ↑↓ choose · Enter expand/copy · Esc close", tree.query)
             } else if tree.pending_shell {

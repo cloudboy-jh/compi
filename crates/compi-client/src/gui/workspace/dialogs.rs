@@ -1,8 +1,16 @@
 use super::*;
+use crate::gui::controls::IconName;
 use gpui::{Animation, AnimationExt, ease_out_quint};
+use gpui_component::ThemeStyled as _;
 
 const OVERLAY_CLOSE_DURATION: Duration = Duration::from_millis(120);
 const OVERLAY_OPEN_DURATION: Duration = Duration::from_millis(180);
+/// How far a drop-down list slides down as it opens.
+const DROP_DOWN_SLIDE: f32 = 8.0;
+/// Widest a drop-down list grows.
+const DROP_DOWN_WIDTH: f32 = 620.0;
+/// Tallest a drop-down list's rows grow.
+const DROP_DOWN_LIST_HEIGHT: f32 = 420.0;
 
 /// How long a closing overlay fades out: not at all with reduced motion.
 pub(in crate::gui) fn overlay_close_duration() -> Duration {
@@ -14,9 +22,9 @@ pub(in crate::gui) fn overlay_close_duration() -> Duration {
 }
 
 impl CompiApp {
-    /// Fades the overlay in as it opens and out as it closes; with reduced motion it
-    /// appears and goes at once.
-    pub(super) fn animate_overlay(&self, content: AnyElement) -> AnyElement {
+    /// Fades the overlay in as it opens and out as it closes; a drop-down list also
+    /// slides down a little as it opens. With reduced motion it appears and goes at once.
+    pub(super) fn animate_overlay(&self, content: AnyElement, drop_down: bool) -> AnyElement {
         let wrapper = div().absolute().inset_0().child(content);
         if let Some(started) = self.overlay_closing_since {
             let duration = overlay_close_duration().as_secs_f32();
@@ -36,14 +44,40 @@ impl CompiApp {
             .with_animation(
                 ("overlay-open", self.overlay_generation as usize),
                 Animation::new(OVERLAY_OPEN_DURATION).with_easing(ease_out_quint()),
-                |element, progress| element.opacity(progress),
+                move |element, progress| {
+                    let element = element.opacity(progress);
+                    if drop_down {
+                        element.top(px(DROP_DOWN_SLIDE * (progress - 1.0)))
+                    } else {
+                        element
+                    }
+                },
             )
             .into_any_element()
     }
 
-    pub(super) fn render_choice_rows(&self, cx: &Context<Self>) -> AnyElement {
+    /// The overlay's choices under their group headings, at most `max_height` tall.
+    /// Palette rows lead with their kind's icon; a note (Searching files…) follows the
+    /// last group's rows.
+    pub(super) fn render_choice_rows(&self, max_height: f32, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let choices = self.overlay_choices(cx);
+        let palette = matches!(self.overlay, Some(Overlay::Palette));
+        let (choices, note) = if palette {
+            self.palette_choices(cx)
+        } else {
+            (self.overlay_choices(cx), None)
+        };
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let heading = move |group: &'static str| {
+            div()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(muted)
+                .child(group)
+        };
         let mut rows = Vec::new();
         let mut previous_group = None;
         for (index, choice) in choices.into_iter().enumerate() {
@@ -55,7 +89,7 @@ impl CompiApp {
             };
             let selected = index == self.overlay_index;
             let selected_background = blend_rgb(colors.surface, colors.foreground, 0.06);
-            let description = if matches!(self.overlay, Some(Overlay::Palette)) {
+            let description = if palette {
                 match &choice.action {
                     ChoiceAction::Command(command) => command.description(),
                     _ => None,
@@ -63,6 +97,12 @@ impl CompiApp {
             } else {
                 None
             };
+            let icon = palette.then_some(match &choice.action {
+                ChoiceAction::Command(_) => IconName::Command,
+                ChoiceAction::Project(_) => IconName::Folder,
+                ChoiceAction::File(_) => IconName::File,
+                _ => IconName::SquareTerminal,
+            });
             let (shortcut, detail) = if matches!(&choice.action, ChoiceAction::Command(_)) {
                 ((!choice.detail.is_empty()).then_some(choice.detail), None)
             } else {
@@ -78,26 +118,34 @@ impl CompiApp {
                 ChoiceAction::ArrangementTab(tab_id) if in_arrangements => Some(tab_id.clone()),
                 _ => None,
             };
+            let line = |text: Option<String>, size: f32| {
+                text.map(|text| {
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_size(px(size))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(muted)
+                        .child(text)
+                })
+            };
             let row = div()
                 .id(("command-choice", index))
-                .min_h(px(40.0))
-                .px_3()
-                .py_2()
+                .mx_1()
+                .min_h(px(36.0))
+                .px_2()
+                .py_1p5()
                 .flex()
-                .flex_col()
-                .justify_center()
-                .gap_1()
+                .items_start()
+                .gap_2()
+                .rounded_sm()
                 .border_1()
-                .border_color(color(if selected {
-                    colors.accent
+                .border_color(if selected {
+                    color(colors.accent)
                 } else {
-                    colors.surface
-                }))
-                .bg(color(if selected {
-                    selected_background
-                } else {
-                    colors.surface
-                }))
+                    gpui::transparent_black()
+                })
+                .when(selected, |row| row.bg(color(selected_background)))
                 .text_color(color(modal_text_color(
                     if choice.reason.is_some() {
                         colors.muted
@@ -121,79 +169,75 @@ impl CompiApp {
                         cx.notify();
                     }),
                 )
+                .when_some(icon, |row, icon| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .h(px(UI_SMALL_LINE_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .child(controls::glyph(icon, muted)),
+                    )
+                })
                 .child(
                     div()
-                        .flex()
-                        .w_full()
+                        .flex_1()
                         .min_w_0()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
                         .child(
                             div()
+                                .flex()
+                                .w_full()
                                 .min_w_0()
-                                .flex_1()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(choice.title),
+                                .items_center()
+                                .justify_between()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(choice.title),
+                                )
+                                .when_some(shortcut, |row, shortcut| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                                            .font_weight(FontWeight::NORMAL)
+                                            .text_color(muted)
+                                            .child(shortcut),
+                                    )
+                                }),
                         )
-                        .when_some(shortcut, |row, shortcut| {
-                            row.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                                    .font_weight(FontWeight::NORMAL)
-                                    .text_color(color(modal_text_color(colors.muted, &colors)))
-                                    .child(shortcut),
-                            )
-                        }),
-                )
-                .when_some(description, |row, description| {
-                    row.child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, &colors)))
-                            .child(description),
-                    )
-                })
-                .when_some(detail, |row, detail| {
-                    row.child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .text_color(color(modal_text_color(colors.muted, &colors)))
-                            .child(detail),
-                    )
-                })
-                .when_some(choice.reason, |row, reason| {
-                    row.child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .pt_1()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(color(modal_text_color(colors.muted, &colors)))
-                            .child(reason),
-                    )
-                });
+                        .children(line(description.map(str::to_owned), UI_SMALL_TEXT_SIZE))
+                        .children(line(detail, UI_SMALL_TEXT_SIZE))
+                        .children(line(choice.reason, UI_MICRO_TEXT_SIZE)),
+                );
             rows.push(
                 div()
-                    .when_some(group_heading, |item, group| {
-                        item.child(
-                            div()
-                                .px_3()
-                                .pt_3()
-                                .pb_1()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(color(modal_text_color(colors.muted, &colors)))
-                                .child(group),
-                        )
-                    })
+                    .when_some(group_heading, |item, group| item.child(heading(group)))
                     .child(row)
+                    .into_any_element(),
+            );
+        }
+        if let Some((group, note)) = note {
+            rows.push(
+                div()
+                    .when(previous_group != Some(group), |item| {
+                        item.child(heading(group))
+                    })
+                    .child(
+                        div()
+                            .mx_1()
+                            .px_2()
+                            .py_1p5()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(note),
+                    )
                     .into_any_element(),
             );
         }
@@ -201,7 +245,8 @@ impl CompiApp {
             .id("overlay-list")
             .min_h_0()
             .flex_1()
-            .max_h(px(380.0))
+            .max_h(px(max_height))
+            .py_1()
             .overflow_y_scroll()
             .track_scroll(&self.overlay_scroll)
             .children(rows)
@@ -250,26 +295,25 @@ impl CompiApp {
                         .gap_2()
                         .border_t_1()
                         .border_color(color(colors.border))
-                        .child(self.settings_action_button(
-                            "confirmation-cancel",
-                            "Cancel",
+                        .child(controls::highlight(
                             self.overlay_focus == 0,
-                            false,
-                            cx.listener(|this, _, _, cx| {
-                                this.dismiss_overlay();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
+                            controls::text_button("confirmation-cancel", "Cancel")
+                                .header()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_overlay();
+                                    cx.notify();
+                                })),
+                            cx,
                         ))
-                        .child(self.settings_action_button(
-                            "confirmation-apply",
-                            confirm_label,
+                        .child(controls::highlight(
                             self.overlay_focus == 1,
-                            true,
-                            cx.listener(|this, _, window, cx| {
-                                this.activate_overlay(window, cx);
-                                cx.stop_propagation();
-                            }),
+                            controls::text_button("confirmation-apply", confirm_label)
+                                .header()
+                                .danger()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.activate_overlay(window, cx);
+                                })),
+                            cx,
                         )),
                 ),
             window,
@@ -316,15 +360,20 @@ impl CompiApp {
                 )
         });
         let button = |id: &'static str, label: &'static str, choice: usize| {
-            let run = cx.listener(move |this, _, window, cx| {
-                this.answer_unsaved(choice, window, cx);
-                cx.stop_propagation();
-            });
-            let focused = self.overlay_focus == choice;
-            match choice {
-                2 => self.settings_primary_button(id, label, focused, run),
-                _ => self.settings_action_button(id, label, focused, choice == 1, run),
-            }
+            let control = controls::text_button(id, label)
+                .header()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.answer_unsaved(choice, window, cx);
+                }));
+            controls::highlight(
+                self.overlay_focus == choice,
+                match choice {
+                    2 => control.primary(),
+                    1 => control.danger(),
+                    _ => control,
+                },
+                cx,
+            )
         };
         self.render_centered_scrim(
             div()
@@ -486,26 +535,25 @@ impl CompiApp {
                         .gap_2()
                         .border_t_1()
                         .border_color(color(colors.border))
-                        .child(self.settings_action_button(
-                            "discard-cancel",
-                            "Cancel",
+                        .child(controls::highlight(
                             self.overlay_focus == 0,
-                            false,
-                            cx.listener(|this, _, _, cx| {
-                                this.dismiss_overlay();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
+                            controls::text_button("discard-cancel", "Cancel")
+                                .header()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_overlay();
+                                    cx.notify();
+                                })),
+                            cx,
                         ))
-                        .child(self.settings_action_button(
-                            "discard-apply",
-                            "Discard",
+                        .child(controls::highlight(
                             self.overlay_focus == 1,
-                            true,
-                            cx.listener(|this, _, window, cx| {
-                                this.activate_overlay(window, cx);
-                                cx.stop_propagation();
-                            }),
+                            controls::text_button("discard-apply", "Discard")
+                                .header()
+                                .danger()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.activate_overlay(window, cx);
+                                })),
+                            cx,
                         )),
                 ),
             window,
@@ -565,27 +613,26 @@ impl CompiApp {
                         .gap_2()
                         .border_t_1()
                         .border_color(color(colors.border))
-                        .child(self.settings_action_button(
-                            "text-cancel",
-                            "Cancel",
+                        .child(controls::highlight(
                             self.overlay_focus == 1,
-                            false,
-                            cx.listener(|this, _, _, cx| {
-                                this.dismiss_overlay();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
+                            controls::text_button("text-cancel", "Cancel")
+                                .header()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_overlay();
+                                    cx.notify();
+                                })),
+                            cx,
                         ))
                         .when(valid, |footer| {
-                            footer.child(self.settings_action_button(
-                                "text-apply",
-                                "Apply",
+                            footer.child(controls::highlight(
                                 self.overlay_focus == 2,
-                                false,
-                                cx.listener(|this, _, window, cx| {
-                                    this.activate_overlay(window, cx);
-                                    cx.stop_propagation();
-                                }),
+                                controls::text_button("text-apply", "Apply")
+                                    .header()
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.activate_overlay(window, cx);
+                                    })),
+                                cx,
                             ))
                         }),
                 ),
@@ -737,17 +784,15 @@ impl CompiApp {
                         .justify_end()
                         .border_t_1()
                         .border_color(color(colors.border))
-                        .child(self.settings_action_button(
-                            "diagnostics-close",
-                            "Close",
-                            true,
-                            false,
-                            cx.listener(|this, _, _, cx| {
-                                this.dismiss_overlay();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        )),
+                        .child(
+                            controls::text_button("diagnostics-close", "Close")
+                                .header()
+                                .key("escape")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_overlay();
+                                    cx.notify();
+                                })),
+                        ),
                 ),
             window,
             cx,
@@ -774,7 +819,15 @@ impl CompiApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(self.overlay_close_button("dialog-close", cx))
+            .child(
+                controls::icon_button("dialog-close", IconName::X, "Close")
+                    .header()
+                    .key("escape")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dismiss_overlay();
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -810,69 +863,140 @@ impl CompiApp {
             .into_any_element()
     }
 
+    /// A list overlay (the palette, workspaces, tabs, windows, recovery) as a drop-down
+    /// hanging under the chrome: no dimming; a click anywhere else closes it and goes
+    /// no further.
     fn render_list_overlay(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let (viewport_width, viewport_height) = overlay_viewport_size(window);
         let overlay_height = viewport_height.max(1.0);
-        let panel_width = (viewport_width - 64.0).clamp(1.0, 620.0);
-        let panel_height = (overlay_height - 48.0).clamp(1.0, 480.0);
-        let title = match &self.overlay {
-            Some(Overlay::Palette) => "Commands",
-            Some(Overlay::Workspaces) => "Switch workspace",
-            Some(Overlay::Tabs { hidden_only: true }) => "Restore hidden terminal tab",
-            Some(Overlay::Tabs { .. }) => "Switch terminal tab",
-            Some(Overlay::Windows) => "Move terminal tab to window",
-            Some(Overlay::Recover { .. }) => "Recover unsaved edits",
-            _ => "Choose",
+        let top = CHROME_HEIGHT + 6.0;
+        let panel_width = (viewport_width - 32.0).clamp(1.0, DROP_DOWN_WIDTH);
+        // Room under the query field, keeping a margin at the window's bottom.
+        let list_height = (overlay_height - top - 64.0).clamp(80.0, DROP_DOWN_LIST_HEIGHT);
+        let scope = self.palette_scope();
+        let (placeholder, chip) = match &self.overlay {
+            Some(Overlay::Palette) => (
+                match scope {
+                    None => "Search commands, tabs, projects and files",
+                    Some(palette::Scope::Projects) => "Search visited folders",
+                    Some(palette::Scope::Files) => "Search this folder's files",
+                },
+                scope.map(|scope| (scope.label(), true)),
+            ),
+            Some(Overlay::Workspaces) => ("Search workspaces", Some(("Switch workspace", false))),
+            Some(Overlay::Tabs { hidden_only: true }) => {
+                ("Search hidden tabs", Some(("Restore hidden tab", false)))
+            }
+            Some(Overlay::Tabs { .. }) => ("Search tabs", Some(("Switch tab", false))),
+            Some(Overlay::Windows) => ("Search windows", Some(("Move tab to window", false))),
+            Some(Overlay::Recover { .. }) => (
+                "Search backed-up files",
+                Some(("Recover unsaved edits", false)),
+            ),
+            _ => ("Search", None),
         };
-        let editable = matches!(
-            self.overlay,
-            Some(
-                Overlay::Palette
-                    | Overlay::Workspaces
-                    | Overlay::Tabs { .. }
-                    | Overlay::Windows
-                    | Overlay::Recover { .. }
-            )
-        );
         div()
+            .id("overlay-backdrop")
             .absolute()
             .top_0()
             .left_0()
             .w(px(viewport_width))
             .h(px(overlay_height))
-            .px_4()
-            .pb_4()
-            .pt(px(CHROME_HEIGHT + 12.0))
+            .pt(px(top))
             .flex()
             .justify_center()
             .items_start()
-            .bg(color(colors.background).opacity(MODAL_SCRIM_OPACITY))
+            .occlude()
             .text_color(color(modal_text_color(colors.foreground, &colors)))
+            .on_any_mouse_down(cx.listener(|this, _, _, cx| {
+                this.dismiss_overlay();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .id("overlay-drop-down")
+                    .w(px(panel_width))
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .popover_style(cx)
+                    .text_color(color(modal_text_color(colors.foreground, &colors)))
+                    .overflow_hidden()
+                    .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                    .child(self.render_drop_down_field(placeholder, chip, cx))
+                    .child(self.render_choice_rows(list_height, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// A drop-down's query: a search icon, a chip naming what the list holds (a
+    /// palette scope's with × to remove it) and the text.
+    fn render_drop_down_field(
+        &self,
+        placeholder: &'static str,
+        chip: Option<(&'static str, bool)>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        div()
+            .flex_none()
+            .h(px(44.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(color(colors.border))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.dismiss_overlay();
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    cx.stop_propagation();
                     cx.notify();
                 }),
             )
+            .child(controls::glyph(IconName::Search, muted))
+            .when_some(chip, |field, (label, removable)| {
+                field.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_0p5()
+                        .child(controls::chip(label, controls::ChipTone::Neutral))
+                        .when(removable, |chip| {
+                            chip.child(
+                                div()
+                                    .id("palette-scope-clear")
+                                    .p_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(color(colors.surface_hover)))
+                                    .tooltip(controls::tooltip(
+                                        "Search everything",
+                                        None,
+                                        Some("backspace"),
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.clear_palette_scope();
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                                    .child(controls::glyph(IconName::X, muted)),
+                            )
+                        }),
+                )
+            })
             .child(
                 div()
-                    .w(px(panel_width))
-                    .h(px(panel_height))
-                    .min_h_0()
-                    .mt_2()
-                    .flex()
-                    .flex_col()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(color(colors.border))
-                    .bg(color(colors.surface))
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.render_dialog_header(title, cx))
-                    .when(editable, |panel| panel.child(self.render_editor(cx)))
-                    .child(self.render_choice_rows(cx)),
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(20.0))
+                    .child(self.render_query_text(placeholder, true, cx)),
             )
             .into_any_element()
     }
@@ -951,10 +1075,9 @@ impl CompiApp {
     }
 
     pub(super) fn render_overlay(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let mut drop_down = false;
         let content = if matches!(self.overlay, Some(Overlay::ImageInspector)) {
             self.render_image_inspector(cx)
-        } else if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
-            self.render_theme_catalog(window, cx)
         } else if matches!(
             self.overlay,
             Some(Overlay::Confirm { .. } | Overlay::ConfirmDaemonRestart { .. })
@@ -971,8 +1094,9 @@ impl CompiApp {
         } else if matches!(self.overlay, Some(Overlay::Arrangements { .. })) {
             self.render_arrangement_overlay(window, cx)
         } else {
+            drop_down = true;
             self.render_list_overlay(window, cx)
         };
-        self.animate_overlay(content)
+        self.animate_overlay(content, drop_down)
     }
 }

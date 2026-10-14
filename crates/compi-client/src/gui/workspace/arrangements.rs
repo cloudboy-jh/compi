@@ -497,28 +497,26 @@ impl CompiApp {
                 div()
                     .flex()
                     .gap_2()
-                    .child(self.settings_segment_button(
-                        "arrangement-mirror",
-                        "Mirror (M)",
-                        mirror,
-                        false,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_arrangement_transform(|t| t.mirror = !t.mirror);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.settings_segment_button(
-                        "arrangement-flip",
-                        "Flip (F)",
-                        flip,
-                        false,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_arrangement_transform(|t| t.flip = !t.flip);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    )),
+                    .child(
+                        controls::text_button("arrangement-mirror", "Mirror")
+                            .header()
+                            .selected(mirror)
+                            .key("m")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_arrangement_transform(|t| t.mirror = !t.mirror);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        controls::text_button("arrangement-flip", "Flip")
+                            .header()
+                            .selected(flip)
+                            .key("f")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_arrangement_transform(|t| t.flip = !t.flip);
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -576,7 +574,7 @@ impl CompiApp {
                                     .min_w_0()
                                     .flex()
                                     .flex_col()
-                                    .child(self.render_choice_rows(cx)),
+                                    .child(self.render_choice_rows(380.0, cx)),
                             )
                             .child(side),
                     )
@@ -604,28 +602,24 @@ impl CompiApp {
                                     .flex()
                                     .flex_none()
                                     .gap_2()
-                                    .child(self.settings_action_button(
-                                        "arrangement-cancel",
-                                        "Cancel",
-                                        false,
-                                        false,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.dismiss_overlay();
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }),
-                                    ))
+                                    .child(
+                                        controls::text_button("arrangement-cancel", "Cancel")
+                                            .header()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.dismiss_overlay();
+                                                cx.notify();
+                                            })),
+                                    )
                                     // Hidden, like the name dialog's Apply, when there is nothing to apply.
                                     .when(selected.is_some() && candidate.is_some() && !unchanged, |actions| {
-                                        actions.child(self.settings_primary_button(
-                                            "arrangement-apply",
-                                            "Apply",
-                                            false,
-                                            cx.listener(|this, _, window, cx| {
-                                                this.activate_overlay(window, cx);
-                                                cx.stop_propagation();
-                                            }),
-                                        ))
+                                        actions.child(
+                                            controls::text_button("arrangement-apply", "Apply")
+                                                .header()
+                                                .primary()
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.activate_overlay(window, cx);
+                                                })),
+                                        )
                                     }),
                             ),
                     ),

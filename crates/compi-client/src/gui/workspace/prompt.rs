@@ -1319,21 +1319,6 @@ impl CompiApp {
         self.settings_focused(group, SettingsAction::Prompt(action))
     }
 
-    fn prompt_listener(
-        &self,
-        group: &RowCx,
-        action: PromptAction,
-        cx: &Context<Self>,
-    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
-        let group = group.clone();
-        cx.listener(move |this, _, _, cx| {
-            this.focus_settings_control(&group, SettingsAction::Prompt(action));
-            this.activate_prompt_action(action);
-            cx.stop_propagation();
-            cx.notify();
-        })
-    }
-
     fn prompt_segment(
         &self,
         group: &RowCx,
@@ -1342,19 +1327,14 @@ impl CompiApp {
         active: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let focused = self.prompt_focused(group, action);
-        div()
-            .relative()
-            .flex_none()
-            .child(self.settings_segment_button(
-                ("prompt-control", prompt_control_id(action)),
-                label,
-                active,
-                focused,
-                self.prompt_listener(group, action, cx),
-            ))
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
+        self.settings_control(
+            group,
+            SettingsAction::Prompt(action),
+            controls::text_button(("prompt-control", prompt_control_id(action)), label)
+                .header()
+                .selected(active),
+            cx,
+        )
     }
 
     fn prompt_button(
@@ -1364,19 +1344,12 @@ impl CompiApp {
         label: impl Into<SharedString>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let focused = self.prompt_focused(group, action);
-        div()
-            .relative()
-            .flex_none()
-            .child(self.settings_action_button(
-                ("prompt-control", prompt_control_id(action)),
-                label,
-                focused,
-                false,
-                self.prompt_listener(group, action, cx),
-            ))
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element()
+        self.settings_control(
+            group,
+            SettingsAction::Prompt(action),
+            controls::text_button(("prompt-control", prompt_control_id(action)), label).header(),
+            cx,
+        )
     }
 
     /// Turn off or a history row's Restore: a button with the confirm popover.
@@ -1388,14 +1361,14 @@ impl CompiApp {
         destructive: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let focused = self.prompt_focused(group, action);
         let id = prompt_control_id(action);
-        let trigger = div()
-            .relative()
-            .flex_none()
-            .child(self.settings_popup_button(("prompt-control", id), label, focused, destructive))
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element();
+        let button = controls::text_button(("prompt-control", id), label).header();
+        let trigger = self.settings_control(
+            group,
+            SettingsAction::Prompt(action),
+            if destructive { button.danger() } else { button },
+            cx,
+        );
         self.prompt_popover(("prompt-popover", id), trigger, group, action, None, cx)
     }
 
@@ -1488,11 +1461,11 @@ impl CompiApp {
         }
         let mut column = div()
             .min_w_0()
-            .pt_3()
+            .py_3()
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.settings_subheading("Shell prompt"))
+            .child(div().font_weight(FontWeight::MEDIUM).child(group.title))
             .child(header);
         if let Some(Err(error)) = &state.environment {
             column = column
@@ -1681,7 +1654,7 @@ impl CompiApp {
                     .when(environment.login_shell.shell.is_none(), |toggle| {
                         toggle.opacity(0.5)
                     })
-                    .child(self.render_settings_toggle(
+                    .child(self.settings_switch(
                         group,
                         state.outside,
                         SettingsAction::Prompt(PromptAction::Outside),
@@ -2072,29 +2045,27 @@ impl CompiApp {
                         div()
                             .flex_none()
                             .when(!ready, |button| button.opacity(0.5))
-                            .child(if destructive {
-                                self.settings_action_button(
-                                    "prompt-confirm",
-                                    label,
-                                    confirm_focused,
-                                    true,
-                                    listener(true),
-                                )
-                            } else {
-                                self.settings_primary_button(
-                                    "prompt-confirm",
-                                    label,
-                                    confirm_focused,
-                                    listener(true),
-                                )
-                            }),
+                            .child(controls::highlight(
+                                confirm_focused,
+                                {
+                                    let confirm = controls::text_button("prompt-confirm", label)
+                                        .header()
+                                        .on_click(listener(true));
+                                    if destructive {
+                                        confirm.danger()
+                                    } else {
+                                        confirm.primary()
+                                    }
+                                },
+                                cx,
+                            )),
                     )
-                    .child(self.settings_action_button(
-                        "prompt-cancel",
-                        "Cancel",
+                    .child(controls::highlight(
                         !confirm_focused,
-                        false,
-                        listener(false),
+                        controls::text_button("prompt-cancel", "Cancel")
+                            .header()
+                            .on_click(listener(false)),
+                        cx,
                     )),
             )
             .into_any_element()

@@ -71,8 +71,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use workspace::pane_drag::PaneDrag;
 use workspace::{
-    CatalogReturn, DividerDrag, FloatDrag, FloatLayout, Overlay, Popup, TransferSeed,
-    open_compi_window,
+    DividerDrag, FloatDrag, FloatLayout, Overlay, Popup, TransferSeed, open_compi_window,
 };
 
 const DEFAULT_COLS: i16 = 100;
@@ -96,9 +95,7 @@ const TITLEBAR_TRAFFIC_LIGHT_INSET: f32 = 78.0;
 const UI_BODY_TEXT_SIZE: f32 = 14.0;
 const UI_SMALL_TEXT_SIZE: f32 = 13.0;
 const UI_MICRO_TEXT_SIZE: f32 = 12.0;
-const UI_BODY_LINE_HEIGHT: f32 = 20.0;
 const UI_SMALL_LINE_HEIGHT: f32 = 18.0;
-const UI_MICRO_LINE_HEIGHT: f32 = 16.0;
 const TAB_DRAG_THRESHOLD: f32 = 4.0;
 const TERMINAL_PADDING: f32 = 8.0;
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
@@ -568,6 +565,10 @@ enum UiEvent {
         request: u64,
         result: Result<Vec<compi_protocol::SearchEntry>, String>,
     },
+    PaletteFilesSearched {
+        request: u64,
+        result: Result<Vec<compi_protocol::SearchEntry>, String>,
+    },
     ContentListed {
         pane_id: PaneId,
         root: String,
@@ -896,13 +897,14 @@ struct CompiApp {
     settings_scope: SettingsScope,
     daemon_restarting: bool,
     zoom: f32,
-    catalog_return: Option<CatalogReturn>,
     overlay: Option<Overlay>,
     overlay_index: usize,
     overlay_scroll: ScrollHandle,
     overlay_focus: usize,
     overlay_generation: u64,
     overlay_closing_since: Option<Instant>,
+    /// The palette's scope chip and file search; see `workspace::palette`.
+    palette: workspace::palette::PaletteState,
     /// Settings panes, Quick Appearance and their keyboard highlight; see `settings`.
     settings: workspace::settings::SettingsUi,
     popup: Option<Popup>,

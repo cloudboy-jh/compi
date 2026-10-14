@@ -1,7 +1,11 @@
+use super::settings::{RowCx, SettingsAction, SettingsHost, THEME_BAR_ROW, settings_card};
 use super::*;
+use crate::gui::controls::IconName;
 use crate::theme::{ThemeDefinition, ThemeId};
 use crate::theme_store::ThemeLibrary;
+use gpui::Entity;
 use gpui::PathPromptOptions;
+use gpui_component::Sizable as _;
 
 // One local store job at a time, including across native windows. The library also
 // serializes mutations; this gate bounds the GUI's queued filesystem work.
@@ -25,13 +29,27 @@ impl Drop for CatalogStorePermit {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum ThemeFilter {
+/// Which themes the theme list shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ThemeFilter {
     #[default]
     All,
     Dark,
     Light,
     Favorites,
+}
+
+impl ThemeFilter {
+    pub(super) const ALL: [Self; 4] = [Self::All, Self::Dark, Self::Light, Self::Favorites];
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+            Self::Favorites => "Favorites",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,42 +59,66 @@ pub(super) enum CatalogTarget {
     Both,
 }
 
+/// A theme session of one Settings pane: the theme tiles' or the theme list's live
+/// preview, and the list's filter, search and store operations. It ends when the
+/// preview is applied or cancelled with the list closed, and is cancelled when the
+/// pane loses the keyboard, closes or shows something else.
 pub(in crate::gui) struct CatalogState {
     pub(super) original: AppearanceSettings,
     accepted: AppearanceSettings,
     pub(super) candidate: Arc<ThemeDefinition>,
     pub(super) target: CatalogTarget,
+    /// The Settings pane the session belongs to.
+    pub(super) pane: PaneId,
+    /// The pane shows the theme list rather than its section.
+    pub(super) list: bool,
+    /// The list's search, lowercased.
+    pub(super) query: String,
+    /// The pane had the keyboard since the session started; losing it cancels.
+    pub(super) held: bool,
     ordered_themes: Vec<Arc<ThemeDefinition>>,
     scope: SettingsScope,
-    filter: ThemeFilter,
-    licenses: bool,
-    previewed: bool,
-    pending: bool,
+    pub(super) filter: ThemeFilter,
+    pub(super) licenses: bool,
+    pub(super) previewed: bool,
+    pub(super) pending: bool,
     operation_id: u64,
-    error: Option<String>,
-    status: Option<String>,
-    remove_mode: bool,
+    pub(super) error: Option<String>,
+    pub(super) status: Option<String>,
+    pub(super) remove_mode: bool,
     removal_candidate: Option<ThemeId>,
-    removal_confirmation: bool,
+    pub(super) removal_confirmation: bool,
+}
+
+impl CatalogState {
+    /// Whether the pane shows the Apply / Cancel bar: a preview or a removal waits.
+    pub(super) fn awaiting_decision(&self) -> bool {
+        self.previewed || self.remove_mode
+    }
+
+    /// The section the session's list and tiles live in.
+    pub(super) fn section(&self) -> compi_protocol::SettingsSection {
+        match self.target {
+            CatalogTarget::Both => compi_protocol::SettingsSection::Appearance,
+            CatalogTarget::Terminal => compi_protocol::SettingsSection::Advanced,
+        }
+    }
 }
 
 impl CompiApp {
-    pub(super) fn open_theme_catalog(&mut self, scope: SettingsScope) {
-        self.open_theme_catalog_target(scope, CatalogTarget::Both);
-    }
-
-    pub(super) fn open_theme_catalog_target(
-        &mut self,
-        scope: SettingsScope,
-        target: CatalogTarget,
-    ) {
-        let parent = if self.popup == Some(Popup::QuickAppearance) {
-            Some(CatalogReturn::QuickAppearance)
-        } else {
-            self.focused_pane()
-                .filter(|pane| self.settings_content(pane).is_some())
-                .map(|pane| CatalogReturn::Settings(pane.clone()))
-        };
+    /// Starts a theme session for `target` in the Settings pane `pane`, the list open
+    /// when `list`. A session already there for `target` is kept (opening its list);
+    /// another one is cancelled first.
+    pub(super) fn start_theme_session(&mut self, pane: PaneId, target: CatalogTarget, list: bool) {
+        if let Some(catalog) = &mut self.theme_catalog
+            && catalog.pane == pane
+            && catalog.target == target
+        {
+            catalog.list |= list;
+            return;
+        }
+        self.cancel_catalog_preview();
+        let scope = self.settings_scope;
         let original = self.accepted_appearance();
         let accepted = if scope == SettingsScope::Global {
             self.config.configured_appearance.clone()
@@ -89,16 +131,17 @@ impl CompiApp {
             &accepted.theme
         });
         let ordered_themes = self.catalog_ordered_themes();
-        self.open_overlay(Overlay::ThemeCatalog, "");
-        self.catalog_return = parent;
-        self.settings_scope = scope;
         self.theme_catalog = Some(CatalogState {
             original,
             accepted,
             candidate,
+            target,
+            pane,
+            list,
+            query: String::new(),
+            held: false,
             ordered_themes,
             scope,
-            target,
             filter: ThemeFilter::All,
             licenses: false,
             previewed: false,
@@ -118,9 +161,52 @@ impl CompiApp {
         self.terminal_theme_override = original.terminal_theme_override;
     }
 
+    /// Ends the theme session, restoring what it previewed.
     pub(super) fn cancel_catalog_preview(&mut self) {
         if let Some(catalog) = self.theme_catalog.take() {
             self.restore_catalog_axes(&catalog.original);
+        }
+    }
+
+    /// Cancel in the Apply / Cancel bar, or Escape: the preview or removal is dropped.
+    /// With the list open the session stays on it, back on the current theme.
+    pub(super) fn cancel_theme_preview(&mut self) {
+        let Some(catalog) = &self.theme_catalog else {
+            return;
+        };
+        if catalog.pending {
+            return;
+        }
+        if !catalog.list {
+            self.cancel_catalog_preview();
+            return;
+        }
+        let original = catalog.original.clone();
+        self.restore_catalog_axes(&original);
+        let current = self.catalog_current_theme();
+        if let Some(catalog) = &mut self.theme_catalog {
+            if let Some(current) = current {
+                catalog.candidate = current;
+            }
+            catalog.previewed = false;
+            catalog.remove_mode = false;
+            catalog.removal_candidate = None;
+            catalog.removal_confirmation = false;
+            catalog.status = None;
+            catalog.error = None;
+        }
+    }
+
+    /// Back from the theme list: a waiting preview keeps its bar; otherwise the
+    /// session ends.
+    pub(super) fn close_theme_list(&mut self) {
+        match &mut self.theme_catalog {
+            Some(catalog) if catalog.previewed && !catalog.remove_mode => {
+                catalog.list = false;
+                catalog.licenses = false;
+            }
+            Some(_) => self.cancel_catalog_preview(),
+            None => {}
         }
     }
 
@@ -139,71 +225,39 @@ impl CompiApp {
 
     fn catalog_ordered_themes(&self) -> Vec<Arc<ThemeDefinition>> {
         let mut themes: Vec<_> = self.theme_library.entries().cloned().collect();
-        themes.sort_by_cached_key(|theme| (theme.label().to_lowercase(), theme.id().to_owned()));
+        sort_themes(&mut themes);
         themes
     }
 
-    fn catalog_themes(&self) -> impl Iterator<Item = Arc<ThemeDefinition>> + '_ {
-        let catalog = self.theme_catalog.as_ref();
-        let filter = catalog.map_or(ThemeFilter::All, |catalog| catalog.filter);
-        let remove_mode = catalog.is_some_and(|catalog| catalog.remove_mode);
-        let ordered: &[Arc<ThemeDefinition>] =
-            catalog.map_or(&[][..], |catalog| catalog.ordered_themes.as_slice());
-        let current_theme = self.catalog_current_theme();
-        let pinned = current_theme
-            .clone()
-            .into_iter()
-            .filter(move |_| !remove_mode);
-        let visible = move |theme: &Arc<ThemeDefinition>| {
-            if !remove_mode
-                && current_theme
-                    .as_ref()
-                    .is_some_and(|current| theme.theme_id() == current.theme_id())
-            {
-                return false;
-            }
-            let visible = if remove_mode {
-                theme.is_imported()
-            } else {
-                match filter {
-                    ThemeFilter::All => true,
-                    ThemeFilter::Dark => theme.is_dark(),
-                    ThemeFilter::Light => !theme.is_dark(),
-                    ThemeFilter::Favorites => {
-                        self.config.theme_favorites.contains(theme.theme_id())
-                    }
-                }
-            };
-            visible
-                && self.ime_text.split_whitespace().all(|word| {
-                    [
-                        theme.id(),
-                        theme.label(),
-                        theme.family(),
-                        theme.description(),
-                    ]
-                    .into_iter()
-                    .any(|text| {
-                        text.as_bytes()
-                            .windows(word.len())
-                            .any(|part| part.eq_ignore_ascii_case(word.as_bytes()))
-                    })
-                })
+    /// The theme grid's groups, as far as the filter and search let themes through;
+    /// see `group_themes`. Removal lists the local themes, by appearance only.
+    pub(super) fn catalog_groups(&self) -> Vec<ThemeGroup> {
+        let Some(catalog) = self.theme_catalog.as_ref() else {
+            return Vec::new();
         };
-        let favorite_visible = visible.clone();
-        let favorites = ordered
-            .iter()
-            .filter(move |theme| {
-                self.config.theme_favorites.contains(theme.theme_id()) && favorite_visible(theme)
-            })
-            .cloned();
-        let others = ordered
-            .iter()
-            .filter(move |theme| {
-                !self.config.theme_favorites.contains(theme.theme_id()) && visible(theme)
-            })
-            .cloned();
-        pinned.chain(favorites).chain(others)
+        let favorites = &self.config.theme_favorites;
+        let query = catalog.query.as_str();
+        let visible = catalog.ordered_themes.iter().filter(|theme| {
+            if catalog.remove_mode {
+                theme.is_imported() && theme_matches(theme, ThemeFilter::All, false, query)
+            } else {
+                theme_matches(
+                    theme,
+                    catalog.filter,
+                    favorites.contains(theme.theme_id()),
+                    query,
+                )
+            }
+        });
+        if catalog.remove_mode {
+            return group_themes(visible, None, &[]);
+        }
+        let current = self.catalog_current_theme();
+        group_themes(
+            visible,
+            current.as_ref().map(|theme| theme.theme_id()),
+            favorites,
+        )
     }
 
     fn preview_catalog_theme(&mut self, theme: Arc<ThemeDefinition>) {
@@ -242,186 +296,143 @@ impl CompiApp {
         }
     }
 
-    pub(super) fn move_catalog_selection(&mut self, backwards: bool) {
+    /// Moves the grid's selection one `step` in a grid of `columns`, previewing it;
+    /// see `grid_step`.
+    pub(super) fn move_catalog_selection(&mut self, step: GridStep, columns: usize) {
         let Some(catalog) = &self.theme_catalog else {
             return;
         };
         if catalog.pending || CATALOG_STORE_BUSY.load(Ordering::Acquire) {
             return;
         }
-        let remove_mode = catalog.remove_mode;
-        let themes: Vec<_> = self.catalog_themes().collect();
-        if themes.is_empty() {
-            return;
-        }
         let id = if catalog.remove_mode {
-            catalog.removal_candidate.as_ref()
+            catalog.removal_candidate.clone()
         } else {
-            Some(catalog.candidate.theme_id())
+            Some(catalog.candidate.theme_id().clone())
         };
-        let index = themes.iter().position(|theme| Some(theme.theme_id()) == id);
-        let next = match index {
-            Some(index) if backwards => (index + themes.len() - 1) % themes.len(),
-            Some(index) => (index + 1) % themes.len(),
-            None if backwards => themes.len() - 1,
-            None => 0,
-        };
-        if catalog.remove_mode {
-            if let Some(catalog) = &mut self.theme_catalog {
-                catalog.removal_candidate = Some(themes[next].theme_id().clone());
-                catalog.removal_confirmation = false;
-            }
-        } else {
-            self.preview_catalog_theme(themes[next].clone());
+        let groups = self.catalog_groups();
+        let themes: Vec<_> = groups.iter().flat_map(|group| &group.themes).collect();
+        let index = themes
+            .iter()
+            .position(|theme| Some(theme.theme_id()) == id.as_ref());
+        if let Some(next) = grid_step(&grid_rows(&groups, columns), index, step) {
+            self.select_catalog_theme(Arc::clone(themes[next]));
         }
-        self.overlay_scroll.scroll_to_item(if remove_mode {
-            next
-        } else {
-            next.saturating_sub(1)
-        });
     }
 
-    pub(super) fn handle_catalog_key(
-        &mut self,
-        key: &Keystroke,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
-            return false;
-        }
-        // Search/list, compact filters, import, More, cancel, apply, selected star. The
-        // More menu holds attribution, export and local removal; open, it has the keys.
-        let focus_count = 10;
-        match key.key.as_str() {
-            "escape" => self.dismiss_overlay(),
-            "tab" => {
-                self.overlay_focus = if key.modifiers.shift {
-                    (self.overlay_focus + focus_count - 1) % focus_count
-                } else {
-                    (self.overlay_focus + 1) % focus_count
-                };
-                if self.overlay_focus == 9 {
-                    let selected = self.catalog_action_theme();
-                    let visible = selected.as_ref().is_some_and(|selected| {
-                        self.catalog_themes()
-                            .any(|theme| theme.theme_id() == selected.theme_id())
-                    });
-                    if !visible {
-                        self.move_catalog_selection(false);
-                    }
-                }
-            }
-            "up" | "down" if self.overlay_focus == 0 || self.overlay_focus == 9 => {
-                self.move_catalog_selection(key.key == "up");
-            }
-            "left" | "right" if (1..=4).contains(&self.overlay_focus) => {
-                let (first, last) = (1, 4);
-                self.overlay_focus = if key.key == "left" {
-                    if self.overlay_focus == first {
-                        last
-                    } else {
-                        self.overlay_focus - 1
-                    }
-                } else if self.overlay_focus == last {
-                    first
-                } else {
-                    self.overlay_focus + 1
-                };
-                self.activate_catalog_control(self.overlay_focus, window, cx);
-            }
-            "space" if self.overlay_focus == 0 => return false,
-            "enter" | "space" => self.activate_catalog_control(self.overlay_focus, window, cx),
-            _ if self.overlay_focus == 0 => return false,
-            _ if key.key_char.is_some()
-                || matches!(key.key.as_str(), "backspace" | "delete" | "home" | "end")
-                || ((key.modifiers.platform || key.modifiers.control)
-                    && matches!(key.key.as_str(), "a" | "c" | "v")) =>
-            {
-                self.overlay_focus = 0;
-                cx.notify();
-                return false;
-            }
-            _ => return true,
-        }
-        cx.notify();
-        true
-    }
-
-    fn activate_catalog_control(
-        &mut self,
-        focus: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if focus != 7
-            && self
-                .theme_catalog
-                .as_ref()
-                .is_some_and(|catalog| catalog.pending)
-        {
+    /// A list row picked: previewed, or in removal the one to remove.
+    pub(super) fn select_catalog_theme(&mut self, theme: Arc<ThemeDefinition>) {
+        let Some(catalog) = &mut self.theme_catalog else {
+            return;
+        };
+        if catalog.pending {
             return;
         }
-        match focus {
-            0 | 8 => {
-                if self
-                    .theme_catalog
-                    .as_ref()
-                    .is_some_and(|catalog| catalog.remove_mode)
-                {
-                    self.remove_catalog_theme(window, cx);
-                } else {
-                    self.apply_catalog_theme(window, cx);
-                }
-            }
-            1..=4 => {
-                if let Some(catalog) = &mut self.theme_catalog {
-                    if catalog.remove_mode {
-                        catalog.status = None;
-                        catalog.error = None;
-                    }
-                    catalog.filter = [
-                        ThemeFilter::All,
-                        ThemeFilter::Dark,
-                        ThemeFilter::Light,
-                        ThemeFilter::Favorites,
-                    ][focus - 1];
-                    catalog.licenses = false;
-                    catalog.remove_mode = false;
-                    catalog.removal_confirmation = false;
-                }
-                self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
-            }
-            5 => self.import_catalog_theme(window, cx),
-            6 => self.popup = Some(Popup::CatalogMenu),
-            7 => self.dismiss_overlay(),
-            9 => {
-                if let Some(theme) = self.catalog_action_theme() {
-                    self.toggle_theme_favorite(theme.theme_id().clone(), window, cx);
-                }
-            }
-            _ => {}
+        if catalog.remove_mode {
+            catalog.removal_candidate = Some(theme.theme_id().clone());
+            catalog.removal_confirmation = false;
+        } else {
+            self.preview_catalog_theme(theme);
         }
     }
 
-    /// The More menu's actions: attribution, export and local removal. Like every
-    /// catalog control, they wait while a dialog or the theme store is busy.
-    fn catalog_menu(&self, cx: &Context<Self>) -> AnyElement {
+    /// Whether `theme` is the list's selected row.
+    pub(super) fn catalog_selected(&self, theme: &ThemeDefinition) -> bool {
+        self.theme_catalog.as_ref().is_some_and(|catalog| {
+            if catalog.remove_mode {
+                catalog.removal_candidate.as_ref() == Some(theme.theme_id())
+            } else {
+                catalog.candidate.theme_id() == theme.theme_id()
+            }
+        })
+    }
+
+    /// The list's filter; picking one leaves removal and attribution.
+    pub(super) fn set_catalog_filter(&mut self, filter: ThemeFilter) {
+        if let Some(catalog) = &mut self.theme_catalog {
+            if catalog.pending {
+                return;
+            }
+            if catalog.remove_mode {
+                catalog.status = None;
+                catalog.error = None;
+            }
+            catalog.filter = filter;
+            catalog.licenses = false;
+            catalog.remove_mode = false;
+            catalog.removal_confirmation = false;
+        }
+    }
+
+    /// The bar's primary action: apply the preview, or in removal remove the selected
+    /// local theme (asking first).
+    pub(super) fn decide_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .theme_catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.remove_mode)
+        {
+            self.remove_catalog_theme(window, cx);
+        } else {
+            self.apply_catalog_theme(window, cx);
+        }
+    }
+
+    /// Stars or unstars the list's selected theme.
+    pub(super) fn toggle_selected_favorite(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(theme) = self.catalog_action_theme() {
+            self.toggle_theme_favorite(theme.theme_id().clone(), window, cx);
+        }
+    }
+
+    /// The More menu's actions: import, attribution, export and local removal. Like
+    /// every list control, they wait while a dialog or the theme store is busy.
+    pub(super) fn catalog_menu(&self, focused: bool, cx: &Context<Self>) -> AnyElement {
         let catalog = self.theme_catalog.as_ref();
         let busy = catalog.is_some_and(|catalog| catalog.pending);
         let licenses = catalog.is_some_and(|catalog| catalog.licenses);
         let remove_mode = catalog.is_some_and(|catalog| catalog.remove_mode);
         let open = self.popup == Some(Popup::CatalogMenu);
+        let trigger = controls::icon_button("theme-menu-button", IconName::Ellipsis, "More")
+            .header()
+            .menu_open(open)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_popup(Popup::CatalogMenu, !open);
+                cx.notify();
+            }));
         controls::menu(
             "theme-menu",
-            self.settings_popup_button(
-                "theme-menu-button",
-                "More",
-                self.overlay_focus == 6 || open,
-                false,
-            ),
+            controls::highlight(focused, trigger, cx),
             open,
             [
+                controls::menu_item(
+                    "Import Zed theme…",
+                    cx.listener(|this, _, window, cx| {
+                        this.import_catalog_theme(window, cx);
+                        cx.notify();
+                    }),
+                )
+                .disabled(busy),
+                controls::menu_item(
+                    "Export selected…",
+                    cx.listener(|this, _, _, cx| {
+                        this.export_catalog_theme(cx);
+                        cx.notify();
+                    }),
+                )
+                .disabled(busy),
+                controls::menu_item(
+                    if remove_mode {
+                        "Back to themes"
+                    } else {
+                        "Remove local theme"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_catalog_removal();
+                        cx.notify();
+                    }),
+                )
+                .disabled(busy),
                 controls::menu_item(
                     if licenses {
                         "Back to themes"
@@ -436,34 +447,10 @@ impl CompiApp {
                     }),
                 )
                 .disabled(busy),
-                controls::menu_item(
-                    "Export selected",
-                    cx.listener(|this, _, _, cx| {
-                        this.export_catalog_theme(cx);
-                        cx.notify();
-                    }),
-                )
-                .disabled(busy),
-                controls::menu_item(
-                    if remove_mode {
-                        "Back to themes"
-                    } else {
-                        "Remove local"
-                    },
-                    cx.listener(|this, _, _, cx| {
-                        this.toggle_catalog_removal();
-                        this.overlay_focus = 0;
-                        cx.notify();
-                    }),
-                )
-                .disabled(busy),
             ],
         )
         .anchor(Anchor::TopRight)
         .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-            if *open {
-                this.overlay_focus = 6;
-            }
             this.set_popup(Popup::CatalogMenu, *open);
             cx.notify();
         }))
@@ -486,12 +473,20 @@ impl CompiApp {
             .entries()
             .find(|theme| theme.is_imported())
             .map(|theme| theme.theme_id().clone());
+        let original = match &self.theme_catalog {
+            Some(catalog) if !catalog.pending => catalog.original.clone(),
+            _ => return,
+        };
+        // Removal does not preview: the panes go back to the accepted colors.
+        self.restore_catalog_axes(&original);
+        let current = self.catalog_current_theme();
         if let Some(catalog) = &mut self.theme_catalog {
-            if catalog.pending {
-                return;
-            }
             catalog.remove_mode = !catalog.remove_mode;
             catalog.licenses = false;
+            catalog.previewed = false;
+            if let Some(current) = current {
+                catalog.candidate = current;
+            }
             catalog.removal_candidate = first;
             catalog.removal_confirmation = false;
             catalog.error = None;
@@ -499,8 +494,6 @@ impl CompiApp {
                 .remove_mode
                 .then(|| "Select an unused local theme. Its source file is kept.".into());
         }
-        self.ime_text.clear();
-        self.overlay_scroll.set_offset(point(px(0.0), px(0.0)));
     }
 
     pub(super) fn apply_catalog_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -516,7 +509,13 @@ impl CompiApp {
         let Some(mut catalog) = self.theme_catalog.take() else {
             return;
         };
-        let mut appearance = catalog.accepted.clone();
+        // The window settings as they are now; the session's copy predates any change
+        // made beside the grid (transparency, opacity).
+        let mut appearance = if catalog.scope == SettingsScope::Global {
+            self.config.configured_appearance.clone()
+        } else {
+            self.accepted_appearance()
+        };
         if catalog.target == CatalogTarget::Both {
             appearance.theme = catalog.candidate.theme_id().clone();
         }
@@ -547,8 +546,14 @@ impl CompiApp {
             self.save_state();
             self.broadcast_global_appearance(window, cx);
         }
-        self.dismiss_overlay();
-        window.focus(&self.focus_handle, cx);
+        // With the list open the session goes on from the colors just applied.
+        if catalog.list {
+            self.start_theme_session(catalog.pane.clone(), catalog.target, true);
+            if let Some(session) = &mut self.theme_catalog {
+                session.filter = catalog.filter;
+                session.query = catalog.query;
+            }
+        }
         cx.notify();
     }
 
@@ -1048,640 +1053,799 @@ impl CompiApp {
         cx.notify();
     }
 
-    pub(super) fn render_theme_catalog_entry_target(
+    /// The theme section: a header line (title, search, filter, More), notices, then
+    /// every theme as a tile in `columns` equal columns, under its group's label (see
+    /// `group_themes`), filling the rest of the page in its own scroll (`grid`, whose
+    /// viewport `viewport` records). With `back`, a back control leads the header (the
+    /// terminal colors page).
+    pub(super) fn render_theme_section(
         &self,
-        theme: Arc<ThemeDefinition>,
-        target: CatalogTarget,
-        focused: bool,
+        row: &RowCx,
+        search: &Entity<gpui_component::input::InputState>,
+        (grid, viewport): (&ScrollHandle, AnyElement),
+        columns: usize,
+        back: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let colors = *self.colors();
-        let locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
-        let row_background = if focused {
-            blend_rgb(colors.surface, colors.accent, 0.1)
-        } else {
-            colors.surface
-        };
-        let button_background = blend_rgb(colors.surface, colors.foreground, 0.11);
-        let button_hover = blend_rgb(colors.surface, colors.foreground, 0.17);
-        div()
-            .min_h(px(52.0))
-            .py_1()
-            .rounded_sm()
-            .bg(color(row_background))
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                div().flex_1().min_w_0().flex().flex_col().gap_1().child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(theme.label().to_owned()),
-                ),
-            )
-            .child(
-                div()
-                    .id(("browse-theme-catalog", target as usize))
-                    .flex_none()
-                    .min_w(px(72.0))
-                    .min_h(px(32.0))
-                    .px_2()
-                    .rounded_sm()
-                    .bg(color(button_background))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(color(ui_text_color(
-                        if locked {
-                            colors.muted
-                        } else {
-                            colors.foreground
-                        },
-                        button_background,
-                    )))
-                    .when(!locked, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(color(button_hover)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_theme_catalog_target(this.settings_scope, target);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }))
-                    })
-                    .child("Change"),
-            )
-            .into_any_element()
-    }
-
-    fn theme_sample(theme: &ThemeDefinition) -> AnyElement {
-        let colors = theme.colors();
-        let terminal = theme.terminal();
-        // Show the opaque color baseline; window material is a separate preference.
-        div()
-            .w(gpui::relative(0.5))
-            .flex_none()
-            .rounded_sm()
-            .border_1()
-            .border_color(color(colors.border))
-            .overflow_hidden()
-            .bg(material_color(colors.background, 1.0))
-            .child(
-                div()
-                    .h(px(25.0))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .bg(color(colors.surface))
-                    .child(chrome_icon(ChromeIcon::Mark, color(colors.accent)))
-                    .child(
-                        div()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(color(ui_text_color(
-                                colors.foreground,
-                                composite_rgb(colors.surface, colors.background & 0x00ff_ffff),
-                            )))
-                            .child("compi / src"),
-                    ),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .bg(material_color(terminal.background, 1.0))
-                    .flex()
-                    .flex_col()
-                    .font_family("monospace")
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_color(color(ui_text_color(
-                                        terminal.ansi[6],
-                                        terminal.background & 0x00ff_ffff,
-                                    )))
-                                    .child("$"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(color(terminal.foreground))
-                                    .child("git status"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_color(color(ui_text_color(
-                                        terminal.ansi[2],
-                                        terminal.background & 0x00ff_ffff,
-                                    )))
-                                    .child("main"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(color(terminal.foreground))
-                                    .child("working tree clean"),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn catalog_action_button(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        focus: usize,
-        destructive: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        self.settings_action_button(
-            id,
-            label,
-            self.overlay_focus == focus,
-            destructive,
-            cx.listener(move |this, _, window, cx| {
-                this.overlay_focus = focus;
-                this.activate_catalog_control(focus, window, cx);
-                cx.stop_propagation();
-                cx.notify();
-            }),
-        )
-    }
-
-    pub(super) fn render_theme_catalog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let Some(catalog) = &self.theme_catalog else {
             return div().into_any_element();
         };
         let colors = *self.colors();
-        let (viewport_width, viewport_height) = overlay_viewport_size(window);
-        let panel_width = (viewport_width - 32.0).clamp(1.0, 780.0);
-        let panel_height = (viewport_height - 32.0).clamp(1.0, 700.0);
-        let compact_footer = panel_width < 520.0;
-        let candidate = &catalog.candidate;
-        let action_theme = self.catalog_action_theme();
-        let current_theme = self.catalog_current_theme();
-        let current_id = current_theme.as_ref().map(|theme| theme.theme_id());
-        let filters = [
-            (ThemeFilter::All, "All"),
-            (ThemeFilter::Dark, "Dark"),
-            (ThemeFilter::Light, "Light"),
-            (ThemeFilter::Favorites, "Favorites"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (filter, label))| {
-            self.settings_segment_button(
-                ("theme-filter", index),
-                label,
-                catalog.filter == filter && !catalog.remove_mode,
-                self.overlay_focus == index + 1,
-                cx.listener(move |this, _, window, cx| {
-                    this.overlay_focus = index + 1;
-                    this.activate_catalog_control(index + 1, window, cx);
-                    cx.stop_propagation();
-                    cx.notify();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let terminal = catalog.target == CatalogTarget::Terminal;
+        let locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
+        let current_id = self
+            .catalog_current_theme()
+            .map(|theme| theme.theme_id().clone());
+        let list_focused = self.settings_focused(row, SettingsAction::ThemeList);
+        let star_focused = self.settings_focused(row, SettingsAction::ThemeFavorite);
+        let more_focused = self.settings_focused(row, SettingsAction::ThemeMore);
+        let filters_focused = self.settings_focused(row, SettingsAction::ThemeFilter);
+        let filter_row = row.clone();
+        let filters = controls::segmented(
+            "theme-filter",
+            ThemeFilter::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, filter)| {
+                    let row = filter_row.clone();
+                    controls::text_button(("theme-filter", index), filter.label())
+                        .selected(catalog.filter == filter && !catalog.remove_mode)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.focus_settings_control(&row, SettingsAction::ThemeFilter);
+                            this.set_catalog_filter(filter);
+                            cx.notify();
+                        }))
                 }),
-            )
-        });
-        let render_row = |theme: Arc<ThemeDefinition>| {
-            let selected = if catalog.remove_mode {
-                catalog.removal_candidate.as_ref() == Some(theme.theme_id())
-            } else {
-                theme.theme_id() == candidate.theme_id()
-            };
-            let current = Some(theme.theme_id()) == current_id;
-            let favorite = self.config.theme_favorites.contains(theme.theme_id());
-            let preview = theme.clone();
-            let favorite_id = theme.theme_id().clone();
-            let row_id = gpui::SharedString::from(format!("catalog-theme-{}", theme.id()));
-            let star_id = gpui::SharedString::from(format!("catalog-favorite-{}", theme.id()));
-            div()
-                .id(row_id)
-                .px_3()
-                .py_2()
-                .flex()
-                .flex_wrap()
-                .gap_3()
-                .border_b_1()
-                .border_color(color(colors.border))
-                .bg(color(if selected {
-                    blend_rgb(colors.surface, colors.accent, 0.14)
+        );
+        let header = div()
+            .flex_none()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x_3()
+            .gap_y_2()
+            .when(back, |header| {
+                header.child(
+                    self.settings_control(
+                        row,
+                        SettingsAction::ThemeBack,
+                        controls::icon_button((row.row, 0_usize), IconName::ChevronLeft, "Back")
+                            .header()
+                            .key("escape"),
+                        cx,
+                    ),
+                )
+            })
+            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(
+                if catalog.remove_mode {
+                    "Remove local themes"
+                } else if terminal {
+                    "Terminal colors"
                 } else {
-                    colors.surface
-                }))
-                .cursor_pointer()
-                .hover(move |style| style.bg(color(colors.surface_hover)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.overlay_focus = 0;
-                    if let Some(catalog) = &mut this.theme_catalog {
-                        if catalog.pending {
-                            return;
-                        }
-                        if catalog.remove_mode {
-                            catalog.removal_candidate = Some(preview.theme_id().clone());
-                            catalog.removal_confirmation = false;
-                        } else {
-                            this.preview_catalog_theme(preview.clone());
-                        }
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
-                .child(
+                    "Theme"
+                },
+            ))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w(px(120.0))
+                    .max_w(px(280.0))
+                    .child(
+                        gpui_component::input::Input::new(search)
+                            .appearance(true)
+                            .cleanable(true)
+                            .with_size(gpui_component::Size::Small),
+                    )
+                    .child(self.settings_focus_anchor(
+                        self.settings_focused(row, SettingsAction::ThemeSearch),
+                        cx,
+                    )),
+            )
+            .child(
+                controls::highlight(filters_focused, filters, cx)
+                    .child(self.settings_focus_anchor(filters_focused, cx)),
+            )
+            .child(
+                div()
+                    .ml_auto()
+                    .relative()
+                    .child(self.catalog_menu(more_focused, cx))
+                    .child(self.settings_focus_anchor(more_focused, cx)),
+            );
+        let override_note = !terminal && self.scoped_appearance().terminal_theme_override;
+        let notices = (catalog.pending
+            || catalog.error.is_some()
+            || catalog.status.is_some()
+            || locked
+            || override_note)
+            .then(|| {
+                div()
+                    .flex_none()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .line_height(px(UI_SMALL_LINE_HEIGHT))
+                    .text_color(muted)
+                    .when(locked, |notes| notes.child("Colors are fixed by --theme."))
+                    .when(override_note && !locked, |notes| {
+                        notes.child("Terminal colors are overridden in Advanced.")
+                    })
+                    .when(catalog.pending, |notes| {
+                        notes.child("Waiting for dialog or local theme store…")
+                    })
+                    .when_some(catalog.error.clone(), |notes, error| {
+                        notes.child(
+                            div()
+                                .text_color(color(modal_text_color(colors.error, &colors)))
+                                .child(error),
+                        )
+                    })
+                    .when_some(catalog.status.clone(), |notes, status| notes.child(status))
+            });
+        let content = if catalog.licenses {
+            let attribution = self
+                .catalog_action_theme()
+                .unwrap_or_else(|| catalog.candidate.clone());
+            settings_card(&colors)
+                .p_4()
+                .gap_4()
+                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .line_height(px(UI_SMALL_LINE_HEIGHT))
+                .child(self.settings_subheading("Selected theme attribution"))
+                .child(attribution.attribution().to_owned())
+                .child(self.settings_subheading("Bundled theme licenses"))
+                .child(crate::theme::THEME_ATTRIBUTION)
+                .child(self.settings_subheading("Bundled font licenses"))
+                .child(crate::font_catalog::FONT_ATTRIBUTION)
+                .into_any_element()
+        } else {
+            let groups = self.catalog_groups();
+            if groups.is_empty() {
+                div()
+                    .text_color(muted)
+                    .child(if catalog.remove_mode {
+                        "No matching local themes to remove."
+                    } else {
+                        "No matching themes. Try another search or filter."
+                    })
+                    .into_any_element()
+            } else {
+                let columns = columns.max(1);
+                let mut first = 0;
+                let sections = groups.iter().map(|group| {
+                    let start = first;
+                    first += group.themes.len();
+                    let rows = group
+                        .themes
+                        .chunks(columns)
+                        .enumerate()
+                        .map(|(line, chunk)| {
+                            let tiles = chunk.iter().enumerate().map(|(offset, theme)| {
+                                let selected = self.catalog_selected(theme);
+                                let current = !catalog.remove_mode
+                                    && current_id.as_ref() == Some(theme.theme_id());
+                                self.render_theme_tile(
+                                    row,
+                                    (start + line * columns + offset, theme.clone()),
+                                    (selected, current),
+                                    (list_focused, star_focused),
+                                    line == 0,
+                                    cx,
+                                )
+                            });
+                            div()
+                                .flex()
+                                .gap_3()
+                                .children(tiles)
+                                // Empty cells keep a short row's tiles as wide as the others.
+                                .children((chunk.len()..columns).map(|_| div().flex_1().min_w_0()))
+                        });
                     div()
-                        .flex_1()
-                        .min_w(px(100.0))
                         .flex()
                         .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .text_ellipsis()
-                                        .font_weight(if selected {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::MEDIUM
-                                        })
-                                        .text_color(color(modal_text_color(
-                                            colors.foreground,
-                                            &colors,
-                                        )))
-                                        .child(theme.label().to_owned()),
-                                )
-                                .when(current, |title| {
-                                    title.child(
-                                        div()
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                                            .line_height(px(UI_MICRO_LINE_HEIGHT))
-                                            .text_color(color(modal_text_color(
-                                                colors.foreground,
-                                                &colors,
-                                            )))
-                                            .child(
-                                                div()
-                                                    .size(px(14.0))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(color(colors.accent))
-                                                    .child(
-                                                        div()
-                                                            .size(px(6.0))
-                                                            .rounded_full()
-                                                            .bg(color(colors.accent)),
-                                                    ),
-                                            )
-                                            .child("Current"),
-                                    )
-                                }),
-                        )
+                        .gap(px(THEME_GROUP_LABEL_GAP))
                         .child(
                             div()
                                 .text_size(px(UI_SMALL_TEXT_SIZE))
                                 .line_height(px(UI_SMALL_LINE_HEIGHT))
-                                .text_color(color(modal_text_color(colors.muted, &colors)))
-                                .child(format!(
-                                    "{} · {}{}",
-                                    theme.family(),
-                                    if theme.is_dark() { "Dark" } else { "Light" },
-                                    if theme.is_imported() { " · Local" } else { "" }
-                                )),
-                        ),
-                )
-                .when(panel_width >= 440.0, |row| {
-                    row.child(Self::theme_sample(&theme))
-                })
-                .child(
-                    div()
-                        .id(star_id)
-                        .flex_none()
-                        .min_w(px(32.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .when(selected && self.overlay_focus == 9, |star| {
-                            star.bg(color(blend_rgb(colors.surface, colors.accent, 0.18)))
-                        })
-                        .px_1()
-                        .py_2()
-                        .text_size(px(19.0))
-                        .text_color(color(modal_text_color(
-                            if favorite {
-                                colors.accent
-                            } else {
-                                colors.muted
-                            },
-                            &colors,
-                        )))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.toggle_theme_favorite(favorite_id.clone(), window, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child(if favorite { "★" } else { "☆" }),
-                )
-                .into_any_element()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(muted)
+                                .child(group.label),
+                        )
+                        .child(div().flex().flex_col().gap_3().children(rows))
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .pb_2()
+                    .children(sections)
+                    .into_any_element()
+            }
         };
-        let mut themes = self
-            .catalog_themes()
-            .filter(|theme| catalog.remove_mode || Some(theme.theme_id()) != current_id)
-            .peekable();
-        let has_results = themes.peek().is_some();
-        let rows = themes.map(&render_row);
-        let body = if catalog.licenses {
-            let selected_attribution = action_theme.as_ref().unwrap_or(candidate).attribution();
-            div()
-                .id("theme-license-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .p_3()
-                .flex()
-                .flex_col()
-                .gap_5()
-                .text_size(px(UI_SMALL_TEXT_SIZE))
-                .line_height(px(UI_SMALL_LINE_HEIGHT))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(self.settings_subheading("Selected theme attribution"))
-                        .child(selected_attribution),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(self.settings_subheading("Bundled theme licenses"))
-                        .child(crate::theme::THEME_ATTRIBUTION),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(self.settings_subheading("Bundled font licenses"))
-                        .child(crate::font_catalog::FONT_ATTRIBUTION),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .id("theme-catalog-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.overlay_scroll)
-                .children(rows)
-                .when(!has_results, |body| {
-                    body.child(
-                        div()
-                            .px_3()
-                            .py_3()
-                            .text_color(color(modal_text_color(colors.muted, &colors)))
-                            .child(if catalog.remove_mode {
-                                "No matching local themes to remove."
-                            } else {
-                                "No matching themes. Try another search or filter."
-                            }),
-                    )
-                })
-                .into_any_element()
-        };
-        let preview_status = if catalog.remove_mode {
-            "Removal does not change appearance. In-use themes are protected.".to_owned()
-        } else if self.config.provenance.theme == crate::config::ValueSource::CommandLine {
-            "Colors are fixed by --theme. Import, export and favorites remain available.".to_owned()
-        } else {
-            format!(
-                "{} {}. Apply to keep these colors.",
-                if catalog.previewed {
-                    "Previewing"
-                } else {
-                    "Selected"
-                },
-                candidate.label(),
-            )
-        };
+        // No `min_h_0`: the header, notes and the grid's minimum height always fit, and a
+        // short page scrolls around them.
         div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .w(px(viewport_width))
-            .h(px(viewport_height.max(1.0)))
-            .p_4()
+            .flex_1()
+            .min_w_0()
             .flex()
-            .justify_center()
-            .items_center()
-            .bg(color(colors.background).opacity(MODAL_SCRIM_OPACITY))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.dismiss_overlay();
-                    window.focus(&this.focus_handle, cx);
-                    cx.notify();
-                }),
+            .flex_col()
+            .gap_3()
+            .child(header)
+            .children(notices)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(160.0))
+                    .child(
+                        div()
+                            .id("theme-grid")
+                            .absolute()
+                            .inset_0()
+                            .overflow_y_scroll()
+                            .track_scroll(grid)
+                            // The scroll clips: room for a tile's ring on every edge.
+                            .p(px(4.0))
+                            .child(content),
+                    )
+                    .child(viewport),
+            )
+            .into_any_element()
+    }
+
+    /// One tile of the theme grid: the theme's swatch (an accent edge when selected, a
+    /// check when current) over its name and star; the star shows while hovered,
+    /// selected or starred. A tile in its group's `first_row` scrolls into view with
+    /// the group's label.
+    fn render_theme_tile(
+        &self,
+        row: &RowCx,
+        (index, theme): (usize, Arc<ThemeDefinition>),
+        (selected, current): (bool, bool),
+        (list_focused, star_focused): (bool, bool),
+        first_row: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let favorite = self.config.theme_favorites.contains(theme.theme_id());
+        let favorite_id = theme.theme_id().clone();
+        let star = controls::icon_button(
+            ("theme-star", index),
+            if favorite {
+                IconName::StarFill
+            } else {
+                IconName::Star
+            },
+            if favorite {
+                "Remove from favorites"
+            } else {
+                "Add to favorites"
+            },
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.toggle_theme_favorite(favorite_id.clone(), window, cx);
+        }));
+        let pick = theme.clone();
+        let pick_row = row.clone();
+        let on_accent = ui_text_color(colors.background & 0x00ff_ffff, colors.accent);
+        let tile = div()
+            .id(("theme-tile", index))
+            .group("theme-tile")
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.focus_settings_control(&pick_row, SettingsAction::ThemeList);
+                this.select_catalog_theme(pick.clone());
+                cx.notify();
+            }))
+            .child(
+                theme_swatch(&theme, 64.0)
+                    .when(selected, |swatch| {
+                        swatch.border_2().border_color(color(colors.accent))
+                    })
+                    .when(!selected, |swatch| {
+                        swatch.hover(move |style| style.border_color(color(colors.muted)))
+                    })
+                    .when(current, |swatch| {
+                        swatch.child(
+                            div()
+                                .absolute()
+                                .top(px(6.0))
+                                .right(px(6.0))
+                                .size(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(color(colors.accent))
+                                .child(controls::glyph(IconName::Check, color(on_accent))),
+                        )
+                    }),
             )
             .child(
                 div()
-                    .w(px(panel_width))
-                    .h(px(panel_height))
-                    .min_h_0()
+                    .min_w_0()
                     .flex()
-                    .flex_col()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(color(colors.border))
-                    .bg(color(colors.surface))
-                    .text_size(px(UI_BODY_TEXT_SIZE))
-                    .line_height(px(UI_BODY_LINE_HEIGHT))
-                    .text_color(color(modal_text_color(colors.foreground, &colors)))
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .items_center()
+                    .gap_1()
                     .child(
                         div()
-                            .flex_none()
-                            .p_3()
-                            .flex()
-                            .flex_wrap()
-                            .justify_between()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(18.0))
-                                    .line_height(px(24.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(if catalog.target == CatalogTarget::Terminal {
-                                        "Terminal colors"
-                                    } else {
-                                        "Theme"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .line_height(px(UI_SMALL_LINE_HEIGHT))
-                                    .text_color(color(modal_text_color(colors.muted, &colors)))
-                                    .child(if catalog.scope == SettingsScope::Global {
-                                        "Global defaults · Esc cancels"
-                                    } else {
-                                        "This window · Esc cancels"
-                                    }),
-                            ),
-                    )
-                    .child(self.render_editor(cx))
-                    .child(
-                        div()
-                            .flex_none()
-                            .px_3()
-                            .py_2()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .when(compact_footer, |filters| filters.w_full().flex_wrap())
-                                    .gap_1()
-                                    .children(filters),
-                            )
-                            .child(div().flex_1().min_w_0())
-                            .child(self.catalog_action_button(
-                                "import-theme",
-                                "Import",
-                                5,
-                                false,
-                                cx,
-                            ))
-                            .child(self.catalog_menu(cx)),
-                    )
-                    .when(!catalog.licenses && !catalog.remove_mode, |panel| {
-                        panel.child(
-                            div()
-                                .flex_none()
-                                .when_some(current_theme.as_ref(), |section, theme| {
-                                    section.child(render_row(theme.clone()))
-                                }),
-                        )
-                    })
-                    .child(body)
-                    .when(
-                        catalog.pending || catalog.error.is_some() || catalog.status.is_some(),
-                        |panel| {
-                            panel.child(
-                                div()
-                                    .flex_none()
-                                    .min_w_0()
-                                    .px_3()
-                                    .py_3()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .line_height(px(UI_SMALL_LINE_HEIGHT))
-                                    .text_color(color(modal_text_color(colors.muted, &colors)))
-                                    .when(catalog.pending, |feedback| {
-                                        feedback.child("Waiting for dialog or local theme store…")
-                                    })
-                                    .when_some(catalog.error.as_ref(), |feedback, error| {
-                                        feedback.child(
-                                            div()
-                                                .text_color(color(modal_text_color(
-                                                    colors.error,
-                                                    &colors,
-                                                )))
-                                                .child(error.clone()),
-                                        )
-                                    })
-                                    .when_some(catalog.status.as_ref(), |feedback, status| {
-                                        feedback.child(div().child(status.clone()))
-                                    }),
-                            )
-                        },
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .line_height(px(UI_SMALL_LINE_HEIGHT))
+                            .text_color(color(modal_text_color(
+                                if selected || current {
+                                    colors.foreground
+                                } else {
+                                    colors.muted
+                                },
+                                &colors,
+                            )))
+                            .when(selected || current, |name| {
+                                name.font_weight(FontWeight::MEDIUM)
+                            })
+                            .child(theme.label().to_owned()),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .p_3()
-                            .border_t_1()
-                            .border_color(color(colors.border))
-                            .flex()
-                            .gap_3()
-                            .when(compact_footer, |footer| footer.flex_col().items_start())
-                            .when(!compact_footer, |footer| footer.items_center())
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .when(compact_footer, |text| text.w_full())
-                                    .when(!compact_footer, |text| text.flex_1())
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .line_height(px(UI_SMALL_LINE_HEIGHT))
-                                    .text_color(color(modal_text_color(colors.muted, &colors)))
-                                    .child(preview_status),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .when(compact_footer, |actions| actions.w_full().justify_end())
-                                    .child(self.catalog_action_button(
-                                        "cancel-theme-preview",
-                                        "Cancel",
-                                        7,
-                                        false,
-                                        cx,
-                                    ))
-                                    .child(self.settings_primary_button(
-                                        "apply-catalog-theme",
-                                        if catalog.pending {
-                                            "Working…"
-                                        } else if catalog.remove_mode {
-                                            if catalog.removal_confirmation {
-                                                "Confirm removal"
-                                            } else {
-                                                "Remove selected"
-                                            }
-                                        } else {
-                                            "Apply"
-                                        },
-                                        self.overlay_focus == 8,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.overlay_focus = 8;
-                                            this.activate_catalog_control(8, window, cx);
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }),
-                                    )),
-                            ),
+                            .when(!(favorite || selected), |star| {
+                                star.invisible()
+                                    .group_hover("theme-tile", |style| style.visible())
+                            })
+                            .child(controls::highlight(selected && star_focused, star, cx)),
                     ),
-            )
+            );
+        controls::highlight(selected && list_focused, tile, cx)
+            .flex_1()
+            .min_w_0()
+            .when(selected, |tile| {
+                // In a group's first row, scrolling into view brings its label too.
+                let above = if first_row {
+                    UI_SMALL_LINE_HEIGHT + THEME_GROUP_LABEL_GAP
+                } else {
+                    0.0
+                };
+                tile.child(
+                    div()
+                        .absolute()
+                        .top(px(-above))
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(self.settings_focus_anchor(list_focused || star_focused, cx)),
+                )
+            })
             .into_any_element()
+    }
+
+    /// The Apply / Cancel bar at the foot of the Settings pane `pane_id`, while its
+    /// theme session waits for a decision.
+    pub(super) fn render_theme_bar(
+        &self,
+        pane_id: &PaneId,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let catalog = self
+            .theme_catalog
+            .as_ref()
+            .filter(|catalog| &catalog.pane == pane_id && catalog.awaiting_decision())?;
+        let colors = *self.colors();
+        let row = RowCx {
+            host: SettingsHost::Pane(pane_id.clone()),
+            row: THEME_BAR_ROW,
+            title: "Theme preview",
+            compact: false,
+            header: false,
+        };
+        let status = if catalog.remove_mode {
+            "Removal does not change appearance. In-use themes are protected.".to_owned()
+        } else {
+            format!(
+                "Previewing {}{}",
+                catalog.candidate.label(),
+                if catalog.target == CatalogTarget::Terminal {
+                    " in terminals"
+                } else {
+                    ""
+                }
+            )
+        };
+        let decide = controls::text_button(
+            "theme-apply",
+            if catalog.remove_mode {
+                if catalog.removal_confirmation {
+                    "Confirm removal"
+                } else {
+                    "Remove selected"
+                }
+            } else {
+                "Apply"
+            },
+        )
+        .header()
+        .key("enter")
+        .loading(catalog.pending);
+        Some(
+            div()
+                .flex_none()
+                .px_4()
+                .py_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_t_1()
+                .border_color(color(colors.border))
+                .bg(color(colors.surface))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .text_color(color(modal_text_color(colors.muted, &colors)))
+                        .child(status),
+                )
+                .child(
+                    self.settings_control(
+                        &row,
+                        SettingsAction::ThemeCancel,
+                        controls::text_button("theme-cancel", "Cancel")
+                            .header()
+                            .key("escape"),
+                        cx,
+                    ),
+                )
+                .child(self.settings_control(
+                    &row,
+                    SettingsAction::ThemeApply,
+                    if catalog.remove_mode {
+                        decide.danger()
+                    } else {
+                        decide.primary()
+                    },
+                    cx,
+                ))
+                .into_any_element(),
+        )
+    }
+}
+
+/// The narrowest a theme tile gets; the grid fits as many columns as this allows.
+const THEME_TILE_MIN_WIDTH: f32 = 200.0;
+/// The gap between theme tiles.
+const THEME_TILE_GAP: f32 = 12.0;
+/// The most columns the theme grid has, however wide.
+const THEME_GRID_MAX_COLUMNS: usize = 4;
+/// Between a group's label and its first row of tiles.
+const THEME_GROUP_LABEL_GAP: f32 = 8.0;
+
+/// How many columns the theme grid has `width` pixels across: as many tiles of the
+/// minimum width as fit, at least one and at most four. They share the row.
+pub(super) fn theme_grid_columns(width: f32) -> usize {
+    let fit = ((width + THEME_TILE_GAP) / (THEME_TILE_MIN_WIDTH + THEME_TILE_GAP)).floor();
+    (fit.max(1.0) as usize).min(THEME_GRID_MAX_COLUMNS)
+}
+
+/// A labelled run of the theme grid.
+pub(super) struct ThemeGroup {
+    pub(super) label: &'static str,
+    pub(super) themes: Vec<Arc<ThemeDefinition>>,
+}
+
+/// `themes` in grid order: by family, then variant name, ignoring case, so a
+/// family's variants stay together.
+fn sort_themes(themes: &mut [Arc<ThemeDefinition>]) {
+    themes.sort_by_cached_key(|theme| {
+        (
+            theme.family().to_lowercase(),
+            theme.label().to_lowercase(),
+            theme.id().to_owned(),
+        )
+    });
+}
+
+/// `visible` (already filtered, in family then variant order) as the grid's groups:
+/// Yours (the `current` theme first, then `favorites`), then Dark and Light without
+/// those, each keeping the given order. Empty groups are left out.
+fn group_themes<'a>(
+    visible: impl IntoIterator<Item = &'a Arc<ThemeDefinition>>,
+    current: Option<&ThemeId>,
+    favorites: &[ThemeId],
+) -> Vec<ThemeGroup> {
+    let mut yours = Vec::new();
+    let mut dark = Vec::new();
+    let mut light = Vec::new();
+    for theme in visible {
+        if Some(theme.theme_id()) == current {
+            yours.insert(0, Arc::clone(theme));
+        } else if favorites.contains(theme.theme_id()) {
+            yours.push(Arc::clone(theme));
+        } else if theme.is_dark() {
+            dark.push(Arc::clone(theme));
+        } else {
+            light.push(Arc::clone(theme));
+        }
+    }
+    [("Yours", yours), ("Dark", dark), ("Light", light)]
+        .into_iter()
+        .filter(|(_, themes)| !themes.is_empty())
+        .map(|(label, themes)| ThemeGroup { label, themes })
+        .collect()
+}
+
+/// A keyboard move in the theme grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GridStep {
+    /// Left: the previous theme in display order.
+    Previous,
+    /// Right: the next theme in display order.
+    Next,
+    /// The same column of the row above.
+    Up,
+    /// The same column of the row below.
+    Down,
+}
+
+/// The grid's rows as (first index, length) in display order: each group's themes
+/// in rows of `columns`, every group starting a new row.
+fn grid_rows(groups: &[ThemeGroup], columns: usize) -> Vec<(usize, usize)> {
+    let columns = columns.max(1);
+    let mut rows = Vec::new();
+    let mut start = 0;
+    for group in groups {
+        let end = start + group.themes.len();
+        rows.extend(
+            (start..end)
+                .step_by(columns)
+                .map(|row| (row, columns.min(end - row))),
+        );
+        start = end;
+    }
+    rows
+}
+
+/// Where `step` takes the selection at `index` in a grid of `rows`. Left and Right
+/// cross group boundaries and stop at the ends; Up and Down keep the column, taking
+/// a shorter row's last tile, and stay on the first or last row. With nothing
+/// selected, Left and Up pick the last theme and Right and Down the first.
+fn grid_step(rows: &[(usize, usize)], index: Option<usize>, step: GridStep) -> Option<usize> {
+    let &(start, length) = rows.last()?;
+    let last = start + length - 1;
+    let Some(index) = index.filter(|index| *index <= last) else {
+        return Some(match step {
+            GridStep::Previous | GridStep::Up => last,
+            GridStep::Next | GridStep::Down => 0,
+        });
+    };
+    let row = rows
+        .iter()
+        .position(|&(start, length)| (start..start + length).contains(&index))?;
+    let target = match step {
+        GridStep::Previous => return Some(index.saturating_sub(1)),
+        GridStep::Next => return Some((index + 1).min(last)),
+        GridStep::Up => row.checked_sub(1),
+        GridStep::Down => Some(row + 1).filter(|row| *row < rows.len()),
+    };
+    Some(target.map_or(index, |target| {
+        let (start, length) = rows[target];
+        start + (index - rows[row].0).min(length - 1)
+    }))
+}
+
+/// A theme at a glance on its own colors: the iris in its accent on its background,
+/// with a few of its terminal colors. The opaque baseline; window material is a
+/// separate preference.
+fn theme_swatch(theme: &ThemeDefinition, height: f32) -> Stateful<Div> {
+    let colors = theme.colors();
+    let terminal = theme.terminal();
+    div()
+        .id(SharedString::from(format!("swatch-{}", theme.id())))
+        .relative()
+        .flex_none()
+        .w_full()
+        .h(px(height))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .border_color(color(colors.border))
+        .overflow_hidden()
+        .bg(material_color(colors.background, 1.0))
+        .child(chrome_icon(ChromeIcon::Mark, color(colors.accent)))
+        .child(
+            div()
+                .absolute()
+                .left(px(8.0))
+                .bottom(px(7.0))
+                .flex()
+                .gap(px(3.0))
+                .children([1, 2, 3, 4, 5].map(|index| {
+                    div()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(color(terminal.ansi[index]))
+                })),
+        )
+}
+
+/// Whether `theme` passes the list's `filter` (`favorite` says whether it is starred)
+/// and every word of the lowercased `query`, which may be in its id, name, family or
+/// description, ignoring ASCII case.
+pub(super) fn theme_matches(
+    theme: &ThemeDefinition,
+    filter: ThemeFilter,
+    favorite: bool,
+    query: &str,
+) -> bool {
+    let passes = match filter {
+        ThemeFilter::All => true,
+        ThemeFilter::Dark => theme.is_dark(),
+        ThemeFilter::Light => !theme.is_dark(),
+        ThemeFilter::Favorites => favorite,
+    };
+    passes
+        && query.split_whitespace().all(|word| {
+            [
+                theme.id(),
+                theme.label(),
+                theme.family(),
+                theme.description(),
+            ]
+            .into_iter()
+            .any(|text| {
+                text.as_bytes()
+                    .windows(word.len())
+                    .any(|part| part.eq_ignore_ascii_case(word.as_bytes()))
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ThemePreset;
+
+    #[test]
+    fn theme_list_filters_and_searches() {
+        let themes: Vec<_> = ThemePreset::ALL
+            .iter()
+            .map(|preset| preset.definition())
+            .collect();
+        let dark = themes.iter().find(|theme| theme.is_dark()).unwrap();
+        let light = themes.iter().find(|theme| !theme.is_dark()).unwrap();
+        assert!(theme_matches(dark, ThemeFilter::All, false, ""));
+        assert!(theme_matches(dark, ThemeFilter::Dark, false, ""));
+        assert!(!theme_matches(dark, ThemeFilter::Light, false, ""));
+        assert!(theme_matches(light, ThemeFilter::Light, false, ""));
+        assert!(!theme_matches(light, ThemeFilter::Favorites, false, ""));
+        assert!(theme_matches(light, ThemeFilter::Favorites, true, ""));
+        // Words match the name or family in any case, and all must match.
+        let name = dark.label().to_lowercase();
+        let first = name.split_whitespace().next().unwrap();
+        assert!(theme_matches(dark, ThemeFilter::All, false, first));
+        assert!(theme_matches(
+            dark,
+            ThemeFilter::All,
+            false,
+            &dark.family().to_uppercase()
+        ));
+        assert!(!theme_matches(
+            dark,
+            ThemeFilter::All,
+            false,
+            &format!("{first} zzzqqq")
+        ));
+        assert!(!theme_matches(dark, ThemeFilter::Dark, false, "zzzqqq"));
+    }
+
+    #[test]
+    fn the_grid_groups_yours_then_dark_and_light_with_families_together() {
+        let mut themes: Vec<_> = ThemePreset::ALL
+            .into_iter()
+            .map(ThemePreset::definition)
+            .collect();
+        sort_themes(&mut themes);
+        let current = themes.iter().find(|theme| !theme.is_dark()).unwrap();
+        let favorite = themes.iter().rev().find(|theme| theme.is_dark()).unwrap();
+        let (current, favorite) = (current.theme_id().clone(), favorite.theme_id().clone());
+        let groups = group_themes(&themes, Some(&current), std::slice::from_ref(&favorite));
+        let labels: Vec<_> = groups.iter().map(|group| group.label).collect();
+        assert_eq!(labels, ["Yours", "Dark", "Light"]);
+        let ids: Vec<_> = groups[0]
+            .themes
+            .iter()
+            .map(|theme| theme.theme_id().clone())
+            .collect();
+        assert_eq!(ids, [current.clone(), favorite.clone()]);
+        // Every theme shows once: Dark and Light leave out what Yours holds.
+        let shown: usize = groups.iter().map(|group| group.themes.len()).sum();
+        assert_eq!(shown, themes.len());
+        assert!(groups[1].themes.iter().all(|theme| theme.is_dark()));
+        assert!(groups[2].themes.iter().all(|theme| !theme.is_dark()));
+        assert!(groups[1..].iter().all(|group| {
+            group
+                .themes
+                .iter()
+                .all(|theme| ![&current, &favorite].contains(&theme.theme_id()))
+        }));
+        // A family's variants stay together: family, then variant order.
+        for group in &groups[1..] {
+            let keys: Vec<_> = group
+                .themes
+                .iter()
+                .map(|theme| (theme.family().to_lowercase(), theme.label().to_lowercase()))
+                .collect();
+            assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        // Empty groups are left out.
+        let dark: Vec<_> = themes
+            .iter()
+            .filter(|theme| theme.is_dark())
+            .cloned()
+            .collect();
+        let labels: Vec<_> = group_themes(&dark, None, &[])
+            .iter()
+            .map(|group| group.label)
+            .collect();
+        assert_eq!(labels, ["Dark"]);
+        assert!(group_themes(&[], Some(&current), &[]).is_empty());
+    }
+
+    #[test]
+    fn arrows_cross_groups_and_up_and_down_keep_the_column() {
+        let theme = ThemePreset::CompiNeutral.definition();
+        let groups: Vec<_> = [("Yours", 1), ("Dark", 5), ("Light", 2)]
+            .into_iter()
+            .map(|(label, count)| ThemeGroup {
+                label,
+                themes: vec![theme.clone(); count],
+            })
+            .collect();
+        // Each group starts a row: [0] / [1 2 3] [4 5] / [6 7].
+        let rows = grid_rows(&groups, 3);
+        assert_eq!(rows, [(0, 1), (1, 3), (4, 2), (6, 2)]);
+        let step = |index, step| grid_step(&rows, Some(index), step).unwrap();
+        // Left and Right follow display order across groups and stop at the ends.
+        assert_eq!(step(0, GridStep::Next), 1);
+        assert_eq!(step(1, GridStep::Previous), 0);
+        assert_eq!(step(0, GridStep::Previous), 0);
+        assert_eq!(step(7, GridStep::Next), 7);
+        // Up and Down keep the column across group boundaries, clamped to short rows.
+        assert_eq!(step(0, GridStep::Down), 1);
+        assert_eq!(step(3, GridStep::Down), 5);
+        assert_eq!(step(5, GridStep::Down), 7);
+        assert_eq!(step(4, GridStep::Down), 6);
+        assert_eq!(step(3, GridStep::Up), 0);
+        assert_eq!(step(6, GridStep::Up), 4);
+        assert_eq!(step(7, GridStep::Down), 7);
+        assert_eq!(step(0, GridStep::Up), 0);
+        // Nothing selected: Up and Left start at the end, Down and Right at the start.
+        assert_eq!(grid_step(&rows, None, GridStep::Up), Some(7));
+        assert_eq!(grid_step(&rows, None, GridStep::Down), Some(0));
+        assert_eq!(grid_step(&[], None, GridStep::Next), None);
+        // Columns: tiles of at least 200 px, one to four of them.
+        assert_eq!(theme_grid_columns(0.0), 1);
+        assert_eq!(theme_grid_columns(411.0), 1);
+        assert_eq!(theme_grid_columns(412.0), 2);
+        assert_eq!(theme_grid_columns(5000.0), 4);
     }
 }

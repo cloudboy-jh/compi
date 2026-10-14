@@ -131,7 +131,7 @@ registry! {
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
     BrowseFiles, "browse_files", "Browse files in terminal pane", Some("cmd-shift-e"), Some("ctrl-shift-e");
-    JumpProject, "jump_project", "Jump to project directory", None, None;
+    JumpProject, "jump_project", "Jump to project…", None, None;
     ShowFiles, "show_files", "Files", None, None;
     OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
     NewEditor, "new_editor", "New editor", None, None;
@@ -353,12 +353,11 @@ impl Command {
             RemovePane => Some("Stops this terminal and removes its pane."),
             EndSurface => Some("Stops this terminal and its child processes; keeps its contents."),
             RestartSurface => Some("Starts a new process in this terminal."),
-            BrowseFiles | JumpProject => {
-                Some("Browses folders without sending commands to your terminal.")
-            }
+            BrowseFiles => Some("Browses folders without sending commands to your terminal."),
+            JumpProject => Some("Lists the folders your shells visited; one opens in a new tab."),
             ShowFiles => Some("Shows this pane's folder in a file pane beside it."),
             OpenFile => Some(
-                "Searches this pane's folder and opens a file in the editor; your terminal gets no input.",
+                "Searches this pane's folder in the palette and opens a file in the editor; your terminal gets no input.",
             ),
             NewEditor => Some("Opens this pane's folder in a new file pane beside it."),
             ShowChanges => Some(
@@ -423,6 +422,7 @@ impl Command {
             SwapPaneLeft | SwapPaneRight | SwapPaneUp | SwapPaneDown => "move exchange layout",
             ShowFiles => "folder browse explorer editor content",
             OpenFile => "quick open find search fuzzy goto editor",
+            JumpProject => "recent folders directories cd z new tab",
             NewEditor => "file folder pane content split",
             ShowChanges => "git diff review status staged unstaged uncommitted",
             DiffThisFile => "git diff compare changes review index head",
@@ -733,7 +733,8 @@ impl Command {
                     Some("Wait for this terminal to stop before restarting")
                 }
             }
-            BrowseFiles | JumpProject => {
+            JumpProject => None,
+            BrowseFiles => {
                 if !c.has_pane {
                     Some("Select a terminal pane first")
                 } else {

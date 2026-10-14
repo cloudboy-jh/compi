@@ -1,18 +1,21 @@
 //! The editor surface's controls: one vocabulary over GPUI Kit.
 //!
-//! Every button, segmented switch, checkbox and chip in a content pane (tab strip, folder
-//! sidebar, Changes list, commit box, diff header and diff body) is built here, so they
-//! share two sizes, four variants and the same states.
+//! Every button, segmented switch, on/off switch, checkbox and chip in a content pane
+//! (tab strip, folder sidebar, Changes list, commit box, diff header and diff body,
+//! Settings) and in dialogs is built here, so they share two sizes, four variants and
+//! the same states.
 //!
 //! - **Sizes.** [`ControlSize::Row`] (20 px, Kit `XSmall`) inside list rows, diff lines,
 //!   the find bar and the tab strip; [`ControlSize::Header`] (24 px, Kit `Small`) in
-//!   header bars, banners and the commit box.
+//!   header bars, banners, the commit box, Settings and dialogs.
 //! - **Variants.** Ghost for icon actions ([`icon_button`]), outline for secondary text
 //!   actions ([`text_button`]), [`Control::primary`] for the one primary action (Commit)
 //!   and [`Control::danger`] for destructive ones (Discard).
 //! - **States.** Kit's hover, pressed and focus ring (Compi's accent); disabled with its
 //!   reason in the tooltip ([`Control::disabled_because`]); loading while the action's
 //!   write runs ([`Control::loading`]); selected for switches ([`Control::selected`]).
+//!   Surfaces that keep their own keyboard highlight (Settings, dialogs) ring the
+//!   highlighted control with [`highlight`].
 //! - **Tooltips.** Every icon-only control has one, and an action with a key shows it
 //!   through Kit's `Kbd` ([`Control::key`]). Kit's own tooltips need Kit's `Root`, which
 //!   Compi does not use, so controls show Kit's `Tooltip` view through GPUI's tooltip
@@ -56,6 +59,7 @@ use gpui_component::kbd::Kbd;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::popover::Popover;
 use gpui_component::spinner::Spinner;
+use gpui_component::switch::Switch;
 use gpui_component::tag::Tag;
 use gpui_component::theme::Theme;
 use gpui_component::tooltip::Tooltip;
@@ -86,6 +90,12 @@ gpui_kit_assets::icon_assets!(
         Columns2,
         Rows2,
         Circle,
+        LayoutPanelLeft,
+        Keyboard,
+        Gauge,
+        CircleArrowDown,
+        SlidersHorizontal,
+        Command,
     ]
 );
 
@@ -239,6 +249,9 @@ pub(super) fn sync_theme(theme: &mut Theme, colors: &ThemeColors) {
     theme.button_danger_hover = color(palette.danger[1]);
     theme.button_danger_active = color(palette.danger[2]);
     theme.button_danger_foreground = color(palette.danger_text);
+    // A switch's thumb is the text color on the accent, on its track when off too.
+    theme.switch = color(blend_rgb(colors.background, colors.foreground, 0.3));
+    theme.switch_thumb = color(palette.primary_text);
 }
 
 /// Records the colors chips and tooltips read; call after [`sync_theme`].
@@ -292,6 +305,7 @@ enum Variant {
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 type ToggleHandler = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+type SwitchHandler = Rc<dyn Fn(&bool, &mut Window, &mut App)>;
 
 /// A button of the editor surface. Build one with [`icon_button`] or [`text_button`].
 #[derive(IntoElement)]
@@ -657,6 +671,91 @@ impl RenderOnce for CheckControl {
                 wrapper.tooltip(tooltip(title, detail, None))
             })
     }
+}
+
+/// An on/off switch. Build with [`switch`].
+#[derive(IntoElement)]
+pub(super) struct SwitchControl {
+    id: ElementId,
+    checked: bool,
+    label: Option<SharedString>,
+    on_toggle: Option<SwitchHandler>,
+}
+
+/// Kit's switch, on when `checked`: 28 × 16 px, the accent when on. It has no text of
+/// its own; the row beside it says what it turns on.
+pub(super) fn switch(id: impl Into<ElementId>, checked: bool) -> SwitchControl {
+    SwitchControl {
+        id: id.into(),
+        checked,
+        label: None,
+        on_toggle: None,
+    }
+}
+
+impl SwitchControl {
+    /// The name a screen reader announces: the setting's title.
+    pub(super) fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Runs with the requested state when the switch is clicked or toggled from the
+    /// keyboard; a `cx.listener` fits.
+    pub(super) fn on_toggle(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle = Some(Rc::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for SwitchControl {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let mut control = Switch::new("switch")
+            .checked(self.checked)
+            .with_size(Size::Small);
+        if let Some(label) = self.label {
+            control = control.accessibility_label(label);
+        }
+        if let Some(on_toggle) = self.on_toggle {
+            control = control.on_click(move |checked, window, cx| {
+                cx.stop_propagation();
+                on_toggle(checked, window, cx);
+            });
+        }
+        div()
+            .id(self.id)
+            .flex_none()
+            .h(px(ControlSize::Header.height()))
+            .flex()
+            .items_center()
+            .child(control)
+    }
+}
+
+/// `child` with an accent ring around it while `highlighted`: the keyboard highlight of
+/// a surface that keeps its own (Settings, dialogs) rather than GPUI focus.
+pub(super) fn highlight(highlighted: bool, child: impl IntoElement, cx: &App) -> Div {
+    let (colors, _) = control_theme(cx);
+    div()
+        .relative()
+        .flex_none()
+        .child(child)
+        .when(highlighted, |wrapper| {
+            wrapper.child(
+                div()
+                    .absolute()
+                    .top(px(-2.0))
+                    .left(px(-2.0))
+                    .right(px(-2.0))
+                    .bottom(px(-2.0))
+                    .rounded(px(CONTROL_RADIUS + 2.0))
+                    .border_2()
+                    .border_color(color(colors.accent)),
+            )
+        })
 }
 
 /// What a chip's text says about its subject.
@@ -1820,6 +1919,22 @@ mod tests {
             IconName::CircleCheck,
             IconName::CircleAlert,
             IconName::CircleX,
+            IconName::Palette,
+            IconName::LayoutPanelLeft,
+            IconName::SquareTerminal,
+            IconName::Keyboard,
+            IconName::Gauge,
+            IconName::CircleArrowDown,
+            IconName::SlidersHorizontal,
+            IconName::Command,
+            IconName::Search,
+            IconName::Folder,
+            IconName::File,
+            IconName::Star,
+            IconName::StarFill,
+            IconName::ChevronLeft,
+            IconName::ChevronRight,
+            IconName::Ellipsis,
         ] {
             let path = icon.path();
             assert!(

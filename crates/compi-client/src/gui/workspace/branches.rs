@@ -1,5 +1,5 @@
-//! Switch branch… and Create branch…: a repository's branches in Compi's picker overlay,
-//! the one Open file… and Jump to project use.
+//! Switch branch… and Create branch…: a repository's branches in Compi's in-pane picker
+//! overlay, the one the file browser and `compi z` use.
 //!
 //! The picker lists the current branch, local branches, then remote-tracking ones, filtered
 //! as you type. Enter switches (`GitAction::SwitchBranch`; a remote branch becomes a local

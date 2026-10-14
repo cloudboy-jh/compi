@@ -18,6 +18,7 @@ mod git_gutter;
 pub(super) mod media;
 pub(in crate::gui) mod menus;
 pub(in crate::gui) mod metadata;
+pub(in crate::gui) mod palette;
 pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
 pub(in crate::gui) mod presentation;
@@ -320,7 +321,6 @@ pub(super) enum TextPurpose {
 #[derive(Clone)]
 pub(super) enum Overlay {
     Palette,
-    ThemeCatalog,
     ImageInspector,
     Text {
         purpose: TextPurpose,
@@ -384,17 +384,9 @@ pub(super) enum Popup {
     UiFont,
     /// Settings → Terminal → Terminal font.
     TerminalFont,
-    /// The theme catalog's More menu.
+    /// The theme list's More menu.
     CatalogMenu,
     /// The Appearance controls under the sidebar's Appearance button.
-    QuickAppearance,
-}
-
-/// Where closing the theme catalog returns to: the Settings pane it was opened from,
-/// or Quick Appearance.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum CatalogReturn {
-    Settings(PaneId),
     QuickAppearance,
 }
 
@@ -899,13 +891,13 @@ impl CompiApp {
             settings_scope: SettingsScope::Global,
             daemon_restarting: false,
             zoom,
-            catalog_return: None,
             overlay: None,
             overlay_index: 0,
             overlay_scroll: ScrollHandle::new(),
             overlay_focus: 0,
             overlay_generation: 0,
             overlay_closing_since: None,
+            palette: palette::PaletteState::default(),
             settings: settings::SettingsUi::default(),
             popup: None,
             context_menu: None,
@@ -1272,12 +1264,10 @@ impl CompiApp {
         }
     }
 
+    /// The window's accepted appearance: its overrides over the global defaults. A theme
+    /// preview changes only the drawn theme, never these.
     pub(super) fn accepted_appearance(&self) -> AppearanceSettings {
-        let mut appearance = self
-            .theme_catalog
-            .as_ref()
-            .map(|catalog| catalog.original.clone())
-            .unwrap_or_else(|| inherited_appearance(&self.config, &self.state.appearance));
+        let mut appearance = inherited_appearance(&self.config, &self.state.appearance);
         if let Some(opacity) = self.opacity_drag_origin {
             appearance.terminal_opacity = opacity;
         }
@@ -1966,6 +1956,9 @@ impl CompiApp {
             } => {
                 self.tree_searched(pane_id, request, result);
             }
+            UiEvent::PaletteFilesSearched { request, result } => {
+                self.palette_files_searched(request, result);
+            }
             UiEvent::ContentListed {
                 pane_id,
                 root,
@@ -2285,7 +2278,7 @@ impl CompiApp {
                                 self.open_file_tree_with_shell(true)
                             }
                             compi_protocol::ShellAction::JumpProject => {
-                                self.open_project_jump_with_shell(true)
+                                self.open_shell_project_jump()
                             }
                         }
                     }
@@ -3205,7 +3198,6 @@ impl CompiApp {
         self.finish_dismiss_overlay();
         self.report_focus(false);
         self.overlay_structure = self.workspace.as_ref().map(structure_key);
-        self.catalog_return = None;
         self.popup = None;
         self.context_menu = None;
         self.tab_menu = None;
@@ -3226,25 +3218,13 @@ impl CompiApp {
             // Selects and menus inside the overlay go with it.
             self.popup = None;
         }
-        let parent = matches!(self.overlay, Some(Overlay::ThemeCatalog))
-            .then(|| self.catalog_return.take())
-            .flatten();
         if self.overlay.is_some() && self.overlay_closing_since.is_none() {
-            self.cancel_catalog_preview();
             self.overlay_closing_since = Some(Instant::now());
-        }
-        match parent {
-            // Back in the Settings pane, on the control that opened the catalog.
-            Some(CatalogReturn::Settings(pane)) => self.focus_pane(pane),
-            Some(CatalogReturn::QuickAppearance) => self.return_to_quick_appearance(),
-            None => {}
         }
     }
 
     fn finish_dismiss_overlay(&mut self) {
-        self.cancel_catalog_preview();
         self.image_inspector = None;
-        self.catalog_return = None;
         self.overlay = None;
         self.overlay_closing_since = None;
         self.ime_text.clear();
@@ -3314,7 +3294,7 @@ impl CompiApp {
             if self.overlay_closing_since.is_some() {
                 return true;
             }
-            if self.handle_dialog_key(key, window, cx) || self.handle_catalog_key(key, window, cx) {
+            if self.handle_dialog_key(key, window, cx) {
                 return true;
             }
             match key.key.as_str() {
@@ -3342,6 +3322,13 @@ impl CompiApp {
                     } else {
                         self.overlay_scroll.scroll_to_item(self.overlay_index);
                     }
+                }
+                "backspace"
+                    if matches!(self.overlay, Some(Overlay::Palette))
+                        && self.ime_text.is_empty()
+                        && self.palette_scope().is_some() =>
+                {
+                    self.clear_palette_scope();
                 }
                 "backspace" | "delete"
                     if !matches!(
@@ -3472,6 +3459,9 @@ impl CompiApp {
         self.ime_selected_range = cursor..cursor;
         self.ime_marked_range = None;
         self.overlay_index = 0;
+        if matches!(self.overlay, Some(Overlay::Palette)) {
+            self.palette_query_changed();
+        }
     }
 
     fn execute(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
@@ -3487,7 +3477,7 @@ impl CompiApp {
             .and_then(|view| self.workspace.as_ref()?.surface(&view.surface_id))
             .cloned();
         match command {
-            Command::OpenPalette => self.open_overlay(Overlay::Palette, ""),
+            Command::OpenPalette => self.open_palette(None),
             Command::CreateWorkspace => self.open_overlay(
                 Overlay::Text {
                     purpose: TextPurpose::CreateWorkspace,
@@ -3820,14 +3810,14 @@ impl CompiApp {
                 self.save_state();
             }
             Command::BrowseFiles => self.open_file_tree(),
-            Command::JumpProject => self.open_project_jump(),
+            Command::JumpProject => self.open_palette(Some(palette::Scope::Projects)),
             Command::ShowFiles => self.show_files(false, window, cx),
             Command::NewEditor => self.show_files(true, window, cx),
             Command::ShowChanges => self.show_changes(window, cx),
             Command::DiffThisFile => self.diff_this_file(window, cx),
             Command::NextChange => self.step_editor_change(true, window, cx),
             Command::PreviousChange => self.step_editor_change(false, window, cx),
-            Command::OpenFile => self.open_file_picker(),
+            Command::OpenFile => self.open_palette(Some(palette::Scope::Files)),
             Command::GitFetch | Command::GitPull | Command::GitPush => {
                 let remote = match command {
                     Command::GitFetch => remote::RemoteCommand::Fetch,
@@ -3898,7 +3888,9 @@ impl CompiApp {
                 let stop = self.prompt_group_stop();
                 self.open_settings(Some(SettingsSection::Terminal), stop, window, cx);
             }
-            Command::OpenThemeCatalog => self.open_theme_catalog(SettingsScope::Global),
+            Command::OpenThemeCatalog => {
+                self.open_theme_settings(catalog::CatalogTarget::Both, window, cx)
+            }
             Command::OpenConfiguration => {
                 let path = self.config.path.clone();
                 if !path.as_os_str().is_empty() {
@@ -4028,7 +4020,6 @@ impl CompiApp {
             return;
         };
         match overlay {
-            Overlay::ThemeCatalog => self.apply_catalog_theme(window, cx),
             Overlay::ImageInspector => self.dismiss_overlay(),
             Overlay::Text { purpose, .. } => {
                 let label = self.ime_text.trim().to_owned();
@@ -4129,6 +4120,11 @@ impl CompiApp {
                             self.save_state();
                         }
                         ChoiceAction::Tab(id) => self.select_terminal(id, true),
+                        ChoiceAction::Pane(tab_id, pane_id) => {
+                            self.open_palette_pane(tab_id, pane_id, window);
+                        }
+                        ChoiceAction::Project(path) => self.create_terminal(Some(path)),
+                        ChoiceAction::File(path) => self.open_palette_file(path, window, cx),
                         ChoiceAction::Window(handle) => {
                             if let Some(tab) = self.selected_tab().map(|tab| tab.id.clone()) {
                                 self.transfer_tab(tab, Some(handle), window, cx);
@@ -4171,6 +4167,12 @@ enum ChoiceAction {
     Command(Command),
     Workspace(SessionId),
     Tab(TabId),
+    /// A pane of a tab, from the palette: the tab is selected and the pane focused.
+    Pane(TabId, PaneId),
+    /// A visited directory, from the palette, opened in a new tab.
+    Project(String),
+    /// A found file, from the palette, opened in the editor.
+    File(String),
     Window(AnyWindowHandle),
     Arrangement(arrangements::ArrangementChoice),
     /// Toggles whether another tab is merged by the arrangement picker.
@@ -4483,41 +4485,7 @@ impl CompiApp {
         let query = self.ime_text.to_lowercase();
         let mut choices = Vec::new();
         match &self.overlay {
-            Some(Overlay::ThemeCatalog) => {}
-            Some(Overlay::Palette) => {
-                let context = self.command_context(cx);
-                for category in commands::CommandCategory::ALL {
-                    for spec in commands::REGISTRY.iter().filter(|spec| {
-                        spec.command != Command::OpenPalette
-                            && spec.category() == category
-                            && spec.matches_query(&self.ime_text)
-                    }) {
-                        choices.push(Choice {
-                            title: self.command_label(spec.command).into(),
-                            detail: self.configured_shortcut(spec.command).unwrap_or("").into(),
-                            group: Some(category.label()),
-                            reason: spec.command.disabled_reason(&context).map(str::to_owned),
-                            action: ChoiceAction::Command(spec.command),
-                        });
-                    }
-                }
-                if let Some(workspace) = &self.workspace {
-                    for session in &workspace.sessions {
-                        for tab in &session.tabs {
-                            let title = format!("{} / {}", session.label, self.tab_label(tab));
-                            if !query.is_empty() && title.to_lowercase().contains(&query) {
-                                choices.push(Choice {
-                                    title,
-                                    detail: self.tab_status(tab),
-                                    group: Some("Open tabs"),
-                                    reason: None,
-                                    action: ChoiceAction::Tab(tab.id.clone()),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+            Some(Overlay::Palette) => choices = self.palette_choices(cx).0,
             Some(Overlay::Workspaces) => {
                 if let Some(workspace) = &self.workspace {
                     for session in &workspace.sessions {
@@ -7265,21 +7233,8 @@ fn native_material_available() -> bool {
 impl CompiApp {
     fn render_editor(&self, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let text = self.ime_text.clone();
-        let placeholder = if matches!(self.overlay, Some(Overlay::ThemeCatalog)) {
-            "Search themes by name or family…"
-        } else {
-            "Type to search or enter a name…"
-        };
-        let selection = self.ime_selected_range.clone();
-        let marked = self.ime_marked_range.clone();
-        let ui_font = self.ui_font.family();
-        let input = cx.entity();
-        let focus = self.focus_handle.clone();
-        let editor_focused = !matches!(
-            self.overlay,
-            Some(Overlay::Text { .. } | Overlay::ThemeCatalog)
-        ) || self.overlay_focus == 0;
+        let editor_focused =
+            !matches!(self.overlay, Some(Overlay::Text { .. })) || self.overlay_focus == 0;
         div()
             .relative()
             .mx_3()
@@ -7302,88 +7257,94 @@ impl CompiApp {
                     cx.notify();
                 }),
             )
-            .child(
-                canvas(
-                    move |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        window.handle_input(
-                            &focus,
-                            ElementInputHandler::new(bounds, input.clone()),
-                            cx,
-                        );
-                        let displayed: SharedString = if text.is_empty() {
-                            placeholder.into()
-                        } else {
-                            text.clone().into()
-                        };
-                        let run = TextRun {
-                            len: displayed.len(),
-                            font: gpui::font(ui_font),
-                            color: color(modal_text_color(
-                                if text.is_empty() {
-                                    colors.muted
-                                } else {
-                                    colors.foreground
-                                },
-                                &colors,
-                            )),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let line =
-                            window
-                                .text_system()
-                                .shape_line(displayed, px(13.0), &[run], None);
-                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                            let start = utf16_byte_index(&text, selection.start);
-                            let end = utf16_byte_index(&text, selection.end);
-                            let caret = if text.is_empty() {
-                                px(0.0)
-                            } else {
-                                line.x_for_index(end)
-                            };
-                            let scroll = (caret - bounds.size.width + px(4.0)).max(px(0.0));
-                            let origin = point(bounds.left() - scroll, bounds.top());
-                            if start != end {
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(origin.x + line.x_for_index(start), origin.y),
-                                        size(
-                                            line.x_for_index(end) - line.x_for_index(start),
-                                            px(20.0),
-                                        ),
-                                    ),
-                                    color(colors.selection),
-                                ));
-                            }
-                            let _ = line.paint(origin, px(20.0), TextAlign::Left, None, window, cx);
-                            if editor_focused {
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(origin.x + caret, origin.y),
-                                        size(px(1.0), px(20.0)),
-                                    ),
-                                    color(colors.foreground),
-                                ));
-                            }
-                            if editor_focused && let Some(marked) = marked {
-                                let start = line.x_for_index(utf16_byte_index(&text, marked.start));
-                                let end = line.x_for_index(utf16_byte_index(&text, marked.end));
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(origin.x + start, origin.y + px(19.0)),
-                                        size(end - start, px(1.0)),
-                                    ),
-                                    color(colors.accent),
-                                ));
-                            }
-                        });
-                    },
-                )
-                .size_full(),
-            )
+            .child(self.render_query_text("Type to search or enter a name…", editor_focused, cx))
             .into_any_element()
+    }
+
+    /// The overlay's text (`ime_text`) with its caret, selection and composition, or
+    /// `placeholder` while empty; it takes the window's text input.
+    pub(super) fn render_query_text(
+        &self,
+        placeholder: &'static str,
+        editor_focused: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let text = self.ime_text.clone();
+        let selection = self.ime_selected_range.clone();
+        let marked = self.ime_marked_range.clone();
+        let ui_font = self.ui_font.family();
+        let input = cx.entity();
+        let focus = self.focus_handle.clone();
+        canvas(
+            move |_, _, _| (),
+            move |bounds, _, window, cx| {
+                window.handle_input(&focus, ElementInputHandler::new(bounds, input.clone()), cx);
+                let displayed: SharedString = if text.is_empty() {
+                    placeholder.into()
+                } else {
+                    text.clone().into()
+                };
+                let run = TextRun {
+                    len: displayed.len(),
+                    font: gpui::font(ui_font),
+                    color: color(modal_text_color(
+                        if text.is_empty() {
+                            colors.muted
+                        } else {
+                            colors.foreground
+                        },
+                        &colors,
+                    )),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(displayed, px(13.0), &[run], None);
+                window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    let start = utf16_byte_index(&text, selection.start);
+                    let end = utf16_byte_index(&text, selection.end);
+                    let caret = if text.is_empty() {
+                        px(0.0)
+                    } else {
+                        line.x_for_index(end)
+                    };
+                    let scroll = (caret - bounds.size.width + px(4.0)).max(px(0.0));
+                    let origin = point(bounds.left() - scroll, bounds.top());
+                    if start != end {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(origin.x + line.x_for_index(start), origin.y),
+                                size(line.x_for_index(end) - line.x_for_index(start), px(20.0)),
+                            ),
+                            color(colors.selection),
+                        ));
+                    }
+                    let _ = line.paint(origin, px(20.0), TextAlign::Left, None, window, cx);
+                    if editor_focused {
+                        window.paint_quad(fill(
+                            Bounds::new(point(origin.x + caret, origin.y), size(px(1.0), px(20.0))),
+                            color(colors.foreground),
+                        ));
+                    }
+                    if editor_focused && let Some(marked) = marked {
+                        let start = line.x_for_index(utf16_byte_index(&text, marked.start));
+                        let end = line.x_for_index(utf16_byte_index(&text, marked.end));
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(origin.x + start, origin.y + px(19.0)),
+                                size(end - start, px(1.0)),
+                            ),
+                            color(colors.accent),
+                        ));
+                    }
+                });
+            },
+        )
+        .size_full()
+        .into_any_element()
     }
 }
 
