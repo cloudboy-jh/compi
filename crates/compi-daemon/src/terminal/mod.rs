@@ -1762,13 +1762,7 @@ impl Perform for TerminalState {
                 }
             }
             "777" if params.len() == 4 && params[1] == b"compi" && params[2] == b"pid" => {
-                self.shell_pid = std::str::from_utf8(params[3])
-                    .ok()
-                    .filter(|text| {
-                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-                    .and_then(|text| text.parse::<u32>().ok())
-                    .filter(|pid| *pid > 0);
+                self.shell_pid = parse_pid(params[3]);
             }
             "777" if params.len() == 3 && params[1] == b"compi" => {
                 if params[2] == b"tree" {
@@ -1784,9 +1778,16 @@ impl Perform for TerminalState {
                 Some(program_status::Command::Report(report)) => self.program_status.apply(report),
                 None => {}
             },
-            // A new shell prompt: semantic prompt mark `A`.
+            // A new shell prompt: semantic prompt mark `A` carrying the shell's pid as `aid`.
+            // Programs such as Pi mark their own prompts too; those end nothing.
             "133" if params.get(1).is_some_and(|mark| *mark == b"A") => {
-                self.program_status.end_activity()
+                let aid = params[2..]
+                    .iter()
+                    .find_map(|option| option.strip_prefix(b"aid="))
+                    .and_then(parse_pid);
+                if aid.is_some() && aid == self.shell_pid {
+                    self.program_status.end_activity()
+                }
             }
             _ => {}
         }
@@ -1948,6 +1949,15 @@ impl Perform for TerminalState {
             _ => self.diagnostics.record(format!("ESC:{byte:02x}")),
         }
     }
+}
+
+/// A positive decimal process id, as the shell bridge prints `$$`.
+fn parse_pid(value: &[u8]) -> Option<u32> {
+    std::str::from_utf8(value)
+        .ok()
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
 }
 
 fn parse_osc7_path(value: &[u8]) -> Option<String> {
@@ -2458,7 +2468,12 @@ mod tests {
         // Records belong to the terminal, not a screen; other prompt marks change nothing.
         terminal.advance(b"\x1b[?1049h\x1b]133;B\x07\x1b[?1049l\x1b]133;D;0\x07");
         assert_eq!(program_states(&terminal).len(), 2);
-        terminal.advance(b"\x1b]133;A\x1b\\");
+        // A program's own prompt marks are not the shell's prompt, before or after the
+        // shell has said who it is.
+        terminal.advance(b"\x1b]133;A\x1b\\\x1b]777;compi;pid;123\x07");
+        terminal.advance(b"\x1b]133;A\x1b\\\x1b]133;A;aid=456\x07\x1b]133;A;aid=x123\x07");
+        assert_eq!(program_states(&terminal).len(), 2);
+        terminal.advance(b"\x1b]133;A;cl=m;aid=123\x1b\\");
         assert_eq!(
             program_states(&terminal),
             [(Some("build".into()), ProgramState::Done)]
