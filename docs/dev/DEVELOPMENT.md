@@ -28,7 +28,7 @@ Enter reopens a closed preview, `r` Enter restarts the dev daemon, and `q` Enter
 
 Everything runs as instance `compi-dev` from `target/compi-dev/`: runnable copies of the binaries in `bin/` (macOS: `Compi Dev.app`), state in `data/` (passed as `COMPI_DATA_DIR`), and a separate `config.toml` with update checks off. It never uses the installed Compi, its daemon, its configuration, or its state directory. Cargo still builds into the normal `target/debug` cache; because nothing runs from there, a running preview or dev daemon never blocks a build. `cargo clean` resets the dev environment. Run one `cargo dev` per user at a time.
 
-On Windows, prepare ConPTY first (above). The dev daemon is started outside Cargo's process job, so closing the terminal ends the preview but not the dev shells. On macOS the preview runs from a minimal `Compi Dev.app` bundle, because the client's launch guard expects an app bundle.
+On Windows, prepare ConPTY first (above). The dev daemon is started outside Cargo's process job, so closing the terminal ends the preview but not the dev shells. On macOS the preview runs from a minimal `Compi Dev.app` bundle, because the client's launch guard expects an app bundle; if the runner is killed, the preview stays open with the dev shells until the next `cargo dev` closes it.
 
 The project allows one dev instance per checkout (see `AGENTS.md`). On start and on `--stop`, `cargo dev` stops every other Compi daemon or preview running from this checkout's target directory, such as hand-launched `--instance` previews, and prints what it stopped. Their shells end. The installed Compi and anything outside the target directory are never touched.
 
