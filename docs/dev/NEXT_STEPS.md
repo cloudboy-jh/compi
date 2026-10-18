@@ -1,6 +1,6 @@
 # Compi next steps
 
-Features 1 to 3 of the features doc (editor, diffs and Git; program status; settings and cleanup) are done, and Monitor (feature 4) phases 4a–4c are drafted as 0.2.0, not yet published. Product scope lives in the separate features doc; finished work is in [Completed work](COMPLETED.md).
+Features 1 to 3 of the features doc (editor, diffs and Git; program status; settings and cleanup) are done, and Monitor (feature 4) phases 4a–4c shipped in 0.2.0 (published 2026-10-18). Product scope lives in the separate features doc; finished work is in [Completed work](COMPLETED.md).
 
 Done: phase 0, GPUI upgrade (`2e2b9fe`); phase 1, content panes (`4b458be`); phase 2, files and editor (see [Completed work](COMPLETED.md#files-and-editor-phase-2--2026-10-11)); phase 3, file safety (see [Completed work](COMPLETED.md#file-safety-phase-3--2026-10-12)); phase 4, diff view (see [Completed work](COMPLETED.md#diff-view-phase-4--2026-10-12)); phase 5, editor and diff (see [Completed work](COMPLETED.md#editor-and-diff-phase-5--2026-10-12)); phase 6a, stage, commit, discard (see [Completed work](COMPLETED.md#stage-commit-discard-phase-6a--2026-10-12)); phase 6b, editor controls, one tab per file, remote and branches (see [Completed work](COMPLETED.md#editor-controls-tabs-remote-and-branches-phase-6b--2026-10-12)).
 
