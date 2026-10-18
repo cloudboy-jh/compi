@@ -1,6 +1,6 @@
 # Compi next steps
 
-Features 1 and 2 (editor, then diffs and Git) are complete. Product scope lives in the separate features doc; finished work is in [Completed work](COMPLETED.md).
+Features 1 to 3 of the features doc (editor, diffs and Git; program status; settings and cleanup) are done, and Monitor (feature 4) phases 4a–4c are drafted as 0.2.0, not yet published. Product scope lives in the separate features doc; finished work is in [Completed work](COMPLETED.md).
 
 Done: phase 0, GPUI upgrade (`2e2b9fe`); phase 1, content panes (`4b458be`); phase 2, files and editor (see [Completed work](COMPLETED.md#files-and-editor-phase-2--2026-10-11)); phase 3, file safety (see [Completed work](COMPLETED.md#file-safety-phase-3--2026-10-12)); phase 4, diff view (see [Completed work](COMPLETED.md#diff-view-phase-4--2026-10-12)); phase 5, editor and diff (see [Completed work](COMPLETED.md#editor-and-diff-phase-5--2026-10-12)); phase 6a, stage, commit, discard (see [Completed work](COMPLETED.md#stage-commit-discard-phase-6a--2026-10-12)); phase 6b, editor controls, one tab per file, remote and branches (see [Completed work](COMPLETED.md#editor-controls-tabs-remote-and-branches-phase-6b--2026-10-12)).
 
@@ -13,6 +13,8 @@ Done: phase 0, GPUI upgrade (`2e2b9fe`); phase 1, content panes (`4b458be`); pha
 - Gaps to keep or drop: text selection in diffs; diff settings are not saved between sessions; tooltips can linger after a click changes the layout (GPUI); long folder names squeeze their icon in the Files tree; the tab strip scrolls sideways without an indicator; material-light's muted text is below AA (4.2:1 opaque, 2.8:1 with transparency).
 
 ## Next
+
+Order agreed 2026-10-18: scrolling fix step 1 (as 0.2.1), views in place, Monitor in Settings, Monitor 4d, scrolling step 2 (with the protocol change views in place need), everything reachable from the CLI, Monitor 4e and 4f. Items 4–7 below hold the plans.
 
 1. **Program Status Protocol (OSC 7501)**, the next feature in the features doc.
    - Done, phase A: the daemon parses reports and answers feature detection, keeps at most 64 records per terminal with the prompt (OSC 133 `A` from the shell bridge), exit, reset and acknowledgement rules, and bounds every OSC string before parsing. Protocol 26 adds `WatchProgramStatus` (current records, then coalesced changes) and `AcknowledgeProgramStatus`. Covered by `daemon_integration` `program_status_reaches_watchers_through_the_pty_and_follows_its_lifecycle` through ConPTY and WSL Bash.
@@ -41,5 +43,27 @@ Done: phase 0, GPUI upgrade (`2e2b9fe`); phase 1, content panes (`4b458be`); pha
    - **4f. Targets.** Target selector for the Windows host, each WSL distribution (the streaming collector, with PID revalidation and kill inside it) and connected hosts.
    - Later: resizable columns with saved visibility and order.
    - Out of scope: Pulse embedding, notebooks, databases, a TODO board, battery, energy and sensors, menu-bar monitoring, package management.
+
+4. **Scrolling in TUIs and omp.** Scrolling up while a program prints keeps snapping back to the bottom.
+   - Causes, measured on a Mac in `cargo dev`: scrollback is capped by 1 MiB of cell memory (`MAX_SCROLLBACK_BYTES`, about 33 bytes a cell), not the 10,000-line setting, so an 80-column pane keeps 420 of 3,000 printed lines and wider panes fewer. Once full, every new line evicts the oldest, the client sees a history that no longer starts with its old one and resets to the bottom (`gui/workspace.rs` `history_invalidated`). omp and Pi clear and reprint the scrollback (`ESC[2J ESC[H ESC[3J`) whenever something above the screen changes, which does the same. Each scrollback change resends the whole history (`terminal/mod.rs`, `Delta.scrollback`). In the alternate screen without mouse reporting (`less`, `man`, Git's pager) the wheel does nothing, and every trackpad event moves at least a line or sends a whole wheel click, with fractions never added up.
+   - **Step 1, no protocol change (0.2.1).** Keep the view on the same text when old lines are evicted (find the overlap between the old and new history), and after a clear that reprints the same history (find the anchor line in the new one); move only when the line read is gone. A "↓ N new lines" chip while scrolled up; a click or typing returns to the bottom. Alternate scroll mode (DECSET 1007, on by default): the wheel sends ↑/↓ in the alternate screen without mouse reporting. Fractional wheel and trackpad deltas add up per pane; only whole lines scroll or reach a TUI.
+   - **Step 2, protocol 29.** Scrollback deltas carry appended rows and an evicted count, the full history only on attach or a real clear. Rows are stored compactly (text and style runs, trailing blanks dropped) so `scrollback_lines` means lines within a measured memory budget; the client's mirror follows.
+   - Checks: tests that streaming while scrolled up keeps the view, eviction and clear-and-reprint keep the anchor, fractional deltas add up, and 10,000 lines are kept after step 2. By hand on a Mac and Windows with a trackpad and a wheel: omp mid-run, `less`, `man`, `htop`, `vim`.
+
+5. **Views in place.** A command that opens something opens it in the pane it came from, not in a new split.
+   - `compi files`, `compi edit`, `compi diff` (and later `compi monitor`, `compi settings`) show their view in the pane of the shell they were run in; palette commands do the same in the focused pane. The shell keeps running underneath and keeps its size.
+   - A small **Terminal / Files** switch at the top of the pane (named for what the pane shows: Files, Monitor, Settings), like the Edit / Diff switch on file tabs. `Cmd+Shift+E` (`Ctrl+Shift+E`) flips it too. Esc keeps its current meanings.
+   - The pane menu gains **Move to its own pane** to put the view beside the shell when wanted.
+   - The in-place tree browser (`Cmd+Shift+E`, `compi tree`) folds into this, so there is one file view; opened from `compi tree`, **Enter folder** still changes the shell's directory.
+   - Model: a terminal leaf may carry one content view and which side is shown, kept in the workspace so it survives reconnects and restarts (protocol 29, workspace file format 6, with the older-daemon marking as before).
+   - Checks: daemon tests for the new leaf shape and format migration; in `cargo dev`, `compi files` and `compi edit` in a lone pane and in a split, switching back and forth while the shell prints, reconnect, and **Move to its own pane**.
+
+6. **Monitor in Settings.** Settings → **Performance** becomes **Monitor**: the Overview cards, live, without the rail, and an **Open as pane** button. Monitor still opens as its own pane from the palette. The frame-rate overlay, Rebuild renderer, Copy diagnostics and Compi's own CPU and memory move to **Advanced**. The section keeps its saved name so older workspace files still load.
+
+7. **Everything reachable from the CLI.** A palette command or pane counts as shipped only when the CLI reaches it.
+   - `compi command list` (id, name, shortcut) and `compi command run <id>`, run in the window that owns the shell, both with `--json`. GUI handoff version 10 adds the window control; the daemon protocol is unchanged.
+   - `compi monitor [overview|processes|cpu|memory|disk|network]` and `compi settings [SECTION]`, opening in place (item 5).
+   - `compi monitor --json totals [--history 5m]` and `compi monitor --json processes [--group] [--search TEXT]` read the daemon directly, with no window needed.
+   - Checks: CLI tests for list, run and the JSON shapes; in `cargo dev`, `compi monitor processes` and `compi command run open_settings` from a shell.
 
 Out of scope for Git: history graphs, interactive rebase, a stash UI, force-push, line-level staging.
