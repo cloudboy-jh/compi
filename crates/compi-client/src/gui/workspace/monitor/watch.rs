@@ -320,3 +320,64 @@ pub(super) fn watch_totals(context: WatchContext, generation: u64, stop: mpsc::R
         );
     });
 }
+
+/// Starts the icon fetcher: it answers the app ids `requests` brings, one at a time, on
+/// a connection of its own. An icon the daemon would not give is reported as none.
+pub(super) fn watch_icons(
+    context: WatchContext,
+    generation: u64,
+    stop: mpsc::Receiver<()>,
+    requests: mpsc::Receiver<String>,
+) {
+    thread::spawn(move || {
+        let send = |event: IconsEvent| {
+            context
+                .sender
+                .send(UiEvent::Monitor(MonitorEvent::Icons { generation, event }))
+        };
+        run(
+            &context,
+            &stop,
+            // Icons are not worth a message; the fetcher just reconnects.
+            |_| true,
+            |client| {
+                if !send(IconsEvent::Connected) {
+                    return WatchEnd::Stopped;
+                }
+                loop {
+                    if stopped(&stop) {
+                        return WatchEnd::Stopped;
+                    }
+                    if context.quiesced.load(Ordering::Acquire) {
+                        return WatchEnd::Failed(PAUSED_FOR_UPDATE.into());
+                    }
+                    match requests.recv_timeout(WATCH_POLL) {
+                        Ok(id) => {
+                            let answer = client.app_icon(&id);
+                            let image = answer
+                                .as_ref()
+                                .ok()
+                                .and_then(|png| png.as_deref())
+                                .and_then(icons::decode_icon);
+                            if !send(IconsEvent::Fetched { id, image }) {
+                                return WatchEnd::Stopped;
+                            }
+                            // A refusal leaves the connection usable; a lost one does not.
+                            if let Err(error) = answer
+                                && client.poll_event().is_err()
+                            {
+                                return WatchEnd::Failed(error.to_string());
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Err(error) = client.poll_event() {
+                                return WatchEnd::Failed(error.to_string());
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return WatchEnd::Stopped,
+                    }
+                }
+            },
+        );
+    });
+}

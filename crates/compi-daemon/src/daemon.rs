@@ -5,7 +5,7 @@ use crate::launch;
 use crate::program_status::ProgramStatusWatch;
 use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
 use crate::system_metrics::{
-    SystemMetricsHub, SystemMetricsWatch, SystemTotalsHub, SystemTotalsWatch,
+    SystemMetricsHub, SystemMetricsWatch, SystemTotalsHub, SystemTotalsWatch, app_icon,
 };
 use compi_protocol::frame;
 #[cfg(windows)]
@@ -811,6 +811,16 @@ fn handle_connection(
                         message: ServerMessage::SystemMetricsWatching,
                     })?;
                     system_metrics_watch.get_or_insert_with(|| SystemMetricsHub::shared().watch());
+                }
+                ClientMessage::GetAppIcon { group_id } => {
+                    let png_base64 = app_icon(&group_id).map(|icon| icon.to_string());
+                    sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::AppIcon {
+                            group_id,
+                            png_base64,
+                        },
+                    })?;
                 }
                 ClientMessage::WatchSystemTotals => {
                     let (host, history, watch) = SystemTotalsHub::shared().watch();

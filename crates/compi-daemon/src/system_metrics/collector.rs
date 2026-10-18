@@ -3,7 +3,9 @@
 //! users' processes, which the kernel withholds from a non-root daemon).
 
 use super::{Collect, Collected};
-use compi_protocol::system_metrics::{MAX_COMMAND_BYTES, Process, ProcessDetails, ProcessSample};
+use compi_protocol::system_metrics::{
+    AppGroup, MAX_COMMAND_BYTES, Process, ProcessDetails, ProcessSample,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -96,6 +98,7 @@ impl Collect for HostCollector {
                     },
                     owner: platform::owner(process, user, own_user.as_ref(), &extra),
                     app: platform::is_app(pid, executable.as_deref(), &extra),
+                    app_group: executable.as_deref().and_then(app_group),
                     executable,
                     restricted: !readable,
                 })
@@ -154,6 +157,41 @@ impl UserNames {
             .map(|user| user.name().to_owned())
             .or_else(|| platform::well_known_user(user))
     }
+}
+
+/// The application `executable` belongs to: on macOS its outermost `.app` bundle, so an
+/// app's helpers (nested bundles, XPC services, frameworks) join it; otherwise, and for
+/// executables outside any bundle, the executable itself.
+fn app_group(executable: &str) -> Option<AppGroup> {
+    if executable.is_empty() {
+        return None;
+    }
+    if cfg!(target_os = "macos")
+        && let Some(end) = executable.find(".app/")
+    {
+        let bundle = &executable[..end + ".app".len()];
+        let name = bundle.rsplit('/').next()?.strip_suffix(".app")?;
+        return Some(AppGroup {
+            id: bundle.to_owned(),
+            name: name.to_owned(),
+        });
+    }
+    let file = executable.rsplit(['/', '\\']).next()?;
+    let name = if cfg!(windows) {
+        file.len()
+            .checked_sub(4)
+            .filter(|&stem| {
+                file.get(stem..)
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case(".exe"))
+            })
+            .map_or(file, |stem| &file[..stem])
+    } else {
+        file
+    };
+    Some(AppGroup {
+        id: executable.to_owned(),
+        name: name.to_owned(),
+    })
 }
 
 /// The command line joined with spaces, cut to `MAX_COMMAND_BYTES` at a character boundary.
@@ -583,6 +621,32 @@ mod platform {
 mod tests {
     use super::*;
     use compi_protocol::system_metrics::ProcessOwner;
+
+    #[test]
+    fn processes_join_the_app_that_holds_them() {
+        let group = |path: &str| app_group(path).map(|group| (group.id, group.name));
+        assert_eq!(group(""), None);
+        if cfg!(target_os = "macos") {
+            let brave = Some((
+                "/Applications/Brave Browser.app".to_owned(),
+                "Brave Browser".to_owned(),
+            ));
+            assert_eq!(
+                group("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+                brave
+            );
+            assert_eq!(
+                group(
+                    "/Applications/Brave Browser.app/Contents/Frameworks/B.framework/Helpers/Brave Browser Helper (Renderer).app/Contents/MacOS/Brave Browser Helper (Renderer)"
+                ),
+                brave
+            );
+        }
+        assert_eq!(
+            group("/bin/zsh"),
+            Some(("/bin/zsh".to_owned(), "zsh".to_owned()))
+        );
+    }
 
     #[test]
     fn command_lines_are_joined_and_cut_at_a_character_boundary() {

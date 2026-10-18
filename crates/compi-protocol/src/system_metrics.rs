@@ -165,7 +165,23 @@ pub struct ProcessDetails {
     /// The host does not let the daemon read this process's resources, so its missing
     /// values are withheld rather than unsupported (macOS: other users' processes).
     pub restricted: bool,
+    /// The application the process belongs to, shared by all its processes: on macOS
+    /// its outermost `.app` bundle (so an app's helpers join it), elsewhere its
+    /// executable. `None` when the executable is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_group: Option<AppGroup>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct AppGroup {
+    /// The bundle or executable path; also what `GetAppIcon` asks for.
+    pub id: String,
+    /// The bundle's name without `.app`, or the executable's file name (without `.exe`).
+    pub name: String,
+}
+
+/// Largest icon sent, in bytes of PNG.
+pub const MAX_APP_ICON_BYTES: usize = 256 * 1024;
 
 /// Whose process it is, relative to the user the daemon runs as.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -238,6 +254,7 @@ mod tests {
                     owner: ProcessOwner::CurrentUser,
                     app: false,
                     restricted: false,
+                    app_group: None,
                 })
             }),
             cpu_percent: None,

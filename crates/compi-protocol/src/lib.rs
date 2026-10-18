@@ -371,6 +371,10 @@ pub enum ClientMessage {
     /// Answers `SystemTotalsWatching` with the host and the last hour of totals, then sends
     /// each later sample as `SystemTotalsSampled`, in order, while this connection stays open.
     WatchSystemTotals,
+    /// The icon of an application the daemon named in an `AppGroup`, answered by `AppIcon`.
+    GetAppIcon {
+        group_id: String,
+    },
     ShutdownDaemon,
 }
 
@@ -494,6 +498,12 @@ pub enum ServerMessage {
     /// order; a connection that falls an hour behind skips to what is still kept.
     SystemTotalsSampled {
         sample: system_metrics::TotalsSample,
+    },
+    /// `None` when the application has no icon the daemon can read.
+    AppIcon {
+        group_id: String,
+        /// A PNG of at most `MAX_APP_ICON_BYTES`, standard padded base64.
+        png_base64: Option<String>,
     },
     /// Unsolicited, after `WatchSystemMetrics`: the latest sample of the host. A client
     /// behind on reading is sent the newest one, never a backlog.

@@ -6,8 +6,10 @@
 //! only once.
 
 mod collector;
+mod icons;
 mod totals;
 
+pub use icons::app_icon;
 pub use totals::{SystemTotalsHub, SystemTotalsWatch};
 
 use compi_protocol::system_metrics::{Process, ProcessSample, SystemSample};
@@ -236,6 +238,7 @@ mod tests {
                     owner: ProcessOwner::CurrentUser,
                     app: false,
                     restricted: false,
+                    app_group: None,
                 }),
             };
             let mut processes = vec![process(1)];

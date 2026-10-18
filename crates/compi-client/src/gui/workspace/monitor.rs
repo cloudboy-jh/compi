@@ -6,9 +6,10 @@
 //! the pane, and is sent the way Settings sends its section. The range, pause, search,
 //! filter, sort and selection are this window's.
 //!
-//! Two watchers per window feed it (`watch`): the host's totals while any Monitor pane
-//! is drawn, its processes while a drawn pane shows Processes. Pausing freezes what is
-//! drawn while samples keep arriving; resuming jumps to the newest.
+//! Three watchers per window feed it (`watch`): the host's totals while any Monitor pane
+//! is drawn; its processes, and the apps' icons (`icons`), while a drawn pane shows
+//! Overview (Memory by app) or Processes. Pausing freezes what is drawn while samples
+//! keep arriving; resuming jumps to the newest.
 use super::*;
 use crate::gui::controls::IconName;
 use crate::monitor::totals::Span;
@@ -19,11 +20,13 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use std::cell::Cell;
 use std::sync::mpsc;
 
+mod icons;
 mod overview;
 mod processes;
 mod watch;
 
 use crate::monitor::layout::{self, CardMove, OverviewCard, OverviewRows};
+use icons::{ICON_QUEUE, IconCache, IconsEvent};
 use overview::{Metric, TotalsFeed};
 use processes::{ProcessFeed, ProcessList};
 use watch::{
@@ -50,6 +53,10 @@ pub(in crate::gui) enum MonitorEvent {
         generation: u64,
         /// Boxed: a totals sample is several times the size of the other events.
         event: Box<TotalsEvent>,
+    },
+    Icons {
+        generation: u64,
+        event: IconsEvent,
     },
 }
 
@@ -85,9 +92,17 @@ pub(in crate::gui) struct MonitorUi {
     panes: HashMap<PaneId, MonitorPane>,
     processes: ProcessFeed,
     totals: TotalsFeed,
+    icons: IconCache,
     /// How much history the graphs show.
     span: Span,
     paused: bool,
+}
+
+impl MonitorUi {
+    /// The app icons this window holds, so its sprite atlas keeps them while it does.
+    pub(in crate::gui) fn icon_images(&self) -> impl Iterator<Item = &Arc<RenderImage>> {
+        self.icons.images()
+    }
 }
 
 /// The Monitor leaves of `node`.
@@ -242,11 +257,11 @@ impl CompiApp {
                 );
             }
         }
+        // Overview's Memory by app needs the processes too; resource pages do not.
         let processes_wanted = shown.iter().any(|(pane_id, _)| {
-            self.monitor
-                .panes
-                .get(pane_id)
-                .is_some_and(|pane| pane.page == MonitorPage::Processes)
+            self.monitor.panes.get(pane_id).is_some_and(|pane| {
+                matches!(pane.page, MonitorPage::Overview | MonitorPage::Processes)
+            })
         });
         let context = WatchContext {
             target: self.target.clone(),
@@ -266,7 +281,16 @@ impl CompiApp {
         match self.monitor.processes.slot.want(processes_wanted) {
             SlotChange::Start(generation, stop) => {
                 self.reset_process_feed(FeedState::Connecting);
-                watch::watch_processes(context, generation, stop);
+                watch::watch_processes(context.clone(), generation, stop);
+            }
+            SlotChange::Linger => linger = true,
+            SlotChange::Unchanged => {}
+        }
+        match self.monitor.icons.slot.want(processes_wanted) {
+            SlotChange::Start(generation, stop) => {
+                let (requests, asked) = mpsc::sync_channel(ICON_QUEUE);
+                self.monitor.icons.start(requests);
+                watch::watch_icons(context, generation, stop, asked);
             }
             SlotChange::Linger => linger = true,
             SlotChange::Unchanged => {}
@@ -313,7 +337,11 @@ impl CompiApp {
         if processes {
             self.reset_process_feed(FeedState::Connecting);
         }
-        totals || processes
+        let icons = self.monitor.icons.slot.expire();
+        if icons {
+            self.monitor.icons.stop();
+        }
+        totals || processes || icons
     }
 
     pub(super) fn monitor_event(&mut self, event: MonitorEvent) {
@@ -322,6 +350,11 @@ impl CompiApp {
                 self.processes_event(generation, event)
             }
             MonitorEvent::Totals { generation, event } => self.totals_event(generation, *event),
+            MonitorEvent::Icons { generation, event } => {
+                if self.monitor.icons.slot.is_current(generation) {
+                    self.monitor.icons.event(event);
+                }
+            }
         }
     }
 
@@ -442,7 +475,7 @@ impl CompiApp {
                 let Some(card) = pane.card.filter(|card| drawn(*card)) else {
                     return false;
                 };
-                let page = Metric::of_card(card).map_or(MonitorPage::Memory, Metric::page);
+                let page = overview::card_page(card);
                 self.set_monitor_page(pane_id, page);
                 return true;
             }

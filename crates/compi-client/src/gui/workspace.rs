@@ -4675,7 +4675,8 @@ impl CompiApp {
                 self.image_inspector
                     .iter()
                     .filter_map(|inspector| inspector.image.as_ref()),
-            );
+            )
+            .chain(self.monitor.icon_images());
         for image in images {
             let id = Arc::as_ptr(image) as usize;
             self.rendered_image_ids.insert(id);

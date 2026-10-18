@@ -10,8 +10,10 @@
 //! sample (a gap, or before the history begins) draws no dots at all.
 use super::*;
 use crate::gui::workspace::settings::settings_card;
+use crate::monitor::apps::RowKey;
 use crate::monitor::layout::{self, OverviewCard, OverviewLayout};
 use crate::monitor::totals::{self, Combine, Span, TotalsHistory};
+use crate::monitor::treemap::{self, Rect};
 use crate::monitor::{
     bytes_parts, format_bytes, format_percent, format_rate, format_uptime, format_whole_percent,
     percent_parts, rate_parts,
@@ -98,14 +100,14 @@ impl Metric {
         }
     }
 
-    /// The metric an Overview card shows; Memory by type is not one.
+    /// The metric an Overview card shows; Memory by type and by app are not one.
     pub(super) const fn of_card(card: OverviewCard) -> Option<Self> {
         match card {
             OverviewCard::Cpu => Some(Self::Cpu),
             OverviewCard::Memory => Some(Self::Memory),
             OverviewCard::Disk => Some(Self::Disk),
             OverviewCard::Network => Some(Self::Network),
-            OverviewCard::MemoryByType => None,
+            OverviewCard::MemoryByType | OverviewCard::MemoryByApp => None,
         }
     }
 
@@ -556,6 +558,9 @@ impl CompiApp {
                                 cx,
                             )
                         }
+                        None if placed.card == OverviewCard::MemoryByApp => {
+                            self.render_memory_by_app(pane_id, width, highlighted, cx)
+                        }
                         None => memory.map_or_else(
                             || div().into_any_element(),
                             |memory| {
@@ -643,8 +648,9 @@ impl CompiApp {
         }
     }
 
-    /// The icon, title and chevron line of a card; the title gives way first.
-    fn card_title(&self, metric: Metric, title: &'static str) -> Div {
+    /// The icon, title and chevron line of a card, with `detail` before the chevron; the
+    /// title gives way first.
+    fn card_title(&self, metric: Metric, title: &'static str, detail: Option<String>) -> Div {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         div()
@@ -666,11 +672,203 @@ impl CompiApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
+            .children(detail.map(|detail| {
+                div()
+                    .flex_none()
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .whitespace_nowrap()
+                    .child(detail)
+            }))
             .child(
                 div()
                     .flex_none()
                     .child(controls::glyph(IconName::ChevronRight, muted)),
             )
+    }
+
+    /// Memory by app in a card `width` wide: the largest apps (and the rest as Other) as
+    /// a treemap of tiles in proportion to their memory. A tile opens Processes on its
+    /// app; the card, on the table as it was.
+    fn render_memory_by_app(
+        &self,
+        pane_id: &PaneId,
+        width: f32,
+        highlighted: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let feed = &self.monitor.processes;
+        let memory = &feed.memory;
+        let inner = (width - 2.0 * CARD_INSET).max(1.0);
+        let height = layout::treemap_height(inner);
+        let has_data = !feed.processes.is_empty();
+        let title = self.card_title(
+            Metric::Memory,
+            "Memory by app",
+            has_data.then(|| format!("{} in all", format_bytes(memory.total))),
+        );
+        let tiles = if has_data {
+            let tint = color(self.metric_color(Metric::Memory));
+            let mut values: Vec<f64> = memory.apps.iter().map(|app| app.bytes as f64).collect();
+            if memory.other > 0 {
+                values.push(memory.other as f64);
+            }
+            let rects = treemap::squarify(
+                &values,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: inner,
+                    height,
+                },
+            );
+            let tiles = rects.into_iter().enumerate().map(|(index, rect)| {
+                let app = memory.apps.get(index);
+                let (name, bytes) = app.map_or(("Other".to_owned(), memory.other), |app| {
+                    (crate::monitor::display_line(&app.name), app.bytes)
+                });
+                self.render_app_tile(
+                    pane_id,
+                    index,
+                    rect,
+                    app.map(|app| &app.key),
+                    name,
+                    bytes,
+                    tint,
+                    cx,
+                )
+            });
+            div()
+                .relative()
+                .w(px(inner))
+                .h(px(height))
+                .children(tiles)
+                .into_any_element()
+        } else {
+            div()
+                .h(px(height))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .text_color(muted)
+                .child("Reading processes…")
+                .into_any_element()
+        };
+        let body = div().flex().flex_col().gap_3().child(title).child(tiles);
+        self.clickable_card(
+            pane_id,
+            OverviewCard::MemoryByApp,
+            width,
+            highlighted,
+            body,
+            cx,
+        )
+    }
+
+    /// One tile of Memory by app at `rect` (1 px inside it, so tiles keep a gap): the
+    /// app's icon, name and memory where it fits, the icon alone where only that fits.
+    #[allow(clippy::too_many_arguments)]
+    fn render_app_tile(
+        &self,
+        pane_id: &PaneId,
+        index: usize,
+        rect: Rect,
+        key: Option<&RowKey>,
+        name: String,
+        bytes: u64,
+        tint: Hsla,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let (width, height) = ((rect.width - 1.0).max(0.0), (rect.height - 1.0).max(0.0));
+        let icon_id = match key {
+            Some(RowKey::Group(id)) => Some(id.as_str()),
+            _ => None,
+        };
+        let fill = if key.is_some() {
+            tint.opacity(0.14)
+        } else {
+            color(colors.border).opacity(0.5)
+        };
+        let content = if width >= 96.0 && height >= 56.0 {
+            Some(
+                div()
+                    .size_full()
+                    .p(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(key.is_some(), |content| {
+                        content.child(self.app_icon(icon_id, &name, 24.0))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name.clone()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(format_bytes(bytes)),
+                    )
+                    .into_any_element(),
+            )
+        } else if width >= 28.0 && height >= 28.0 && key.is_some() {
+            Some(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(self.app_icon(
+                        icon_id,
+                        &name,
+                        24.0_f32.min(width - 4.0).min(height - 4.0),
+                    ))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+        let pane_id = pane_id.clone();
+        let reveal = key.cloned();
+        let detail: SharedString = format_bytes(bytes).into();
+        div()
+            .id(("monitor-app-tile", index))
+            .absolute()
+            .left(px(rect.x + 0.5))
+            .top(px(rect.y + 0.5))
+            .w(px(width))
+            .h(px(height))
+            .overflow_hidden()
+            .rounded_sm()
+            .bg(fill)
+            .hover(move |style| style.bg(fill.opacity(fill.a * 1.8)))
+            .children(content)
+            .tooltip(controls::tooltip(name, Some(detail), None))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                match &reveal {
+                    Some(key) => this.reveal_process_row(&pane_id, key.clone()),
+                    None => this.set_monitor_page(&pane_id, MonitorPage::Processes),
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// A card `width` wide that opens `card`'s page on click; `highlighted` rings it for
@@ -686,7 +884,7 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let pane_id = pane_id.clone();
-        let page = Metric::of_card(card).map_or(MonitorPage::Memory, Metric::page);
+        let page = card_page(card);
         let surface = settings_card(&colors)
             .id(("monitor-card", card as usize))
             .flex_1()
@@ -745,7 +943,7 @@ impl CompiApp {
                     .flex()
                     .flex_col()
                     .gap_0p5()
-                    .child(self.card_title(data.metric, data.metric.title()))
+                    .child(self.card_title(data.metric, data.metric.title(), None))
                     .child(
                         div()
                             .min_w_0()
@@ -985,7 +1183,7 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_3()
-            .child(self.card_title(Metric::Memory, "Memory by type"))
+            .child(self.card_title(Metric::Memory, "Memory by type", None))
             .child(content);
         self.clickable_card(
             pane_id,
@@ -1306,6 +1504,15 @@ impl CompiApp {
             (Some(only), None) | (None, Some(only)) => Some(only),
             (None, None) => None,
         }
+    }
+}
+
+/// The page an Overview card opens: its metric's, Memory for Memory by type, Processes
+/// for Memory by app.
+pub(super) fn card_page(card: OverviewCard) -> MonitorPage {
+    match card {
+        OverviewCard::MemoryByApp => MonitorPage::Processes,
+        card => Metric::of_card(card).map_or(MonitorPage::Memory, Metric::page),
     }
 }
 

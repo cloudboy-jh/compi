@@ -727,6 +727,23 @@ impl DaemonClient {
         }
     }
 
+    /// The PNG icon of an application group, if the daemon can read one.
+    pub fn app_icon(&mut self, group_id: &str) -> Result<Option<Vec<u8>>> {
+        use base64::Engine as _;
+        match self.request_bounded(
+            ClientMessage::GetAppIcon {
+                group_id: group_id.to_owned(),
+            },
+            Duration::from_secs(5),
+        )? {
+            ServerMessage::AppIcon { png_base64, .. } => png_base64
+                .map(|png| base64::engine::general_purpose::STANDARD.decode(png))
+                .transpose()
+                .map_err(|error| format!("daemon sent an unreadable icon: {error}").into()),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     pub fn attach_console_surface(
         &mut self,
         surface: &SurfaceInfo,

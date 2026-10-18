@@ -29,6 +29,7 @@ pub enum OverviewCard {
     Disk,
     Network,
     MemoryByType,
+    MemoryByApp,
 }
 
 /// A card in its row and how many columns it spans.
@@ -45,16 +46,20 @@ const fn placed(card: OverviewCard, span: usize) -> Placed {
 /// Overview's rows, top to bottom, each a full row of the grid.
 pub type OverviewRows = &'static [&'static [Placed]];
 
-use OverviewCard::{Cpu, Disk, Memory, MemoryByType, Network};
+use OverviewCard::{Cpu, Disk, Memory, MemoryByApp, MemoryByType, Network};
 
 static THREE_WITH_MEMORY: OverviewRows = &[
     &[placed(Cpu, 1), placed(Memory, 1), placed(Disk, 1)],
-    &[placed(Network, 1), placed(MemoryByType, 2)],
+    &[
+        placed(Network, 1),
+        placed(MemoryByType, 1),
+        placed(MemoryByApp, 1),
+    ],
 ];
 static TWO_WITH_MEMORY: OverviewRows = &[
     &[placed(Cpu, 1), placed(Memory, 1)],
     &[placed(Disk, 1), placed(Network, 1)],
-    &[placed(MemoryByType, 2)],
+    &[placed(MemoryByType, 1), placed(MemoryByApp, 1)],
 ];
 static ONE_WITH_MEMORY: OverviewRows = &[
     &[placed(Cpu, 1)],
@@ -62,22 +67,23 @@ static ONE_WITH_MEMORY: OverviewRows = &[
     &[placed(Disk, 1)],
     &[placed(Network, 1)],
     &[placed(MemoryByType, 1)],
+    &[placed(MemoryByApp, 1)],
 ];
-static FOUR: OverviewRows = &[&[
-    placed(Cpu, 1),
-    placed(Memory, 1),
-    placed(Disk, 1),
-    placed(Network, 1),
-]];
+static THREE: OverviewRows = &[
+    &[placed(Cpu, 1), placed(Memory, 1), placed(Disk, 1)],
+    &[placed(Network, 1), placed(MemoryByApp, 2)],
+];
 static TWO: OverviewRows = &[
     &[placed(Cpu, 1), placed(Memory, 1)],
     &[placed(Disk, 1), placed(Network, 1)],
+    &[placed(MemoryByApp, 2)],
 ];
 static ONE: OverviewRows = &[
     &[placed(Cpu, 1)],
     &[placed(Memory, 1)],
     &[placed(Disk, 1)],
     &[placed(Network, 1)],
+    &[placed(MemoryByApp, 1)],
 ];
 
 /// The padding around a page `page_width` wide and the width of its content.
@@ -105,6 +111,8 @@ pub struct OverviewLayout {
     pub card_width: f32,
     /// The columns Memory by type spans; 0 without it.
     pub memory_span: usize,
+    /// The columns Memory by app spans.
+    pub apps_span: usize,
     pub compact: bool,
     pub rows: OverviewRows,
 }
@@ -118,20 +126,14 @@ impl OverviewLayout {
 }
 
 /// Overview on a page `page_width` wide, with or without the Memory by type card: the
-/// most columns (of 3, 2, 1 with it; 4, 2, 1 without) whose cards stay at least
-/// [`MIN_CARD_WIDTH`], and the cards placed so every row is full.
+/// most columns (of 3, 2, 1) whose cards stay at least [`MIN_CARD_WIDTH`], and the
+/// cards placed so every row is full.
 pub fn overview_layout(page_width: f32, memory_by_type: bool) -> OverviewLayout {
     let (padding, content_width) = page_frame(page_width);
     let gap = gap(content_width);
     let per_column = |columns: usize| (content_width - gap * (columns - 1) as f32) / columns as f32;
-    let allowed: &[usize] = if memory_by_type {
-        &[3, 2, 1]
-    } else {
-        &[4, 2, 1]
-    };
-    let columns = allowed
-        .iter()
-        .copied()
+    let columns = [3, 2, 1]
+        .into_iter()
         .find(|&columns| per_column(columns) >= MIN_CARD_WIDTH)
         .unwrap_or(1);
     let card_width = per_column(columns).floor().max(1.0);
@@ -139,25 +141,32 @@ pub fn overview_layout(page_width: f32, memory_by_type: bool) -> OverviewLayout 
         (3, true) => THREE_WITH_MEMORY,
         (2, true) => TWO_WITH_MEMORY,
         (_, true) => ONE_WITH_MEMORY,
-        (4, false) => FOUR,
+        (3, false) => THREE,
         (2, false) => TWO,
         (_, false) => ONE,
     };
-    let memory_span = rows
-        .iter()
-        .flat_map(|row| row.iter())
-        .find(|placed| placed.card == MemoryByType)
-        .map_or(0, |placed| placed.span);
+    let span_of = |card: OverviewCard| {
+        rows.iter()
+            .flat_map(|row| row.iter())
+            .find(|placed| placed.card == card)
+            .map_or(0, |placed| placed.span)
+    };
     OverviewLayout {
         padding,
         gap,
         content_width,
         columns,
         card_width,
-        memory_span,
+        memory_span: span_of(MemoryByType),
+        apps_span: span_of(MemoryByApp),
         compact: card_width < COMPACT_CARD_WIDTH,
         rows,
     }
+}
+
+/// The height of Memory by app's treemap in a card whose body is `inner_width` wide.
+pub fn treemap_height(inner_width: f32) -> f32 {
+    (inner_width * 2.0 / 3.0).clamp(160.0, 320.0)
 }
 
 /// A keyboard move between Overview's cards.
@@ -316,18 +325,15 @@ mod tests {
 
     #[test]
     fn columns_are_the_most_that_keep_cards_wide_enough() {
-        // With Memory by type: 3 columns need 3 * 264 + 2 * 16 = 824.
-        assert_eq!(overview_layout(page(824.0), true).columns, 3);
-        assert_eq!(overview_layout(page(823.0), true).columns, 2);
-        // 2 columns need 2 * 264 + 16 = 544.
-        assert_eq!(overview_layout(page(544.0), true).columns, 2);
-        assert_eq!(overview_layout(page(543.0), true).columns, 1);
-        // Without it: 4 columns need 4 * 264 + 3 * 16 = 1104, and 3 is never used.
-        assert_eq!(overview_layout(page(1104.0), false).columns, 4);
-        assert_eq!(overview_layout(page(1103.0), false).columns, 2);
-        assert_eq!(overview_layout(page(900.0), false).columns, 2);
-        assert_eq!(overview_layout(page(544.0), false).columns, 2);
-        assert_eq!(overview_layout(page(543.0), false).columns, 1);
+        for memory in [true, false] {
+            // 3 columns need 3 * 264 + 2 * 16 = 824.
+            assert_eq!(overview_layout(page(824.0), memory).columns, 3);
+            assert_eq!(overview_layout(page(823.0), memory).columns, 2);
+            // 2 columns need 2 * 264 + 16 = 544.
+            assert_eq!(overview_layout(page(544.0), memory).columns, 2);
+            assert_eq!(overview_layout(page(543.0), memory).columns, 1);
+            assert_eq!(overview_layout(page(3000.0), memory).columns, 3);
+        }
         assert_eq!(overview_layout(200.0, false).columns, 1);
         assert_eq!(overview_layout(page(824.0), true).card_width, 264.0);
         assert_eq!(overview_layout(page(825.0), true).card_width, 264.0);
@@ -365,10 +371,10 @@ mod tests {
             cards(&three),
             [
                 vec![(Cpu, 1), (Memory, 1), (Disk, 1)],
-                vec![(Network, 1), (MemoryByType, 2)],
+                vec![(Network, 1), (MemoryByType, 1), (MemoryByApp, 1)],
             ]
         );
-        assert_eq!(three.memory_span, 2);
+        assert_eq!((three.memory_span, three.apps_span), (1, 1));
         assert_eq!(three.width(2), 2.0 * three.card_width + three.gap);
         let two = overview_layout(page(600.0), true);
         assert_eq!(
@@ -376,20 +382,36 @@ mod tests {
             [
                 vec![(Cpu, 1), (Memory, 1)],
                 vec![(Disk, 1), (Network, 1)],
-                vec![(MemoryByType, 2)],
+                vec![(MemoryByType, 1), (MemoryByApp, 1)],
             ]
         );
-        assert_eq!(two.memory_span, 2);
         let one = overview_layout(page(400.0), true);
-        assert_eq!(one.rows.len(), 5);
-        assert_eq!(one.memory_span, 1);
+        assert_eq!(one.rows.len(), 6);
+        assert_eq!((one.memory_span, one.apps_span), (1, 1));
+        let three = overview_layout(page(900.0), false);
         assert_eq!(
-            cards(&overview_layout(page(1200.0), false)),
-            [vec![(Cpu, 1), (Memory, 1), (Disk, 1), (Network, 1)]]
+            cards(&three),
+            [
+                vec![(Cpu, 1), (Memory, 1), (Disk, 1)],
+                vec![(Network, 1), (MemoryByApp, 2)],
+            ]
         );
-        assert_eq!(overview_layout(page(600.0), false).rows.len(), 2);
-        assert_eq!(overview_layout(page(400.0), false).rows.len(), 4);
-        assert_eq!(overview_layout(page(1200.0), false).memory_span, 0);
+        assert_eq!((three.memory_span, three.apps_span), (0, 2));
+        let two = overview_layout(page(600.0), false);
+        assert_eq!(
+            cards(&two),
+            [
+                vec![(Cpu, 1), (Memory, 1)],
+                vec![(Disk, 1), (Network, 1)],
+                vec![(MemoryByApp, 2)],
+            ]
+        );
+        let one = overview_layout(page(400.0), false);
+        assert_eq!(one.rows.len(), 5);
+        assert_eq!(one.apps_span, 1);
+        assert_eq!(treemap_height(120.0), 160.0);
+        assert_eq!(treemap_height(300.0), 200.0);
+        assert_eq!(treemap_height(900.0), 320.0);
     }
 
     #[test]
@@ -409,26 +431,35 @@ mod tests {
         assert_eq!(move_card(rows, None, CardMove::Down), Some(Cpu));
         assert_eq!(step(MemoryByType, CardMove::Up), Some(Memory));
         assert_eq!(step(MemoryByType, CardMove::Left), Some(Network));
-        assert_eq!(step(MemoryByType, CardMove::Right), Some(MemoryByType));
-        assert_eq!(step(MemoryByType, CardMove::Down), Some(MemoryByType));
-        assert_eq!(step(Disk, CardMove::Down), Some(MemoryByType));
-        assert_eq!(step(Memory, CardMove::Down), Some(MemoryByType));
+        assert_eq!(step(MemoryByType, CardMove::Right), Some(MemoryByApp));
+        assert_eq!(step(MemoryByApp, CardMove::Right), Some(MemoryByApp));
+        assert_eq!(step(MemoryByApp, CardMove::Up), Some(Disk));
+        assert_eq!(step(MemoryByApp, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(step(Disk, CardMove::Down), Some(MemoryByApp));
         assert_eq!(step(Cpu, CardMove::Down), Some(Network));
         assert_eq!(step(Network, CardMove::Up), Some(Cpu));
         assert_eq!(step(Cpu, CardMove::Left), Some(Cpu));
         assert_eq!(step(Disk, CardMove::Right), Some(Disk));
         assert_eq!(step(Disk, CardMove::Home), Some(Cpu));
-        assert_eq!(step(Cpu, CardMove::End), Some(MemoryByType));
-        // Two columns: Memory by type spans the last row.
+        assert_eq!(step(Cpu, CardMove::End), Some(MemoryByApp));
+        // Without Memory by type, Memory by app spans two columns: from it, Up goes to
+        // Memory (the leftmost of the two it covers), and from Disk, Down reaches it.
+        let three = |from, step| move_card(THREE, Some(from), step);
+        assert_eq!(three(MemoryByApp, CardMove::Up), Some(Memory));
+        assert_eq!(three(Disk, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(three(MemoryByApp, CardMove::Left), Some(Network));
+        // Two columns: Memory by app spans the last row.
+        let two = |from, step| move_card(TWO, Some(from), step);
+        assert_eq!(two(Network, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(two(MemoryByApp, CardMove::Up), Some(Disk));
         let two = |from, step| move_card(TWO_WITH_MEMORY, Some(from), step);
-        assert_eq!(two(Network, CardMove::Down), Some(MemoryByType));
-        assert_eq!(two(MemoryByType, CardMove::Up), Some(Disk));
+        assert_eq!(two(Network, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(two(MemoryByType, CardMove::Right), Some(MemoryByApp));
         // A highlight on a card not drawn starts over at the first card.
         assert_eq!(
-            move_card(FOUR, Some(MemoryByType), CardMove::Left),
+            move_card(THREE, Some(MemoryByType), CardMove::Left),
             Some(Cpu)
         );
-        assert_eq!(move_card(FOUR, Some(Disk), CardMove::Down), Some(Disk));
         assert_eq!(move_card(ONE, Some(Memory), CardMove::Down), Some(Disk));
         assert_eq!(move_card(&[], None, CardMove::Down), None);
     }

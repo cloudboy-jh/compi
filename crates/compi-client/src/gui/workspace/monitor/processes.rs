@@ -1,12 +1,18 @@
-//! Monitor's Processes page: the host's processes in a virtualized table.
+//! Monitor's Processes page: the host's processes in a virtualized table, one row per
+//! app by default ("Group by app", per window) with its processes beneath it when
+//! expanded.
 //!
-//! Which processes a pane shows, in what order and how their values read is pure
-//! (`crate::monitor`); the search, filter, sort and selection are this window's, per
-//! pane. While the pointer is over the table its rows keep their order (values update in
-//! place, newcomers go last, leavers go), and the table sorts again when the pointer
-//! leaves or the sort, search or filter changes.
+//! Which rows a pane shows, in what order and how their values read is pure
+//! (`crate::monitor` and `crate::monitor::apps`); the search, filter, sort, expanded
+//! apps and selection are this window's, per pane. While the pointer is over the table
+//! its rows keep their order (values update in place, newcomers go last, leavers go),
+//! and the table sorts again when the pointer leaves or the sort, search or filter
+//! changes.
 use super::*;
-use crate::monitor::{self as listing, Column, Direction, Filter, ProcessKey, Search, Sort, Step};
+use crate::monitor::apps::{
+    self, Arranged, Group, GroupUser, MemoryByApp, RowKey, RowKind, TableRow, View,
+};
+use crate::monitor::{self as listing, Column, Direction, Filter, Search, Sort, Step};
 use compi_protocol::system_metrics::{Process, ProcessDetails};
 use gpui::{ScrollStrategy, UniformListScrollHandle, uniform_list};
 
@@ -18,6 +24,11 @@ const TABLE_INSET: f32 = 12.0;
 const TOOLBAR_COUNT_MIN_WIDTH: f32 = 480.0;
 /// Longest command line a name's tooltip shows.
 const TOOLTIP_COMMAND_CHARS: usize = 400;
+/// A row's app icon, and the room a fold chevron takes before it.
+const ROW_ICON: f32 = 16.0;
+const FOLD_WIDTH: f32 = 16.0;
+/// Apps Memory by app shows by name; the rest are Other.
+const MEMORY_APPS: usize = 7;
 
 /// The window's processes, shared by its Monitor panes.
 #[derive(Default)]
@@ -29,6 +40,10 @@ pub(super) struct ProcessFeed {
     apps_known: bool,
     /// The newest sample while Monitor is paused, shown when it resumes.
     pending: Option<ProcessesSample>,
+    /// One row per process rather than per app: "Group by app" is off in this window.
+    flat: bool,
+    /// Memory by app over the processes shown, for Overview.
+    pub(super) memory: MemoryByApp,
 }
 
 /// One pane's view of the processes.
@@ -37,10 +52,11 @@ pub(super) struct ProcessList {
     query: Search,
     filter: Filter,
     sort: Sort,
-    /// Indices of the feed's processes, in the order shown, and their keys.
-    rows: Vec<usize>,
-    keys: Vec<ProcessKey>,
-    selected: Option<ProcessKey>,
+    /// The rows shown, their keys and the apps they refer to.
+    table: Arranged,
+    selected: Option<RowKey>,
+    /// Apps whose processes show beneath them, by group id.
+    expanded: HashSet<String>,
     /// The pointer is over the table, so its rows keep their order.
     pointer: bool,
     scroll: UniformListScrollHandle,
@@ -59,24 +75,22 @@ fn effective_filter(filter: Filter, apps_known: bool) -> Filter {
 }
 
 /// Orders `list`'s rows from `feed`: held in their last order while the pointer is over
-/// the table and `hold`, else sorted. A selection no longer shown is cleared.
+/// the table and `hold`, else sorted. A selection no longer shown moves to the row that
+/// now shows it (an app that became a single process), else is cleared.
 fn arrange(list: &mut ProcessList, feed: &ProcessFeed, hold: bool) {
-    let filter = effective_filter(list.filter, feed.apps_known);
-    list.rows = if hold && list.pointer {
-        listing::arrange_held(&feed.processes, &list.keys, filter, &list.query, list.sort)
-    } else {
-        listing::arrange(&feed.processes, filter, &list.query, list.sort)
+    let view = View {
+        filter: effective_filter(list.filter, feed.apps_known),
+        search: &list.query,
+        sort: list.sort,
+        grouped: !feed.flat,
+        expanded: &list.expanded,
     };
-    list.keys = list
-        .rows
-        .iter()
-        .map(|&row| listing::key(&feed.processes[row]))
-        .collect();
-    if list
-        .selected
-        .is_some_and(|selected| !list.keys.contains(&selected))
-    {
-        list.selected = None;
+    let held = (hold && list.pointer).then_some(list.table.keys.as_slice());
+    let table = apps::arrange_rows(&feed.processes, view, held);
+    list.table = table;
+    if let Some(selected) = list.selected.take() {
+        list.selected = apps::find_row(&list.table, &feed.processes, &selected)
+            .map(|row| list.table.keys[row].clone());
     }
 }
 
@@ -101,6 +115,74 @@ fn name_tooltip(details: &ProcessDetails) -> (String, Option<SharedString>) {
     }
     let detail = (!lines.is_empty()).then(|| lines.join("\n").into());
     (listing::display_line(&details.name), detail)
+}
+
+/// What a value cell shows.
+enum CellText {
+    Value(String),
+    /// A fact about the row rather than a value: a count of processes.
+    Quiet(String),
+    /// Not available; `withheld` when the host refused it.
+    Unavailable {
+        withheld: bool,
+    },
+}
+
+fn value_or_unavailable(value: Option<String>, withheld: bool) -> CellText {
+    value.map_or(CellText::Unavailable { withheld }, CellText::Value)
+}
+
+/// `column` of a process's row.
+fn process_cell_text(process: &Process, column: Column, logical_cpus: u32) -> CellText {
+    let sample = &process.sample;
+    let withheld = process.details.restricted;
+    match column {
+        Column::Name => CellText::Value(listing::display_line(&process.details.name)),
+        Column::Cpu => value_or_unavailable(
+            listing::cpu_share(sample.cpu_percent, logical_cpus).map(listing::format_cpu),
+            withheld,
+        ),
+        Column::Memory => {
+            value_or_unavailable(sample.memory_bytes.map(listing::format_bytes), withheld)
+        }
+        Column::Threads => {
+            value_or_unavailable(sample.threads.map(|threads| threads.to_string()), withheld)
+        }
+        Column::CpuTime => {
+            value_or_unavailable(sample.cpu_time_ms.map(listing::format_cpu_time), withheld)
+        }
+        Column::Pid => CellText::Value(sample.pid.to_string()),
+        Column::User => value_or_unavailable(
+            process.details.user.as_deref().map(listing::display_line),
+            withheld,
+        ),
+    }
+}
+
+/// `column` of an app's row: its sums, its process count and its user.
+fn group_cell_text(group: &Group, column: Column, logical_cpus: u32) -> CellText {
+    let unavailable = CellText::Unavailable { withheld: false };
+    match column {
+        Column::Name => CellText::Value(listing::display_line(&group.name)),
+        Column::Cpu => listing::cpu_share(group.cpu_percent, logical_cpus)
+            .map_or(unavailable, |share| {
+                CellText::Value(listing::format_cpu(share))
+            }),
+        Column::Memory => group.memory_bytes.map_or(unavailable, |bytes| {
+            CellText::Value(listing::format_bytes(bytes))
+        }),
+        Column::Threads => group
+            .threads
+            .map_or(unavailable, |threads| CellText::Value(threads.to_string())),
+        Column::CpuTime => group.cpu_time_ms.map_or(unavailable, |time| {
+            CellText::Value(listing::format_cpu_time(time))
+        }),
+        Column::Pid => CellText::Quiet(format!("{} processes", group.members.len())),
+        Column::User => match &group.user {
+            GroupUser::Shared(user) => CellText::Value(listing::display_line(user)),
+            GroupUser::Mixed => unavailable,
+        },
+    }
 }
 
 impl CompiApp {
@@ -135,9 +217,9 @@ impl CompiApp {
             query: Search::default(),
             filter: Filter::All,
             sort: Sort::default(),
-            rows: Vec::new(),
-            keys: Vec::new(),
+            table: Arranged::default(),
             selected: None,
+            expanded: HashSet::new(),
             pointer: false,
             scroll: UniformListScrollHandle::new(),
             page_rows: 1,
@@ -154,6 +236,7 @@ impl CompiApp {
         } = &mut self.monitor;
         processes.state = state;
         processes.processes.clear();
+        processes.memory = MemoryByApp::default();
         processes.pending = None;
         for pane in panes.values_mut() {
             arrange(&mut pane.list, processes, false);
@@ -175,8 +258,9 @@ impl CompiApp {
                 }
             }
             ProcessesEvent::Sampled(sample) => {
-                // Paused, the table keeps what it shows until Monitor resumes; the first
-                // sample always shows, so a pause never leaves it empty.
+                // Paused, the table and Memory by app keep what they show until Monitor
+                // resumes; the first sample always shows, so a pause never leaves them
+                // empty.
                 if self.monitor.paused && !self.monitor.processes.processes.is_empty() {
                     self.monitor.processes.pending = Some(sample);
                 } else {
@@ -194,6 +278,7 @@ impl CompiApp {
         processes.processes = sample.processes;
         processes.logical_cpus = sample.logical_cpus;
         processes.apps_known = sample.apps_known;
+        processes.memory = apps::memory_by_app(&processes.processes, MEMORY_APPS);
         for pane in panes.values_mut() {
             arrange(&mut pane.list, processes, true);
         }
@@ -210,6 +295,26 @@ impl CompiApp {
     pub(super) fn process_count(&self) -> Option<usize> {
         let feed = &self.monitor.processes;
         matches!(feed.state, FeedState::Live | FeedState::Stale).then_some(feed.processes.len())
+    }
+
+    /// Opens the Processes page on `key` (an app from Memory by app): the app expanded,
+    /// its row selected and scrolled into view.
+    pub(super) fn reveal_process_row(&mut self, pane_id: &PaneId, key: RowKey) {
+        self.set_monitor_page(pane_id, MonitorPage::Processes);
+        let MonitorUi {
+            panes, processes, ..
+        } = &mut self.monitor;
+        let Some(list) = panes.get_mut(pane_id).map(|pane| &mut pane.list) else {
+            return;
+        };
+        if let RowKey::Group(id) = &key {
+            list.expanded.insert(id.clone());
+        }
+        arrange(list, processes, false);
+        if let Some(row) = apps::find_row(&list.table, &processes.processes, &key) {
+            list.selected = Some(list.table.keys[row].clone());
+            list.scroll.scroll_to_item(row, ScrollStrategy::Center);
+        }
     }
 
     /// The focused Monitor pane's search field has the keyboard.
@@ -285,9 +390,10 @@ impl CompiApp {
         };
         let current = list
             .selected
-            .and_then(|selected| list.keys.iter().position(|key| *key == selected));
-        if let Some(next) = listing::step_selection(current, list.keys.len(), step) {
-            list.selected = Some(list.keys[next]);
+            .as_ref()
+            .and_then(|selected| list.table.keys.iter().position(|key| key == selected));
+        if let Some(next) = listing::step_selection(current, list.table.keys.len(), step) {
+            list.selected = Some(list.table.keys[next].clone());
             list.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
         }
     }
@@ -305,6 +411,98 @@ impl CompiApp {
         }
     }
 
+    /// Turns "Group by app" on or off in this window.
+    fn set_group_by_app(&mut self, grouped: bool) {
+        let MonitorUi {
+            panes, processes, ..
+        } = &mut self.monitor;
+        if processes.flat != grouped {
+            return;
+        }
+        processes.flat = !grouped;
+        for pane in panes.values_mut() {
+            arrange(&mut pane.list, processes, false);
+        }
+    }
+
+    /// Expands or collapses app `id` (`open`, or the other way when `None`). The rows
+    /// keep their order while the pointer is over the table.
+    fn fold_process_group(&mut self, pane_id: &PaneId, id: &str, open: Option<bool>) {
+        let MonitorUi {
+            panes, processes, ..
+        } = &mut self.monitor;
+        let Some(list) = panes.get_mut(pane_id).map(|pane| &mut pane.list) else {
+            return;
+        };
+        let open = open.unwrap_or(!list.expanded.contains(id));
+        let changed = if open {
+            list.expanded.insert(id.to_owned())
+        } else {
+            list.expanded.remove(id)
+        };
+        if changed {
+            arrange(list, processes, true);
+            if let Some(row) = list
+                .selected
+                .as_ref()
+                .and_then(|selected| list.table.keys.iter().position(|key| key == selected))
+            {
+                list.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+            }
+        }
+    }
+
+    /// Right, Left and Enter on the selected row: expand, collapse (from one of its
+    /// processes, go up to the app) or toggle an app. Whether a key was taken.
+    fn fold_key(&mut self, pane_id: &PaneId, key: &str) -> bool {
+        let Some(list) = self.monitor.panes.get(pane_id).map(|pane| &pane.list) else {
+            return false;
+        };
+        let Some(row) = list
+            .selected
+            .as_ref()
+            .and_then(|selected| list.table.keys.iter().position(|key| key == selected))
+        else {
+            return false;
+        };
+        match (list.table.rows[row], key) {
+            (
+                TableRow {
+                    kind: RowKind::Group(group),
+                    ..
+                },
+                "right" | "left" | "enter",
+            ) => {
+                let id = list.table.groups[group].id.clone();
+                let open = match key {
+                    "right" => Some(true),
+                    "left" => Some(false),
+                    _ => None,
+                };
+                self.fold_process_group(pane_id, &id, open);
+                true
+            }
+            (TableRow { member: true, .. }, "left") => {
+                // The app is the nearest app row above.
+                let parent = list.table.rows[..row]
+                    .iter()
+                    .rposition(|row| matches!(row.kind, RowKind::Group(_)));
+                if let Some(parent) = parent
+                    && let Some(list) = self
+                        .monitor
+                        .panes
+                        .get_mut(pane_id)
+                        .map(|pane| &mut pane.list)
+                {
+                    list.selected = Some(list.table.keys[parent].clone());
+                    list.scroll.scroll_to_item(parent, ScrollStrategy::Nearest);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn sort_process_table(&mut self, pane_id: &PaneId, column: Column) {
         let MonitorUi {
             panes, processes, ..
@@ -314,7 +512,8 @@ impl CompiApp {
             arrange(list, processes, false);
             if let Some(at) = list
                 .selected
-                .and_then(|selected| list.keys.iter().position(|key| *key == selected))
+                .as_ref()
+                .and_then(|selected| list.table.keys.iter().position(|key| key == selected))
             {
                 list.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
             }
@@ -351,13 +550,15 @@ impl CompiApp {
         let Some(list) = self.monitor.panes.get(pane_id).map(|pane| &pane.list) else {
             return false;
         };
+        let (page_rows, search, has_selection) =
+            (list.page_rows, list.search.clone(), list.selected.is_some());
         let modifiers = &key.modifiers;
         let plain = !modifiers.control && !modifiers.alt && !modifiers.platform;
         let step = match key.key.as_str() {
             "up" => Some(Step::Up),
             "down" => Some(Step::Down),
-            "pageup" => Some(Step::PageUp(list.page_rows)),
-            "pagedown" => Some(Step::PageDown(list.page_rows)),
+            "pageup" => Some(Step::PageUp(page_rows)),
+            "pagedown" => Some(Step::PageDown(page_rows)),
             "home" => Some(Step::Home),
             "end" => Some(Step::End),
             _ => None,
@@ -365,27 +566,33 @@ impl CompiApp {
         .filter(|_| plain && !modifiers.shift);
         if let Some(step) = step {
             self.step_process_selection(pane_id, step);
-        } else if key.key == "escape" && plain && !list.search.read(cx).value().is_empty() {
-            list.search
-                .update(cx, |search, cx| search.set_value("", window, cx));
-        } else if key.key == "escape" && plain && list.selected.is_some() {
+            return true;
+        }
+        if plain && !modifiers.shift && self.fold_key(pane_id, &key.key) {
+            return true;
+        }
+        if key.key == "escape" && plain && !search.read(cx).value().is_empty() {
+            search.update(cx, |search, cx| search.set_value("", window, cx));
+            return true;
+        }
+        if key.key == "escape" && plain && has_selection {
             if let Some(pane) = self.monitor.panes.get_mut(pane_id) {
                 pane.list.selected = None;
             }
-        } else if let Some(text) = key
+            return true;
+        }
+        if let Some(text) = key
             .key_char
             .as_deref()
             .filter(|text| plain && !text.trim().is_empty() && !text.chars().any(char::is_control))
         {
             // Typing searches.
-            let query = format!("{}{text}", list.search.read(cx).value());
-            list.search
-                .update(cx, |search, cx| search.set_value(query, window, cx));
+            let query = format!("{}{text}", search.read(cx).value());
+            search.update(cx, |search, cx| search.set_value(query, window, cx));
             self.focus_process_search(pane_id, window, cx);
-        } else {
-            return false;
+            return true;
         }
-        true
+        false
     }
 
     /// The Processes page `width` pixels wide: search, filters and count, then the table
@@ -409,7 +616,7 @@ impl CompiApp {
             FeedState::Live | FeedState::Stale if feed.processes.is_empty() => {
                 self.monitor_message("No processes reported", None)
             }
-            FeedState::Live | FeedState::Stale if list.rows.is_empty() => {
+            FeedState::Live | FeedState::Stale if list.table.rows.is_empty() => {
                 let text = list.search.read(cx).value();
                 let text = text.trim();
                 self.monitor_message(
@@ -435,7 +642,7 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Search, filters and the process count.
+    /// Search, filters, Group by app and the process count.
     fn render_process_toolbar(
         &self,
         pane_id: &PaneId,
@@ -444,6 +651,7 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
         let feed = &self.monitor.processes;
         let current = effective_filter(list.filter, feed.apps_known);
         let filters = controls::segmented(
@@ -462,6 +670,26 @@ impl CompiApp {
                         }))
                 }),
         );
+        let grouped = !feed.flat;
+        let group_switch = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                controls::switch("monitor-group-by-app", grouped)
+                    .label("Group by app")
+                    .on_toggle(cx.listener(move |this, on: &bool, _, cx| {
+                        this.set_group_by_app(*on);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .whitespace_nowrap()
+                    .child("Group by app"),
+            );
         let counted = matches!(feed.state, FeedState::Live | FeedState::Stale)
             && width >= TOOLBAR_COUNT_MIN_WIDTH;
         div()
@@ -484,14 +712,18 @@ impl CompiApp {
                 ),
             )
             .child(filters)
+            .child(group_switch)
             .when(counted, |toolbar| {
                 toolbar.child(
                     div()
                         .flex_none()
                         .ml_auto()
                         .text_size(px(UI_MICRO_TEXT_SIZE))
-                        .text_color(color(modal_text_color(colors.muted, &colors)))
-                        .child(listing::format_count(list.rows.len(), feed.processes.len())),
+                        .text_color(muted)
+                        .child(listing::format_count(
+                            list.table.process_count(),
+                            feed.processes.len(),
+                        )),
                 )
             })
             .into_any_element()
@@ -555,7 +787,7 @@ impl CompiApp {
         let hover_pane = pane_id.clone();
         let rows = uniform_list(
             "monitor-rows",
-            list.rows.len(),
+            list.table.rows.len(),
             cx.processor(move |this, range: Range<usize>, window, cx| {
                 if let Some(pane) = this.monitor.panes.get_mut(&list_pane) {
                     pane.list.page_rows = range.len().saturating_sub(1).max(1);
@@ -590,6 +822,89 @@ impl CompiApp {
             .into_any_element()
     }
 
+    /// The Name cell of row `index`: the fold chevron of an app, the app's icon (an app
+    /// row, or a top-level process) and the name; an app's processes sit indented under
+    /// its name. Hover shows where a process runs from, or an app's path.
+    #[allow(clippy::too_many_arguments)]
+    fn render_name_cell(
+        &self,
+        pane_id: &PaneId,
+        index: usize,
+        row: TableRow,
+        table: &Arranged,
+        processes: &[Process],
+        grouped: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let cell = process_cell(div().id(("monitor-name", index)), Column::Name).gap_1();
+        match row.kind {
+            RowKind::Group(group) => {
+                let group = &table.groups[group];
+                let id = group.id.clone();
+                let pane = pane_id.clone();
+                let fold = div()
+                    .id(("monitor-fold", index))
+                    .flex_none()
+                    .w(px(FOLD_WIDTH))
+                    .flex()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(controls::glyph(
+                        if group.expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        },
+                        muted,
+                    ))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.fold_process_group(&pane, &id, None);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }));
+                let (title, detail): (SharedString, SharedString) = (
+                    listing::display_line(&group.name).into(),
+                    listing::display_line(&group.id).into(),
+                );
+                cell.child(fold)
+                    .child(self.app_icon(Some(&group.id), &group.name, ROW_ICON))
+                    .child(cell_text(listing::display_line(&group.name)).ml_1())
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(muted)
+                            .child(group.members.len().to_string()),
+                    )
+                    .tooltip(controls::tooltip(title, Some(detail), None))
+            }
+            RowKind::Process(process) => {
+                let process = &processes[process];
+                let details = process.details.clone();
+                let app = details.app_group.as_ref();
+                let cell = if row.member {
+                    cell.child(div().flex_none().w(px(FOLD_WIDTH + ROW_ICON + 8.0)))
+                } else {
+                    cell.when(grouped, |cell| {
+                        cell.child(div().flex_none().w(px(FOLD_WIDTH)))
+                    })
+                    .child(self.app_icon(
+                        app.map(|app| app.id.as_str()),
+                        app.map_or(details.name.as_str(), |app| app.name.as_str()),
+                        ROW_ICON,
+                    ))
+                };
+                let name = listing::display_line(&details.name);
+                cell.child(cell_text(name).ml_1())
+                    .tooltip(move |window, cx| {
+                        let (title, detail) = name_tooltip(&details);
+                        controls::tooltip(title, detail, None)(window, cx)
+                    })
+            }
+        }
+    }
+
     /// The table rows in `range`. The selection is filled in the accent while the table
     /// has the keyboard (`keyboard`), quieter otherwise.
     fn render_process_rows(
@@ -604,6 +919,7 @@ impl CompiApp {
             return Vec::new();
         };
         let feed = &self.monitor.processes;
+        let table = &list.table;
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         let selected_fill = if keyboard {
@@ -614,34 +930,37 @@ impl CompiApp {
         let width = columns.len();
         range
             .filter_map(|index| {
-                let process = feed.processes.get(*list.rows.get(index)?)?;
-                let key = listing::key(process);
-                let selected = list.selected == Some(key);
-                let details = &process.details;
-                let sample = &process.sample;
+                let row = *table.rows.get(index)?;
+                let key = table.keys.get(index)?.clone();
+                let selected = list.selected.as_ref() == Some(&key);
                 let cells = columns.iter().enumerate().map(|(position, &column)| {
-                    let id = index * width + position;
-                    let value = match column {
-                        Column::Name => Some(listing::display_line(&details.name)),
-                        Column::Cpu => listing::cpu_share(sample.cpu_percent, feed.logical_cpus)
-                            .map(listing::format_cpu),
-                        Column::Memory => sample.memory_bytes.map(listing::format_bytes),
-                        Column::Threads => sample.threads.map(|threads| threads.to_string()),
-                        Column::CpuTime => sample.cpu_time_ms.map(listing::format_cpu_time),
-                        Column::Pid => Some(sample.pid.to_string()),
-                        Column::User => details.user.as_deref().map(listing::display_line),
-                    };
-                    let cell = process_cell(div().id(("monitor-cell", id)), column);
-                    match value {
-                        Some(text) if column == Column::Name => {
-                            let details = details.clone();
-                            cell.child(cell_text(text)).tooltip(move |window, cx| {
-                                let (title, detail) = name_tooltip(&details);
-                                controls::tooltip(title, detail, None)(window, cx)
-                            })
+                    if column == Column::Name {
+                        return self
+                            .render_name_cell(
+                                pane_id,
+                                index,
+                                row,
+                                table,
+                                &feed.processes,
+                                !feed.flat,
+                                cx,
+                            )
+                            .into_any_element();
+                    }
+                    let text = match row.kind {
+                        RowKind::Process(process) => {
+                            process_cell_text(&feed.processes[process], column, feed.logical_cpus)
                         }
-                        Some(text) => cell.child(cell_text(text)),
-                        None if details.restricted => cell
+                        RowKind::Group(group) => {
+                            group_cell_text(&table.groups[group], column, feed.logical_cpus)
+                        }
+                    };
+                    let cell =
+                        process_cell(div().id(("monitor-cell", index * width + position)), column);
+                    match text {
+                        CellText::Value(text) => cell.child(cell_text(text)),
+                        CellText::Quiet(text) => cell.text_color(muted).child(cell_text(text)),
+                        CellText::Unavailable { withheld: true } => cell
                             .text_color(muted)
                             .child(UNAVAILABLE)
                             .tooltip(controls::tooltip(
@@ -652,8 +971,11 @@ impl CompiApp {
                                 ),
                                 None,
                             )),
-                        None => cell.text_color(muted).child(UNAVAILABLE),
+                        CellText::Unavailable { withheld: false } => {
+                            cell.text_color(muted).child(UNAVAILABLE)
+                        }
                     }
+                    .into_any_element()
                 });
                 let pane = pane_id.clone();
                 Some(
@@ -670,7 +992,7 @@ impl CompiApp {
                         })
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             if let Some(ui) = this.monitor.panes.get_mut(&pane) {
-                                ui.list.selected = Some(key);
+                                ui.list.selected = Some(key.clone());
                                 window.focus(&ui.focus, cx);
                             }
                             cx.notify();

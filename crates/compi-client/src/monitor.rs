@@ -7,8 +7,10 @@
 //! Sorting puts unavailable values last in either direction, and breaks ties by name,
 //! then pid, so the same processes always come in the same order.
 
+pub mod apps;
 pub mod layout;
 pub mod totals;
+pub mod treemap;
 
 use compi_protocol::system_metrics::{Process, ProcessOwner};
 use std::cmp::Ordering;
@@ -221,6 +223,16 @@ impl Search {
             .iter()
             .all(|word| fields.iter().any(|field| field.contains(word.as_str())))
     }
+
+    /// Whether every word occurs in `name` (an app's), ignoring case. An empty search
+    /// names nothing.
+    pub fn names(&self, name: &str) -> bool {
+        if self.words.is_empty() {
+            return false;
+        }
+        let name = name.to_lowercase();
+        self.words.iter().all(|word| name.contains(word.as_str()))
+    }
 }
 
 fn shown(process: &Process, filter: Filter, search: &Search) -> bool {
@@ -250,36 +262,59 @@ fn unavailable_last<T>(
     }
 }
 
+/// What a row is sorted by: a process's values, or an app group's sums.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Entry<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) cpu: Option<f32>,
+    pub(crate) memory: Option<u64>,
+    pub(crate) threads: Option<u32>,
+    pub(crate) cpu_time: Option<u64>,
+    pub(crate) pid: u32,
+    pub(crate) user: Option<&'a str>,
+    pub(crate) start_time: u64,
+}
+
+impl<'a> Entry<'a> {
+    pub(crate) fn of(process: &'a Process) -> Self {
+        let sample = &process.sample;
+        Self {
+            name: &process.details.name,
+            cpu: sample.cpu_percent,
+            memory: sample.memory_bytes,
+            threads: sample.threads,
+            cpu_time: sample.cpu_time_ms,
+            pid: sample.pid,
+            user: process.details.user.as_deref(),
+            start_time: sample.start_time,
+        }
+    }
+}
+
 /// `a` against `b` under `sort`; ties go by name, then pid, then start time.
-pub fn compare(a: &Process, b: &Process, sort: Sort) -> Ordering {
+pub(crate) fn compare_entries(a: &Entry, b: &Entry, sort: Sort) -> Ordering {
     let directed = |ordering: Ordering| match sort.direction {
         Direction::Ascending => ordering,
         Direction::Descending => ordering.reverse(),
     };
-    let (x, y) = (&a.sample, &b.sample);
     let primary = match sort.column {
-        Column::Name => directed(compare_names(&a.details.name, &b.details.name)),
-        Column::Cpu => unavailable_last(x.cpu_percent, y.cpu_percent, |x, y| {
-            directed(x.total_cmp(&y))
-        }),
-        Column::Memory => {
-            unavailable_last(x.memory_bytes, y.memory_bytes, |x, y| directed(x.cmp(&y)))
-        }
-        Column::Threads => unavailable_last(x.threads, y.threads, |x, y| directed(x.cmp(&y))),
-        Column::CpuTime => {
-            unavailable_last(x.cpu_time_ms, y.cpu_time_ms, |x, y| directed(x.cmp(&y)))
-        }
-        Column::Pid => directed(x.pid.cmp(&y.pid)),
-        Column::User => unavailable_last(
-            a.details.user.as_deref(),
-            b.details.user.as_deref(),
-            |x, y| directed(compare_names(x, y)),
-        ),
+        Column::Name => directed(compare_names(a.name, b.name)),
+        Column::Cpu => unavailable_last(a.cpu, b.cpu, |x, y| directed(x.total_cmp(&y))),
+        Column::Memory => unavailable_last(a.memory, b.memory, |x, y| directed(x.cmp(&y))),
+        Column::Threads => unavailable_last(a.threads, b.threads, |x, y| directed(x.cmp(&y))),
+        Column::CpuTime => unavailable_last(a.cpu_time, b.cpu_time, |x, y| directed(x.cmp(&y))),
+        Column::Pid => directed(a.pid.cmp(&b.pid)),
+        Column::User => unavailable_last(a.user, b.user, |x, y| directed(compare_names(x, y))),
     };
     primary
-        .then_with(|| compare_names(&a.details.name, &b.details.name))
-        .then_with(|| x.pid.cmp(&y.pid))
-        .then_with(|| x.start_time.cmp(&y.start_time))
+        .then_with(|| compare_names(a.name, b.name))
+        .then_with(|| a.pid.cmp(&b.pid))
+        .then_with(|| a.start_time.cmp(&b.start_time))
+}
+
+/// `a` against `b` under `sort`; ties go by name, then pid, then start time.
+pub fn compare(a: &Process, b: &Process, sort: Sort) -> Ordering {
+    compare_entries(&Entry::of(a), &Entry::of(b), sort)
 }
 
 /// The indices of `processes` the table shows: those `filter` admits and `search`
@@ -498,6 +533,7 @@ mod tests {
                 owner: ProcessOwner::CurrentUser,
                 app: false,
                 restricted: false,
+                app_group: None,
             }),
         }
     }
