@@ -1401,14 +1401,11 @@ impl CompiApp {
                 wanted
             }
             Some(pane_id) if self.monitor_pane_focus(pane_id).is_some() => {
-                let Some(focus) = self.monitor_pane_focus(pane_id) else {
+                let Some(wanted) = self.monitor_keyboard(pane_id, window, cx) else {
+                    // Its search field or the pane already has the keyboard.
                     return;
                 };
-                if focus.contains_focused(window, cx) {
-                    // Its search field or table already has the keyboard.
-                    return;
-                }
-                focus.clone()
+                wanted
             }
             Some(pane_id) => {
                 let Some(ui) = self.content.panes.get(pane_id) else {

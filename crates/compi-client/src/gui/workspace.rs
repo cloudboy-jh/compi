@@ -2002,7 +2002,7 @@ impl CompiApp {
             } => self.prompt_responded(job, request, result),
             UiEvent::ProgramStatusWatched(statuses) => self.program_status.replace_all(statuses),
             UiEvent::ProgramStatusChanged(status) => self.program_status.update(status),
-            UiEvent::Monitor { generation, event } => self.monitor_event(generation, event),
+            UiEvent::Monitor(event) => self.monitor_event(event),
             UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.connection_error = None;
                 self.accept_workspace(workspace);

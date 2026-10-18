@@ -1,67 +1,59 @@
-//! Monitor: a content pane listing the daemon host's processes.
+//! Monitor: a content pane showing the daemon host's usage. A nav rail on the left lists
+//! the pages (Overview, Processes, then the hardware with live values) above the host;
+//! a header line names the page and holds the range and pause controls.
 //!
-//! Which processes a pane shows, in what order and how their values read is pure
-//! (`crate::monitor`); this draws it and keeps it fed. One watching connection per
-//! window carries the samples, and it runs only while a Monitor pane is drawn (in
-//! the tab shown, or floating): [`LINGER`] after the last one goes out of sight it
-//! closes, which stops the daemon's sampling unless another window still watches.
-//! Samples go through a [`ProcessTable`] per connection, since the daemon sends each
-//! process's details once per connection.
+//! The pane's page lives in the daemon (`PaneContent::Monitor`), so it persists with
+//! the pane, and is sent the way Settings sends its section. The range, pause, search,
+//! filter, sort and selection are this window's.
 //!
-//! The pane itself (`PaneContent::Monitor`) holds nothing; the search, filter, sort
-//! and selection are this window's, per pane. While the pointer is over the table its
-//! rows keep their order (values update in place, newcomers go last, leavers go), and
-//! the table sorts again when the pointer leaves or the sort, search or filter changes.
+//! Two watchers per window feed it (`watch`): the host's totals while any Monitor pane
+//! is drawn, its processes while a drawn pane shows Processes. Pausing freezes what is
+//! drawn while samples keep arriving; resuming jumps to the newest.
 use super::*;
 use crate::gui::controls::IconName;
-use crate::monitor::{self as listing, Column, Direction, Filter, ProcessKey, Search, Sort, Step};
-use compi_protocol::system_metrics::{Process, ProcessDetails, ProcessTable, SystemSample};
-use compi_protocol::{MonitorContent, PaneContent};
-use gpui::{Entity, ScrollStrategy, UniformListScrollHandle, uniform_list};
+use crate::monitor::totals::Span;
+use compi_protocol::{MonitorContent, MonitorPage, PaneContent};
+use gpui::Entity;
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
+use std::cell::Cell;
 use std::sync::mpsc;
 
-/// How often the daemon samples while watched.
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
-/// Without a sample for this long, the values shown are stale.
-const STALE_AFTER: Duration = Duration::from_secs(3 * SAMPLE_INTERVAL.as_secs());
-/// The watcher outlives the last shown pane by this much, so flicking between tabs does
-/// not reconnect.
-const LINGER: Duration = Duration::from_secs(2);
-/// How often the watching connection looks for samples and for being stopped.
-const WATCH_POLL: Duration = Duration::from_millis(50);
-/// Wait before reconnecting after the connection failed or was released.
-const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-/// One table row.
-const ROW_HEIGHT: f32 = 24.0;
-/// The table's inset from the pane's edges.
-const TABLE_INSET: f32 = 12.0;
-/// Narrower than this, the header drops its title, then its process count.
-const HEADER_TITLE_MIN_WIDTH: f32 = 600.0;
-const HEADER_COUNT_MIN_WIDTH: f32 = 480.0;
-/// Longest command line a name's tooltip shows.
-const TOOLTIP_COMMAND_CHARS: usize = 400;
+mod overview;
+mod processes;
+mod watch;
+
+use crate::monitor::layout::{self, CardMove, OverviewCard, OverviewRows};
+use overview::{Metric, TotalsFeed};
+use processes::{ProcessFeed, ProcessList};
+use watch::{
+    LINGER, ProcessesEvent, ProcessesSample, SlotChange, TotalsEvent, WatchContext, WatchSlot,
+};
+
 const UNAVAILABLE: &str = "—";
+/// The nav rail, with labels and values, and with icons only.
+const NAV_WIDTH: f32 = 196.0;
+const NAV_COMPACT_WIDTH: f32 = 52.0;
+/// Panes narrower than this show the nav as icons only, which leaves a page of at
+/// least the width a single column of cards needs.
+const NAV_COMPACT_BELOW: f32 = 640.0;
+/// Narrower than this, the header drops the host's name.
+const HEADER_SUBTITLE_MIN_WIDTH: f32 = 440.0;
 
-/// What the window's watcher reports, tagged with the watcher's generation.
+/// What a window's watchers report, tagged with the watcher's generation.
 pub(in crate::gui) enum MonitorEvent {
-    /// Watching; no sample yet.
-    Connecting,
-    Sampled(MonitorSample),
-    /// No sample for [`STALE_AFTER`].
-    Stale,
-    /// The connection failed or ended; the watcher retries.
-    Failed(String),
+    Processes {
+        generation: u64,
+        event: ProcessesEvent,
+    },
+    Totals {
+        generation: u64,
+        /// Boxed: a totals sample is several times the size of the other events.
+        event: Box<TotalsEvent>,
+    },
 }
 
-pub(in crate::gui) struct MonitorSample {
-    processes: Vec<Process>,
-    logical_cpus: u32,
-    apps_known: bool,
-}
-
-/// What the window knows of the host's processes.
+/// What the window knows from one watcher.
 #[derive(Clone, Debug, Default, PartialEq)]
 enum FeedState {
     #[default]
@@ -71,205 +63,31 @@ enum FeedState {
     Failed(String),
 }
 
-#[derive(Default)]
-struct Feed {
-    state: FeedState,
-    processes: Vec<Process>,
-    logical_cpus: u32,
-    apps_known: bool,
-}
-
-/// The running watcher; dropping it stops the thread, which closes the connection.
-struct Watcher {
-    generation: u64,
-    _stop: mpsc::Sender<()>,
-}
-
 /// One Monitor pane's client state.
 struct MonitorPane {
-    /// Keyboard focus of the table; the search field sits inside it.
+    /// Keyboard focus of the pane; the search field sits inside it.
     focus: FocusHandle,
-    search: Entity<InputState>,
-    query: Search,
-    filter: Filter,
-    sort: Sort,
-    /// Indices of the feed's processes, in the order shown, and their keys.
-    rows: Vec<usize>,
-    keys: Vec<ProcessKey>,
-    selected: Option<ProcessKey>,
-    /// The pointer is over the table, so its rows keep their order.
-    pointer: bool,
-    scroll: UniformListScrollHandle,
-    /// Rows the table showed at its last draw: Page Up and Page Down move by it.
-    page: usize,
-    _events: Subscription,
+    /// The page shown. It is sent to the daemon when it differs from `persisted`, the
+    /// page the daemon last reported; `sent` is the one on its way.
+    page: MonitorPage,
+    persisted: MonitorPage,
+    sent: Option<MonitorPage>,
+    /// Overview's card with the keyboard highlight.
+    card: Option<OverviewCard>,
+    /// Overview's grid at its last draw: the highlight moves on it.
+    card_rows: Cell<OverviewRows>,
+    list: ProcessList,
 }
 
-/// The Monitor panes of this window and the samples they share.
+/// The Monitor panes of this window and what they share.
 #[derive(Default)]
 pub(in crate::gui) struct MonitorUi {
     panes: HashMap<PaneId, MonitorPane>,
-    watcher: Option<Watcher>,
-    generation: u64,
-    /// When the last shown pane stopped showing; the watcher stops [`LINGER`] later.
-    hidden_since: Option<Instant>,
-    feed: Feed,
-}
-
-/// Filter that the feed can answer: Apps means nothing where the host can't tell apps.
-fn effective_filter(filter: Filter, apps_known: bool) -> Filter {
-    if filter == Filter::Apps && !apps_known {
-        Filter::All
-    } else {
-        filter
-    }
-}
-
-/// Orders `pane`'s rows from `feed`: held in their last order while the pointer is
-/// over the table and `hold`, else sorted. A selection no longer shown is cleared.
-fn arrange_pane(pane: &mut MonitorPane, feed: &Feed, hold: bool) {
-    let filter = effective_filter(pane.filter, feed.apps_known);
-    pane.rows = if hold && pane.pointer {
-        listing::arrange_held(&feed.processes, &pane.keys, filter, &pane.query, pane.sort)
-    } else {
-        listing::arrange(&feed.processes, filter, &pane.query, pane.sort)
-    };
-    pane.keys = pane
-        .rows
-        .iter()
-        .map(|&row| listing::key(&feed.processes[row]))
-        .collect();
-    if pane
-        .selected
-        .is_some_and(|selected| !pane.keys.contains(&selected))
-    {
-        pane.selected = None;
-    }
-}
-
-#[derive(PartialEq, Eq)]
-enum WatchEnd {
-    /// The window closed or stopped the watcher.
-    Stopped,
-    Failed(String),
-}
-
-/// The watcher has been dropped (or the window is gone).
-fn stopped(stop: &mpsc::Receiver<()>) -> bool {
-    matches!(stop.try_recv(), Err(mpsc::TryRecvError::Disconnected))
-}
-
-/// Watches the host's processes on a connection of its own until stopped, reconnecting
-/// after failures; while an update holds `quiesced` it stays disconnected.
-fn watch(
-    generation: u64,
-    target: ConnectionTarget,
-    sender: UiEventSender,
-    stop: mpsc::Receiver<()>,
-    quiesced: Arc<AtomicBool>,
-    connection_guard: Arc<Mutex<()>>,
-) {
-    loop {
-        if stopped(&stop) {
-            return;
-        }
-        let client = {
-            let Ok(_guard) = connection_guard.lock() else {
-                return;
-            };
-            if quiesced.load(Ordering::Acquire) {
-                Err("Paused while Compi updates".to_owned())
-            } else {
-                target
-                    .connect()
-                    .map_err(|error| format!("Couldn't connect to the Compi daemon: {error}"))
-            }
-        };
-        let end = match client {
-            Ok(mut client) => follow(&mut client, generation, &sender, &stop, &quiesced),
-            Err(error) => WatchEnd::Failed(error),
-        };
-        let WatchEnd::Failed(error) = end else {
-            return;
-        };
-        if !sender.send(UiEvent::Monitor {
-            generation,
-            event: MonitorEvent::Failed(error),
-        }) {
-            return;
-        }
-        let retry = Instant::now() + RECONNECT_DELAY;
-        while Instant::now() < retry {
-            if stopped(&stop) {
-                return;
-            }
-            thread::sleep(WATCH_POLL);
-        }
-    }
-}
-
-fn follow(
-    client: &mut DaemonClient,
-    generation: u64,
-    sender: &UiEventSender,
-    stop: &mpsc::Receiver<()>,
-    quiesced: &AtomicBool,
-) -> WatchEnd {
-    let send = |event| sender.send(UiEvent::Monitor { generation, event });
-    if let Err(error) = client.watch_system_metrics() {
-        return WatchEnd::Failed(format!("The daemon can't list processes: {error}"));
-    }
-    if !send(MonitorEvent::Connecting) {
-        return WatchEnd::Stopped;
-    }
-    // Details come once per connection, so a new connection starts a new table.
-    let mut table = ProcessTable::default();
-    let mut last_sample = Instant::now();
-    let mut stale = false;
-    loop {
-        if stopped(stop) {
-            return WatchEnd::Stopped;
-        }
-        if quiesced.load(Ordering::Acquire) {
-            return WatchEnd::Failed("Paused while Compi updates".into());
-        }
-        match client.poll_event() {
-            Ok(Some(ServerEvent::Control {
-                message: ServerMessage::SystemSampled { sample },
-                ..
-            })) => {
-                let SystemSample {
-                    logical_cpus,
-                    apps_known,
-                    processes,
-                    ..
-                } = sample;
-                let processes = table.apply(processes);
-                last_sample = Instant::now();
-                stale = false;
-                if !send(MonitorEvent::Sampled(MonitorSample {
-                    processes,
-                    logical_cpus,
-                    apps_known,
-                })) {
-                    return WatchEnd::Stopped;
-                }
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                if !stale && last_sample.elapsed() >= STALE_AFTER {
-                    stale = true;
-                    if !send(MonitorEvent::Stale) {
-                        return WatchEnd::Stopped;
-                    }
-                }
-                thread::sleep(WATCH_POLL);
-            }
-            Err(error) => {
-                return WatchEnd::Failed(format!("Lost the connection to the daemon: {error}"));
-            }
-        }
-    }
+    processes: ProcessFeed,
+    totals: TotalsFeed,
+    /// How much history the graphs show.
+    span: Span,
+    paused: bool,
 }
 
 /// The Monitor leaves of `node`.
@@ -287,32 +105,20 @@ fn monitor_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<&'a PaneId>) {
     }
 }
 
-/// A name's tooltip: the name, then where it runs from and how it was started.
-fn name_tooltip(details: &ProcessDetails) -> (String, Option<SharedString>) {
-    let mut lines = Vec::new();
-    if let Some(executable) = &details.executable {
-        lines.push(listing::display_line(executable));
+const fn page_title(page: MonitorPage) -> &'static str {
+    match page {
+        MonitorPage::Overview => "Overview",
+        MonitorPage::Processes => "Processes",
+        MonitorPage::Cpu => "CPU",
+        MonitorPage::Memory => "Memory",
+        MonitorPage::Disk => "Disk",
+        MonitorPage::Network => "Network",
     }
-    if let Some(command) = &details.command {
-        let mut command = listing::display_line(command);
-        if let Some((cut, _)) = command.char_indices().nth(TOOLTIP_COMMAND_CHARS) {
-            command.truncate(cut);
-            command.push('…');
-        }
-        if lines.first() != Some(&command) {
-            lines.push(command);
-        }
-    }
-    if details.restricted {
-        lines.push("Owned by another user; this host withholds its details".into());
-    }
-    let detail = (!lines.is_empty()).then(|| lines.join("\n").into());
-    (listing::display_line(&details.name), detail)
 }
 
 impl CompiApp {
-    /// Opens Monitor: focuses this window's Monitor pane, or opens one
-    /// beside the focused pane (in a tab of its own when the window has none).
+    /// Opens Monitor: focuses this window's Monitor pane, or opens one beside the
+    /// focused pane (in a tab of its own when the window has none).
     pub(super) fn open_monitor(&mut self) {
         if self.overlay.is_some() {
             self.dismiss_overlay();
@@ -384,166 +190,154 @@ impl CompiApp {
         found
     }
 
-    /// Before drawing: state for each Monitor pane shown, and the watcher running
-    /// while any is (stopping [`LINGER`] after the last one went out of sight).
+    /// Before drawing: state for each Monitor pane shown, its page sent to the daemon
+    /// when it changed, and the watchers running while wanted.
     pub(super) fn prepare_monitor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = &self.workspace else {
             return;
         };
-        let is_monitor = |pane: &PaneId| {
-            content::find_pane_content(workspace, pane).is_some_and(PaneContent::is_monitor)
+        let page_of = |pane: &PaneId| match content::find_pane_content(workspace, pane) {
+            Some(PaneContent::Monitor(monitor)) => Some(monitor.page),
+            _ => None,
         };
-        self.monitor.panes.retain(|pane, _| is_monitor(pane));
-        let shown: Vec<PaneId> = self
+        self.monitor.panes.retain(|pane, _| page_of(pane).is_some());
+        let shown: Vec<(PaneId, MonitorPage)> = self
             .shown_content_panes()
-            .filter(|pane| is_monitor(pane))
-            .cloned()
+            .filter_map(|pane| Some((pane.clone(), page_of(pane)?)))
             .collect();
-        for pane_id in &shown {
-            if !self.monitor.panes.contains_key(pane_id) {
-                let pane = self.new_monitor_pane(pane_id, window, cx);
-                self.monitor.panes.insert(pane_id.clone(), pane);
+        for (pane_id, daemon) in &shown {
+            let daemon = *daemon;
+            match self.monitor.panes.get_mut(pane_id) {
+                None => {
+                    let pane = self.new_monitor_pane(pane_id, daemon, window, cx);
+                    self.monitor.panes.insert(pane_id.clone(), pane);
+                }
+                Some(pane) => {
+                    if pane.sent == Some(daemon) {
+                        pane.sent = None;
+                        pane.persisted = daemon;
+                    } else if pane.sent.is_some() && !self.mutation_pending {
+                        // The change did not apply; show what the daemon has.
+                        pane.sent = None;
+                        pane.persisted = daemon;
+                        pane.page = daemon;
+                    } else if pane.sent.is_none() && daemon != pane.persisted {
+                        pane.persisted = daemon;
+                        pane.page = daemon;
+                    }
+                }
+            }
+            let Some(pane) = self.monitor.panes.get_mut(pane_id) else {
+                continue;
+            };
+            if pane.page != pane.persisted && pane.sent.is_none() && !self.mutation_pending {
+                pane.sent = Some(pane.page);
+                let content = PaneContent::Monitor(MonitorContent { page: pane.page });
+                self.mutate(
+                    WorkspaceMutation::UpdateContent {
+                        pane_id: pane_id.clone(),
+                        content,
+                    },
+                    false,
+                );
             }
         }
-        if !shown.is_empty() {
-            self.monitor.hidden_since = None;
-            if self.monitor.watcher.is_none() {
-                self.start_monitor_watcher();
+        let processes_wanted = shown.iter().any(|(pane_id, _)| {
+            self.monitor
+                .panes
+                .get(pane_id)
+                .is_some_and(|pane| pane.page == MonitorPage::Processes)
+        });
+        let context = WatchContext {
+            target: self.target.clone(),
+            sender: self.event_tx.clone(),
+            quiesced: self.update_quiesced.clone(),
+            connection_guard: self.update_connection_guard.clone(),
+        };
+        let mut linger = false;
+        match self.monitor.totals.slot.want(!shown.is_empty()) {
+            SlotChange::Start(generation, stop) => {
+                self.monitor.totals.reset(FeedState::Connecting);
+                watch::watch_totals(context.clone(), generation, stop);
             }
-        } else if self.monitor.watcher.is_some() && self.monitor.hidden_since.is_none() {
-            self.monitor.hidden_since = Some(Instant::now());
+            SlotChange::Linger => linger = true,
+            SlotChange::Unchanged => {}
+        }
+        match self.monitor.processes.slot.want(processes_wanted) {
+            SlotChange::Start(generation, stop) => {
+                self.reset_process_feed(FeedState::Connecting);
+                watch::watch_processes(context, generation, stop);
+            }
+            SlotChange::Linger => linger = true,
+            SlotChange::Unchanged => {}
+        }
+        if linger {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(LINGER).await;
-                this.update(cx, |this, _| this.expire_monitor_watcher())
-                    .ok();
+                this.update(cx, |this, cx| {
+                    if this.expire_monitor_watchers() {
+                        cx.notify();
+                    }
+                })
+                .ok();
             })
             .detach();
         }
     }
 
     fn new_monitor_pane(
-        &mut self,
+        &self,
         pane_id: &PaneId,
+        page: MonitorPage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> MonitorPane {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search processes"));
-        let changed = pane_id.clone();
-        let events = cx.subscribe(&search, move |this, search, event: &InputEvent, cx| {
-            if !matches!(event, InputEvent::Change) {
-                return;
-            }
-            let query = Search::new(&search.read(cx).value());
-            let MonitorUi { panes, feed, .. } = &mut this.monitor;
-            let Some(pane) = panes.get_mut(&changed) else {
-                return;
-            };
-            if pane.query != query {
-                pane.query = query;
-                arrange_pane(pane, feed, false);
-                pane.scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            }
-        });
-        let mut pane = MonitorPane {
+        MonitorPane {
             focus: cx.focus_handle(),
-            search,
-            query: Search::default(),
-            filter: Filter::All,
-            sort: Sort::default(),
-            rows: Vec::new(),
-            keys: Vec::new(),
-            selected: None,
-            pointer: false,
-            scroll: UniformListScrollHandle::new(),
-            page: 1,
-            _events: events,
-        };
-        arrange_pane(&mut pane, &self.monitor.feed, false);
-        pane
-    }
-
-    fn start_monitor_watcher(&mut self) {
-        self.monitor.generation += 1;
-        let generation = self.monitor.generation;
-        let (stop, stopped) = mpsc::channel();
-        let target = self.target.clone();
-        let sender = self.event_tx.clone();
-        let quiesced = self.update_quiesced.clone();
-        let connection_guard = self.update_connection_guard.clone();
-        thread::spawn(move || {
-            watch(
-                generation,
-                target,
-                sender,
-                stopped,
-                quiesced,
-                connection_guard,
-            )
-        });
-        self.monitor.watcher = Some(Watcher {
-            generation,
-            _stop: stop,
-        });
-        self.reset_monitor_feed(FeedState::Connecting);
-    }
-
-    /// Stops the watcher once no pane has shown for [`LINGER`].
-    fn expire_monitor_watcher(&mut self) {
-        if self
-            .monitor
-            .hidden_since
-            .is_some_and(|since| since.elapsed() >= LINGER)
-        {
-            self.monitor.hidden_since = None;
-            self.monitor.watcher = None;
-            self.reset_monitor_feed(FeedState::Connecting);
+            page,
+            persisted: page,
+            sent: None,
+            card: None,
+            card_rows: Cell::new(&[]),
+            list: self.new_process_list(pane_id, window, cx),
         }
     }
 
-    /// Forgets every process: what is not current is not shown.
-    fn reset_monitor_feed(&mut self, state: FeedState) {
-        let MonitorUi { panes, feed, .. } = &mut self.monitor;
-        *feed = Feed {
-            state,
-            ..Feed::default()
-        };
-        for pane in panes.values_mut() {
-            arrange_pane(pane, feed, false);
+    /// Stops each watcher no pane has wanted for [`LINGER`]; whether one stopped.
+    fn expire_monitor_watchers(&mut self) -> bool {
+        let totals = self.monitor.totals.slot.expire();
+        if totals {
+            self.monitor.totals.reset(FeedState::Connecting);
         }
+        let processes = self.monitor.processes.slot.expire();
+        if processes {
+            self.reset_process_feed(FeedState::Connecting);
+        }
+        totals || processes
     }
 
-    pub(super) fn monitor_event(&mut self, generation: u64, event: MonitorEvent) {
-        if self
-            .monitor
-            .watcher
-            .as_ref()
-            .is_none_or(|watcher| watcher.generation != generation)
-        {
-            // A watcher stopped since.
-            return;
-        }
+    pub(super) fn monitor_event(&mut self, event: MonitorEvent) {
         match event {
-            MonitorEvent::Connecting => self.reset_monitor_feed(FeedState::Connecting),
-            MonitorEvent::Failed(error) => self.reset_monitor_feed(FeedState::Failed(error)),
-            MonitorEvent::Stale => {
-                let feed = &mut self.monitor.feed;
-                if feed.state == FeedState::Live {
-                    feed.state = FeedState::Stale;
-                }
+            MonitorEvent::Processes { generation, event } => {
+                self.processes_event(generation, event)
             }
-            MonitorEvent::Sampled(sample) => {
-                let MonitorUi { panes, feed, .. } = &mut self.monitor;
-                *feed = Feed {
-                    state: FeedState::Live,
-                    processes: sample.processes,
-                    logical_cpus: sample.logical_cpus,
-                    apps_known: sample.apps_known,
-                };
-                for pane in panes.values_mut() {
-                    arrange_pane(pane, feed, true);
-                }
-            }
+            MonitorEvent::Totals { generation, event } => self.totals_event(generation, *event),
+        }
+    }
+
+    /// Shows `page` in `pane_id`; the daemon learns it before the next draw.
+    fn set_monitor_page(&mut self, pane_id: &PaneId, page: MonitorPage) {
+        if let Some(pane) = self.monitor.panes.get_mut(pane_id) {
+            pane.page = page;
+            pane.card = None;
+        }
+    }
+
+    fn set_monitor_paused(&mut self, paused: bool) {
+        self.monitor.paused = paused;
+        self.monitor.totals.freeze(paused);
+        if !paused {
+            self.resume_processes();
         }
     }
 
@@ -557,119 +351,24 @@ impl CompiApp {
         self.monitor.panes.values().any(|pane| {
             *focused == pane.focus
                 || pane.focus.contains_focused(window, cx)
-                || pane.search.focus_handle(cx) == *focused
+                || pane.list.search.focus_handle(cx) == *focused
         })
     }
 
-    /// The focused Monitor pane's search field has the keyboard.
-    pub(super) fn monitor_search_has_keyboard(&self, window: &Window, cx: &App) -> bool {
-        self.focused_pane()
-            .and_then(|pane| self.monitor.panes.get(pane))
-            .is_some_and(|pane| pane.search.focus_handle(cx).is_focused(window))
-    }
-
-    /// Keys in the focused Monitor pane's search field, before the field's own:
-    /// Escape clears it (an empty one hands the keyboard to the table), Down, Enter and
-    /// Tab go to the table.
-    pub(super) fn monitor_search_key(
-        &mut self,
-        key: &Keystroke,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.monitor_search_has_keyboard(window, cx) {
-            return false;
+    /// Where the keyboard should go in the focused Monitor pane `pane_id`, or `None`
+    /// when it is there: the search field keeps it on the Processes page (it may not be
+    /// drawn yet when Ctrl/Cmd+F just switched page), and the pane takes it otherwise.
+    pub(super) fn monitor_keyboard(
+        &self,
+        pane_id: &PaneId,
+        window: &Window,
+        cx: &App,
+    ) -> Option<FocusHandle> {
+        let pane = self.monitor.panes.get(pane_id)?;
+        if pane.list.search.focus_handle(cx).is_focused(window) {
+            return (pane.page != MonitorPage::Processes).then(|| pane.focus.clone());
         }
-        let modifiers = &key.modifiers;
-        if modifiers.control || modifiers.alt || modifiers.platform {
-            return false;
-        }
-        let Some(pane_id) = self.focused_pane().cloned() else {
-            return false;
-        };
-        let Some(pane) = self.monitor.panes.get(&pane_id) else {
-            return false;
-        };
-        match key.key.as_str() {
-            "escape" if !pane.search.read(cx).value().is_empty() => {
-                pane.search
-                    .update(cx, |search, cx| search.set_value("", window, cx));
-                true
-            }
-            "escape" => {
-                window.focus(&pane.focus, cx);
-                true
-            }
-            "down" | "enter" | "tab" if !modifiers.shift => {
-                window.focus(&pane.focus, cx);
-                if pane.selected.is_none() {
-                    self.step_monitor_selection(&pane_id, Step::Home);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn focus_monitor_search(&self, pane_id: &PaneId, window: &mut Window, cx: &mut App) {
-        if let Some(pane) = self.monitor.panes.get(pane_id) {
-            let handle = pane.search.focus_handle(cx);
-            window.focus(&handle, cx);
-        }
-    }
-
-    fn step_monitor_selection(&mut self, pane_id: &PaneId, step: Step) {
-        let Some(pane) = self.monitor.panes.get_mut(pane_id) else {
-            return;
-        };
-        let current = pane
-            .selected
-            .and_then(|selected| pane.keys.iter().position(|key| *key == selected));
-        if let Some(next) = listing::step_selection(current, pane.keys.len(), step) {
-            pane.selected = Some(pane.keys[next]);
-            pane.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
-        }
-    }
-
-    fn set_monitor_filter(&mut self, pane_id: &PaneId, filter: Filter) {
-        let MonitorUi { panes, feed, .. } = &mut self.monitor;
-        if let Some(pane) = panes.get_mut(pane_id)
-            && pane.filter != filter
-        {
-            pane.filter = filter;
-            arrange_pane(pane, feed, false);
-            pane.scroll.scroll_to_item(0, ScrollStrategy::Top);
-        }
-    }
-
-    fn sort_monitor_table(&mut self, pane_id: &PaneId, column: Column) {
-        let MonitorUi { panes, feed, .. } = &mut self.monitor;
-        if let Some(pane) = panes.get_mut(pane_id) {
-            pane.sort = pane.sort.clicked(column);
-            arrange_pane(pane, feed, false);
-            if let Some(at) = pane
-                .selected
-                .and_then(|selected| pane.keys.iter().position(|key| *key == selected))
-            {
-                pane.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
-            }
-        }
-    }
-
-    /// The pointer entered or left the table; leaving sorts it again.
-    fn hover_monitor_table(&mut self, pane_id: &PaneId, hovered: bool) -> bool {
-        let MonitorUi { panes, feed, .. } = &mut self.monitor;
-        let Some(pane) = panes.get_mut(pane_id) else {
-            return false;
-        };
-        if pane.pointer == hovered {
-            return false;
-        }
-        pane.pointer = hovered;
-        if !hovered {
-            arrange_pane(pane, feed, false);
-        }
-        !hovered
+        (!pane.focus.contains_focused(window, cx)).then(|| pane.focus.clone())
     }
 
     /// Keys in a Monitor pane that its search field left alone.
@@ -683,49 +382,29 @@ impl CompiApp {
         let Some(pane) = self.monitor.panes.get(pane_id) else {
             return;
         };
-        if pane.search.focus_handle(cx).is_focused(window) {
+        if pane.list.search.focus_handle(cx).is_focused(window) {
             // Text belongs to the field; Escape, Down, Enter and Tab were taken before it.
             return;
         }
+        let page = pane.page;
         let key = &event.keystroke;
         let modifiers = &key.modifiers;
-        let plain = !modifiers.control && !modifiers.alt && !modifiers.platform;
-        let step = match key.key.as_str() {
-            "up" => Some(Step::Up),
-            "down" => Some(Step::Down),
-            "pageup" => Some(Step::PageUp(pane.page)),
-            "pagedown" => Some(Step::PageDown(pane.page)),
-            "home" => Some(Step::Home),
-            "end" => Some(Step::End),
-            _ => None,
-        }
-        .filter(|_| plain && !modifiers.shift);
-        if let Some(step) = step {
-            self.step_monitor_selection(pane_id, step);
-        } else if key.key == "f"
+        let plain = !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift;
+        let handled = if key.key == "f"
             && (modifiers.control || modifiers.platform)
             && !modifiers.alt
             && !modifiers.shift
         {
-            self.focus_monitor_search(pane_id, window, cx);
-        } else if key.key == "escape" && plain && !pane.search.read(cx).value().is_empty() {
-            pane.search
-                .update(cx, |search, cx| search.set_value("", window, cx));
-        } else if key.key == "escape" && plain && pane.selected.is_some() {
-            if let Some(pane) = self.monitor.panes.get_mut(pane_id) {
-                pane.selected = None;
-            }
-        } else if let Some(text) = key
-            .key_char
-            .as_deref()
-            .filter(|text| plain && !text.trim().is_empty() && !text.chars().any(char::is_control))
-        {
-            // Typing searches.
-            let query = format!("{}{text}", pane.search.read(cx).value());
-            pane.search
-                .update(cx, |search, cx| search.set_value(query, window, cx));
-            self.focus_monitor_search(pane_id, window, cx);
+            // Ctrl/Cmd+F searches the processes, from any page.
+            self.set_monitor_page(pane_id, MonitorPage::Processes);
+            self.focus_process_search(pane_id, window, cx);
+            true
+        } else if page == MonitorPage::Processes {
+            self.processes_key_down(pane_id, key, window, cx)
         } else {
+            plain && self.monitor_page_key(pane_id, page, &key.key)
+        };
+        if !handled {
             self.handle_app_key(event, window, cx);
         }
         // Nothing typed in Monitor reaches a shell.
@@ -733,158 +412,53 @@ impl CompiApp {
         cx.notify();
     }
 
-    /// One Monitor pane `width` pixels wide: its header line, then the table or
-    /// what stands in for it.
-    pub(super) fn render_monitor_pane(
-        &self,
-        pane_id: &PaneId,
-        width: f32,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let Some(pane) = self.monitor.panes.get(pane_id) else {
-            return div().into_any_element();
+    /// Keys on Overview (arrows move between cards, Enter opens one, Escape lets go)
+    /// and on a resource page (Escape goes back to Overview).
+    fn monitor_page_key(&mut self, pane_id: &PaneId, page: MonitorPage, key: &str) -> bool {
+        let Some(pane) = self.monitor.panes.get_mut(pane_id) else {
+            return false;
         };
-        let colors = *self.colors();
-        let feed = &self.monitor.feed;
-        let muted = color(modal_text_color(colors.muted, &colors));
-        let body = match &feed.state {
-            FeedState::Connecting => self.monitor_message("Reading processes…", None),
-            FeedState::Failed(error) => self.monitor_message(
-                "Can't read processes",
-                Some((format!("{error} (retrying)"), colors.error)),
-            ),
-            FeedState::Live | FeedState::Stale if feed.processes.is_empty() => {
-                self.monitor_message("No processes reported", None)
+        if let Some(metric) = Metric::of_page(page) {
+            if key != "escape" {
+                return false;
             }
-            FeedState::Live | FeedState::Stale if pane.rows.is_empty() => {
-                let text = pane.search.read(cx).value();
-                let text = text.trim();
-                self.monitor_message(
-                    "No processes match",
-                    (!text.is_empty()).then(|| (format!("Nothing matches “{text}”"), colors.muted)),
-                )
-            }
-            FeedState::Live | FeedState::Stale => {
-                self.render_monitor_table(pane_id, pane, width, cx)
-            }
+            pane.page = MonitorPage::Overview;
+            pane.card = Some(metric.card());
+            return true;
+        }
+        let rows = pane.card_rows.get();
+        let drawn = |card: OverviewCard| {
+            rows.iter()
+                .flat_map(|row| row.iter())
+                .any(|placed| placed.card == card)
         };
-        let key_pane = pane_id.clone();
-        let click_pane = pane_id.clone();
-        div()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .track_focus(&pane.focus)
-            .text_color(color(modal_text_color(colors.foreground, &colors)))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                this.monitor_key_down(&key_pane, event, window, cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    // The search field takes focus itself; elsewhere the table does.
-                    if !window.default_prevented()
-                        && let Some(pane) = this.monitor.panes.get(&click_pane)
-                    {
-                        window.focus(&pane.focus, cx);
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(self.render_monitor_header(pane_id, pane, width, cx))
-            .when(feed.state == FeedState::Stale, |pane| {
-                pane.child(
-                    div()
-                        .flex_none()
-                        .px_4()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(color(colors.border))
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                        .text_color(muted)
-                        .child("Not updating: no new sample from the daemon for a while; the values shown are out of date."),
-                )
-            })
-            .child(body)
-            .into_any_element()
+        let step = match key {
+            "escape" if pane.card.is_none() => return false,
+            "escape" => {
+                pane.card = None;
+                return true;
+            }
+            "enter" | "space" => {
+                let Some(card) = pane.card.filter(|card| drawn(*card)) else {
+                    return false;
+                };
+                let page = Metric::of_card(card).map_or(MonitorPage::Memory, Metric::page);
+                self.set_monitor_page(pane_id, page);
+                return true;
+            }
+            "left" => CardMove::Left,
+            "right" => CardMove::Right,
+            "up" => CardMove::Up,
+            "down" => CardMove::Down,
+            "home" => CardMove::Home,
+            "end" => CardMove::End,
+            _ => return false,
+        };
+        pane.card = layout::move_card(rows, pane.card, step);
+        true
     }
 
-    /// The header line: title, search, filters and the process count.
-    fn render_monitor_header(
-        &self,
-        pane_id: &PaneId,
-        pane: &MonitorPane,
-        width: f32,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let colors = *self.colors();
-        let feed = &self.monitor.feed;
-        let current = effective_filter(pane.filter, feed.apps_known);
-        let filters = controls::segmented(
-            "monitor-filter",
-            Filter::ALL
-                .into_iter()
-                .filter(|filter| *filter != Filter::Apps || feed.apps_known)
-                .enumerate()
-                .map(|(index, filter)| {
-                    let pane_id = pane_id.clone();
-                    controls::text_button(("monitor-filter", index), filter.label())
-                        .selected(current == filter)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_monitor_filter(&pane_id, filter);
-                            cx.notify();
-                        }))
-                }),
-        );
-        let counted = matches!(feed.state, FeedState::Live | FeedState::Stale)
-            && width >= HEADER_COUNT_MIN_WIDTH;
-        div()
-            .flex_none()
-            .min_h(px(44.0))
-            .px_4()
-            .py(px(10.0))
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_x_3()
-            .gap_y_2()
-            .border_b_1()
-            .border_color(color(colors.border))
-            .when(width >= HEADER_TITLE_MIN_WIDTH, |header| {
-                header.child(
-                    div()
-                        .flex_none()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Monitor"),
-                )
-            })
-            .child(
-                div().flex_1().min_w(px(120.0)).max_w(px(280.0)).child(
-                    Input::new(&pane.search)
-                        .appearance(true)
-                        .cleanable(true)
-                        .with_size(gpui_component::Size::Small),
-                ),
-            )
-            .child(filters)
-            .when(counted, |header| {
-                header.child(
-                    div()
-                        .flex_none()
-                        .ml_auto()
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                        .text_color(color(modal_text_color(colors.muted, &colors)))
-                        .child(listing::format_count(pane.rows.len(), feed.processes.len())),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// A centred message in place of the table.
+    /// A centred message in place of a page's content.
     fn monitor_message(&self, title: &'static str, detail: Option<(String, u32)>) -> AnyElement {
         let colors = *self.colors();
         div()
@@ -911,222 +485,355 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The column headings (click to sort) over the rows, drawn as they scroll in.
-    fn render_monitor_table(
+    /// The line over a page whose samples stopped coming.
+    fn monitor_stale_note(&self) -> AnyElement {
+        let colors = *self.colors();
+        div()
+            .flex_none()
+            .px_4()
+            .py_1()
+            .border_b_1()
+            .border_color(color(colors.border))
+            .text_size(px(UI_MICRO_TEXT_SIZE))
+            .text_color(color(modal_text_color(colors.muted, &colors)))
+            .child(
+                "Not updating: no new sample from the daemon for a while; the values shown are out of date.",
+            )
+            .into_any_element()
+    }
+
+    /// One Monitor pane `width` pixels wide: the nav rail, then the header and page.
+    pub(super) fn render_monitor_pane(
         &self,
         pane_id: &PaneId,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Some(pane) = self.monitor.panes.get(pane_id) else {
+            return div().into_any_element();
+        };
+        let colors = *self.colors();
+        let compact = width < NAV_COMPACT_BELOW;
+        // The rail's border is inside its width (border-box) and the content pane has no
+        // padding or border of its own, so the page gets exactly the rest.
+        let page_width = (width
+            - if compact {
+                NAV_COMPACT_WIDTH
+            } else {
+                NAV_WIDTH
+            })
+        .max(1.0);
+        let page = match pane.page {
+            MonitorPage::Overview => self.render_monitor_overview(pane_id, pane, page_width, cx),
+            MonitorPage::Processes => self.render_processes_page(pane_id, pane, page_width, cx),
+            page => Metric::of_page(page).map_or_else(
+                || div().into_any_element(),
+                |metric| self.render_monitor_resource(pane_id, metric, page_width, cx),
+            ),
+        };
+        let key_pane = pane_id.clone();
+        let click_pane = pane_id.clone();
+        div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .track_focus(&pane.focus)
+            .text_color(color(modal_text_color(colors.foreground, &colors)))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                this.monitor_key_down(&key_pane, event, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    // The search field takes focus itself; elsewhere the pane does.
+                    if !window.default_prevented()
+                        && let Some(pane) = this.monitor.panes.get(&click_pane)
+                    {
+                        window.focus(&pane.focus, cx);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(self.render_monitor_nav(pane_id, pane, compact, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_monitor_header(pane, page_width, cx))
+                    .child(page),
+            )
+            .into_any_element()
+    }
+
+    /// The nav rail: Overview, Processes, then the hardware with live values, and the
+    /// host at the foot. `compact` shows icons only, their names in tooltips.
+    fn render_monitor_nav(
+        &self,
+        pane_id: &PaneId,
+        pane: &MonitorPane,
+        compact: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let latest = self.monitor.totals.shown().latest();
+        let entry = |index: usize,
+                     page: MonitorPage,
+                     icon: IconName,
+                     tint: Option<u32>,
+                     value: Option<Option<String>>| {
+            let selected = pane.page == page;
+            let label = page_title(page);
+            let pane_id = pane_id.clone();
+            let value_text = value
+                .clone()
+                .map(|value| value.unwrap_or_else(|| UNAVAILABLE.to_owned()));
+            div()
+                .id(("monitor-nav", index))
+                .flex_none()
+                .h(px(30.0))
+                .rounded_md()
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .when(compact, |entry| entry.justify_center())
+                .when(!compact, |entry| entry.px_2())
+                .when(selected, |entry| {
+                    entry
+                        .bg(color(colors.surface_hover))
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .when(!selected, |entry| {
+                    entry
+                        .text_color(muted)
+                        .hover(move |style| style.bg(color(colors.surface_hover)))
+                })
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_monitor_page(&pane_id, page);
+                    cx.notify();
+                }))
+                .child(controls::glyph(
+                    icon,
+                    tint.map_or_else(
+                        || {
+                            if selected {
+                                color(modal_text_color(colors.foreground, &colors))
+                            } else {
+                                muted
+                            }
+                        },
+                        color,
+                    ),
+                ))
+                .when(compact, |entry| {
+                    entry.tooltip(controls::tooltip(
+                        label,
+                        value_text.clone().map(SharedString::from),
+                        None,
+                    ))
+                })
+                .when(!compact, |entry| {
+                    entry
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                        .children(value.map(|value| {
+                            div()
+                                .flex_none()
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .text_color(muted)
+                                .whitespace_nowrap()
+                                .child(value.unwrap_or_else(|| UNAVAILABLE.to_owned()))
+                        }))
+                })
+        };
+        let hardware = Metric::ALL.into_iter().enumerate().map(|(index, metric)| {
+            entry(
+                2 + index,
+                metric.page(),
+                metric.icon(),
+                Some(self.metric_color(metric)),
+                latest.map(|latest| metric.nav_value(latest)),
+            )
+        });
+        let host = self.monitor.totals.host.as_ref();
+        let host_name = host
+            .and_then(|host| host.host_name.as_deref())
+            .map(crate::monitor::display_line);
+        let detail = self.monitor_host_detail();
+        div()
+            .flex_none()
+            .w(px(if compact {
+                NAV_COMPACT_WIDTH
+            } else {
+                NAV_WIDTH
+            }))
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .px(px(if compact { 8.0 } else { 10.0 }))
+            .py_3()
+            .border_r_1()
+            .border_color(color(colors.border))
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .child(entry(
+                0,
+                MonitorPage::Overview,
+                IconName::LayoutDashboard,
+                None,
+                None,
+            ))
+            .child(entry(
+                1,
+                MonitorPage::Processes,
+                IconName::List,
+                None,
+                self.process_count().map(|count| Some(count.to_string())),
+            ))
+            .child(if compact {
+                div()
+                    .my_2()
+                    .mx_1()
+                    .h(px(1.0))
+                    .bg(color(colors.border))
+                    .into_any_element()
+            } else {
+                div()
+                    .px_2()
+                    .pt_3()
+                    .pb_1()
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .child("Hardware")
+                    .into_any_element()
+            })
+            .children(hardware)
+            .child(div().flex_1())
+            .when(
+                !compact && (host_name.is_some() || detail.is_some()),
+                |nav| {
+                    nav.child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .border_t_1()
+                            .border_color(color(colors.border))
+                            .children(host_name.map(|name| {
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(name)
+                            }))
+                            .children(detail.map(|detail| {
+                                div()
+                                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                                    .text_color(muted)
+                                    .child(detail)
+                            })),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    /// The header line: the page's title and the host, then the range and pause.
+    fn render_monitor_header(
+        &self,
         pane: &MonitorPane,
         width: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let columns = listing::visible_columns(width - 2.0 * TABLE_INSET);
         let muted = color(modal_text_color(colors.muted, &colors));
-        let headings = columns.iter().enumerate().map(|(index, &column)| {
-            let sorted = pane.sort.column == column;
-            let arrow = sorted.then(|| {
-                controls::glyph(
-                    match pane.sort.direction {
-                        Direction::Ascending => IconName::ArrowUp,
-                        Direction::Descending => IconName::ArrowDown,
-                    },
-                    muted,
-                )
-            });
-            // The arrow sits on the inner side: before right-aligned labels, after others.
-            let (before, after) = if column.numeric() {
-                (arrow, None)
-            } else {
-                (None, arrow)
-            };
-            let pane_id = pane_id.clone();
-            monitor_cell(div().id(("monitor-column", index)), column)
-                .h_full()
-                .gap_1()
-                .cursor_pointer()
-                .rounded_sm()
-                .hover(move |style| style.bg(color(colors.surface_hover)))
-                .when(sorted, |cell| cell.font_weight(FontWeight::SEMIBOLD))
-                .children(before)
-                .child(column.label())
-                .children(after)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.sort_monitor_table(&pane_id, column);
-                    cx.notify();
-                }))
-        });
-        let header = div()
-            .flex_none()
-            .h(px(ROW_HEIGHT + 4.0))
-            .px(px(TABLE_INSET))
-            .flex()
-            .items_center()
-            .border_b_1()
-            .border_color(color(colors.border))
-            .text_size(px(UI_MICRO_TEXT_SIZE))
-            .text_color(muted)
-            .children(headings);
-        let list_pane = pane_id.clone();
-        let hover_pane = pane_id.clone();
-        let list = uniform_list(
-            "monitor-rows",
-            pane.rows.len(),
-            cx.processor(move |this, range: Range<usize>, window, cx| {
-                if let Some(pane) = this.monitor.panes.get_mut(&list_pane) {
-                    pane.page = range.len().saturating_sub(1).max(1);
-                }
-                let keyboard = this
-                    .monitor
-                    .panes
-                    .get(&list_pane)
-                    .is_some_and(|pane| pane.focus.is_focused(window));
-                this.render_monitor_rows(&list_pane, &columns, range, keyboard, cx)
-            }),
-        )
-        .track_scroll(&pane.scroll)
-        .flex_1()
-        .min_h_0()
-        .px(px(TABLE_INSET))
-        .py_1();
-        div()
-            .id("monitor-table")
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if this.hover_monitor_table(&hover_pane, *hovered) {
-                    cx.notify();
-                }
-            }))
-            .child(header)
-            .child(list)
-            .into_any_element()
-    }
-
-    /// The table rows in `range`. The selection is filled in the accent while the table
-    /// has the keyboard (`keyboard`), quieter otherwise.
-    fn render_monitor_rows(
-        &self,
-        pane_id: &PaneId,
-        columns: &[Column],
-        range: Range<usize>,
-        keyboard: bool,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
-        let Some(pane) = self.monitor.panes.get(pane_id) else {
-            return Vec::new();
-        };
-        let feed = &self.monitor.feed;
-        let colors = *self.colors();
-        let muted = color(modal_text_color(colors.muted, &colors));
-        let selected_fill = if keyboard {
-            color(colors.accent).opacity(0.22)
-        } else {
-            color(colors.surface_hover)
-        };
-        let width = columns.len();
-        range
-            .filter_map(|index| {
-                let process = feed.processes.get(*pane.rows.get(index)?)?;
-                let key = listing::key(process);
-                let selected = pane.selected == Some(key);
-                let details = &process.details;
-                let sample = &process.sample;
-                let cells = columns.iter().enumerate().map(|(position, &column)| {
-                    let id = index * width + position;
-                    let value = match column {
-                        Column::Name => Some(listing::display_line(&details.name)),
-                        Column::Cpu => listing::cpu_share(sample.cpu_percent, feed.logical_cpus)
-                            .map(listing::format_cpu),
-                        Column::Memory => sample.memory_bytes.map(listing::format_memory),
-                        Column::Threads => sample.threads.map(|threads| threads.to_string()),
-                        Column::CpuTime => sample.cpu_time_ms.map(listing::format_cpu_time),
-                        Column::Pid => Some(sample.pid.to_string()),
-                        Column::User => details.user.as_deref().map(listing::display_line),
-                    };
-                    let cell = monitor_cell(div().id(("monitor-cell", id)), column);
-                    match value {
-                        Some(text) if column == Column::Name => {
-                            let details = details.clone();
-                            cell.child(cell_text(text)).tooltip(move |window, cx| {
-                                let (title, detail) = name_tooltip(&details);
-                                controls::tooltip(title, detail, None)(window, cx)
-                            })
-                        }
-                        Some(text) => cell.child(cell_text(text)),
-                        None if details.restricted => cell
-                            .text_color(muted)
-                            .child(UNAVAILABLE)
-                            .tooltip(controls::tooltip(
-                                "Not available",
-                                Some(
-                                    "This host doesn't let Compi read other users' processes"
-                                        .into(),
-                                ),
-                                None,
-                            )),
-                        None => cell.text_color(muted).child(UNAVAILABLE),
-                    }
-                });
-                let pane = pane_id.clone();
-                Some(
-                    div()
-                        .id(("monitor-row", index))
-                        .h(px(ROW_HEIGHT))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .rounded_sm()
-                        .when(selected, |row| row.bg(selected_fill))
-                        .when(!selected, |row| {
-                            row.hover(move |style| style.bg(color(colors.surface_hover)))
-                        })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            if let Some(ui) = this.monitor.panes.get_mut(&pane) {
-                                ui.selected = Some(key);
-                                window.focus(&ui.focus, cx);
-                            }
+        let paused = self.monitor.paused;
+        let host = self
+            .monitor
+            .totals
+            .host
+            .as_ref()
+            .and_then(|host| host.host_name.as_deref())
+            .map(crate::monitor::display_line)
+            .filter(|_| width >= HEADER_SUBTITLE_MIN_WIDTH);
+        let spans = (pane.page != MonitorPage::Processes).then(|| {
+            controls::segmented(
+                "monitor-span",
+                Span::ALL.into_iter().enumerate().map(|(index, span)| {
+                    controls::text_button(("monitor-span", index), span.label())
+                        .selected(self.monitor.span == span)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.monitor.span = span;
                             cx.notify();
                         }))
-                        .children(cells)
-                        .into_any_element(),
-                )
-            })
-            .collect()
+                }),
+            )
+        });
+        let pause = controls::icon_button(
+            "monitor-pause",
+            if paused {
+                IconName::Play
+            } else {
+                IconName::Pause
+            },
+            if paused { "Resume" } else { "Pause" },
+        )
+        .header()
+        .selected(paused)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_monitor_paused(!paused);
+            cx.notify();
+        }));
+        div()
+            .flex_none()
+            .h(px(44.0))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(color(colors.border))
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(page_title(pane.page)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .child(match (host, paused) {
+                        (Some(host), true) => format!("{host} · Paused"),
+                        (Some(host), false) => host,
+                        (None, true) => "Paused".to_owned(),
+                        (None, false) => String::new(),
+                    }),
+            )
+            .children(spans)
+            .child(pause)
+            .into_any_element()
     }
-}
-
-/// A table cell of `column`: Name takes the room the others leave; amounts are
-/// right-aligned. One line, cut with an ellipsis.
-fn monitor_cell(cell: Stateful<Div>, column: Column) -> Stateful<Div> {
-    let cell = cell
-        .h_full()
-        .px_2()
-        .flex()
-        .items_center()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_ellipsis();
-    let cell = if column == Column::Name {
-        cell.flex_1().min_w(px(listing::NAME_MIN_WIDTH))
-    } else {
-        cell.flex_none().w(px(column.width()))
-    };
-    if column.numeric() {
-        cell.justify_end()
-    } else {
-        cell
-    }
-}
-
-/// A cell's value, which shrinks with its cell and ends in an ellipsis when cut.
-fn cell_text(text: String) -> Div {
-    div()
-        .min_w_0()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_ellipsis()
-        .child(text)
 }

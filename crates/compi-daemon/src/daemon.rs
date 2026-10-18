@@ -4,7 +4,9 @@ use crate::file_tree;
 use crate::launch;
 use crate::program_status::ProgramStatusWatch;
 use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
-use crate::system_metrics::{SystemMetricsHub, SystemMetricsWatch};
+use crate::system_metrics::{
+    SystemMetricsHub, SystemMetricsWatch, SystemTotalsHub, SystemTotalsWatch,
+};
 use compi_protocol::frame;
 #[cfg(windows)]
 use compi_protocol::identity::PipeSecurity;
@@ -457,6 +459,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
     let security = PipeSecurity::for_current_user()?;
     compi_protocol::perf::log_startup_metric("daemon_security_ready_ms", started_at.elapsed());
     let stopping = Arc::new(AtomicBool::new(false));
+    SystemTotalsHub::shared().start(stopping.clone());
     if compi_protocol::perf::enabled() {
         let sampler_manager = manager.clone();
         let sampler_stopping = stopping.clone();
@@ -670,6 +673,7 @@ fn handle_connection(
     let mut workspace_events = manager.subscribe();
     let mut program_status_watch: Option<ProgramStatusWatch> = None;
     let mut system_metrics_watch: Option<SystemMetricsWatch> = None;
+    let mut system_totals_watch: Option<SystemTotalsWatch> = None;
     let mut workspace_changed = false;
     let mut uploads = HashMap::<UploadId, ImageUpload>::new();
     let result = (|| -> Result<()> {
@@ -684,6 +688,9 @@ fn handle_connection(
             }
             if let Some(watch) = system_metrics_watch.as_mut() {
                 send_system_metrics(&sink, watch)?;
+            }
+            if let Some(watch) = system_totals_watch.as_mut() {
+                send_system_totals(&sink, watch)?;
             }
             let Some(incoming) = reader.poll(&connection)? else {
                 thread::sleep(Duration::from_millis(5));
@@ -804,6 +811,14 @@ fn handle_connection(
                         message: ServerMessage::SystemMetricsWatching,
                     })?;
                     system_metrics_watch.get_or_insert_with(|| SystemMetricsHub::shared().watch());
+                }
+                ClientMessage::WatchSystemTotals => {
+                    let (host, history, watch) = SystemTotalsHub::shared().watch();
+                    sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::SystemTotalsWatching { host, history },
+                    })?;
+                    system_totals_watch = Some(watch);
                 }
                 ClientMessage::AcknowledgeProgramStatus {
                     surface_id,
@@ -1505,6 +1520,23 @@ fn send_system_metrics(sink: &ConnectionSink, watch: &mut SystemMetricsWatch) ->
     })?;
     if sent {
         watch.delivered(generation, &collected);
+    }
+    Ok(())
+}
+
+/// Sends the totals samples this connection has not had, in order, while it has room.
+fn send_system_totals(sink: &ConnectionSink, watch: &mut SystemTotalsWatch) -> Result<()> {
+    for sample in watch.pending() {
+        let sent = sink.send_control_if_room(&ServerControl {
+            request_id: None,
+            message: ServerMessage::SystemTotalsSampled {
+                sample: (*sample).clone(),
+            },
+        })?;
+        if !sent {
+            break;
+        }
+        watch.delivered(&sample);
     }
     Ok(())
 }

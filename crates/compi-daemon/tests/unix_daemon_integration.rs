@@ -5,7 +5,7 @@ mod kitty;
 
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
-use compi_protocol::system_metrics::{ProcessOwner, ProcessTable, SystemSample};
+use compi_protocol::system_metrics::{ProcessOwner, ProcessTable, SystemSample, TotalsSample};
 use compi_protocol::{
     ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, FolderContent,
     LayoutNode, PROTOCOL_VERSION, PaneContent, ScreenSnapshot, ServerEvent, ServerMessage,
@@ -1034,6 +1034,60 @@ fn next_sample(client: &mut DaemonClient) -> SystemSample {
         assert!(
             started.elapsed() < TIMEOUT,
             "no system sample after {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[test]
+fn system_totals_arrive_in_order_after_the_kept_history() {
+    let mut daemon = DaemonGuard::start();
+    let mut watcher = daemon.client();
+    let (host, history) = watcher.watch_system_totals().unwrap();
+    assert!(host.logical_cpus >= 1);
+    // The daemon samples from the start, whether or not anyone watches.
+    let mut previous = history.last().map(|sample| sample.sequence);
+    let mut later = Vec::new();
+    while later.len() < 2 {
+        let sample = next_totals(&mut watcher);
+        if let Some(previous) = previous {
+            assert_eq!(sample.sequence, previous + 1);
+        }
+        previous = Some(sample.sequence);
+        later.push(sample);
+    }
+    let last = later.last().unwrap();
+    assert!(last.cpu.is_some(), "a later sample measures CPU");
+    let memory = last.memory.as_ref().unwrap();
+    assert!(memory.used_bytes > 0 && memory.used_bytes <= memory.total_bytes);
+    assert!(last.disk.as_ref().is_some_and(|disk| disk.total_bytes > 0));
+
+    // A later watcher is given the history the first one saw arrive.
+    let mut other = daemon.client();
+    let (_, history) = other.watch_system_totals().unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|sample| sample.sequence == last.sequence)
+    );
+    drop((watcher, other));
+    daemon.shutdown();
+}
+
+fn next_totals(client: &mut DaemonClient) -> TotalsSample {
+    let started = Instant::now();
+    loop {
+        match client.poll_event().unwrap() {
+            Some(ServerEvent::Control {
+                message: ServerMessage::SystemTotalsSampled { sample },
+                ..
+            }) => return sample,
+            Some(_) => {}
+            None => thread::sleep(POLL_INTERVAL),
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "no totals sample after {:?}",
             started.elapsed()
         );
     }

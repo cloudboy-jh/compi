@@ -2056,6 +2056,9 @@ mod tests {
         let monitor = PaneContent::Monitor(MonitorContent::default());
         let row = content_row(&session, &tab, &PaneId::new("monitor"), &monitor);
         assert_eq!(row["type"], "monitor");
-        assert_eq!(row["content"], json!({"kind": "monitor"}));
+        assert_eq!(
+            row["content"],
+            json!({"kind": "monitor", "page": "overview"})
+        );
     }
 }

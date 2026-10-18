@@ -6,6 +6,9 @@
 //! only once.
 
 mod collector;
+mod totals;
+
+pub use totals::{SystemTotalsHub, SystemTotalsWatch};
 
 use compi_protocol::system_metrics::{Process, ProcessSample, SystemSample};
 use std::collections::HashSet;

@@ -18,7 +18,7 @@ unicode-width.workspace = true
 vte.workspace = true
 portable-pty = "0.9"
 parking_lot = "0.12"
-sysinfo = { version = "0.39", default-features = false, features = ["system", "user"] }
+sysinfo = { version = "0.39", default-features = false, features = ["disk", "network", "system", "user"] }
 
 [dev-dependencies]
 compi-client = { path = "../compi-client" }
@@ -38,6 +38,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Pipes",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

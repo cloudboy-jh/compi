@@ -1,5 +1,8 @@
-//! Monitor's samples of the daemon's host, collected only while a connection
-//! watches them (`WatchSystemMetrics`).
+//! Monitor's samples of the daemon's host.
+//!
+//! System totals (CPU, memory, disk, network) are sampled all the time into an hour of
+//! history and sent to connections that `WatchSystemTotals`. Processes are sampled only
+//! while a connection watches them (`WatchSystemMetrics`).
 //!
 //! A value the host would not give the daemon is `None`, never zero: a zero is a real
 //! reading. Names, paths and command lines are whatever the processes chose and are shown
@@ -8,6 +11,110 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Time between two totals samples.
+pub const TOTALS_INTERVAL_MS: u64 = 2000;
+/// Totals samples kept: one hour.
+pub const TOTALS_HISTORY: usize = 1800;
+
+/// What the host is, sent once when a connection starts watching totals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostInfo {
+    pub host_name: Option<String>,
+    /// The operating system and its version, such as "macOS 26.6 Tahoe".
+    pub os: Option<String>,
+    /// The processor's name, such as "Apple M3 Pro".
+    pub cpu: Option<String>,
+    pub logical_cpus: u32,
+    /// Milliseconds since the Unix epoch.
+    pub booted_at_ms: Option<u64>,
+}
+
+/// One totals sample. Rates cover the interval since the previous sample, so the first
+/// sample after the daemon starts has none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TotalsSample {
+    /// Counts samples since the daemon started; consecutive samples differ by one.
+    pub sequence: u64,
+    /// Milliseconds since the Unix epoch.
+    pub sampled_at_ms: u64,
+    pub cpu: Option<CpuTotals>,
+    pub memory: Option<MemoryTotals>,
+    /// The disk holding the system: the volume at `/`, or the Windows system drive.
+    pub disk: Option<DiskTotals>,
+    pub network: Option<NetworkTotals>,
+}
+
+/// Percentages of all logical CPUs together, 0 to 100.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct CpuTotals {
+    /// Programs, including niced ones.
+    pub user: f32,
+    /// The kernel on their behalf.
+    pub system: f32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MemoryTotals {
+    pub total_bytes: u64,
+    /// Memory in use: what is not free or reclaimable cache.
+    pub used_bytes: u64,
+    /// How the memory divides, in the host's own terms, adding up to `total_bytes`.
+    pub kinds: Vec<MemoryKind>,
+    pub swap_total_bytes: Option<u64>,
+    pub swap_used_bytes: Option<u64>,
+    /// Where the host reports it (macOS).
+    pub pressure: Option<MemoryPressure>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryKind {
+    pub kind: MemoryKindName,
+    pub bytes: u64,
+}
+
+/// macOS divides memory into App, Wired, Compressed, Cached and Free; Windows and Linux
+/// into Used, Cached and Free.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKindName {
+    App,
+    Wired,
+    Compressed,
+    Used,
+    Cached,
+    Free,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPressure {
+    Normal,
+    Elevated,
+    Critical,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskTotals {
+    pub name: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub read_bytes_per_second: Option<u64>,
+    pub written_bytes_per_second: Option<u64>,
+    /// Written since the disk's counters started, where the host keeps them.
+    pub written_bytes: Option<u64>,
+}
+
+/// Every network interface with a hardware address together, so loopback and tunnels
+/// that carry the same traffic again are left out.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkTotals {
+    pub received_bytes_per_second: Option<u64>,
+    pub sent_bytes_per_second: Option<u64>,
+    /// Since the interfaces' counters started (usually boot).
+    pub received_bytes: u64,
+    pub sent_bytes: u64,
+}
 
 /// One sample of the host's processes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

@@ -713,6 +713,20 @@ impl DaemonClient {
         }
     }
 
+    /// Starts receiving `SystemTotalsSampled` events on this connection, after returning
+    /// the host and the last hour of totals, oldest first.
+    pub fn watch_system_totals(
+        &mut self,
+    ) -> Result<(
+        crate::system_metrics::HostInfo,
+        Vec<crate::system_metrics::TotalsSample>,
+    )> {
+        match self.request_bounded(ClientMessage::WatchSystemTotals, Duration::from_secs(5))? {
+            ServerMessage::SystemTotalsWatching { host, history } => Ok((host, history)),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     pub fn attach_console_surface(
         &mut self,
         surface: &SurfaceInfo,

@@ -1,0 +1,1315 @@
+//! Monitor's Overview and resource pages (CPU, Memory, Disk, Network), drawn from the
+//! window's totals history.
+//!
+//! Each metric has a colour from the theme's own ANSI palette (CPU blue, Memory green,
+//! Disk yellow, Network cyan), made legible on the pane, and uses it for its nav icon,
+//! card icon and dots. History graphs are dot matrices painted as quads: one column per
+//! time bucket of the selected range, filled from the bottom. Percentages (CPU, memory)
+//! take a bucket's mean, rates (disk, network) its peak, scaled to the highest value in
+//! the range with a floor so an idle link does not fill a column. A bucket with no
+//! sample (a gap, or before the history begins) draws no dots at all.
+use super::*;
+use crate::gui::workspace::settings::settings_card;
+use crate::monitor::layout::{self, OverviewCard, OverviewLayout};
+use crate::monitor::totals::{self, Combine, Span, TotalsHistory};
+use crate::monitor::{
+    bytes_parts, format_bytes, format_percent, format_rate, format_uptime, format_whole_percent,
+    percent_parts, rate_parts,
+};
+use compi_protocol::system_metrics::{
+    HostInfo, MemoryKindName, MemoryPressure, MemoryTotals, TotalsSample,
+};
+use gpui::{Bounds, PathBuilder, fill, point, size};
+
+/// A dot of a history graph, and the gap between dots.
+const DOT: f32 = 3.0;
+const DOT_GAP: f32 = 2.0;
+/// Rows of dots in a card's strip.
+const CARD_DOT_ROWS: usize = 8;
+/// Rates below these never fill a column: an idle disk or link stays low.
+const DISK_RATE_FLOOR: f64 = 1024.0 * 1024.0;
+const NETWORK_RATE_FLOOR: f64 = 128.0 * 1024.0;
+/// A card's padding and border on each side (`p_4` and `border_1`).
+const CARD_INSET: f32 = 17.0;
+/// Between a card's figures.
+const CARD_FIGURE_GAP: f32 = 12.0;
+/// Between the ring and the legend of Memory by type.
+const RING_GAP: f32 = 24.0;
+
+/// The window's totals, shared by its Monitor panes.
+#[derive(Default)]
+pub(super) struct TotalsFeed {
+    pub(super) slot: WatchSlot,
+    pub(super) state: FeedState,
+    pub(super) host: Option<HostInfo>,
+    history: TotalsHistory,
+    /// What Monitor showed when it was paused.
+    frozen: Option<TotalsHistory>,
+}
+
+impl TotalsFeed {
+    /// The history drawn: frozen while paused, else live.
+    pub(super) fn shown(&self) -> &TotalsHistory {
+        self.frozen.as_ref().unwrap_or(&self.history)
+    }
+
+    /// Forgets the history: what is not current is not shown.
+    pub(super) fn reset(&mut self, state: FeedState) {
+        *self = Self {
+            slot: std::mem::take(&mut self.slot),
+            state,
+            ..Self::default()
+        };
+    }
+
+    pub(super) fn freeze(&mut self, paused: bool) {
+        self.frozen = paused.then(|| self.history.clone());
+    }
+}
+
+/// The hardware Monitor reports, each with a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Metric {
+    Cpu,
+    Memory,
+    Disk,
+    Network,
+}
+
+impl Metric {
+    pub(super) const ALL: [Self; 4] = [Self::Cpu, Self::Memory, Self::Disk, Self::Network];
+
+    pub(super) const fn page(self) -> MonitorPage {
+        match self {
+            Self::Cpu => MonitorPage::Cpu,
+            Self::Memory => MonitorPage::Memory,
+            Self::Disk => MonitorPage::Disk,
+            Self::Network => MonitorPage::Network,
+        }
+    }
+
+    /// The metric's card on Overview.
+    pub(super) const fn card(self) -> OverviewCard {
+        match self {
+            Self::Cpu => OverviewCard::Cpu,
+            Self::Memory => OverviewCard::Memory,
+            Self::Disk => OverviewCard::Disk,
+            Self::Network => OverviewCard::Network,
+        }
+    }
+
+    /// The metric an Overview card shows; Memory by type is not one.
+    pub(super) const fn of_card(card: OverviewCard) -> Option<Self> {
+        match card {
+            OverviewCard::Cpu => Some(Self::Cpu),
+            OverviewCard::Memory => Some(Self::Memory),
+            OverviewCard::Disk => Some(Self::Disk),
+            OverviewCard::Network => Some(Self::Network),
+            OverviewCard::MemoryByType => None,
+        }
+    }
+
+    pub(super) const fn of_page(page: MonitorPage) -> Option<Self> {
+        match page {
+            MonitorPage::Cpu => Some(Self::Cpu),
+            MonitorPage::Memory => Some(Self::Memory),
+            MonitorPage::Disk => Some(Self::Disk),
+            MonitorPage::Network => Some(Self::Network),
+            MonitorPage::Overview | MonitorPage::Processes => None,
+        }
+    }
+
+    pub(super) const fn title(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Memory => "Memory",
+            Self::Disk => "Disk",
+            Self::Network => "Network",
+        }
+    }
+
+    pub(super) const fn icon(self) -> IconName {
+        match self {
+            Self::Cpu => IconName::Cpu,
+            Self::Memory => IconName::MemoryStick,
+            Self::Disk => IconName::HardDrive,
+            Self::Network => IconName::Network,
+        }
+    }
+
+    /// The metric's colour in the theme's ANSI palette: blue, green, yellow, cyan.
+    const fn palette_index(self) -> usize {
+        match self {
+            Self::Cpu => 4,
+            Self::Memory => 2,
+            Self::Disk => 3,
+            Self::Network => 6,
+        }
+    }
+
+    /// The metric's value in `sample`, short enough for the nav.
+    pub(super) fn nav_value(self, sample: &TotalsSample) -> Option<String> {
+        match self {
+            Self::Cpu => totals::cpu_used(sample).map(|cpu| format_whole_percent(cpu as f32)),
+            Self::Memory => sample
+                .memory
+                .as_ref()
+                .and_then(totals::memory_used_percent)
+                .map(|used| format_whole_percent(used as f32)),
+            Self::Disk => sample.disk.as_ref().and_then(disk_rate).map(format_rate),
+            Self::Network => sample
+                .network
+                .and_then(|network| network.received_bytes_per_second)
+                .map(format_rate),
+        }
+    }
+}
+
+/// Read and written together, where either is known.
+fn disk_rate(disk: &compi_protocol::system_metrics::DiskTotals) -> Option<u64> {
+    match (disk.read_bytes_per_second, disk.written_bytes_per_second) {
+        (None, None) => None,
+        (read, written) => Some(read.unwrap_or(0) + written.unwrap_or(0)),
+    }
+}
+
+/// How the range reads in a graph's caption.
+const fn span_caption(span: Span) -> &'static str {
+    match span {
+        Span::Minute => "Last minute",
+        Span::FiveMinutes => "Last 5 minutes",
+        Span::FifteenMinutes => "Last 15 minutes",
+        Span::Hour => "Last hour",
+    }
+}
+
+/// A value with its unit, or unavailable.
+type Reading = Option<(String, &'static str)>;
+
+/// One small labelled figure of a card or page.
+struct Figure {
+    label: &'static str,
+    value: Option<String>,
+}
+
+fn figure(label: &'static str, value: Option<String>) -> Figure {
+    Figure { label, value }
+}
+
+/// What a card shows besides its graph.
+struct Card {
+    metric: Metric,
+    subtitle: String,
+    value: Reading,
+    badge: Option<MemoryPressure>,
+    figures: [Figure; 3],
+}
+
+fn card(metric: Metric, sample: Option<&TotalsSample>, host: Option<&HostInfo>) -> Card {
+    match metric {
+        Metric::Cpu => {
+            let cpu = sample.and_then(|sample| sample.cpu);
+            Card {
+                metric,
+                subtitle: "Now".into(),
+                value: sample
+                    .and_then(totals::cpu_used)
+                    .map(|used| percent_parts(used as f32)),
+                badge: None,
+                figures: [
+                    figure("User", cpu.map(|cpu| format_percent(cpu.user))),
+                    figure("System", cpu.map(|cpu| format_percent(cpu.system))),
+                    figure(
+                        "Cores",
+                        host.map(|host| host.logical_cpus)
+                            .filter(|cores| *cores > 0)
+                            .map(|cores| cores.to_string()),
+                    ),
+                ],
+            }
+        }
+        Metric::Memory => {
+            let memory = sample.and_then(|sample| sample.memory.as_ref());
+            let [first, second, third] = memory.map_or(
+                [
+                    figure("App", None),
+                    figure("Wired", None),
+                    figure("Compressed", None),
+                ],
+                |memory| {
+                    totals::memory_figures(memory)
+                        .map(|shown| figure(shown.label, shown.bytes.map(format_bytes)))
+                },
+            );
+            Card {
+                metric,
+                subtitle: memory.map_or_else(
+                    || "In use".into(),
+                    |memory| format!("In use of {}", format_bytes(memory.total_bytes)),
+                ),
+                value: memory.map(|memory| bytes_parts(memory.used_bytes)),
+                badge: memory
+                    .and_then(|memory| memory.pressure)
+                    .filter(|pressure| *pressure != MemoryPressure::Normal),
+                figures: [first, second, third],
+            }
+        }
+        Metric::Disk => {
+            let disk = sample.and_then(|sample| sample.disk.as_ref());
+            Card {
+                metric,
+                subtitle: disk.map_or_else(
+                    || "Free".into(),
+                    |disk| format!("Free of {}", format_bytes(disk.total_bytes)),
+                ),
+                value: disk.map(|disk| bytes_parts(disk.available_bytes)),
+                badge: None,
+                figures: [
+                    figure(
+                        "Reading",
+                        disk.and_then(|disk| disk.read_bytes_per_second)
+                            .map(format_rate),
+                    ),
+                    figure(
+                        "Writing",
+                        disk.and_then(|disk| disk.written_bytes_per_second)
+                            .map(format_rate),
+                    ),
+                    figure(
+                        "Written",
+                        disk.and_then(|disk| disk.written_bytes).map(format_bytes),
+                    ),
+                ],
+            }
+        }
+        Metric::Network => {
+            let network = sample.and_then(|sample| sample.network);
+            Card {
+                metric,
+                subtitle: "Downloading".into(),
+                value: network
+                    .and_then(|network| network.received_bytes_per_second)
+                    .map(rate_parts),
+                badge: None,
+                figures: [
+                    figure(
+                        "Uploading",
+                        network
+                            .and_then(|network| network.sent_bytes_per_second)
+                            .map(format_rate),
+                    ),
+                    figure(
+                        "Received",
+                        network.map(|network| format_bytes(network.received_bytes)),
+                    ),
+                    figure(
+                        "Sent",
+                        network.map(|network| format_bytes(network.sent_bytes)),
+                    ),
+                ],
+            }
+        }
+    }
+}
+
+/// One history graph: a dense window of values (one per sample), how a column sums
+/// them up and the value of a full column. `under` is drawn under `values` in its own
+/// shade (CPU's system share under its total).
+struct Strip {
+    values: Vec<Option<f64>>,
+    under: Option<Vec<Option<f64>>>,
+    combine: Combine,
+    scale: f64,
+    color: Hsla,
+    under_color: Hsla,
+    faint: Hsla,
+}
+
+/// The metric's overview graph: CPU and memory in use, disk read and written together,
+/// network received.
+fn card_series(
+    metric: Metric,
+    history: &TotalsHistory,
+    span: Span,
+) -> (Vec<Option<f64>>, Combine, f64) {
+    let samples = span.samples();
+    match metric {
+        Metric::Cpu => (
+            history.window(samples, totals::cpu_used),
+            Combine::Mean,
+            100.0,
+        ),
+        Metric::Memory => (
+            history.window(samples, |sample| {
+                sample.memory.as_ref().and_then(totals::memory_used_percent)
+            }),
+            Combine::Mean,
+            100.0,
+        ),
+        Metric::Disk => {
+            let values = history.window(samples, |sample| {
+                sample
+                    .disk
+                    .as_ref()
+                    .and_then(disk_rate)
+                    .map(|rate| rate as f64)
+            });
+            let scale = totals::rate_scale(&values, DISK_RATE_FLOOR);
+            (values, Combine::Max, scale)
+        }
+        Metric::Network => {
+            let values = history.window(samples, |sample| {
+                sample
+                    .network
+                    .and_then(|network| network.received_bytes_per_second)
+                    .map(|rate| rate as f64)
+            });
+            let scale = totals::rate_scale(&values, NETWORK_RATE_FLOOR);
+            (values, Combine::Max, scale)
+        }
+    }
+}
+
+/// A dot-matrix graph `height` pixels tall filling its width: as many columns as fit,
+/// the newest at the right.
+fn dot_graph(strip: Strip, height: f32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let pitch = DOT + DOT_GAP;
+            let width = f32::from(bounds.size.width);
+            let columns = ((width + DOT_GAP) / pitch).floor().max(0.0) as usize;
+            let rows = ((f32::from(bounds.size.height) + DOT_GAP) / pitch)
+                .floor()
+                .max(0.0) as usize;
+            if columns == 0 || rows == 0 {
+                return;
+            }
+            let top = totals::buckets(&strip.values, columns, strip.combine);
+            let under = strip
+                .under
+                .as_ref()
+                .map(|under| totals::buckets(under, columns, strip.combine));
+            // Right-aligned, so the newest column sits on the edge.
+            let left = f32::from(bounds.origin.x) + width - (columns as f32 * pitch - DOT_GAP);
+            let bottom = f32::from(bounds.origin.y) + f32::from(bounds.size.height);
+            for (column, value) in top.iter().enumerate() {
+                let Some(value) = value else {
+                    continue;
+                };
+                let filled = totals::filled_dots(*value, strip.scale, rows);
+                let beneath = under
+                    .as_ref()
+                    .and_then(|under| under[column])
+                    .map_or(0, |under| totals::filled_dots(under, strip.scale, rows))
+                    .min(filled);
+                let x = left + column as f32 * pitch;
+                for row in 0..rows {
+                    let y = bottom - DOT - row as f32 * pitch;
+                    let tint = if row < beneath {
+                        strip.under_color
+                    } else if row < filled {
+                        strip.color
+                    } else {
+                        strip.faint
+                    };
+                    window.paint_quad(
+                        fill(
+                            Bounds::new(point(px(x), px(y)), size(px(DOT), px(DOT))),
+                            tint,
+                        )
+                        .corner_radii(px(DOT / 2.0)),
+                    );
+                }
+            }
+        },
+    )
+    .w_full()
+    .h(px(height))
+}
+
+/// A ring of `segments` (each a share of the whole and its colour), clockwise from the
+/// top, painted as filled paths.
+fn ring(segments: Vec<(f64, Hsla)>, diameter: f32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center_x = f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0;
+            let center_y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
+            let outer = f32::from(bounds.size.width).min(f32::from(bounds.size.height)) / 2.0;
+            let inner = outer * 0.68;
+            let at = |radius: f32, angle: f32| {
+                point(
+                    px(center_x + radius * angle.cos()),
+                    px(center_y + radius * angle.sin()),
+                )
+            };
+            let mut start = -std::f32::consts::FRAC_PI_2;
+            for (share, tint) in &segments {
+                let sweep = (*share as f32).clamp(0.0, 1.0) * std::f32::consts::TAU;
+                if sweep <= 0.0 {
+                    continue;
+                }
+                // About every 3 degrees, so the edge reads as a curve.
+                let steps = ((sweep / 3f32.to_radians()).ceil() as usize).max(2);
+                let mut points = Vec::with_capacity(2 * (steps + 1));
+                for step in 0..=steps {
+                    points.push(at(outer, start + sweep * step as f32 / steps as f32));
+                }
+                for step in (0..=steps).rev() {
+                    points.push(at(inner, start + sweep * step as f32 / steps as f32));
+                }
+                let mut path = PathBuilder::fill();
+                path.add_polygon(&points, true);
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, *tint);
+                }
+                start += sweep;
+            }
+        },
+    )
+    .size(px(diameter))
+}
+
+impl CompiApp {
+    /// The colour of `metric`, from the theme's ANSI palette, legible on the pane.
+    pub(super) fn metric_color(&self, metric: Metric) -> u32 {
+        let colors = self.colors();
+        modal_text_color(self.theme.terminal().ansi[metric.palette_index()], colors)
+    }
+
+    pub(super) fn totals_event(&mut self, generation: u64, event: TotalsEvent) {
+        let paused = self.monitor.paused;
+        let feed = &mut self.monitor.totals;
+        if !feed.slot.is_current(generation) {
+            // A watcher stopped since.
+            return;
+        }
+        // While paused, what is drawn (`frozen`) stays as it was; only the live history
+        // behind it changes.
+        match event {
+            TotalsEvent::Watching { host, history } => {
+                // A new connection: its history replaces what the window had.
+                feed.state = FeedState::Live;
+                feed.host = Some(host);
+                feed.history = TotalsHistory::seeded(history);
+                if paused && feed.frozen.is_none() {
+                    feed.freeze(true);
+                }
+            }
+            TotalsEvent::Sampled(sample) => {
+                feed.state = FeedState::Live;
+                feed.history.push(sample);
+            }
+            TotalsEvent::Stale => {
+                if feed.state == FeedState::Live {
+                    feed.state = FeedState::Stale;
+                }
+            }
+            TotalsEvent::Failed(error) => {
+                feed.state = FeedState::Failed(error);
+                feed.history = TotalsHistory::default();
+            }
+        }
+    }
+
+    /// The Overview page on a page `width` wide: the cards placed on the grid
+    /// `layout::overview_layout` computes, each at its exact width, rows of equal height.
+    pub(super) fn render_monitor_overview(
+        &self,
+        pane_id: &PaneId,
+        pane: &MonitorPane,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if let Some(message) = self.totals_message() {
+            return message;
+        }
+        let feed = &self.monitor.totals;
+        let history = feed.shown();
+        let latest = history.latest();
+        let memory = latest
+            .and_then(|sample| sample.memory.as_ref())
+            .filter(|memory| !memory.kinds.is_empty());
+        let grid = layout::overview_layout(width, memory.is_some());
+        // The keyboard highlight moves on the grid drawn.
+        pane.card_rows.set(grid.rows);
+        let rows = grid.rows.iter().map(|row| {
+            div()
+                .flex()
+                .items_stretch()
+                .gap(px(grid.gap))
+                .children(row.iter().map(|placed| {
+                    let width = grid.width(placed.span);
+                    let highlighted = pane.card == Some(placed.card);
+                    match Metric::of_card(placed.card) {
+                        Some(metric) => {
+                            let (values, combine, scale) =
+                                card_series(metric, history, self.monitor.span);
+                            self.render_metric_card(
+                                pane_id,
+                                card(metric, latest, feed.host.as_ref()),
+                                self.strip(metric, values, None, combine, scale, 1.0),
+                                &grid,
+                                width,
+                                highlighted,
+                                cx,
+                            )
+                        }
+                        None => memory.map_or_else(
+                            || div().into_any_element(),
+                            |memory| {
+                                self.render_memory_by_type(pane_id, memory, width, highlighted, cx)
+                            },
+                        ),
+                    }
+                }))
+        });
+        self.monitor_scroll_page(
+            "monitor-overview",
+            grid.padding,
+            grid.content_width,
+            div().flex().flex_col().gap(px(grid.gap)).children(rows),
+        )
+    }
+
+    /// A message in place of a page that draws totals, while they are not there.
+    fn totals_message(&self) -> Option<AnyElement> {
+        let feed = &self.monitor.totals;
+        if !feed.shown().is_empty() {
+            return None;
+        }
+        let colors = self.colors();
+        Some(match &feed.state {
+            FeedState::Failed(error) => self.monitor_message(
+                "Can't read the host's usage",
+                Some((format!("{error} (retrying)"), colors.error)),
+            ),
+            FeedState::Connecting | FeedState::Live | FeedState::Stale => {
+                self.monitor_message("Reading the host's usage…", None)
+            }
+        })
+    }
+
+    /// A page that scrolls: `padding` around `content`, which is `content_width` wide
+    /// and centred.
+    fn monitor_scroll_page(
+        &self,
+        id: &'static str,
+        padding: f32,
+        content_width: f32,
+        content: Div,
+    ) -> AnyElement {
+        let stale = self.monitor.totals.state == FeedState::Stale;
+        div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .when(stale, |page| page.child(self.monitor_stale_note()))
+            .child(
+                div()
+                    .id(id)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(px(padding))
+                    .child(content.w(px(content_width)).mx_auto()),
+            )
+            .into_any_element()
+    }
+
+    /// A graph of `values` in `metric`'s colour (`shade` of it), with `under` beneath in
+    /// the full colour.
+    fn strip(
+        &self,
+        metric: Metric,
+        values: Vec<Option<f64>>,
+        under: Option<Vec<Option<f64>>>,
+        combine: Combine,
+        scale: f64,
+        shade: f32,
+    ) -> Strip {
+        let tint = color(self.metric_color(metric));
+        Strip {
+            values,
+            under,
+            combine,
+            scale,
+            color: tint.opacity(shade),
+            under_color: tint,
+            faint: tint.opacity(0.14),
+        }
+    }
+
+    /// The icon, title and chevron line of a card; the title gives way first.
+    fn card_title(&self, metric: Metric, title: &'static str) -> Div {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().flex_none().child(controls::glyph(
+                metric.icon(),
+                color(self.metric_color(metric)),
+            )))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .child(controls::glyph(IconName::ChevronRight, muted)),
+            )
+    }
+
+    /// A card `width` wide that opens `card`'s page on click; `highlighted` rings it for
+    /// the keyboard. It fills its row's height, and `body` fills the card.
+    fn clickable_card(
+        &self,
+        pane_id: &PaneId,
+        card: OverviewCard,
+        width: f32,
+        highlighted: bool,
+        body: Div,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let pane_id = pane_id.clone();
+        let page = Metric::of_card(card).map_or(MonitorPage::Memory, Metric::page);
+        let surface = settings_card(&colors)
+            .id(("monitor-card", card as usize))
+            .flex_1()
+            .p_4()
+            .cursor_pointer()
+            .hover(move |style| style.border_color(color(colors.accent).opacity(0.6)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.set_monitor_page(&pane_id, page);
+                cx.notify();
+            }))
+            .child(body.flex_1().min_w_0());
+        controls::highlight(highlighted, surface, cx)
+            .w(px(width))
+            .flex()
+            .flex_col()
+            .into_any_element()
+    }
+
+    /// A metric's card on `grid`, `width` wide: title and subtitle, the big value, three
+    /// figures, and the graph at the bottom.
+    #[allow(clippy::too_many_arguments)]
+    fn render_metric_card(
+        &self,
+        pane_id: &PaneId,
+        data: Card,
+        strip: Strip,
+        grid: &OverviewLayout,
+        width: f32,
+        highlighted: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let compact = grid.compact;
+        let badge = data.badge.map(|pressure| match pressure {
+            MemoryPressure::Critical => controls::chip("Critical", controls::ChipTone::Danger),
+            MemoryPressure::Elevated | MemoryPressure::Normal => controls::chip(
+                "Elevated",
+                controls::ChipTone::Tint(self.metric_color(Metric::Disk)),
+            ),
+        });
+        // Compact, the badge goes under the subtitle; otherwise beside the value.
+        let (badge_above, badge_beside) = if compact {
+            (badge, None)
+        } else {
+            (None, badge)
+        };
+        let inner = (width - 2.0 * CARD_INSET).max(1.0);
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(self.card_title(data.metric, data.metric.title()))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(data.subtitle),
+                    )
+                    .children(badge_above.map(|badge| div().flex().child(badge))),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .child(self.big_reading(data.value, if compact { 24.0 } else { 28.0 }))
+                    .children(badge_beside.map(|badge| div().flex_none().child(badge))),
+            )
+            .child(self.figure_grid(
+                &data.figures,
+                3,
+                inner,
+                CARD_FIGURE_GAP,
+                if compact {
+                    UI_MICRO_TEXT_SIZE
+                } else {
+                    UI_SMALL_TEXT_SIZE
+                },
+            ))
+            // The graphs of a row line up at the bottom of their cards.
+            .child(div().flex_1())
+            .child(dot_graph(
+                strip,
+                CARD_DOT_ROWS as f32 * (DOT + DOT_GAP) - DOT_GAP,
+            ));
+        self.clickable_card(pane_id, data.metric.card(), width, highlighted, body, cx)
+    }
+
+    /// A large value and its unit, or a muted dash.
+    fn big_reading(&self, reading: Reading, size: f32) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        match reading {
+            Some((value, unit)) => div()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .items_baseline()
+                .gap_1()
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .text_size(px(size))
+                        .line_height(px(size * 1.15))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(value),
+                )
+                .child(
+                    div()
+                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .text_color(muted)
+                        .child(unit),
+                )
+                .into_any_element(),
+            None => div()
+                .text_size(px(size))
+                .line_height(px(size * 1.15))
+                .text_color(muted)
+                .child(UNAVAILABLE)
+                .into_any_element(),
+        }
+    }
+
+    /// `figures` in an equal grid of `columns` across `width`, rows as needed. Labels
+    /// and values stay on one line and end in an ellipsis when cut.
+    fn figure_grid(
+        &self,
+        figures: &[Figure],
+        columns: usize,
+        width: f32,
+        gap: f32,
+        value_size: f32,
+    ) -> Div {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let cell_width = layout::cell_width(width, columns, gap);
+        let line = || {
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .children(figures.chunks(columns.max(1)).map(|row| {
+                div().flex().gap(px(gap)).children(row.iter().map(|figure| {
+                    div()
+                        .flex_none()
+                        .w(px(cell_width))
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            line()
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .text_color(muted)
+                                .child(figure.label),
+                        )
+                        .child(match &figure.value {
+                            Some(value) => line()
+                                .text_size(px(value_size))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(value.clone()),
+                            None => line()
+                                .text_size(px(value_size))
+                                .text_color(muted)
+                                .child(UNAVAILABLE),
+                        })
+                }))
+            }))
+    }
+
+    /// How memory divides, in a card `width` wide: a ring of the kinds in the host's
+    /// order with the share in use in its middle, and a legend beside it (under it, the
+    /// ring centred, when narrow).
+    fn render_memory_by_type(
+        &self,
+        pane_id: &PaneId,
+        memory: &MemoryTotals,
+        width: f32,
+        highlighted: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let (beside, diameter) = layout::ring_layout(width);
+        let inner = (width - 2.0 * CARD_INSET).max(1.0);
+        let whole: u64 = memory.kinds.iter().map(|kind| kind.bytes).sum();
+        let kinds: Vec<(MemoryKindName, u64, Hsla)> = memory
+            .kinds
+            .iter()
+            .map(|kind| (kind.kind, kind.bytes, self.memory_kind_color(kind.kind)))
+            .collect();
+        let segments = kinds
+            .iter()
+            .map(|&(_, bytes, tint)| (bytes as f64 / whole.max(1) as f64, tint))
+            .collect();
+        let in_use = totals::memory_used_percent(memory).map_or_else(
+            || UNAVAILABLE.to_owned(),
+            |used| format_whole_percent(used as f32),
+        );
+        let legend = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .map(|legend| {
+                if beside {
+                    legend.w(px((inner - diameter - RING_GAP).max(1.0)))
+                } else {
+                    legend.w_full()
+                }
+            })
+            .children(kinds.iter().map(|&(kind, bytes, tint)| {
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(tint))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(totals::kind_label(kind)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(muted)
+                            .whitespace_nowrap()
+                            .child(format_bytes(bytes)),
+                    )
+            }));
+        let ring = div()
+            .relative()
+            .flex_none()
+            .size(px(diameter))
+            .child(ring(segments, diameter))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(if diameter < 120.0 { 18.0 } else { 20.0 }))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(in_use),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .child("in use"),
+                    ),
+            );
+        let content = if beside {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(RING_GAP))
+                .child(ring)
+                .child(legend)
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(div().flex().justify_center().child(ring))
+                .child(legend)
+        };
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.card_title(Metric::Memory, "Memory by type"))
+            .child(content);
+        self.clickable_card(
+            pane_id,
+            OverviewCard::MemoryByType,
+            width,
+            highlighted,
+            body,
+            cx,
+        )
+    }
+
+    /// Each kind of memory in its own colour of the theme's palette; free memory faint.
+    fn memory_kind_color(&self, kind: MemoryKindName) -> Hsla {
+        let colors = self.colors();
+        let palette = self.theme.terminal();
+        let index = match kind {
+            MemoryKindName::App | MemoryKindName::Used => 2,
+            MemoryKindName::Wired => 3,
+            MemoryKindName::Compressed => 5,
+            MemoryKindName::Cached => 6,
+            MemoryKindName::Free => return color(colors.border),
+        };
+        color(modal_text_color(palette.ansi[index], colors))
+    }
+
+    /// A resource page `width` wide: the metric's figures, large, in an equal grid, and
+    /// its history over the range.
+    pub(super) fn render_monitor_resource(
+        &self,
+        pane_id: &PaneId,
+        metric: Metric,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if let Some(message) = self.totals_message() {
+            return message;
+        }
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let (padding, content_width) = layout::page_frame(width);
+        let gap = layout::gap(content_width);
+        let inner = (content_width - 2.0 * CARD_INSET).max(1.0);
+        let feed = &self.monitor.totals;
+        let history = feed.shown();
+        let latest = history.latest();
+        let host = feed.host.as_ref();
+        let span = self.monitor.span;
+        let samples = span.samples();
+        let data = card(metric, latest, host);
+        let (figures, caption, graphs): (Vec<Figure>, Option<String>, Vec<(&'static str, Strip)>) =
+            match metric {
+                Metric::Cpu => {
+                    let total = history.window(samples, totals::cpu_used);
+                    let system = history.window(samples, |sample| {
+                        sample.cpu.map(|cpu| f64::from(cpu.system))
+                    });
+                    let mut figures = vec![figure(
+                        "In use",
+                        latest
+                            .and_then(totals::cpu_used)
+                            .map(|used| format_percent(used as f32)),
+                    )];
+                    figures.extend(data.figures);
+                    (
+                        figures,
+                        host.and_then(|host| host.cpu.as_deref())
+                            .map(totals_display),
+                        vec![(
+                            "User over system",
+                            self.strip(metric, total, Some(system), Combine::Mean, 100.0, 0.55),
+                        )],
+                    )
+                }
+                Metric::Memory => {
+                    let memory = latest.and_then(|sample| sample.memory.as_ref());
+                    let used = history.window(samples, |sample| {
+                        sample.memory.as_ref().and_then(totals::memory_used_percent)
+                    });
+                    let mut figures = vec![
+                        figure(
+                            "In use",
+                            memory.map(|memory| format_bytes(memory.used_bytes)),
+                        ),
+                        figure(
+                            "Total",
+                            memory.map(|memory| format_bytes(memory.total_bytes)),
+                        ),
+                    ];
+                    figures.extend(data.figures);
+                    figures.push(figure(
+                        "Swap",
+                        memory.and_then(|memory| {
+                            Some(format!(
+                                "{} of {}",
+                                format_bytes(memory.swap_used_bytes?),
+                                format_bytes(memory.swap_total_bytes?)
+                            ))
+                        }),
+                    ));
+                    figures.push(figure(
+                        "Pressure",
+                        memory.and_then(|memory| memory.pressure).map(|pressure| {
+                            match pressure {
+                                MemoryPressure::Normal => "Normal",
+                                MemoryPressure::Elevated => "Elevated",
+                                MemoryPressure::Critical => "Critical",
+                            }
+                            .to_owned()
+                        }),
+                    ));
+                    (
+                        figures,
+                        None,
+                        vec![(
+                            "In use",
+                            self.strip(metric, used, None, Combine::Mean, 100.0, 1.0),
+                        )],
+                    )
+                }
+                Metric::Disk => {
+                    let disk = latest.and_then(|sample| sample.disk.as_ref());
+                    let read = history.window(samples, |sample| {
+                        sample
+                            .disk
+                            .as_ref()
+                            .and_then(|disk| disk.read_bytes_per_second)
+                            .map(|rate| rate as f64)
+                    });
+                    let written = history.window(samples, |sample| {
+                        sample
+                            .disk
+                            .as_ref()
+                            .and_then(|disk| disk.written_bytes_per_second)
+                            .map(|rate| rate as f64)
+                    });
+                    // Both graphs share one scale, so their heights compare.
+                    let scale = totals::rate_scale(&read, DISK_RATE_FLOOR)
+                        .max(totals::rate_scale(&written, DISK_RATE_FLOOR));
+                    let mut figures = vec![
+                        figure("Free", disk.map(|disk| format_bytes(disk.available_bytes))),
+                        figure("Total", disk.map(|disk| format_bytes(disk.total_bytes))),
+                    ];
+                    figures.extend(data.figures);
+                    (
+                        figures,
+                        disk.map(|disk| totals_display(&disk.name)),
+                        vec![
+                            (
+                                "Reading",
+                                self.strip(metric, read, None, Combine::Max, scale, 1.0),
+                            ),
+                            (
+                                "Writing",
+                                self.strip(metric, written, None, Combine::Max, scale, 0.55),
+                            ),
+                        ],
+                    )
+                }
+                Metric::Network => {
+                    let network = latest.and_then(|sample| sample.network);
+                    let received = history.window(samples, |sample| {
+                        sample
+                            .network
+                            .and_then(|network| network.received_bytes_per_second)
+                            .map(|rate| rate as f64)
+                    });
+                    let sent = history.window(samples, |sample| {
+                        sample
+                            .network
+                            .and_then(|network| network.sent_bytes_per_second)
+                            .map(|rate| rate as f64)
+                    });
+                    let scale = totals::rate_scale(&received, NETWORK_RATE_FLOOR)
+                        .max(totals::rate_scale(&sent, NETWORK_RATE_FLOOR));
+                    let mut figures = vec![figure(
+                        "Downloading",
+                        network
+                            .and_then(|network| network.received_bytes_per_second)
+                            .map(format_rate),
+                    )];
+                    figures.extend(data.figures);
+                    (
+                        figures,
+                        None,
+                        vec![
+                            (
+                                "Downloading",
+                                self.strip(metric, received, None, Combine::Max, scale, 1.0),
+                            ),
+                            (
+                                "Uploading",
+                                self.strip(metric, sent, None, Combine::Max, scale, 0.55),
+                            ),
+                        ],
+                    )
+                }
+            };
+        let figure_columns = layout::figure_columns(inner, figures.len());
+        let figures_card = settings_card(&colors)
+            .p_4()
+            .gap_3()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_none().child(controls::glyph(
+                        metric.icon(),
+                        color(self.metric_color(metric)),
+                    )))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(data.subtitle),
+                    )
+                    .when_some(caption, |line, caption| {
+                        line.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .text_color(muted)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(caption),
+                        )
+                    }),
+            )
+            .child(self.big_reading(data.value, layout::resource_value_size(content_width)))
+            .child(self.figure_grid(&figures, figure_columns, inner, gap, 18.0));
+        let graph_height = layout::graph_height(content_width);
+        let graphs_card = settings_card(&colors)
+            .p_4()
+            .gap_4()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("History"),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(span_caption(span)),
+                    ),
+            )
+            .children(graphs.into_iter().map(|(label, strip)| {
+                let legend = if strip.under.is_some() {
+                    vec![("User", strip.color), ("System", strip.under_color)]
+                } else {
+                    vec![(label, strip.color)]
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .children(legend.into_iter().map(|(label, tint)| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(div().size(px(8.0)).rounded_full().bg(tint))
+                                    .child(label)
+                            })),
+                    )
+                    .child(dot_graph(strip, graph_height))
+            }));
+        let memory_by_type = (metric == Metric::Memory)
+            .then(|| latest.and_then(|sample| sample.memory.as_ref()))
+            .flatten()
+            .filter(|memory| !memory.kinds.is_empty())
+            .map(|memory| self.render_memory_by_type(pane_id, memory, content_width, false, cx));
+        self.monitor_scroll_page(
+            "monitor-resource",
+            padding,
+            content_width,
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(gap))
+                .child(figures_card)
+                .child(graphs_card)
+                .children(memory_by_type),
+        )
+    }
+
+    /// The host line of Monitor's nav: the processor and how long the host has been up.
+    pub(super) fn monitor_host_detail(&self) -> Option<String> {
+        let feed = &self.monitor.totals;
+        let host = feed.host.as_ref()?;
+        let uptime = host
+            .booted_at_ms
+            .zip(feed.shown().latest().map(|latest| latest.sampled_at_ms))
+            .map(|(booted, now)| {
+                format!("Up {}", format_uptime(totals::uptime_seconds(booted, now)))
+            });
+        let cpu = host.cpu.as_deref().map(totals_display);
+        match (cpu, uptime) {
+            (Some(cpu), Some(uptime)) => Some(format!("{cpu} · {uptime}")),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Text the host chose (a disk or processor name), as one line.
+fn totals_display(text: &str) -> String {
+    crate::monitor::display_line(text)
+}

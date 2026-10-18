@@ -1,10 +1,14 @@
-//! Monitor's process list, kept pure: which processes a pane shows, in what
-//! order, and how their values read. The pane (`gui::workspace::monitor`) draws it;
+//! Monitor, kept pure: which processes a pane shows, in what order, and how values
+//! read (here), the totals history its graphs draw from ([`totals`]) and how its pages
+//! divide their width ([`layout`]). The pane (`gui::workspace::monitor`) draws them;
 //! nothing here talks to the daemon or GPUI.
 //!
 //! A value the host would not give is `None` and reads as unavailable, never as zero.
 //! Sorting puts unavailable values last in either direction, and breaks ties by name,
 //! then pid, so the same processes always come in the same order.
+
+pub mod layout;
+pub mod totals;
 
 use compi_protocol::system_metrics::{Process, ProcessOwner};
 use std::cmp::Ordering;
@@ -358,17 +362,77 @@ pub fn format_cpu(share: f32) -> String {
     format!("{share:.1}%")
 }
 
-/// Resident memory in KB below a megabyte, else in MB or GB with one decimal.
-pub fn format_memory(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * KB;
-    const GB: u64 = MB * KB;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
+const KB: u64 = 1024;
+const MB: u64 = KB * KB;
+const GB: u64 = MB * KB;
+const TB: u64 = GB * KB;
+
+/// A size as a number and its unit: KB below a megabyte (rounded up, so a few bytes
+/// are not "0 KB"), else MB, GB or TB with one decimal. Binary units.
+pub fn bytes_parts(bytes: u64) -> (String, &'static str) {
+    let scaled = |unit: u64| format!("{:.1}", bytes as f64 / unit as f64);
+    if bytes >= TB {
+        (scaled(TB), "TB")
+    } else if bytes >= GB {
+        (scaled(GB), "GB")
     } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
+        (scaled(MB), "MB")
     } else {
-        format!("{} KB", bytes.div_ceil(KB))
+        (bytes.div_ceil(KB).to_string(), "KB")
+    }
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    let (value, unit) = bytes_parts(bytes);
+    format!("{value} {unit}")
+}
+
+/// A transfer rate as a number and its unit: whole B/s below a kilobyte a second, else
+/// KB/s, MB/s or GB/s with one decimal. Binary units.
+pub fn rate_parts(bytes_per_second: u64) -> (String, &'static str) {
+    let scaled = |unit: u64| format!("{:.1}", bytes_per_second as f64 / unit as f64);
+    if bytes_per_second >= GB {
+        (scaled(GB), "GB/s")
+    } else if bytes_per_second >= MB {
+        (scaled(MB), "MB/s")
+    } else if bytes_per_second >= KB {
+        (scaled(KB), "KB/s")
+    } else {
+        (bytes_per_second.to_string(), "B/s")
+    }
+}
+
+pub fn format_rate(bytes_per_second: u64) -> String {
+    let (value, unit) = rate_parts(bytes_per_second);
+    format!("{value} {unit}")
+}
+
+/// A percentage with one decimal and its unit.
+pub fn percent_parts(percent: f32) -> (String, &'static str) {
+    (format!("{:.1}", percent.clamp(0.0, 100.0)), "%")
+}
+
+pub fn format_percent(percent: f32) -> String {
+    let (value, unit) = percent_parts(percent);
+    format!("{value}{unit}")
+}
+
+/// A whole percentage, for tight places such as Monitor's nav.
+pub fn format_whole_percent(percent: f32) -> String {
+    format!("{:.0}%", percent.clamp(0.0, 100.0))
+}
+
+/// How long the host has been up: "Xd Yh" from a day, else "Xh Ym".
+pub fn format_uptime(seconds: u64) -> String {
+    let (days, hours, minutes) = (
+        seconds / 86_400,
+        seconds % 86_400 / 3600,
+        seconds % 3600 / 60,
+    );
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else {
+        format!("{hours}h {minutes}m")
     }
 }
 
@@ -691,12 +755,28 @@ mod tests {
         assert_eq!(cpu_share(None, 8), None);
         assert_eq!(format_cpu(12.345), "12.3%");
         assert_eq!(format_cpu(0.0), "0.0%");
-        assert_eq!(format_memory(0), "0 KB");
-        assert_eq!(format_memory(1), "1 KB");
-        assert_eq!(format_memory(512 * 1024), "512 KB");
-        assert_eq!(format_memory(1024 * 1024), "1.0 MB");
-        assert_eq!(format_memory(150 * 1024 * 1024 + 300 * 1024), "150.3 MB");
-        assert_eq!(format_memory(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+        assert_eq!(format_bytes(0), "0 KB");
+        assert_eq!(format_bytes(1), "1 KB");
+        assert_eq!(format_bytes(512 * 1024), "512 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(150 * 1024 * 1024 + 300 * 1024), "150.3 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+        assert_eq!(
+            bytes_parts(2 * 1024 * 1024 * 1024 * 1024),
+            ("2.0".into(), "TB")
+        );
+        assert_eq!(format_rate(0), "0 B/s");
+        assert_eq!(format_rate(1023), "1023 B/s");
+        assert_eq!(format_rate(1536), "1.5 KB/s");
+        assert_eq!(format_rate(5 * 1024 * 1024), "5.0 MB/s");
+        assert_eq!(rate_parts(3 * 1024 * 1024 * 1024), ("3.0".into(), "GB/s"));
+        assert_eq!(format_percent(12.345), "12.3%");
+        assert_eq!(format_percent(140.0), "100.0%");
+        assert_eq!(percent_parts(7.0), ("7.0".into(), "%"));
+        assert_eq!(format_whole_percent(62.6), "63%");
+        assert_eq!(format_uptime(59), "0h 0m");
+        assert_eq!(format_uptime(3 * 3600 + 25 * 60), "3h 25m");
+        assert_eq!(format_uptime(24 * 86_400 + 14 * 3600 + 59), "24d 14h");
         assert_eq!(format_cpu_time(0), "0:00");
         assert_eq!(format_cpu_time(65_999), "1:05");
         assert_eq!(format_cpu_time(3_600_000), "1:00:00");

@@ -504,17 +504,21 @@ fn readable_by_older_formats(value: &mut serde_json::Value) {
     }
 }
 
-/// Undoes `readable_by_older_formats` for Monitor leaves. Every layout copy is walked.
+/// Undoes `readable_by_older_formats` for Monitor leaves, keeping their own fields (the
+/// page). Every layout copy is walked.
 fn restore_monitors(value: &mut serde_json::Value) {
     use serde_json::Value;
     match value {
         Value::Array(items) => items.iter_mut().for_each(restore_monitors),
         Value::Object(object) => {
             if object.get("type").and_then(Value::as_str) == Some("content")
-                && let Some(content) = object.get_mut("content")
+                && let Some(Value::Object(content)) = object.get_mut("content")
             {
                 if content.get("shows").and_then(Value::as_str) == Some("monitor") {
-                    *content = serde_json::json!({ "kind": "monitor" });
+                    for placeholder in ["shows", "section", "environment", "root"] {
+                        content.remove(placeholder);
+                    }
+                    content.insert("kind".into(), Value::from("monitor"));
                 }
                 return;
             }
@@ -795,8 +799,8 @@ fn short_id(id: &str) -> String {
 mod tests {
     use super::*;
     use compi_protocol::{
-        ContentEnvironment, ContentTab, FolderContent, GitScope, MonitorContent, PaneContent,
-        SettingsContent, SettingsSection, SplitAxis,
+        ContentEnvironment, ContentTab, FolderContent, GitScope, MonitorContent, MonitorPage,
+        PaneContent, SettingsContent, SettingsSection, SplitAxis,
     };
 
     fn test_path(name: &str) -> PathBuf {
@@ -1286,7 +1290,9 @@ mod tests {
         };
         let monitor = LayoutNode::Content {
             pane_id: PaneId::new("pane-4"),
-            content: PaneContent::Monitor(MonitorContent {}),
+            content: PaneContent::Monitor(MonitorContent {
+                page: MonitorPage::Processes,
+            }),
         };
         let terminal = LayoutNode::Pane {
             pane_id: PaneId::new("pane-1"),

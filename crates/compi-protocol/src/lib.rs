@@ -368,6 +368,9 @@ pub enum ClientMessage {
     /// Answers `SystemMetricsWatching`, then sends `SystemSampled` every few seconds while
     /// this connection stays open. Sampling runs only while some connection watches.
     WatchSystemMetrics,
+    /// Answers `SystemTotalsWatching` with the host and the last hour of totals, then sends
+    /// each later sample as `SystemTotalsSampled`, in order, while this connection stays open.
+    WatchSystemTotals,
     ShutdownDaemon,
 }
 
@@ -483,6 +486,15 @@ pub enum ServerMessage {
     ProgramStatusWatching,
     ProgramStatusAcknowledged,
     SystemMetricsWatching,
+    SystemTotalsWatching {
+        host: system_metrics::HostInfo,
+        history: Vec<system_metrics::TotalsSample>,
+    },
+    /// Unsolicited, after `WatchSystemTotals`: the next totals sample. Samples arrive in
+    /// order; a connection that falls an hour behind skips to what is still kept.
+    SystemTotalsSampled {
+        sample: system_metrics::TotalsSample,
+    },
     /// Unsolicited, after `WatchSystemMetrics`: the latest sample of the host. A client
     /// behind on reading is sent the newest one, never a backlog.
     SystemSampled {
@@ -1041,10 +1053,26 @@ pub struct SettingsContent {
     pub section: SettingsSection,
 }
 
-/// A content pane showing Monitor. What it shows is the daemon's host; how it
-/// is sorted and filtered is each window's own.
+/// A content pane showing Monitor, open at `page`. What it shows is the daemon's host; how
+/// it is sorted, filtered and which range it shows is each window's own.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MonitorContent {}
+pub struct MonitorContent {
+    #[serde(default)]
+    pub page: MonitorPage,
+}
+
+/// Monitor's pages, in the order they are listed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorPage {
+    #[default]
+    Overview,
+    Processes,
+    Cpu,
+    Memory,
+    Disk,
+    Network,
+}
 
 /// The sections of Settings, in the order they are listed.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]

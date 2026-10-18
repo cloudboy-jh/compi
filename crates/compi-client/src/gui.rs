@@ -629,11 +629,8 @@ enum UiEvent {
     /// Every terminal's program status, replacing what was known.
     ProgramStatusWatched(Vec<compi_protocol::program_status::SurfaceProgramStatus>),
     ProgramStatusChanged(compi_protocol::program_status::SurfaceProgramStatus),
-    /// What the window's Monitor watcher saw, from watcher `generation`.
-    Monitor {
-        generation: u64,
-        event: workspace::monitor::MonitorEvent,
-    },
+    /// What one of the window's Monitor watchers saw.
+    Monitor(workspace::monitor::MonitorEvent),
     PerformanceSample(Result<workspace::performance::PerformanceSample, String>),
     TabDisconnected {
         tab_id: u64,
