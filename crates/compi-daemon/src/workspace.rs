@@ -1892,7 +1892,8 @@ fn validate_split_geometry(
 }
 
 /// Content paths must be absolute where they live: on this host, or inside a WSL
-/// distribution, which only a Windows host can reach. Settings carries no paths.
+/// distribution, which only a Windows host can reach. Settings and Monitor carry
+/// no paths.
 fn validate_content(content: &PaneContent) -> Result<(), String> {
     content.validate()?;
     let PaneContent::Files(folder) = content else {
@@ -1922,6 +1923,7 @@ fn content_kind(content: &PaneContent) -> &'static str {
     match content {
         PaneContent::Files(_) => "files",
         PaneContent::Settings(_) => "settings",
+        PaneContent::Monitor(_) => "monitor",
     }
 }
 

@@ -120,8 +120,8 @@ pub(super) fn run(
     Ok(Output::Report { text, value })
 }
 
-/// The selected pane (the calling shell by default), its environment and directory. A
-/// Settings pane has neither, so it cannot be the caller.
+/// The selected pane (the calling shell by default), its environment and directory.
+/// Settings and Monitor panes have neither, so they cannot be the caller.
 pub(super) fn caller<'a>(
     client: &mut DaemonClient,
     state: &'a WorkspaceSnapshot,
@@ -144,15 +144,20 @@ pub(super) fn caller<'a>(
             ..
         } => (folder.environment.clone(), None, Some(folder.root.clone())),
         LayoutNode::Content {
-            content: PaneContent::Settings(_),
+            content: content @ (PaneContent::Settings(_) | PaneContent::Monitor(_)),
             ..
         } => {
             let command = options.args.first().map_or("this command", String::as_str);
+            let shows = if content.is_monitor() {
+                "Monitor"
+            } else {
+                "Settings"
+            };
             return Err(CliError::new(
                 3,
                 "files_pane_required",
                 format!(
-                    "pane {id} shows Settings; {command} needs a terminal pane or a content pane showing files"
+                    "pane {id} shows {shows}; {command} needs a terminal pane or a content pane showing files"
                 ),
             ));
         }

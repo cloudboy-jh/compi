@@ -158,6 +158,7 @@ registry! {
     Reconnect, "reconnect", "Reconnect window", None, None;
     RestartDaemon, "restart_daemon", "Restart daemon", None, None;
     OpenDiagnostics, "open_diagnostics", "Open diagnostics", None, None;
+    OpenMonitor, "open_monitor", "Monitor", None, None;
     Quit, "quit", "Quit Compi", Some("cmd-q"), Some("ctrl-shift-q");
 }
 
@@ -308,7 +309,7 @@ impl Command {
                 CommandCategory::Appearance
             }
             OpenPalette | OpenConfiguration | CheckForUpdates | RestartDaemon | OpenDiagnostics
-            | Quit => CommandCategory::System,
+            | OpenMonitor | Quit => CommandCategory::System,
         }
     }
 
@@ -391,6 +392,9 @@ impl Command {
             Reconnect => Some("Reconnects this window without stopping your terminals."),
             RestartDaemon => Some("Stops all running terminals before restarting the server."),
             Quit => Some("Closes Compi windows; your terminals keep running."),
+            OpenMonitor => Some(
+                "Shows the processes running where your terminals run, with their CPU and memory.",
+            ),
             _ => None,
         }
     }
@@ -435,6 +439,9 @@ impl Command {
             RecoverUnsavedEdits => "backup restore crash lost unsaved changes editor",
             RestartSurface => "exited failed lost process surface",
             Quit => "client close keep running daemon",
+            OpenMonitor => {
+                "task manager processes activity monitor resources top htop cpu memory threads pid kill end usage"
+            }
             _ => "",
         }
     }
@@ -465,6 +472,7 @@ impl Command {
                 | ResetClientLayout
                 | Reconnect
                 | OpenDiagnostics
+                | OpenMonitor
                 | Quit
         );
         if local {
@@ -1763,6 +1771,21 @@ mod tests {
         assert!(!Command::NewTab.spec().matches_query("workspace remove"));
         assert!(search("opacity").any(|spec| spec.command == Command::OpenQuickAppearance));
         assert!(search("appearance settings").any(|spec| spec.command == Command::OpenSettings));
+        for query in [
+            "processes",
+            "activity monitor",
+            "task manager",
+            "resources",
+            "top",
+            "cpu memory",
+            "kill",
+        ] {
+            assert!(
+                search(query).any(|spec| spec.command == Command::OpenMonitor),
+                "{query}"
+            );
+        }
+        assert_eq!(Command::OpenMonitor.spec().shortcut(Platform::Mac), None);
         assert_eq!(
             Command::RestartDaemon.spec().category(),
             CommandCategory::System

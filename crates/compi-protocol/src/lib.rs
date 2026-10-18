@@ -11,6 +11,7 @@ pub mod pipe;
 pub mod program_status;
 pub mod prompt;
 mod screen;
+pub mod system_metrics;
 #[cfg(windows)]
 pub mod wsl;
 
@@ -44,7 +45,8 @@ use std::fmt;
 // acknowledging finished ones.
 // Version 27 makes a content pane's content a kind: files (a folder and its tabs) or
 // Settings, and opens a tab holding only a content pane.
-pub const PROTOCOL_VERSION: u32 = 27;
+// Version 28 adds Monitor: a content kind and watching the host's processes.
+pub const PROTOCOL_VERSION: u32 = 28;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -363,6 +365,9 @@ pub enum ClientMessage {
         surface_id: SurfaceId,
         expected_lifetime: ProcessLifetimeId,
     },
+    /// Answers `SystemMetricsWatching`, then sends `SystemSampled` every few seconds while
+    /// this connection stays open. Sampling runs only while some connection watches.
+    WatchSystemMetrics,
     ShutdownDaemon,
 }
 
@@ -477,6 +482,12 @@ pub enum ServerMessage {
     },
     ProgramStatusWatching,
     ProgramStatusAcknowledged,
+    SystemMetricsWatching,
+    /// Unsolicited, after `WatchSystemMetrics`: the latest sample of the host. A client
+    /// behind on reading is sent the newest one, never a backlog.
+    SystemSampled {
+        sample: system_metrics::SystemSample,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -969,6 +980,8 @@ pub enum PaneContent {
     /// The client's Settings. Only the section shown is kept; what the settings hold
     /// lives in each client's configuration.
     Settings(SettingsContent),
+    /// Monitor: the daemon host's processes.
+    Monitor(MonitorContent),
 }
 
 impl PaneContent {
@@ -977,7 +990,7 @@ impl PaneContent {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Files(folder) => folder.validate(),
-            Self::Settings(_) => Ok(()),
+            Self::Settings(_) | Self::Monitor(_) => Ok(()),
         }
     }
 
@@ -985,7 +998,7 @@ impl PaneContent {
     pub fn folder(&self) -> Option<&FolderContent> {
         match self {
             Self::Files(folder) => Some(folder),
-            Self::Settings(_) => None,
+            Self::Settings(_) | Self::Monitor(_) => None,
         }
     }
 
@@ -993,8 +1006,13 @@ impl PaneContent {
     pub fn settings(&self) -> Option<&SettingsContent> {
         match self {
             Self::Settings(settings) => Some(settings),
-            Self::Files(_) => None,
+            Self::Files(_) | Self::Monitor(_) => None,
         }
+    }
+
+    /// Whether this shows Monitor.
+    pub fn is_monitor(&self) -> bool {
+        matches!(self, Self::Monitor(_))
     }
 
     /// Whether `other` is the same kind of content, which an update must keep.
@@ -1022,6 +1040,11 @@ pub struct FolderContent {
 pub struct SettingsContent {
     pub section: SettingsSection,
 }
+
+/// A content pane showing Monitor. What it shows is the daemon's host; how it
+/// is sorted and filtered is each window's own.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MonitorContent {}
 
 /// The sections of Settings, in the order they are listed.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]

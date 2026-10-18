@@ -5,6 +5,7 @@ mod kitty;
 
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
+use compi_protocol::system_metrics::{ProcessOwner, ProcessTable, SystemSample};
 use compi_protocol::{
     ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, FolderContent,
     LayoutNode, PROTOCOL_VERSION, PaneContent, ScreenSnapshot, ServerEvent, ServerMessage,
@@ -959,4 +960,81 @@ fn root_states(seen: &[Vec<ProgramStatusRecord>]) -> Vec<Option<ProgramState>> {
                 .map(|record| record.state)
         })
         .collect()
+}
+
+#[test]
+fn watched_system_metrics_report_the_daemon_and_send_details_once_per_connection() {
+    let mut daemon = DaemonGuard::start();
+    let daemon_pid = daemon.child.id();
+    let mut watcher = daemon.client();
+    watcher.watch_system_metrics().unwrap();
+    let mut table = ProcessTable::default();
+
+    // The first sample names every process; the daemon is the user's own.
+    let first = next_sample(&mut watcher);
+    assert!(first.logical_cpus >= 1);
+    assert!(
+        first
+            .processes
+            .iter()
+            .all(|sample| sample.details.is_some())
+    );
+    let processes = table.apply(first.processes);
+    let own = processes
+        .iter()
+        .find(|process| process.sample.pid == daemon_pid)
+        .expect("the daemon samples itself");
+    assert_eq!(own.details.owner, ProcessOwner::CurrentUser);
+    assert!(own.details.name.starts_with("compi-daemon"));
+    assert!(own.sample.memory_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(own.sample.threads.is_some_and(|threads| threads >= 1));
+
+    // Later samples carry no details for processes already described, and measure CPU.
+    let second = next_sample(&mut watcher);
+    let own = second
+        .processes
+        .iter()
+        .find(|sample| sample.pid == daemon_pid)
+        .unwrap();
+    assert!(own.details.is_none());
+    assert!(own.cpu_percent.is_some());
+    assert!(
+        table
+            .apply(second.processes)
+            .iter()
+            .any(|process| process.sample.pid == daemon_pid)
+    );
+
+    // Another connection is told everything again.
+    let mut other = daemon.client();
+    other.watch_system_metrics().unwrap();
+    let sample = next_sample(&mut other);
+    assert!(
+        sample
+            .processes
+            .iter()
+            .all(|sample| sample.details.is_some())
+    );
+
+    drop((watcher, other));
+    daemon.shutdown();
+}
+
+fn next_sample(client: &mut DaemonClient) -> SystemSample {
+    let started = Instant::now();
+    loop {
+        match client.poll_event().unwrap() {
+            Some(ServerEvent::Control {
+                message: ServerMessage::SystemSampled { sample },
+                ..
+            }) => return sample,
+            Some(_) => {}
+            None => thread::sleep(POLL_INTERVAL),
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "no system sample after {:?}",
+            started.elapsed()
+        );
+    }
 }

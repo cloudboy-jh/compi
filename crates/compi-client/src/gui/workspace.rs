@@ -18,6 +18,7 @@ mod git_gutter;
 pub(super) mod media;
 pub(in crate::gui) mod menus;
 pub(in crate::gui) mod metadata;
+pub(in crate::gui) mod monitor;
 pub(in crate::gui) mod motion;
 pub(in crate::gui) mod palette;
 pub(in crate::gui) mod pane_drag;
@@ -906,6 +907,7 @@ impl CompiApp {
             overlay_closing_since: None,
             palette: palette::PaletteState::default(),
             settings: settings::SettingsUi::default(),
+            monitor: monitor::MonitorUi::default(),
             popup: None,
             context_menu: None,
             tab_menu: None,
@@ -2000,6 +2002,7 @@ impl CompiApp {
             } => self.prompt_responded(job, request, result),
             UiEvent::ProgramStatusWatched(statuses) => self.program_status.replace_all(statuses),
             UiEvent::ProgramStatusChanged(status) => self.program_status.update(status),
+            UiEvent::Monitor { generation, event } => self.monitor_event(generation, event),
             UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.connection_error = None;
                 self.accept_workspace(workspace);
@@ -3915,6 +3918,7 @@ impl CompiApp {
             }
             Command::OpenQuickAppearance => self.open_quick_appearance(),
             Command::OpenSettings => self.open_settings(None, None, window, cx),
+            Command::OpenMonitor => self.open_monitor(),
             Command::CheckForUpdates => {
                 self.open_settings(Some(SettingsSection::Updates), None, window, cx);
                 self.updates.check();
@@ -4353,6 +4357,7 @@ impl CompiApp {
                             (folder.folder_name().to_owned(), Some(folder.root))
                         }
                         compi_protocol::PaneContent::Settings(_) => ("Settings".to_owned(), None),
+                        compi_protocol::PaneContent::Monitor(_) => ("Monitor".to_owned(), None),
                     };
                     Some(TabPane {
                         floating: self.state.is_floating(&pane_id),
@@ -4638,6 +4643,7 @@ impl CompiApp {
         self.sync_editor_theme(cx);
         self.prepare_content(window, cx);
         self.prepare_settings(window, cx);
+        self.prepare_monitor(window, cx);
         self.reconcile_keyboard_focus(window, cx);
         for view in &mut self.surface_views {
             if !view.stop.load(Ordering::Acquire) {
@@ -5803,6 +5809,12 @@ impl CompiApp {
                                         "empty-settings",
                                         "Settings",
                                         Command::OpenSettings,
+                                        cx,
+                                    ))
+                                    .child(self.command_button(
+                                        "empty-monitor",
+                                        "Monitor",
+                                        Command::OpenMonitor,
                                         cx,
                                     )),
                             ),

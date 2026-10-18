@@ -19,6 +19,7 @@ pub mod image_input;
 pub mod input;
 pub mod layout;
 pub mod metadata;
+pub mod monitor;
 pub mod probe;
 pub mod program_status;
 pub mod project_history;

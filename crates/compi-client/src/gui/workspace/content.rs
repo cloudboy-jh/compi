@@ -1361,9 +1361,9 @@ impl CompiApp {
 
     /// Keyboard focus follows the focused pane: a content pane keeps it on its editor
     /// (or on the pane while it has no editor, or the user left it), a Settings pane on
-    /// its search field or highlighted control, while terminals, overlays and the file
-    /// tree use `focus_handle`, which carries their text input. Focus held by anything
-    /// else is left alone.
+    /// its search field or highlighted control, a Monitor pane on its table or
+    /// search field, while terminals, overlays and the file tree use `focus_handle`,
+    /// which carries their text input. Focus held by anything else is left alone.
     pub(super) fn reconcile_keyboard_focus(&mut self, window: &mut Window, cx: &mut App) {
         let ours = window.focused(cx).is_none_or(|focused| {
             focused == self.focus_handle
@@ -1373,6 +1373,7 @@ impl CompiApp {
                     .values()
                     .any(|ui| ui.owns(&focused, window, cx))
                 || self.settings_owns(&focused, window, cx)
+                || self.monitor_owns(&focused, window, cx)
         });
         if !ours {
             return;
@@ -1398,6 +1399,16 @@ impl CompiApp {
                     return;
                 };
                 wanted
+            }
+            Some(pane_id) if self.monitor_pane_focus(pane_id).is_some() => {
+                let Some(focus) = self.monitor_pane_focus(pane_id) else {
+                    return;
+                };
+                if focus.contains_focused(window, cx) {
+                    // Its search field or table already has the keyboard.
+                    return;
+                }
+                focus.clone()
             }
             Some(pane_id) => {
                 let Some(ui) = self.content.panes.get(pane_id) else {
@@ -1434,6 +1445,7 @@ impl CompiApp {
     pub(super) fn editor_has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.overlay.is_none()
             && (self.settings_search_has_keyboard(window, cx)
+                || self.monitor_search_has_keyboard(window, cx)
                 || self
                     .focused_pane()
                     .and_then(|pane| self.content.panes.get(pane))
@@ -1454,7 +1466,7 @@ impl CompiApp {
         if !self.editor_has_keyboard(window, cx) {
             return;
         }
-        if self.settings_search_key(key, window, cx) {
+        if self.settings_search_key(key, window, cx) || self.monitor_search_key(key, window, cx) {
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2779,11 +2791,12 @@ impl CompiApp {
             .as_ref()
             .and_then(|workspace| find_content(workspace, &pane_id));
         let ui = self.content.panes.get(&pane_id);
-        let settings = self
+        let pane_content = self
             .workspace
             .as_ref()
-            .and_then(|workspace| find_pane_content(workspace, &pane_id))
-            .is_some_and(|content| content.settings().is_some());
+            .and_then(|workspace| find_pane_content(workspace, &pane_id));
+        let settings = pane_content.is_some_and(|content| content.settings().is_some());
+        let monitor = pane_content.is_some_and(PaneContent::is_monitor);
         let menu_id = pane_id.clone();
         let focus_id = pane_id.clone();
         let click_id = pane_id.clone();
@@ -2824,6 +2837,9 @@ impl CompiApp {
             )
             .when(settings, |pane| {
                 pane.child(self.render_settings_pane(&pane_id, rect.width, cx))
+            })
+            .when(monitor, |pane| {
+                pane.child(self.render_monitor_pane(&pane_id, rect.width, cx))
             })
             .when_some(
                 content.zip(ui).filter(|_| {

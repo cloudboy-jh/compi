@@ -2006,10 +2006,10 @@ mod tests {
     }
 
     #[test]
-    fn content_rows_report_files_and_settings_panes() {
+    fn content_rows_report_files_settings_and_monitor_panes() {
         use compi_protocol::{
-            ContentEnvironment, FolderContent, PaneContent, SessionId, SettingsContent,
-            SettingsSection, TabId,
+            ContentEnvironment, FolderContent, MonitorContent, PaneContent, SessionId,
+            SettingsContent, SettingsSection, TabId,
         };
         let files = PaneContent::Files(FolderContent {
             environment: ContentEnvironment::Host,
@@ -2053,5 +2053,9 @@ mod tests {
             row["content"],
             json!({"kind": "settings", "section": "terminal"})
         );
+        let monitor = PaneContent::Monitor(MonitorContent::default());
+        let row = content_row(&session, &tab, &PaneId::new("monitor"), &monitor);
+        assert_eq!(row["type"], "monitor");
+        assert_eq!(row["content"], json!({"kind": "monitor"}));
     }
 }

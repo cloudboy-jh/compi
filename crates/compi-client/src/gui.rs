@@ -629,6 +629,11 @@ enum UiEvent {
     /// Every terminal's program status, replacing what was known.
     ProgramStatusWatched(Vec<compi_protocol::program_status::SurfaceProgramStatus>),
     ProgramStatusChanged(compi_protocol::program_status::SurfaceProgramStatus),
+    /// What the window's Monitor watcher saw, from watcher `generation`.
+    Monitor {
+        generation: u64,
+        event: workspace::monitor::MonitorEvent,
+    },
     PerformanceSample(Result<workspace::performance::PerformanceSample, String>),
     TabDisconnected {
         tab_id: u64,
@@ -907,6 +912,8 @@ struct CompiApp {
     palette: workspace::palette::PaletteState,
     /// Settings panes, Quick Appearance and their keyboard highlight; see `settings`.
     settings: workspace::settings::SettingsUi,
+    /// Monitor panes and the window's process samples; see `monitor`.
+    monitor: workspace::monitor::MonitorUi,
     popup: Option<Popup>,
     /// A menu at the pointer: a right-click, a pane's grip.
     context_menu: Option<controls::ContextMenu>,

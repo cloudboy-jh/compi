@@ -260,9 +260,10 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
                     content: PaneContent::Files(folder),
                     ..
                 } => folder.environment,
-                // Settings has no folder; files beside it are the daemon host's.
+                // Settings and Monitor have no folder; files beside them are
+                // the daemon host's.
                 LayoutNode::Content {
-                    content: PaneContent::Settings(_),
+                    content: PaneContent::Settings(_) | PaneContent::Monitor(_),
                     ..
                 } => ContentEnvironment::Host,
                 LayoutNode::Split { .. } => unreachable!("leaves holds only leaf nodes"),
@@ -294,11 +295,16 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
                     ..
                 } => folder,
                 LayoutNode::Content {
-                    content: PaneContent::Settings(_),
+                    content: content @ (PaneContent::Settings(_) | PaneContent::Monitor(_)),
                     ..
                 } => {
+                    let shows = if content.is_monitor() {
+                        "Monitor"
+                    } else {
+                        "Settings"
+                    };
                     return Err(format!(
-                        "pane {pane_id} shows Settings; update-content needs a content pane showing files"
+                        "pane {pane_id} shows {shows}; update-content needs a content pane showing files"
                     )
                     .into());
                 }

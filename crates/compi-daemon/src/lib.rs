@@ -14,6 +14,7 @@ mod shell_integration;
 #[cfg(windows)]
 pub mod supervisor;
 pub mod surface;
+mod system_metrics;
 pub mod terminal;
 pub mod workspace;
 mod workspace_store;

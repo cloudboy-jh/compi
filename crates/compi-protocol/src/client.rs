@@ -704,6 +704,15 @@ impl DaemonClient {
         }
     }
 
+    /// Starts receiving `SystemSampled` events on this connection. Use a connection of
+    /// its own and drop it to stop: the daemon samples only while someone watches.
+    pub fn watch_system_metrics(&mut self) -> Result<()> {
+        match self.request_bounded(ClientMessage::WatchSystemMetrics, Duration::from_secs(5))? {
+            ServerMessage::SystemMetricsWatching => Ok(()),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     pub fn attach_console_surface(
         &mut self,
         surface: &SurfaceInfo,
