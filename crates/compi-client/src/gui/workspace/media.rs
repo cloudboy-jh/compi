@@ -300,6 +300,7 @@ impl CompiApp {
         view.send(ClientMessage::Input {
             data: crate::input::encode_paste(&input, bracketed),
             latency_id: None,
+            alternate_scroll: false,
         });
         if self.image_previews.len() == MAX_PREVIEWS {
             self.image_previews.pop_front();

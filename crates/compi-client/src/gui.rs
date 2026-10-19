@@ -311,6 +311,9 @@ struct SurfaceView {
     diagnostic_frame_logged: bool,
     transport: Option<TabTransport>,
     scroll_offset: usize,
+    new_lines: usize,
+    pending_scroll: Option<crate::viewport::PendingScroll>,
+    wheel: input::WheelAccumulator,
     selection: Option<Selection>,
     selecting: bool,
     mouse_reporting_down: bool,
@@ -502,6 +505,9 @@ impl SurfaceView {
         self.viewport_fingerprint = None;
         self.selection = None;
         self.scroll_offset = 0;
+        self.new_lines = 0;
+        self.pending_scroll = None;
+        self.wheel = input::WheelAccumulator::default();
         self.selecting = false;
         self.mouse_reporting_down = false;
         self.image_cache.clear();
@@ -1044,6 +1050,8 @@ impl CompiApp {
             keyboard_protocol_flags,
         ) {
             tab.scroll_offset = 0;
+            tab.new_lines = 0;
+            tab.pending_scroll = None;
             let latency_id = perf::begin_input_latency();
             if let Some(latency_id) = latency_id {
                 perf::log_input_latency_stage(latency_id, "key_receipt", None);
@@ -1051,6 +1059,7 @@ impl CompiApp {
             tab.send(ClientMessage::Input {
                 data: bytes,
                 latency_id,
+                alternate_scroll: false,
             });
             let (surface_id, lifetime) = (tab.surface_id.clone(), tab.lifetime.clone());
             self.acknowledge_program_results(&surface_id, &lifetime);
@@ -1139,9 +1148,13 @@ impl CompiApp {
             .snapshot()
             .is_some_and(|snapshot| snapshot.modes.bracketed_paste);
         let data = input::encode_paste(&text, bracketed);
+        tab.scroll_offset = 0;
+        tab.new_lines = 0;
+        tab.pending_scroll = None;
         tab.send(ClientMessage::Input {
             data,
             latency_id: None,
+            alternate_scroll: false,
         });
     }
     fn report_focus(&mut self, focused: bool) {
@@ -1156,6 +1169,7 @@ impl CompiApp {
             tab.send(ClientMessage::Input {
                 data: input::encode_focus(focused),
                 latency_id: None,
+                alternate_scroll: false,
             });
         }
     }
@@ -1189,6 +1203,13 @@ impl CompiApp {
         let Some(tab) = self.focused_view_mut() else {
             return;
         };
+        if tab.pending_scroll.take().is_some() {
+            tab.scroll_offset = 0;
+            tab.new_lines = 0;
+            tab.selection = None;
+            cx.notify();
+            return;
+        }
         let mouse_mode = tab
             .mirror
             .snapshot()
@@ -1218,6 +1239,7 @@ impl CompiApp {
                 tab.send(ClientMessage::Input {
                     data,
                     latency_id: None,
+                    alternate_scroll: false,
                 });
             }
             return;
@@ -1309,6 +1331,7 @@ impl CompiApp {
             tab.send(ClientMessage::Input {
                 data,
                 latency_id: None,
+                alternate_scroll: false,
             });
         }
     }
@@ -1361,6 +1384,7 @@ impl CompiApp {
                 tab.send(ClientMessage::Input {
                     data,
                     latency_id: None,
+                    alternate_scroll: false,
                 });
             }
         } else {
@@ -1412,35 +1436,68 @@ impl CompiApp {
         };
         cx.stop_propagation();
         let cell_height = self.typography.cell_height;
-        let delta = f32::from(event.delta.pixel_delta(px(cell_height)).y);
+        let delta = f64::from(f32::from(event.delta.pixel_delta(px(cell_height)).y))
+            / f64::from(cell_height);
         let Some(tab) = self.focused_view_mut() else {
             return;
         };
-        let mouse_mode = tab
+        let (mouse_mode, alternate_screen, application_cursor) = tab
             .mirror
             .snapshot()
-            .map(|snapshot| snapshot.modes.mouse)
+            .map(|snapshot| {
+                (
+                    snapshot.modes.mouse,
+                    snapshot.modes.alternate_screen,
+                    snapshot.modes.application_cursor,
+                )
+            })
             .unwrap_or_default();
-        if mouse_mode != MouseMode::None && !event.modifiers.shift {
-            let data = input::encode_mouse_wheel(
-                delta > 0.0,
-                point.col,
-                visible_row(tab.rows, point.row),
-                terminal_modifiers(event.modifiers),
-            );
-            tab.send(ClientMessage::Input {
-                data,
-                latency_id: None,
-            });
-        } else {
-            let lines = (delta.abs() / cell_height).ceil().max(1.0) as usize;
-            if delta > 0.0 {
-                tab.scroll_offset = (tab.scroll_offset + lines).min(tab.max_scroll_offset());
-            } else {
-                tab.scroll_offset = tab.scroll_offset.saturating_sub(lines);
+        let route =
+            input::WheelRoute::for_modes(mouse_mode, alternate_screen, event.modifiers.shift);
+        let lines = tab.wheel.take_lines(delta, route);
+        if lines == 0 {
+            return;
+        }
+        let count = lines.unsigned_abs();
+        match route {
+            input::WheelRoute::Mouse => {
+                let data = input::encode_mouse_wheel(
+                    lines > 0,
+                    count,
+                    point.col,
+                    visible_row(tab.rows, point.row),
+                    terminal_modifiers(event.modifiers),
+                );
+                tab.send(ClientMessage::Input {
+                    data,
+                    latency_id: None,
+                    alternate_scroll: false,
+                });
             }
-            self.save_state();
-            cx.notify();
+            input::WheelRoute::Alternate => {
+                let data = input::encode_alternate_scroll(lines > 0, count, application_cursor);
+                tab.send(ClientMessage::Input {
+                    data,
+                    latency_id: None,
+                    alternate_scroll: true,
+                });
+            }
+            input::WheelRoute::History => {
+                if lines > 0 {
+                    tab.scroll_offset = tab
+                        .scroll_offset
+                        .saturating_add(count)
+                        .min(tab.max_scroll_offset());
+                } else {
+                    tab.scroll_offset = tab.scroll_offset.saturating_sub(count);
+                }
+                tab.pending_scroll = None;
+                if tab.scroll_offset == 0 {
+                    tab.new_lines = 0;
+                }
+                self.save_state();
+                cx.notify();
+            }
         }
     }
 }
@@ -1759,9 +1816,12 @@ impl EntityInputHandler for CompiApp {
             && let Some(tab) = self.focused_view_mut()
         {
             tab.scroll_offset = 0;
+            tab.new_lines = 0;
+            tab.pending_scroll = None;
             tab.send(ClientMessage::Input {
                 data: text.as_bytes().to_vec(),
                 latency_id: None,
+                alternate_scroll: false,
             });
             let (surface_id, lifetime) = (tab.surface_id.clone(), tab.lifetime.clone());
             self.acknowledge_program_results(&surface_id, &lifetime);
@@ -1864,25 +1924,41 @@ impl PaintModel {
         focused: bool,
     ) -> Option<Self> {
         let snapshot = tab.mirror.snapshot()?;
-        let (visible_rows, base_row) = visible_rows(snapshot, tab.scroll_offset);
+        let (visible_rows, base_row) = if let Some(pending) = &tab.pending_scroll {
+            (pending.rows.clone(), pending.base)
+        } else {
+            let (rows, base) = visible_rows(snapshot, tab.scroll_offset);
+            (rows.cloned().collect(), base)
+        };
         Some(Self {
-            visible_rows: visible_rows.cloned().collect(),
+            visible_rows,
             base_row,
             scrollback_len: snapshot.scrollback.len(),
             cursor: snapshot.cursor,
             alternate_screen: snapshot.modes.alternate_screen,
-            placements: snapshot.placements.clone(),
+            placements: if tab.pending_scroll.is_some() {
+                Vec::new()
+            } else {
+                snapshot.placements.clone()
+            },
             scroll_offset: tab.scroll_offset,
-            selection: tab.selection,
-            images: tab
-                .image_cache
-                .iter()
-                .map(|(id, (_, image))| (*id, image.clone()))
-                .collect(),
+            selection: tab
+                .pending_scroll
+                .is_none()
+                .then_some(tab.selection)
+                .flatten(),
+            images: if tab.pending_scroll.is_some() {
+                HashMap::new()
+            } else {
+                tab.image_cache
+                    .iter()
+                    .map(|(id, (_, image))| (*id, image.clone()))
+                    .collect()
+            },
             row_render_cache: tab.row_render_cache.clone(),
             typography,
             theme,
-            focused,
+            focused: focused && tab.pending_scroll.is_none(),
         })
     }
 }

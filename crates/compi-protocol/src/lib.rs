@@ -331,6 +331,9 @@ pub enum ClientMessage {
     Input {
         data: Vec<u8>,
         latency_id: Option<u64>,
+        /// GUI-synthesized alternate-screen wheel arrows, not ordinary keyboard input.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        alternate_scroll: bool,
     },
     Resize {
         cols: i16,
@@ -1520,6 +1523,27 @@ pub fn decode_server(payload: &[u8]) -> serde_json::Result<ServerControl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_json_remains_compatible_without_alternate_scroll_marker() {
+        let legacy = br#"{"request_id":7,"type":"input","data":[27,91,65],"latency_id":null}"#;
+        let request = decode_client(legacy).unwrap();
+        assert_eq!(
+            request.message,
+            ClientMessage::Input {
+                data: b"\x1b[A".to_vec(),
+                latency_id: None,
+                alternate_scroll: false,
+            }
+        );
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&encode_client(&request).unwrap()).unwrap();
+        assert!(encoded.get("alternate_scroll").is_none());
+        assert_eq!(
+            encoded,
+            serde_json::from_slice::<serde_json::Value>(legacy).unwrap()
+        );
+    }
 
     #[test]
     fn ids_are_distinct_and_serialize_as_strings() {

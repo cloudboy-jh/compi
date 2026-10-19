@@ -237,6 +237,8 @@ pub struct TerminalState {
     shell_pid: Option<u32>,
     program_status: program_status::ProgramStatusSet,
     modes: TerminalModes,
+    /// DECSET 1007 is daemon-local; screen frames deliberately omit it.
+    alternate_scroll: bool,
     keyboard_protocol_stack: Vec<u8>,
     scroll_top: usize,
     scroll_bottom: usize,
@@ -286,6 +288,7 @@ impl TerminalState {
                 auto_wrap: true,
                 ..TerminalModes::default()
             },
+            alternate_scroll: true,
             keyboard_protocol_stack: Vec::new(),
             scroll_top: 0,
             scroll_bottom: rows,
@@ -327,6 +330,14 @@ impl TerminalState {
             Some(label) => format!("session={session_id},trace={label}"),
             None => format!("session={session_id}"),
         };
+    }
+
+    /// Only GUI-synthesized wheel arrows are subject to alternate-scroll mode.
+    pub fn accepts_input(&self, alternate_scroll: bool) -> bool {
+        !alternate_scroll
+            || (self.active_alternate
+                && self.modes.mouse == MouseMode::None
+                && self.alternate_scroll)
     }
 
     pub fn shell_pid(&self) -> Option<u32> {
@@ -1165,6 +1176,7 @@ impl TerminalState {
                     1003 => self.set_mouse_mode(MouseMode::AnyMotion, enabled),
                     1004 => self.modes.focus_events = enabled,
                     1006 => self.modes.sgr_mouse = enabled,
+                    1007 => self.alternate_scroll = enabled,
                     2004 => self.modes.bracketed_paste = enabled,
                     2026 if enabled => {
                         self.synchronized_output.get_or_insert_with(Instant::now);
@@ -2320,6 +2332,44 @@ mod tests {
 
     fn visible_text(snapshot: &Snapshot, row: usize) -> String {
         row_text(&snapshot.cells[row])
+    }
+
+    #[test]
+    fn alternate_scroll_defaults_on_and_obeys_mode_changes_and_reset() {
+        let mut terminal = TerminalState::new(12, 3);
+        assert!(terminal.alternate_scroll);
+        assert!(!terminal.accepts_input(true));
+        assert!(terminal.accepts_input(false));
+
+        terminal.advance(b"\x1b[?1049h");
+        assert!(terminal.accepts_input(true));
+        terminal.advance(b"\x1b[?1007l");
+        assert!(!terminal.accepts_input(true));
+        assert!(terminal.accepts_input(false));
+        terminal.advance(b"\x1b[?1007h");
+        assert!(terminal.accepts_input(true));
+
+        terminal.advance(b"\x1b[?1007l\x1bc");
+        assert!(terminal.alternate_scroll);
+        assert!(!terminal.accepts_input(true));
+        terminal.advance(b"\x1b[?1049h");
+        assert!(terminal.accepts_input(true));
+    }
+
+    #[test]
+    fn alternate_scroll_requires_alternate_screen_without_mouse_reporting() {
+        let mut terminal = TerminalState::new(12, 3);
+        for mode in [1000, 1002, 1003] {
+            terminal.advance(b"\x1b[?1049h");
+            terminal.advance(format!("\x1b[?{mode}h").as_bytes());
+            assert!(!terminal.accepts_input(true), "mouse mode {mode}");
+            assert!(terminal.accepts_input(false), "mouse mode {mode}");
+            terminal.advance(format!("\x1b[?{mode}l").as_bytes());
+            assert!(terminal.accepts_input(true), "mouse mode {mode}");
+            terminal.advance(b"\x1b[?1049l");
+            assert!(!terminal.accepts_input(true));
+            assert!(terminal.accepts_input(false));
+        }
     }
 
     #[test]

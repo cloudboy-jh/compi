@@ -27,6 +27,13 @@ On Windows/WSL2, Compi's default shell finds Windows commands (`pwsh.exe`, `code
 
 On Windows/WSL2, the tree can browse a shell directory linked into a mounted Windows drive. If the WSL share cannot follow the link, Compi resolves that directory in WSL and retries through its Windows path.
 
+## Scrolling
+
+- Scroll over a terminal pane without changing keyboard focus. While output continues, Compi keeps the text you are reading in place while it remains in retained history, including when older rows are evicted or a program redraws its history.
+- **↓ N new lines** appears when output arrives while you are scrolled up. Click it, or type into the terminal, to return to live output.
+- Wheel and trackpad fractions accumulate per pane instead of rounding every event up. Applications with mouse reporting receive whole wheel reports; alternate-screen pagers such as `less` receive Up/Down keys otherwise. Programs can disable that fallback with DECSET 1007 (`ESC[?1007l`) and re-enable it with `ESC[?1007h`; it starts enabled.
+- Hold Shift to use local scrolling instead of sending wheel input to an application. The existing 1 MiB scrollback memory cap still applies; retaining the full configured line count is separate work.
+
 ## Shell lifecycle and recovery
 
 New tabs and splits open directly into the terminal canvas. Starting a shell shows no bar, spinner, delayed indicator, or reserved space.

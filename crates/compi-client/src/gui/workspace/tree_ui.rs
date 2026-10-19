@@ -81,6 +81,7 @@ impl CompiApp {
             view.send(ClientMessage::Input {
                 data,
                 latency_id: None,
+                alternate_scroll: false,
             });
         }
     }

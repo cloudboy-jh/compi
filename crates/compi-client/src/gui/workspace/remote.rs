@@ -204,9 +204,12 @@ impl CompiApp {
                 .find(|view| view.pane_id == terminal)
             {
                 view.scroll_offset = 0;
+                view.new_lines = 0;
+                view.pending_scroll = None;
                 view.send(ClientMessage::Input {
                     data,
                     latency_id: None,
+                    alternate_scroll: false,
                 });
                 self.remote.typed = Some((view.surface_id.clone(), Instant::now()));
             }

@@ -351,6 +351,7 @@ fn kitty_4k_payload_and_placement_survive_detach_and_reconnect() {
         .request(ClientMessage::Input {
             data: b"cat kitty-transfer\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let before = collect_snapshot_until_marker(&mut attached, b"KITTY_READY_42");
@@ -412,6 +413,7 @@ fn persistent_multi_surface_lifecycle() {
         .send(ClientMessage::Input {
             data: b"echo FIRST_$((20+22))\rexit\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let (first_output, first_exit) = collect_until_exit(&daemon, &mut first_client, &first.id);
@@ -431,6 +433,7 @@ fn persistent_multi_surface_lifecycle() {
         .request(ClientMessage::Input {
             data: b"for ((i=0;i<3000;i++)); do if [ \"$(stty size)\" = '40 100' ]; then stty size; echo ATTACH_SIZE_$((20+22)); break; fi; sleep 0.01; done\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let attach_output = collect_until_marker(&mut second_client, b"ATTACH_SIZE_42");
@@ -450,6 +453,7 @@ fn persistent_multi_surface_lifecycle() {
         .request(ClientMessage::Input {
             data: b"for ((i=0;i<3000;i++)); do if [ \"$(stty size)\" = '50 120' ]; then stty size; echo ACTIVE_SIZE_$((20+22)); break; fi; sleep 0.01; done\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let resize_output = collect_until_marker(&mut second_client, b"ACTIVE_SIZE_42");
@@ -460,6 +464,7 @@ fn persistent_multi_surface_lifecycle() {
                 .as_bytes()
                 .to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let styled = collect_snapshot_until_marker(&mut second_client, b"UNICODE_\xce\xbb");
@@ -475,6 +480,7 @@ fn persistent_multi_surface_lifecycle() {
         .request(ClientMessage::Input {
             data: b"printf '\\033[?1049hALT_%s\\n' SCREEN; read -r reply; printf '\\033[?1049lALT_%s:%s\\n' RETURNED \"$reply\"\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let alternate = collect_snapshot_until_marker(&mut second_client, b"ALT_SCREEN");
@@ -483,6 +489,7 @@ fn persistent_multi_surface_lifecycle() {
         .request(ClientMessage::Input {
             data: b"interactive-complete\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let main =
@@ -497,6 +504,7 @@ fn persistent_multi_surface_lifecycle() {
         .request(ClientMessage::Input {
             data: b"for ((i=0;i<3000;i++)); do if [ -e detached-release ]; then echo REATTACHED_$((20+22)); printf done > detached-complete; break; fi; sleep 0.01; done\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     drop(reattached);
@@ -516,6 +524,7 @@ fn persistent_multi_surface_lifecycle() {
         .send(ClientMessage::Input {
             data: b"printf -v flood '%1024s' ''; flood=${flood// /X}; for ((i=0;i<16384;i++)); do printf '\\033[H%08d:%s' \"$i\" \"$flood\"; done; printf '\\r\\n'; printf done > flood-complete\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     // Do not read or request on after_crash until the shell has written over
@@ -536,6 +545,7 @@ fn persistent_multi_surface_lifecycle() {
         .send(ClientMessage::Input {
             data: b"echo FLOOD_RECOVERED_$((20+22))\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let flood_output = collect_until_marker(&mut after_crash, b"FLOOD_RECOVERED_42");
@@ -548,6 +558,7 @@ fn persistent_multi_surface_lifecycle() {
         .send(ClientMessage::Input {
             data: b"exit\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let (_, flood_exit) = collect_until_exit(&daemon, &mut after_crash, &second.id);
@@ -611,6 +622,7 @@ fn creates_surfaces_in_wsl_and_windows_working_directories() {
             data: b"printf '\\033]7;file://localhost%s\\a' \"$PWD\"; echo WORKDIR_$((20+22))\r"
                 .to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     let snapshot = collect_snapshot_until_marker(&mut attached, b"WORKDIR_42");
@@ -622,6 +634,7 @@ fn creates_surfaces_in_wsl_and_windows_working_directories() {
         .send(ClientMessage::Input {
             data: b"exit\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
     collect_until_exit(&daemon, &mut attached, &windows_session.id);
@@ -1076,6 +1089,7 @@ fn run_command(client: &mut DaemonClient, command: &str) {
         .request(ClientMessage::Input {
             data: format!("{command}\r").into_bytes(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap();
 }

@@ -295,6 +295,7 @@ impl Controller {
             .request(ClientMessage::Input {
                 data: data.as_ref().to_vec(),
                 latency_id: None,
+                alternate_scroll: false,
             })
             .unwrap();
     }
@@ -526,6 +527,57 @@ fn native_shell_persists_across_controllers_and_resizes_in_cwd_with_spaces() {
 }
 
 #[test]
+fn alternate_scroll_filters_only_synthetic_arrows_when_disabled() {
+    let mut daemon = DaemonGuard::start();
+    let mut control = daemon.client();
+    let session = control.create_surface(80, 24, None).unwrap();
+    let mut attached = Controller::attach(&daemon, &session, 80, 24);
+    // Read raw arrow bytes as canonical lines with echo off. Hex output makes
+    // accidental delivery observable without interpreting the arrows as output.
+    attached.input(
+        b"stty -echo; printf '\\033[?1049h\\033[?1007lDISABLED_%s\\n' \"$((20+22))\"; IFS= read -r answer; printf '%s' \"$answer\" | od -An -tx1; printf '\\033[?1007hENABLED_%s\\n' \"$((20+22))\"; IFS= read -r answer; printf '%s' \"$answer\" | od -An -tx1; stty echo\r",
+    );
+    attached.until("DISABLED_42");
+    attached
+        .client
+        .request(ClientMessage::Input {
+            data: b"\x1b[A".to_vec(),
+            latency_id: None,
+            alternate_scroll: true,
+        })
+        .unwrap();
+    attached.input(b"\x1b[B\r");
+    let disabled = snapshot_text(&attached.until("ENABLED_42"));
+    let bytes: Vec<_> = disabled.split_whitespace().collect();
+    assert!(
+        bytes.windows(3).any(|bytes| bytes == ["1b", "5b", "42"]),
+        "{disabled}"
+    );
+    assert!(
+        !bytes.windows(3).any(|bytes| bytes == ["1b", "5b", "41"]),
+        "{disabled}"
+    );
+
+    attached
+        .client
+        .request(ClientMessage::Input {
+            data: b"\x1b[A".to_vec(),
+            latency_id: None,
+            alternate_scroll: true,
+        })
+        .unwrap();
+    attached.input(b"\r");
+    attached.until_matching("synthetic Up arrow bytes", |snapshot| {
+        let text = snapshot_text(snapshot);
+        let bytes: Vec<_> = text.split_whitespace().collect();
+        bytes.windows(3).any(|bytes| bytes == ["1b", "5b", "41"])
+    });
+    control.end_surface(&session).unwrap();
+    wait_status(&mut control, &session.id, SurfaceStatus::Exited);
+    daemon.shutdown();
+}
+
+#[test]
 fn incompatible_protocol_is_rejected_without_affecting_other_clients() {
     let mut daemon = DaemonGuard::start();
     let mut incompatible = daemon.unhandshaken_client();
@@ -562,6 +614,7 @@ fn natural_exit_retains_read_only_grid_and_rejects_input() {
         .request(ClientMessage::Input {
             data: b"printf SHOULD_NOT_RUN\\n\r".to_vec(),
             latency_id: None,
+            alternate_scroll: false,
         })
         .unwrap_err()
         .to_string();

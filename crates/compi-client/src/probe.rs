@@ -716,6 +716,7 @@ fn soak(target: &ConnectionTarget, duration: Duration) -> Result<()> {
     client.request(ClientMessage::Input {
         data: b"i=0; while :; do printf 'COMPI_SOAK_%08d 0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$i\"; i=$((i+1)); sleep 0.02; done\r".to_vec(),
         latency_id: None,
+        alternate_scroll: false,
     })?;
 
     let deadline = Instant::now() + duration;
@@ -752,10 +753,12 @@ fn soak(target: &ConnectionTarget, duration: Duration) -> Result<()> {
     client.request(ClientMessage::Input {
         data: vec![3],
         latency_id: None,
+        alternate_scroll: false,
     })?;
     client.request(ClientMessage::Input {
         data: b"true; exit\r".to_vec(),
         latency_id: None,
+        alternate_scroll: false,
     })?;
     loop {
         match client.read_event()? {
@@ -1092,6 +1095,7 @@ pub(crate) mod console {
                     client.send(ClientMessage::Input {
                         data: bytes[..length].to_vec(),
                         latency_id: None,
+                        alternate_scroll: false,
                     })?;
                 }
                 if count == 0 || detach.is_some() {

@@ -1002,6 +1002,23 @@ impl CompiApp {
                 if weak
                     .update(cx, |this, cx| {
                         this.poll_metadata(cx);
+                        let now = Instant::now();
+                        let mut scroll_expired = false;
+                        for view in &mut this.surface_views {
+                            if view
+                                .pending_scroll
+                                .as_ref()
+                                .is_some_and(|pending| pending.expired(now))
+                            {
+                                view.pending_scroll = None;
+                                view.scroll_offset = 0;
+                                view.new_lines = 0;
+                                scroll_expired = true;
+                            }
+                        }
+                        if scroll_expired {
+                            cx.notify();
+                        }
                         if this.restore_session.is_some() && !this.restore_ready {
                             this.acknowledge_update_restore();
                             cx.notify();
@@ -2102,12 +2119,14 @@ impl CompiApp {
                         view.send(ClientMessage::Input {
                             data: format!("printf '%s\\n' '{marker}'\n").into_bytes(),
                             latency_id: None,
+                            alternate_scroll: false,
                         });
                     }
                     if let Some(data) = remote_input {
                         view.send(ClientMessage::Input {
                             data,
                             latency_id: None,
+                            alternate_scroll: false,
                         });
                     }
                 }
@@ -2180,21 +2199,52 @@ impl CompiApp {
                     if let ScreenMessage::Delta { delta } = &message
                         && let Some(old) = view.mirror.snapshot()
                     {
+                        if delta.sequence != old.sequence.saturating_add(1) {
+                            view.send(ClientMessage::RequestSnapshot);
+                            return;
+                        }
                         let changed_geometry = old.cols != delta.cols || old.rows != delta.rows;
-                        let history_invalidated = delta
-                            .scrollback
-                            .as_ref()
-                            .is_some_and(|history| !history.starts_with(&old.scrollback));
-                        if changed_geometry || history_invalidated {
+                        if changed_geometry {
                             view.selection = None;
                             view.scroll_offset = 0;
+                            view.new_lines = 0;
+                            view.pending_scroll = None;
                             view.selecting = false;
-                        } else if view.scroll_offset > 0
+                        } else if view.pending_scroll.is_none()
                             && let Some(history) = &delta.scrollback
                         {
-                            view.scroll_offset = view
-                                .scroll_offset
-                                .saturating_add(history.len().saturating_sub(old.scrollback.len()));
+                            if !history.starts_with(&old.scrollback) {
+                                // Absolute selection coordinates are uncertain after a rewrite.
+                                view.selection = None;
+                                view.selecting = false;
+                            }
+                            let offset = crate::viewport::anchored_scroll_offset(
+                                &old.scrollback,
+                                history,
+                                view.scroll_offset,
+                            );
+                            match offset {
+                                Some(offset) => {
+                                    view.new_lines = view
+                                        .new_lines
+                                        .saturating_add(offset.saturating_sub(view.scroll_offset));
+                                    view.scroll_offset = offset;
+                                }
+                                None => {
+                                    if history.len() < old.scrollback.len() {
+                                        view.pending_scroll =
+                                            Some(crate::viewport::PendingScroll::new(
+                                                old,
+                                                view.scroll_offset,
+                                                Instant::now(),
+                                            ));
+                                    }
+                                    view.scroll_offset = 0;
+                                    if view.pending_scroll.is_none() {
+                                        view.new_lines = 0;
+                                    }
+                                }
+                            }
                         }
                     }
                     if let ScreenMessage::Snapshot { snapshot } = &message {
@@ -2208,12 +2258,29 @@ impl CompiApp {
                         if !valid {
                             view.selection = None;
                             view.scroll_offset = 0;
+                            view.new_lines = 0;
+                            view.pending_scroll = None;
                             view.selecting = false;
                         }
                     }
                     if matches!(view.mirror.apply(message), MirrorApply::Gap { .. }) {
                         view.send(ClientMessage::RequestSnapshot);
                         return;
+                    }
+                    if let Some(pending) = &view.pending_scroll {
+                        if let Some((offset, added)) = view
+                            .mirror
+                            .snapshot()
+                            .and_then(|snapshot| pending.recover(&snapshot.scrollback))
+                        {
+                            view.scroll_offset = offset;
+                            view.new_lines = view.new_lines.saturating_add(added);
+                            view.pending_scroll = None;
+                        } else if pending.expired(Instant::now()) {
+                            view.pending_scroll = None;
+                            view.scroll_offset = 0;
+                            view.new_lines = 0;
+                        }
                     }
                     if let Some((saved, identity)) = restore {
                         view.restore_viewport(saved, &identity);
@@ -2224,6 +2291,8 @@ impl CompiApp {
                         .is_some_and(|snapshot| snapshot.modes.alternate_screen)
                     {
                         view.scroll_offset = 0;
+                        view.new_lines = 0;
+                        view.pending_scroll = None;
                         view.selection = None;
                         view.selecting = false;
                     }
@@ -2505,6 +2574,9 @@ impl CompiApp {
                     diagnostic_frame_logged: false,
                     transport: None,
                     scroll_offset: 0,
+                    new_lines: 0,
+                    pending_scroll: None,
+                    wheel: input::WheelAccumulator::default(),
                     selection: None,
                     selecting: false,
                     mouse_reporting_down: false,
@@ -3895,6 +3967,8 @@ impl CompiApp {
                 if let Some(view) = self.focused_view_mut() {
                     view.selection = None;
                     view.scroll_offset = 0;
+                    view.new_lines = 0;
+                    view.pending_scroll = None;
                     view.send(ClientMessage::ClearScrollback);
                 }
             }
@@ -3945,6 +4019,8 @@ impl CompiApp {
                 self.state.reset(&self.defaults);
                 for view in &mut self.surface_views {
                     view.scroll_offset = 0;
+                    view.new_lines = 0;
+                    view.pending_scroll = None;
                     view.selection = None;
                 }
                 self.sidebar_width = self.state.sidebar_width;
@@ -6078,6 +6154,9 @@ impl CompiApp {
         });
         let input_owned = focused;
         let drop_view_id = view.map(|view| view.id);
+        let new_lines = view
+            .filter(|view| view.scroll_offset > 0 || view.pending_scroll.is_some())
+            .map_or(0, |view| view.new_lines);
         let paint = view.and_then(|view| {
             PaintModel::from_tab(
                 view,
@@ -6239,6 +6318,29 @@ impl CompiApp {
                     )
                 },
             )
+            .when(!tree_active && new_lines > 0, |pane| {
+                pane.child(
+                    div().absolute().bottom(px(8.0)).right(px(12.0)).child(
+                        controls::text_button(
+                            "terminal-new-lines",
+                            format!("↓ {new_lines} new lines"),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(view) = this
+                                .surface_views
+                                .iter_mut()
+                                .find(|view| view.pane_id == pane_id)
+                            {
+                                view.scroll_offset = 0;
+                                view.new_lines = 0;
+                                view.pending_scroll = None;
+                            }
+                            this.save_state();
+                            cx.notify();
+                        })),
+                    ),
+                )
+            })
     }
 
     /// A floating pane: a title strip (program status, name, and on hover the pane

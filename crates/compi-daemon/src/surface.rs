@@ -1447,8 +1447,18 @@ impl Surface {
         target: &TerminalTarget,
         bytes: &[u8],
         latency_id: Option<u64>,
+        alternate_scroll: bool,
     ) -> std::result::Result<(), SurfaceError> {
         self.require_attached(target)?;
+        if alternate_scroll {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+            if !state.terminal.accepts_input(alternate_scroll) {
+                return Ok(());
+            }
+        }
         self.write_bytes(bytes, latency_id)
     }
 

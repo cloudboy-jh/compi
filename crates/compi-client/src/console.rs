@@ -255,6 +255,7 @@ fn spawn_input_pump(
                         ClientMessage::Input {
                             data: bytes[..detach_at].to_vec(),
                             latency_id: None,
+                            alternate_scroll: false,
                         },
                     )
                     .is_err()
@@ -280,6 +281,7 @@ fn spawn_input_pump(
                 ClientMessage::Input {
                     data: bytes.to_vec(),
                     latency_id: None,
+                    alternate_scroll: false,
                 },
             )
             .is_err()

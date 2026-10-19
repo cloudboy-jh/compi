@@ -34,7 +34,9 @@ fn run() -> compi_client::Result<()> {
             }
             client.attach_surface(surfaces[0], surfaces[0].cols, surfaces[0].rows)?;
             client.request(ClientMessage::Input {
-                data: format!("{}\r", args[2]).into_bytes(), latency_id: None,
+                data: format!("{}\r", args[2]).into_bytes(),
+                latency_id: None,
+                alternate_scroll: false,
             })?;
             client.request(ClientMessage::Detach)?;
             Ok(())

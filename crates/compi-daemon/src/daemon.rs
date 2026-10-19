@@ -1190,13 +1190,17 @@ fn handle_connection(
                         Err(error) => send_surface_error(&sink, request_id, &error),
                     }
                 }
-                ClientMessage::Input { data, latency_id } => {
+                ClientMessage::Input {
+                    data,
+                    latency_id,
+                    alternate_scroll,
+                } => {
                     let Some((surface, target)) =
                         attached_target(&attached, target.as_ref(), &sink, request_id)
                     else {
                         continue;
                     };
-                    match surface.write_input(target, &data, latency_id) {
+                    match surface.write_input(target, &data, latency_id, alternate_scroll) {
                         Ok(()) => sink.send_control(&ServerControl {
                             request_id: Some(request_id),
                             message: ServerMessage::InputAccepted,

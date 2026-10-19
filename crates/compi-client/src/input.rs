@@ -32,6 +32,47 @@ pub enum KeypadKey {
     Add,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WheelRoute {
+    #[default]
+    History,
+    Mouse,
+    Alternate,
+}
+
+impl WheelRoute {
+    pub fn for_modes(mouse: MouseMode, alternate_screen: bool, shift: bool) -> Self {
+        if shift {
+            Self::History
+        } else if mouse != MouseMode::None {
+            Self::Mouse
+        } else if alternate_screen {
+            Self::Alternate
+        } else {
+            Self::History
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct WheelAccumulator {
+    route: WheelRoute,
+    remainder: f64,
+}
+
+impl WheelAccumulator {
+    pub fn take_lines(&mut self, lines: f64, route: WheelRoute) -> isize {
+        if self.route != route {
+            self.route = route;
+            self.remainder = 0.0;
+        }
+        self.remainder += lines;
+        let whole = self.remainder.trunc() as isize;
+        self.remainder -= whole as f64;
+        whole
+    }
+}
+
 pub fn encode_keystroke(
     keystroke: &Key<'_>,
     application_cursor: bool,
@@ -256,8 +297,33 @@ pub fn reports_mouse_motion(mode: MouseMode, button_pressed: bool) -> bool {
     }
 }
 
-pub fn encode_mouse_wheel(up: bool, col: usize, row: usize, modifiers: Modifiers) -> Vec<u8> {
-    encode_sgr_mouse_code(if up { 64 } else { 65 }, col, row, modifiers, true)
+pub fn encode_mouse_wheel(
+    up: bool,
+    lines: usize,
+    col: usize,
+    row: usize,
+    modifiers: Modifiers,
+) -> Vec<u8> {
+    if lines == 0 {
+        return Vec::new();
+    }
+    let mut data = encode_sgr_mouse_code(if up { 64 } else { 65 }, col, row, modifiers, true);
+    let report_len = data.len();
+    data.reserve(report_len * (lines - 1));
+    for _ in 1..lines {
+        data.extend_from_within(..report_len);
+    }
+    data
+}
+
+pub fn encode_alternate_scroll(up: bool, lines: usize, application_cursor: bool) -> Vec<u8> {
+    let arrow: &[u8] = match (up, application_cursor) {
+        (true, false) => b"\x1b[A",
+        (true, true) => b"\x1bOA",
+        (false, false) => b"\x1b[B",
+        (false, true) => b"\x1bOB",
+    };
+    arrow.repeat(lines)
 }
 
 pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -289,6 +355,89 @@ pub fn encode_focus(focused: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_accumulates_signed_fractions_and_cancels_opposite_motion() {
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.take_lines(0.75, WheelRoute::History), 0);
+        assert_eq!(wheel.take_lines(-0.5, WheelRoute::History), 0);
+        assert_eq!(wheel.take_lines(0.75, WheelRoute::History), 1);
+        assert_eq!(wheel.take_lines(0.0, WheelRoute::History), 0);
+        assert_eq!(wheel.take_lines(-2.5, WheelRoute::History), -2);
+        assert_eq!(wheel.take_lines(-0.5, WheelRoute::History), -1);
+        assert_eq!(wheel.take_lines(3.5, WheelRoute::History), 3);
+        assert_eq!(wheel.take_lines(0.5, WheelRoute::History), 1);
+    }
+
+    #[test]
+    fn wheel_fraction_is_isolated_by_pane_and_destination() {
+        let mut first = WheelAccumulator::default();
+        let mut second = WheelAccumulator::default();
+        assert_eq!(first.take_lines(0.75, WheelRoute::History), 0);
+        assert_eq!(second.take_lines(0.5, WheelRoute::History), 0);
+        assert_eq!(first.take_lines(0.5, WheelRoute::History), 1);
+        assert_eq!(second.take_lines(0.5, WheelRoute::History), 1);
+        assert_eq!(first.take_lines(0.75, WheelRoute::Mouse), 0);
+        assert_eq!(first.take_lines(0.25, WheelRoute::Alternate), 0);
+        assert_eq!(first.take_lines(0.75, WheelRoute::Alternate), 1);
+        assert_eq!(first.take_lines(0.75, WheelRoute::History), 0);
+        assert_eq!(first.take_lines(0.0, WheelRoute::Mouse), 0);
+        assert_eq!(first.take_lines(0.25, WheelRoute::History), 0);
+        first = WheelAccumulator::default();
+        assert_eq!(first.take_lines(0.75, WheelRoute::History), 0);
+    }
+
+    #[test]
+    fn wheel_routes_mouse_before_alternate_and_shift_to_history() {
+        for mouse in [
+            MouseMode::None,
+            MouseMode::Normal,
+            MouseMode::ButtonMotion,
+            MouseMode::AnyMotion,
+        ] {
+            for alternate in [false, true] {
+                assert_eq!(
+                    WheelRoute::for_modes(mouse, alternate, true),
+                    WheelRoute::History
+                );
+                let expected = if mouse != MouseMode::None {
+                    WheelRoute::Mouse
+                } else if alternate {
+                    WheelRoute::Alternate
+                } else {
+                    WheelRoute::History
+                };
+                assert_eq!(WheelRoute::for_modes(mouse, alternate, false), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn alternate_wheel_repeats_normal_and_application_arrows() {
+        assert_eq!(encode_alternate_scroll(true, 2, false), b"\x1b[A\x1b[A");
+        assert_eq!(encode_alternate_scroll(false, 2, false), b"\x1b[B\x1b[B");
+        assert_eq!(encode_alternate_scroll(true, 2, true), b"\x1bOA\x1bOA");
+        assert_eq!(encode_alternate_scroll(false, 2, true), b"\x1bOB\x1bOB");
+        assert!(encode_alternate_scroll(true, 0, true).is_empty());
+    }
+
+    #[test]
+    fn mouse_wheel_repeats_complete_reports_with_modifiers() {
+        let modifiers = Modifiers {
+            alt: true,
+            control: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_mouse_wheel(true, 2, 2, 4, modifiers),
+            b"\x1b[<88;3;5M\x1b[<88;3;5M"
+        );
+        assert_eq!(
+            encode_mouse_wheel(false, 3, 0, 0, Modifiers::default()),
+            b"\x1b[<65;1;1M\x1b[<65;1;1M\x1b[<65;1;1M"
+        );
+        assert!(encode_mouse_wheel(true, 0, 0, 0, modifiers).is_empty());
+    }
 
     #[test]
     fn indexes_utf16_at_scalar_boundaries() {

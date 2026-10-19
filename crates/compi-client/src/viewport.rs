@@ -1,5 +1,6 @@
 use compi_protocol::{Row, ScreenSnapshot};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use crate::selection::GridPoint;
 
@@ -27,6 +28,100 @@ pub fn visible_rows(
         .skip(base)
         .take(snapshot.cells.len());
     (rows, base)
+}
+
+/// A clear and its reprint can arrive in separate frames. Keep only the reading
+/// viewport briefly, not another copy of the history. An actual clear expires.
+pub struct PendingScroll {
+    pub rows: Vec<Row>,
+    pub base: usize,
+    deadline: Instant,
+    previous_offset: usize,
+}
+
+impl PendingScroll {
+    pub fn new(snapshot: &ScreenSnapshot, offset: usize, now: Instant) -> Self {
+        let (rows, base) = visible_rows(snapshot, offset);
+        Self {
+            rows: rows.cloned().collect(),
+            base,
+            deadline: now + Duration::from_millis(250),
+            previous_offset: offset,
+        }
+    }
+
+    pub fn expired(&self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+
+    pub fn recover(&self, history: &[Row]) -> Option<(usize, usize)> {
+        let base = matching_base(&self.rows, 0, history)?;
+        let offset = history.len().saturating_sub(base);
+        Some((offset, offset.saturating_sub(self.previous_offset)))
+    }
+}
+
+/// Keep the top reading row, using its neighbours to disambiguate repeated
+/// prompts/blank lines. No allocation or whole-history clone on streaming output.
+/// None means that the reading row is no longer in the received history.
+pub fn anchored_scroll_offset(old: &[Row], new: &[Row], offset: usize) -> Option<usize> {
+    if offset == 0 {
+        return Some(0);
+    }
+    if new.starts_with(old) {
+        return Some(offset.saturating_add(new.len() - old.len()).min(new.len()));
+    }
+    let base = old.len().saturating_sub(offset);
+    matching_base(old, base, new).map(|base| new.len().saturating_sub(base))
+}
+
+fn same_row_text(left: &Row, right: &Row) -> bool {
+    left.wrapped == right.wrapped
+        && left.cells.len() == right.cells.len()
+        && left
+            .cells
+            .iter()
+            .zip(&right.cells)
+            .all(|(left, right)| left.text == right.text && left.width == right.width)
+}
+
+fn matching_base(old: &[Row], base: usize, new: &[Row]) -> Option<usize> {
+    // Prefer text over a blank top row, but never jump to unrelated offscreen text.
+    let anchor = (base..old.len().min(base + 4))
+        .find(|&index| {
+            old[index]
+                .cells
+                .iter()
+                .any(|cell| !cell.text.trim().is_empty())
+        })
+        .unwrap_or(base);
+    let row = old.get(anchor)?;
+    let mut best = None;
+    for (index, candidate) in new.iter().enumerate() {
+        if !same_row_text(row, candidate) {
+            continue;
+        }
+        let mut context = 0;
+        for distance in 1..=3 {
+            if anchor >= distance
+                && index >= distance
+                && same_row_text(&old[anchor - distance], &new[index - distance])
+            {
+                context += 1;
+            }
+            if let (Some(left), Some(right)) =
+                (old.get(anchor + distance), new.get(index + distance))
+                && same_row_text(left, right)
+            {
+                context += 1;
+            }
+        }
+        let rank = (context, std::cmp::Reverse(index.abs_diff(anchor)));
+        if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+            best = Some((rank, index.saturating_sub(anchor - base)));
+        }
+    }
+    best.map(|(_, base)| base)
 }
 
 pub fn visible_to_absolute(
@@ -335,6 +430,53 @@ mod tests {
             images: Vec::new(),
             placements: Vec::new(),
         }
+    }
+
+    fn history(range: Range<usize>) -> Vec<Row> {
+        range
+            .map(|index| row(&format!("line {index:04}"), false))
+            .collect()
+    }
+
+    #[test]
+    fn streaming_and_eviction_keep_the_reading_row() {
+        let old = history(0..100);
+        for new in [history(0..110), history(10..110)] {
+            let offset = anchored_scroll_offset(&old, &new, 50).unwrap();
+            assert!(same_row_text(&old[50], &new[new.len() - offset]));
+            assert_eq!(offset, 60);
+        }
+        assert_eq!(anchored_scroll_offset(&old, &history(60..160), 50), None);
+        assert_eq!(anchored_scroll_offset(&old, &history(10..110), 0), Some(0));
+    }
+
+    #[test]
+    fn redraw_keeps_text_anchor_and_disambiguates_repeated_lines() {
+        let mut old = history(0..30);
+        old[8] = row("repeated ", false);
+        old[18] = old[8].clone();
+        let mut new = history(5..35);
+        new[3] = old[8].clone();
+        new[13] = old[18].clone();
+        new[13].cells[0].foreground = compi_protocol::Color::Indexed(2);
+        assert_eq!(anchored_scroll_offset(&old, &new, 12), Some(17));
+        let mut reprint = history(0..5);
+        reprint.extend(old.iter().cloned());
+        assert_eq!(anchored_scroll_offset(&old, &reprint, 12), Some(12));
+    }
+
+    #[test]
+    fn split_clear_and_reprint_recovers_but_real_clear_expires() {
+        let mut screen = snapshot(history(100..110));
+        screen.scrollback = history(0..100);
+        let now = Instant::now();
+        let pending = PendingScroll::new(&screen, 50, now);
+        assert_eq!(pending.recover(&[]), None);
+        assert_eq!(pending.recover(&history(0..40)), None);
+        assert_eq!(pending.recover(&history(0..110)), Some((60, 10)));
+        assert!(!pending.expired(now + Duration::from_millis(249)));
+        assert!(pending.expired(now + Duration::from_millis(250)));
+        assert!(same_row_text(&pending.rows[0], &screen.scrollback[50]));
     }
 
     #[test]
