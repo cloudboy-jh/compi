@@ -1,13 +1,15 @@
-//! Monitor's Overview and resource pages (CPU, Memory, Disk, Network), drawn from the
-//! window's totals history.
+//! Monitor's Overview, drawn from the window's totals history (and Settings → Monitor,
+//! which draws its cards), and what the resource pages (`resources`) draw with it: the
+//! metrics, their cards' figures, the dot graphs and Memory by type.
 //!
 //! Each metric has a colour from the theme's own ANSI palette (CPU blue, Memory green,
-//! Disk yellow, Network cyan), made legible on the pane, and uses it for its nav icon,
-//! card icon and dots. History graphs are dot matrices painted as quads: one column per
-//! time bucket of the selected range, filled from the bottom. Percentages (CPU, memory)
-//! take a bucket's mean, rates (disk, network) its peak, scaled to the highest value in
-//! the range with a floor so an idle link does not fill a column. A bucket with no
-//! sample (a gap, or before the history begins) draws no dots at all.
+//! GPU magenta, Disk yellow, Network cyan), made legible on the pane, and uses it for
+//! its nav icon, card icon, dots and bars. History graphs are dot matrices painted as
+//! quads: one column per time bucket of the selected range, filled from the bottom.
+//! Percentages (CPU, memory, GPU) take a bucket's mean, rates (disk, network) its peak,
+//! scaled to the highest value in the range with a floor so an idle link does not fill
+//! a column. A bucket with no sample (a gap, or before the history begins) draws no
+//! dots at all.
 use super::*;
 use crate::gui::workspace::settings::settings_card;
 use crate::monitor::apps::RowKey;
@@ -29,16 +31,18 @@ const DOT_GAP: f32 = 2.0;
 /// Rows of dots in a card's strip.
 const CARD_DOT_ROWS: usize = 8;
 /// Rates below these never fill a column: an idle disk or link stays low.
-const DISK_RATE_FLOOR: f64 = 1024.0 * 1024.0;
-const NETWORK_RATE_FLOOR: f64 = 128.0 * 1024.0;
+pub(super) const DISK_RATE_FLOOR: f64 = 1024.0 * 1024.0;
+pub(super) const NETWORK_RATE_FLOOR: f64 = 128.0 * 1024.0;
 /// A card's padding and border on each side (`p_4` and `border_1`).
-const CARD_INSET: f32 = 17.0;
+pub(super) const CARD_INSET: f32 = 17.0;
 /// Between a card's figures.
 const CARD_FIGURE_GAP: f32 = 12.0;
 /// Between the ring and the legend of Memory by type.
 const RING_GAP: f32 = 24.0;
 /// The card Settings → Monitor shows while the totals are not there.
 const SETTINGS_MESSAGE_HEIGHT: f32 = 160.0;
+/// The GPU card's subtitle where the daemon reads no GPU (Linux).
+const GPU_UNAVAILABLE: &str = "Unavailable on this host";
 
 /// The window's totals, shared by its Monitor panes.
 #[derive(Default)]
@@ -76,17 +80,25 @@ impl TotalsFeed {
 pub(super) enum Metric {
     Cpu,
     Memory,
+    Gpu,
     Disk,
     Network,
 }
 
 impl Metric {
-    pub(super) const ALL: [Self; 4] = [Self::Cpu, Self::Memory, Self::Disk, Self::Network];
+    pub(super) const ALL: [Self; 5] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::Gpu,
+        Self::Disk,
+        Self::Network,
+    ];
 
     pub(super) const fn page(self) -> MonitorPage {
         match self {
             Self::Cpu => MonitorPage::Cpu,
             Self::Memory => MonitorPage::Memory,
+            Self::Gpu => MonitorPage::Gpu,
             Self::Disk => MonitorPage::Disk,
             Self::Network => MonitorPage::Network,
         }
@@ -97,6 +109,7 @@ impl Metric {
         match self {
             Self::Cpu => OverviewCard::Cpu,
             Self::Memory => OverviewCard::Memory,
+            Self::Gpu => OverviewCard::Gpu,
             Self::Disk => OverviewCard::Disk,
             Self::Network => OverviewCard::Network,
         }
@@ -107,6 +120,7 @@ impl Metric {
         match card {
             OverviewCard::Cpu => Some(Self::Cpu),
             OverviewCard::Memory => Some(Self::Memory),
+            OverviewCard::Gpu => Some(Self::Gpu),
             OverviewCard::Disk => Some(Self::Disk),
             OverviewCard::Network => Some(Self::Network),
             OverviewCard::MemoryByType | OverviewCard::MemoryByApp => None,
@@ -117,6 +131,7 @@ impl Metric {
         match page {
             MonitorPage::Cpu => Some(Self::Cpu),
             MonitorPage::Memory => Some(Self::Memory),
+            MonitorPage::Gpu => Some(Self::Gpu),
             MonitorPage::Disk => Some(Self::Disk),
             MonitorPage::Network => Some(Self::Network),
             MonitorPage::Overview | MonitorPage::Processes => None,
@@ -127,6 +142,7 @@ impl Metric {
         match self {
             Self::Cpu => "CPU",
             Self::Memory => "Memory",
+            Self::Gpu => "GPU",
             Self::Disk => "Disk",
             Self::Network => "Network",
         }
@@ -136,16 +152,19 @@ impl Metric {
         match self {
             Self::Cpu => IconName::Cpu,
             Self::Memory => IconName::MemoryStick,
+            Self::Gpu => IconName::Gpu,
             Self::Disk => IconName::HardDrive,
             Self::Network => IconName::Network,
         }
     }
 
-    /// The metric's colour in the theme's ANSI palette: blue, green, yellow, cyan.
+    /// The metric's colour in the theme's ANSI palette: blue, green, magenta, yellow,
+    /// cyan.
     const fn palette_index(self) -> usize {
         match self {
             Self::Cpu => 4,
             Self::Memory => 2,
+            Self::Gpu => 5,
             Self::Disk => 3,
             Self::Network => 6,
         }
@@ -160,6 +179,9 @@ impl Metric {
                 .as_ref()
                 .and_then(totals::memory_used_percent)
                 .map(|used| format_whole_percent(used as f32)),
+            Self::Gpu => {
+                totals::gpu_utilization(sample).map(|busy| format_whole_percent(busy as f32))
+            }
             Self::Disk => sample.disk.as_ref().and_then(disk_rate).map(format_rate),
             Self::Network => sample
                 .network
@@ -178,7 +200,7 @@ fn disk_rate(disk: &compi_protocol::system_metrics::DiskTotals) -> Option<u64> {
 }
 
 /// How the range reads in a graph's caption.
-const fn span_caption(span: Span) -> &'static str {
+pub(super) const fn span_caption(span: Span) -> &'static str {
     match span {
         Span::Minute => "Last minute",
         Span::FiveMinutes => "Last 5 minutes",
@@ -188,28 +210,28 @@ const fn span_caption(span: Span) -> &'static str {
 }
 
 /// A value with its unit, or unavailable.
-type Reading = Option<(String, &'static str)>;
+pub(super) type Reading = Option<(String, &'static str)>;
 
 /// One small labelled figure of a card or page.
-struct Figure {
+pub(super) struct Figure {
     label: &'static str,
     value: Option<String>,
 }
 
-fn figure(label: &'static str, value: Option<String>) -> Figure {
+pub(super) fn figure(label: &'static str, value: Option<String>) -> Figure {
     Figure { label, value }
 }
 
 /// What a card shows besides its graph.
-struct Card {
+pub(super) struct Card {
     metric: Metric,
-    subtitle: String,
-    value: Reading,
+    pub(super) subtitle: String,
+    pub(super) value: Reading,
     badge: Option<MemoryPressure>,
-    figures: [Figure; 3],
+    pub(super) figures: [Figure; 3],
 }
 
-fn card(metric: Metric, sample: Option<&TotalsSample>, host: Option<&HostInfo>) -> Card {
+pub(super) fn card(metric: Metric, sample: Option<&TotalsSample>, host: Option<&HostInfo>) -> Card {
     match metric {
         Metric::Cpu => {
             let cpu = sample.and_then(|sample| sample.cpu);
@@ -256,6 +278,38 @@ fn card(metric: Metric, sample: Option<&TotalsSample>, host: Option<&HostInfo>) 
                     .and_then(|memory| memory.pressure)
                     .filter(|pressure| *pressure != MemoryPressure::Normal),
                 figures: [first, second, third],
+            }
+        }
+        Metric::Gpu => {
+            let gpu = sample.and_then(|sample| sample.gpu.as_ref());
+            Card {
+                metric,
+                subtitle: match gpu {
+                    Some(gpu) => gpu
+                        .name
+                        .as_deref()
+                        .map_or_else(|| "Busy".to_owned(), totals_display),
+                    None => GPU_UNAVAILABLE.to_owned(),
+                },
+                value: sample
+                    .and_then(totals::gpu_utilization)
+                    .map(|busy| percent_parts(busy as f32)),
+                badge: None,
+                figures: [
+                    figure(
+                        "Memory used",
+                        gpu.and_then(|gpu| gpu.memory_used_bytes).map(format_bytes),
+                    ),
+                    figure(
+                        "Memory total",
+                        gpu.and_then(|gpu| gpu.memory_total_bytes).map(format_bytes),
+                    ),
+                    figure(
+                        "Memory in use",
+                        gpu.and_then(totals::gpu_memory_percent)
+                            .map(|used| format_percent(used as f32)),
+                    ),
+                ],
             }
         }
         Metric::Disk => {
@@ -319,13 +373,13 @@ fn card(metric: Metric, sample: Option<&TotalsSample>, host: Option<&HostInfo>) 
 /// One history graph: a dense window of values (one per sample), how a column sums
 /// them up and the value of a full column. `under` is drawn under `values` in its own
 /// shade (CPU's system share under its total).
-struct Strip {
+pub(super) struct Strip {
     values: Vec<Option<f64>>,
-    under: Option<Vec<Option<f64>>>,
+    pub(super) under: Option<Vec<Option<f64>>>,
     combine: Combine,
     scale: f64,
-    color: Hsla,
-    under_color: Hsla,
+    pub(super) color: Hsla,
+    pub(super) under_color: Hsla,
     faint: Hsla,
 }
 
@@ -347,6 +401,11 @@ fn card_series(
             history.window(samples, |sample| {
                 sample.memory.as_ref().and_then(totals::memory_used_percent)
             }),
+            Combine::Mean,
+            100.0,
+        ),
+        Metric::Gpu => (
+            history.window(samples, totals::gpu_utilization),
             Combine::Mean,
             100.0,
         ),
@@ -376,7 +435,7 @@ fn card_series(
 
 /// A dot-matrix graph `height` pixels tall filling its width: as many columns as fit,
 /// the newest at the right.
-fn dot_graph(strip: Strip, height: f32) -> impl IntoElement {
+pub(super) fn dot_graph(strip: Strip, height: f32) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -503,7 +562,7 @@ impl CompiApp {
             }
             TotalsEvent::Sampled(sample) => {
                 feed.state = FeedState::Live;
-                feed.history.push(sample);
+                feed.history.push(*sample);
             }
             TotalsEvent::Stale => {
                 if feed.state == FeedState::Live {
@@ -637,7 +696,7 @@ impl CompiApp {
     }
 
     /// A message in place of a page that draws totals, while they are not there.
-    fn totals_message(&self) -> Option<AnyElement> {
+    pub(super) fn totals_message(&self) -> Option<AnyElement> {
         let feed = &self.monitor.totals;
         if !feed.shown().is_empty() {
             return None;
@@ -656,7 +715,7 @@ impl CompiApp {
 
     /// A page that scrolls: `padding` around `content`, which is `content_width` wide
     /// and centred.
-    fn monitor_scroll_page(
+    pub(super) fn monitor_scroll_page(
         &self,
         id: &'static str,
         padding: f32,
@@ -685,7 +744,7 @@ impl CompiApp {
 
     /// A graph of `values` in `metric`'s colour (`shade` of it), with `under` beneath in
     /// the full colour.
-    fn strip(
+    pub(super) fn strip(
         &self,
         metric: Metric,
         values: Vec<Option<f64>>,
@@ -1043,7 +1102,7 @@ impl CompiApp {
     }
 
     /// A large value and its unit, or a muted dash.
-    fn big_reading(&self, reading: Reading, size: f32) -> AnyElement {
+    pub(super) fn big_reading(&self, reading: Reading, size: f32) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         match reading {
@@ -1079,7 +1138,7 @@ impl CompiApp {
 
     /// `figures` in an equal grid of `columns` across `width`, rows as needed. Labels
     /// and values stay on one line and end in an ellipsis when cut.
-    fn figure_grid(
+    pub(super) fn figure_grid(
         &self,
         figures: &[Figure],
         columns: usize,
@@ -1133,7 +1192,7 @@ impl CompiApp {
     /// How memory divides, in a card `width` wide: a ring of the kinds in the host's
     /// order with the share in use in its middle, and a legend beside it (under it, the
     /// ring centred, when narrow).
-    fn render_memory_by_type(
+    pub(super) fn render_memory_by_type(
         &self,
         host: &OverviewHost,
         memory: &MemoryTotals,
@@ -1266,293 +1325,6 @@ impl CompiApp {
         color(modal_text_color(palette.ansi[index], colors))
     }
 
-    /// A resource page `width` wide: the metric's figures, large, in an equal grid, and
-    /// its history over the range.
-    pub(super) fn render_monitor_resource(
-        &self,
-        pane_id: &PaneId,
-        metric: Metric,
-        width: f32,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        if let Some(message) = self.totals_message() {
-            return message;
-        }
-        let colors = *self.colors();
-        let muted = color(modal_text_color(colors.muted, &colors));
-        let (padding, content_width) = layout::page_frame(width);
-        let gap = layout::gap(content_width);
-        let inner = (content_width - 2.0 * CARD_INSET).max(1.0);
-        let feed = &self.monitor.totals;
-        let history = feed.shown();
-        let latest = history.latest();
-        let host = feed.host.as_ref();
-        let span = self.monitor.span;
-        let samples = span.samples();
-        let data = card(metric, latest, host);
-        let (figures, caption, graphs): (Vec<Figure>, Option<String>, Vec<(&'static str, Strip)>) =
-            match metric {
-                Metric::Cpu => {
-                    let total = history.window(samples, totals::cpu_used);
-                    let system = history.window(samples, |sample| {
-                        sample.cpu.map(|cpu| f64::from(cpu.system))
-                    });
-                    let mut figures = vec![figure(
-                        "In use",
-                        latest
-                            .and_then(totals::cpu_used)
-                            .map(|used| format_percent(used as f32)),
-                    )];
-                    figures.extend(data.figures);
-                    (
-                        figures,
-                        host.and_then(|host| host.cpu.as_deref())
-                            .map(totals_display),
-                        vec![(
-                            "User over system",
-                            self.strip(metric, total, Some(system), Combine::Mean, 100.0, 0.55),
-                        )],
-                    )
-                }
-                Metric::Memory => {
-                    let memory = latest.and_then(|sample| sample.memory.as_ref());
-                    let used = history.window(samples, |sample| {
-                        sample.memory.as_ref().and_then(totals::memory_used_percent)
-                    });
-                    let mut figures = vec![
-                        figure(
-                            "In use",
-                            memory.map(|memory| format_bytes(memory.used_bytes)),
-                        ),
-                        figure(
-                            "Total",
-                            memory.map(|memory| format_bytes(memory.total_bytes)),
-                        ),
-                    ];
-                    figures.extend(data.figures);
-                    figures.push(figure(
-                        "Swap",
-                        memory.and_then(|memory| {
-                            Some(format!(
-                                "{} of {}",
-                                format_bytes(memory.swap_used_bytes?),
-                                format_bytes(memory.swap_total_bytes?)
-                            ))
-                        }),
-                    ));
-                    figures.push(figure(
-                        "Pressure",
-                        memory.and_then(|memory| memory.pressure).map(|pressure| {
-                            match pressure {
-                                MemoryPressure::Normal => "Normal",
-                                MemoryPressure::Elevated => "Elevated",
-                                MemoryPressure::Critical => "Critical",
-                            }
-                            .to_owned()
-                        }),
-                    ));
-                    (
-                        figures,
-                        None,
-                        vec![(
-                            "In use",
-                            self.strip(metric, used, None, Combine::Mean, 100.0, 1.0),
-                        )],
-                    )
-                }
-                Metric::Disk => {
-                    let disk = latest.and_then(|sample| sample.disk.as_ref());
-                    let read = history.window(samples, |sample| {
-                        sample
-                            .disk
-                            .as_ref()
-                            .and_then(|disk| disk.read_bytes_per_second)
-                            .map(|rate| rate as f64)
-                    });
-                    let written = history.window(samples, |sample| {
-                        sample
-                            .disk
-                            .as_ref()
-                            .and_then(|disk| disk.written_bytes_per_second)
-                            .map(|rate| rate as f64)
-                    });
-                    // Both graphs share one scale, so their heights compare.
-                    let scale = totals::rate_scale(&read, DISK_RATE_FLOOR)
-                        .max(totals::rate_scale(&written, DISK_RATE_FLOOR));
-                    let mut figures = vec![
-                        figure("Free", disk.map(|disk| format_bytes(disk.available_bytes))),
-                        figure("Total", disk.map(|disk| format_bytes(disk.total_bytes))),
-                    ];
-                    figures.extend(data.figures);
-                    (
-                        figures,
-                        disk.map(|disk| totals_display(&disk.name)),
-                        vec![
-                            (
-                                "Reading",
-                                self.strip(metric, read, None, Combine::Max, scale, 1.0),
-                            ),
-                            (
-                                "Writing",
-                                self.strip(metric, written, None, Combine::Max, scale, 0.55),
-                            ),
-                        ],
-                    )
-                }
-                Metric::Network => {
-                    let network = latest.and_then(|sample| sample.network);
-                    let received = history.window(samples, |sample| {
-                        sample
-                            .network
-                            .and_then(|network| network.received_bytes_per_second)
-                            .map(|rate| rate as f64)
-                    });
-                    let sent = history.window(samples, |sample| {
-                        sample
-                            .network
-                            .and_then(|network| network.sent_bytes_per_second)
-                            .map(|rate| rate as f64)
-                    });
-                    let scale = totals::rate_scale(&received, NETWORK_RATE_FLOOR)
-                        .max(totals::rate_scale(&sent, NETWORK_RATE_FLOOR));
-                    let mut figures = vec![figure(
-                        "Downloading",
-                        network
-                            .and_then(|network| network.received_bytes_per_second)
-                            .map(format_rate),
-                    )];
-                    figures.extend(data.figures);
-                    (
-                        figures,
-                        None,
-                        vec![
-                            (
-                                "Downloading",
-                                self.strip(metric, received, None, Combine::Max, scale, 1.0),
-                            ),
-                            (
-                                "Uploading",
-                                self.strip(metric, sent, None, Combine::Max, scale, 0.55),
-                            ),
-                        ],
-                    )
-                }
-            };
-        let figure_columns = layout::figure_columns(inner, figures.len());
-        let figures_card = settings_card(&colors)
-            .p_4()
-            .gap_3()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_none().child(controls::glyph(
-                        metric.icon(),
-                        color(self.metric_color(metric)),
-                    )))
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(data.subtitle),
-                    )
-                    .when_some(caption, |line, caption| {
-                        line.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
-                                .text_color(muted)
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(caption),
-                        )
-                    }),
-            )
-            .child(self.big_reading(data.value, layout::resource_value_size(content_width)))
-            .child(self.figure_grid(&figures, figure_columns, inner, gap, 18.0));
-        let graph_height = layout::graph_height(content_width);
-        let graphs_card = settings_card(&colors)
-            .p_4()
-            .gap_4()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("History"),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(muted)
-                            .child(span_caption(span)),
-                    ),
-            )
-            .children(graphs.into_iter().map(|(label, strip)| {
-                let legend = if strip.under.is_some() {
-                    vec![("User", strip.color), ("System", strip.under_color)]
-                } else {
-                    vec![(label, strip.color)]
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(muted)
-                            .children(legend.into_iter().map(|(label, tint)| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(div().size(px(8.0)).rounded_full().bg(tint))
-                                    .child(label)
-                            })),
-                    )
-                    .child(dot_graph(strip, graph_height))
-            }));
-        let memory_by_type = (metric == Metric::Memory)
-            .then(|| latest.and_then(|sample| sample.memory.as_ref()))
-            .flatten()
-            .filter(|memory| !memory.kinds.is_empty())
-            .map(|memory| {
-                self.render_memory_by_type(
-                    &OverviewHost::Pane(pane_id.clone()),
-                    memory,
-                    content_width,
-                    false,
-                    cx,
-                )
-            });
-        self.monitor_scroll_page(
-            "monitor-resource",
-            padding,
-            content_width,
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(gap))
-                .child(figures_card)
-                .child(graphs_card)
-                .children(memory_by_type),
-        )
-    }
-
     /// The host line of Monitor's nav: the processor and how long the host has been up.
     pub(super) fn monitor_host_detail(&self) -> Option<String> {
         let feed = &self.monitor.totals;
@@ -1582,6 +1354,6 @@ pub(super) fn card_page(card: OverviewCard) -> MonitorPage {
 }
 
 /// Text the host chose (a disk or processor name), as one line.
-fn totals_display(text: &str) -> String {
+pub(super) fn totals_display(text: &str) -> String {
     crate::monitor::display_line(text)
 }

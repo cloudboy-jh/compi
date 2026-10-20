@@ -1028,6 +1028,8 @@ dependencies = [
  "compi-protocol",
  "flate2",
  "libc",
+ "objc2-core-foundation",
+ "objc2-io-kit",
  "parking_lot",
  "plist",
  "png 0.18.1",

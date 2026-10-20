@@ -1,6 +1,7 @@
 //! How Monitor's pages divide their width, kept pure: the Overview grid (how many
 //! columns, how wide a card, where each card sits and what the keyboard reaches from
-//! it) and the resource pages' figure grid, graph height and Memory by type ring.
+//! it) and the resource pages' figure grid, per-core grid, graph height and Memory by
+//! type ring.
 //!
 //! Widths are whole pixels, so columns and gaps never add up past the content.
 
@@ -16,6 +17,8 @@ const WIDE_PAGE: f32 = 480.0;
 const WIDE_CONTENT: f32 = 480.0;
 /// A figure of a resource page wants at least this much width.
 const FIGURE_WIDTH: f32 = 150.0;
+/// A bar of the CPU page's per-core grid wants at least this much width.
+const CORE_WIDTH: f32 = 120.0;
 /// Memory by type draws ring and legend side by side from this card width.
 const RING_BESIDE_WIDTH: f32 = 480.0;
 /// Memory by type cards narrower than this draw the smaller ring.
@@ -26,6 +29,7 @@ const SMALL_RING_BELOW: f32 = 360.0;
 pub enum OverviewCard {
     Cpu,
     Memory,
+    Gpu,
     Disk,
     Network,
     MemoryByType,
@@ -46,41 +50,43 @@ const fn placed(card: OverviewCard, span: usize) -> Placed {
 /// Overview's rows, top to bottom, each a full row of the grid.
 pub type OverviewRows = &'static [&'static [Placed]];
 
-use OverviewCard::{Cpu, Disk, Memory, MemoryByApp, MemoryByType, Network};
+use OverviewCard::{Cpu, Disk, Gpu, Memory, MemoryByApp, MemoryByType, Network};
 
+// The five resource cards come first, in the nav's order; the memory breakdowns end
+// the grid, Memory by app across a row of its own where the others leave it one.
 static THREE_WITH_MEMORY: OverviewRows = &[
-    &[placed(Cpu, 1), placed(Memory, 1), placed(Disk, 1)],
-    &[
-        placed(Network, 1),
-        placed(MemoryByType, 1),
-        placed(MemoryByApp, 1),
-    ],
+    &[placed(Cpu, 1), placed(Memory, 1), placed(Gpu, 1)],
+    &[placed(Disk, 1), placed(Network, 1), placed(MemoryByType, 1)],
+    &[placed(MemoryByApp, 3)],
 ];
 static TWO_WITH_MEMORY: OverviewRows = &[
     &[placed(Cpu, 1), placed(Memory, 1)],
-    &[placed(Disk, 1), placed(Network, 1)],
-    &[placed(MemoryByType, 1), placed(MemoryByApp, 1)],
+    &[placed(Gpu, 1), placed(Disk, 1)],
+    &[placed(Network, 1), placed(MemoryByType, 1)],
+    &[placed(MemoryByApp, 2)],
 ];
 static ONE_WITH_MEMORY: OverviewRows = &[
     &[placed(Cpu, 1)],
     &[placed(Memory, 1)],
+    &[placed(Gpu, 1)],
     &[placed(Disk, 1)],
     &[placed(Network, 1)],
     &[placed(MemoryByType, 1)],
     &[placed(MemoryByApp, 1)],
 ];
 static THREE: OverviewRows = &[
-    &[placed(Cpu, 1), placed(Memory, 1), placed(Disk, 1)],
-    &[placed(Network, 1), placed(MemoryByApp, 2)],
+    &[placed(Cpu, 1), placed(Memory, 1), placed(Gpu, 1)],
+    &[placed(Disk, 1), placed(Network, 1), placed(MemoryByApp, 1)],
 ];
 static TWO: OverviewRows = &[
     &[placed(Cpu, 1), placed(Memory, 1)],
-    &[placed(Disk, 1), placed(Network, 1)],
-    &[placed(MemoryByApp, 2)],
+    &[placed(Gpu, 1), placed(Disk, 1)],
+    &[placed(Network, 1), placed(MemoryByApp, 1)],
 ];
 static ONE: OverviewRows = &[
     &[placed(Cpu, 1)],
     &[placed(Memory, 1)],
+    &[placed(Gpu, 1)],
     &[placed(Disk, 1)],
     &[placed(Network, 1)],
     &[placed(MemoryByApp, 1)],
@@ -255,6 +261,17 @@ pub fn figure_columns(inner_width: f32, count: usize) -> usize {
         .min(count.max(1))
 }
 
+/// Columns of the CPU page's per-core grid `width` wide holding `count` bars with `gap`
+/// between them: the fewest rows bars at least [`CORE_WIDTH`] wide allow, the bars
+/// spread evenly over them (12 that fit 10 to a row go 6 and 6, not 10 and 2).
+pub fn core_columns(width: f32, count: usize, gap: f32) -> usize {
+    if count == 0 {
+        return 1;
+    }
+    let fit = (((width + gap) / (CORE_WIDTH + gap)).floor().max(1.0) as usize).min(count);
+    count.div_ceil(count.div_ceil(fit))
+}
+
 /// The width of each of `columns` equal cells in `width`, with `gap` between them.
 pub fn cell_width(width: f32, columns: usize, gap: f32) -> f32 {
     let columns = columns.max(1);
@@ -380,45 +397,62 @@ mod tests {
         assert_eq!(
             cards(&three),
             [
-                vec![(Cpu, 1), (Memory, 1), (Disk, 1)],
-                vec![(Network, 1), (MemoryByType, 1), (MemoryByApp, 1)],
+                vec![(Cpu, 1), (Memory, 1), (Gpu, 1)],
+                vec![(Disk, 1), (Network, 1), (MemoryByType, 1)],
+                vec![(MemoryByApp, 3)],
             ]
         );
-        assert_eq!((three.memory_span, three.apps_span), (1, 1));
+        assert_eq!((three.memory_span, three.apps_span), (1, 3));
         assert_eq!(three.width(2), 2.0 * three.card_width + three.gap);
         let two = overview_layout(page(600.0), true);
         assert_eq!(
             cards(&two),
             [
                 vec![(Cpu, 1), (Memory, 1)],
-                vec![(Disk, 1), (Network, 1)],
-                vec![(MemoryByType, 1), (MemoryByApp, 1)],
+                vec![(Gpu, 1), (Disk, 1)],
+                vec![(Network, 1), (MemoryByType, 1)],
+                vec![(MemoryByApp, 2)],
             ]
         );
+        assert_eq!((two.memory_span, two.apps_span), (1, 2));
         let one = overview_layout(page(400.0), true);
-        assert_eq!(one.rows.len(), 6);
+        assert_eq!(one.rows.len(), 7);
         assert_eq!((one.memory_span, one.apps_span), (1, 1));
         let three = overview_layout(page(900.0), false);
         assert_eq!(
             cards(&three),
             [
-                vec![(Cpu, 1), (Memory, 1), (Disk, 1)],
-                vec![(Network, 1), (MemoryByApp, 2)],
+                vec![(Cpu, 1), (Memory, 1), (Gpu, 1)],
+                vec![(Disk, 1), (Network, 1), (MemoryByApp, 1)],
             ]
         );
-        assert_eq!((three.memory_span, three.apps_span), (0, 2));
+        assert_eq!((three.memory_span, three.apps_span), (0, 1));
         let two = overview_layout(page(600.0), false);
         assert_eq!(
             cards(&two),
             [
                 vec![(Cpu, 1), (Memory, 1)],
-                vec![(Disk, 1), (Network, 1)],
-                vec![(MemoryByApp, 2)],
+                vec![(Gpu, 1), (Disk, 1)],
+                vec![(Network, 1), (MemoryByApp, 1)],
             ]
         );
         let one = overview_layout(page(400.0), false);
-        assert_eq!(one.rows.len(), 5);
+        assert_eq!(one.rows.len(), 6);
         assert_eq!(one.apps_span, 1);
+        // Each arrangement draws every card once, the resource cards in the nav's order.
+        for memory in [false, true] {
+            for content in [400.0, 600.0, 900.0] {
+                let drawn: Vec<OverviewCard> = overview_layout(page(content), memory)
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter().map(|placed| placed.card))
+                    .collect();
+                let mut expected = vec![Cpu, Memory, Gpu, Disk, Network];
+                expected.extend(memory.then_some(MemoryByType));
+                expected.push(MemoryByApp);
+                assert_eq!(drawn, expected, "at {content}, memory by type {memory}");
+            }
+        }
         assert_eq!(treemap_height(120.0), 160.0);
         assert_eq!(treemap_height(300.0), 200.0);
         assert_eq!(treemap_height(900.0), 320.0);
@@ -439,38 +473,43 @@ mod tests {
         let rows = THREE_WITH_MEMORY;
         let step = |from, step| move_card(rows, Some(from), step);
         assert_eq!(move_card(rows, None, CardMove::Down), Some(Cpu));
-        assert_eq!(step(MemoryByType, CardMove::Up), Some(Memory));
+        assert_eq!(step(MemoryByType, CardMove::Up), Some(Gpu));
         assert_eq!(step(MemoryByType, CardMove::Left), Some(Network));
-        assert_eq!(step(MemoryByType, CardMove::Right), Some(MemoryByApp));
-        assert_eq!(step(MemoryByApp, CardMove::Right), Some(MemoryByApp));
+        assert_eq!(step(MemoryByType, CardMove::Right), Some(MemoryByType));
+        assert_eq!(step(MemoryByType, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(step(Gpu, CardMove::Down), Some(MemoryByType));
+        // Memory by app spans the whole last row: Up goes to the leftmost card above.
         assert_eq!(step(MemoryByApp, CardMove::Up), Some(Disk));
+        assert_eq!(step(MemoryByApp, CardMove::Right), Some(MemoryByApp));
         assert_eq!(step(MemoryByApp, CardMove::Down), Some(MemoryByApp));
-        assert_eq!(step(Disk, CardMove::Down), Some(MemoryByApp));
-        assert_eq!(step(Cpu, CardMove::Down), Some(Network));
-        assert_eq!(step(Network, CardMove::Up), Some(Cpu));
+        assert_eq!(step(Network, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(step(Cpu, CardMove::Down), Some(Disk));
+        assert_eq!(step(Network, CardMove::Up), Some(Memory));
         assert_eq!(step(Cpu, CardMove::Left), Some(Cpu));
-        assert_eq!(step(Disk, CardMove::Right), Some(Disk));
+        assert_eq!(step(Gpu, CardMove::Right), Some(Gpu));
         assert_eq!(step(Disk, CardMove::Home), Some(Cpu));
         assert_eq!(step(Cpu, CardMove::End), Some(MemoryByApp));
-        // Without Memory by type, Memory by app spans two columns: from it, Up goes to
-        // Memory (the leftmost of the two it covers), and from Disk, Down reaches it.
+        // Without Memory by type, Memory by app ends the second row, under GPU.
         let three = |from, step| move_card(THREE, Some(from), step);
-        assert_eq!(three(MemoryByApp, CardMove::Up), Some(Memory));
-        assert_eq!(three(Disk, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(three(MemoryByApp, CardMove::Up), Some(Gpu));
+        assert_eq!(three(Gpu, CardMove::Down), Some(MemoryByApp));
         assert_eq!(three(MemoryByApp, CardMove::Left), Some(Network));
-        // Two columns: Memory by app spans the last row.
+        // Two columns.
         let two = |from, step| move_card(TWO, Some(from), step);
-        assert_eq!(two(Network, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(two(Disk, CardMove::Down), Some(MemoryByApp));
         assert_eq!(two(MemoryByApp, CardMove::Up), Some(Disk));
+        assert_eq!(two(Network, CardMove::Up), Some(Gpu));
         let two = |from, step| move_card(TWO_WITH_MEMORY, Some(from), step);
         assert_eq!(two(Network, CardMove::Down), Some(MemoryByApp));
-        assert_eq!(two(MemoryByType, CardMove::Right), Some(MemoryByApp));
+        assert_eq!(two(MemoryByType, CardMove::Down), Some(MemoryByApp));
+        assert_eq!(two(MemoryByApp, CardMove::Up), Some(Network));
+        assert_eq!(two(MemoryByType, CardMove::Right), Some(MemoryByType));
         // A highlight on a card not drawn starts over at the first card.
         assert_eq!(
             move_card(THREE, Some(MemoryByType), CardMove::Left),
             Some(Cpu)
         );
-        assert_eq!(move_card(ONE, Some(Memory), CardMove::Down), Some(Disk));
+        assert_eq!(move_card(ONE, Some(Memory), CardMove::Down), Some(Gpu));
         assert_eq!(move_card(&[], None, CardMove::Down), None);
     }
 
@@ -491,5 +530,18 @@ mod tests {
         assert_eq!(ring_layout(480.0), (true, 120.0));
         assert_eq!(ring_layout(479.0), (false, 120.0));
         assert_eq!(ring_layout(359.0), (false, 104.0));
+    }
+
+    #[test]
+    fn core_bars_fill_the_fewest_rows_evenly() {
+        // 10 bars of 120 with gaps of 16 need 10 * 120 + 9 * 16 = 1344.
+        assert_eq!(core_columns(1344.0, 12, 16.0), 6);
+        assert_eq!(core_columns(1344.0, 10, 16.0), 10);
+        assert_eq!(core_columns(1343.0, 10, 16.0), 5);
+        assert_eq!(core_columns(1344.0, 11, 16.0), 6);
+        assert_eq!(core_columns(1344.0, 4, 16.0), 4);
+        assert_eq!(core_columns(1344.0, 64, 16.0), 10);
+        assert_eq!(core_columns(50.0, 8, 16.0), 1);
+        assert_eq!(core_columns(1000.0, 0, 16.0), 1);
     }
 }

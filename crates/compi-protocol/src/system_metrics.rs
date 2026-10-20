@@ -43,6 +43,13 @@ pub struct TotalsSample {
     /// The disk holding the system: the volume at `/`, or the Windows system drive.
     pub disk: Option<DiskTotals>,
     pub network: Option<NetworkTotals>,
+    /// The host's GPU; `None` where the host has none the daemon can read (Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuTotals>,
+    /// What only the newest sample carries: the daemon keeps it out of the history, so
+    /// the last sample of `SystemTotalsWatching` and each `SystemTotalsSampled` have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Box<TotalsDetail>>,
 }
 
 /// Percentages of all logical CPUs together, 0 to 100.
@@ -59,12 +66,67 @@ pub struct MemoryTotals {
     pub total_bytes: u64,
     /// Memory in use: what is not free or reclaimable cache.
     pub used_bytes: u64,
+    /// What programs could still get without swapping: free plus reclaimable cache, as
+    /// the host counts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_bytes: Option<u64>,
     /// How the memory divides, in the host's own terms, adding up to `total_bytes`.
     pub kinds: Vec<MemoryKind>,
     pub swap_total_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
     /// Where the host reports it (macOS).
     pub pressure: Option<MemoryPressure>,
+}
+
+/// The host's GPU. With several, the one with the most memory (Windows sums nothing
+/// across adapters). Unified memory (Apple silicon) reports what the GPU has in use of
+/// the shared memory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GpuTotals {
+    /// Such as "Apple M3 Pro" or "NVIDIA GeForce RTX 4070".
+    pub name: Option<String>,
+    /// Busy share of the GPU over the interval, 0 to 100.
+    pub utilization: Option<f32>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_total_bytes: Option<u64>,
+}
+
+/// The newest sample's breakdowns, shown on the resource pages as they are now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TotalsDetail {
+    /// Busy share of each logical CPU over the interval, 0 to 100, in the host's order;
+    /// empty when the host does not give it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cores: Vec<f32>,
+    /// Mounted volumes a user stores files on (pseudo and system-internal file systems
+    /// left out), the system volume first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<Volume>,
+    /// Interfaces with a hardware address, as `NetworkTotals` counts them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<NetworkInterface>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Volume {
+    /// The volume's label, else its mount point's last part.
+    pub name: String,
+    pub mount_point: String,
+    pub file_system: Option<String>,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub removable: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkInterface {
+    /// The host's name for it, such as `en0` or `Ethernet`.
+    pub name: String,
+    pub received_bytes_per_second: Option<u64>,
+    pub sent_bytes_per_second: Option<u64>,
+    /// Since the interface's counters started (usually boot).
+    pub received_bytes: u64,
+    pub sent_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

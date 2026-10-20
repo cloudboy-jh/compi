@@ -24,6 +24,7 @@ use std::sync::mpsc;
 mod icons;
 mod overview;
 mod processes;
+mod resources;
 mod watch;
 
 use crate::monitor::apps::RowKey;
@@ -151,6 +152,7 @@ const fn page_title(page: MonitorPage) -> &'static str {
         MonitorPage::Processes => "Processes",
         MonitorPage::Cpu => "CPU",
         MonitorPage::Memory => "Memory",
+        MonitorPage::Gpu => "GPU",
         MonitorPage::Disk => "Disk",
         MonitorPage::Network => "Network",
     }

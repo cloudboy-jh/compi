@@ -11,11 +11,12 @@ use compi_protocol::{
 use serde_json::json;
 
 /// Monitor's pages as the command names them.
-const PAGES: [(&str, MonitorPage); 6] = [
+const PAGES: [(&str, MonitorPage); 7] = [
     ("overview", MonitorPage::Overview),
     ("processes", MonitorPage::Processes),
     ("cpu", MonitorPage::Cpu),
     ("memory", MonitorPage::Memory),
+    ("gpu", MonitorPage::Gpu),
     ("disk", MonitorPage::Disk),
     ("network", MonitorPage::Network),
 ];
@@ -81,6 +82,7 @@ pub(super) fn run(
                     MonitorPage::Processes => "Processes",
                     MonitorPage::Cpu => "CPU",
                     MonitorPage::Memory => "Memory",
+                    MonitorPage::Gpu => "GPU",
                     MonitorPage::Disk => "Disk",
                     MonitorPage::Network => "Network",
                 }
@@ -200,6 +202,10 @@ mod tests {
                 .exit,
             2
         );
-        assert_eq!(wanted("monitor", Some("gpu"), None).unwrap_err().exit, 2);
+        assert_eq!(
+            wanted("monitor", Some("gpu"), None).unwrap(),
+            monitor(MonitorPage::Gpu)
+        );
+        assert_eq!(wanted("monitor", Some("fans"), None).unwrap_err().exit, 2);
     }
 }

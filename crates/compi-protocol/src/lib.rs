@@ -47,7 +47,9 @@ use std::fmt;
 // Settings, and opens a tab holding only a content pane.
 // Version 28 adds Monitor: a content kind and watching the host's processes.
 // Version 29 adds views in place: a terminal pane may carry one content view, shown instead
-// of its shell while the shell keeps running underneath at its size.
+// of its shell while the shell keeps running underneath at its size. It also adds Monitor's
+// GPU totals, available memory, the GPU page and the newest sample's per-core, volume and
+// interface breakdowns.
 pub const PROTOCOL_VERSION: u32 = 29;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -1149,6 +1151,7 @@ pub enum MonitorPage {
     Processes,
     Cpu,
     Memory,
+    Gpu,
     Disk,
     Network,
 }

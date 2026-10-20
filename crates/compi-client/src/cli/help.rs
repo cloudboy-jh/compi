@@ -162,7 +162,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("monitor", _) => (
             "monitor [PAGE]",
-            "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, disk or network; without it the pane keeps the page it shows, else Overview. From a Monitor pane (--pane), that pane changes page.",
+            "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, gpu, disk or network; without it the pane keeps the page it shows, else Overview. From a Monitor pane (--pane), that pane changes page.",
             "compi monitor processes",
         ),
         ("layout", _) => (

@@ -96,6 +96,7 @@ gpui_kit_assets::icon_assets!(
         CircleArrowDown,
         SlidersHorizontal,
         Command,
+        Gpu,
     ]
 );
 
@@ -1927,6 +1928,7 @@ mod tests {
             IconName::CircleArrowDown,
             IconName::SlidersHorizontal,
             IconName::Command,
+            IconName::Gpu,
             IconName::Search,
             IconName::Folder,
             IconName::File,

@@ -1,13 +1,15 @@
-//! Monitor's totals, kept pure: the window's history of the host's totals samples, how
-//! a range of it divides into the columns of a dot graph, and which figures the cards
-//! show. The pane (`gui::workspace::monitor`) draws them.
+//! Monitor's totals, kept pure: the window's history of the host's totals samples (and
+//! the newest breakdowns it received), how a range of it divides into the columns of a
+//! dot graph, and which figures the cards show. The pane (`gui::workspace::monitor`)
+//! draws them.
 //!
 //! The history is indexed by the samples' `sequence`, which goes up by one per sample. A
 //! sequence the window never received (its connection fell behind) is a gap, drawn as
 //! an empty column, never as a zero.
 
 use compi_protocol::system_metrics::{
-    MemoryKindName, MemoryTotals, TOTALS_HISTORY, TOTALS_INTERVAL_MS, TotalsSample,
+    GpuTotals, MemoryKindName, MemoryTotals, TOTALS_HISTORY, TOTALS_INTERVAL_MS, TotalsDetail,
+    TotalsSample,
 };
 use std::collections::VecDeque;
 
@@ -54,10 +56,12 @@ impl Span {
 }
 
 /// The totals samples a window received, oldest first, at most an hour's worth of
-/// sequences.
+/// sequences, and the newest breakdowns (per core, volumes, interfaces) any of them
+/// carried. The samples kept never hold breakdowns themselves.
 #[derive(Clone, Debug, Default)]
 pub struct TotalsHistory {
     samples: VecDeque<TotalsSample>,
+    detail: Option<Box<TotalsDetail>>,
 }
 
 impl TotalsHistory {
@@ -71,13 +75,17 @@ impl TotalsHistory {
     }
 
     /// Adds the next sample. One that does not follow the latest (a repeat, or out of
-    /// order) is dropped; samples more than an hour of sequences older go.
-    pub fn push(&mut self, sample: TotalsSample) {
+    /// order) is dropped; samples more than an hour of sequences older go. Its
+    /// breakdowns, if it has them, replace the ones kept.
+    pub fn push(&mut self, mut sample: TotalsSample) {
         if self
             .latest()
             .is_some_and(|latest| sample.sequence <= latest.sequence)
         {
             return;
+        }
+        if let Some(detail) = sample.detail.take() {
+            self.detail = Some(detail);
         }
         let oldest_kept = sample.sequence.saturating_sub(TOTALS_HISTORY as u64 - 1);
         self.samples.push_back(sample);
@@ -92,6 +100,11 @@ impl TotalsHistory {
 
     pub fn latest(&self) -> Option<&TotalsSample> {
         self.samples.back()
+    }
+
+    /// The newest breakdowns received.
+    pub fn detail(&self) -> Option<&TotalsDetail> {
+        self.detail.as_deref()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -193,6 +206,21 @@ pub fn memory_used_percent(memory: &MemoryTotals) -> Option<f64> {
     (memory.total_bytes > 0).then(|| memory.used_bytes as f64 / memory.total_bytes as f64 * 100.0)
 }
 
+/// The GPU's busy share, 0 to 100.
+pub fn gpu_utilization(sample: &TotalsSample) -> Option<f64> {
+    sample
+        .gpu
+        .as_ref()?
+        .utilization
+        .map(|busy| f64::from(busy).clamp(0.0, 100.0))
+}
+
+/// The GPU's memory in use, as a percentage of its memory.
+pub fn gpu_memory_percent(gpu: &GpuTotals) -> Option<f64> {
+    let (used, total) = (gpu.memory_used_bytes?, gpu.memory_total_bytes?);
+    (total > 0).then(|| (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+}
+
 pub const fn kind_label(kind: MemoryKindName) -> &'static str {
     match kind {
         MemoryKindName::App => "App",
@@ -257,6 +285,14 @@ mod tests {
     use super::*;
     use compi_protocol::system_metrics::{CpuTotals, MemoryKind};
 
+    fn with_cores(mut sample: TotalsSample, cores: &[f32]) -> TotalsSample {
+        sample.detail = Some(Box::new(TotalsDetail {
+            cores: cores.to_vec(),
+            ..TotalsDetail::default()
+        }));
+        sample
+    }
+
     fn sample(sequence: u64, cpu: Option<f32>) -> TotalsSample {
         TotalsSample {
             sequence,
@@ -290,6 +326,32 @@ mod tests {
         history.push(sample(6 + TOTALS_HISTORY as u64, Some(2.0)));
         assert_eq!(history.len(), 2);
         assert_eq!(cpu_window(&history, 2), [Some(2.0), Some(2.0)]);
+    }
+
+    #[test]
+    fn history_keeps_the_newest_breakdowns_out_of_its_samples() {
+        let mut history = TotalsHistory::seeded(vec![
+            sample(1, None),
+            with_cores(sample(2, None), &[10.0, 20.0]),
+        ]);
+        assert_eq!(history.detail().map(|detail| detail.cores.len()), Some(2));
+        assert!(
+            history
+                .latest()
+                .is_some_and(|latest| latest.detail.is_none())
+        );
+        // A repeat's breakdowns are dropped with it.
+        history.push(with_cores(sample(2, None), &[99.0]));
+        assert_eq!(history.detail().map(|detail| detail.cores[0]), Some(10.0));
+        // A sample without breakdowns keeps the ones before; the next with them replaces them.
+        history.push(sample(3, None));
+        assert_eq!(history.detail().map(|detail| detail.cores[0]), Some(10.0));
+        history.push(with_cores(sample(4, None), &[50.0]));
+        assert_eq!(
+            history.detail().map(|detail| detail.cores.clone()),
+            Some(vec![50.0])
+        );
+        assert_eq!(TotalsHistory::default().detail(), None);
     }
 
     #[test]
@@ -362,6 +424,7 @@ mod tests {
         let mac = MemoryTotals {
             total_bytes: 100,
             used_bytes: 60,
+            available_bytes: Some(40),
             kinds: kinds(&[
                 (MemoryKindName::App, 30),
                 (MemoryKindName::Wired, 20),
@@ -433,5 +496,32 @@ mod tests {
         assert_eq!(cpu_used(&TotalsSample::default()), None);
         assert_eq!(uptime_seconds(1_000, 61_000), 60);
         assert_eq!(uptime_seconds(5_000, 1_000), 0);
+    }
+
+    #[test]
+    fn gpu_shares_are_unavailable_rather_than_zero() {
+        let gpu = GpuTotals {
+            name: Some("Apple M3 Pro".into()),
+            utilization: Some(140.0),
+            memory_used_bytes: Some(3),
+            memory_total_bytes: Some(12),
+        };
+        let busy = TotalsSample {
+            gpu: Some(gpu.clone()),
+            ..TotalsSample::default()
+        };
+        assert_eq!(gpu_utilization(&busy), Some(100.0));
+        assert_eq!(gpu_utilization(&TotalsSample::default()), None);
+        assert_eq!(gpu_memory_percent(&gpu), Some(25.0));
+        let unknown = GpuTotals {
+            memory_total_bytes: None,
+            ..gpu.clone()
+        };
+        assert_eq!(gpu_memory_percent(&unknown), None);
+        let empty = GpuTotals {
+            memory_total_bytes: Some(0),
+            ..gpu
+        };
+        assert_eq!(gpu_memory_percent(&empty), None);
     }
 }

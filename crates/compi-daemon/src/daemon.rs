@@ -1541,16 +1541,15 @@ fn send_system_metrics(sink: &ConnectionSink, watch: &mut SystemMetricsWatch) ->
 /// Sends the totals samples this connection has not had, in order, while it has room.
 fn send_system_totals(sink: &ConnectionSink, watch: &mut SystemTotalsWatch) -> Result<()> {
     for sample in watch.pending() {
+        let sequence = sample.sequence;
         let sent = sink.send_control_if_room(&ServerControl {
             request_id: None,
-            message: ServerMessage::SystemTotalsSampled {
-                sample: (*sample).clone(),
-            },
+            message: ServerMessage::SystemTotalsSampled { sample },
         })?;
         if !sent {
             break;
         }
-        watch.delivered(&sample);
+        watch.delivered(sequence);
     }
     Ok(())
 }

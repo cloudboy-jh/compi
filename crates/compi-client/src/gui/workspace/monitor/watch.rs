@@ -41,7 +41,8 @@ pub(in crate::gui) enum TotalsEvent {
         host: HostInfo,
         history: Vec<TotalsSample>,
     },
-    Sampled(TotalsSample),
+    /// Boxed: a sample is several times the size of the other events.
+    Sampled(Box<TotalsSample>),
     /// No sample for [`STALE_AFTER`].
     Stale,
     /// The connection failed or ended; the watcher retries.
@@ -313,7 +314,7 @@ pub(super) fn watch_totals(context: WatchContext, generation: u64, stop: mpsc::R
                         let ServerMessage::SystemTotalsSampled { sample } = message else {
                             return None;
                         };
-                        Some(send(TotalsEvent::Sampled(sample)))
+                        Some(send(TotalsEvent::Sampled(Box::new(sample))))
                     },
                 )
             },

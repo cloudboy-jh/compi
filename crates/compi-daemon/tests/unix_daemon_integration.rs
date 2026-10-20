@@ -1170,9 +1170,15 @@ fn system_totals_arrive_in_order_after_the_kept_history() {
     assert!(last.cpu.is_some(), "a later sample measures CPU");
     let memory = last.memory.as_ref().unwrap();
     assert!(memory.used_bytes > 0 && memory.used_bytes <= memory.total_bytes);
+    assert!(memory.available_bytes.is_some());
     assert!(last.disk.as_ref().is_some_and(|disk| disk.total_bytes > 0));
+    // Each sample sent carries the breakdowns as they are now.
+    let detail = last.detail.as_ref().expect("the newest sample's detail");
+    assert_eq!(detail.cores.len(), host.logical_cpus as usize);
+    assert!(!detail.volumes.is_empty(), "at least the system volume");
 
-    // A later watcher is given the history the first one saw arrive.
+    // A later watcher is given the history the first one saw arrive, with the detail on
+    // the newest sample only.
     let mut other = daemon.client();
     let (_, history) = other.watch_system_totals().unwrap();
     assert!(
@@ -1180,6 +1186,9 @@ fn system_totals_arrive_in_order_after_the_kept_history() {
             .iter()
             .any(|sample| sample.sequence == last.sequence)
     );
+    let (newest, kept) = history.split_last().unwrap();
+    assert!(newest.detail.is_some());
+    assert!(kept.iter().all(|sample| sample.detail.is_none()));
     drop((watcher, other));
     daemon.shutdown();
 }

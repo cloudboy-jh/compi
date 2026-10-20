@@ -1,13 +1,15 @@
 //! Monitor, kept pure: which processes a pane shows, in what order, and how values
-//! read (here), the totals history its graphs draw from ([`totals`]) and how its pages
-//! divide their width ([`layout`]). The pane (`gui::workspace::monitor`) draws them;
-//! nothing here talks to the daemon or GPUI.
+//! read (here), the totals history its graphs draw from ([`totals`]), the newest
+//! sample's breakdowns the resource pages list ([`detail`]) and how its pages divide
+//! their width ([`layout`]). The pane (`gui::workspace::monitor`) draws them; nothing
+//! here talks to the daemon or GPUI.
 //!
 //! A value the host would not give is `None` and reads as unavailable, never as zero.
 //! Sorting puts unavailable values last in either direction, and breaks ties by name,
 //! then pid, so the same processes always come in the same order.
 
 pub mod apps;
+pub mod detail;
 pub mod layout;
 pub mod totals;
 pub mod treemap;
@@ -94,13 +96,25 @@ const DROP_ORDER: [Column; 3] = [Column::User, Column::Threads, Column::CpuTime]
 /// The columns a table `width` pixels wide shows: every column while Name keeps its
 /// minimum, else without User, then Threads, then CPU time.
 pub fn visible_columns(width: f32) -> Vec<Column> {
-    let mut columns = Column::ALL.to_vec();
-    for dropped in DROP_ORDER {
-        let needed: f32 = columns.iter().map(|column| column.width()).sum();
+    fit_columns(&Column::ALL, &DROP_ORDER, width, Column::width)
+}
+
+/// The columns of `all` a table `width` pixels wide shows, in their order: every one
+/// while their widths fit, else without each of `drop_order` in turn until they do (or
+/// nothing is left to drop).
+pub fn fit_columns<C: Copy + PartialEq>(
+    all: &[C],
+    drop_order: &[C],
+    width: f32,
+    column_width: impl Fn(C) -> f32,
+) -> Vec<C> {
+    let mut columns = all.to_vec();
+    for dropped in drop_order {
+        let needed: f32 = columns.iter().map(|&column| column_width(column)).sum();
         if needed <= width {
             break;
         }
-        columns.retain(|column| *column != dropped);
+        columns.retain(|column| column != dropped);
     }
     columns
 }
@@ -420,6 +434,16 @@ pub fn bytes_parts(bytes: u64) -> (String, &'static str) {
 pub fn format_bytes(bytes: u64) -> String {
     let (value, unit) = bytes_parts(bytes);
     format!("{value} {unit}")
+}
+
+/// An amount in use of a whole, as "8.0 GB of 16.0 GB"; the amount alone where the
+/// whole is unknown.
+pub fn format_used_of(used: Option<u64>, total: Option<u64>) -> Option<String> {
+    let used = format_bytes(used?);
+    Some(match total {
+        Some(total) => format!("{used} of {}", format_bytes(total)),
+        None => used,
+    })
 }
 
 /// A transfer rate as a number and its unit: whole B/s below a kilobyte a second, else
@@ -810,6 +834,12 @@ mod tests {
         assert_eq!(format_percent(140.0), "100.0%");
         assert_eq!(percent_parts(7.0), ("7.0".into(), "%"));
         assert_eq!(format_whole_percent(62.6), "63%");
+        assert_eq!(
+            format_used_of(Some(2 * 1024 * 1024 * 1024), Some(16 * 1024 * 1024 * 1024)).as_deref(),
+            Some("2.0 GB of 16.0 GB")
+        );
+        assert_eq!(format_used_of(Some(1024), None).as_deref(), Some("1 KB"));
+        assert_eq!(format_used_of(None, Some(1024)), None);
         assert_eq!(format_uptime(59), "0h 0m");
         assert_eq!(format_uptime(3 * 3600 + 25 * 60), "3h 25m");
         assert_eq!(format_uptime(24 * 86_400 + 14 * 3600 + 59), "24d 14h");
