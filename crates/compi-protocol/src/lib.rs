@@ -46,7 +46,9 @@ use std::fmt;
 // Version 27 makes a content pane's content a kind: files (a folder and its tabs) or
 // Settings, and opens a tab holding only a content pane.
 // Version 28 adds Monitor: a content kind and watching the host's processes.
-pub const PROTOCOL_VERSION: u32 = 28;
+// Version 29 adds views in place: a terminal pane may carry one content view, shown instead
+// of its shell while the shell keeps running underneath at its size.
+pub const PROTOCOL_VERSION: u32 = 29;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -919,10 +921,13 @@ pub enum SplitAxis {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LayoutNode {
-    /// A terminal pane, backed by one surface and its process.
+    /// A terminal pane, backed by one surface and its process. It may carry a content
+    /// view shown in its place.
     Pane {
         pane_id: PaneId,
         surface_id: SurfaceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<PaneView>,
     },
     /// A pane that shows files or Settings instead of a terminal. It has no surface or
     /// process.
@@ -939,6 +944,15 @@ pub enum LayoutNode {
 }
 
 impl LayoutNode {
+    /// A terminal leaf with no view.
+    pub fn terminal(pane_id: PaneId, surface_id: SurfaceId) -> Self {
+        Self::Pane {
+            pane_id,
+            surface_id,
+            view: None,
+        }
+    }
+
     /// The pane of a terminal or content leaf; `None` for a split.
     pub fn leaf_pane(&self) -> Option<&PaneId> {
         match self {
@@ -955,7 +969,39 @@ impl LayoutNode {
         }
     }
 
-    /// Whether any leaf in this tree is a content pane.
+    /// A terminal leaf's view, shown or not.
+    pub fn view(&self) -> Option<&PaneView> {
+        match self {
+            Self::Pane { view, .. } => view.as_ref(),
+            Self::Content { .. } | Self::Split { .. } => None,
+        }
+    }
+
+    /// What this leaf holds besides a shell: a content leaf's content or a terminal
+    /// leaf's view, shown or not.
+    pub fn content(&self) -> Option<&PaneContent> {
+        match self {
+            Self::Content { content, .. } => Some(content),
+            Self::Pane { view, .. } => view.as_ref().map(|view| &view.content),
+            Self::Split { .. } => None,
+        }
+    }
+
+    /// The content drawn in this leaf right now: a content leaf's, or a terminal leaf's
+    /// view while it shows its view side.
+    pub fn shown_content(&self) -> Option<&PaneContent> {
+        match self {
+            Self::Content { content, .. } => Some(content),
+            Self::Pane { view, .. } => view
+                .as_ref()
+                .filter(|view| view.side == PaneSide::View)
+                .map(|view| &view.content),
+            Self::Split { .. } => None,
+        }
+    }
+
+    /// Whether any leaf in this tree is a content pane. A terminal leaf with a view is
+    /// not: it is still sized in cells.
     pub fn has_content(&self) -> bool {
         match self {
             Self::Pane { .. } => false,
@@ -963,6 +1009,26 @@ impl LayoutNode {
             Self::Split { first, second, .. } => first.has_content() || second.has_content(),
         }
     }
+}
+
+/// Which side a terminal pane with a view shows.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneSide {
+    /// The shell.
+    Terminal,
+    /// The view.
+    #[default]
+    View,
+}
+
+/// Content carried by a terminal pane and shown in place of its shell. The shell keeps
+/// running underneath at its size; the view shares the pane's ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneView {
+    pub content: PaneContent,
+    #[serde(default)]
+    pub side: PaneSide,
 }
 
 /// Where a content pane's paths live.
@@ -1485,10 +1551,33 @@ pub enum WorkspaceMutation {
         geometry: SplitGeometry,
         content: PaneContent,
     },
-    /// Replace what the content pane `pane_id` shows.
+    /// Replace what the content pane `pane_id` shows, or the view a terminal pane
+    /// carries; the kind must stay the same and a view keeps its side.
     UpdateContent {
         pane_id: PaneId,
         content: PaneContent,
+    },
+    /// Give the terminal pane `pane_id` the view `content`, replacing any view it
+    /// carries, and show it. No process starts or ends; the shell keeps its size.
+    ShowView {
+        pane_id: PaneId,
+        content: PaneContent,
+    },
+    /// Show the terminal pane `pane_id`'s shell or its view.
+    SetPaneSide {
+        pane_id: PaneId,
+        side: PaneSide,
+    },
+    /// Drop the view the terminal pane `pane_id` carries; its shell is shown.
+    CloseView {
+        pane_id: PaneId,
+    },
+    /// Take the terminal pane `pane_id`'s view out into a new content pane placed
+    /// second beside it, like `OpenContent`; the terminal shows its shell.
+    MoveViewToPane {
+        pane_id: PaneId,
+        axis: SplitAxis,
+        geometry: SplitGeometry,
     },
 }
 
@@ -1766,10 +1855,7 @@ mod tests {
                 tabs: vec![WorkspaceTab {
                     id: TabId::new("tab-1"),
                     label: "Shell".into(),
-                    layout: LayoutNode::Pane {
-                        pane_id: PaneId::new("pane-1"),
-                        surface_id: surface.id.clone(),
-                    },
+                    layout: LayoutNode::terminal(PaneId::new("pane-1"), surface.id.clone()),
                     previous_layout: None,
                     merge: None,
                 }],
@@ -1898,6 +1984,45 @@ mod content_tests {
         let files = PaneContent::Files(content(&[], None));
         assert!(!settings.same_kind(&files));
         assert!(settings.same_kind(&PaneContent::Settings(SettingsContent::default())));
+    }
+
+    #[test]
+    fn a_terminal_view_is_omitted_when_absent_and_shown_only_on_its_side() {
+        let bare = LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1"));
+        let json = serde_json::to_value(&bare).unwrap();
+        // A terminal without a view is written as protocol 28 wrote it.
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "pane", "pane_id": "pane-1", "surface_id": "surface-1"})
+        );
+        assert_eq!(serde_json::from_value::<LayoutNode>(json).unwrap(), bare);
+        assert!(bare.content().is_none() && bare.shown_content().is_none());
+
+        let files = PaneContent::Files(content(&[], None));
+        let mut leaf = LayoutNode::Pane {
+            pane_id: PaneId::new("pane-1"),
+            surface_id: SurfaceId::new("surface-1"),
+            view: Some(PaneView {
+                content: files.clone(),
+                side: PaneSide::View,
+            }),
+        };
+        let json = serde_json::to_value(&leaf).unwrap();
+        assert_eq!(json["view"]["side"], "view");
+        assert_eq!(json["view"]["content"]["kind"], "files");
+        assert_eq!(serde_json::from_value::<LayoutNode>(json).unwrap(), leaf);
+        assert_eq!(leaf.shown_content(), Some(&files));
+        // Still a terminal, sized in cells.
+        assert!(!leaf.has_content());
+        assert_eq!(leaf.surface_id(), Some(&SurfaceId::new("surface-1")));
+        if let LayoutNode::Pane {
+            view: Some(view), ..
+        } = &mut leaf
+        {
+            view.side = PaneSide::Terminal;
+        }
+        assert!(leaf.shown_content().is_none());
+        assert_eq!(leaf.content(), Some(&files));
     }
 
     #[test]

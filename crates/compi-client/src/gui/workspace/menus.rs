@@ -3,8 +3,9 @@
 //! opens its pane menu. They are Kit popup menus (`controls::context_menu`).
 //!
 //! Every pane menu lists the same pane actions in the same order ([`PaneAction`]):
-//! Focus (where the pane is not focused), Move to new tab, Float or Dock pane, End
-//! process… (terminals; it always asks first) and Close pane.
+//! Focus (where the pane is not focused), Move to new tab, Move to its own pane (a
+//! terminal's view), Float or Dock pane, End process… (terminals; it always asks
+//! first), Close Files / Settings / Monitor (a terminal's view) and Close pane.
 //!
 //! The tab menu lists the tab's actions, then a Panes group: one row per pane that
 //! focuses it, a × that closes it in one click while the menu stays open, and a ›
@@ -21,26 +22,32 @@ use gpui_component::ActiveTheme as _;
 pub(in crate::gui) enum PaneAction {
     Focus,
     MoveToNewTab,
+    /// A terminal's view into a pane of its own beside the terminal.
+    MoveToOwnPane,
     /// Float pane, or Dock pane for a floating one.
     Float,
     /// End process…, for terminals; it asks first.
     EndProcess,
+    /// Close Files, Settings or Monitor: a terminal's view goes, its shell stays.
+    CloseView,
     Close,
 }
 
 impl PaneAction {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Focus,
         Self::MoveToNewTab,
+        Self::MoveToOwnPane,
         Self::Float,
         Self::EndProcess,
+        Self::CloseView,
         Self::Close,
     ];
 
     /// The command that does the same to the focused pane, for its shortcut hint.
     fn command(self) -> Option<Command> {
         match self {
-            Self::Focus => None,
+            Self::Focus | Self::MoveToOwnPane | Self::CloseView => None,
             Self::MoveToNewTab => Some(Command::DetachPane),
             Self::Float => Some(Command::TogglePaneFloat),
             Self::EndProcess => Some(Command::EndSurface),
@@ -52,9 +59,15 @@ impl PaneAction {
         match self {
             Self::Focus => "Focus",
             Self::MoveToNewTab => "Move to new tab",
+            Self::MoveToOwnPane => "Move to its own pane",
             Self::Float if facts.floating => "Dock pane",
             Self::Float => "Float pane",
             Self::EndProcess => "End process…",
+            Self::CloseView => match facts.view {
+                Some("Settings") => "Close Settings",
+                Some("Monitor") => "Close Monitor",
+                _ => "Close Files",
+            },
             Self::Close => "Close pane",
         }
     }
@@ -70,10 +83,15 @@ pub(in crate::gui) struct PaneFacts {
     floats_full: bool,
     /// For a terminal, whether its process runs; `None` for a content pane.
     running: Option<bool>,
+    /// What a terminal's view shows ([`super::views::view_label`]); `None` without one.
+    view: Option<&'static str>,
+    /// Why the view cannot move to its own pane now.
+    view_busy: Option<&'static str>,
 }
 
 /// The pane actions a menu lists for a pane, each with why it is unavailable: Focus
-/// only when the pane is not `focused`, End process… only for a terminal.
+/// only when the pane is not `focused`, End process… only for a terminal, the view's
+/// actions only for a terminal carrying one.
 fn pane_actions(
     facts: &PaneFacts,
     focused: bool,
@@ -83,6 +101,7 @@ fn pane_actions(
         .filter(move |action| match action {
             PaneAction::Focus => !focused,
             PaneAction::EndProcess => facts.running.is_some(),
+            PaneAction::MoveToOwnPane | PaneAction::CloseView => facts.view.is_some(),
             _ => true,
         })
         .map(|action| (action, pane_action_reason(action, facts)))
@@ -95,6 +114,8 @@ fn pane_action_reason(action: PaneAction, facts: &PaneFacts) -> Option<&'static 
             Some("Dock a floating pane first")
         }
         PaneAction::EndProcess if facts.running != Some(true) => Some("The process is not running"),
+        PaneAction::MoveToOwnPane if facts.floating => Some("Dock this pane first"),
+        PaneAction::MoveToOwnPane => facts.view_busy,
         _ => None,
     }
 }
@@ -161,6 +182,9 @@ impl CompiApp {
                 )
             })
         });
+        let view = leaf_node(&tab.layout, pane_id)
+            .and_then(LayoutNode::view)
+            .map(|view| super::views::view_label(&view.content));
         Some((
             tab.id.clone(),
             PaneFacts {
@@ -168,6 +192,8 @@ impl CompiApp {
                 floating: self.state.is_floating(pane_id),
                 floats_full: self.state.floating.len() >= crate::client_state::MAX_FLOATING,
                 running,
+                view,
+                view_busy: view.and_then(|_| self.content_busy(pane_id)),
             },
         ))
     }
@@ -252,6 +278,14 @@ impl CompiApp {
             PaneAction::Float if facts.floating => self.dock_pane(pane_id),
             PaneAction::Float => self.float_pane(pane_id.clone()),
             PaneAction::EndProcess => self.end_process(pane_id),
+            PaneAction::MoveToOwnPane => {
+                if !facts.floating && self.selected_tab().is_none_or(|tab| tab.id != tab_id) {
+                    self.select_terminal(tab_id, false);
+                    self.rebuild_layout(window, true);
+                }
+                self.move_view_to_own_pane(pane_id);
+            }
+            PaneAction::CloseView => self.close_view(pane_id, window, cx),
             PaneAction::Close => self.close_pane(pane_id, window, cx),
         }
         window.focus(&self.focus_handle, cx);
@@ -1040,6 +1074,8 @@ mod tests {
             floating,
             floats_full,
             running,
+            view: None,
+            view_busy: None,
         }
     }
 
@@ -1080,6 +1116,60 @@ mod tests {
                 .map(|(action, _)| action)
                 .collect::<Vec<_>>(),
             [Focus, MoveToNewTab, Float, Close]
+        );
+    }
+
+    #[test]
+    fn only_a_terminal_carrying_a_view_offers_its_actions() {
+        use PaneAction::*;
+        let carrying = |view, view_busy| PaneFacts {
+            view: Some(view),
+            view_busy,
+            ..facts(2, false, false, Some(true))
+        };
+        let actions = |facts: &PaneFacts| {
+            listed(facts, true)
+                .into_iter()
+                .map(|(action, _)| action)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            actions(&facts(2, false, false, Some(true))),
+            [MoveToNewTab, Float, EndProcess, Close]
+        );
+        assert_eq!(
+            actions(&carrying("Files", None)),
+            [
+                MoveToNewTab,
+                MoveToOwnPane,
+                Float,
+                EndProcess,
+                CloseView,
+                Close
+            ]
+        );
+        // Named for what the view shows.
+        assert_eq!(CloseView.label(&carrying("Files", None)), "Close Files");
+        assert_eq!(CloseView.label(&carrying("Monitor", None)), "Close Monitor");
+        assert_eq!(
+            CloseView.label(&carrying("Settings", None)),
+            "Close Settings"
+        );
+        // A save under way keeps the view where it is until it lands.
+        let saving = carrying("Files", Some("Wait for the save to finish"));
+        assert_eq!(
+            pane_action_reason(MoveToOwnPane, &saving),
+            Some("Wait for the save to finish")
+        );
+        assert_eq!(pane_action_reason(CloseView, &saving), None);
+        // A float has no split to move the view into.
+        let floating = PaneFacts {
+            floating: true,
+            ..carrying("Files", None)
+        };
+        assert_eq!(
+            pane_action_reason(MoveToOwnPane, &floating),
+            Some("Dock this pane first")
         );
     }
 }

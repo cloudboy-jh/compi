@@ -105,17 +105,19 @@ impl MonitorUi {
     }
 }
 
-/// The Monitor leaves of `node`.
+/// The Monitor panes of `node`: content panes, and terminal views on either side.
 fn monitor_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<&'a PaneId>) {
     match node {
-        LayoutNode::Content {
-            pane_id,
-            content: PaneContent::Monitor(_),
-        } => output.push(pane_id),
-        LayoutNode::Content { .. } | LayoutNode::Pane { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             monitor_leaves(first, output);
             monitor_leaves(second, output);
+        }
+        leaf => {
+            if let (Some(pane_id), Some(PaneContent::Monitor(_))) =
+                (leaf.leaf_pane(), leaf.content())
+            {
+                output.push(pane_id);
+            }
         }
     }
 }
@@ -132,9 +134,10 @@ const fn page_title(page: MonitorPage) -> &'static str {
 }
 
 impl CompiApp {
-    /// Opens Monitor: focuses this window's Monitor pane, or opens one beside the
-    /// focused pane (in a tab of its own when the window has none).
-    pub(super) fn open_monitor(&mut self) {
+    /// Opens Monitor: focuses this window's Monitor pane (showing it where a terminal
+    /// carries it), else shows it in place of the focused terminal, else opens one
+    /// beside the focused pane (in a tab of its own when the window has none).
+    pub(super) fn open_monitor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlay.is_some() {
             self.dismiss_overlay();
         }
@@ -146,10 +149,15 @@ impl CompiApp {
                 }
                 self.select_terminal(tab, false);
             }
+            self.reveal_view(&pane_id);
             self.focus_pane(pane_id);
             return;
         }
         let content = PaneContent::Monitor(MonitorContent::default());
+        if let Some(terminal) = self.focused_terminal() {
+            self.show_view(&terminal, content, window, cx);
+            return;
+        }
         let beside = self.focused_pane().cloned().or_else(|| {
             let mut leaves = Vec::new();
             collect_leaves(&self.selected_tab()?.layout, &mut leaves);
@@ -205,6 +213,15 @@ impl CompiApp {
         found
     }
 
+    /// Monitor moved from `from` to pane `to` with its view: its page, search and
+    /// selection go along.
+    pub(super) fn move_monitor_pane(&mut self, from: &PaneId, to: &PaneId, cx: &mut Context<Self>) {
+        if let Some(mut pane) = self.monitor.panes.remove(from) {
+            pane.list.moved_to(to, cx);
+            self.monitor.panes.insert(to.clone(), pane);
+        }
+    }
+
     /// Before drawing: state for each Monitor pane shown, its page sent to the daemon
     /// when it changed, and the watchers running while wanted.
     pub(super) fn prepare_monitor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -215,7 +232,10 @@ impl CompiApp {
             Some(PaneContent::Monitor(monitor)) => Some(monitor.page),
             _ => None,
         };
-        self.monitor.panes.retain(|pane, _| page_of(pane).is_some());
+        let moving = self.views.moving_from();
+        self.monitor
+            .panes
+            .retain(|pane, _| page_of(pane).is_some() || moving == Some(pane));
         let shown: Vec<(PaneId, MonitorPage)> = self
             .shown_content_panes()
             .filter_map(|pane| Some((pane.clone(), page_of(pane)?)))

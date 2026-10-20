@@ -26,8 +26,10 @@ use windows::core::PCWSTR;
 /// (protocol 25) holds one tab per file, a diff being that tab's mode. Format 4 (protocol
 /// 27) tags every content leaf with its `kind`, so a content pane may show Settings.
 /// Format 5 (protocol 28) adds the Monitor kind, stored so older daemons can read the
-/// file far enough to refuse it (see `readable_by_older_formats`).
-const FORMAT_VERSION: u32 = 5;
+/// file far enough to refuse it (see `readable_by_older_formats`). Format 6 (protocol 29)
+/// lets a terminal leaf carry a content `view`; older daemons ignore the key and reach
+/// their format check.
+const FORMAT_VERSION: u32 = 6;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -144,9 +146,12 @@ impl WorkspaceStore {
                         value["format_version"] = 4.into();
                     }
                     if value.get("format_version") == Some(&serde_json::Value::from(4)) {
-                        value["format_version"] = FORMAT_VERSION.into();
+                        value["format_version"] = 5.into();
                     }
                     if value.get("format_version") == Some(&serde_json::Value::from(5)) {
+                        value["format_version"] = 6.into();
+                    }
+                    if value.get("format_version") == Some(&serde_json::Value::from(6)) {
                         restore_monitors(&mut value);
                     }
                     serde_json::from_value::<Manifest>(value)
@@ -290,10 +295,10 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
         tabs.push(WorkspaceTab {
             id: TabId::new(format!("tab-imported-{}", session.id)),
             label: format!("Shell {}", short_id(&session.id)),
-            layout: LayoutNode::Pane {
-                pane_id: PaneId::new(format!("pane-imported-{}", session.id)),
-                surface_id: surface_id.clone(),
-            },
+            layout: LayoutNode::terminal(
+                PaneId::new(format!("pane-imported-{}", session.id)),
+                surface_id.clone(),
+            ),
             previous_layout: None,
             merge: None,
         });
@@ -624,6 +629,7 @@ fn validate_layout(
         LayoutNode::Pane {
             pane_id,
             surface_id,
+            view,
         } => {
             if !panes.insert(pane_id.clone()) {
                 return Err("workspace contains duplicate pane IDs".into());
@@ -632,6 +638,12 @@ fn validate_layout(
                 return Err(
                     format!("pane {pane_id} references missing surface {surface_id}").into(),
                 );
+            }
+            // Only shape checks, as for content leaves.
+            if let Some(view) = view {
+                view.content
+                    .validate()
+                    .map_err(|error| format!("view of pane {pane_id}: {error}"))?;
             }
         }
         // Only shape checks: whether paths are absolute depends on the host, and a
@@ -800,7 +812,7 @@ mod tests {
     use super::*;
     use compi_protocol::{
         ContentEnvironment, ContentTab, FolderContent, GitScope, MonitorContent, MonitorPage,
-        PaneContent, SettingsContent, SettingsSection, SplitAxis,
+        PaneContent, PaneSide, PaneView, SettingsContent, SettingsSection, SplitAxis,
     };
 
     fn test_path(name: &str) -> PathBuf {
@@ -850,10 +862,7 @@ mod tests {
             tabs: vec![WorkspaceTab {
                 id: TabId::new("tab-1"),
                 label: "Shell".into(),
-                layout: LayoutNode::Pane {
-                    pane_id: PaneId::new("pane-1"),
-                    surface_id: SurfaceId::new("surface-1"),
-                },
+                layout: LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1")),
                 previous_layout: None,
                 merge: None,
             }],
@@ -979,14 +988,14 @@ mod tests {
                 layout: LayoutNode::Split {
                     axis: compi_protocol::SplitAxis::Horizontal,
                     ratio: f32::NAN,
-                    first: Box::new(LayoutNode::Pane {
-                        pane_id: PaneId::new("pane-1"),
-                        surface_id: SurfaceId::new("surface-1"),
-                    }),
-                    second: Box::new(LayoutNode::Pane {
-                        pane_id: PaneId::new("pane-2"),
-                        surface_id: SurfaceId::new("surface-1"),
-                    }),
+                    first: Box::new(LayoutNode::terminal(
+                        PaneId::new("pane-1"),
+                        SurfaceId::new("surface-1"),
+                    )),
+                    second: Box::new(LayoutNode::terminal(
+                        PaneId::new("pane-2"),
+                        SurfaceId::new("surface-1"),
+                    )),
                 },
                 previous_layout: None,
                 merge: None,
@@ -1028,10 +1037,7 @@ mod tests {
                 active: Some(ContentTab::edit("/home/user/project/a.rs")),
             }),
         };
-        let terminal = LayoutNode::Pane {
-            pane_id: PaneId::new("pane-1"),
-            surface_id: SurfaceId::new("surface-1"),
-        };
+        let terminal = LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1"));
         let split = |first: &LayoutNode, second: &LayoutNode| LayoutNode::Split {
             axis: SplitAxis::Horizontal,
             ratio: 0.5,
@@ -1294,10 +1300,7 @@ mod tests {
                 page: MonitorPage::Processes,
             }),
         };
-        let terminal = LayoutNode::Pane {
-            pane_id: PaneId::new("pane-1"),
-            surface_id: SurfaceId::new("surface-1"),
-        };
+        let terminal = LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1"));
         let split = |first: &LayoutNode, second: &LayoutNode| LayoutNode::Split {
             axis: SplitAxis::Horizontal,
             ratio: 0.5,
@@ -1446,6 +1449,143 @@ mod tests {
             roots(tab.previous_layout.as_ref().unwrap()),
             ["/", "/", "/home/user/project"]
         );
+        let _ = fs::remove_file(path);
+    }
+
+    /// `content_kinds_workspace` with the terminal carrying a Monitor view, its shell
+    /// shown, in both arrangements.
+    fn views_workspace() -> StoredWorkspace {
+        let mut workspace = content_kinds_workspace();
+        let view = PaneView {
+            content: PaneContent::Monitor(MonitorContent {
+                page: MonitorPage::Processes,
+            }),
+            side: PaneSide::Terminal,
+        };
+        let tab = &mut workspace.sessions[0].tabs[0];
+        let Some(LayoutNode::Split { second, .. }) = tab.previous_layout.as_deref_mut() else {
+            unreachable!()
+        };
+        let LayoutNode::Split { first, .. } = &mut tab.layout else {
+            unreachable!()
+        };
+        for terminal in [first, second] {
+            let LayoutNode::Pane { view: slot, .. } = &mut **terminal else {
+                unreachable!()
+            };
+            *slot = Some(view.clone());
+        }
+        workspace
+    }
+
+    #[test]
+    fn a_terminal_view_survives_reopen_and_must_be_well_formed() {
+        let path = test_path("views");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let workspace = views_workspace();
+        store.commit(&workspace).unwrap();
+        // Only content leaves are marked for older daemons; a view is stored as it is.
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let view = &saved["workspace"]["sessions"][0]["tabs"][0]["layout"]["first"]["view"];
+        assert_eq!(
+            *view,
+            serde_json::json!({ "content": { "kind": "monitor", "page": "processes" }, "side": "terminal" })
+        );
+        let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.sessions, workspace.sessions);
+        let _ = fs::remove_file(path);
+
+        let mut malformed = workspace;
+        let tab = &mut malformed.sessions[0].tabs[0];
+        tab.previous_layout = None;
+        let LayoutNode::Split { first, .. } = &mut tab.layout else {
+            unreachable!()
+        };
+        let LayoutNode::Pane {
+            view: Some(view), ..
+        } = &mut **first
+        else {
+            unreachable!()
+        };
+        view.content = PaneContent::Files(FolderContent {
+            environment: ContentEnvironment::Host,
+            root: "/project".into(),
+            tabs: Vec::new(),
+            active: Some(ContentTab::edit("/project/missing.rs")),
+        });
+        assert!(validate(&malformed).is_err());
+    }
+
+    #[test]
+    fn format_5_files_load_as_format_6() {
+        let path = test_path("format-5");
+        let expected = content_kinds_workspace();
+        // As a format-5 daemon wrote it: Monitor leaves marked for older daemons.
+        let mut manifest = serde_json::to_value(Manifest {
+            format_version: 5,
+            workspace: expected.clone(),
+        })
+        .unwrap();
+        readable_by_older_formats(&mut manifest);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(workspace.sessions, expected.sessions);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["format_version"], 6);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_format_5_daemon_reaches_its_version_check_on_terminal_views() {
+        // Protocol 28's shapes, as far as a format-5 daemon parses a layout.
+        #[derive(Deserialize)]
+        struct OldManifest {
+            format_version: u32,
+            workspace: OldWorkspace,
+        }
+        #[derive(Deserialize)]
+        struct OldWorkspace {
+            sessions: Vec<OldSession>,
+        }
+        #[derive(Deserialize)]
+        struct OldSession {
+            tabs: Vec<OldTab>,
+        }
+        #[derive(Deserialize)]
+        struct OldTab {
+            #[allow(dead_code)]
+            layout: OldLayout,
+            #[allow(dead_code)]
+            previous_layout: Option<OldLayout>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldLayout {
+            Pane {
+                #[allow(dead_code)]
+                pane_id: PaneId,
+                #[allow(dead_code)]
+                surface_id: SurfaceId,
+            },
+            Content {
+                #[allow(dead_code)]
+                content: PaneContent,
+            },
+            Split {
+                #[allow(dead_code)]
+                first: Box<OldLayout>,
+                #[allow(dead_code)]
+                second: Box<OldLayout>,
+            },
+        }
+
+        let path = test_path("view-downgrade");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        store.commit(&views_workspace()).unwrap();
+        let old: OldManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old.format_version, FORMAT_VERSION);
+        assert_eq!(old.workspace.sessions[0].tabs.len(), 1);
         let _ = fs::remove_file(path);
     }
 }

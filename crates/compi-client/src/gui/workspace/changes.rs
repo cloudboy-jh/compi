@@ -120,6 +120,8 @@ struct CommitBox {
     draft: Option<(String, String)>,
     /// A commit is on its way.
     committing: bool,
+    /// The box moved to another pane with its view; its events still name the old one.
+    moved: bool,
     _events: Subscription,
 }
 
@@ -317,6 +319,21 @@ impl RepoStatus {
             reread: false,
             outcome: None,
             selected: None,
+        }
+    }
+
+    /// A commit, stage, unstage or discard is on its way.
+    pub(super) fn busy(&self) -> bool {
+        !self.in_flight.is_empty() || self.commit.as_ref().is_some_and(|commit| commit.committing)
+    }
+
+    /// The folder's view moved to another pane: a read on its way answers the old one,
+    /// so the next refresh reads again, and the commit box's events are bound anew.
+    pub(super) fn moved(&mut self) {
+        self.reading = None;
+        self.marked = false;
+        if let Some(commit) = &mut self.commit {
+            commit.moved = true;
         }
     }
 
@@ -1027,6 +1044,43 @@ fn row_controls(
         )
 }
 
+/// What typing in the commit box of `pane_id` does: the Commit button follows whether
+/// the summary holds text, and Enter in it goes on to the description `body`.
+fn commit_events(
+    pane_id: &PaneId,
+    summary: &Entity<InputState>,
+    body: Entity<TextareaState>,
+    window: &mut Window,
+    cx: &mut Context<CompiApp>,
+) -> Subscription {
+    let pane = pane_id.clone();
+    cx.subscribe_in(
+        summary,
+        window,
+        move |this, input, event: &InputEvent, window, cx| match event {
+            InputEvent::Change => {
+                let filled = !input.read(cx).value().trim().is_empty();
+                if let Some(commit) = this
+                    .content
+                    .panes
+                    .get_mut(&pane)
+                    .and_then(|ui| ui.repo.commit.as_mut())
+                    && commit.has_summary != filled
+                {
+                    commit.has_summary = filled;
+                    cx.notify();
+                }
+            }
+            // Enter in the summary goes on to the description.
+            InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            } => body.update(cx, |body, cx| body.focus(window, cx)),
+            _ => {}
+        },
+    )
+}
+
 impl CompiApp {
     /// The Git changes of `pane_id`'s folder: `None` outside a work tree or until the
     /// first read lands. Kept fresh while the pane is visible.
@@ -1476,6 +1530,27 @@ impl CompiApp {
                 ui.repo.commit = Some(commit);
             }
         }
+        let moved: Vec<(PaneId, Entity<InputState>, Entity<TextareaState>)> = self
+            .content
+            .panes
+            .iter()
+            .filter_map(|(pane_id, ui)| {
+                let commit = ui.repo.commit.as_ref().filter(|commit| commit.moved)?;
+                Some((pane_id.clone(), commit.summary.clone(), commit.body.clone()))
+            })
+            .collect();
+        for (pane_id, summary, body) in moved {
+            let events = commit_events(&pane_id, &summary, body, window, cx);
+            if let Some(commit) = self
+                .content
+                .panes
+                .get_mut(&pane_id)
+                .and_then(|ui| ui.repo.commit.as_mut())
+            {
+                commit.moved = false;
+                commit._events = events;
+            }
+        }
     }
 
     /// The summary field, the body field and what their events do.
@@ -1491,32 +1566,7 @@ impl CompiApp {
                 .placeholder("Description")
                 .auto_grow(2, 8)
         });
-        let (pane, next) = (pane_id.clone(), body.clone());
-        let events = cx.subscribe_in(
-            &summary,
-            window,
-            move |this, input, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => {
-                    let filled = !input.read(cx).value().trim().is_empty();
-                    if let Some(commit) = this
-                        .content
-                        .panes
-                        .get_mut(&pane)
-                        .and_then(|ui| ui.repo.commit.as_mut())
-                        && commit.has_summary != filled
-                    {
-                        commit.has_summary = filled;
-                        cx.notify();
-                    }
-                }
-                // Enter in the summary goes on to the description.
-                InputEvent::PressEnter {
-                    secondary: false,
-                    shift: false,
-                } => next.update(cx, |body, cx| body.focus(window, cx)),
-                _ => {}
-            },
-        );
+        let events = commit_events(pane_id, &summary, body.clone(), window, cx);
         CommitBox {
             summary,
             body,
@@ -1524,6 +1574,7 @@ impl CompiApp {
             amend: false,
             draft: None,
             committing: false,
+            moved: false,
             _events: events,
         }
     }

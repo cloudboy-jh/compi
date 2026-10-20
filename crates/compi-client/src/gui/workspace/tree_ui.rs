@@ -1,68 +1,12 @@
+//! The pickers drawn over the pane they serve: `compi z`'s Jump to project, which
+//! answers the shell that asked, and Switch branch / Create branch (see `branches`).
+//! Browsing folders is the Files view's (see `views`).
 use super::*;
 use gpui::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_TREE_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 impl CompiApp {
-    pub(super) fn open_file_tree(&mut self) {
-        self.open_file_tree_with_shell(false);
-    }
-
-    pub(super) fn open_file_tree_with_shell(&mut self, pending_shell: bool) {
-        let Some(view) = self.focused_view() else {
-            self.global_error = Some("Select a terminal pane to browse files".into());
-            return;
-        };
-        let pane_id = view.pane_id.clone();
-        let surface_id = view.surface_id.clone();
-        let reported = view
-            .mirror
-            .snapshot()
-            .and_then(|snapshot| snapshot.current_directory.clone());
-        let surface = self
-            .workspace
-            .as_ref()
-            .and_then(|workspace| workspace.surface(&surface_id));
-        let root = reported.or_else(|| {
-            surface.and_then(|surface| {
-                surface
-                    .working_directory
-                    .as_ref()
-                    .map(|cwd| cwd.resolved_wsl_path.clone())
-                    .or_else(|| surface.launch.working_directory.clone())
-                    .or_else(|| {
-                        surface
-                            .launch
-                            .profile
-                            .as_ref()
-                            .and_then(|profile| profile.working_directory.clone())
-                    })
-            })
-        });
-        let Some(root) = root.filter(|root| root.starts_with('/')) else {
-            self.global_error = Some(
-                "The shell has not reported its current directory. Enable OSC 7 shell integration to browse from this pane.".into(),
-            );
-            if pending_shell {
-                self.reply_to_shell(&pane_id, None);
-            }
-            return;
-        };
-        if self.file_tree.is_some() {
-            self.close_file_tree();
-        }
-        let mut tree = tree::FileTree::new(pane_id.clone(), root.clone());
-        tree.pending_shell = pending_shell;
-        tree.surface_id = Some(surface_id.clone());
-        tree.request = NEXT_TREE_REQUEST.fetch_add(1, Ordering::Relaxed);
-        let request = tree.request;
-        self.report_focus(false);
-        self.file_tree = Some(tree);
-        self.tree_scroll.set_offset(point(px(0.0), px(0.0)));
-        self.request_tree_directory(pane_id, surface_id, root, request);
-    }
-
+    /// Answers the shell of `pane_id` waiting in `compi tree` or `compi z`: with
+    /// `path`, a folder to change to; without, nothing, which cancels.
     pub(super) fn reply_to_shell(&mut self, pane_id: &PaneId, path: Option<&str>) {
         let data = path
             .map(|path| {
@@ -86,24 +30,21 @@ impl CompiApp {
         }
     }
 
+    /// Closes the picker; Jump to project answers its shell with nothing.
     pub(super) fn close_file_tree(&mut self) {
         if let Some(tree) = self.file_tree.take() {
-            if tree.pending_shell {
+            if tree.project_mode {
                 self.reply_to_shell(&tree.pane_id, None);
             }
             self.report_focus(true);
         }
     }
 
+    /// Jump to project: the shell changes to the selected folder.
     fn enter_tree_directory(&mut self) {
-        let Some(tree) = self.file_tree.as_ref() else {
+        let Some(tree) = self.file_tree.as_ref().filter(|tree| tree.project_mode) else {
             return;
         };
-        if !tree.pending_shell {
-            self.global_error =
-                Some("To change this shell's directory, run compi tree from its prompt.".into());
-            return;
-        }
         let Some(path) = tree
             .selected()
             .filter(|row| row.directory)
@@ -139,7 +80,6 @@ impl CompiApp {
         }
         let mut picker = tree::FileTree::new(pane_id, current.unwrap_or_else(|| "/".into()));
         picker.project_mode = true;
-        picker.pending_shell = true;
         self.report_focus(false);
         self.file_tree = Some(picker);
         self.tree_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -168,177 +108,17 @@ impl CompiApp {
         let Some(tree) = self.file_tree.as_mut() else {
             return;
         };
+        tree.query.push_str(text);
         if tree.branches.is_some() {
-            tree.query.push_str(text);
             self.refresh_branch_matches();
-        } else if tree.project_mode {
-            tree.query.push_str(text);
+        } else {
             self.refresh_project_matches();
-        } else if tree.searching {
-            tree.query.push_str(text);
-            self.request_tree_search();
-        }
-    }
-
-    fn request_tree_directory(
-        &self,
-        pane_id: PaneId,
-        surface_id: SurfaceId,
-        path: String,
-        request: u64,
-    ) {
-        let target = self.target.clone();
-        let sender = self.event_tx.clone();
-        thread::spawn(move || {
-            let result = (|| -> crate::Result<_> {
-                target.connect()?.list_directory(surface_id, path.clone())
-            })()
-            .map_err(|error| error.to_string());
-            sender.send(UiEvent::TreeListed {
-                pane_id,
-                request,
-                parent: path,
-                result,
-            });
-        });
-    }
-
-    fn request_tree_search(&mut self) {
-        let Some(tree) = self.file_tree.as_mut() else {
-            return;
-        };
-        let request = NEXT_TREE_REQUEST.fetch_add(1, Ordering::Relaxed);
-        tree.search_request = request;
-        tree.search_results.clear();
-        tree.selected = 0;
-        if tree.query.is_empty() {
-            return;
-        }
-        let Some(surface_id) = tree.surface_id.clone() else {
-            return;
-        };
-        let pane_id = tree.pane_id.clone();
-        let root = tree.rows[0].path.clone();
-        let query = tree.query.clone();
-        let target = self.target.clone();
-        let sender = self.event_tx.clone();
-        thread::spawn(move || {
-            let result = (|| -> crate::Result<_> {
-                target.connect()?.search_directory(surface_id, root, query)
-            })()
-            .map_err(|error| error.to_string());
-            sender.send(UiEvent::TreeSearched {
-                pane_id,
-                request,
-                result,
-            });
-        });
-    }
-
-    pub(super) fn tree_listed(
-        &mut self,
-        pane_id: PaneId,
-        request: u64,
-        parent: String,
-        result: Result<Vec<compi_protocol::DirectoryEntry>, String>,
-    ) {
-        let Some(tree) = self
-            .file_tree
-            .as_mut()
-            .filter(|tree| tree.pane_id == pane_id && tree.request == request)
-        else {
-            return;
-        };
-        match result {
-            Ok(entries) => {
-                tree.error = None;
-                tree.replace_children(
-                    &parent,
-                    entries
-                        .into_iter()
-                        .map(|entry| tree::Entry {
-                            name: entry.name,
-                            directory: entry.is_directory,
-                        })
-                        .collect(),
-                );
-            }
-            Err(error) => {
-                if let Some(row) = tree.rows.iter_mut().find(|row| row.path == parent) {
-                    row.loading = false;
-                    row.expanded = false;
-                }
-                tree.error = Some(error);
-            }
-        }
-    }
-
-    pub(super) fn tree_searched(
-        &mut self,
-        pane_id: PaneId,
-        request: u64,
-        result: Result<Vec<compi_protocol::SearchEntry>, String>,
-    ) {
-        let Some(tree) = self.file_tree.as_mut().filter(|tree| {
-            tree.pane_id == pane_id && tree.search_request == request && !tree.query.is_empty()
-        }) else {
-            return;
-        };
-        match result {
-            Ok(entries) => {
-                tree.error = None;
-                tree.replace_search_results(
-                    entries
-                        .into_iter()
-                        .map(|entry| (entry.path, entry.is_directory))
-                        .collect(),
-                );
-            }
-            Err(error) => {
-                tree.error = Some(error);
-            }
         }
     }
 
     fn scroll_to_selected_tree_row(&self) {
         if let Some(tree) = &self.file_tree {
             self.tree_scroll.scroll_to_item(tree.selected);
-        }
-    }
-
-    fn toggle_tree_row(&mut self, index: usize) {
-        let Some(tree) = self.file_tree.as_mut() else {
-            return;
-        };
-        if tree.project_mode {
-            tree.selected = index;
-            self.enter_tree_directory();
-            return;
-        }
-        if tree.searching && !tree.query.is_empty() {
-            let Some(row) = tree.search_results.get(index).filter(|row| row.directory) else {
-                return;
-            };
-            let path = row.path.clone();
-            let pane_id = tree.pane_id.clone();
-            let request = NEXT_TREE_REQUEST.fetch_add(1, Ordering::Relaxed);
-            let previous =
-                std::mem::replace(tree, tree::FileTree::new(pane_id.clone(), path.clone()));
-            tree.pending_shell = previous.pending_shell;
-            tree.surface_id = previous.surface_id;
-            tree.request = request;
-            if let Some(surface_id) = tree.surface_id.clone() {
-                self.request_tree_directory(pane_id, surface_id, path, request);
-            }
-            return;
-        }
-        let Some(path) = tree.toggle(index) else {
-            return;
-        };
-        let pane_id = tree.pane_id.clone();
-        let request = tree.request;
-        if let Some(surface_id) = tree.surface_id.clone() {
-            self.request_tree_directory(pane_id, surface_id, path, request);
         }
     }
 
@@ -376,6 +156,7 @@ impl CompiApp {
         cx.notify();
     }
 
+    /// Keys while a picker is open: it takes them all.
     pub(super) fn handle_tree_key(
         &mut self,
         key: &Keystroke,
@@ -386,122 +167,31 @@ impl CompiApp {
             return false;
         };
         #[cfg(target_os = "macos")]
-        if key.key_char.is_some()
-            && !key.modifiers.control
-            && !key.modifiers.platform
-            && (tree.project_mode || tree.searching || tree.branches.is_some())
-        {
+        if key.key_char.is_some() && !key.modifiers.control && !key.modifiers.platform {
             // AppKit supplies composed text and IME through EntityInputHandler.
             return false;
         }
         if tree.branches.is_some() {
             self.handle_branch_key(key, window, cx);
-            return true;
-        }
-        if tree.project_mode {
+        } else {
             self.handle_project_key(key, cx);
-            return true;
         }
-        let searching = tree.searching;
-        match key.key.as_str() {
-            "escape" => self.close_file_tree(),
-            "up" => self.file_tree.as_mut().unwrap().move_selection(-1),
-            "down" => self.file_tree.as_mut().unwrap().move_selection(1),
-            "enter" if key.modifiers.control || key.modifiers.platform => {
-                self.enter_tree_directory();
-            }
-            "right" | "enter" => {
-                let tree = self.file_tree.as_ref().unwrap();
-                let index = tree.selected;
-                if tree.selected().is_some_and(|row| row.directory) {
-                    self.toggle_tree_row(index);
-                } else if key.key == "enter" {
-                    self.copy_tree_path(cx);
-                }
-            }
-            "left" if !searching => {
-                let tree = self.file_tree.as_mut().unwrap();
-                let selected = tree.selected;
-                if tree.rows[selected].expanded {
-                    tree.toggle(selected);
-                } else if tree.rows[selected].depth > 0 {
-                    tree.selected = (0..selected)
-                        .rev()
-                        .find(|index| tree.rows[*index].depth < tree.rows[selected].depth)
-                        .unwrap_or(0);
-                }
-            }
-            "backspace" if searching => {
-                self.file_tree.as_mut().unwrap().query.pop();
-                self.request_tree_search();
-            }
-            "c" if !searching || key.modifiers.control || key.modifiers.platform => {
-                self.copy_tree_path(cx);
-            }
-            "/" if !searching => {
-                let tree = self.file_tree.as_mut().unwrap();
-                tree.searching = true;
-                tree.query.clear();
-                tree.selected = 0;
-            }
-            "f" if key.modifiers.control || key.modifiers.platform => {
-                let tree = self.file_tree.as_mut().unwrap();
-                tree.searching = true;
-                tree.query.clear();
-                tree.selected = 0;
-            }
-            _ if searching && !key.modifiers.control && !key.modifiers.platform => {
-                if let Some(text) = key.key_char.as_deref() {
-                    self.append_tree_text(text);
-                }
-            }
-            _ => {}
-        }
-        self.scroll_to_selected_tree_row();
-        cx.notify();
         true
     }
 
+    /// The open picker, over its pane.
     pub(super) fn render_file_tree(&self, cx: &Context<Self>) -> AnyElement {
         let Some(tree) = self.file_tree.as_ref() else {
             return div().into_any_element();
         };
         let colors = *self.colors();
-        let can_enter = tree.pending_shell && tree.selected().is_some_and(|row| row.directory);
+        let can_enter = tree.project_mode && tree.selected().is_some_and(|row| row.directory);
         let input = cx.entity();
         let focus = self.focus_handle.clone();
         let line_height = self.typography.cell_height.max(18.0);
-        let mut continuing = [false; 32];
         let rows = tree.display_rows().iter().enumerate().map(|(index, row)| {
             let selected = index == tree.selected;
             let folder = row.directory;
-            let depth = row.depth.min(31);
-            let branch =
-                (depth > 0 && !tree.project_mode && (!tree.searching || tree.query.is_empty()))
-                    .then(|| {
-                        let mut prefix = String::with_capacity(depth * 3);
-                        for &has_next in continuing.iter().take(depth).skip(1) {
-                            prefix.push_str(if has_next { "│  " } else { "   " });
-                        }
-                        prefix.push_str(if row.has_next_sibling {
-                            "├─"
-                        } else {
-                            "└─"
-                        });
-                        prefix
-                    });
-            continuing[depth] = row.has_next_sibling;
-            let label = if tree.project_mode {
-                row.path.clone()
-            } else if tree.searching && !tree.query.is_empty() {
-                row.path
-                    .strip_prefix(tree.rows[0].path.trim_end_matches('/'))
-                    .unwrap_or(&row.path)
-                    .trim_start_matches('/')
-                    .to_owned()
-            } else {
-                row.name.clone()
-            };
             div()
                 .id(("tree-row", index))
                 .h(px(line_height))
@@ -520,15 +210,12 @@ impl CompiApp {
                         }
                         this.scroll_to_selected_tree_row();
                         if event.click_count >= 2 && folder {
-                            this.toggle_tree_row(index);
+                            this.enter_tree_directory();
                         }
                         cx.stop_propagation();
                         cx.notify();
                     }),
                 )
-                .when_some(branch, |entry, prefix| {
-                    entry.child(div().text_color(color(colors.muted)).child(prefix))
-                })
                 .child(
                     div()
                         .h(px(line_height - 2.0))
@@ -540,37 +227,9 @@ impl CompiApp {
                         .when(!selected, |entry| {
                             entry.hover(move |style| style.bg(color(colors.surface_hover)))
                         })
-                        .child(
-                            div()
-                                .w(px(20.0))
-                                .flex_none()
-                                .text_color(color(if selected {
-                                    colors.foreground
-                                } else {
-                                    colors.muted
-                                }))
-                                .child(if folder {
-                                    if row.expanded { "▾" } else { "▸" }
-                                } else {
-                                    ""
-                                })
-                                .when(folder, |arrow| {
-                                    arrow.on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            if let Some(tree) = this.file_tree.as_mut() {
-                                                tree.selected = index;
-                                            }
-                                            this.toggle_tree_row(index);
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }),
-                                    )
-                                }),
-                        )
                         .child(tree_entry_icon(
                             folder,
-                            row.expanded,
+                            false,
                             color(if selected {
                                 colors.foreground
                             } else if folder {
@@ -579,7 +238,7 @@ impl CompiApp {
                                 colors.muted
                             }),
                         ))
-                        .child(div().ml_1().child(label)),
+                        .child(div().ml_1().child(row.path.clone())),
                 )
         });
         let branch_rows = tree
@@ -598,8 +257,7 @@ impl CompiApp {
         let title = match &tree.branches {
             Some(picker) if picker.create => format!("Create branch in {}", picker.repo),
             Some(picker) => format!("Switch branch in {}", picker.repo),
-            None if tree.project_mode => "Jump to project".to_owned(),
-            None => tree.rows[0].path.clone(),
+            None => "Jump to project".to_owned(),
         };
         div()
             .id("file-tree")
@@ -615,7 +273,11 @@ impl CompiApp {
                 canvas(
                     move |_, _, _| (),
                     move |bounds, _, window, cx| {
-                        window.handle_input(&focus, ElementInputHandler::new(bounds, input.clone()), cx);
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, input.clone()),
+                            cx,
+                        );
                     },
                 )
                 .absolute()
@@ -633,7 +295,14 @@ impl CompiApp {
                     .justify_between()
                     .border_b_1()
                     .border_color(color(colors.border))
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(color(colors.muted)).child(title))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(color(colors.muted))
+                            .child(title),
+                    )
                     .when_some(tree.branches.as_ref(), |header, picker| {
                         header.child(self.render_branch_action(tree, picker, cx))
                     })
@@ -683,25 +352,58 @@ impl CompiApp {
                     }),
             )
             .when_some(branch_note, |view, note| {
-                view.child(div().px_2().py_1().text_color(color(colors.muted)).child(note))
+                view.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(color(colors.muted))
+                        .child(note),
+                )
             })
-            .when(tree.project_mode && tree.search_results.is_empty(), |view| {
-                view.child(div().px_2().py_1().text_color(color(colors.muted)).child("No visited directories match. Browse a project first."))
+            .when(
+                tree.project_mode && tree.search_results.is_empty(),
+                |view| {
+                    view.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_color(color(colors.muted))
+                            .child("No visited directories match. Browse a project first."),
+                    )
+                },
+            )
+            .when_some(tree.error.as_deref(), |view, error| {
+                view.child(
+                    div()
+                        .px_2()
+                        .text_color(color(colors.error))
+                        .child(error.to_owned()),
+                )
             })
-            .when_some(tree.error.as_deref(), |view, error| view.child(div().px_2().text_color(color(colors.error)).child(error.to_owned())))
-            .child(div().flex_none().px_2().py_1().text_color(color(colors.muted)).child(if let Some(write) = self.branch_write.as_ref().filter(|_| tree.branches.is_some()) {
-                write.label.clone()
-            } else if let Some(picker) = &tree.branches {
-                format!("Branch: {}  ·  type to filter · ↑↓ choose · Enter {} · Esc close", tree.query, if picker.create { "create" } else { "switch" })
-            } else if tree.project_mode {
-                format!("Jump: {}  ·  ↑↓ choose · Enter cd · Esc close", tree.query)
-            } else if tree.searching {
-                format!("Search: {}  ·  ↑↓ choose · Enter expand/copy · Esc close", tree.query)
-            } else if tree.pending_shell {
-                "↑↓ select · Enter expand/copy · Ctrl+Enter enter folder · C copy path · / search · Esc close".to_owned()
-            } else {
-                "↑↓ select · Enter expand/copy · C copy path · / search · Esc close".to_owned()
-            }))
+            .child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .text_color(color(colors.muted))
+                    .child(
+                        if let Some(write) = self
+                            .branch_write
+                            .as_ref()
+                            .filter(|_| tree.branches.is_some())
+                        {
+                            write.label.clone()
+                        } else if let Some(picker) = &tree.branches {
+                            format!(
+                                "Branch: {}  ·  type to filter · ↑↓ choose · Enter {} · Esc close",
+                                tree.query,
+                                if picker.create { "create" } else { "switch" }
+                            )
+                        } else {
+                            format!("Jump: {}  ·  ↑↓ choose · Enter cd · Esc close", tree.query)
+                        },
+                    ),
+            )
             .into_any_element()
     }
 }

@@ -560,17 +560,6 @@ enum UiEvent {
     ImageClipboardReady(Result<gpui::Image, String>),
     ImageOperationFinished(Result<String, String>),
     SurfacesLoaded(Result<compi_protocol::WorkspaceSnapshot, String>),
-    TreeListed {
-        pane_id: PaneId,
-        request: u64,
-        parent: String,
-        result: Result<Vec<compi_protocol::DirectoryEntry>, String>,
-    },
-    TreeSearched {
-        pane_id: PaneId,
-        request: u64,
-        result: Result<Vec<compi_protocol::SearchEntry>, String>,
-    },
     PaletteFilesSearched {
         request: u64,
         result: Result<Vec<compi_protocol::SearchEntry>, String>,
@@ -845,8 +834,11 @@ struct CompiApp {
     metadata: workspace::metadata::MetadataUi,
     program_status: workspace::program_status::ProgramStatusUi,
     focused_view: Option<u64>,
+    /// The `compi z` and branch pickers, over the terminal they serve.
     file_tree: Option<workspace::tree::FileTree>,
     tree_scroll: ScrollHandle,
+    /// Views in place: a shell waiting for Enter folder, a view moving to its own pane.
+    views: workspace::views::ViewsUi,
     /// A branch switch or create the daemon has not answered yet.
     branch_write: Option<workspace::branches::BranchWrite>,
     /// Fetch, Pull and Push: one waiting for its terminal, and the terminal typed into last.
@@ -978,20 +970,29 @@ impl CompiApp {
     }
 
     /// The pane with the keyboard, terminal or content. `focused_view` is only ever
-    /// a terminal, so it is `None` while a content pane has the keyboard.
+    /// a terminal, so it is `None` while a content pane has the keyboard; it stays set
+    /// while a terminal pane shows its view, whose shell then takes no input.
     fn focused_pane(&self) -> Option<&PaneId> {
         self.state.focused_pane(self.workspace.as_ref()?)
     }
 
-    /// The focused pane's folder and files, if it is a content pane showing files.
+    /// The focused pane's folder and files, if it shows files: a content pane, or a
+    /// terminal pane showing its Files view.
     fn focused_content(&self) -> Option<&compi_protocol::FolderContent> {
-        workspace::content::find_content(self.workspace.as_ref()?, self.focused_pane()?)
+        self.focused_pane_content()?.folder()
     }
 
-    /// What the focused pane shows, if it is a content pane of any kind.
+    /// What the focused pane shows instead of a terminal, if anything: a content pane of
+    /// any kind, or a terminal pane showing its view.
     fn focused_pane_content(&self) -> Option<&compi_protocol::PaneContent> {
-        workspace::content::find_pane_content(self.workspace.as_ref()?, self.focused_pane()?)
+        workspace::content::find_shown_content(self.workspace.as_ref()?, self.focused_pane()?)
     }
+
+    /// The focused terminal pane shows its view: its shell takes no keys, text or paste.
+    fn focused_shell_hidden(&self) -> bool {
+        self.focused_view.is_some() && self.focused_pane_content().is_some()
+    }
+
     fn refresh_typography(&mut self, window: &Window) -> bool {
         let scale = window.scale_factor();
         if (scale - self.typography_scale).abs() <= f32::EPSILON {
@@ -1016,6 +1017,9 @@ impl CompiApp {
     fn handle_keystroke(&mut self, keystroke: &Keystroke) -> bool {
         if self.overlay.is_some() {
             return true;
+        }
+        if self.focused_shell_hidden() {
+            return false;
         }
         let Some(tab) = self.focused_view_mut() else {
             return false;
@@ -1093,6 +1097,9 @@ impl CompiApp {
     }
 
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.focused_shell_hidden() {
+            return;
+        }
         let clipboard = cx.read_from_clipboard();
         #[cfg(windows)]
         if !clipboard.as_ref().is_some_and(|item| {
@@ -1157,7 +1164,10 @@ impl CompiApp {
             alternate_scroll: false,
         });
     }
+    /// Reports focus in or out to the focused terminal's program. A terminal showing its
+    /// view is never reported focused: its shell is out of sight.
     fn report_focus(&mut self, focused: bool) {
+        let focused = focused && !self.focused_shell_hidden();
         let Some(tab) = self.focused_view_mut() else {
             return;
         };
@@ -1813,6 +1823,7 @@ impl EntityInputHandler for CompiApp {
         self.ime_marked_range = None;
         self.ime_selected_range = 0..0;
         if !text.is_empty()
+            && !self.focused_shell_hidden()
             && let Some(tab) = self.focused_view_mut()
         {
             tab.scroll_offset = 0;

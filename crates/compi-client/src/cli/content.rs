@@ -1,12 +1,11 @@
-//! `compi files` and `compi edit`: show a folder or file in a content pane beside the
-//! selected terminal, reusing a content pane its tab already has. `compi diff` places its
-//! panes the same way.
+//! `compi files` and `compi edit`: show a folder or file in the pane they run from. A
+//! terminal shows it as its view, in place of its shell, which keeps running underneath;
+//! a files content pane shows it itself. `compi diff` places its views the same way.
 use super::{CliError, Options, Output, pane_surface, submit, targets};
-use crate::{DaemonClient, arrangement, cli_window::Action, connection::ConnectionTarget};
+use crate::{DaemonClient, cli_window::Action, connection::ConnectionTarget};
 use compi_protocol::{
     ContentEnvironment, ContentTab, FolderContent, LayoutNode, MutationReceipt, PaneContent,
-    PaneId, SplitAxis, SplitGeometry, SurfaceInfo, WorkspaceMutation, WorkspaceSnapshot,
-    WorkspaceTab,
+    PaneId, PaneSide, SurfaceInfo, WorkspaceMutation, WorkspaceSnapshot,
 };
 use serde_json::{Value, json};
 
@@ -15,11 +14,11 @@ pub(super) enum Show {
     Folder(String),
     Tab {
         tab: ContentTab,
-        /// The absolute file the tab is about; a content pane whose root holds it is reused.
+        /// The absolute file the tab is about; a view's root that holds it stays.
         file: String,
-        /// When set, only a content pane rooted at this folder or below it is reused.
+        /// When set, a view's root must also be this folder or lie below it to stay.
         within: Option<String>,
-        /// The root of a new content pane for the tab.
+        /// The root files take when none are shown or a view's root does not stay.
         root: String,
     },
 }
@@ -27,36 +26,25 @@ pub(super) enum Show {
 /// The pane a command runs from, and where its relative paths start.
 pub(super) struct Caller<'a> {
     pub id: PaneId,
-    pub tab: &'a WorkspaceTab,
     pub environment: ContentEnvironment,
     /// The caller's terminal; `None` when the caller is a files content pane.
     pub surface: Option<&'a SurfaceInfo>,
+    /// The files the pane holds now: a files content pane's, or a terminal's files view,
+    /// shown or not.
+    pub files: Option<FolderContent>,
+    /// The caller is a terminal showing its view rather than its shell.
+    pub view_shown: bool,
     /// The shell's directory (or a content pane's root), normalised.
     pub directory: Option<String>,
     /// Paths are in Windows syntax, which only a Windows host's are.
     pub windows: bool,
 }
 
-/// The content pane a command shows something in.
+/// The pane a command shows something in: always the caller's own.
 pub(super) struct Placed {
     pub pane_id: PaneId,
     pub receipt: Option<MutationReceipt>,
-    /// The pane was opened beside the caller rather than reused.
-    pub opened: bool,
 }
-
-/// Terminal grids measured in nominal 8x16-pixel cells, the scale content minimums are
-/// in; the GUI lays the split out with real metrics when it applies it.
-const CELL_METRICS: crate::layout::LayoutMetrics = crate::layout::LayoutMetrics {
-    cell_width: 8.0,
-    line_height: 16.0,
-    padding_x: 0.0,
-    padding_y: 0.0,
-    pane_chrome_height: 0.0,
-    divider_thickness: 1.0,
-    margin: 0.0,
-    scale_factor: 1.0,
-};
 
 pub(super) fn run(
     client: &mut DaemonClient,
@@ -121,28 +109,44 @@ pub(super) fn run(
 }
 
 /// The selected pane (the calling shell by default), its environment and directory.
-/// Settings and Monitor panes have neither, so they cannot be the caller.
+/// Settings and Monitor panes have neither, so they cannot be the caller; a terminal
+/// showing one as its view can, and its view becomes files.
 pub(super) fn caller<'a>(
     client: &mut DaemonClient,
     state: &'a WorkspaceSnapshot,
     options: &Options,
 ) -> Result<Caller<'a>, CliError> {
-    let (_, tab, leaf) = targets::pane(state, options)?;
+    let (_, _, leaf) = targets::pane(state, options)?;
     let id = leaf
         .leaf_pane()
         .expect("targets resolve only leaf nodes")
         .clone();
-    let (environment, surface, base) = match &leaf {
-        LayoutNode::Pane { surface_id, .. } => {
-            let surface = pane_surface(state, surface_id)?;
+    let (environment, surface, base, files, view_shown) = match leaf {
+        LayoutNode::Pane {
+            surface_id, view, ..
+        } => {
+            let surface = pane_surface(state, &surface_id)?;
             let environment = ContentEnvironment::of_surface(surface);
             let base = shell_directory(client, options, surface, &environment)?;
-            (environment, Some(surface), base)
+            let view_shown = view
+                .as_ref()
+                .is_some_and(|view| view.side == PaneSide::View);
+            let files = view.and_then(|view| match view.content {
+                PaneContent::Files(folder) => Some(folder),
+                PaneContent::Settings(_) | PaneContent::Monitor(_) => None,
+            });
+            (environment, Some(surface), base, files, view_shown)
         }
         LayoutNode::Content {
             content: PaneContent::Files(folder),
             ..
-        } => (folder.environment.clone(), None, Some(folder.root.clone())),
+        } => (
+            folder.environment.clone(),
+            None,
+            Some(folder.root.clone()),
+            Some(folder),
+            false,
+        ),
         LayoutNode::Content {
             content: content @ (PaneContent::Settings(_) | PaneContent::Monitor(_)),
             ..
@@ -169,9 +173,10 @@ pub(super) fn caller<'a>(
     Ok(Caller {
         directory: base.and_then(|base| resolve_path(None, &base, windows).ok()),
         id,
-        tab,
         environment,
         surface,
+        files,
+        view_shown,
         windows,
     })
 }
@@ -185,112 +190,114 @@ impl Caller<'_> {
     }
 }
 
-/// Shows `show` in the content pane `reusable` picks, or in a new one beside the caller:
-/// a folder becomes the pane's root; a tab is added if missing and made active.
+/// Shows `show` in the caller's own pane: a terminal shows it as its view, in place of
+/// its shell; a files content pane shows it itself. See `merged` for what changes.
 pub(super) fn place(
     client: &mut DaemonClient,
     state: &WorkspaceSnapshot,
     caller: &Caller,
     show: &Show,
 ) -> Result<Placed, CliError> {
-    let windows = caller.windows;
-    if let Some((pane_id, current)) = reusable(
-        &caller.tab.layout,
-        &caller.id,
+    let current = caller
+        .files
+        .as_ref()
+        .filter(|files| files.environment == caller.environment);
+    let content = merged(
+        current.cloned(),
         &caller.environment,
         show,
-        windows,
-    ) {
-        let mut content = current.clone();
-        match show {
-            Show::Folder(folder) => {
-                if resolve_path(None, &content.root, windows).ok().as_ref() != Some(folder) {
-                    content.root = folder.clone();
-                }
-            }
-            Show::Tab { tab, file, .. } => {
-                // The file's one tab takes the mode asked for, keeping its place and path.
-                let tab = match open_tab(&content, file, windows) {
-                    Some(index) => {
-                        let shown = content.tabs[index].with_diff(tab.diff_scope());
-                        content.tabs[index] = shown.clone();
-                        shown
-                    }
-                    None => {
-                        content.tabs.push(tab.clone());
-                        tab.clone()
-                    }
-                };
-                content.active = Some(tab);
+        caller.windows,
+        // A terminal's view follows the shell; a content pane keeps its own folder.
+        caller.surface.is_some(),
+    );
+    content.validate().map_err(CliError::usage)?;
+    let unchanged = current == Some(&content);
+    let mutation = if caller.surface.is_none() {
+        (!unchanged).then(|| WorkspaceMutation::UpdateContent {
+            pane_id: caller.id.clone(),
+            content: PaneContent::Files(content),
+        })
+    } else {
+        (!unchanged || !caller.view_shown).then(|| WorkspaceMutation::ShowView {
+            pane_id: caller.id.clone(),
+            content: PaneContent::Files(content),
+        })
+    };
+    let receipt = mutation
+        .map(|mutation| submit(client, state, mutation, None))
+        .transpose()?;
+    Ok(Placed {
+        pane_id: caller.id.clone(),
+        receipt,
+    })
+}
+
+/// `current` (the pane's files, if it shows any in `environment`) with `show` in it: a
+/// folder becomes the root; a tab is added if missing and made active. With `follow`,
+/// a root that does not hold the tab's file (or lies outside its `within` folder) moves
+/// to the tab's own root. Without `current`, new files show just that.
+fn merged(
+    current: Option<FolderContent>,
+    environment: &ContentEnvironment,
+    show: &Show,
+    windows: bool,
+    follow: bool,
+) -> FolderContent {
+    let Some(mut content) = current else {
+        let environment = environment.clone();
+        return match show {
+            Show::Folder(folder) => FolderContent {
+                environment,
+                root: folder.clone(),
+                tabs: Vec::new(),
+                active: None,
+            },
+            Show::Tab { tab, root, .. } => FolderContent {
+                environment,
+                root: root.clone(),
+                tabs: vec![tab.clone()],
+                active: Some(tab.clone()),
+            },
+        };
+    };
+    let current_root = resolve_path(None, &content.root, windows).ok();
+    match show {
+        Show::Folder(folder) => {
+            if current_root.as_ref() != Some(folder) {
+                content.root = folder.clone();
             }
         }
-        content.validate().map_err(CliError::usage)?;
-        let receipt = if content == current {
-            None
-        } else {
-            Some(submit(
-                client,
-                state,
-                WorkspaceMutation::UpdateContent {
-                    pane_id: pane_id.clone(),
-                    content: PaneContent::Files(content),
-                },
-                None,
-            )?)
-        };
-        return Ok(Placed {
-            pane_id,
-            receipt,
-            opened: false,
-        });
+        Show::Tab {
+            tab,
+            file,
+            within,
+            root,
+        } => {
+            let holds = current_root.is_some_and(|current| {
+                contains(&current, file, windows)
+                    && within.as_ref().is_none_or(|within| {
+                        *within == current || contains(within, &current, windows)
+                    })
+            });
+            if follow && !holds {
+                content.root = root.clone();
+            }
+            // The file's one tab takes the mode asked for, keeping its place and path.
+            let tab = match open_tab(&content, file, windows) {
+                Some(index) => {
+                    let shown = content.tabs[index].with_diff(tab.diff_scope());
+                    content.tabs[index] = shown.clone();
+                    shown
+                }
+                None => {
+                    content.tabs.push(tab.clone());
+                    tab.clone()
+                }
+            };
+            content.active = Some(tab);
+        }
     }
-    let surface = caller
-        .surface
-        .expect("a content pane caller is always reused, never split");
-    let environment = caller.environment.clone();
-    let content = match show {
-        Show::Folder(folder) => FolderContent {
-            environment,
-            root: folder.clone(),
-            tabs: Vec::new(),
-            active: None,
-        },
-        Show::Tab { tab, root, .. } => FolderContent {
-            environment,
-            root: root.clone(),
-            tabs: vec![tab.clone()],
-            active: Some(tab.clone()),
-        },
-    };
-    content.validate().map_err(CliError::usage)?;
-    let receipt = submit(
-        client,
-        state,
-        WorkspaceMutation::OpenContent {
-            pane_id: caller.id.clone(),
-            axis: SplitAxis::Horizontal,
-            geometry: geometry(surface)?,
-            content: PaneContent::Files(content),
-        },
-        None,
-    )?;
-    let pane_id = receipt
-        .affected_panes
-        .iter()
-        .find(|pane| **pane != caller.id)
-        .cloned()
-        .ok_or_else(|| {
-            CliError::new(
-                1,
-                "operation_failed",
-                "the daemon did not report the new content pane",
-            )
-        })?;
-    Ok(Placed {
-        pane_id,
-        receipt: Some(receipt),
-        opened: true,
-    })
+    content
 }
 
 /// Hands `action` to a window showing the pane and reports what was opened: the text
@@ -308,22 +315,15 @@ pub(super) fn report(
     let not_shown = crate::cli_window::execute(target, options.window.as_deref(), action)
         .err()
         .map(|error| error.to_string());
-    let Placed {
-        pane_id,
-        receipt,
-        opened,
-    } = placed;
-    let mut text = format!(
-        "Opened {subject} in {}pane {pane_id}",
-        if *opened { "new " } else { "" }
-    );
+    let Placed { pane_id, receipt } = placed;
+    let mut text = format!("Opened {subject} in pane {pane_id}");
     if let Some(reason) = &not_shown {
         text.push_str(&format!(" · not shown: {reason}"));
     }
     text.push('\n');
     Ok((
         text,
-        json!({"pane_id":pane_id,"opened":opened,"shown":not_shown.is_none(),"not_shown":not_shown,"receipt":receipt,"workspace":after}),
+        json!({"pane_id":pane_id,"shown":not_shown.is_none(),"not_shown":not_shown,"receipt":receipt,"workspace":after}),
     ))
 }
 
@@ -352,76 +352,6 @@ fn shell_directory(
         }
     }
     Ok(client.surface_metadata(surface)?.directory.value)
-}
-
-/// Split geometry for a content pane beside `surface`'s terminal; rejects a terminal too
-/// small for both, as the daemon would.
-fn geometry(surface: &SurfaceInfo) -> Result<SplitGeometry, CliError> {
-    use crate::layout::PaneKind;
-    let terminal = CELL_METRICS.minimum(PaneKind::Terminal);
-    let content = CELL_METRICS.minimum(PaneKind::Content);
-    let geometry = SplitGeometry {
-        width: f32::from(surface.cols) * CELL_METRICS.cell_width,
-        height: f32::from(surface.rows) * CELL_METRICS.line_height,
-        min_width: terminal.width.max(content.width),
-        min_height: terminal.height.max(content.height),
-        divider: CELL_METRICS.divider_size(),
-    };
-    if geometry.width < 2.0 * geometry.min_width + geometry.divider
-        || geometry.height < geometry.min_height
-    {
-        return Err(CliError::usage(
-            "pane is too small to open files beside it; enlarge the pane first",
-        ));
-    }
-    Ok(geometry)
-}
-
-/// The files content pane in `layout` to show `show` in: `caller` itself when it is one;
-/// else one in `environment` whose root is the folder, or for a tab the one whose root
-/// holds its file (and lies within its `within` folder), preferring one with the tab open,
-/// then the deepest root. A Settings pane never shows files.
-fn reusable(
-    layout: &LayoutNode,
-    caller: &PaneId,
-    environment: &ContentEnvironment,
-    show: &Show,
-    windows: bool,
-) -> Option<(PaneId, FolderContent)> {
-    let mut best: Option<((bool, usize), PaneId, FolderContent)> = None;
-    for leaf in arrangement::leaves(layout) {
-        let LayoutNode::Content {
-            pane_id,
-            content: PaneContent::Files(content),
-        } = leaf
-        else {
-            continue;
-        };
-        if &pane_id == caller {
-            return Some((pane_id, content));
-        }
-        if &content.environment != environment {
-            continue;
-        }
-        let root = resolve_path(None, &content.root, windows).ok();
-        let rank = match show {
-            Show::Folder(folder) => (root.as_ref() == Some(folder)).then_some((true, 0)),
-            Show::Tab { file, within, .. } => root
-                .filter(|root| contains(root, file, windows))
-                .filter(|root| {
-                    within
-                        .as_ref()
-                        .is_none_or(|within| within == root || contains(within, root, windows))
-                })
-                .map(|root| (open_tab(&content, file, windows).is_some(), root.len())),
-        };
-        if let Some(rank) = rank
-            && best.as_ref().is_none_or(|(current, ..)| rank > *current)
-        {
-            best = Some((rank, pane_id, content));
-        }
-    }
-    best.map(|(_, pane_id, content)| (pane_id, content))
 }
 
 /// Where normalised `file` is open among `content`'s tabs, in either mode.
@@ -477,7 +407,7 @@ pub(super) fn resolve_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::SurfaceId;
+    use compi_protocol::GitScope;
 
     #[test]
     fn locations_strip_a_trailing_line_and_column() {
@@ -527,107 +457,68 @@ mod tests {
     }
 
     #[test]
-    fn content_panes_are_reused_by_environment_and_root() {
-        let content = |pane: &str, root: &str, files: &[&str], distribution: Option<&str>| {
-            LayoutNode::Content {
-                pane_id: PaneId::new(pane),
-                content: PaneContent::Files(FolderContent {
-                    environment: distribution.map_or(ContentEnvironment::Host, |name| {
-                        ContentEnvironment::Wsl {
-                            distribution: name.into(),
-                        }
-                    }),
-                    root: root.into(),
-                    tabs: files.iter().map(|file| ContentTab::edit(*file)).collect(),
-                    active: None,
-                }),
-            }
-        };
-        let split = |first, second| LayoutNode::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: 0.5,
-            first: Box::new(first),
-            second: Box::new(second),
-        };
-        let settings = LayoutNode::Content {
-            pane_id: PaneId::new("settings"),
-            content: PaneContent::Settings(compi_protocol::SettingsContent::default()),
-        };
-        let layout = split(
-            split(
-                split(
-                    LayoutNode::Pane {
-                        pane_id: PaneId::new("terminal"),
-                        surface_id: SurfaceId::new("surface"),
-                    },
-                    settings,
-                ),
-                content("wsl", "/home/me/proj", &[], Some("Ubuntu")),
-            ),
-            split(
-                content("proj", "/home/me/proj/", &[], None),
-                split(
-                    content("src", "/home/me/proj/src", &[], None),
-                    content("open", "/home/me", &["/home/me/proj/src/lib.rs"], None),
-                ),
-            ),
-        );
-        let pick = |caller: &str, show: Show| {
-            reusable(
-                &layout,
-                &PaneId::new(caller),
-                &ContentEnvironment::Host,
-                &show,
-                false,
-            )
-            .map(|(pane, _)| pane.as_str().to_owned())
-        };
+    fn files_in_place_keep_their_tabs_and_follow_the_shell_only_as_a_view() {
+        let host = ContentEnvironment::Host;
         let file = |path: &str| Show::Tab {
             tab: ContentTab::edit(path),
             file: path.into(),
             within: None,
-            root: "/".into(),
+            root: "/home/me/other".into(),
         };
-        let diff = |path: &str| Show::Tab {
-            tab: ContentTab::diff(
-                format!("/home/me/proj/{path}"),
-                compi_protocol::GitScope::Unstaged,
-            ),
-            file: format!("/home/me/proj/{path}"),
+        let current = |root: &str| FolderContent {
+            environment: host.clone(),
+            root: root.into(),
+            tabs: vec![ContentTab::edit("/home/me/proj/a.rs")],
+            active: None,
+        };
+        // Nothing shown yet: just what was asked for.
+        let fresh = merged(None, &host, &file("/home/me/other/b.rs"), false, true);
+        assert_eq!(fresh.root, "/home/me/other");
+        assert_eq!(fresh.tabs, [ContentTab::edit("/home/me/other/b.rs")]);
+        assert_eq!(fresh.active, Some(ContentTab::edit("/home/me/other/b.rs")));
+        // A file under the root joins the open tabs and the root stays.
+        let proj = current("/home/me/proj/");
+        let inside = merged(
+            Some(proj.clone()),
+            &host,
+            &file("/home/me/proj/src/c.rs"),
+            false,
+            true,
+        );
+        assert_eq!(inside.root, "/home/me/proj/");
+        assert_eq!(inside.tabs.len(), 2);
+        assert_eq!(
+            inside.active,
+            Some(ContentTab::edit("/home/me/proj/src/c.rs"))
+        );
+        // A terminal's view follows the shell to a file elsewhere, keeping its tabs; a
+        // content pane keeps its own folder.
+        let elsewhere = file("/home/me/other/b.rs");
+        let view = merged(Some(proj.clone()), &host, &elsewhere, false, true);
+        assert_eq!(view.root, "/home/me/other");
+        assert_eq!(view.tabs.len(), 2);
+        let pane = merged(Some(proj.clone()), &host, &elsewhere, false, false);
+        assert_eq!(pane.root, "/home/me/proj/");
+        // A diff moves a root holding the file but outside its repository to the
+        // repository, and the file's one tab switches to Diff mode.
+        let diff = Show::Tab {
+            tab: ContentTab::diff("/home/me/proj/a.rs", GitScope::Unstaged),
+            file: "/home/me/proj/a.rs".into(),
             within: Some("/home/me/proj".into()),
             root: "/home/me/proj".into(),
         };
+        let reviewed = merged(Some(current("/home/me")), &host, &diff, false, true);
+        assert_eq!(reviewed.root, "/home/me/proj");
         assert_eq!(
-            pick("terminal", Show::Folder("/home/me/proj".into())).as_deref(),
-            Some("proj")
+            reviewed.tabs,
+            [ContentTab::diff("/home/me/proj/a.rs", GitScope::Unstaged)]
         );
-        assert_eq!(pick("terminal", Show::Folder("/home".into())), None);
-        assert_eq!(
-            pick("terminal", file("/home/me/proj/src/main.rs")).as_deref(),
-            Some("src")
-        );
-        assert_eq!(
-            pick("terminal", file("/home/me/proj/src/lib.rs")).as_deref(),
-            Some("open")
-        );
-        assert_eq!(
-            pick("terminal", file("/home/me/proj/README.md")).as_deref(),
-            Some("proj")
-        );
-        assert_eq!(
-            pick("terminal", file("/home/me/proj")).as_deref(),
-            Some("open")
-        );
-        assert_eq!(pick("terminal", file("/srv/x")), None);
-        assert_eq!(pick("src", file("/srv/x")).as_deref(), Some("src"));
-        // A diff goes to a pane inside its repository, even when another has the file open.
-        assert_eq!(pick("terminal", diff("src/lib.rs")).as_deref(), Some("src"));
-        assert_eq!(pick("terminal", diff("README.md")).as_deref(), Some("proj"));
-        // Settings never shows files, even when it is the caller.
-        assert_eq!(pick("settings", file("/srv/x")), None);
-        assert_eq!(
-            pick("settings", Show::Folder("/home/me/proj".into())).as_deref(),
-            Some("proj")
-        );
+        // Inside the repository the root stays.
+        let kept = merged(Some(proj.clone()), &host, &diff, false, true);
+        assert_eq!(kept.root, "/home/me/proj/");
+        // A folder becomes the root.
+        let folder = merged(Some(proj), &host, &Show::Folder("/srv".into()), false, true);
+        assert_eq!(folder.root, "/srv");
+        assert_eq!(folder.tabs.len(), 1);
     }
 }

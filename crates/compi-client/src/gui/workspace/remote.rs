@@ -127,13 +127,20 @@ fn at_prompt(shell: &str, foreground: &str) -> bool {
     shell.trim_start_matches('-') == foreground.trim_start_matches('-')
 }
 
-/// The terminal panes of `node`, with their surfaces.
+/// The terminal panes of `node` showing their shell, with their surfaces. One showing
+/// its view is left out: what is typed there would go unseen, or answer a `compi tree`
+/// waiting for a folder.
 fn terminal_leaves<'a>(node: &'a LayoutNode, leaves: &mut Vec<(&'a PaneId, &'a SurfaceId)>) {
     match node {
         LayoutNode::Pane {
             pane_id,
             surface_id,
-        } => leaves.push((pane_id, surface_id)),
+            ..
+        } => {
+            if node.shown_content().is_none() {
+                leaves.push((pane_id, surface_id));
+            }
+        }
         LayoutNode::Content { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             terminal_leaves(first, leaves);

@@ -1050,6 +1050,7 @@ fn changed(
             LayoutNode::Pane {
                 pane_id,
                 surface_id,
+                ..
             } => output.push((pane_id, surface_id)),
             LayoutNode::Content { .. } => {}
             LayoutNode::Split { first, second, .. } => {
@@ -1101,8 +1102,8 @@ fn pane_surface<'a>(
 }
 
 /// One `pane list`/`pane show` entry. Terminals report their surface, fresh runtime
-/// metadata and program status; content panes have no process and report what they
-/// show: files or Settings.
+/// metadata, program status and any view they carry; content panes have no process and
+/// report what they show: files, Settings or Monitor.
 fn pane_row(
     client: &mut DaemonClient,
     state: &WorkspaceSnapshot,
@@ -1115,6 +1116,7 @@ fn pane_row(
         LayoutNode::Pane {
             pane_id,
             surface_id,
+            view,
         } => {
             let surface = pane_surface(state, surface_id)?;
             let program_status = client
@@ -1123,7 +1125,11 @@ fn pane_row(
                 .filter(|status| status.process_lifetime_id == surface.process_lifetime_id)
                 .map_or(&[][..], |status| &status.records)
                 .to_vec();
-            json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Terminal,"surface":surface,"metadata":client.surface_metadata(surface)?,"program_status":program_status})
+            let mut row = json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Terminal,"surface":surface,"metadata":client.surface_metadata(surface)?,"program_status":program_status});
+            if let Some(view) = view {
+                row["view"] = json!(view);
+            }
+            row
         }
         LayoutNode::Content { pane_id, content } => content_row(session, tab, pane_id, content),
         LayoutNode::Split { .. } => unreachable!("pane rows are built only for leaf nodes"),
@@ -1263,8 +1269,8 @@ struct UnsavedFile {
     path: String,
 }
 
-/// The files open windows report unsaved in the content panes among `closing`, each
-/// once even when several windows show the pane.
+/// The files open windows report unsaved in the panes among `closing` (content panes and
+/// terminals' Files views), each once even when several windows show the pane.
 fn unsaved_files(
     closing: &[PaneId],
     windows: &[crate::cli_window::WindowInfo],
@@ -1272,10 +1278,7 @@ fn unsaved_files(
     windows
         .iter()
         .flat_map(|window| &window.panes)
-        .filter(|pane| {
-            pane.pane_type == crate::cli_window::PaneType::Content
-                && closing.contains(&pane.pane_id)
-        })
+        .filter(|pane| closing.contains(&pane.pane_id))
         .flat_map(|pane| {
             pane.unsaved_files.iter().map(|path| UnsavedFile {
                 pane_id: pane.pane_id.clone(),
@@ -1288,8 +1291,9 @@ fn unsaved_files(
 }
 
 /// Ask once before a close that would end running processes or discard edits that open
-/// windows hold unsaved in its content panes. With no GUI host running nothing is
-/// unsaved. There is no bypass: scripts terminate panes and save files first.
+/// windows hold unsaved in its content panes or terminals' Files views. With no GUI host
+/// running nothing is unsaved. There is no bypass: scripts terminate panes and save
+/// files first.
 fn confirm_close(
     target: &ConnectionTarget,
     state: &WorkspaceSnapshot,
@@ -1299,7 +1303,11 @@ fn confirm_close(
     let mut closing = Vec::new();
     for leaf in leaves {
         match leaf {
-            LayoutNode::Pane { surface_id, .. } => {
+            LayoutNode::Pane {
+                pane_id,
+                surface_id,
+                view,
+            } => {
                 if state.surface(&surface_id).is_some_and(|surface| {
                     matches!(
                         surface.status,
@@ -1307,6 +1315,9 @@ fn confirm_close(
                     )
                 }) {
                     running.push(surface_id);
+                }
+                if view.is_some_and(|view| view.content.folder().is_some()) {
+                    closing.push(pane_id);
                 }
             }
             LayoutNode::Content { pane_id, .. } => closing.push(pane_id),
@@ -1926,7 +1937,7 @@ mod tests {
         }
     }
     #[test]
-    fn close_reports_unsaved_files_of_closing_content_panes_from_every_window() {
+    fn close_reports_unsaved_files_of_closing_files_from_every_window() {
         use crate::cli_window::{PaneInfo, PaneType, TargetIdentity, WindowInfo};
         let pane = |id: &str, pane_type, unsaved: &[&str]| PaneInfo {
             pane_id: PaneId::new(id),
@@ -1998,11 +2009,15 @@ mod tests {
             ]
         );
 
+        // A terminal's Files view holds unsaved edits too.
         let terminal = [window(
             "primary",
             vec![pane("term", PaneType::Terminal, &["/src/t.rs"])],
         )];
-        assert!(unsaved_files(&closing, &terminal).is_empty());
+        assert_eq!(
+            unsaved_files(&closing, &terminal),
+            [file("term", "/src/t.rs")]
+        );
     }
 
     #[test]

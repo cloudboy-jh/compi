@@ -1270,10 +1270,10 @@ mod tests {
                             WorkspaceTab {
                                 id: TabId::from(id.clone()),
                                 label: id.clone(),
-                                layout: LayoutNode::Pane {
-                                    pane_id: PaneId::from(format!("{id}-pane")),
-                                    surface_id: SurfaceId::from(format!("{id}-surface")),
-                                },
+                                layout: LayoutNode::terminal(
+                                    PaneId::from(format!("{id}-pane")),
+                                    SurfaceId::from(format!("{id}-surface")),
+                                ),
                                 previous_layout: None,
                                 merge: None,
                             }
@@ -1684,10 +1684,10 @@ mod tests {
             axis: compi_protocol::SplitAxis::Horizontal,
             ratio: 0.5,
             first: Box::new(workspace.sessions[0].tabs[0].layout.clone()),
-            second: Box::new(LayoutNode::Pane {
-                pane_id: PaneId::from("second-pane"),
-                surface_id: SurfaceId::from("second-surface"),
-            }),
+            second: Box::new(LayoutNode::terminal(
+                PaneId::from("second-pane"),
+                SurfaceId::from("second-surface"),
+            )),
         };
         let mut source = ClientState::default();
         source.select_tab(&workspace, &TabId::from("one-a"));
@@ -1703,10 +1703,10 @@ mod tests {
         assert!(destination.selected_tab(&workspace).is_none());
         assert!(destination.restore_tab(&workspace, &TabId::from("one-a")));
         let previous = workspace.clone();
-        workspace.sessions[0].tabs[0].layout = LayoutNode::Pane {
-            pane_id: PaneId::from("replacement"),
-            surface_id: SurfaceId::from("replacement-surface"),
-        };
+        workspace.sessions[0].tabs[0].layout = LayoutNode::terminal(
+            PaneId::from("replacement"),
+            SurfaceId::from("replacement-surface"),
+        );
         destination.reconcile(Some(&previous), &workspace);
         assert_eq!(
             destination.focused_pane(&workspace).unwrap().as_str(),
@@ -1721,14 +1721,14 @@ mod tests {
         workspace.sessions[0].tabs[0].layout = LayoutNode::Split {
             axis: compi_protocol::SplitAxis::Horizontal,
             ratio: 0.5,
-            first: Box::new(LayoutNode::Pane {
-                pane_id: PaneId::from("one-a-pane"),
-                surface_id: SurfaceId::from("one-a-pane-surface"),
-            }),
-            second: Box::new(LayoutNode::Pane {
-                pane_id: PaneId::from("agent"),
-                surface_id: SurfaceId::from("agent-surface"),
-            }),
+            first: Box::new(LayoutNode::terminal(
+                PaneId::from("one-a-pane"),
+                SurfaceId::from("one-a-pane-surface"),
+            )),
+            second: Box::new(LayoutNode::terminal(
+                PaneId::from("agent"),
+                SurfaceId::from("agent-surface"),
+            )),
         };
         let agent = PaneId::from("agent");
         let mut state = ClientState::default();
@@ -1754,17 +1754,14 @@ mod tests {
 
         // Another client moves the pane to a new tab: the float follows it.
         let previous = workspace.clone();
-        workspace.sessions[0].tabs[0].layout = LayoutNode::Pane {
-            pane_id: PaneId::from("one-a-pane"),
-            surface_id: SurfaceId::from("one-a-pane-surface"),
-        };
+        workspace.sessions[0].tabs[0].layout = LayoutNode::terminal(
+            PaneId::from("one-a-pane"),
+            SurfaceId::from("one-a-pane-surface"),
+        );
         workspace.sessions[0].tabs.push(WorkspaceTab {
             id: TabId::from("moved"),
             label: "moved".into(),
-            layout: LayoutNode::Pane {
-                pane_id: agent.clone(),
-                surface_id: SurfaceId::from("agent-surface"),
-            },
+            layout: LayoutNode::terminal(agent.clone(), SurfaceId::from("agent-surface")),
             previous_layout: None,
             merge: None,
         });

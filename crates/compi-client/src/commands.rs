@@ -130,7 +130,7 @@ registry! {
     Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-v");
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
-    BrowseFiles, "browse_files", "Browse files in terminal pane", Some("cmd-shift-e"), Some("ctrl-shift-e");
+    BrowseFiles, "browse_files", "Files / terminal", Some("cmd-shift-e"), Some("ctrl-shift-e");
     JumpProject, "jump_project", "Jump to project…", None, None;
     ShowFiles, "show_files", "Files", None, None;
     OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
@@ -236,8 +236,11 @@ pub struct CommandContext {
     pub has_workspace: bool,
     pub has_tab: bool,
     pub has_pane: bool,
-    /// The focused pane shows content, not a terminal.
+    /// The focused pane shows content, not a terminal: a content pane, or a terminal
+    /// pane showing its view.
     pub content_pane: bool,
+    /// The focused pane is a terminal carrying a view, shown or not.
+    pub pane_view: bool,
     /// The focused content pane shows a file tab in Edit mode.
     pub file_tab: bool,
     /// The focused content pane shows a file tab in Diff mode.
@@ -354,13 +357,19 @@ impl Command {
             RemovePane => Some("Stops this terminal and removes its pane."),
             EndSurface => Some("Stops this terminal and its child processes; keeps its contents."),
             RestartSurface => Some("Starts a new process in this terminal."),
-            BrowseFiles => Some("Browses folders without sending commands to your terminal."),
+            BrowseFiles => Some(
+                "Flips this pane between its shell and its view, or shows the shell's folder in its place; the shell keeps running.",
+            ),
             JumpProject => Some("Lists the folders your shells visited; one opens in a new tab."),
-            ShowFiles => Some("Shows this pane's folder in a file pane beside it."),
+            ShowFiles => Some(
+                "Shows this pane's folder in its place; a terminal's shell keeps running underneath.",
+            ),
             OpenFile => Some(
                 "Searches this pane's folder in the palette and opens a file in the editor; your terminal gets no input.",
             ),
-            NewEditor => Some("Opens this pane's folder in a new file pane beside it."),
+            NewEditor => Some(
+                "Opens this pane's folder in its place, or in a new file pane beside it when the pane already shows something.",
+            ),
             ShowChanges => Some(
                 "Shows this repository's uncommitted Git changes beside the folder; nothing is staged or changed.",
             ),
@@ -746,7 +755,7 @@ impl Command {
                 if !c.has_pane {
                     Some("Select a terminal pane first")
                 } else {
-                    c.content_pane.then_some(CONTENT_PANE_REASON)
+                    (c.content_pane && !c.pane_view).then_some(CONTENT_PANE_REASON)
                 }
             }
             ShowFiles | ShowChanges | NewEditor => {
@@ -1763,6 +1772,42 @@ mod tests {
             Some(Command::OpenFile)
         );
         assert!(search("quick open").any(|spec| spec.command == Command::OpenFile));
+    }
+
+    #[test]
+    fn the_view_shortcut_flips_a_terminal_on_either_side_but_not_a_content_pane() {
+        let bindings = HashMap::new();
+        let shortcut = ShortcutKey {
+            key: "e",
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        let route = |context: &CommandContext, owner| {
+            resolve_key(Platform::Mac, shortcut, owner, context, &bindings)
+        };
+        // A terminal showing its shell, with or without a view.
+        let mut context = ready();
+        assert!(Command::BrowseFiles.disabled_reason(&context).is_none());
+        context.pane_view = true;
+        assert_eq!(
+            route(&context, InputOwner::Terminal),
+            KeyRoute::Command(Command::BrowseFiles)
+        );
+        // The same terminal showing its view: the view, or its editor, has the keys.
+        context.content_pane = true;
+        for owner in [InputOwner::Content, InputOwner::Editor] {
+            assert_eq!(
+                route(&context, owner),
+                KeyRoute::Command(Command::BrowseFiles)
+            );
+        }
+        // A content pane has no shell to flip to.
+        context.pane_view = false;
+        assert_eq!(
+            route(&context, InputOwner::Content),
+            KeyRoute::Disabled(Command::BrowseFiles, CONTENT_PANE_REASON)
+        );
     }
 
     #[test]

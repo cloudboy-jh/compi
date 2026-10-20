@@ -31,6 +31,7 @@ pub(in crate::gui) mod settings;
 pub(super) mod tree;
 mod tree_ui;
 pub(in crate::gui) mod unsaved;
+pub(in crate::gui) mod views;
 mod whats_new;
 static PREPARED_HANDOFF: LazyLock<Mutex<Option<std::path::PathBuf>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -851,6 +852,7 @@ impl CompiApp {
             focused_view: None,
             file_tree: None,
             tree_scroll: ScrollHandle::new(),
+            views: Default::default(),
             branch_write: None,
             remote: Default::default(),
             tab_scroll_handle: ScrollHandle::new(),
@@ -1848,9 +1850,11 @@ impl CompiApp {
                     );
                 }
             }
+            let shell_focus = self.shell_focus();
             self.state.reconcile(self.workspace.as_ref(), &workspace);
             self.workspace = Some(workspace);
             self.sync_visible_views();
+            self.views_settled(shell_focus);
             self.prune_content();
             self.refresh_unsaved_prompt();
             self.save_state();
@@ -1968,21 +1972,6 @@ impl CompiApp {
                     Err(error) => error,
                 })
             }
-            UiEvent::TreeListed {
-                pane_id,
-                request,
-                parent,
-                result,
-            } => {
-                self.tree_listed(pane_id, request, parent, result);
-            }
-            UiEvent::TreeSearched {
-                pane_id,
-                request,
-                result,
-            } => {
-                self.tree_searched(pane_id, request, result);
-            }
             UiEvent::PaletteFilesSearched { request, result } => {
                 self.palette_files_searched(request, result);
             }
@@ -2055,6 +2044,7 @@ impl CompiApp {
                 match result {
                     Ok((workspace, receipt)) => {
                         self.global_error = None;
+                        self.view_mutation_finished(Some(&receipt), cx);
                         self.accept_workspace(workspace);
                         self.remote_split_finished(Some(&receipt));
                         if select_created {
@@ -2076,6 +2066,7 @@ impl CompiApp {
                         self.global_error = Some(format!(
                             "Workspace change outcome is unconfirmed: {error}. Refreshing authoritative state; the operation will not be retried automatically."
                         ));
+                        self.view_mutation_finished(None, cx);
                         self.refresh_surfaces(false);
                         self.remote_split_finished(None);
                     }
@@ -2352,10 +2343,10 @@ impl CompiApp {
                         self.global_error =
                             Some("Close the active dialog before browsing directories".into());
                     } else {
-                        self.focus_pane(pane_id);
+                        self.focus_pane(pane_id.clone());
                         match action {
                             compi_protocol::ShellAction::BrowseFiles => {
-                                self.open_file_tree_with_shell(true)
+                                self.browse_from_shell(pane_id)
                             }
                             compi_protocol::ShellAction::JumpProject => {
                                 self.open_shell_project_jump()
@@ -2488,6 +2479,7 @@ impl CompiApp {
             if let LayoutNode::Pane {
                 pane_id,
                 surface_id,
+                ..
             } = float
                 && !leaves.iter().any(|(pane, _)| pane == &pane_id)
             {
@@ -3135,6 +3127,7 @@ fn collect_leaves(tree: &LayoutNode, output: &mut Vec<(PaneId, Option<SurfaceId>
         LayoutNode::Pane {
             pane_id,
             surface_id,
+            ..
         } => output.push((pane_id.clone(), Some(surface_id.clone()))),
         LayoutNode::Content { pane_id, .. } => output.push((pane_id.clone(), None)),
         LayoutNode::Split { first, second, .. } => {
@@ -3234,6 +3227,10 @@ impl CompiApp {
             has_tab: tab.is_some(),
             has_pane: pane.is_some(),
             content_pane: self.focused_pane_content().is_some(),
+            pane_view: workspace
+                .zip(pane)
+                .and_then(|(workspace, pane)| content::find_leaf(workspace, pane)?.view())
+                .is_some(),
             file_tab: self
                 .focused_content()
                 .is_some_and(|content| content.active_file().is_some()),
@@ -3253,10 +3250,12 @@ impl CompiApp {
                 .unwrap_or(0),
             has_selection: self
                 .focused_view()
+                .filter(|_| !self.focused_shell_hidden())
                 .and_then(|view| selected_text(view.mirror.snapshot(), view.selection))
                 .is_some(),
             terminal_available: self
                 .focused_view()
+                .filter(|_| !self.focused_shell_hidden())
                 .is_some_and(|view| view.transport.is_some()),
             can_paste: true,
             surface_status: status,
@@ -3919,7 +3918,7 @@ impl CompiApp {
                 self.state.sidebar_width = self.sidebar_width;
                 self.save_state();
             }
-            Command::BrowseFiles => self.open_file_tree(),
+            Command::BrowseFiles => self.toggle_pane_view(window, cx),
             Command::JumpProject => self.open_palette(Some(palette::Scope::Projects)),
             Command::ShowFiles => self.show_files(false, window, cx),
             Command::NewEditor => self.show_files(true, window, cx),
@@ -3992,7 +3991,7 @@ impl CompiApp {
             }
             Command::OpenQuickAppearance => self.open_quick_appearance(),
             Command::OpenSettings => self.open_settings(None, None, window, cx),
-            Command::OpenMonitor => self.open_monitor(),
+            Command::OpenMonitor => self.open_monitor(window, cx),
             Command::CheckForUpdates => {
                 self.open_settings(Some(SettingsSection::Updates), None, window, cx);
                 self.updates.check();
@@ -4446,6 +4445,7 @@ impl CompiApp {
                 LayoutNode::Pane {
                     pane_id,
                     surface_id,
+                    ..
                 } => Some(self.terminal_tab_pane(index, pane_id, &surface_id)),
                 LayoutNode::Split { .. } => None,
             })
@@ -4717,6 +4717,7 @@ impl CompiApp {
             window.on_next_frame(move |_, cx| cx.notify(view_id));
         }
         self.sync_editor_theme(cx);
+        self.prepare_views(window, cx);
         self.prepare_content(window, cx);
         self.prepare_settings(window, cx);
         self.prepare_monitor(window, cx);
@@ -6116,7 +6117,8 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// One pane's terminal (or file tree) at `rect` within its parent. Tiled and
+    /// One pane at `rect` within its parent: its terminal (or a picker over it), its
+    /// view in place of the terminal while it shows one, or its content. Tiled and
     /// floating presentations share it, so both use the same attached view.
     fn render_pane(
         &self,
@@ -6127,6 +6129,10 @@ impl CompiApp {
     ) -> gpui::Stateful<gpui::Div> {
         if geometry.surface_id.is_none() {
             return self.render_content_pane(id, geometry, rect, cx);
+        }
+        let id = id.into();
+        if let Some(view) = self.render_shown_view(id.clone(), geometry, rect, cx) {
+            return view;
         }
         let colors = *self.colors();
         let pane_id = geometry.pane_id.clone();
@@ -6303,6 +6309,10 @@ impl CompiApp {
                 )
             })
             .when(tree_active, |pane| pane.child(self.render_file_tree(cx)))
+            .children(
+                self.render_shell_switch(&geometry.pane_id, cx)
+                    .filter(|_| !tree_active),
+            )
             .when_some(
                 terminal_scroll.filter(|_| !tree_active),
                 |pane, (position, length)| {
@@ -7244,6 +7254,9 @@ impl CompiApp {
             }
             return;
         }
+        // A shell of this tab waiting in `compi tree` is answered here: the destination
+        // does not know it waits.
+        self.cancel_shell_reply_in(&tab.layout);
         self.report_focus(false);
         let mut transferred = Some(
             self.surface_views
@@ -7748,10 +7761,16 @@ fn structure_key(workspace: &WorkspaceSnapshot) -> u64 {
             LayoutNode::Pane {
                 pane_id,
                 surface_id,
+                view,
             } => {
                 0_u8.hash(hasher);
                 pane_id.as_str().hash(hasher);
                 surface_id.as_str().hash(hasher);
+                // Whether it carries a view, and of what kind, decides its menu; the
+                // shown side and the view's state do not.
+                view.as_ref()
+                    .map(|view| std::mem::discriminant(&view.content))
+                    .hash(hasher);
             }
             // What a content pane shows is not part of what menus target.
             LayoutNode::Content { pane_id, .. } => {

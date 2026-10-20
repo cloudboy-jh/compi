@@ -1037,19 +1037,103 @@ fn step(order: &[Stop], current: Option<Stop>, forward: bool) -> Option<Stop> {
     )
 }
 
-/// The Settings leaves of `node`.
+/// The Settings panes of `node`: content panes, and terminal views on either side.
 fn settings_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<&'a PaneId>) {
     match node {
-        LayoutNode::Content {
-            pane_id,
-            content: PaneContent::Settings(_),
-        } => output.push(pane_id),
-        LayoutNode::Content { .. } | LayoutNode::Pane { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             settings_leaves(first, output);
             settings_leaves(second, output);
         }
+        leaf => {
+            if let (Some(pane_id), Some(PaneContent::Settings(_))) =
+                (leaf.leaf_pane(), leaf.content())
+            {
+                output.push(pane_id);
+            }
+        }
     }
+}
+
+/// What typing in, entering and leaving the search field of Settings pane `pane_id` do.
+fn settings_search_events(
+    pane_id: &PaneId,
+    search: &Entity<InputState>,
+    cx: &mut Context<CompiApp>,
+) -> gpui::Subscription {
+    let changed = pane_id.clone();
+    cx.subscribe(search, move |this, search, event: &InputEvent, cx| {
+        match event {
+            InputEvent::Change => {
+                let query = search.read(cx).value().to_lowercase();
+                if let Some(pane) = this.settings.panes.get_mut(&changed) {
+                    pane.query = query;
+                    pane.scroll.handle.set_offset(point(px(0.0), px(0.0)));
+                }
+            }
+            // A click in the field moves the highlight there.
+            InputEvent::Focus => {
+                this.settings.focus = Some(SettingsFocus {
+                    host: SettingsHost::Pane(changed.clone()),
+                    stop: Stop::Search,
+                });
+            }
+            // Leaving an empty field folds it back behind its icon.
+            InputEvent::Blur => {
+                let Some(pane) = this.settings.panes.get(&changed) else {
+                    return;
+                };
+                let host = SettingsHost::Pane(changed.clone());
+                if !pane.query.trim().is_empty()
+                    || this.settings.focus.as_ref()
+                        != Some(&SettingsFocus {
+                            host: host.clone(),
+                            stop: Stop::Search,
+                        })
+                {
+                    return;
+                }
+                let section = pane.section;
+                this.settings.focus = Some(SettingsFocus {
+                    host,
+                    stop: Stop::Section(section),
+                });
+            }
+            InputEvent::PressEnter { .. } => return,
+        }
+        cx.notify();
+    })
+}
+
+/// What typing in and entering the theme search field of Settings pane `pane_id` do.
+fn theme_search_events(
+    pane_id: &PaneId,
+    theme_search: &Entity<InputState>,
+    cx: &mut Context<CompiApp>,
+) -> gpui::Subscription {
+    let changed = pane_id.clone();
+    cx.subscribe(theme_search, move |this, search, event: &InputEvent, cx| {
+        match event {
+            InputEvent::Change => {
+                let query = search.read(cx).value().to_lowercase();
+                if let Some(catalog) = &mut this.theme_catalog
+                    && catalog.pane == changed
+                {
+                    catalog.query = query;
+                }
+            }
+            InputEvent::Focus => {
+                this.settings.focus = Some(SettingsFocus {
+                    host: SettingsHost::Pane(changed.clone()),
+                    stop: Stop::Control {
+                        row: this.theme_stop_row(&changed),
+                        action: SettingsAction::ThemeSearch,
+                    },
+                });
+            }
+            InputEvent::PressEnter { .. } | InputEvent::Blur => return,
+        }
+        cx.notify();
+    })
 }
 
 impl CompiApp {
@@ -1260,8 +1344,9 @@ impl CompiApp {
     }
 
     /// Opens Settings: focuses this window's Settings pane, at `section` when given,
-    /// or opens one beside the focused pane. The keyboard starts on `stop`, else on
-    /// the section; the search field stays behind its icon until wanted.
+    /// showing it where a terminal carries it; else shows it in place of the focused
+    /// terminal, else opens one beside the focused pane. The keyboard starts on `stop`,
+    /// else on the section; the search field stays behind its icon until wanted.
     pub(super) fn open_settings(
         &mut self,
         section: Option<SettingsSection>,
@@ -1285,6 +1370,7 @@ impl CompiApp {
                 }
                 self.select_terminal(tab, false);
             }
+            self.reveal_view(&pane_id);
             self.focus_pane(pane_id.clone());
             let mut current = section.unwrap_or_default();
             if let Some(pane) = self.settings.panes.get_mut(&pane_id) {
@@ -1313,6 +1399,10 @@ impl CompiApp {
         });
         self.settings_scope = SettingsScope::Global;
         self.settings.pending = Some(stop.unwrap_or(Stop::Section(section.unwrap_or_default())));
+        if let Some(terminal) = self.focused_terminal() {
+            self.show_view(&terminal, content, window, cx);
+            return;
+        }
         match beside {
             Some(beside) => {
                 self.open_content_beside(&beside, content);
@@ -1390,15 +1480,42 @@ impl CompiApp {
         found
     }
 
+    /// Settings moved from `from` to pane `to` with its view: its search, section,
+    /// scroll and keyboard highlight go along.
+    pub(super) fn move_settings_pane(
+        &mut self,
+        from: &PaneId,
+        to: &PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mut pane) = self.settings.panes.remove(from) {
+            pane._events = settings_search_events(to, &pane.search, cx);
+            pane._theme_events = theme_search_events(to, &pane.theme_search, cx);
+            self.settings.panes.insert(to.clone(), pane);
+        }
+        if let Some(focus) = &mut self.settings.focus
+            && focus.host == SettingsHost::Pane(from.clone())
+        {
+            focus.host = SettingsHost::Pane(to.clone());
+        }
+        if let Some(catalog) = &mut self.theme_catalog
+            && catalog.pane == *from
+        {
+            catalog.pane = to.clone();
+        }
+    }
+
     /// Before drawing: state for each Settings pane shown, its section sent to the
     /// daemon when it changed, and the shell prompt detected when its group shows.
     pub(super) fn prepare_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = &self.workspace else {
             return;
         };
+        let moving = self.views.moving_from();
         self.settings.panes.retain(|pane, _| {
-            content::find_pane_content(workspace, pane)
-                .is_some_and(|content| content.settings().is_some())
+            moving == Some(pane)
+                || content::find_pane_content(workspace, pane)
+                    .is_some_and(|content| content.settings().is_some())
         });
         let shown: Vec<(PaneId, SettingsSection)> = self
             .shown_content_panes()
@@ -1412,78 +1529,10 @@ impl CompiApp {
                 None => {
                     let search =
                         cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
-                    let changed = pane_id.clone();
-                    let events =
-                        cx.subscribe(&search, move |this, search, event: &InputEvent, cx| {
-                            match event {
-                                InputEvent::Change => {
-                                    let query = search.read(cx).value().to_lowercase();
-                                    if let Some(pane) = this.settings.panes.get_mut(&changed) {
-                                        pane.query = query;
-                                        pane.scroll.handle.set_offset(point(px(0.0), px(0.0)));
-                                    }
-                                }
-                                // A click in the field moves the highlight there.
-                                InputEvent::Focus => {
-                                    this.settings.focus = Some(SettingsFocus {
-                                        host: SettingsHost::Pane(changed.clone()),
-                                        stop: Stop::Search,
-                                    });
-                                }
-                                // Leaving an empty field folds it back behind its icon.
-                                InputEvent::Blur => {
-                                    let Some(pane) = this.settings.panes.get(&changed) else {
-                                        return;
-                                    };
-                                    let host = SettingsHost::Pane(changed.clone());
-                                    if !pane.query.trim().is_empty()
-                                        || this.settings.focus.as_ref()
-                                            != Some(&SettingsFocus {
-                                                host: host.clone(),
-                                                stop: Stop::Search,
-                                            })
-                                    {
-                                        return;
-                                    }
-                                    let section = pane.section;
-                                    this.settings.focus = Some(SettingsFocus {
-                                        host,
-                                        stop: Stop::Section(section),
-                                    });
-                                }
-                                InputEvent::PressEnter { .. } => return,
-                            }
-                            cx.notify();
-                        });
+                    let events = settings_search_events(&pane_id, &search, cx);
                     let theme_search =
                         cx.new(|cx| InputState::new(window, cx).placeholder("Search themes"));
-                    let changed = pane_id.clone();
-                    let theme_events = cx.subscribe(
-                        &theme_search,
-                        move |this, search, event: &InputEvent, cx| {
-                            match event {
-                                InputEvent::Change => {
-                                    let query = search.read(cx).value().to_lowercase();
-                                    if let Some(catalog) = &mut this.theme_catalog
-                                        && catalog.pane == changed
-                                    {
-                                        catalog.query = query;
-                                    }
-                                }
-                                InputEvent::Focus => {
-                                    this.settings.focus = Some(SettingsFocus {
-                                        host: SettingsHost::Pane(changed.clone()),
-                                        stop: Stop::Control {
-                                            row: this.theme_stop_row(&changed),
-                                            action: SettingsAction::ThemeSearch,
-                                        },
-                                    });
-                                }
-                                InputEvent::PressEnter { .. } | InputEvent::Blur => return,
-                            }
-                            cx.notify();
-                        },
-                    );
+                    let theme_events = theme_search_events(&pane_id, &theme_search, cx);
                     self.settings.panes.insert(
                         pane_id.clone(),
                         SettingsPane {

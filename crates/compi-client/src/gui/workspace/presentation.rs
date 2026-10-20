@@ -260,7 +260,16 @@ impl CompiApp {
                     .collect()
             })
             .unwrap_or_default();
-        let shown_content: Vec<&PaneId> = self.shown_content_panes().collect();
+        // Content panes have no surface view; terminals showing their view have one.
+        let shown_content: Vec<&PaneId> = self
+            .shown_content_panes()
+            .filter(|pane_id| {
+                !self
+                    .surface_views
+                    .iter()
+                    .any(|view| &view.pane_id == *pane_id)
+            })
+            .collect();
         WindowInfo {
             window_id: self.slot_id.clone(),
             target: TargetIdentity::from_target(&self.target),
@@ -283,7 +292,8 @@ impl CompiApp {
                     focused: self.focused_view == Some(view.id),
                     floating: self.state.is_floating(&view.pane_id),
                     zoomed: self.zoomed_pane() == Some(&view.pane_id),
-                    unsaved_files: Vec::new(),
+                    // A terminal's Files view keeps its edits whichever side shows.
+                    unsaved_files: self.unsaved_files(&view.pane_id),
                 })
                 .chain(
                     // Content panes have no view; list the ones this window shows.
@@ -306,13 +316,28 @@ impl CompiApp {
                 .chain(
                     // Hidden tabs keep their editors; closing them must still see edits.
                     self.content_panes()
-                        .filter(|pane_id| !shown_content.contains(pane_id))
+                        .filter(|pane_id| {
+                            !shown_content.contains(pane_id)
+                                && !self.surface_views.iter().any(|view| {
+                                    &view.pane_id == *pane_id && !view.stop.load(Ordering::Acquire)
+                                })
+                        })
                         .filter_map(|pane_id| {
                             let unsaved_files = self.unsaved_files(pane_id);
+                            // A terminal's Files view in a hidden tab is the terminal's.
+                            let surface_id = self
+                                .workspace
+                                .as_ref()
+                                .and_then(|workspace| content::find_leaf(workspace, pane_id))
+                                .and_then(|leaf| leaf.surface_id().cloned());
                             (!unsaved_files.is_empty()).then(|| PaneInfo {
                                 pane_id: pane_id.clone(),
-                                pane_type: PaneType::Content,
-                                surface_id: None,
+                                pane_type: if surface_id.is_some() {
+                                    PaneType::Terminal
+                                } else {
+                                    PaneType::Content
+                                },
+                                surface_id,
                                 cols: None,
                                 rows: None,
                                 focused: false,
@@ -605,17 +630,29 @@ impl CompiApp {
                 "Tab is not visible in the selected window; choose the window that owns it".into(),
             );
         }
-        let Some(LayoutNode::Content {
-            content: compi_protocol::PaneContent::Files(content),
-            ..
-        }) = leaf_node(&tab.layout, pane_id)
-        else {
-            return Err("Pane shows a terminal, not files".into());
+        // A content pane, or a terminal carrying a Files view, which shows first.
+        let Some(leaf) = leaf_node(&tab.layout, pane_id) else {
+            return Ok(false);
+        };
+        let Some(content) = leaf.content().and_then(compi_protocol::PaneContent::folder) else {
+            // A terminal gets its Files view from the CLI's own change, which may not
+            // have reached this window yet.
+            if leaf.surface_id().is_some() {
+                return Ok(false);
+            }
+            return Err("Pane does not show files".into());
         };
         if content.active_file() != Some(file.as_str()) {
             return Ok(false);
         }
         let environment = content.environment.clone();
+        if leaf
+            .view()
+            .is_some_and(|view| view.side == compi_protocol::PaneSide::Terminal)
+        {
+            self.set_pane_side(pane_id, compi_protocol::PaneSide::View);
+            return Ok(false);
+        }
         let tab_id = tab.id.clone();
         if !self.state.is_floating(pane_id) {
             self.select_terminal(tab_id, false);
@@ -693,12 +730,16 @@ impl CompiApp {
                 "Tab is not visible in the selected window; choose the window that owns it".into(),
             );
         }
-        let Some(LayoutNode::Content {
-            content: compi_protocol::PaneContent::Files(content),
-            ..
-        }) = leaf_node(&tab.layout, pane_id)
-        else {
-            return Err("Pane shows a terminal, not files".into());
+        // A content pane, or a terminal carrying a Files view, which shows first.
+        let Some(leaf) = leaf_node(&tab.layout, pane_id) else {
+            return Ok(false);
+        };
+        let Some(content) = leaf.content().and_then(compi_protocol::PaneContent::folder) else {
+            // As for a reveal: a terminal's Files view may still be on its way.
+            if leaf.surface_id().is_some() {
+                return Ok(false);
+            }
+            return Err("Pane does not show files".into());
         };
         // The CLI's change put the file's tab in Diff mode at `scope`; `path` is
         // repository-relative, the tab's path absolute.
@@ -707,6 +748,13 @@ impl CompiApp {
                 shown == scope && active.replace('\\', "/").ends_with(&format!("/{path}"))
             })
         {
+            return Ok(false);
+        }
+        if leaf
+            .view()
+            .is_some_and(|view| view.side == compi_protocol::PaneSide::Terminal)
+        {
+            self.set_pane_side(pane_id, compi_protocol::PaneSide::View);
             return Ok(false);
         }
         let tab_id = tab.id.clone();

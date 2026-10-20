@@ -695,10 +695,7 @@ mod tests {
     use compi_protocol::{ContentEnvironment, FolderContent, PaneContent, SurfaceId};
 
     fn pane(id: &str) -> LayoutNode {
-        LayoutNode::Pane {
-            pane_id: PaneId::new(id),
-            surface_id: SurfaceId::new(format!("{id}-surface")),
-        }
+        LayoutNode::terminal(PaneId::new(id), SurfaceId::new(format!("{id}-surface")))
     }
 
     fn split(axis: SplitAxis, ratio: f32, first: LayoutNode, second: LayoutNode) -> LayoutNode {

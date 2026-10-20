@@ -185,6 +185,40 @@ fn group_cell_text(group: &Group, column: Column, logical_cpus: u32) -> CellText
     }
 }
 
+impl ProcessList {
+    /// The list's pane moved to `pane_id` with its view: its search follows.
+    pub(super) fn moved_to(&mut self, pane_id: &PaneId, cx: &mut Context<CompiApp>) {
+        self._events = process_search_events(pane_id, &self.search, cx);
+    }
+}
+
+/// Typing in Monitor pane `pane_id`'s process search narrows its table.
+fn process_search_events(
+    pane_id: &PaneId,
+    search: &Entity<InputState>,
+    cx: &mut Context<CompiApp>,
+) -> Subscription {
+    let changed = pane_id.clone();
+    cx.subscribe(search, move |this, search, event: &InputEvent, cx| {
+        if !matches!(event, InputEvent::Change) {
+            return;
+        }
+        let query = Search::new(&search.read(cx).value());
+        let MonitorUi {
+            panes, processes, ..
+        } = &mut this.monitor;
+        let Some(list) = panes.get_mut(&changed).map(|pane| &mut pane.list) else {
+            return;
+        };
+        if list.query != query {
+            list.query = query;
+            arrange(list, processes, false);
+            list.scroll.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+        }
+    })
+}
+
 impl CompiApp {
     pub(super) fn new_process_list(
         &self,
@@ -193,25 +227,7 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> ProcessList {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search processes"));
-        let changed = pane_id.clone();
-        let events = cx.subscribe(&search, move |this, search, event: &InputEvent, cx| {
-            if !matches!(event, InputEvent::Change) {
-                return;
-            }
-            let query = Search::new(&search.read(cx).value());
-            let MonitorUi {
-                panes, processes, ..
-            } = &mut this.monitor;
-            let Some(list) = panes.get_mut(&changed).map(|pane| &mut pane.list) else {
-                return;
-            };
-            if list.query != query {
-                list.query = query;
-                arrange(list, processes, false);
-                list.scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            }
-        });
+        let events = process_search_events(pane_id, &search, cx);
         let mut list = ProcessList {
             search,
             query: Search::default(),

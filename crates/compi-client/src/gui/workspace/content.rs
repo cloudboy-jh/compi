@@ -17,8 +17,8 @@ use super::*;
 use crate::gui::controls::{self, ChipTone, IconName, icon_button, text_button};
 use compi_protocol::{
     ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
-    FolderContent, GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent, ServerGeneration,
-    ServerId,
+    FolderContent, GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent, PaneSide, PaneView,
+    ServerGeneration, ServerId,
 };
 use gpui::Entity;
 use gpui_component::highlighter::HighlightTheme;
@@ -494,6 +494,13 @@ impl PaneUi {
         rows
     }
 
+    /// The folder selected in the tree, when its row shows.
+    fn selected_folder(&self) -> Option<String> {
+        let row = self.tree.rows.get(self.tree.selected)?;
+        (row.directory && self.visible_rows().contains(&self.tree.selected))
+            .then(|| row.path.clone())
+    }
+
     fn scroll_to_selected(&self) {
         if let Some(position) = self
             .visible_rows()
@@ -530,22 +537,39 @@ impl PaneUi {
     }
 }
 
-/// What `pane` shows, if it is a content pane of any kind.
-pub(in crate::gui) fn find_pane_content<'a>(
+/// The terminal or content leaf of `pane`, in whichever tab holds it.
+pub(in crate::gui) fn find_leaf<'a>(
     workspace: &'a WorkspaceSnapshot,
     pane: &PaneId,
-) -> Option<&'a PaneContent> {
+) -> Option<&'a LayoutNode> {
     workspace
         .sessions
         .iter()
         .flat_map(|session| &session.tabs)
-        .find_map(|tab| match leaf_node(&tab.layout, pane)? {
-            LayoutNode::Content { content, .. } => Some(content),
-            _ => None,
-        })
+        .find_map(|tab| leaf_node(&tab.layout, pane))
 }
 
-/// The folder and files `pane` shows, if it is a content pane showing files.
+/// What `pane` holds besides a shell: a content pane's content, or the view a terminal
+/// pane carries, shown or not. Client state of content stays keyed by the pane either
+/// way, so it survives flipping a view to its shell and back.
+pub(in crate::gui) fn find_pane_content<'a>(
+    workspace: &'a WorkspaceSnapshot,
+    pane: &PaneId,
+) -> Option<&'a PaneContent> {
+    find_leaf(workspace, pane)?.content()
+}
+
+/// What `pane` draws instead of a terminal right now: a content pane's content, or a
+/// terminal pane's view while it shows its view side.
+pub(in crate::gui) fn find_shown_content<'a>(
+    workspace: &'a WorkspaceSnapshot,
+    pane: &PaneId,
+) -> Option<&'a PaneContent> {
+    find_leaf(workspace, pane)?.shown_content()
+}
+
+/// The folder and files `pane` holds, if it is a content pane or terminal view showing
+/// files, shown or not.
 pub(in crate::gui) fn find_content<'a>(
     workspace: &'a WorkspaceSnapshot,
     pane: &PaneId,
@@ -553,27 +577,30 @@ pub(in crate::gui) fn find_content<'a>(
     find_pane_content(workspace, pane)?.folder()
 }
 
-/// The content panes of `node` that show files.
+/// The panes of `node` holding files: content panes, and terminal panes whose view
+/// shows files on either side.
 pub(super) fn content_leaves<'a>(
     node: &'a LayoutNode,
     visit: &mut impl FnMut(&'a PaneId, &'a FolderContent),
 ) {
     match node {
-        LayoutNode::Content {
-            pane_id,
-            content: PaneContent::Files(folder),
-        } => visit(pane_id, folder),
-        LayoutNode::Content { .. } | LayoutNode::Pane { .. } => {}
         LayoutNode::Split { first, second, .. } => {
             content_leaves(first, visit);
             content_leaves(second, visit);
+        }
+        leaf => {
+            if let (Some(pane_id), Some(PaneContent::Files(folder))) =
+                (leaf.leaf_pane(), leaf.content())
+            {
+                visit(pane_id, folder);
+            }
         }
     }
 }
 
 /// The content pane in `layout` to show `file` (or, without one, the folder `root`) in:
 /// one in `environment` whose root holds the file, preferring `beside` itself, then one
-/// with the file open, then the deepest root.
+/// with the file open, then the deepest root. A terminal's view stays with its shell.
 pub(super) fn reusable_content<'a>(
     layout: &'a LayoutNode,
     beside: &PaneId,
@@ -583,7 +610,9 @@ pub(super) fn reusable_content<'a>(
 ) -> Option<(&'a PaneId, &'a FolderContent)> {
     let mut best: Option<((bool, bool, usize), &PaneId, &FolderContent)> = None;
     content_leaves(layout, &mut |pane_id, content| {
-        if &content.environment != environment {
+        if &content.environment != environment
+            || leaf_node(layout, pane_id).is_some_and(|leaf| leaf.surface_id().is_some())
+        {
             return;
         }
         let rank = match (file, root) {
@@ -721,6 +750,36 @@ fn editor_language(path: &str, len: usize) -> &'static str {
     }
 }
 
+/// Marks the editor of `pane_id` dirty, or clean again, as its text changes.
+fn watch_editor(
+    pane_id: &PaneId,
+    state: &Entity<EditorState>,
+    cx: &mut Context<CompiApp>,
+) -> Subscription {
+    let pane_id = pane_id.clone();
+    cx.subscribe(state, move |this, editor, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change) {
+            this.editor_changed(&pane_id, &editor, cx);
+        }
+    })
+}
+
+/// Enter in the Save as field of `path` in `pane_id` saves there.
+fn save_as_events(
+    pane_id: &PaneId,
+    path: &str,
+    input: &Entity<InputState>,
+    cx: &mut Context<CompiApp>,
+) -> Subscription {
+    let (pane, file) = (pane_id.clone(), path.to_owned());
+    cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::PressEnter { .. }) {
+            this.submit_save_as(&pane, &file, cx);
+            cx.notify();
+        }
+    })
+}
+
 /// The editor of a file just read, holding the edits of `restore` if it has a backup.
 fn file_editor(
     pane_id: &PaneId,
@@ -743,12 +802,7 @@ fn file_editor(
             .default_value(text)
     });
     let saved = state.read(cx).text().clone();
-    let pane_id = pane_id.clone();
-    let changes = cx.subscribe(&state, move |this, editor, event: &InputEvent, cx| {
-        if matches!(event, InputEvent::Change) {
-            this.editor_changed(&pane_id, &editor, cx);
-        }
-    });
+    let changes = watch_editor(pane_id, &state, cx);
     let mut editor = FileEditor {
         state,
         _changes: changes,
@@ -938,13 +992,20 @@ impl CompiApp {
         cx.set_global(applied);
     }
 
-    /// Content panes this window draws: tiled in the visible tab, or floating.
+    /// Panes this window draws content in: tiled in the visible tab, or floating;
+    /// content panes, and terminal panes showing their view.
     pub(super) fn shown_content_panes(&self) -> impl Iterator<Item = &PaneId> {
+        let workspace = self.workspace.as_ref();
         self.visible_layout()
             .into_iter()
             .flat_map(|layout| &layout.panes)
             .chain(self.float_layouts.iter().map(|float| &float.pane))
-            .filter(|pane| pane.surface_id.is_none())
+            .filter(move |pane| {
+                pane.surface_id.is_none()
+                    || workspace.is_some_and(|workspace| {
+                        find_shown_content(workspace, &pane.pane_id).is_some()
+                    })
+            })
             .map(|pane| &pane.pane_id)
     }
 
@@ -1175,9 +1236,13 @@ impl CompiApp {
                 backups.delete(environment, path);
             }
         };
+        // A view on its way to its own pane keeps its state until the receipt names
+        // the pane it goes to.
+        let moving = self.views.moving_from().cloned();
         self.content
             .panes
             .retain(|pane_id, ui| match find_content(workspace, pane_id) {
+                None if moving.as_ref() == Some(pane_id) => true,
                 Some(content) => {
                     let moves: Vec<(String, String)> = ui
                         .files
@@ -1231,6 +1296,72 @@ impl CompiApp {
     /// Content panes with client state, shown or not.
     pub(super) fn content_panes(&self) -> impl Iterator<Item = &PaneId> {
         self.content.panes.keys()
+    }
+
+    /// The folder tree of `pane_id` shows and has the keyboard: beside an open file the
+    /// sidebar opens on Files; without one the folder view lists it anyway.
+    pub(super) fn show_folder_tree(&mut self, pane_id: &PaneId) {
+        if let Some(ui) = self.content.panes.get_mut(pane_id) {
+            ui.sidebar = true;
+            ui.mode = SidebarMode::Files;
+        }
+        self.content.released = Some(pane_id.clone());
+    }
+
+    /// Why the files `pane_id` holds cannot move to another pane now: a save or a Git
+    /// write under way answers the pane it started in.
+    pub(super) fn content_busy(&self, pane_id: &PaneId) -> Option<&'static str> {
+        let ui = self.content.panes.get(pane_id)?;
+        if ui
+            .files
+            .values()
+            .any(|file| matches!(&file.body, FileBody::Ready(editor) if editor.saving.is_some()))
+        {
+            Some("Wait for the save to finish")
+        } else if ui.repo.busy() {
+            Some("Wait for the Git change to finish")
+        } else {
+            None
+        }
+    }
+
+    /// The files of `from` now show in pane `to`: its editors, unsaved edits, folder
+    /// and changes go along. Reads still on their way answer `from`, so they go again.
+    pub(super) fn move_content_pane(&mut self, from: &PaneId, to: &PaneId, cx: &mut Context<Self>) {
+        if self.content.released.as_ref() == Some(from) {
+            self.content.released = Some(to.clone());
+        }
+        if let Some((pending, ..)) = &mut self.content.pending_diff
+            && pending == from
+        {
+            *pending = to.clone();
+        }
+        let Some(mut ui) = self.content.panes.remove(from) else {
+            return;
+        };
+        ui.tree.pane_id = to.clone();
+        ui.files
+            .retain(|_, file| !matches!(file.body, FileBody::Loading));
+        for (path, file) in &mut ui.files {
+            if let FileBody::Ready(editor) = &mut file.body {
+                editor._changes = watch_editor(to, &editor.state, cx);
+                if let Some(save_as) = &mut editor.save_as {
+                    save_as._events = save_as_events(to, path, &save_as.input, cx);
+                }
+            }
+        }
+        ui.diffs.clear();
+        ui.repo.moved();
+        let relist = ui.tree.rows[0].loading;
+        for row in ui.tree.rows.iter_mut().skip(1).filter(|row| row.loading) {
+            row.loading = false;
+            row.expanded = false;
+        }
+        let (environment, root) = (ui.environment.clone(), ui.root().to_owned());
+        self.content.panes.insert(to.clone(), ui);
+        if relist {
+            self.request_content_listing(to.clone(), environment, root.clone(), root);
+        }
     }
 
     /// Open files in `pane_id` with unsaved changes, in tab order.
@@ -1508,10 +1639,12 @@ impl CompiApp {
         }
     }
 
-    /// Opens `file` (or, without one, the folder `root`) in a content pane of `beside`'s
-    /// tab: one in `environment` whose root holds the file, unless `new_pane`; else a new
-    /// pane split beside `beside`, rooted at `root` or the file's folder. The file becomes
-    /// the active one, with the cursor on the 1-based `line`.
+    /// Opens `file` (or, without one, the folder `root`) for `beside`. A terminal pane
+    /// shows it in its view, in place of its shell; with `new_pane` only when it
+    /// carries no view yet. Otherwise a content pane of `beside`'s tab in `environment`
+    /// whose root holds the file shows it, unless `new_pane`; else a new pane split
+    /// beside `beside`, rooted at `root` or the file's folder. The file becomes the
+    /// active one, with the cursor on the 1-based `line`.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::gui) fn open_content_file(
         &mut self,
@@ -1534,6 +1667,14 @@ impl CompiApp {
             self.global_error = Some("The pane to open files beside no longer exists".into());
             return;
         };
+        if let Some(view) = leaf_node(&tab.layout, beside)
+            .filter(|leaf| leaf.surface_id().is_some() && (!new_pane || leaf.view().is_none()))
+            .map(|leaf| leaf.view().cloned())
+        {
+            self.content.released = None;
+            self.open_file_in_view(beside, view, environment, root, file, line, window, cx);
+            return;
+        }
         let reuse = (!new_pane)
             .then(|| {
                 reusable_content(
@@ -1584,44 +1725,113 @@ impl CompiApp {
         cx.notify();
     }
 
+    /// `open_content_file` in terminal pane `pane_id`, which carries `view`: a Files view
+    /// in `environment` keeps its tabs and takes the file, moving its root to `root` (or
+    /// the file's folder) when the file lies outside it; anything else gives way to a
+    /// new Files view, asking first about unsaved edits it would drop.
+    #[allow(clippy::too_many_arguments)]
+    fn open_file_in_view(
+        &mut self,
+        pane_id: &PaneId,
+        view: Option<PaneView>,
+        environment: ContentEnvironment,
+        root: Option<String>,
+        file: Option<String>,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = view
+            .as_ref()
+            .and_then(|view| view.content.folder())
+            .filter(|folder| folder.environment == environment);
+        let content = match current {
+            Some(current) => {
+                let mut merged = current.clone();
+                match (&file, &root) {
+                    (Some(file), root) => {
+                        if !root_contains(&merged.root, file) {
+                            merged.root = root.clone().unwrap_or_else(|| parent_folder(file));
+                        }
+                        merged.show(ContentTab::edit(file.clone()));
+                    }
+                    (None, Some(root)) if !same_folder(&merged.root, root) => {
+                        merged.root = root.clone();
+                    }
+                    (None, _) => {}
+                }
+                merged
+            }
+            None => {
+                let Some(root) = root.or_else(|| file.as_deref().map(parent_folder)) else {
+                    return;
+                };
+                FolderContent {
+                    environment: environment.clone(),
+                    root,
+                    tabs: file.iter().map(ContentTab::edit).collect(),
+                    active: file.clone().map(ContentTab::edit),
+                }
+            }
+        };
+        let content = PaneContent::Files(content);
+        let shown = view.is_some_and(|view| view.side == PaneSide::View && view.content == content);
+        if !shown {
+            self.show_view(pane_id, content, window, cx);
+        }
+        if let (Some(file), Some(line)) = (file, line) {
+            self.reveal_line(pane_id, &environment, &file, line, window, cx);
+        }
+        self.focus_pane(pane_id.clone());
+        cx.notify();
+    }
+
     /// Splits `beside` for a new content pane showing `content`; `false` with a global
     /// error when there is no room.
     pub(super) fn open_content_beside(&mut self, beside: &PaneId, content: PaneContent) -> bool {
-        let Some(layout) = &self.layout else {
+        if self.layout.is_none() {
             return false;
-        };
-        let kind = layout::PaneKind::Content;
-        let (rect, minimum) = match layout
-            .split_feasibility(beside, SplitAxis::Horizontal, kind)
-            .and_then(|rect| {
-                layout
-                    .split_minimum(beside, kind)
-                    .map(|minimum| (rect, minimum))
-                    .ok_or("The pane to open files beside no longer exists")
-            }) {
-            Ok(fit) => fit,
+        }
+        let geometry = match self.content_split(beside) {
+            Ok(geometry) => geometry,
             Err(reason) => {
                 self.global_error = Some(reason.into());
                 return false;
             }
         };
-        let divider = self.metrics().divider_thickness;
         self.mutate(
             WorkspaceMutation::OpenContent {
                 pane_id: beside.clone(),
                 axis: SplitAxis::Horizontal,
-                geometry: compi_protocol::SplitGeometry {
-                    width: rect.width,
-                    height: rect.height,
-                    min_width: minimum.width,
-                    min_height: minimum.height,
-                    divider,
-                },
+                geometry,
                 content,
             },
             true,
         );
         true
+    }
+
+    /// Where a content pane split side by side with `beside` goes, or why it does not fit.
+    pub(super) fn content_split(
+        &self,
+        beside: &PaneId,
+    ) -> Result<compi_protocol::SplitGeometry, &'static str> {
+        let layout = self
+            .layout
+            .as_ref()
+            .ok_or("The pane to open files beside no longer exists")?;
+        let kind = layout::PaneKind::Content;
+        let rect = layout.split_feasibility(beside, SplitAxis::Horizontal, kind)?;
+        let minimum = layout
+            .split_minimum(beside, kind)
+            .ok_or("The pane to open files beside no longer exists")?;
+        Ok(compi_protocol::SplitGeometry {
+            width: rect.width,
+            height: rect.height,
+            min_width: minimum.width,
+            min_height: minimum.height,
+            divider: self.metrics().divider_thickness,
+        })
     }
 
     /// Moves the cursor to `line` of `path` in `pane_id` now if its editor shows, or
@@ -1904,13 +2114,7 @@ impl CompiApp {
             Some(save_as) => save_as.input.clone(),
             None => {
                 let input = cx.new(|cx| InputState::new(window, cx).default_value(path.to_owned()));
-                let (pane, file) = (pane_id.clone(), path.to_owned());
-                let events = cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.submit_save_as(&pane, &file, cx);
-                        cx.notify();
-                    }
-                });
+                let events = save_as_events(pane_id, path, &input, cx);
                 editor.save_as = Some(SaveAs {
                     input: input.clone(),
                     _events: events,
@@ -2762,11 +2966,32 @@ impl CompiApp {
             .and_then(|workspace| find_content(workspace, pane_id))
             .and_then(|content| content.active.clone())
             .filter(|tab| tab.diff_scope().is_some());
+        // With a shell waiting in `compi tree`, Ctrl/Cmd+Enter enters the selected
+        // folder, and Esc with nothing else to dismiss returns to the shell unchanged.
+        let awaiting = self.views.awaits_folder(pane_id);
+        if awaiting
+            && key.key == "enter"
+            && (key.modifiers.control || key.modifiers.platform)
+            && !key.modifiers.shift
+            && !key.modifiers.alt
+        {
+            if let Some(folder) = self
+                .content
+                .panes
+                .get(pane_id)
+                .and_then(PaneUi::selected_folder)
+            {
+                self.enter_view_folder(pane_id, folder);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let handled = self.changes_list_key(pane_id, key, window, cx)
             || diff.is_some_and(|tab| self.diff_tab_key_down(pane_id, &tab, event, window, cx))
             || self.content_tree_key(pane_id, key, window, cx);
-        if !handled {
-            self.handle_app_key(event, window, cx);
+        if !handled && !self.handle_app_key(event, window, cx) && awaiting && key.key == "escape" {
+            self.set_pane_side(pane_id, PaneSide::Terminal);
         }
         cx.stop_propagation();
         cx.notify();
@@ -3239,6 +3464,23 @@ impl CompiApp {
                         )
                 }
             });
+        // A shell waiting in `compi tree` changes to the folder selected here.
+        let enter = self.views.awaits_folder(pane_id).then(|| {
+            let folder = ui.selected_folder();
+            let (pane, path) = (pane_id.clone(), folder.clone());
+            div().flex_none().mx_2().mb_1().flex().child(
+                text_button("content-enter-folder", "Enter folder")
+                    .detail("The shell that ran compi tree changes to the selected folder")
+                    .key("secondary-enter")
+                    .disabled_because(folder.is_none().then_some("Select a folder to enter"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(path) = &path {
+                            this.enter_view_folder(&pane, path.clone());
+                        }
+                        cx.notify();
+                    })),
+            )
+        });
         div()
             .flex_1()
             .min_h_0()
@@ -3246,6 +3488,7 @@ impl CompiApp {
             .flex_col()
             .text_size(px(UI_SMALL_TEXT_SIZE))
             .child(filter)
+            .children(enter)
             .when_some(ui.tree.error.as_deref(), |tree, error| {
                 tree.child(
                     div()

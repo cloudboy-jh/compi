@@ -864,10 +864,7 @@ mod tests {
     }
 
     fn pane(id: &str) -> LayoutNode {
-        LayoutNode::Pane {
-            pane_id: PaneId::new(id),
-            surface_id: SurfaceId::new(format!("{id}-surface")),
-        }
+        LayoutNode::terminal(PaneId::new(id), SurfaceId::new(format!("{id}-surface")))
     }
 
     fn tiled(id: &str, x: f32, width: f32) -> layout::PaneLayout {

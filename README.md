@@ -18,7 +18,7 @@ Shells that keep running when you close the window, with an editor, diffs and Gi
 
 ## Edit
 
-- Open files beside the terminal that's using them: `compi edit src/main.rs:42`, Ctrl-click a path in any output, or the command palette.
+- Open files right where you are: `compi edit src/main.rs:42`, Ctrl-click a path in any output, or the command palette show them in the terminal's own pane, and Ctrl+Shift+E flips back to the shell, still running.
 - A native code editor with syntax highlighting and search. Saves never overwrite changes made outside it, and unsaved edits survive a crash.
 
 ## Review

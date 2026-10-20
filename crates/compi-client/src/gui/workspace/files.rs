@@ -100,6 +100,29 @@ impl CompiApp {
             .ok_or(NO_SEARCH_TERMINAL)
     }
 
+    /// The environment and folder of terminal pane `pane_id`'s shell, as Files would
+    /// root a view at it.
+    pub(super) fn shell_folder(
+        &self,
+        pane_id: &PaneId,
+    ) -> Result<(ContentEnvironment, String), &'static str> {
+        let view = self
+            .surface_views
+            .iter()
+            .find(|view| &view.pane_id == pane_id)
+            .ok_or("Select a terminal pane first")?;
+        let surface = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.surface(&view.surface_id))
+            .ok_or("Select a terminal pane first")?;
+        let environment = ContentEnvironment::of_surface(surface);
+        let folder = self
+            .terminal_folder(view, surface, self.windows_paths(&environment))
+            .ok_or(UNKNOWN_DIRECTORY)?;
+        Ok((environment, folder))
+    }
+
     pub(super) fn file_scope(&self) -> Result<FileScope, &'static str> {
         let pane_id = self.focused_pane().ok_or("Select a pane first")?.clone();
         if let Some(content) = self.focused_content() {
@@ -137,8 +160,9 @@ impl CompiApp {
         })
     }
 
-    /// Files and New editor: the focused terminal's folder in a content pane beside it,
-    /// a new one for New editor. Files in a content pane shows its own folder.
+    /// Files and New editor: the focused terminal's folder in its place, in its view (New
+    /// editor in a new pane beside it once it carries one). Files in a pane showing files
+    /// shows its own folder.
     pub(super) fn show_files(
         &mut self,
         new_pane: bool,
@@ -168,8 +192,8 @@ impl CompiApp {
         );
     }
 
-    /// Opens a Ctrl/Cmd-clicked file of `pane_id`'s terminal beside it once the daemon has
-    /// read it, at its line; a path that is not a readable file leaves only a note.
+    /// Opens a Ctrl/Cmd-clicked file of `pane_id`'s terminal in its view once the daemon
+    /// has read it, at its line; a path that is not a readable file leaves only a note.
     pub(in crate::gui) fn open_terminal_file_link(
         &mut self,
         pane_id: &PaneId,

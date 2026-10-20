@@ -140,8 +140,8 @@ pub struct PaneInfo {
     pub focused: bool,
     pub floating: bool,
     pub zoomed: bool,
-    /// Absolute paths of files with unsaved edits in this window's content pane; empty
-    /// (and omitted) for terminal panes and for content panes with nothing unsaved.
+    /// Absolute paths of files with unsaved edits in this window's content pane or a
+    /// terminal's Files view; empty (and omitted) when nothing is unsaved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsaved_files: Vec<String>,
 }

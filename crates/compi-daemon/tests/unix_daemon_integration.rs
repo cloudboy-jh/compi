@@ -8,8 +8,9 @@ use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRec
 use compi_protocol::system_metrics::{ProcessOwner, ProcessTable, SystemSample, TotalsSample};
 use compi_protocol::{
     ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, FolderContent,
-    LayoutNode, PROTOCOL_VERSION, PaneContent, ScreenSnapshot, ServerEvent, ServerMessage,
-    SplitAxis, SplitGeometry, SurfaceId, SurfaceInfo, SurfaceStatus, WorkspaceMutation,
+    LayoutNode, PROTOCOL_VERSION, PaneContent, PaneSide, PaneView, ScreenSnapshot, ServerEvent,
+    ServerMessage, SplitAxis, SplitGeometry, SurfaceId, SurfaceInfo, SurfaceStatus,
+    WorkspaceMutation,
 };
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -806,6 +807,62 @@ fn content_pane_survives_daemon_restart_and_closes_without_a_process() {
     assert_eq!(
         workspace.surface(&surface.id).unwrap().status,
         SurfaceStatus::Running
+    );
+    daemon.shutdown();
+}
+
+#[test]
+fn terminal_view_survives_daemon_restart_and_leaves_the_shell_its_size() {
+    let mut daemon = DaemonGuard::start();
+    let mut control = daemon.client();
+    let surface = control.create_surface(80, 24, None).unwrap();
+    let mut attached = Controller::attach(&daemon, &surface, 80, 24);
+    let terminal = control.workspace().unwrap().sessions[0].tabs[0]
+        .layout
+        .leaf_pane()
+        .unwrap()
+        .clone();
+    let project = daemon.directory.join("project");
+    let notes = project.join("notes.md").to_string_lossy().into_owned();
+    let content = PaneContent::Files(FolderContent {
+        environment: ContentEnvironment::Host,
+        root: project.to_string_lossy().into_owned(),
+        tabs: vec![compi_protocol::ContentTab::edit(notes.clone())],
+        active: Some(compi_protocol::ContentTab::edit(notes)),
+    });
+    let shown = control
+        .mutate(WorkspaceMutation::ShowView {
+            pane_id: terminal.clone(),
+            content: content.clone(),
+        })
+        .unwrap();
+    assert_eq!(shown.operation_state, "committed");
+    assert!(shown.affected_surfaces.is_empty());
+    let leaf = LayoutNode::Pane {
+        pane_id: terminal,
+        surface_id: surface.id.clone(),
+        view: Some(PaneView {
+            content,
+            side: PaneSide::View,
+        }),
+    };
+    assert_eq!(
+        control.workspace().unwrap().sessions[0].tabs[0].layout,
+        leaf
+    );
+    // The shell keeps running under its view, at the size it had.
+    attached.input(b"printf 'SIZE_%s\\n' \"$(stty size | tr ' ' x)\"\r");
+    attached.until("SIZE_24x80");
+    drop(attached);
+    drop(control);
+    daemon.crash_and_restart();
+
+    let mut control = daemon.client();
+    let lost = wait_status(&mut control, &surface.id, SurfaceStatus::Lost);
+    assert_eq!((lost.cols, lost.rows), (80, 24));
+    assert_eq!(
+        control.workspace().unwrap().sessions[0].tabs[0].layout,
+        leaf
     );
     daemon.shutdown();
 }

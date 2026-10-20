@@ -123,6 +123,7 @@ pub fn terminal(leaf: &LayoutNode, command: &str) -> Result<(PaneId, SurfaceId),
         LayoutNode::Pane {
             pane_id,
             surface_id,
+            ..
         } => Ok((pane_id.clone(), surface_id.clone())),
         LayoutNode::Content { pane_id, .. } => Err(CliError::new(
             3,
@@ -297,10 +298,7 @@ mod tests {
                 tabs: vec![WorkspaceTab {
                     id: TabId::new(tab_id),
                     label: "build".into(),
-                    layout: LayoutNode::Pane {
-                        pane_id: PaneId::new(pane),
-                        surface_id: SurfaceId::new(surface),
-                    },
+                    layout: LayoutNode::terminal(PaneId::new(pane), SurfaceId::new(surface)),
                     previous_layout: None,
                     merge: None,
                 }],

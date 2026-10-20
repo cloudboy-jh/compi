@@ -4,7 +4,7 @@ use crate::connection::ConnectionTarget;
 use crate::console;
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use compi_protocol::{
-    ClientMessage, ContentEnvironment, FolderContent, LayoutNode, PaneContent, PaneId,
+    ClientMessage, ContentEnvironment, FolderContent, LayoutNode, PaneContent, PaneId, PaneSide,
     ScreenMessage, ServerMessage, SessionId, SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus,
     TabId, WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
@@ -114,6 +114,8 @@ fn usage() {
          compi-probe [connection options] pane split-right|split-down <pane-id> [working-directory]\n  \
          compi-probe [connection options] pane open-content <pane-id> <folder> [--down] [--file <path>]... [--active <path>]\n  \
          compi-probe [connection options] pane update-content <pane-id> <folder> [--file <path>]... [--active <path>]\n  \
+         compi-probe [connection options] pane side <pane-id> terminal|view\n  \
+         compi-probe [connection options] pane close-view|move-view <pane-id>\n  \
          compi-probe [connection options] pane swap <pane-id> <pane-id>\n  \
          compi-probe [connection options] pane remove <pane-id>\n  \
          compi-probe [connection options] surface attach|inspect|end|restart <surface-id>\n  \
@@ -127,7 +129,9 @@ fn usage() {
          right after a merge) recreates the merged tabs. Arranging only moves and\n\
          resizes existing panes; no shell is started, restarted, or ended.\n\
          open-content puts a content pane right of (or, with --down, below) a pane;\n\
-         update-content replaces what a content pane shows. Host paths are made\n\
+         update-content replaces what a content pane (or a terminal's view) shows.\n\
+         side flips a terminal between its shell and its view; close-view drops the\n\
+         view; move-view puts it in its own pane to the right. Host paths are made\n\
          absolute against the current directory; WSL paths are used as given.\n\
          Press Ctrl+] to detach without stopping the shell."
     );
@@ -289,34 +293,54 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
         }
         Some("update-content") if args.len() >= 3 => {
             let pane_id = PaneId::new(args[1].clone());
-            let folder = match find_leaf(&workspace, &pane_id)? {
-                LayoutNode::Content {
-                    content: PaneContent::Files(folder),
-                    ..
-                } => folder,
-                LayoutNode::Content {
-                    content: content @ (PaneContent::Settings(_) | PaneContent::Monitor(_)),
-                    ..
-                } => {
+            let leaf = find_leaf(&workspace, &pane_id)?;
+            let folder = match leaf.content() {
+                Some(PaneContent::Files(folder)) => folder.clone(),
+                Some(content @ (PaneContent::Settings(_) | PaneContent::Monitor(_))) => {
                     let shows = if content.is_monitor() {
                         "Monitor"
                     } else {
                         "Settings"
                     };
                     return Err(format!(
-                        "pane {pane_id} shows {shows}; update-content needs a content pane showing files"
+                        "pane {pane_id} shows {shows}; update-content needs files"
                     )
                     .into());
                 }
-                _ => {
+                None => {
                     return Err(format!(
-                        "pane {pane_id} is a terminal pane; update-content needs a content pane"
+                        "pane {pane_id} is a terminal without a view; update-content needs files"
                     )
                     .into());
                 }
             };
             let (content, _) = content_arguments(&args[2..], folder.environment, false)?;
             WorkspaceMutation::UpdateContent { pane_id, content }
+        }
+        Some("side") if args.len() == 3 => WorkspaceMutation::SetPaneSide {
+            pane_id: PaneId::new(args[1].clone()),
+            side: match args[2].as_str() {
+                "terminal" => PaneSide::Terminal,
+                "view" => PaneSide::View,
+                _ => return Err("side must be terminal or view".into()),
+            },
+        },
+        Some("close-view") if args.len() == 2 => WorkspaceMutation::CloseView {
+            pane_id: PaneId::new(args[1].clone()),
+        },
+        Some("move-view") if args.len() == 2 => {
+            let pane_id = PaneId::new(args[1].clone());
+            WorkspaceMutation::MoveViewToPane {
+                geometry: split_geometry(
+                    &workspace,
+                    &pane_id,
+                    SplitAxis::Horizontal,
+                    crate::layout::PaneKind::Content,
+                    (cols, rows),
+                )?,
+                pane_id,
+                axis: SplitAxis::Horizontal,
+            }
         }
         Some("remove") if args.len() == 2 => WorkspaceMutation::RemovePane {
             pane_id: PaneId::new(args[1].clone()),

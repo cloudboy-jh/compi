@@ -1,6 +1,6 @@
-//! `compi diff [PATH[:LINE]]`: a changed file's tab, in Diff mode, in the content pane of its
-//! repository, or with no PATH that pane's Changes list. Panes are found or opened as
-//! `compi edit` does; Git is only read, never written.
+//! `compi diff [PATH[:LINE]]`: a changed file's tab, in Diff mode, shown in the pane it runs
+//! from (a terminal's view, or a files content pane inside its repository), or with no PATH
+//! that pane's Changes list. Git is only read, never written.
 use super::content::{self, Placed, Show};
 use super::{CliError, Options, Output};
 use crate::content_path::repo_relative;
@@ -26,7 +26,6 @@ pub(super) fn run(
             Placed {
                 pane_id: caller.id.clone(),
                 receipt: None,
-                opened: false,
             }
         } else {
             content::place(client, state, &caller, &Show::Folder(repo.clone()))?

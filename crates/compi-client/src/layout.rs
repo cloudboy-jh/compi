@@ -665,6 +665,7 @@ impl Allocation<'_, '_> {
             LayoutNode::Pane {
                 pane_id,
                 surface_id,
+                ..
             } => {
                 let px = m.ceil(m.padding_x);
                 let py = m.ceil(m.padding_y);
@@ -804,10 +805,7 @@ mod tests {
         }
     }
     fn leaf(id: &str) -> LayoutNode {
-        LayoutNode::Pane {
-            pane_id: id.into(),
-            surface_id: id.into(),
-        }
+        LayoutNode::terminal(id.into(), id.into())
     }
     fn split(axis: SplitAxis, ratio: f32, first: LayoutNode, second: LayoutNode) -> LayoutNode {
         LayoutNode::Split {

@@ -1,4 +1,4 @@
-use compi_protocol::{PaneId, SurfaceId};
+use compi_protocol::PaneId;
 
 #[derive(Clone, Debug)]
 pub(in crate::gui) struct Entry {
@@ -14,25 +14,21 @@ pub(in crate::gui) struct Row {
     pub directory: bool,
     pub expanded: bool,
     pub loading: bool,
-    pub has_next_sibling: bool,
 }
 
+/// A folder tree: a files pane's folder, or a picker over a pane: `compi z`'s visited
+/// folders over its terminal (`project_mode`), or a repository's branches (`branches`).
 pub(in crate::gui) struct FileTree {
     pub pane_id: PaneId,
     pub rows: Vec<Row>,
     pub search_results: Vec<Row>,
     pub selected: usize,
     pub query: String,
-    pub searching: bool,
-    pub pending_shell: bool,
+    /// Jump to project: the rows are the visited folders matching `query`.
     pub project_mode: bool,
-    /// The terminal surface the daemon lists and searches folders through.
-    pub surface_id: Option<SurfaceId>,
     pub error: Option<String>,
     /// Switch branch…: the picker lists a repository's branches instead of files.
     pub branches: Option<super::branches::BranchPicker>,
-    pub request: u64,
-    pub search_request: u64,
 }
 
 impl FileTree {
@@ -50,19 +46,13 @@ impl FileTree {
                 directory: true,
                 expanded: true,
                 loading: true,
-                has_next_sibling: false,
             }],
             search_results: Vec::new(),
             selected: 0,
             query: String::new(),
-            searching: false,
-            pending_shell: false,
             project_mode: false,
-            surface_id: None,
             error: None,
             branches: None,
-            request: 1,
-            search_request: 0,
         }
     }
 
@@ -73,10 +63,8 @@ impl FileTree {
     pub fn display_rows(&self) -> &[Row] {
         if self.project_mode {
             &self.search_results
-        } else if !self.searching || self.query.is_empty() {
-            &self.rows
         } else {
-            &self.search_results
+            &self.rows
         }
     }
 
@@ -92,7 +80,6 @@ impl FileTree {
                     directory,
                     expanded: false,
                     loading: false,
-                    has_next_sibling: false,
                 }
             })
             .collect();
@@ -115,15 +102,13 @@ impl FileTree {
         let selected_path = self.rows.get(self.selected).map(|row| row.path.clone());
         self.rows.drain(index + 1..end);
         entries.retain(|entry| entry.name != "." && entry.name != "..");
-        let child_count = entries.len();
-        let children = entries.into_iter().enumerate().map(|(index, entry)| Row {
+        let children = entries.into_iter().map(|entry| Row {
             path: join_path(parent, &entry.name),
             name: entry.name,
             depth: depth + 1,
             directory: entry.directory,
             expanded: false,
             loading: false,
-            has_next_sibling: index + 1 < child_count,
         });
         self.rows.splice(index + 1..index + 1, children);
         self.selected = selected_path
@@ -250,11 +235,8 @@ mod tests {
             }],
         );
         assert_eq!(
-            tree.rows
-                .iter()
-                .map(|row| (row.depth, row.has_next_sibling))
-                .collect::<Vec<_>>(),
-            vec![(0, false), (1, true), (2, false), (1, false)]
+            tree.rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2, 1]
         );
         tree.selected = 3;
         tree.toggle(1);
@@ -267,19 +249,6 @@ mod tests {
         );
         assert_eq!(tree.selected, 2);
         assert_eq!(join_path("/", "file name"), "/file name");
-    }
-
-    #[test]
-    fn search_results_navigate_paths_outside_expanded_tree() {
-        let mut tree = FileTree::new(PaneId::new("pane"), "/work".into());
-        tree.query = "bt".into();
-        tree.searching = true;
-        tree.replace_search_results(vec![
-            ("/work/apps/beta.rs".into(), false),
-            ("/work/other/beta.txt".into(), false),
-        ]);
-        tree.move_selection(1);
-        assert_eq!(tree.selected().unwrap().path, "/work/other/beta.txt");
     }
 
     #[test]

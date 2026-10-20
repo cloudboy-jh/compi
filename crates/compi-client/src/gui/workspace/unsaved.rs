@@ -944,10 +944,10 @@ mod tests {
                             LayoutNode::Split {
                                 axis: SplitAxis::Horizontal,
                                 ratio: 0.5,
-                                first: Box::new(LayoutNode::Pane {
-                                    pane_id: PaneId::new("terminal"),
-                                    surface_id: SurfaceId::new("surface"),
-                                }),
+                                first: Box::new(LayoutNode::terminal(
+                                    PaneId::new("terminal"),
+                                    SurfaceId::new("surface"),
+                                )),
                                 second: Box::new(pane("left")),
                             },
                         ),

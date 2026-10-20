@@ -142,17 +142,17 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("files", _) => (
             "files [DIR]",
-            "Browse DIR (default: the shell's current directory) in a content pane beside the selected terminal, in that terminal's environment (host or its WSL distribution). Relative DIR resolves against the shell's directory; . and .. are resolved without touching the filesystem. A content pane in the tab already showing DIR is focused instead of opening another; from a content pane (--pane), that pane shows DIR.",
+            "Browse DIR (default: the shell's current directory) in the selected terminal's own pane, in that terminal's environment (host or its WSL distribution). The pane shows the Files view in place of the shell, which keeps running underneath at its size; the Terminal / Files switch at the top of the pane (or Cmd/Ctrl+Shift+E) flips between them. Relative DIR resolves against the shell's directory; . and .. are resolved without touching the filesystem. Files the view already shows stay open as tabs. From a content pane (--pane), that pane shows DIR.",
             "compi files ../docs",
         ),
         ("edit", _) => (
             "edit [FILE[:LINE[:COL]]]",
-            "Open FILE in a content pane beside the selected terminal and put the cursor on LINE (default 1; COL is accepted and ignored). Reuses a content pane in the tab whose folder holds FILE (or the --pane content pane); otherwise opens one rooted at the shell's directory when it holds FILE, else at FILE's folder. A missing or unreadable FILE is reported by the editor. An existing folder without :LINE, or no FILE, browses it like files. With no Compi window showing the tab the pane still opens and a note says it was not shown.",
+            "Open FILE in the selected terminal's Files view, in place of the shell, and put the cursor on LINE (default 1; COL is accepted and ignored). The view keeps the files it has open; its folder stays when it holds FILE, else becomes the shell's directory when that holds FILE, else FILE's folder. From a content pane (--pane), that pane opens FILE and keeps its folder. A missing or unreadable FILE is reported by the editor. An existing folder without :LINE, or no FILE, browses it like files. With no Compi window showing the tab the view still opens and a note says it was not shown.",
             "compi edit src/main.rs:42",
         ),
         ("diff", _) => (
             "diff [PATH[:LINE[:COL]]]",
-            "Show PATH's uncommitted change as a diff tab in the content pane of its Git repository, scrolled to LINE of the new side (COL is accepted and ignored). The unstaged change (work tree against the index) wins over the staged one (index against HEAD). PATH resolves like edit; the pane is the one in the tab whose folder lies in the repository and holds PATH (or the --pane content pane), else a new one beside the selected terminal rooted at the repository's top level. Without PATH, the repository of the shell's directory lists its changes in the pane's Changes sidebar. Exits 1 with not_a_repository outside a Git work tree and no_changes when PATH has no uncommitted change. Git is only read: files, the index and other Git state never change.",
+            "Show PATH's uncommitted change as a diff tab in the selected terminal's Files view, in place of the shell, scrolled to LINE of the new side (COL is accepted and ignored). The unstaged change (work tree against the index) wins over the staged one (index against HEAD). PATH resolves like edit; the view's folder stays when it lies in the repository and holds PATH, else becomes the repository's top level. From a content pane (--pane) inside the repository, that pane shows the diff. Without PATH, the repository of the shell's directory lists its changes in the view's Changes sidebar. Exits 1 with not_a_repository outside a Git work tree and no_changes when PATH has no uncommitted change. Git is only read: files, the index and other Git state never change.",
             "compi diff src/layout.rs:40",
         ),
         ("layout", _) => (
@@ -177,7 +177,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("window", Some("list")) => (
             "window list",
-            "List native window slot IDs, visible tab IDs, and pane presentation state, with each pane's type (terminal or content) and a content pane's unsaved_files, for the selected connection.",
+            "List native window slot IDs, visible tab IDs, and pane presentation state, with each pane's type (terminal or content) and the unsaved_files of a content pane or a terminal's Files view, for the selected connection.",
             "compi --instance dev --json window list",
         ),
         ("theme", Some("install")) => (

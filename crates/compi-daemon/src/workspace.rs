@@ -1,9 +1,9 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
     ContentEnvironment, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES,
-    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId,
-    PlannedLayoutNode, ProcessLifetimeId, ServerGeneration, SessionId, SplitAxis, SurfaceId,
-    SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation, WorkspaceSession,
+    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId, PaneSide,
+    PaneView, PlannedLayoutNode, ProcessLifetimeId, ServerGeneration, SessionId, SplitAxis,
+    SurfaceId, SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation, WorkspaceSession,
     WorkspaceSnapshot, WorkspaceTab,
 };
 use sha2::{Digest, Sha256};
@@ -780,10 +780,7 @@ fn apply_mutation(
                 tabs: vec![WorkspaceTab {
                     id: tab_id.clone(),
                     label: String::new(),
-                    layout: LayoutNode::Pane {
-                        pane_id: pane_id.clone(),
-                        surface_id: surface.id.clone(),
-                    },
+                    layout: LayoutNode::terminal(pane_id.clone(), surface.id.clone()),
                     previous_layout: None,
                     merge: None,
                 }],
@@ -840,10 +837,7 @@ fn apply_mutation(
             session.tabs.push(WorkspaceTab {
                 id: tab_id.clone(),
                 label: label.clone(),
-                layout: LayoutNode::Pane {
-                    pane_id: pane_id.clone(),
-                    surface_id: surface.id.clone(),
-                },
+                layout: LayoutNode::terminal(pane_id.clone(), surface.id.clone()),
                 previous_layout: None,
                 merge: None,
             });
@@ -930,10 +924,7 @@ fn apply_mutation(
                 &mut workspace.sessions,
                 pane_id,
                 *axis,
-                LayoutNode::Pane {
-                    pane_id: new_pane.clone(),
-                    surface_id: surface.id.clone(),
-                },
+                LayoutNode::terminal(new_pane.clone(), surface.id.clone()),
             )
             .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
             affected_sessions.push(session_id);
@@ -970,19 +961,18 @@ fn apply_mutation(
         }
         WorkspaceMutation::UpdateContent { pane_id, content } => {
             validate_content(content).map_err(invalid)?;
-            let tab = workspace
-                .sessions
-                .iter_mut()
-                .flat_map(|session| &mut session.tabs)
-                .find(|tab| contains_pane(&tab.layout, pane_id))
+            let (tab, mut leaf) = pane_leaf(&mut workspace.sessions, pane_id)
                 .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
-            let Some(LayoutNode::Content {
-                content: current, ..
-            }) = leaf_mut(&mut tab.layout, pane_id)
-            else {
-                return Err(invalid(format!(
-                    "pane {pane_id} is a terminal, not a content pane"
-                )));
+            let current = match &mut leaf {
+                LayoutNode::Content { content, .. } => content,
+                LayoutNode::Pane {
+                    view: Some(view), ..
+                } => &mut view.content,
+                LayoutNode::Pane { view: None, .. } | LayoutNode::Split { .. } => {
+                    return Err(invalid(format!(
+                        "pane {pane_id} is a terminal without a view; it has no content to update"
+                    )));
+                }
             };
             if !current.same_kind(content) {
                 return Err(invalid(format!(
@@ -995,23 +985,84 @@ fn apply_mutation(
                 return Ok("unchanged".into());
             }
             *current = content.clone();
-            // Restorable and split-back trees hold this same leaf; they must not
-            // bring back what the pane showed before.
-            let merge = tab.merge.as_deref_mut().into_iter().flat_map(|merge| {
-                merge
-                    .own_layout
-                    .iter_mut()
-                    .chain(merge.tabs.iter_mut().map(|record| &mut record.layout))
-            });
-            for tree in tab.previous_layout.as_deref_mut().into_iter().chain(merge) {
-                if let Some(LayoutNode::Content {
-                    content: recorded, ..
-                }) = leaf_mut(tree, pane_id)
-                {
-                    *recorded = content.clone();
-                }
-            }
+            replace_leaf(tab, leaf);
             affected_panes.push(pane_id.clone());
+            Ok("committed".into())
+        }
+        WorkspaceMutation::ShowView { pane_id, content } => {
+            validate_content(content).map_err(invalid)?;
+            let (tab, mut leaf) = pane_leaf(&mut workspace.sessions, pane_id)
+                .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            let view = terminal_view(&mut leaf).map_err(invalid)?;
+            let shown = PaneView {
+                content: content.clone(),
+                side: PaneSide::View,
+            };
+            affected_tabs.push(tab.id.clone());
+            if view.as_ref() == Some(&shown) {
+                return Ok("unchanged".into());
+            }
+            *view = Some(shown);
+            replace_leaf(tab, leaf);
+            affected_panes.push(pane_id.clone());
+            Ok("committed".into())
+        }
+        WorkspaceMutation::SetPaneSide { pane_id, side } => {
+            let (tab, mut leaf) = pane_leaf(&mut workspace.sessions, pane_id)
+                .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            let view = terminal_view(&mut leaf)
+                .map_err(invalid)?
+                .as_mut()
+                .ok_or_else(|| invalid(format!("pane {pane_id} carries no view")))?;
+            affected_tabs.push(tab.id.clone());
+            if view.side == *side {
+                return Ok("unchanged".into());
+            }
+            view.side = *side;
+            replace_leaf(tab, leaf);
+            affected_panes.push(pane_id.clone());
+            Ok("committed".into())
+        }
+        WorkspaceMutation::CloseView { pane_id } => {
+            let (tab, mut leaf) = pane_leaf(&mut workspace.sessions, pane_id)
+                .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            terminal_view(&mut leaf)
+                .map_err(invalid)?
+                .take()
+                .ok_or_else(|| invalid(format!("pane {pane_id} carries no view")))?;
+            affected_tabs.push(tab.id.clone());
+            replace_leaf(tab, leaf);
+            affected_panes.push(pane_id.clone());
+            Ok("committed".into())
+        }
+        WorkspaceMutation::MoveViewToPane {
+            pane_id,
+            axis,
+            geometry,
+        } => {
+            validate_split_geometry(geometry, *axis).map_err(invalid)?;
+            let (tab, mut leaf) = pane_leaf(&mut workspace.sessions, pane_id)
+                .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            let view = terminal_view(&mut leaf)
+                .map_err(invalid)?
+                .take()
+                .ok_or_else(|| invalid(format!("pane {pane_id} carries no view")))?;
+            validate_content(&view.content).map_err(invalid)?;
+            replace_leaf(tab, leaf);
+            let new_pane = PaneId::new(allocate("pane", ordinal));
+            let (session_id, tab_id) = split_leaf(
+                &mut workspace.sessions,
+                pane_id,
+                *axis,
+                LayoutNode::Content {
+                    pane_id: new_pane.clone(),
+                    content: view.content,
+                },
+            )
+            .expect("the terminal pane was found");
+            affected_sessions.push(session_id);
+            affected_tabs.push(tab_id);
+            affected_panes.extend([pane_id.clone(), new_pane]);
             Ok("committed".into())
         }
         WorkspaceMutation::GrowTab {
@@ -1685,6 +1736,53 @@ fn leaf_mut<'a>(node: &'a mut LayoutNode, target: &PaneId) -> Option<&'a mut Lay
     }
 }
 
+/// The tab holding pane `pane_id` and a copy of its leaf, to change and put back with
+/// `replace_leaf`.
+fn pane_leaf<'a>(
+    sessions: &'a mut [WorkspaceSession],
+    pane_id: &PaneId,
+) -> Option<(&'a mut WorkspaceTab, LayoutNode)> {
+    sessions
+        .iter_mut()
+        .flat_map(|session| &mut session.tabs)
+        .find_map(|tab| {
+            let leaf = leaf_mut(&mut tab.layout, pane_id)?.clone();
+            Some((tab, leaf))
+        })
+}
+
+/// The view slot of a terminal leaf; content leaves have none.
+fn terminal_view(leaf: &mut LayoutNode) -> Result<&mut Option<PaneView>, String> {
+    match leaf {
+        LayoutNode::Pane { view, .. } => Ok(view),
+        LayoutNode::Content { pane_id, .. } => {
+            Err(format!("pane {pane_id} is a content pane, not a terminal"))
+        }
+        LayoutNode::Split { .. } => unreachable!("a leaf is never a split"),
+    }
+}
+
+/// Put `leaf` in place of the leaf with its pane in `tab`. Restorable and split-back
+/// trees hold that same leaf, so it changes there too: they must not bring back what
+/// the pane showed before.
+fn replace_leaf(tab: &mut WorkspaceTab, leaf: LayoutNode) {
+    let pane_id = leaf.leaf_pane().expect("a leaf has a pane").clone();
+    let merge = tab.merge.as_deref_mut().into_iter().flat_map(|merge| {
+        merge
+            .own_layout
+            .iter_mut()
+            .chain(merge.tabs.iter_mut().map(|record| &mut record.layout))
+    });
+    for tree in std::iter::once(&mut tab.layout)
+        .chain(tab.previous_layout.as_deref_mut())
+        .chain(merge)
+    {
+        if let Some(recorded) = leaf_mut(tree, &pane_id) {
+            *recorded = leaf.clone();
+        }
+    }
+}
+
 fn set_split_ratio(mut node: &mut LayoutNode, path: &[bool], ratio: f32) -> bool {
     for second_child in path {
         let LayoutNode::Split { first, second, .. } = node else {
@@ -1822,10 +1920,7 @@ fn materialize_growth_plan(
             );
             let surface_id = surface.id.clone();
             created.push(surface);
-            LayoutNode::Pane {
-                pane_id,
-                surface_id,
-            }
+            LayoutNode::terminal(pane_id, surface_id)
         }
         PlannedLayoutNode::Split {
             axis,
@@ -2109,6 +2204,7 @@ fn collect_surface_for_pane(node: &LayoutNode, pane_id: &PaneId, output: &mut Ve
         LayoutNode::Pane {
             pane_id: current,
             surface_id,
+            ..
         } if current == pane_id => output.push(surface_id.clone()),
         LayoutNode::Pane { .. } | LayoutNode::Content { .. } => {}
         LayoutNode::Split { first, second, .. } => {
@@ -3123,7 +3219,7 @@ mod tests {
         assert!(session.tabs[1].label.is_empty());
         assert!(matches!(
             &session.tabs[1].layout,
-            LayoutNode::Pane { pane_id, surface_id }
+            LayoutNode::Pane { pane_id, surface_id, view: None }
                 if pane_id == &d && surface_id == &detached_surface.id
         ));
         let LayoutNode::Split {
@@ -3290,14 +3386,8 @@ mod tests {
         };
 
         // Missing, duplicated, foreign, and mismatched leaves are all refused.
-        let foreign_surface = LayoutNode::Pane {
-            pane_id: c.clone(),
-            surface_id: launched[0].id.clone(),
-        };
-        let unknown = LayoutNode::Pane {
-            pane_id: PaneId::new("pane-unknown"),
-            surface_id: launched[2].id.clone(),
-        };
+        let foreign_surface = LayoutNode::terminal(c.clone(), launched[0].id.clone());
+        let unknown = LayoutNode::terminal(PaneId::new("pane-unknown"), launched[2].id.clone());
         for (id, layout) in [
             (
                 "arrange-missing",
@@ -4403,10 +4493,10 @@ mod tests {
                 axis: SplitAxis::Vertical,
                 ratio: 0.5,
                 first: Box::new(content_leaf),
-                second: Box::new(LayoutNode::Pane {
-                    pane_id: split.affected_panes[1].clone(),
-                    surface_id: shell.id,
-                }),
+                second: Box::new(LayoutNode::terminal(
+                    split.affected_panes[1].clone(),
+                    shell.id,
+                )),
             }
         );
     }
@@ -4582,7 +4672,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert_eq!(
             error.message,
-            format!("pane {terminal} is a terminal, not a content pane")
+            format!("pane {terminal} is a terminal without a view; it has no content to update")
         );
         let error = update("update-missing", &PaneId::new("missing-pane"), &two_files).unwrap_err();
         assert!(error.message.contains("was not found"), "{error}");
@@ -5052,6 +5142,464 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert!(error.message.contains("holds a content pane"), "{error}");
         assert_eq!(actor.snapshot().unwrap(), before);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    fn show_view(pane_id: &PaneId, content: PaneContent) -> WorkspaceMutation {
+        WorkspaceMutation::ShowView {
+            pane_id: pane_id.clone(),
+            content,
+        }
+    }
+
+    /// The terminal leaf of `pane_id` and `surface` carrying `content` on `side`.
+    fn viewing(
+        pane_id: &PaneId,
+        surface: &SurfaceInfo,
+        content: &PaneContent,
+        side: PaneSide,
+    ) -> LayoutNode {
+        LayoutNode::Pane {
+            pane_id: pane_id.clone(),
+            surface_id: surface.id.clone(),
+            view: Some(PaneView {
+                content: content.clone(),
+                side,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_view_shows_flips_updates_and_closes_over_a_running_shell() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let before = actor.snapshot().unwrap();
+        let tab_id = before.sessions[0].tabs[0].id.clone();
+        let mutate = |id: &str, operation: WorkspaceMutation| {
+            let receipt = mutate_current(&actor, id, operation).unwrap();
+            let after = actor.snapshot().unwrap();
+            // The shell keeps running at its size; nothing launches, ends or resizes.
+            assert_eq!(after.surfaces, before.surfaces, "{id}");
+            assert!(
+                matches!(effects.try_recv(), Err(TryRecvError::Empty)),
+                "{id}"
+            );
+            assert!(receipt.affected_surfaces.is_empty(), "{id}");
+            assert_eq!(receipt.affected_tabs, vec![tab_id.clone()], "{id}");
+            (receipt, after.sessions[0].tabs[0].layout.clone())
+        };
+        let committed = |receipt: &MutationReceipt| {
+            assert_eq!(receipt.operation_state, "committed");
+            assert_eq!(receipt.affected_panes, vec![terminal.clone()]);
+        };
+        let unchanged = |receipt: &MutationReceipt| {
+            assert_eq!(receipt.operation_state, "unchanged");
+            assert!(receipt.affected_panes.is_empty());
+        };
+
+        let files = host_content(&["a.rs"]);
+        let (receipt, layout) = mutate("show", show_view(&terminal, files.clone()));
+        committed(&receipt);
+        assert_eq!(layout, viewing(&terminal, &surface, &files, PaneSide::View));
+        unchanged(&mutate("show-same", show_view(&terminal, files.clone())).0);
+
+        let flip = |side| WorkspaceMutation::SetPaneSide {
+            pane_id: terminal.clone(),
+            side,
+        };
+        let (receipt, layout) = mutate("flip", flip(PaneSide::Terminal));
+        committed(&receipt);
+        assert_eq!(
+            layout,
+            viewing(&terminal, &surface, &files, PaneSide::Terminal)
+        );
+        unchanged(&mutate("flip-same", flip(PaneSide::Terminal)).0);
+
+        // An update changes what the view shows and keeps the side it is on.
+        let two_files = host_content(&["a.rs", "b.rs"]);
+        let update = |content: &PaneContent| WorkspaceMutation::UpdateContent {
+            pane_id: terminal.clone(),
+            content: content.clone(),
+        };
+        let (receipt, layout) = mutate("update", update(&two_files));
+        committed(&receipt);
+        assert_eq!(
+            layout,
+            viewing(&terminal, &surface, &two_files, PaneSide::Terminal)
+        );
+        unchanged(&mutate("update-same", update(&two_files)).0);
+
+        // Showing another kind replaces the view and shows it.
+        let settings = settings_content(SettingsSection::Terminal);
+        let (receipt, layout) = mutate("show-settings", show_view(&terminal, settings.clone()));
+        committed(&receipt);
+        assert_eq!(
+            layout,
+            viewing(&terminal, &surface, &settings, PaneSide::View)
+        );
+
+        let (receipt, layout) = mutate(
+            "close",
+            WorkspaceMutation::CloseView {
+                pane_id: terminal.clone(),
+            },
+        );
+        committed(&receipt);
+        assert_eq!(layout, before.sessions[0].tabs[0].layout);
+        assert_eq!(
+            actor
+                .snapshot()
+                .unwrap()
+                .surface(&surface.id)
+                .unwrap()
+                .status,
+            SurfaceStatus::Running
+        );
+    }
+
+    #[test]
+    fn view_requests_that_cannot_apply_change_nothing() {
+        let (actor, effects, _, terminal) = running_terminal();
+        let content_pane = mutate_current(
+            &actor,
+            "open",
+            open_content(&terminal, host_content(&["a.rs"])),
+        )
+        .unwrap()
+        .affected_panes[1]
+            .clone();
+        let reject = |id: &str, operation: WorkspaceMutation| {
+            let before = actor.snapshot().unwrap();
+            let error = actor
+                .mutate(request(&actor, id, before.revision, operation))
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{id}: {error}");
+            assert_eq!(actor.snapshot().unwrap(), before, "{id}");
+            assert!(
+                actor.outcome(MutationId::new(id)).unwrap().is_none(),
+                "{id}"
+            );
+            error.message
+        };
+        let flip = |pane_id: &PaneId| WorkspaceMutation::SetPaneSide {
+            pane_id: pane_id.clone(),
+            side: PaneSide::Terminal,
+        };
+        let close = |pane_id: &PaneId| WorkspaceMutation::CloseView {
+            pane_id: pane_id.clone(),
+        };
+        let move_out = |pane_id: &PaneId, geometry| WorkspaceMutation::MoveViewToPane {
+            pane_id: pane_id.clone(),
+            axis: SplitAxis::Horizontal,
+            geometry,
+        };
+        let update = |pane_id: &PaneId, content| WorkspaceMutation::UpdateContent {
+            pane_id: pane_id.clone(),
+            content,
+        };
+
+        // Only a terminal carries a view.
+        for (id, operation) in [
+            ("show-content", show_view(&content_pane, host_content(&[]))),
+            ("flip-content", flip(&content_pane)),
+            ("close-content", close(&content_pane)),
+            ("move-content", move_out(&content_pane, split_geometry())),
+        ] {
+            assert_eq!(
+                reject(id, operation),
+                format!("pane {content_pane} is a content pane, not a terminal")
+            );
+        }
+        // A terminal without a view has none to flip, close, move or update.
+        for (id, operation) in [
+            ("flip-viewless", flip(&terminal)),
+            ("close-viewless", close(&terminal)),
+            ("move-viewless", move_out(&terminal, split_geometry())),
+        ] {
+            assert_eq!(
+                reject(id, operation),
+                format!("pane {terminal} carries no view")
+            );
+        }
+        let message = reject("update-viewless", update(&terminal, host_content(&[])));
+        assert!(message.contains("without a view"), "{message}");
+        let missing = PaneId::new("missing-pane");
+        for (id, operation) in [
+            ("show-missing", show_view(&missing, host_content(&[]))),
+            ("flip-missing", flip(&missing)),
+            ("close-missing", close(&missing)),
+            ("move-missing", move_out(&missing, split_geometry())),
+        ] {
+            let message = reject(id, operation);
+            assert!(message.contains("was not found"), "{id}: {message}");
+        }
+        let relative = PaneContent::Files(FolderContent {
+            root: "relative/project".into(),
+            ..host_folder(&[])
+        });
+        let message = reject("show-relative", show_view(&terminal, relative.clone()));
+        assert!(message.contains("not absolute"), "{message}");
+
+        mutate_current(
+            &actor,
+            "show",
+            show_view(&terminal, host_content(&["a.rs"])),
+        )
+        .unwrap();
+        assert_eq!(
+            reject(
+                "update-kind",
+                update(&terminal, settings_content(SettingsSection::Appearance))
+            ),
+            format!(
+                "pane {terminal} shows files; an update cannot change what kind of content it shows"
+            )
+        );
+        let message = reject("update-relative", update(&terminal, relative));
+        assert!(message.contains("not absolute"), "{message}");
+        let mut cramped = split_geometry();
+        cramped.width = 200.0;
+        let message = reject("move-cramped", move_out(&terminal, cramped));
+        assert!(message.contains("minimum-sized"), "{message}");
+        let revision = actor.snapshot().unwrap().revision;
+        let mut launching = request(
+            &actor,
+            "show-launch",
+            revision,
+            show_view(&terminal, host_content(&[])),
+        );
+        launching.launch = Some(Box::new(compi_protocol::LaunchContext::default()));
+        assert_eq!(
+            actor.mutate(launching).unwrap_err().message,
+            "launch context requires a launch operation"
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn moving_a_view_to_its_own_pane_puts_it_beside_the_shell() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let content = host_content(&["a.rs", "b.rs"]);
+        mutate_current(&actor, "show", show_view(&terminal, content.clone())).unwrap();
+        let before = actor.snapshot().unwrap();
+        let receipt = mutate_current(
+            &actor,
+            "move",
+            WorkspaceMutation::MoveViewToPane {
+                pane_id: terminal.clone(),
+                axis: SplitAxis::Vertical,
+                geometry: split_geometry(),
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(
+            receipt.affected_sessions,
+            vec![before.sessions[0].id.clone()]
+        );
+        assert_eq!(
+            receipt.affected_tabs,
+            vec![before.sessions[0].tabs[0].id.clone()]
+        );
+        assert!(receipt.affected_surfaces.is_empty());
+        assert_eq!(receipt.affected_panes.len(), 2);
+        assert_eq!(receipt.affected_panes[0], terminal);
+        let moved = actor.snapshot().unwrap();
+        assert_eq!(
+            moved.sessions[0].tabs[0].layout,
+            LayoutNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::terminal(terminal.clone(), surface.id.clone())),
+                second: Box::new(LayoutNode::Content {
+                    pane_id: receipt.affected_panes[1].clone(),
+                    content,
+                }),
+            }
+        );
+        assert_eq!(moved.surfaces, before.surfaces);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn view_changes_reach_restore_and_split_back_records() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let files = host_content(&["a.rs"]);
+        mutate_current(&actor, "show", show_view(&terminal, files.clone())).unwrap();
+        let settings_pane = mutate_current(
+            &actor,
+            "open-settings",
+            open_content(&terminal, settings_content(SettingsSection::Terminal)),
+        )
+        .unwrap()
+        .affected_panes[1]
+            .clone();
+        let tab_a = actor.snapshot().unwrap().sessions[0].tabs[0].clone();
+        let LayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = tab_a.layout.clone()
+        else {
+            unreachable!()
+        };
+        let arrange = |id: &str, layout: LayoutNode| {
+            mutate_current(
+                &actor,
+                id,
+                WorkspaceMutation::ArrangeTab {
+                    tab_id: tab_a.id.clone(),
+                    layout,
+                },
+            )
+        };
+        // Swapping leaves a restorable tree that holds the terminal and its view.
+        arrange(
+            "swap",
+            LayoutNode::Split {
+                axis,
+                ratio,
+                first: second,
+                second: first,
+            },
+        )
+        .unwrap();
+        mutate_current(
+            &actor,
+            "flip",
+            WorkspaceMutation::SetPaneSide {
+                pane_id: terminal.clone(),
+                side: PaneSide::Terminal,
+            },
+        )
+        .unwrap();
+        let flipped = viewing(&terminal, &surface, &files, PaneSide::Terminal);
+        let swapped = actor.snapshot().unwrap().sessions[0].tabs[0].clone();
+        let previous = swapped.previous_layout.as_deref().unwrap().clone();
+        assert_eq!(leaf_node(&previous, &terminal), flipped);
+        // Going back to the earlier arrangement moves panes only; the view stays flipped.
+        arrange("restore", previous).unwrap();
+        assert_eq!(
+            leaf_node(
+                &actor.snapshot().unwrap().sessions[0].tabs[0].layout,
+                &terminal
+            ),
+            flipped
+        );
+
+        // Merge the terminal's tab into another, then drop its view.
+        mutate_current(
+            &actor,
+            "tab-b",
+            WorkspaceMutation::CreateTab {
+                session_id: actor.snapshot().unwrap().sessions[0].id.clone(),
+                label: "build".into(),
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::Launch(_, _)
+        ));
+        let tabs = actor.snapshot().unwrap().sessions[0].tabs.clone();
+        let (a_tab, b_tab) = (&tabs[0], &tabs[1]);
+        let merged = LayoutNode::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.5,
+            first: Box::new(b_tab.layout.clone()),
+            second: Box::new(a_tab.layout.clone()),
+        };
+        let merge = |id: &str, layout: LayoutNode| {
+            mutate_current(
+                &actor,
+                id,
+                WorkspaceMutation::MergeTabs {
+                    tab_id: b_tab.id.clone(),
+                    sources: vec![a_tab.id.clone()],
+                    layout,
+                },
+            )
+        };
+        // Merging moves panes; it never changes what a terminal's view shows.
+        let mut altered = merged.clone();
+        *leaf_mut(&mut altered, &terminal).unwrap() =
+            viewing(&terminal, &surface, &files, PaneSide::View);
+        assert_eq!(
+            merge("merge-altered", altered).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        merge("merge", merged).unwrap();
+        mutate_current(
+            &actor,
+            "close-view",
+            WorkspaceMutation::CloseView {
+                pane_id: terminal.clone(),
+            },
+        )
+        .unwrap();
+        mutate_current(
+            &actor,
+            "split-back",
+            WorkspaceMutation::SplitMergedTabs {
+                tab_id: b_tab.id.clone(),
+            },
+        )
+        .unwrap();
+        let restored = actor.snapshot().unwrap();
+        let restored_a = restored.sessions[0]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == a_tab.id)
+            .unwrap();
+        assert_eq!(
+            pane_ids(&restored_a.layout),
+            vec![terminal.clone(), settings_pane]
+        );
+        assert_eq!(
+            leaf_node(&restored_a.layout, &terminal),
+            LayoutNode::terminal(terminal, surface.id)
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn detaching_a_terminal_carries_its_view() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let files = host_content(&["a.rs"]);
+        mutate_current(&actor, "show", show_view(&terminal, files.clone())).unwrap();
+        let content_pane = mutate_current(
+            &actor,
+            "open",
+            open_content(&terminal, settings_content(SettingsSection::Terminal)),
+        )
+        .unwrap()
+        .affected_panes[1]
+            .clone();
+        let detached = mutate_current(
+            &actor,
+            "detach",
+            WorkspaceMutation::DetachPane {
+                pane_id: terminal.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(detached.affected_surfaces, vec![surface.id.clone()]);
+        let after = actor.snapshot().unwrap();
+        assert_eq!(
+            pane_ids(&after.sessions[0].tabs[0].layout),
+            vec![content_pane]
+        );
+        assert_eq!(
+            after.sessions[0].tabs[1].layout,
+            viewing(&terminal, &surface, &files, PaneSide::View)
+        );
+        assert_eq!(
+            after.surface(&surface.id).unwrap().status,
+            SurfaceStatus::Running
+        );
         assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
     }
 }
