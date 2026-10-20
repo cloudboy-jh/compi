@@ -2,25 +2,18 @@
 //! in place of its shell, which keeps running underneath at its size: the layout still
 //! sizes the pane in cells, so its PTY never shrinks for the view. The view shares the
 //! terminal's `PaneId`, so its content's client state (`ContentUi`, `SettingsUi`,
-//! `MonitorUi`) stays keyed by it whichever side shows. While the view shows, keys,
-//! text, paste and the wheel go to it, never to the shell, whose program hears it lost
-//! focus. A Terminal / <view> switch at the pane's top right, and Cmd/Ctrl+Shift+E,
-//! flip the side; Move to its own pane puts the view in a pane of its own beside the
-//! shell, and its client state follows it to that pane.
+//! `MonitorUi`) stays keyed by it whichever side shows. A shown view draws over the
+//! whole pane as a content pane does; keys, text, paste and the wheel go to it, never
+//! to the shell, whose program hears it lost focus. Cmd/Ctrl+Shift+E flips the side,
+//! Escape with nothing left to dismiss in the view goes back to the shell, and the pane
+//! menu shows either side; Move to its own pane puts the view in a pane of its own
+//! beside the shell, and its client state follows it to that pane.
 //!
 //! `compi tree` shows the shell's folder in its Files view with **Enter folder**, which
 //! answers the shell waiting for a folder to change to; leaving the view any other way
 //! answers with nothing, which cancels.
 use super::*;
-use crate::gui::controls::text_button;
 use compi_protocol::{MutationReceipt, PaneContent, PaneSide, PaneView};
-
-/// Height of the strip above a shown view that holds its switch.
-const VIEW_STRIP_HEIGHT: f32 = 28.0;
-/// The switch sits this far from the pane's top and right edges, clear of the program
-/// status dot in the top padding band, on either side.
-const SWITCH_TOP: f32 = 2.0;
-const SWITCH_RIGHT: f32 = 2.0 * PANE_RADIUS + 3.0 * TERMINAL_PADDING;
 
 /// Client-only state of views in place.
 #[derive(Default)]
@@ -71,7 +64,7 @@ impl ViewsUi {
     }
 }
 
-/// What the switch and the pane menu call a view.
+/// What the pane menu calls a view.
 pub(super) const fn view_label(content: &PaneContent) -> &'static str {
     match content {
         PaneContent::Files(_) => "Files",
@@ -493,151 +486,20 @@ impl CompiApp {
             .map(|view| (view, self.focused_shell_hidden()))
     }
 
-    /// The Terminal / <view> switch of terminal pane `pane_id`, which carries `view`;
-    /// both options are keyed to Cmd/Ctrl+Shift+E, as the Edit / Diff switch is to its
-    /// shortcut.
-    fn render_view_switch(
-        &self,
-        pane_id: &PaneId,
-        view: &PaneView,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let colors = *self.colors();
-        let label = view_label(&view.content);
-        let shortcut = crate::commands::Command::BrowseFiles
-            .spec()
-            .shortcut(crate::commands::Platform::current());
-        let option = |id: &'static str, title: &'static str, side: PaneSide, detail: String| {
-            let pane = pane_id.clone();
-            let mut option = text_button(id, title)
-                .selected(view.side == side)
-                .detail(detail)
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                    this.focus_pane(pane.clone());
-                    if this.pane_view(&pane).is_some_and(|view| view.side != side) {
-                        this.set_pane_side(&pane, side);
-                    }
-                    cx.notify();
-                }));
-            if let Some(key) = shortcut {
-                option = option.key(key);
-            }
-            option
-        };
-        div()
-            .id("pane-view-switch")
-            .absolute()
-            .top(px(SWITCH_TOP))
-            .right(px(SWITCH_RIGHT))
-            .rounded_sm()
-            .bg(color(colors.surface))
-            // The switch, not the terminal under it, takes the click.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(controls::segmented(
-                "pane-view-sides",
-                [
-                    option(
-                        "pane-view-terminal",
-                        "Terminal",
-                        PaneSide::Terminal,
-                        "Shows the shell, which kept running underneath".to_owned(),
-                    ),
-                    option(
-                        "pane-view-content",
-                        label,
-                        PaneSide::View,
-                        format!("Shows {label} in place of the shell"),
-                    ),
-                ],
-            ))
+    /// Escape that nothing in terminal pane `pane_id`'s shown view took: the pane shows
+    /// its shell again, which answers a `compi tree` waiting there with nothing. `false`
+    /// for a content pane, which has no shell to go back to.
+    pub(super) fn escape_to_shell(&mut self, pane_id: &PaneId) -> bool {
+        if !self.shows_view(pane_id) {
+            return false;
+        }
+        self.set_pane_side(pane_id, PaneSide::Terminal);
+        true
     }
 
-    /// The switch over a terminal pane showing its shell, when it carries a view; it
-    /// overlays the terminal and takes none of its rows.
-    pub(super) fn render_shell_switch(
-        &self,
-        pane_id: &PaneId,
-        cx: &Context<Self>,
-    ) -> Option<AnyElement> {
-        let view = self
-            .pane_view(pane_id)
-            .filter(|view| view.side == PaneSide::Terminal)?;
-        Some(
-            self.render_view_switch(pane_id, view, cx)
-                .into_any_element(),
-        )
-    }
-
-    /// Terminal pane `geometry` showing its view at `rect`: the view's content below a
-    /// slim strip holding the switch. `None` while it shows its shell.
-    pub(super) fn render_shown_view(
-        &self,
-        id: impl Into<gpui::ElementId>,
-        geometry: &layout::PaneLayout,
-        rect: layout::Rect,
-        cx: &Context<Self>,
-    ) -> Option<gpui::Stateful<gpui::Div>> {
-        let view = self
-            .pane_view(&geometry.pane_id)
-            .filter(|view| view.side == PaneSide::View)?;
-        let colors = *self.colors();
-        let body = layout::Rect {
-            x: 0.0,
-            y: VIEW_STRIP_HEIGHT,
-            width: rect.width,
-            height: (rect.height - VIEW_STRIP_HEIGHT).max(1.0),
-        };
-        let (focus_id, menu_id) = (geometry.pane_id.clone(), geometry.pane_id.clone());
-        Some(
-            div()
-                .id(id)
-                .absolute()
-                .left(px(rect.x))
-                .top(px(rect.y))
-                .w(px(rect.width))
-                .h(px(rect.height))
-                .bg(material_color(
-                    colors.background,
-                    self.effective_background_opacity(),
-                ))
-                .child(
-                    div()
-                        .id("pane-view-strip")
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .w(px(rect.width))
-                        .h(px(VIEW_STRIP_HEIGHT))
-                        .border_b_1()
-                        .border_color(color(colors.border))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                if this.focused_pane() != Some(&focus_id) {
-                                    this.focus_pane(focus_id.clone());
-                                    cx.notify();
-                                }
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                this.focus_pane(menu_id.clone());
-                                this.open_pane_menu(
-                                    &menu_id,
-                                    event.position,
-                                    Anchor::TopLeft,
-                                    window,
-                                    cx,
-                                );
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(self.render_content_pane("pane-view-body", geometry, body, cx))
-                .child(self.render_view_switch(&geometry.pane_id, view, cx)),
-        )
+    /// Whether terminal pane `pane_id` shows its view: it draws as a content pane does.
+    pub(super) fn shows_view(&self, pane_id: &PaneId) -> bool {
+        self.pane_view(pane_id)
+            .is_some_and(|view| view.side == PaneSide::View)
     }
 }

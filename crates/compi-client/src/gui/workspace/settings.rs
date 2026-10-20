@@ -1985,9 +1985,13 @@ impl CompiApp {
         }
     }
 
-    /// Returns the keyboard to the terminal Settings was opened from, or another
-    /// terminal of the tab.
+    /// Returns the keyboard to the shell: a terminal showing Settings as its view shows
+    /// its shell again; else the terminal Settings was opened from, or another terminal
+    /// of the tab, takes it.
     fn leave_settings(&mut self, pane_id: &PaneId) {
+        if self.escape_to_shell(pane_id) {
+            return;
+        }
         let terminals: Vec<PaneId> = self
             .selected_tab()
             .map(|tab| {

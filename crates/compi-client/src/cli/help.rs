@@ -142,7 +142,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("files", _) => (
             "files [DIR]",
-            "Browse DIR (default: the shell's current directory) in the selected terminal's own pane, in that terminal's environment (host or its WSL distribution). The pane shows the Files view in place of the shell, which keeps running underneath at its size; the Terminal / Files switch at the top of the pane (or Cmd/Ctrl+Shift+E) flips between them. Relative DIR resolves against the shell's directory; . and .. are resolved without touching the filesystem. Files the view already shows stay open as tabs. From a content pane (--pane), that pane shows DIR.",
+            "Browse DIR (default: the shell's current directory) in the selected terminal's own pane, in that terminal's environment (host or its WSL distribution). The Files view replaces what the pane shows; the shell keeps running underneath at its size, and Cmd/Ctrl+Shift+E or Esc returns to it. Relative DIR resolves against the shell's directory; . and .. are resolved without touching the filesystem. Files the view already shows stay open as tabs. From a content pane (--pane), that pane shows DIR.",
             "compi files ../docs",
         ),
         ("edit", _) => (
@@ -154,6 +154,16 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "diff [PATH[:LINE[:COL]]]",
             "Show PATH's uncommitted change as a diff tab in the selected terminal's Files view, in place of the shell, scrolled to LINE of the new side (COL is accepted and ignored). The unstaged change (work tree against the index) wins over the staged one (index against HEAD). PATH resolves like edit; the view's folder stays when it lies in the repository and holds PATH, else becomes the repository's top level. From a content pane (--pane) inside the repository, that pane shows the diff. Without PATH, the repository of the shell's directory lists its changes in the view's Changes sidebar. Exits 1 with not_a_repository outside a Git work tree and no_changes when PATH has no uncommitted change. Git is only read: files, the index and other Git state never change.",
             "compi diff src/layout.rs:40",
+        ),
+        ("settings", _) => (
+            "settings [SECTION]",
+            "Show Settings in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. SECTION is appearance, interface, terminal, keyboard, monitor, updates or advanced; without it the pane keeps the section it shows, else Appearance. From a Settings pane (--pane), that pane changes section.",
+            "compi settings terminal",
+        ),
+        ("monitor", _) => (
+            "monitor [PAGE]",
+            "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, disk or network; without it the pane keeps the page it shows, else Overview. From a Monitor pane (--pane), that pane changes page.",
+            "compi monitor processes",
         ),
         ("layout", _) => (
             "layout list | PRESET | mirror | flip | restore",
@@ -197,7 +207,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         _ => (
             "[GLOBAL OPTIONS] COMMAND [ARGS]",
-            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
+            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; settings; monitor; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
             "compi --instance dev --json workspace list",
         ),
     };

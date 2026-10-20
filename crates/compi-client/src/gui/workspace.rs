@@ -6119,9 +6119,10 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// One pane at `rect` within its parent: its terminal (or a picker over it), its
-    /// view in place of the terminal while it shows one, or its content. Tiled and
-    /// floating presentations share it, so both use the same attached view.
+    /// One pane at `rect` within its parent: its terminal (or a picker over it), or its
+    /// content: a content pane's, or a terminal's view while it shows one, which covers
+    /// the whole pane. Tiled and floating presentations share it, so both use the same
+    /// attached view.
     fn render_pane(
         &self,
         id: impl Into<gpui::ElementId>,
@@ -6129,12 +6130,8 @@ impl CompiApp {
         rect: layout::Rect,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if geometry.surface_id.is_none() {
+        if geometry.surface_id.is_none() || self.shows_view(&geometry.pane_id) {
             return self.render_content_pane(id, geometry, rect, cx);
-        }
-        let id = id.into();
-        if let Some(view) = self.render_shown_view(id.clone(), geometry, rect, cx) {
-            return view;
         }
         let colors = *self.colors();
         let pane_id = geometry.pane_id.clone();
@@ -6311,10 +6308,6 @@ impl CompiApp {
                 )
             })
             .when(tree_active, |pane| pane.child(self.render_file_tree(cx)))
-            .children(
-                self.render_shell_switch(&geometry.pane_id, cx)
-                    .filter(|_| !tree_active),
-            )
             .when_some(
                 terminal_scroll.filter(|_| !tree_active),
                 |pane, (position, length)| {

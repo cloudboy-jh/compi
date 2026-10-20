@@ -8,6 +8,7 @@ mod help;
 mod targets;
 #[cfg(any(windows, target_os = "macos"))]
 mod update;
+mod view;
 
 use crate::{DaemonClient, Result, arrangement, config, connection::ConnectionTarget};
 use compi_protocol::{
@@ -30,6 +31,8 @@ const COMMANDS: &[&str] = &[
     "files",
     "edit",
     "diff",
+    "settings",
+    "monitor",
     "layout",
     "run",
     "attach",
@@ -950,6 +953,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         "split" => return split(&mut client, &mut state, options, &config),
         "files" | "edit" => return content::run(&mut client, &state, &target, options),
         "diff" => return diff::run(&mut client, &state, &target, options),
+        "settings" | "monitor" => return view::run(&mut client, &state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
             let surface = pane_surface(&state, &surface_id)?.clone();
@@ -1576,7 +1580,7 @@ fn validate(
             &["--cwd", "--panes", "--layout"],
             &["--right", "--down"],
         ),
-        ("files" | "edit" | "diff", _) => (1, 2, &[], &[]),
+        ("files" | "edit" | "diff" | "settings" | "monitor", _) => (1, 2, &[], &[]),
         ("layout", Some(_)) => (2, 2, &[], &[]),
         ("run", _) => (2, usize::MAX, &[], &[]),
         ("attach" | "detach", _) => (1, 1, &[], &[]),
@@ -1906,7 +1910,7 @@ mod tests {
         }
     }
     #[test]
-    fn files_edit_and_diff_take_at_most_one_path() {
+    fn view_commands_take_at_most_one_argument() {
         let validated = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
             assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
@@ -1923,6 +1927,9 @@ mod tests {
             &["--pane", "pane-1", "edit", "--", "-notes.md"],
             &["diff"],
             &["--json", "diff", "src/layout.rs:40"],
+            &["settings"],
+            &["settings", "terminal"],
+            &["--json", "monitor", "processes"],
         ] {
             assert!(validated(accepted).is_ok(), "{accepted:?}");
         }
@@ -1932,6 +1939,8 @@ mod tests {
             &["edit", "a.rs", "--cwd", "/tmp"],
             &["diff", "a.rs", "b.rs"],
             &["diff", "--staged"],
+            &["settings", "terminal", "fonts"],
+            &["monitor", "--page", "cpu"],
         ] {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }

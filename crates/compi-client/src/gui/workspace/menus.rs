@@ -3,9 +3,10 @@
 //! opens its pane menu. They are Kit popup menus (`controls::context_menu`).
 //!
 //! Every pane menu lists the same pane actions in the same order ([`PaneAction`]):
-//! Focus (where the pane is not focused), Move to new tab, Move to its own pane (a
-//! terminal's view), Float or Dock pane, End process… (terminals; it always asks
-//! first), Close Files / Settings / Monitor (a terminal's view) and Close pane.
+//! Focus (where the pane is not focused), Show terminal / Show Files, Settings or
+//! Monitor (a terminal's view, whichever side is hidden), Move to new tab, Move to its
+//! own pane (a terminal's view), Float or Dock pane, End process… (terminals; it always
+//! asks first), Close Files / Settings / Monitor (a terminal's view) and Close pane.
 //!
 //! The tab menu lists the tab's actions, then a Panes group: one row per pane that
 //! focuses it, a × that closes it in one click while the menu stays open, and a ›
@@ -21,6 +22,9 @@ use gpui_component::ActiveTheme as _;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::gui) enum PaneAction {
     Focus,
+    /// Show terminal while a terminal shows its view; Show Files, Settings or Monitor
+    /// while it shows its shell with a view behind it.
+    ShowSide,
     MoveToNewTab,
     /// A terminal's view into a pane of its own beside the terminal.
     MoveToOwnPane,
@@ -34,8 +38,9 @@ pub(in crate::gui) enum PaneAction {
 }
 
 impl PaneAction {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Focus,
+        Self::ShowSide,
         Self::MoveToNewTab,
         Self::MoveToOwnPane,
         Self::Float,
@@ -48,6 +53,7 @@ impl PaneAction {
     fn command(self) -> Option<Command> {
         match self {
             Self::Focus | Self::MoveToOwnPane | Self::CloseView => None,
+            Self::ShowSide => Some(Command::BrowseFiles),
             Self::MoveToNewTab => Some(Command::DetachPane),
             Self::Float => Some(Command::TogglePaneFloat),
             Self::EndProcess => Some(Command::EndSurface),
@@ -58,6 +64,12 @@ impl PaneAction {
     fn label(self, facts: &PaneFacts) -> &'static str {
         match self {
             Self::Focus => "Focus",
+            Self::ShowSide if facts.view_shown => "Show terminal",
+            Self::ShowSide => match facts.view {
+                Some("Settings") => "Show Settings",
+                Some("Monitor") => "Show Monitor",
+                _ => "Show Files",
+            },
             Self::MoveToNewTab => "Move to new tab",
             Self::MoveToOwnPane => "Move to its own pane",
             Self::Float if facts.floating => "Dock pane",
@@ -85,6 +97,8 @@ pub(in crate::gui) struct PaneFacts {
     running: Option<bool>,
     /// What a terminal's view shows ([`super::views::view_label`]); `None` without one.
     view: Option<&'static str>,
+    /// The view shows, in place of the shell.
+    view_shown: bool,
     /// Why the view cannot move to its own pane now.
     view_busy: Option<&'static str>,
 }
@@ -101,7 +115,9 @@ fn pane_actions(
         .filter(move |action| match action {
             PaneAction::Focus => !focused,
             PaneAction::EndProcess => facts.running.is_some(),
-            PaneAction::MoveToOwnPane | PaneAction::CloseView => facts.view.is_some(),
+            PaneAction::ShowSide | PaneAction::MoveToOwnPane | PaneAction::CloseView => {
+                facts.view.is_some()
+            }
             _ => true,
         })
         .map(|action| (action, pane_action_reason(action, facts)))
@@ -182,9 +198,9 @@ impl CompiApp {
                 )
             })
         });
-        let view = leaf_node(&tab.layout, pane_id)
-            .and_then(LayoutNode::view)
-            .map(|view| super::views::view_label(&view.content));
+        let view = leaf_node(&tab.layout, pane_id).and_then(LayoutNode::view);
+        let view_shown = view.is_some_and(|view| view.side == compi_protocol::PaneSide::View);
+        let view = view.map(|view| super::views::view_label(&view.content));
         Some((
             tab.id.clone(),
             PaneFacts {
@@ -193,6 +209,7 @@ impl CompiApp {
                 floats_full: self.state.floating.len() >= crate::client_state::MAX_FLOATING,
                 running,
                 view,
+                view_shown,
                 view_busy: view.and_then(|_| self.content_busy(pane_id)),
             },
         ))
@@ -262,12 +279,22 @@ impl CompiApp {
             return;
         }
         match action {
-            PaneAction::Focus => {
+            PaneAction::Focus | PaneAction::ShowSide => {
                 if self.selected_tab().is_none_or(|tab| tab.id != tab_id) {
                     self.select_terminal(tab_id, false);
                     self.rebuild_layout(window, true);
                 }
                 self.focus_pane(pane_id.clone());
+                if action == PaneAction::ShowSide {
+                    self.set_pane_side(
+                        pane_id,
+                        if facts.view_shown {
+                            compi_protocol::PaneSide::Terminal
+                        } else {
+                            compi_protocol::PaneSide::View
+                        },
+                    );
+                }
             }
             PaneAction::MoveToNewTab => self.mutate(
                 WorkspaceMutation::DetachPane {
@@ -1075,6 +1102,7 @@ mod tests {
             floats_full,
             running,
             view: None,
+            view_shown: false,
             view_busy: None,
         }
     }
@@ -1140,6 +1168,7 @@ mod tests {
         assert_eq!(
             actions(&carrying("Files", None)),
             [
+                ShowSide,
                 MoveToNewTab,
                 MoveToOwnPane,
                 Float,
@@ -1155,6 +1184,17 @@ mod tests {
             CloseView.label(&carrying("Settings", None)),
             "Close Settings"
         );
+        // Show names the hidden side: the view behind the shell, or the shell behind it.
+        assert_eq!(ShowSide.label(&carrying("Files", None)), "Show Files");
+        assert_eq!(ShowSide.label(&carrying("Settings", None)), "Show Settings");
+        assert_eq!(ShowSide.label(&carrying("Monitor", None)), "Show Monitor");
+        let shown = PaneFacts {
+            view_shown: true,
+            ..carrying("Monitor", None)
+        };
+        assert_eq!(ShowSide.label(&shown), "Show terminal");
+        assert_eq!(pane_action_reason(ShowSide, &shown), None);
+        assert_eq!(ShowSide.command(), Some(Command::BrowseFiles));
         // A save under way keeps the view where it is until it lands.
         let saving = carrying("Files", Some("Wait for the save to finish"));
         assert_eq!(

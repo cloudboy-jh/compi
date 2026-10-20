@@ -2967,7 +2967,7 @@ impl CompiApp {
             .and_then(|content| content.active.clone())
             .filter(|tab| tab.diff_scope().is_some());
         // With a shell waiting in `compi tree`, Ctrl/Cmd+Enter enters the selected
-        // folder, and Esc with nothing else to dismiss returns to the shell unchanged.
+        // folder.
         let awaiting = self.views.awaits_folder(pane_id);
         if awaiting
             && key.key == "enter"
@@ -2990,8 +2990,16 @@ impl CompiApp {
         let handled = self.changes_list_key(pane_id, key, window, cx)
             || diff.is_some_and(|tab| self.diff_tab_key_down(pane_id, &tab, event, window, cx))
             || self.content_tree_key(pane_id, key, window, cx);
-        if !handled && !self.handle_app_key(event, window, cx) && awaiting && key.key == "escape" {
-            self.set_pane_side(pane_id, PaneSide::Terminal);
+        // Esc with nothing else to dismiss shows a terminal's shell again (and leaves a
+        // waiting `compi tree` where it was).
+        if !handled
+            && !self.handle_app_key(event, window, cx)
+            && key.key == "escape"
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+        {
+            self.escape_to_shell(pane_id);
         }
         cx.stop_propagation();
         cx.notify();

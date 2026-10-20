@@ -130,7 +130,7 @@ registry! {
     Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-v");
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
-    BrowseFiles, "browse_files", "Files / terminal", Some("cmd-shift-e"), Some("ctrl-shift-e");
+    BrowseFiles, "browse_files", "Toggle view", Some("cmd-shift-e"), Some("ctrl-shift-e");
     JumpProject, "jump_project", "Jump to project…", None, None;
     ShowFiles, "show_files", "Files", None, None;
     OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
@@ -358,7 +358,7 @@ impl Command {
             EndSurface => Some("Stops this terminal and its child processes; keeps its contents."),
             RestartSurface => Some("Starts a new process in this terminal."),
             BrowseFiles => Some(
-                "Flips this pane between its shell and its view, or shows the shell's folder in its place; the shell keeps running.",
+                "Shows this terminal's view in place of its shell, or the shell again; without a view, shows the shell's folder. The shell keeps running.",
             ),
             JumpProject => Some("Lists the folders your shells visited; one opens in a new tab."),
             ShowFiles => Some(

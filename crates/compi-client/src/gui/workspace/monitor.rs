@@ -526,8 +526,9 @@ impl CompiApp {
         } else {
             plain && self.monitor_page_key(pane_id, page, &key.key)
         };
-        if !handled {
-            self.handle_app_key(event, window, cx);
+        // Esc that let go of everything shows a terminal's shell again.
+        if !handled && !self.handle_app_key(event, window, cx) && key.key == "escape" && plain {
+            self.escape_to_shell(pane_id);
         }
         // Nothing typed in Monitor reaches a shell.
         cx.stop_propagation();
