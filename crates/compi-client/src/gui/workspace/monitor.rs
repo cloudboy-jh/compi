@@ -7,9 +7,10 @@
 //! filter, sort and selection are this window's.
 //!
 //! Three watchers per window feed it (`watch`): the host's totals while any Monitor pane
-//! is drawn; its processes, and the apps' icons (`icons`), while a drawn pane shows
-//! Overview (Memory by app) or Processes. Pausing freezes what is drawn while samples
-//! keep arriving; resuming jumps to the newest.
+//! or Settings → Monitor is drawn; its processes, and the apps' icons (`icons`), while a
+//! drawn pane shows Overview (Memory by app) or Processes, or Settings → Monitor (which
+//! draws Overview's cards) is drawn. Pausing freezes what is drawn while samples keep
+//! arriving; resuming jumps to the newest.
 use super::*;
 use crate::gui::controls::IconName;
 use crate::monitor::totals::Span;
@@ -25,6 +26,7 @@ mod overview;
 mod processes;
 mod watch;
 
+use crate::monitor::apps::RowKey;
 use crate::monitor::layout::{self, CardMove, OverviewCard, OverviewRows};
 use icons::{ICON_QUEUE, IconCache, IconsEvent};
 use overview::{Metric, TotalsFeed};
@@ -42,6 +44,24 @@ const NAV_COMPACT_WIDTH: f32 = 52.0;
 const NAV_COMPACT_BELOW: f32 = 640.0;
 /// Narrower than this, the header drops the host's name.
 const HEADER_SUBTITLE_MIN_WIDTH: f32 = 440.0;
+/// Over a page whose samples stopped coming.
+const STALE_NOTE: &str =
+    "Not updating: no new sample from the daemon for a while; the values shown are out of date.";
+
+/// Where Overview's cards are drawn: in a Monitor pane, or in Settings → Monitor, whose
+/// cards open Monitor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OverviewHost {
+    Pane(PaneId),
+    Settings,
+}
+
+/// What a click on Overview opens: a page, or Processes on an app of Memory by app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MonitorTarget {
+    Page(MonitorPage),
+    App(RowKey),
+}
 
 /// What a window's watchers report, tagged with the watcher's generation.
 pub(in crate::gui) enum MonitorEvent {
@@ -96,6 +116,9 @@ pub(in crate::gui) struct MonitorUi {
     /// How much history the graphs show.
     span: Span,
     paused: bool,
+    /// What the next Monitor pane drawn opens on: set when Settings → Monitor opens
+    /// Monitor from a card before the pane has client state.
+    pending: Option<MonitorTarget>,
 }
 
 impl MonitorUi {
@@ -138,6 +161,16 @@ impl CompiApp {
     /// carries it), else shows it in place of the focused terminal, else opens one
     /// beside the focused pane (in a tab of its own when the window has none).
     pub(super) fn open_monitor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_monitor_on(None, window, cx);
+    }
+
+    /// Opens Monitor as `open_monitor` does, then shows `target` in it.
+    fn open_monitor_on(
+        &mut self,
+        target: Option<MonitorTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.overlay.is_some() {
             self.dismiss_overlay();
         }
@@ -150,9 +183,16 @@ impl CompiApp {
                 self.select_terminal(tab, false);
             }
             self.reveal_view(&pane_id);
-            self.focus_pane(pane_id);
+            self.focus_pane(pane_id.clone());
+            match target {
+                Some(target) if self.monitor.panes.contains_key(&pane_id) => {
+                    self.show_monitor_target(&pane_id, target);
+                }
+                target => self.monitor.pending = target,
+            }
             return;
         }
+        self.monitor.pending = target;
         let content = PaneContent::Monitor(MonitorContent::default());
         if let Some(terminal) = self.focused_terminal() {
             self.show_view(&terminal, content, window, cx);
@@ -222,8 +262,32 @@ impl CompiApp {
         }
     }
 
+    /// A click on Overview: in a pane it shows `target` there; in Settings it opens
+    /// Monitor on `target`.
+    fn open_overview_target(
+        &mut self,
+        host: &OverviewHost,
+        target: MonitorTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match host {
+            OverviewHost::Pane(pane_id) => self.show_monitor_target(pane_id, target),
+            OverviewHost::Settings => self.open_monitor_on(Some(target), window, cx),
+        }
+    }
+
+    /// Shows `target` in the Monitor pane `pane_id`.
+    fn show_monitor_target(&mut self, pane_id: &PaneId, target: MonitorTarget) {
+        match target {
+            MonitorTarget::Page(page) => self.set_monitor_page(pane_id, page),
+            MonitorTarget::App(key) => self.reveal_process_row(pane_id, key),
+        }
+    }
+
     /// Before drawing: state for each Monitor pane shown, its page sent to the daemon
-    /// when it changed, and the watchers running while wanted.
+    /// when it changed, and the watchers running while wanted (Settings → Monitor
+    /// wants the ones a pane showing Overview does).
     pub(super) fn prepare_monitor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = &self.workspace else {
             return;
@@ -246,6 +310,9 @@ impl CompiApp {
                 None => {
                     let pane = self.new_monitor_pane(pane_id, daemon, window, cx);
                     self.monitor.panes.insert(pane_id.clone(), pane);
+                    if let Some(target) = self.monitor.pending.take() {
+                        self.show_monitor_target(pane_id, target);
+                    }
                 }
                 Some(pane) => {
                     if pane.sent == Some(daemon) {
@@ -277,12 +344,14 @@ impl CompiApp {
                 );
             }
         }
+        let settings = self.settings_row_shown(super::settings::MONITOR_ROW);
         // Overview's Memory by app needs the processes too; resource pages do not.
-        let processes_wanted = shown.iter().any(|(pane_id, _)| {
-            self.monitor.panes.get(pane_id).is_some_and(|pane| {
-                matches!(pane.page, MonitorPage::Overview | MonitorPage::Processes)
-            })
-        });
+        let processes_wanted = settings
+            || shown.iter().any(|(pane_id, _)| {
+                self.monitor.panes.get(pane_id).is_some_and(|pane| {
+                    matches!(pane.page, MonitorPage::Overview | MonitorPage::Processes)
+                })
+            });
         let context = WatchContext {
             target: self.target.clone(),
             sender: self.event_tx.clone(),
@@ -290,7 +359,7 @@ impl CompiApp {
             connection_guard: self.update_connection_guard.clone(),
         };
         let mut linger = false;
-        match self.monitor.totals.slot.want(!shown.is_empty()) {
+        match self.monitor.totals.slot.want(settings || !shown.is_empty()) {
             SlotChange::Start(generation, stop) => {
                 self.monitor.totals.reset(FeedState::Connecting);
                 watch::watch_totals(context.clone(), generation, stop);
@@ -549,9 +618,7 @@ impl CompiApp {
             .border_color(color(colors.border))
             .text_size(px(UI_MICRO_TEXT_SIZE))
             .text_color(color(modal_text_color(colors.muted, &colors)))
-            .child(
-                "Not updating: no new sample from the daemon for a while; the values shown are out of date.",
-            )
+            .child(STALE_NOTE)
             .into_any_element()
     }
 

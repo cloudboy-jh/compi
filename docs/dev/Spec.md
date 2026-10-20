@@ -804,7 +804,7 @@ Measure separately:
 - Paint CPU time versus actual frame pacing.
 - Private memory, working set, GPU memory, threads, handles/file descriptors, and process counts.
 
-The built-in Performance section samples only while visible or while its per-window FPS overlay is enabled. It reports client and daemon CPU, preferred resident/private memory, handles or file descriptors where supported, daemon surface counts, bounded render timing, display refresh when available, and shaped-row/decoded-image cache occupancy. Rendered-update FPS is an application redraw measure, not swap-chain presentation telemetry. Rebuild renderer clears client visual caches and preserves daemon-owned terminal state; reconnect remains a separate transport recovery action.
+The built-in performance rows (Settings → Advanced → Performance) sample only while shown or while the per-window FPS overlay is enabled. They report client and daemon CPU, preferred resident/private memory, handles or file descriptors where supported, daemon surface counts, bounded render timing, display refresh when available, and shaped-row/decoded-image cache occupancy. Rendered-update FPS is an application redraw measure, not swap-chain presentation telemetry. Rebuild renderer clears client visual caches and preserves daemon-owned terminal state; reconnect remains a separate transport recovery action. Settings → Monitor (saved as section `performance`, so older workspace files load) shows Monitor's Overview cards without the rail, running the totals, processes and icon watchers while drawn, with **Open as pane**; a card opens Monitor on its page.
 
 Baseline gates:
 

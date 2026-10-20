@@ -37,6 +37,8 @@ const CARD_INSET: f32 = 17.0;
 const CARD_FIGURE_GAP: f32 = 12.0;
 /// Between the ring and the legend of Memory by type.
 const RING_GAP: f32 = 24.0;
+/// The card Settings → Monitor shows while the totals are not there.
+const SETTINGS_MESSAGE_HEIGHT: f32 = 160.0;
 
 /// The window's totals, shared by its Monitor panes.
 #[derive(Default)]
@@ -516,7 +518,7 @@ impl CompiApp {
     }
 
     /// The Overview page on a page `width` wide: the cards placed on the grid
-    /// `layout::overview_layout` computes, each at its exact width, rows of equal height.
+    /// `layout::overview_layout` computes, in the page's scroll.
     pub(super) fn render_monitor_overview(
         &self,
         pane_id: &PaneId,
@@ -527,15 +529,76 @@ impl CompiApp {
         if let Some(message) = self.totals_message() {
             return message;
         }
+        let grid = layout::overview_layout(width, self.overview_memory().is_some());
+        // The keyboard highlight moves on the grid drawn.
+        pane.card_rows.set(grid.rows);
+        self.monitor_scroll_page(
+            "monitor-overview",
+            grid.padding,
+            grid.content_width,
+            self.overview_cards(&OverviewHost::Pane(pane_id.clone()), &grid, pane.card, cx),
+        )
+    }
+
+    /// Settings → Monitor, `width` wide: Overview's cards without the rail, header or a
+    /// scroll of their own. A card opens Monitor on its page.
+    pub(in crate::gui::workspace) fn render_settings_monitor(
+        &self,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        if let Some(message) = self.totals_message() {
+            return settings_card(&colors)
+                .h(px(SETTINGS_MESSAGE_HEIGHT))
+                .child(message)
+                .into_any_element();
+        }
+        let grid = layout::overview_grid(width, self.overview_memory().is_some());
+        let stale = self.monitor.totals.state == FeedState::Stale;
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(stale, |page| {
+                page.child(
+                    div()
+                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_color(color(modal_text_color(colors.muted, &colors)))
+                        .child(STALE_NOTE),
+                )
+            })
+            .child(
+                self.overview_cards(&OverviewHost::Settings, &grid, None, cx)
+                    .w(px(grid.content_width)),
+            )
+            .into_any_element()
+    }
+
+    /// The memory Memory by type divides, when the host reports its kinds.
+    fn overview_memory(&self) -> Option<&MemoryTotals> {
+        self.monitor
+            .totals
+            .shown()
+            .latest()
+            .and_then(|sample| sample.memory.as_ref())
+            .filter(|memory| !memory.kinds.is_empty())
+    }
+
+    /// Overview's cards on `grid`, each at its exact width, rows of equal height;
+    /// `highlighted` rings a card for the keyboard.
+    fn overview_cards(
+        &self,
+        host: &OverviewHost,
+        grid: &OverviewLayout,
+        highlighted: Option<OverviewCard>,
+        cx: &Context<Self>,
+    ) -> Div {
         let feed = &self.monitor.totals;
         let history = feed.shown();
         let latest = history.latest();
-        let memory = latest
-            .and_then(|sample| sample.memory.as_ref())
-            .filter(|memory| !memory.kinds.is_empty());
-        let grid = layout::overview_layout(width, memory.is_some());
-        // The keyboard highlight moves on the grid drawn.
-        pane.card_rows.set(grid.rows);
+        let memory = self.overview_memory();
         let rows = grid.rows.iter().map(|row| {
             div()
                 .flex()
@@ -543,39 +606,34 @@ impl CompiApp {
                 .gap(px(grid.gap))
                 .children(row.iter().map(|placed| {
                     let width = grid.width(placed.span);
-                    let highlighted = pane.card == Some(placed.card);
+                    let highlighted = highlighted == Some(placed.card);
                     match Metric::of_card(placed.card) {
                         Some(metric) => {
                             let (values, combine, scale) =
                                 card_series(metric, history, self.monitor.span);
                             self.render_metric_card(
-                                pane_id,
+                                host,
                                 card(metric, latest, feed.host.as_ref()),
                                 self.strip(metric, values, None, combine, scale, 1.0),
-                                &grid,
+                                grid,
                                 width,
                                 highlighted,
                                 cx,
                             )
                         }
                         None if placed.card == OverviewCard::MemoryByApp => {
-                            self.render_memory_by_app(pane_id, width, highlighted, cx)
+                            self.render_memory_by_app(host, width, highlighted, cx)
                         }
                         None => memory.map_or_else(
                             || div().into_any_element(),
                             |memory| {
-                                self.render_memory_by_type(pane_id, memory, width, highlighted, cx)
+                                self.render_memory_by_type(host, memory, width, highlighted, cx)
                             },
                         ),
                     }
                 }))
         });
-        self.monitor_scroll_page(
-            "monitor-overview",
-            grid.padding,
-            grid.content_width,
-            div().flex().flex_col().gap(px(grid.gap)).children(rows),
-        )
+        div().flex().flex_col().gap(px(grid.gap)).children(rows)
     }
 
     /// A message in place of a page that draws totals, while they are not there.
@@ -692,7 +750,7 @@ impl CompiApp {
     /// app; the card, on the table as it was.
     fn render_memory_by_app(
         &self,
-        pane_id: &PaneId,
+        host: &OverviewHost,
         width: f32,
         highlighted: bool,
         cx: &Context<Self>,
@@ -730,7 +788,7 @@ impl CompiApp {
                     (crate::monitor::display_line(&app.name), app.bytes)
                 });
                 self.render_app_tile(
-                    pane_id,
+                    host,
                     index,
                     rect,
                     app.map(|app| &app.key),
@@ -759,7 +817,7 @@ impl CompiApp {
         };
         let body = div().flex().flex_col().gap_3().child(title).child(tiles);
         self.clickable_card(
-            pane_id,
+            host,
             OverviewCard::MemoryByApp,
             width,
             highlighted,
@@ -773,7 +831,7 @@ impl CompiApp {
     #[allow(clippy::too_many_arguments)]
     fn render_app_tile(
         &self,
-        pane_id: &PaneId,
+        host: &OverviewHost,
         index: usize,
         rect: Rect,
         key: Option<&RowKey>,
@@ -844,8 +902,10 @@ impl CompiApp {
         } else {
             None
         };
-        let pane_id = pane_id.clone();
-        let reveal = key.cloned();
+        let host = host.clone();
+        let target = key.map_or(MonitorTarget::Page(MonitorPage::Processes), |key| {
+            MonitorTarget::App(key.clone())
+        });
         let detail: SharedString = format_bytes(bytes).into();
         div()
             .id(("monitor-app-tile", index))
@@ -860,11 +920,8 @@ impl CompiApp {
             .hover(move |style| style.bg(fill.opacity(fill.a * 1.8)))
             .children(content)
             .tooltip(controls::tooltip(name, Some(detail), None))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                match &reveal {
-                    Some(key) => this.reveal_process_row(&pane_id, key.clone()),
-                    None => this.set_monitor_page(&pane_id, MonitorPage::Processes),
-                }
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_overview_target(&host, target.clone(), window, cx);
                 cx.stop_propagation();
                 cx.notify();
             }))
@@ -875,7 +932,7 @@ impl CompiApp {
     /// the keyboard. It fills its row's height, and `body` fills the card.
     fn clickable_card(
         &self,
-        pane_id: &PaneId,
+        host: &OverviewHost,
         card: OverviewCard,
         width: f32,
         highlighted: bool,
@@ -883,7 +940,7 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let pane_id = pane_id.clone();
+        let host = host.clone();
         let page = card_page(card);
         let surface = settings_card(&colors)
             .id(("monitor-card", card as usize))
@@ -891,8 +948,8 @@ impl CompiApp {
             .p_4()
             .cursor_pointer()
             .hover(move |style| style.border_color(color(colors.accent).opacity(0.6)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.set_monitor_page(&pane_id, page);
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_overview_target(&host, MonitorTarget::Page(page), window, cx);
                 cx.notify();
             }))
             .child(body.flex_1().min_w_0());
@@ -908,7 +965,7 @@ impl CompiApp {
     #[allow(clippy::too_many_arguments)]
     fn render_metric_card(
         &self,
-        pane_id: &PaneId,
+        host: &OverviewHost,
         data: Card,
         strip: Strip,
         grid: &OverviewLayout,
@@ -982,7 +1039,7 @@ impl CompiApp {
                 strip,
                 CARD_DOT_ROWS as f32 * (DOT + DOT_GAP) - DOT_GAP,
             ));
-        self.clickable_card(pane_id, data.metric.card(), width, highlighted, body, cx)
+        self.clickable_card(host, data.metric.card(), width, highlighted, body, cx)
     }
 
     /// A large value and its unit, or a muted dash.
@@ -1078,7 +1135,7 @@ impl CompiApp {
     /// ring centred, when narrow).
     fn render_memory_by_type(
         &self,
-        pane_id: &PaneId,
+        host: &OverviewHost,
         memory: &MemoryTotals,
         width: f32,
         highlighted: bool,
@@ -1186,7 +1243,7 @@ impl CompiApp {
             .child(self.card_title(Metric::Memory, "Memory by type", None))
             .child(content);
         self.clickable_card(
-            pane_id,
+            host,
             OverviewCard::MemoryByType,
             width,
             highlighted,
@@ -1473,7 +1530,15 @@ impl CompiApp {
             .then(|| latest.and_then(|sample| sample.memory.as_ref()))
             .flatten()
             .filter(|memory| !memory.kinds.is_empty())
-            .map(|memory| self.render_memory_by_type(pane_id, memory, content_width, false, cx));
+            .map(|memory| {
+                self.render_memory_by_type(
+                    &OverviewHost::Pane(pane_id.clone()),
+                    memory,
+                    content_width,
+                    false,
+                    cx,
+                )
+            });
         self.monitor_scroll_page(
             "monitor-resource",
             padding,

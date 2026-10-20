@@ -182,7 +182,10 @@ impl CompiApp {
         cx.write_to_clipboard(ClipboardItem::new_string(
             self.performance.diagnostics(self.cache_metrics()),
         ));
-        self.performance_notice = Some("Performance diagnostics copied.".into());
+        self.performance_notice = Some((
+            super::settings::DIAGNOSTICS_ROW,
+            "Performance diagnostics copied.",
+        ));
     }
 
     pub(super) fn render_fps_overlay(&self) -> AnyElement {
@@ -207,17 +210,13 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Settings → Performance: one row holding the measurements and their controls.
-    pub(super) fn render_performance_section(
-        &self,
-        row: &super::settings::RowCx,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        use super::settings::SettingsAction;
+    /// Settings → Advanced → Compi's resource use: the frame rate, the resources of the
+    /// window and the terminal server, and the renderer's caches.
+    pub(super) fn render_compi_resources(&self) -> AnyElement {
         let colors = *self.colors();
         let cache = self.cache_metrics();
         let latest = self.performance.latest.as_ref();
-        let metric = |label: &'static str, value: String| {
+        let metric = |label: &'static str, value: String, divided: bool| {
             div()
                 .w_full()
                 .min_w_0()
@@ -225,8 +224,9 @@ impl CompiApp {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .border_b_1()
-                .border_color(color(colors.border))
+                .when(divided, |metric| {
+                    metric.border_b_1().border_color(color(colors.border))
+                })
                 .child(
                     div()
                         .font_weight(FontWeight::MEDIUM)
@@ -243,10 +243,6 @@ impl CompiApp {
         let render = latest.map(|latest| &latest.render);
         let client = latest.map(|latest| &latest.client);
         let daemon = latest.map(|latest| &latest.daemon);
-        let fps_row = super::settings::RowCx {
-            title: "Show FPS",
-            ..row.clone()
-        };
         let cpu_label = |value: Option<f32>| {
             value.map_or_else(|| "Unavailable".into(), |value| format!("{value:.1}%"))
         };
@@ -271,12 +267,14 @@ impl CompiApp {
                     || "Waiting for measurements…".into(),
                     |render| format!("{:.0} FPS", render.updates_per_second),
                 ),
+                true,
             ))
             .child(self.render_sparkline(&self.performance.fps_history))
             .child(self.settings_subheading("Resources"))
             .child(metric(
                 "Compi window",
                 process_summary(latest.and_then(|latest| latest.client_cpu), client),
+                true,
             ))
             .child(metric(
                 "Terminal server",
@@ -284,6 +282,7 @@ impl CompiApp {
                     latest.and_then(|latest| latest.daemon_cpu),
                     daemon.map(|daemon| &daemon.process),
                 ),
+                true,
             ))
             .child(metric(
                 "Terminals",
@@ -296,11 +295,13 @@ impl CompiApp {
                         )
                     },
                 ),
+                true,
             ))
             .child(self.settings_subheading("Renderer"))
             .child(metric(
                 "Cached text rows",
                 format!("{} / {}", cache.shaped_rows, cache.shaped_capacity),
+                true,
             ))
             .child(metric(
                 "Cached images",
@@ -309,45 +310,13 @@ impl CompiApp {
                     cache.image_bytes as f64 / 1_048_576.0,
                     cache.image_capacity as f64 / 1_048_576.0
                 ),
+                true,
             ))
             .child(metric(
                 "Images waiting to decode",
                 cache.pending_decodes.to_string(),
-            ))
-            .child(self.settings_row(
-                "Show FPS",
-                "Show the frame rate on screen.".into(),
-                self.settings_switch(&fps_row, self.state.show_fps, SettingsAction::ToggleFps, cx),
                 false,
             ))
-            .child(self.settings_row(
-                "Rebuild renderer",
-                "Clears rendering caches without stopping your terminals.".into(),
-                self.settings_button(
-                    row,
-                    1,
-                    "Rebuild renderer",
-                    SettingsAction::RebuildRenderer,
-                    cx,
-                ),
-                row.compact,
-            ))
-            .child(div().flex().child(self.settings_button(
-                row,
-                2,
-                "Copy diagnostics",
-                SettingsAction::CopyPerformance,
-                cx,
-            )))
-            .when_some(self.performance_notice.clone(), |section, notice| {
-                section.child(
-                    div()
-                        .min_w_0()
-                        .text_size(px(UI_SMALL_TEXT_SIZE))
-                        .text_color(color(modal_text_color(colors.muted, &colors)))
-                        .child(notice),
-                )
-            })
             .when_some(self.performance.error.clone(), |section, error| {
                 section.child(
                     div()
@@ -357,6 +326,47 @@ impl CompiApp {
                         .child(error),
                 )
             })
+            .into_any_element()
+    }
+
+    /// Rebuild renderer or Copy diagnostics: the row's button, and what it last did
+    /// under it.
+    pub(super) fn render_performance_button(
+        &self,
+        row: &super::settings::RowCx,
+        label: &'static str,
+        action: super::settings::SettingsAction,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let notice = self
+            .performance_notice
+            .filter(|(notice_row, _)| *notice_row == row.row)
+            .map(|(_, notice)| notice);
+        let button = self.render_button_row(
+            row,
+            super::settings::row_description(row.row).into(),
+            label,
+            action,
+            false,
+            cx,
+        );
+        let Some(notice) = notice else {
+            return button;
+        };
+        div()
+            .min_w_0()
+            .pb_3()
+            .flex()
+            .flex_col()
+            .child(button)
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .text_color(color(modal_text_color(colors.muted, &colors)))
+                    .child(notice),
+            )
             .into_any_element()
     }
 

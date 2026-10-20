@@ -4679,7 +4679,9 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         record_frame_metrics();
-        let performance_visible = self.settings_row_shown("performance");
+        // Compi's resource use draws the samples; Copy diagnostics copies them.
+        let performance_visible = self.settings_row_shown(settings::RESOURCES_ROW)
+            || self.settings_row_shown(settings::DIAGNOSTICS_ROW);
         let sample_fps = self.state.show_fps || performance_visible;
         self.performance_enabled
             .store(sample_fps, Ordering::Release);

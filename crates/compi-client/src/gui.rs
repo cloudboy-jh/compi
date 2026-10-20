@@ -917,7 +917,9 @@ struct CompiApp {
     prompt_settings: workspace::prompt::PromptSettingsState,
     performance_enabled: Arc<AtomicBool>,
     performance: workspace::performance::PerformanceMonitor,
-    performance_notice: Option<String>,
+    /// What Rebuild renderer or Copy diagnostics last did, under that row: its id and
+    /// the notice.
+    performance_notice: Option<(&'static str, &'static str)>,
     /// `structure_key` when the open overlay was captured; see `CommandContext::structure`.
     overlay_structure: Option<u64>,
     pane_zoom: PaneZoomState,

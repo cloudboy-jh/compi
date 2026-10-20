@@ -1162,7 +1162,10 @@ pub enum SettingsSection {
     Interface,
     Terminal,
     Keyboard,
-    Performance,
+    /// Monitor's Overview. Saved as "performance", the section's name before it
+    /// became Monitor, so older workspace files still load.
+    #[serde(rename = "performance")]
+    Monitor,
     Updates,
     Advanced,
 }
@@ -1173,7 +1176,7 @@ impl SettingsSection {
         Self::Interface,
         Self::Terminal,
         Self::Keyboard,
-        Self::Performance,
+        Self::Monitor,
         Self::Updates,
         Self::Advanced,
     ];
@@ -1184,7 +1187,7 @@ impl SettingsSection {
             Self::Interface => "Interface",
             Self::Terminal => "Terminal",
             Self::Keyboard => "Keyboard",
-            Self::Performance => "Performance",
+            Self::Monitor => "Monitor",
             Self::Updates => "Updates",
             Self::Advanced => "Advanced",
         }
@@ -1984,6 +1987,20 @@ mod content_tests {
         let files = PaneContent::Files(content(&[], None));
         assert!(!settings.same_kind(&files));
         assert!(settings.same_kind(&PaneContent::Settings(SettingsContent::default())));
+    }
+
+    #[test]
+    fn the_monitor_section_keeps_the_performance_name() {
+        let monitor = PaneContent::Settings(SettingsContent {
+            section: SettingsSection::Monitor,
+        });
+        let saved = serde_json::json!({"kind": "settings", "section": "performance"});
+        assert_eq!(serde_json::to_value(&monitor).unwrap(), saved);
+        assert_eq!(
+            serde_json::from_value::<PaneContent>(saved).unwrap(),
+            monitor
+        );
+        assert_eq!(SettingsSection::Monitor.label(), "Monitor");
     }
 
     #[test]

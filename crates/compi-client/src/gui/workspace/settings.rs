@@ -11,9 +11,10 @@
 //! A pane draws a one-line header (title, section icons, search); the selected icon
 //! names the section, so a page is just its cards of rows, each under its group's
 //! label when the section has more than one group, with the header rows (the scope
-//! switch) at the right end of the first label line. The Appearance page and
-//! Advanced's terminal colors page end in the theme grid (`catalog`), which fills the
-//! pane and previews on the real panes until the Apply / Cancel bar decides.
+//! switch, Monitor's Open as pane) at the right end of the first label line. The
+//! Appearance page and Advanced's terminal colors page end in the theme grid
+//! (`catalog`), which fills the pane and previews on the real panes until the Apply /
+//! Cancel bar decides. Monitor's page is Overview's cards, drawn on the page itself.
 use super::catalog::{CatalogTarget, GridStep};
 use super::*;
 use crate::gui::controls::IconName;
@@ -32,6 +33,8 @@ const STACKED_ROW_WIDTH: f32 = 440.0;
 const HEADER_TITLE_MIN_WIDTH: f32 = 380.0;
 /// The width of a drawn choice (pane density, focus indicator).
 const OPTION_CARD_WIDTH: f32 = 120.0;
+/// The width of Quick Appearance's content.
+const QUICK_APPEARANCE_WIDTH: f32 = 380.0;
 /// The row holding the shell prompt group; see `prompt`.
 pub(super) const PROMPT_ROW: &str = "shell-prompt";
 /// The theme list's controls, as one row of the keyboard order; see `catalog`.
@@ -40,6 +43,16 @@ pub(super) const THEME_LIST_ROW: &str = "theme-list";
 pub(super) const THEME_BAR_ROW: &str = "theme-bar";
 /// Advanced's group of the configuration file and the terminal server.
 const RECOVERY_GROUP: &str = "Configuration and recovery";
+/// Advanced's group of Compi's own performance tools.
+const PERFORMANCE_GROUP: &str = "Performance";
+/// The Monitor page's Overview; while shown, Monitor's watchers run (see `monitor`).
+pub(super) const MONITOR_ROW: &str = "monitor";
+/// Compi's own resource use; while shown, the window samples it.
+pub(super) const RESOURCES_ROW: &str = "compi-resources";
+/// Copy diagnostics, which copies those samples; while shown, the window takes them.
+pub(super) const DIAGNOSTICS_ROW: &str = "performance-diagnostics";
+/// Rebuild renderer.
+pub(super) const REBUILD_ROW: &str = "rebuild-renderer";
 
 /// Focusable controls of Settings → Updates. Which ones exist depends on the update
 /// state; see `update_stops`.
@@ -93,6 +106,7 @@ pub(super) enum SettingsAction {
     OpenConfiguration,
     OpenPalette,
     OpenSettings,
+    OpenMonitor,
     ToggleFps,
     RebuildRenderer,
     CopyPerformance,
@@ -206,6 +220,15 @@ pub(super) struct RowCx {
     pub(super) header: bool,
 }
 
+/// How a row draws.
+#[derive(Clone, Copy)]
+enum Draw {
+    /// Inside its group's card.
+    Card(fn(&CompiApp, &RowCx, &Context<CompiApp>) -> AnyElement),
+    /// On the page in place of a card, given the page's width: a row of cards of its own.
+    Page(fn(&CompiApp, &RowCx, f32, &Context<CompiApp>) -> AnyElement),
+}
+
 /// One setting: its place, the words search matches, the controls it holds in
 /// keyboard order, and how it draws.
 pub(super) struct Row {
@@ -222,7 +245,7 @@ pub(super) struct Row {
     /// Whether it shows now; some rows depend on other settings.
     shown: fn(&CompiApp) -> bool,
     stops: fn(&CompiApp) -> Vec<SettingsAction>,
-    render: fn(&CompiApp, &RowCx, &Context<CompiApp>) -> AnyElement,
+    draw: Draw,
 }
 
 impl Row {
@@ -271,7 +294,31 @@ const fn row(
         header: false,
         shown: |_| true,
         stops,
-        render,
+        draw: Draw::Card(render),
+    }
+}
+
+/// A row drawn on the page rather than in a card; `render` gets the page's width.
+const fn page_row(
+    id: &'static str,
+    section: SettingsSection,
+    title: &'static str,
+    description: &'static str,
+    keywords: &'static str,
+    stops: fn(&CompiApp) -> Vec<SettingsAction>,
+    render: fn(&CompiApp, &RowCx, f32, &Context<CompiApp>) -> AnyElement,
+) -> Row {
+    Row {
+        id,
+        section,
+        group: None,
+        title,
+        description,
+        keywords,
+        header: false,
+        shown: |_| true,
+        stops,
+        draw: Draw::Page(render),
     }
 }
 
@@ -726,21 +773,24 @@ static ROWS: &[Row] = &[
             )
         },
     ),
-    // Performance.
-    row(
-        "performance",
-        SettingsSection::Performance,
-        "Performance",
-        "Frame rate, resource use and renderer caches.",
-        "fps frames cpu memory renderer cache diagnostics rebuild",
-        |_| {
-            vec![
-                SettingsAction::ToggleFps,
-                SettingsAction::RebuildRenderer,
-                SettingsAction::CopyPerformance,
-            ]
-        },
-        |app, row, cx| app.render_performance_section(row, cx),
+    // Monitor.
+    in_header(row(
+        "monitor-open",
+        SettingsSection::Monitor,
+        "Open as pane",
+        "Open Monitor in a pane, with its processes and each resource's history.",
+        "monitor pane open processes task manager",
+        |_| vec![SettingsAction::OpenMonitor],
+        |app, row, cx| app.render_open_monitor_row(row, cx),
+    )),
+    page_row(
+        MONITOR_ROW,
+        SettingsSection::Monitor,
+        "Monitor",
+        "The host's CPU, memory, disk and network, and the apps using its memory.",
+        "monitor overview cpu memory disk network processes apps usage activity",
+        |_| Vec::new(),
+        |app, _, width, cx| app.render_settings_monitor(width, cx),
     ),
     // Updates.
     row(
@@ -863,6 +913,76 @@ static ROWS: &[Row] = &[
         ),
     ),
     grouped(
+        PERFORMANCE_GROUP,
+        row(
+            "show-fps",
+            SettingsSection::Advanced,
+            "Show FPS",
+            "Show the frame rate on screen.",
+            "fps frames frame rate overlay",
+            |_| vec![SettingsAction::ToggleFps],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.state.show_fps,
+                    SettingsAction::ToggleFps,
+                    row_description("show-fps"),
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        PERFORMANCE_GROUP,
+        row(
+            RESOURCES_ROW,
+            SettingsSection::Advanced,
+            "Compi's resource use",
+            "Frame rate, CPU and memory of Compi and its terminal server, and renderer caches.",
+            "fps frames cpu memory renderer cache resources usage",
+            |_| Vec::new(),
+            |app, _, _| app.render_compi_resources(),
+        ),
+    ),
+    grouped(
+        PERFORMANCE_GROUP,
+        row(
+            REBUILD_ROW,
+            SettingsSection::Advanced,
+            "Rebuild renderer",
+            "Clears rendering caches without stopping your terminals.",
+            "renderer cache rebuild reset",
+            |_| vec![SettingsAction::RebuildRenderer],
+            |app, row, cx| {
+                app.render_performance_button(
+                    row,
+                    "Rebuild renderer",
+                    SettingsAction::RebuildRenderer,
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        PERFORMANCE_GROUP,
+        row(
+            DIAGNOSTICS_ROW,
+            SettingsSection::Advanced,
+            "Performance diagnostics",
+            "Copy Compi's frame rate, resource use and renderer caches as text.",
+            "diagnostics copy clipboard fps cpu memory renderer",
+            |_| vec![SettingsAction::CopyPerformance],
+            |app, row, cx| {
+                app.render_performance_button(
+                    row,
+                    "Copy diagnostics",
+                    SettingsAction::CopyPerformance,
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
         RECOVERY_GROUP,
         row(
             "configuration",
@@ -940,7 +1060,7 @@ static ROWS: &[Row] = &[
 ];
 
 /// The registered description of the row `id`, for rows that show it as is.
-fn row_description(id: &str) -> &'static str {
+pub(super) fn row_description(id: &str) -> &'static str {
     ROWS.iter()
         .find(|row| row.id == id)
         .map_or("", |row| row.description)
@@ -2277,6 +2397,7 @@ impl CompiApp {
                 self.execute(Command::OpenConfiguration, window, cx)
             }
             SettingsAction::OpenPalette => self.execute(Command::OpenPalette, window, cx),
+            SettingsAction::OpenMonitor => self.execute(Command::OpenMonitor, window, cx),
             SettingsAction::ToggleFps => {
                 self.state.show_fps = !self.state.show_fps;
                 self.save_state();
@@ -2412,8 +2533,10 @@ impl CompiApp {
         self.typography_scale = 0.0;
         self.refresh_typography(window);
         self.rebuild_layout(window, true);
-        self.performance_notice =
-            Some("Renderer rebuilt. Visual caches will repopulate as needed.".into());
+        self.performance_notice = Some((
+            REBUILD_ROW,
+            "Renderer rebuilt. Visual caches will repopulate as needed.",
+        ));
     }
 
     pub(super) fn settings_subheading(&self, label: &str) -> AnyElement {
@@ -2802,7 +2925,7 @@ impl CompiApp {
         )
     }
 
-    fn render_button_row(
+    pub(super) fn render_button_row(
         &self,
         row: &RowCx,
         detail: String,
@@ -2822,6 +2945,22 @@ impl CompiApp {
                 cx,
             ),
             row.compact,
+        )
+    }
+
+    /// Monitor's Open as pane: a button at the right end of the page's first label
+    /// line or, in search results, a row.
+    fn render_open_monitor_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        if row.header {
+            return self.settings_button(row, 0, row.title, SettingsAction::OpenMonitor, cx);
+        }
+        self.render_button_row(
+            row,
+            row_description(row.row).into(),
+            "Open as pane",
+            SettingsAction::OpenMonitor,
+            false,
+            cx,
         )
     }
 
@@ -3796,10 +3935,12 @@ impl CompiApp {
     }
 
     /// `rows` in cards: consecutive rows of one section and group share a card, with
-    /// hairlines between its rows. A label above a card names its group when the
-    /// section has more than one; in search results (`search`) every card has one,
-    /// "Section · Group" or just the section. `header` rows (the scope switch) sit at
-    /// the right end of the first label line.
+    /// hairlines between its rows; a page row draws in place of a card, `width` wide.
+    /// A label above a card names its group when the section has more than one; in
+    /// search results (`search`) every card has one, "Section · Group" or just the
+    /// section. `header` rows (the scope switch) sit at the right end of the first
+    /// label line.
+    #[allow(clippy::too_many_arguments)]
     fn render_settings_cards(
         &self,
         host: &SettingsHost,
@@ -3807,50 +3948,57 @@ impl CompiApp {
         header: &[&'static Row],
         search: bool,
         compact: bool,
+        width: f32,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = *self.colors();
-        let mut header = (!header.is_empty()).then(|| {
-            header
-                .iter()
-                .map(|row| {
-                    let row_cx = RowCx {
-                        host: host.clone(),
-                        row: row.id,
-                        title: row.title,
-                        compact: false,
-                        header: true,
-                    };
-                    (row.render)(self, &row_cx, cx)
-                })
-                .collect::<Vec<_>>()
-        });
+        let draw = |row: &Row, header: bool| {
+            let row_cx = RowCx {
+                host: host.clone(),
+                row: row.id,
+                title: row.title,
+                compact: compact && !header,
+                header,
+            };
+            match row.draw {
+                Draw::Card(render) => render(self, &row_cx, cx),
+                Draw::Page(render) => render(self, &row_cx, width, cx),
+            }
+        };
+        let mut header = (!header.is_empty())
+            .then(|| header.iter().map(|row| draw(row, true)).collect::<Vec<_>>());
         let mut elements = Vec::new();
-        for run in rows.chunk_by(|a, b| a.section == b.section && a.group == b.group) {
+        let in_card = |row: &Row| matches!(row.draw, Draw::Card(_));
+        // A page row splits its group into runs; only the first is labelled.
+        let mut previous: Option<(SettingsSection, Option<&'static str>)> = None;
+        for run in rows.chunk_by(|a, b| {
+            a.section == b.section && a.group == b.group && in_card(a) && in_card(b)
+        }) {
             let first = run[0];
+            let continued = previous.replace((first.section, first.group))
+                == Some((first.section, first.group));
             let group = first.group.filter(|_| section_grouped(first.section));
             let label: Option<SharedString> = match (search, group) {
+                _ if continued => None,
                 (true, Some(group)) => Some(format!("{} · {group}", first.section.label()).into()),
                 (true, None) => Some(first.section.label().into()),
                 (false, group) => group.map(SharedString::from),
             };
-            let card =
-                settings_card(&colors).children(run.iter().enumerate().map(|(index, row)| {
-                    let row_cx = RowCx {
-                        host: host.clone(),
-                        row: row.id,
-                        title: row.title,
-                        compact,
-                        header: false,
-                    };
-                    div()
-                        .min_w_0()
-                        .px_4()
-                        .when(index > 0, |line| {
-                            line.border_t_1().border_color(color(colors.border))
-                        })
-                        .child((row.render)(self, &row_cx, cx))
-                }));
+            let card = if in_card(first) {
+                settings_card(&colors)
+                    .children(run.iter().enumerate().map(|(index, row)| {
+                        div()
+                            .min_w_0()
+                            .px_4()
+                            .when(index > 0, |line| {
+                                line.border_t_1().border_color(color(colors.border))
+                            })
+                            .child(draw(row, false))
+                    }))
+                    .into_any_element()
+            } else {
+                draw(first, false)
+            };
             let trailing = header.take();
             elements.push(if label.is_some() || trailing.is_some() {
                 div()
@@ -3862,7 +4010,7 @@ impl CompiApp {
                     .child(card)
                     .into_any_element()
             } else {
-                card.into_any_element()
+                card
             });
         }
         if let Some(trailing) = header {
@@ -3932,9 +4080,11 @@ impl CompiApp {
                     .filter(|row| row.id != THEME_ROW)
                     .partition(|row| row.header);
                 page = page.children(
-                    self.render_settings_cards(&host, &rows, &header, false, stacked, cx)
-                        .into_iter()
-                        .map(|card| div().flex_none().child(card)),
+                    self.render_settings_cards(
+                        &host, &rows, &header, false, stacked, page_width, cx,
+                    )
+                    .into_iter()
+                    .map(|card| div().flex_none().child(card)),
                 );
             }
             // Short panes scroll the whole page; the grid keeps a usable height.
@@ -3968,10 +4118,10 @@ impl CompiApp {
                         .into_any_element(),
                 ]
             } else if searching {
-                self.render_settings_cards(&host, &rows, &[], true, stacked, cx)
+                self.render_settings_cards(&host, &rows, &[], true, stacked, page_width, cx)
             } else {
                 let (header, rows): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.header);
-                self.render_settings_cards(&host, &rows, &header, false, stacked, cx)
+                self.render_settings_cards(&host, &rows, &header, false, stacked, page_width, cx)
             };
             div()
                 .relative()
@@ -4093,7 +4243,7 @@ impl CompiApp {
         popover
             .content(
                 div()
-                    .w(px(380.0))
+                    .w(px(QUICK_APPEARANCE_WIDTH))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -4119,6 +4269,7 @@ impl CompiApp {
                                             &[],
                                             false,
                                             false,
+                                            QUICK_APPEARANCE_WIDTH,
                                             cx,
                                         ),
                                     )),
@@ -4162,7 +4313,7 @@ fn section_icon(section: SettingsSection) -> IconName {
         SettingsSection::Interface => IconName::LayoutPanelLeft,
         SettingsSection::Terminal => IconName::SquareTerminal,
         SettingsSection::Keyboard => IconName::Keyboard,
-        SettingsSection::Performance => IconName::Gauge,
+        SettingsSection::Monitor => IconName::Gauge,
         SettingsSection::Updates => IconName::CircleArrowDown,
         SettingsSection::Advanced => IconName::SlidersHorizontal,
     }
@@ -4271,6 +4422,10 @@ mod tests {
         assert_eq!(ids("opacity"), ["transparency", "opacity"]);
         // Descriptions.
         assert_eq!(ids("foreground process"), ["metadata-process"]);
+        // Compi's performance tools are Advanced's; Monitor's words find its page.
+        assert_eq!(ids("rebuild"), [REBUILD_ROW]);
+        assert_eq!(ids("fps"), ["show-fps", RESOURCES_ROW, DIAGNOSTICS_ROW]);
+        assert!(ids("network").contains(&MONITOR_ROW));
         // A group name finds its rows.
         assert_eq!(
             ids("tab metadata"),
@@ -4398,7 +4553,11 @@ mod tests {
             assert_eq!(rows.next().unwrap().group, Some(group));
             assert!(section_grouped(section));
         }
-        assert_eq!(ROWS.iter().filter(|row| row.header).count(), 2);
+        // Monitor's Open as pane leads its page the same way, above Overview.
+        let mut monitor = rows_for(SettingsSection::Monitor, "");
+        assert!(monitor.next().unwrap().header);
+        assert_eq!(monitor.next().unwrap().id, MONITOR_ROW);
+        assert_eq!(ROWS.iter().filter(|row| row.header).count(), 3);
     }
 
     #[test]
@@ -4407,7 +4566,7 @@ mod tests {
         for section in [
             SettingsSection::Terminal,
             SettingsSection::Keyboard,
-            SettingsSection::Performance,
+            SettingsSection::Monitor,
             SettingsSection::Updates,
         ] {
             assert!(!section_grouped(section), "{section:?}");

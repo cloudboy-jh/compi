@@ -126,10 +126,20 @@ impl OverviewLayout {
 }
 
 /// Overview on a page `page_width` wide, with or without the Memory by type card: the
-/// most columns (of 3, 2, 1) whose cards stay at least [`MIN_CARD_WIDTH`], and the
-/// cards placed so every row is full.
+/// page's padding around [`overview_grid`] of the content.
 pub fn overview_layout(page_width: f32, memory_by_type: bool) -> OverviewLayout {
     let (padding, content_width) = page_frame(page_width);
+    OverviewLayout {
+        padding,
+        ..overview_grid(content_width, memory_by_type)
+    }
+}
+
+/// Overview's cards across `content_width`, without padding (Settings → Monitor draws
+/// them on its own page): the most columns (of 3, 2, 1) whose cards stay at least
+/// [`MIN_CARD_WIDTH`], and the cards placed so every row is full.
+pub fn overview_grid(content_width: f32, memory_by_type: bool) -> OverviewLayout {
+    let content_width = content_width.clamp(1.0, MAX_CONTENT_WIDTH);
     let gap = gap(content_width);
     let per_column = |columns: usize| (content_width - gap * (columns - 1) as f32) / columns as f32;
     let columns = [3, 2, 1]
@@ -152,7 +162,7 @@ pub fn overview_layout(page_width: f32, memory_by_type: bool) -> OverviewLayout 
             .map_or(0, |placed| placed.span)
     };
     OverviewLayout {
-        padding,
+        padding: 0.0,
         gap,
         content_width,
         columns,
