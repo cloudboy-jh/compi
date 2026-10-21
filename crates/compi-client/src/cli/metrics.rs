@@ -1,19 +1,24 @@
-//! `compi monitor totals` and `compi monitor list`: Monitor's data for scripts, read
-//! straight from the daemon on the command's own connection, with no window. The
-//! daemon stops sampling processes once the connection closes with the command.
+//! `compi monitor totals`, `list`, `sources`, `inspect` and `quit`: Monitor's data and
+//! process actions for scripts, read straight from the daemon on the command's own
+//! connection, with no window. The daemon stops sampling processes once the connection
+//! closes with the command.
 use super::{CliError, Options, Output};
 use crate::DaemonClient;
 use crate::monitor::apps::{self, Group, GroupUser, RowKind, View};
 use crate::monitor::totals::{self, Span};
 use crate::monitor::{
     Filter, Search, Sort, cpu_share, display_line, format_bytes, format_count, format_cpu,
-    format_percent, format_rate, format_used_of,
+    format_local_time, format_percent, format_rate, format_running_for, format_used_of,
 };
-use compi_protocol::system_metrics::{HostInfo, Process, ProcessTable, SystemSample, TotalsSample};
-use compi_protocol::{ServerEvent, ServerMessage};
+use compi_protocol::system_metrics::{
+    HostInfo, MonitorSource, Process, ProcessInspection, ProcessState, ProcessTable, QuitOutcome,
+    SystemSample, TotalsSample,
+};
+use compi_protocol::{LayoutNode, PaneId, ServerEvent, ServerMessage, WorkspaceSnapshot};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::io::{self, Write};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long a command waits for the daemon's first useful sample.
 const WAIT: Duration = Duration::from_secs(5);
@@ -33,13 +38,89 @@ pub(super) fn span(range: &str) -> Result<Span, CliError> {
         })
 }
 
+/// `--source SOURCE` as the command names it: `host`, or `wsl:NAME` for a WSL 2
+/// distribution of a Windows daemon.
+pub(super) fn source(name: &str) -> Result<MonitorSource, CliError> {
+    let source = match name.split_once(':') {
+        _ if name == "host" => MonitorSource::Host,
+        Some(("wsl", distribution)) => MonitorSource::Wsl {
+            distribution: distribution.to_owned(),
+        },
+        _ => {
+            return Err(CliError::usage(format!(
+                "--source must be host or wsl:NAME, not {name}"
+            )));
+        }
+    };
+    source
+        .validate()
+        .map_err(|error| CliError::usage(format!("--source {name}: {error}")))?;
+    Ok(source)
+}
+
+/// A source as `--source` and `compi monitor sources` name it.
+pub(super) fn source_name(source: &MonitorSource) -> String {
+    match source {
+        MonitorSource::Host => "host".into(),
+        MonitorSource::Wsl { distribution } => format!("wsl:{distribution}"),
+    }
+}
+
+/// Refuses a source the daemon does not list. The host is always listed.
+pub(super) fn known(client: &mut DaemonClient, source: &MonitorSource) -> Result<(), CliError> {
+    if source.is_host() {
+        return Ok(());
+    }
+    let sources = client.monitor_sources()?;
+    if sources.contains(source) {
+        Ok(())
+    } else {
+        Err(unknown_source(source, &sources))
+    }
+}
+
+fn unknown_source(source: &MonitorSource, sources: &[MonitorSource]) -> CliError {
+    CliError::new(
+        2,
+        "unknown_source",
+        format!(
+            "unknown Monitor source {}; use one of {}",
+            source_name(source),
+            sources
+                .iter()
+                .map(source_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+}
+
+/// The `--source` of `options`, else the host, once the daemon has it.
+fn chosen_source(client: &mut DaemonClient, options: &Options) -> Result<MonitorSource, CliError> {
+    let source = options
+        .values
+        .get("--source")
+        .map(|name| source(name))
+        .transpose()?
+        .unwrap_or_default();
+    known(client, &source)?;
+    Ok(source)
+}
+
+/// The PID argument of `monitor inspect` and `monitor quit`.
+pub(super) fn pid(text: &str) -> Result<u32, CliError> {
+    text.parse()
+        .map_err(|_| CliError::usage(format!("PID must be a process ID, not {text}")))
+}
+
 pub(super) fn totals(client: &mut DaemonClient, options: &Options) -> Result<Output, CliError> {
     let span = options
         .values
         .get("--history")
         .map(|range| span(range))
         .transpose()?;
-    let (host, mut history) = client.watch_system_totals()?;
+    let source = chosen_source(client, options)?;
+    let (host, mut history) = client.watch_system_totals(source.clone())?;
     // A daemon that has just started may not have sampled yet.
     if history.is_empty() {
         let sample = wait(client, |message| match message {
@@ -52,7 +133,18 @@ pub(super) fn totals(client: &mut DaemonClient, options: &Options) -> Result<Out
     let samples = recent(history, span);
     Ok(Output::Report {
         text: totals_text(&host, &samples, span),
-        value: json!({"host": host, "samples": samples}),
+        value: json!({"source": source, "host": host, "samples": samples}),
+    })
+}
+
+pub(super) fn sources(client: &mut DaemonClient) -> Result<Output, CliError> {
+    let sources = client.monitor_sources()?;
+    Ok(Output::Report {
+        text: sources
+            .iter()
+            .map(|source| format!("{}\n", source_name(source)))
+            .collect(),
+        value: json!({ "sources": sources }),
     })
 }
 
@@ -170,7 +262,7 @@ fn totals_text(host: &HostInfo, samples: &[TotalsSample], span: Option<Span>) ->
         .collect()
 }
 
-/// One sample of the host's processes, with every process's details.
+/// One sample of a source's processes, with every process's details.
 struct Listing {
     sampled_at_ms: u64,
     logical_cpus: u32,
@@ -178,12 +270,17 @@ struct Listing {
     processes: Vec<Process>,
 }
 
-pub(super) fn list(client: &mut DaemonClient, options: &Options) -> Result<Output, CliError> {
-    client.watch_system_metrics()?;
-    // The first sample has no CPU values yet; the next follows shortly. Details come
-    // once per process, so every sample goes through the table.
+/// Watches `source` on this connection and takes its first sample, or with `cpu` the
+/// first with CPU values (about half a second later: the first has none yet).
+fn listing(
+    client: &mut DaemonClient,
+    source: &MonitorSource,
+    cpu: bool,
+) -> Result<Listing, CliError> {
+    client.watch_system_metrics(source.clone())?;
+    // Details come once per process, so every sample goes through the table.
     let mut table = ProcessTable::default();
-    let listing = wait(client, |message| {
+    wait(client, |message| {
         let ServerMessage::SystemSampled { sample } = message else {
             return None;
         };
@@ -194,20 +291,319 @@ pub(super) fn list(client: &mut DaemonClient, options: &Options) -> Result<Outpu
             processes,
         } = sample;
         let processes = table.apply(processes);
-        processes
-            .iter()
-            .any(|process| process.sample.cpu_percent.is_some())
-            .then_some(Listing {
-                sampled_at_ms,
-                logical_cpus,
-                apps_known,
-                processes,
-            })
+        (!cpu
+            || processes
+                .iter()
+                .any(|process| process.sample.cpu_percent.is_some()))
+        .then_some(Listing {
+            sampled_at_ms,
+            logical_cpus,
+            apps_known,
+            processes,
+        })
     })?
-    .ok_or_else(|| no_sample("process"))?;
+    .ok_or_else(|| no_sample("process"))
+}
+
+pub(super) fn list(client: &mut DaemonClient, options: &Options) -> Result<Output, CliError> {
+    let source = chosen_source(client, options)?;
+    let listing = listing(client, &source, true)?;
     let search = Search::new(options.values.get("--search").map_or("", String::as_str));
-    let (text, value) = report(&listing, &search, options.switches.contains("--group"));
+    let (text, mut value) = report(&listing, &search, options.switches.contains("--group"));
+    value["source"] = json!(source);
     Ok(Output::Report { text, value })
+}
+
+/// The process `pid` names in `listing`.
+fn find(listing: &Listing, pid: u32) -> Result<&Process, CliError> {
+    listing
+        .processes
+        .iter()
+        .find(|process| process.sample.pid == pid)
+        .ok_or_else(|| CliError::new(1, "no_process", format!("no process has PID {pid}")))
+}
+
+fn gone(name: &str, pid: u32) -> CliError {
+    CliError::new(
+        1,
+        "process_gone",
+        format!("{name} (PID {pid}) has already exited"),
+    )
+}
+
+pub(super) fn inspect(client: &mut DaemonClient, options: &Options) -> Result<Output, CliError> {
+    let pid = pid(&options.args[2])?;
+    let source = chosen_source(client, options)?;
+    let listing = listing(client, &source, true)?;
+    let process = find(&listing, pid)?;
+    let inspection = client
+        .inspect_process(source.clone(), pid, process.sample.start_time)?
+        .ok_or_else(|| gone(&display_line(&process.details.name), pid))?;
+    let pane_id = match &process.details.surface {
+        Some(surface) => surface_pane(&client.workspace()?, surface),
+        None => None,
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let (text, value) = inspection_report(
+        &listing,
+        process,
+        &inspection,
+        &source,
+        pane_id.as_ref(),
+        now,
+    );
+    Ok(Output::Report { text, value })
+}
+
+/// The pane whose terminal runs `surface`, if the workspace shows it.
+fn surface_pane(state: &WorkspaceSnapshot, surface: &compi_protocol::SurfaceId) -> Option<PaneId> {
+    state
+        .sessions
+        .iter()
+        .flat_map(|session| &session.tabs)
+        .flat_map(|tab| crate::arrangement::leaves(&tab.layout))
+        .find_map(|leaf| match leaf {
+            LayoutNode::Pane {
+                pane_id,
+                surface_id,
+                ..
+            } if surface_id == *surface => Some(pane_id),
+            _ => None,
+        })
+}
+
+/// What `monitor inspect` prints: one labelled line per fact, and in JSON the process as
+/// `monitor list` gives it with the inspection, its Compi surface and that surface's pane.
+fn inspection_report(
+    listing: &Listing,
+    process: &Process,
+    inspection: &ProcessInspection,
+    source: &MonitorSource,
+    pane_id: Option<&PaneId>,
+    now: u64,
+) -> (String, Value) {
+    const UNAVAILABLE: &str = "unavailable";
+    let sample = &process.sample;
+    let details = &process.details;
+    let or_unavailable =
+        |text: Option<&String>| text.map_or(UNAVAILABLE.into(), |text| display_line(text));
+    let mut lines = vec![("Name", display_line(&details.name))];
+    if !source.is_host() {
+        lines.push(("Source", source_name(source)));
+    }
+    lines.push(("PID", sample.pid.to_string()));
+    lines.push((
+        "Started",
+        if sample.start_time == 0 {
+            UNAVAILABLE.into()
+        } else {
+            format!(
+                "{} · {}",
+                format_local_time(sample.start_time),
+                format_running_for(sample.start_time, now)
+            )
+        },
+    ));
+    lines.push(("User", or_unavailable(details.user.as_ref())));
+    lines.push((
+        "State",
+        inspection.state.map_or(UNAVAILABLE, state_name).to_owned(),
+    ));
+    lines.push((
+        "Directory",
+        or_unavailable(inspection.working_directory.as_ref()),
+    ));
+    lines.push(("Executable", or_unavailable(details.executable.as_ref())));
+    lines.push((
+        "Arguments",
+        match &inspection.arguments {
+            Some(arguments) => {
+                let mut text = arguments
+                    .iter()
+                    .map(|argument| shell_word(argument))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if inspection.arguments_cut {
+                    text.push_str(" … (cut)");
+                }
+                text
+            }
+            None => or_unavailable(details.command.as_ref()),
+        },
+    ));
+    lines.push((
+        "Parent",
+        sample.parent_pid.map_or("none".into(), |parent| {
+            match listing
+                .processes
+                .iter()
+                .find(|process| process.sample.pid == parent)
+            {
+                Some(process) => format!("{parent} ({})", display_line(&process.details.name)),
+                None => parent.to_string(),
+            }
+        }),
+    ));
+    lines.push((
+        "CPU",
+        cpu_share(sample.cpu_percent, listing.logical_cpus).map_or(UNAVAILABLE.into(), format_cpu),
+    ));
+    lines.push((
+        "Memory",
+        sample.memory_bytes.map_or(UNAVAILABLE.into(), format_bytes),
+    ));
+    if let Some(surface) = &details.surface {
+        lines.push((
+            "Terminal",
+            match pane_id {
+                Some(pane_id) => format!("surface {surface} in pane {pane_id}"),
+                None => format!("surface {surface}"),
+            },
+        ));
+    }
+    let text = lines
+        .into_iter()
+        .map(|(label, value)| format!("{label:<12}{value}\n"))
+        .collect();
+    let mut value = process_value(process, listing.logical_cpus);
+    value["source"] = json!(source);
+    value["sampled_at_ms"] = json!(listing.sampled_at_ms);
+    value["inspection"] = json!(inspection);
+    value["surface"] = json!(details.surface);
+    value["pane_id"] = json!(pane_id);
+    (text, value)
+}
+
+fn state_name(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Running => "running",
+        ProcessState::Sleeping => "sleeping",
+        ProcessState::Waiting => "waiting (uninterruptible)",
+        ProcessState::Stopped => "stopped",
+        ProcessState::Zombie => "zombie",
+        ProcessState::Idle => "idle",
+        ProcessState::Other => "other",
+    }
+}
+
+/// An argument as a POSIX shell reads it back: single-quoted when it is empty or holds
+/// whitespace, quotes or shell syntax.
+fn shell_word(argument: &str) -> String {
+    let argument = display_line(argument);
+    if !argument.is_empty()
+        && !argument.contains(|character: char| {
+            character.is_whitespace() || "'\"\\$`;&|<>()*?[]{}#~!".contains(character)
+        })
+    {
+        argument
+    } else {
+        format!("'{}'", argument.replace('\'', r"'\''"))
+    }
+}
+
+pub(super) fn quit(client: &mut DaemonClient, options: &Options) -> Result<Output, CliError> {
+    let pid = pid(&options.args[2])?;
+    let force = options.switches.contains("--force");
+    let source = chosen_source(client, options)?;
+    let listing = listing(client, &source, false)?;
+    let process = find(&listing, pid)?;
+    let name = display_line(&process.details.name);
+    confirm_quit(&quit_question(
+        &name,
+        pid,
+        force,
+        process.details.surface.is_some(),
+    ))?;
+    let start_time = process.sample.start_time;
+    let outcome = client.quit_process(source.clone(), pid, start_time, force)?;
+    quit_answer(&name, pid, start_time, force, &source, outcome)
+}
+
+/// The question `monitor quit` asks, as Monitor's confirmation words it.
+fn quit_question(name: &str, pid: u32, force: bool, in_terminal: bool) -> String {
+    let mut question = if force {
+        format!("Force quit {name} (PID {pid})? Unsaved work in it is lost.")
+    } else {
+        format!("Quit {name} (PID {pid})?")
+    };
+    if in_terminal {
+        question.push_str(" It runs in a Compi terminal.");
+    }
+    question.push_str(" [y/N] ");
+    question
+}
+
+/// Asks `question` on the terminal. There is no bypass: a script cannot answer it.
+fn confirm_quit(question: &str) -> Result<(), CliError> {
+    if !super::interactive() {
+        return Err(CliError::new(
+            4,
+            "confirmation_required",
+            format!(
+                "{} Interactive confirmation is required; nothing was signalled",
+                question.trim_end_matches(" [y/N] ")
+            ),
+        ));
+    }
+    eprint!("{question}");
+    io::stderr()
+        .flush()
+        .map_err(|error| CliError::new(1, "io_error", error.to_string()))?;
+    let answer = super::read_answer()?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        Ok(())
+    } else {
+        Err(CliError::new(
+            4,
+            "cancelled",
+            "quit cancelled; nothing was signalled",
+        ))
+    }
+}
+
+/// What the daemon did, as the command reports it: only a sent quit succeeds.
+fn quit_answer(
+    name: &str,
+    pid: u32,
+    start_time: u64,
+    force: bool,
+    source: &MonitorSource,
+    outcome: QuitOutcome,
+) -> Result<Output, CliError> {
+    let failure = |code, message: String| Err(CliError::new(1, code, message));
+    match outcome {
+        QuitOutcome::Sent => Ok(Output::Report {
+            text: if force {
+                format!("Force quit {name} (PID {pid})\n")
+            } else {
+                format!("Asked {name} (PID {pid}) to quit\n")
+            },
+            value: json!({
+                "source": source,
+                "pid": pid,
+                "start_time": start_time,
+                "name": name,
+                "force": force,
+                "outcome": QuitOutcome::Sent,
+            }),
+        }),
+        QuitOutcome::Gone => Err(gone(name, pid)),
+        QuitOutcome::Denied => failure(
+            "permission_denied",
+            format!("Compi isn't allowed to quit {name} (PID {pid})"),
+        ),
+        QuitOutcome::NoWindow => failure(
+            "no_window",
+            format!("{name} (PID {pid}) has no window to close; use --force to force quit it"),
+        ),
+        QuitOutcome::Refused { reason } => failure(
+            "refused",
+            format!("Compi will not quit {name} (PID {pid}): {reason}"),
+        ),
+    }
 }
 
 /// The processes `search` keeps, busiest first, as Monitor's Processes table sorts them;
@@ -520,6 +916,7 @@ mod tests {
                     id: format!("/Applications/{app}.app"),
                     name: app.into(),
                 }),
+                surface: None,
             }),
         }
     }
@@ -652,5 +1049,273 @@ mod tests {
         let row = text.lines().nth(1).unwrap();
         assert!(row.contains(&format!("{}…", "x".repeat(NAME_WIDTH - 1))));
         assert!(!row.contains(&"x".repeat(NAME_WIDTH)));
+    }
+
+    #[test]
+    fn sources_are_host_or_a_wsl_distribution() {
+        assert_eq!(source("host").unwrap(), MonitorSource::Host);
+        let wsl = |distribution: &str| MonitorSource::Wsl {
+            distribution: distribution.into(),
+        };
+        assert_eq!(source("wsl:Ubuntu-24.04").unwrap(), wsl("Ubuntu-24.04"));
+        // Only the first colon separates: the rest is the distribution's name.
+        assert_eq!(source("wsl:a:b").unwrap(), wsl("a:b"));
+        for name in [
+            "Host", "local", "Ubuntu", "wsl", "wsl:", "wsl:a/b", r"wsl:a\b",
+        ] {
+            assert_eq!(source(name).unwrap_err().exit, 2, "{name}");
+        }
+        for name in ["host", "wsl:Ubuntu", "wsl:a:b"] {
+            assert_eq!(source_name(&source(name).unwrap()), name);
+        }
+        let error = unknown_source(
+            &wsl("Arch"),
+            &[MonitorSource::Host, wsl("Ubuntu"), wsl("Debian")],
+        );
+        assert_eq!((error.exit, error.code), (2, "unknown_source"));
+        assert_eq!(
+            error.message,
+            "unknown Monitor source wsl:Arch; use one of host, wsl:Ubuntu, wsl:Debian"
+        );
+        // `monitor sources --json` gives the protocol's shape.
+        assert_eq!(
+            json!({"sources": [MonitorSource::Host, wsl("Ubuntu")]}),
+            json!({"sources": [{"type": "host"}, {"type": "wsl", "distribution": "Ubuntu"}]})
+        );
+    }
+
+    #[test]
+    fn pids_are_unsigned_32_bit_numbers() {
+        assert_eq!(pid("4120").unwrap(), 4120);
+        assert_eq!(pid("0").unwrap(), 0);
+        for text in ["-1", "x", "", "4294967296", "1.5"] {
+            assert_eq!(pid(text).unwrap_err().exit, 2, "{text}");
+        }
+        let error = find(&listing(), 99).err().unwrap();
+        assert_eq!((error.exit, error.code), (1, "no_process"));
+        assert_eq!(find(&listing(), 20).unwrap().details.name, "cargo");
+    }
+
+    #[test]
+    fn arguments_are_quoted_as_a_shell_reads_them() {
+        assert_eq!(shell_word("--serve"), "--serve");
+        assert_eq!(shell_word("/usr/bin/cargo"), "/usr/bin/cargo");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word(""), "''");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("$HOME"), "'$HOME'");
+        // A control character cannot break the line.
+        assert_eq!(shell_word("a\nb"), "'a b'");
+    }
+
+    fn workspace() -> WorkspaceSnapshot {
+        use compi_protocol::{
+            ServerGeneration, ServerId, SessionId, SurfaceId, TabId, WorkspaceSession, WorkspaceTab,
+        };
+        WorkspaceSnapshot {
+            server_id: ServerId::new("server"),
+            server_generation: ServerGeneration::new("generation"),
+            revision: 1,
+            initialized: true,
+            sessions: vec![WorkspaceSession {
+                id: SessionId::new("session"),
+                label: "work".into(),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("tab"),
+                    label: "build".into(),
+                    layout: LayoutNode::terminal(
+                        PaneId::new("pane-a"),
+                        SurfaceId::new("surface-1"),
+                    ),
+                    previous_layout: None,
+                    merge: None,
+                }],
+            }],
+            surfaces: vec![],
+            recovery_message: None,
+        }
+    }
+
+    #[test]
+    fn inspection_reports_what_the_sample_leaves_out() {
+        use compi_protocol::SurfaceId;
+        let surface = SurfaceId::new("surface-1");
+        assert_eq!(
+            surface_pane(&workspace(), &surface),
+            Some(PaneId::new("pane-a"))
+        );
+        assert_eq!(surface_pane(&workspace(), &SurfaceId::new("other")), None);
+
+        let mut listing = listing();
+        let cargo = &mut listing.processes[2];
+        cargo.sample.parent_pid = Some(30);
+        cargo.details = Arc::new(ProcessDetails {
+            surface: Some(surface.clone()),
+            ..(*cargo.details).clone()
+        });
+        let inspection = ProcessInspection {
+            state: Some(ProcessState::Sleeping),
+            working_directory: Some("/Users/me/proj".into()),
+            arguments: Some(vec![
+                "cargo".into(),
+                "build".into(),
+                "a b".into(),
+                String::new(),
+            ]),
+            arguments_cut: false,
+        };
+        let now = 100 + 2 * 3600 + 5 * 60;
+        let pane = PaneId::new("pane-a");
+        let process = &listing.processes[2];
+        let (text, value) = inspection_report(
+            &listing,
+            process,
+            &inspection,
+            &MonitorSource::Host,
+            Some(&pane),
+            now,
+        );
+        let started = format!(
+            "Started     {} · {}",
+            format_local_time(100),
+            format_running_for(100, now)
+        );
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "Name        cargo",
+                "PID         20",
+                started.as_str(),
+                "User        me",
+                "State       sleeping",
+                "Directory   /Users/me/proj",
+                "Executable  /usr/bin/cargo",
+                "Arguments   cargo build 'a b' ''",
+                "Parent      30 (launchd)",
+                "CPU         20.0%",
+                "Memory      100.0 MB",
+                "Terminal    surface surface-1 in pane pane-a",
+            ]
+        );
+        assert_eq!(value["pid"], 20);
+        assert_eq!(value["start_time"], 100);
+        assert_eq!(value["parent_pid"], 30);
+        assert_eq!(value["cpu_share"], 20.0);
+        assert_eq!(value["details"]["name"], "cargo");
+        assert_eq!(value["source"], json!({"type": "host"}));
+        assert_eq!(value["sampled_at_ms"], 1_000);
+        assert_eq!(
+            value["inspection"],
+            json!({
+                "state": "sleeping",
+                "working_directory": "/Users/me/proj",
+                "arguments": ["cargo", "build", "a b", ""],
+                "arguments_cut": false,
+            })
+        );
+        assert_eq!(value["surface"], "surface-1");
+        assert_eq!(value["pane_id"], "pane-a");
+
+        // What the host cannot read stays unavailable; without arguments the sample's
+        // command line stands in; a cut list says so.
+        let ubuntu = MonitorSource::Wsl {
+            distribution: "Ubuntu".into(),
+        };
+        let launchd = &listing.processes[3];
+        let (text, value) = inspection_report(
+            &listing,
+            launchd,
+            &ProcessInspection::default(),
+            &ubuntu,
+            None,
+            now,
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "Source      wsl:Ubuntu");
+        assert_eq!(lines[5], "State       unavailable");
+        assert_eq!(lines[6], "Directory   unavailable");
+        assert_eq!(lines[8], "Arguments   /usr/bin/launchd --serve");
+        assert_eq!(lines[9], "Parent      1");
+        assert_eq!(lines[10], "CPU         unavailable");
+        assert_eq!(lines.len(), 12, "no Terminal line outside a terminal");
+        assert_eq!(
+            value["source"],
+            json!({"type": "wsl", "distribution": "Ubuntu"})
+        );
+        assert_eq!(value["surface"], Value::Null);
+        assert_eq!(value["pane_id"], Value::Null);
+        let cut = ProcessInspection {
+            arguments: Some(vec!["launchd".into()]),
+            arguments_cut: true,
+            ..ProcessInspection::default()
+        };
+        let (text, _) = inspection_report(&listing, launchd, &cut, &ubuntu, None, now);
+        assert!(text.contains("\nArguments   launchd … (cut)\n"));
+    }
+
+    #[test]
+    fn quitting_asks_as_monitor_does() {
+        assert_eq!(
+            quit_question("cargo", 20, false, false),
+            "Quit cargo (PID 20)? [y/N] "
+        );
+        assert_eq!(
+            quit_question("cargo", 20, true, true),
+            "Force quit cargo (PID 20)? Unsaved work in it is lost. It runs in a Compi terminal. [y/N] "
+        );
+    }
+
+    #[test]
+    fn only_a_sent_quit_succeeds() {
+        let answer =
+            |force, outcome| quit_answer("cargo", 20, 100, force, &MonitorSource::Host, outcome);
+        let Ok(Output::Report { text, value }) = answer(false, QuitOutcome::Sent) else {
+            panic!("a sent quit succeeds");
+        };
+        assert_eq!(text, "Asked cargo (PID 20) to quit\n");
+        assert_eq!(
+            value,
+            json!({
+                "source": {"type": "host"},
+                "pid": 20,
+                "start_time": 100,
+                "name": "cargo",
+                "force": false,
+                "outcome": {"type": "sent"},
+            })
+        );
+        let Ok(Output::Report { text, value }) = answer(true, QuitOutcome::Sent) else {
+            panic!("a sent force quit succeeds");
+        };
+        assert_eq!(text, "Force quit cargo (PID 20)\n");
+        assert_eq!(value["force"], true);
+        for (outcome, code, message) in [
+            (
+                QuitOutcome::Gone,
+                "process_gone",
+                "cargo (PID 20) has already exited",
+            ),
+            (
+                QuitOutcome::Denied,
+                "permission_denied",
+                "Compi isn't allowed to quit cargo (PID 20)",
+            ),
+            (
+                QuitOutcome::NoWindow,
+                "no_window",
+                "cargo (PID 20) has no window to close; use --force to force quit it",
+            ),
+            (
+                QuitOutcome::Refused {
+                    reason: "it is the Compi daemon".into(),
+                },
+                "refused",
+                "Compi will not quit cargo (PID 20): it is the Compi daemon",
+            ),
+        ] {
+            let error = answer(false, outcome).err().unwrap();
+            assert_eq!((error.exit, error.code), (1, code));
+            assert_eq!(error.message, message);
+        }
     }
 }

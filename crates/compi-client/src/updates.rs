@@ -420,7 +420,7 @@ pub(crate) fn time_since(then: u64, now: u64) -> String {
 }
 
 /// UTC calendar date of a Unix timestamp (Howard Hinnant's days-from-civil inverse).
-fn civil_date(unix: u64) -> (i64, u32, u32) {
+pub(crate) fn civil_date(unix: u64) -> (i64, u32, u32) {
     let days = (unix / 86_400) as i64 + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days.rem_euclid(146_097);

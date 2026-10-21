@@ -8,6 +8,7 @@ use crate::{
         DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MAX_TERMINAL_OPACITY, MIN_SIDEBAR_WIDTH,
         MIN_TERMINAL_OPACITY,
     },
+    monitor::ColumnLayout,
     project_history::ProjectHistory,
     theme::{BackgroundEffect, ThemeId},
 };
@@ -181,6 +182,10 @@ pub struct ClientState {
     /// Whether the front floating pane owns the keyboard instead of the tiles.
     #[serde(default)]
     pub floating_focused: bool,
+    /// How Monitor's Processes table arranges its columns in this window. Additive;
+    /// loading keeps only known columns and widths in range.
+    #[serde(default, skip_serializing_if = "ColumnLayout::is_default")]
+    pub monitor_columns: ColumnLayout,
 }
 
 impl Default for ClientState {
@@ -200,6 +205,7 @@ impl Default for ClientState {
             project_history: ProjectHistory::default(),
             floating: Vec::new(),
             floating_focused: false,
+            monitor_columns: ColumnLayout::default(),
         }
     }
 }
@@ -576,6 +582,7 @@ impl ClientState {
         self.font_zoom = source.font_zoom;
         self.sidebar_width = source.sidebar_width;
         self.show_fps = source.show_fps;
+        self.monitor_columns = source.monitor_columns.clone();
         self.selected_session = None;
         self.selected_tabs.clear();
         self.focused_panes.clear();
@@ -1838,6 +1845,32 @@ mod tests {
                 .all(|float| float.rect == FloatRect::DEFAULT)
         );
         assert!(!state.sanitize(&ClientState::default()).unwrap());
+    }
+
+    #[test]
+    fn monitor_columns_are_additive_survive_restart_and_follow_a_torn_off_tab() {
+        use crate::monitor::Column;
+        let directory = Directory::new();
+        let mut slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&slot.path).unwrap()).unwrap();
+        assert!(stored.get("monitor_columns").is_none());
+        slot.state.monitor_columns.set_hidden(Column::User, true);
+        slot.state
+            .monitor_columns
+            .move_before(Column::Pid, Some(Column::Cpu));
+        slot.state.monitor_columns.set_width(Column::Memory, 120.0);
+        let expected = slot.state.clone();
+        slot.save().unwrap();
+        drop(slot);
+        let slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        assert_eq!(slot.state, expected);
+        assert!(slot.diagnostics.is_empty());
+        let workspace = workspace();
+        let tab = workspace.sessions[0].tabs[0].id.clone();
+        let mut torn = ClientState::default();
+        assert!(torn.initialize_transfer(&workspace, &tab, &slot.state));
+        assert_eq!(torn.monitor_columns, expected.monitor_columns);
     }
 
     #[test]

@@ -1,12 +1,15 @@
-//! Monitor's samples of the daemon's host.
+//! Monitor's samples of a source: the daemon's host or, on Windows, a WSL distribution.
 //!
-//! System totals (CPU, memory, disk, network) are sampled all the time into an hour of
-//! history and sent to connections that `WatchSystemTotals`. Processes are sampled only
-//! while a connection watches them (`WatchSystemMetrics`).
+//! The host's totals (CPU, memory, disk, network) are sampled all the time into an hour of
+//! history and sent to connections that `WatchSystemTotals`; a WSL distribution's only
+//! while watched. Processes are sampled only while a connection watches them
+//! (`WatchSystemMetrics`). Totals and process IDs of two sources are never mixed.
 //!
-//! A value the host would not give the daemon is `None`, never zero: a zero is a real
+//! A value the source would not give the daemon is `None`, never zero: a zero is a real
 //! reading. Names, paths and command lines are whatever the processes chose and are shown
 //! as plain text.
+
+use crate::SurfaceId;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +19,85 @@ use std::sync::Arc;
 pub const TOTALS_INTERVAL_MS: u64 = 2000;
 /// Totals samples kept: one hour.
 pub const TOTALS_HISTORY: usize = 1800;
+
+/// What Monitor watches: the daemon's host, or a WSL 2 distribution of a Windows daemon.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MonitorSource {
+    #[default]
+    Host,
+    Wsl {
+        distribution: String,
+    },
+}
+
+impl MonitorSource {
+    pub fn is_host(&self) -> bool {
+        matches!(self, Self::Host)
+    }
+
+    /// Shape checks every daemon applies: a WSL distribution name is non-empty, at most 256
+    /// bytes, and free of NUL, `/` and `\`.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Host => Ok(()),
+            Self::Wsl { distribution } => {
+                if distribution.is_empty()
+                    || distribution.len() > 256
+                    || distribution.contains(['\0', '/', '\\'])
+                {
+                    Err("Monitor source names an invalid WSL distribution".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// The full argument list `InspectProcess` returns is cut at this many bytes in all.
+pub const MAX_INSPECTED_ARGUMENT_BYTES: usize = 64 * 1024;
+
+/// What a process sample leaves out, read once when the inspector asks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessInspection {
+    pub state: Option<ProcessState>,
+    pub working_directory: Option<String>,
+    /// Every argument, the program first, cut once the total passes
+    /// `MAX_INSPECTED_ARGUMENT_BYTES` (then `arguments_cut`).
+    pub arguments: Option<Vec<String>>,
+    pub arguments_cut: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessState {
+    Running,
+    Sleeping,
+    /// Uninterruptible wait, usually on disk.
+    Waiting,
+    Stopped,
+    Zombie,
+    Idle,
+    Other,
+}
+
+/// What became of a `QuitProcess`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QuitOutcome {
+    /// The process was asked to quit (or, forced, was ended).
+    Sent,
+    /// No process has that PID any more, or the PID now names a process with another start
+    /// time; nothing was signalled.
+    Gone,
+    /// The host does not let the daemon signal it.
+    Denied,
+    /// Windows: the process has no window to close; only Force quit can end it.
+    NoWindow,
+    /// The daemon will not signal it: itself, PID 0 or 1, or a process the host keeps.
+    Refused { reason: String },
+}
 
 /// What the host is, sent once when a connection starts watching totals.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,6 +314,10 @@ pub struct ProcessDetails {
     /// executable. `None` when the executable is not known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_group: Option<AppGroup>,
+    /// The Compi terminal surface the process runs in, when it belongs to one's session
+    /// (Unix), job (Windows) or shell session (WSL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<SurfaceId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -317,6 +403,7 @@ mod tests {
                     app: false,
                     restricted: false,
                     app_group: None,
+                    surface: None,
                 })
             }),
             cpu_percent: None,

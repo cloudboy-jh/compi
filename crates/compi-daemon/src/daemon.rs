@@ -5,7 +5,7 @@ use crate::launch;
 use crate::program_status::ProgramStatusWatch;
 use crate::surface::{ConnectionSink, Surface, SurfaceError, SurfaceManager};
 use crate::system_metrics::{
-    SystemMetricsHub, SystemMetricsWatch, SystemTotalsHub, SystemTotalsWatch, app_icon,
+    Source, SystemMetricsWatch, SystemTotalsHub, SystemTotalsWatch, app_icon, monitor_sources,
 };
 use compi_protocol::frame;
 #[cfg(windows)]
@@ -674,6 +674,8 @@ fn handle_connection(
     let mut program_status_watch: Option<ProgramStatusWatch> = None;
     let mut system_metrics_watch: Option<SystemMetricsWatch> = None;
     let mut system_totals_watch: Option<SystemTotalsWatch> = None;
+    // Set while a totals watch waits for its source to describe itself before answering.
+    let mut system_totals_request: Option<u64> = None;
     let mut workspace_changed = false;
     let mut uploads = HashMap::<UploadId, ImageUpload>::new();
     let result = (|| -> Result<()> {
@@ -689,9 +691,7 @@ fn handle_connection(
             if let Some(watch) = system_metrics_watch.as_mut() {
                 send_system_metrics(&sink, watch)?;
             }
-            if let Some(watch) = system_totals_watch.as_mut() {
-                send_system_totals(&sink, watch)?;
-            }
+            send_system_totals(&sink, &mut system_totals_watch, &mut system_totals_request)?;
             let Some(incoming) = reader.poll(&connection)? else {
                 thread::sleep(Duration::from_millis(5));
                 continue;
@@ -804,14 +804,19 @@ fn handle_connection(
                         message: ServerMessage::ProgramStatusWatching,
                     })?;
                 }
-                ClientMessage::WatchSystemMetrics => {
-                    // Answered first, so every sample follows the answer.
-                    sink.send_control(&ServerControl {
-                        request_id: Some(request_id),
-                        message: ServerMessage::SystemMetricsWatching,
-                    })?;
-                    system_metrics_watch.get_or_insert_with(|| SystemMetricsHub::shared().watch());
-                }
+                ClientMessage::WatchSystemMetrics { source } => match Source::resolve(&source) {
+                    Ok(source) => {
+                        // Answered first, so every sample follows the answer.
+                        sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::SystemMetricsWatching,
+                        })?;
+                        system_metrics_watch = Some(source.watch_processes());
+                    }
+                    Err(message) => {
+                        send_error(&sink, Some(request_id), ErrorCode::InvalidRequest, &message)
+                    }
+                },
                 ClientMessage::GetAppIcon { group_id } => {
                     let png_base64 = app_icon(&group_id).map(|icon| icon.to_string());
                     sink.send_control(&ServerControl {
@@ -822,14 +827,63 @@ fn handle_connection(
                         },
                     })?;
                 }
-                ClientMessage::WatchSystemTotals => {
-                    let (host, history, watch) = SystemTotalsHub::shared().watch();
-                    sink.send_control(&ServerControl {
-                        request_id: Some(request_id),
-                        message: ServerMessage::SystemTotalsWatching { host, history },
-                    })?;
-                    system_totals_watch = Some(watch);
-                }
+                ClientMessage::WatchSystemTotals { source } => match Source::resolve(&source) {
+                    Ok(source) => {
+                        system_totals_watch = Some(source.watch_totals());
+                        system_totals_request = Some(request_id);
+                        send_system_totals(
+                            &sink,
+                            &mut system_totals_watch,
+                            &mut system_totals_request,
+                        )?;
+                    }
+                    Err(message) => {
+                        send_error(&sink, Some(request_id), ErrorCode::InvalidRequest, &message)
+                    }
+                },
+                ClientMessage::ListMonitorSources => sink.send_control(&ServerControl {
+                    request_id: Some(request_id),
+                    message: ServerMessage::MonitorSourcesListed {
+                        sources: monitor_sources(),
+                    },
+                })?,
+                ClientMessage::InspectProcess {
+                    source,
+                    pid,
+                    start_time,
+                } => match Source::resolve(&source) {
+                    Ok(source) => match source.inspect(pid, start_time) {
+                        Ok(inspection) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ProcessInspected { inspection },
+                        })?,
+                        Err(message) => {
+                            send_error(&sink, Some(request_id), ErrorCode::Internal, &message)
+                        }
+                    },
+                    Err(message) => {
+                        send_error(&sink, Some(request_id), ErrorCode::InvalidRequest, &message)
+                    }
+                },
+                ClientMessage::QuitProcess {
+                    source,
+                    pid,
+                    start_time,
+                    force,
+                } => match Source::resolve(&source) {
+                    Ok(source) => match source.quit(pid, start_time, force) {
+                        Ok(outcome) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ProcessQuitAnswered { outcome },
+                        })?,
+                        Err(message) => {
+                            send_error(&sink, Some(request_id), ErrorCode::Internal, &message)
+                        }
+                    },
+                    Err(message) => {
+                        send_error(&sink, Some(request_id), ErrorCode::InvalidRequest, &message)
+                    }
+                },
                 ClientMessage::AcknowledgeProgramStatus {
                     surface_id,
                     expected_lifetime,
@@ -1535,8 +1589,8 @@ fn send_program_status(
     Ok(())
 }
 
-/// Sends the newest sample of the host if this connection has room for it; a client
-/// behind on reading skips to a later one.
+/// Sends the newest sample of the watched source if this connection has room for it; a
+/// client behind on reading skips to a later one.
 fn send_system_metrics(sink: &ConnectionSink, watch: &mut SystemMetricsWatch) -> Result<()> {
     let Some((generation, collected)) = watch.pending() else {
         return Ok(());
@@ -1553,9 +1607,36 @@ fn send_system_metrics(sink: &ConnectionSink, watch: &mut SystemMetricsWatch) ->
     Ok(())
 }
 
-/// Sends the totals samples this connection has not had, in order, while it has room.
-fn send_system_totals(sink: &ConnectionSink, watch: &mut SystemTotalsWatch) -> Result<()> {
-    for sample in watch.pending() {
+/// Answers `request` once the watched source has described itself (at once for the host),
+/// or drops the watch with an error when it cannot be sampled; then sends the totals
+/// samples this connection has not had, in order, while it has room.
+fn send_system_totals(
+    sink: &ConnectionSink,
+    watch: &mut Option<SystemTotalsWatch>,
+    request: &mut Option<u64>,
+) -> Result<()> {
+    let Some(opened) = watch.as_mut() else {
+        return Ok(());
+    };
+    if let Some(request_id) = *request {
+        match opened.open() {
+            None => return Ok(()),
+            Some(Ok((host, history))) => {
+                *request = None;
+                sink.send_control(&ServerControl {
+                    request_id: Some(request_id),
+                    message: ServerMessage::SystemTotalsWatching { host, history },
+                })?;
+            }
+            Some(Err(message)) => {
+                *request = None;
+                *watch = None;
+                send_error(sink, Some(request_id), ErrorCode::Internal, &message);
+                return Ok(());
+            }
+        }
+    }
+    for sample in opened.pending() {
         let sequence = sample.sequence;
         let sent = sink.send_control_if_room(&ServerControl {
             request_id: None,
@@ -1564,7 +1645,7 @@ fn send_system_totals(sink: &ConnectionSink, watch: &mut SystemTotalsWatch) -> R
         if !sent {
             break;
         }
-        watch.delivered(sequence);
+        opened.delivered(sequence);
     }
     Ok(())
 }

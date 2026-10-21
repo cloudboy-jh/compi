@@ -1,8 +1,9 @@
-//! Monitor's watching connections: one for the host's totals while any Monitor pane is
-//! drawn, one for its processes while a drawn pane shows Processes. Each runs on its own
-//! thread and connection, reconnects after failures, stays released while an update
-//! holds the window's connections, and stops (closing its connection) [`LINGER`] after
-//! it stopped being wanted, so flicking between tabs or pages does not reconnect.
+//! Monitor's watching connections, per source: one for a source's totals while a
+//! Monitor pane showing it is drawn, one for its processes while a drawn pane shows them
+//! (and one window-wide icon fetcher). Each runs on its own thread and connection,
+//! reconnects after failures, stays released while an update holds the window's
+//! connections, and stops (closing its connection) [`LINGER`] after it stopped being
+//! wanted, so flicking between tabs or pages does not reconnect.
 use super::*;
 use compi_protocol::system_metrics::{
     HostInfo, Process, ProcessTable, SystemSample, TOTALS_INTERVAL_MS, TotalsSample,
@@ -81,6 +82,10 @@ impl WatchSlot {
             .is_some_and(|watcher| watcher.generation == generation)
     }
 
+    pub(super) fn is_running(&self) -> bool {
+        self.watcher.is_some()
+    }
+
     pub(super) fn want(&mut self, wanted: bool) -> SlotChange {
         if wanted {
             self.unwanted_since = None;
@@ -117,10 +122,11 @@ impl WatchSlot {
     }
 }
 
-/// What every watcher needs from its window.
+/// What every watcher needs from its window, and the source it watches.
 #[derive(Clone)]
 pub(super) struct WatchContext {
     pub(super) target: ConnectionTarget,
+    pub(super) source: MonitorSource,
     pub(super) sender: UiEventSender,
     pub(super) quiesced: Arc<AtomicBool>,
     pub(super) connection_guard: Arc<Mutex<()>>,
@@ -237,6 +243,7 @@ pub(super) fn watch_processes(context: WatchContext, generation: u64, stop: mpsc
             context
                 .sender
                 .send(UiEvent::Monitor(MonitorEvent::Processes {
+                    source: context.source.clone(),
                     generation,
                     event,
                 }))
@@ -246,7 +253,7 @@ pub(super) fn watch_processes(context: WatchContext, generation: u64, stop: mpsc
             &stop,
             |error| send(ProcessesEvent::Failed(error)),
             |client| {
-                if let Err(error) = client.watch_system_metrics() {
+                if let Err(error) = client.watch_system_metrics(context.source.clone()) {
                     return WatchEnd::Failed(format!("The daemon can't list processes: {error}"));
                 }
                 if !send(ProcessesEvent::Connecting) {
@@ -285,6 +292,7 @@ pub(super) fn watch_totals(context: WatchContext, generation: u64, stop: mpsc::R
     thread::spawn(move || {
         let send = |event: TotalsEvent| {
             context.sender.send(UiEvent::Monitor(MonitorEvent::Totals {
+                source: context.source.clone(),
                 generation,
                 event: Box::new(event),
             }))
@@ -294,7 +302,7 @@ pub(super) fn watch_totals(context: WatchContext, generation: u64, stop: mpsc::R
             &stop,
             |error| send(TotalsEvent::Failed(error)),
             |client| {
-                let (host, history) = match client.watch_system_totals() {
+                let (host, history) = match client.watch_system_totals(context.source.clone()) {
                     Ok(watching) => watching,
                     Err(error) => {
                         return WatchEnd::Failed(format!(
@@ -324,6 +332,8 @@ pub(super) fn watch_totals(context: WatchContext, generation: u64, stop: mpsc::R
 
 /// Starts the icon fetcher: it answers the app ids `requests` brings, one at a time, on
 /// a connection of its own. An icon the daemon would not give is reported as none.
+/// Icons are of the daemon host's apps (`GetAppIcon` names no source), so its context
+/// names the host.
 pub(super) fn watch_icons(
     context: WatchContext,
     generation: u64,

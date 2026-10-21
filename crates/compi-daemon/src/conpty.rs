@@ -217,6 +217,10 @@ impl ConptySession {
         Ok((input, output))
     }
 
+    pub fn job(&self) -> Result<OwnedHandle> {
+        Ok(self.job.try_clone()?)
+    }
+
     pub fn resize_owned(&self, cols: i16, rows: i16) -> Result<()> {
         let hpc = self.hpc.as_ref().ok_or("ConPTY is closed")?;
         if cols <= 0 || rows <= 0 {

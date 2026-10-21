@@ -1438,6 +1438,8 @@ pub(super) struct MenuItem {
     /// Why the action is unavailable; shown under its label.
     reason: Option<SharedString>,
     disabled: bool,
+    /// A check mark before the label: the option is on.
+    checked: bool,
     on_select: ClickHandler,
 }
 
@@ -1451,6 +1453,7 @@ pub(super) fn menu_item(
         key: None,
         reason: None,
         disabled: false,
+        checked: false,
         on_select: Rc::new(on_select),
     }
 }
@@ -1458,6 +1461,12 @@ pub(super) fn menu_item(
 impl MenuItem {
     pub(super) fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Marks the item as the option that is on.
+    pub(super) fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
         self
     }
 
@@ -1515,6 +1524,7 @@ fn popup_menu_item(item: &MenuItem) -> PopupMenuItem {
     };
     let on_select = item.on_select.clone();
     row.disabled(item.disabled)
+        .checked(item.checked)
         .on_click(move |event, window, cx| on_select(event, window, cx))
 }
 

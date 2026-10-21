@@ -534,6 +534,16 @@ fn ring(segments: Vec<(f64, Hsla)>, diameter: f32) -> impl IntoElement {
     .size(px(diameter))
 }
 
+/// The memory Memory by type divides, when the source reports its kinds.
+fn overview_memory(feeds: &SourceFeeds) -> Option<&MemoryTotals> {
+    feeds
+        .totals
+        .shown()
+        .latest()
+        .and_then(|sample| sample.memory.as_ref())
+        .filter(|memory| !memory.kinds.is_empty())
+}
+
 impl CompiApp {
     /// The colour of `metric`, from the theme's ANSI palette, legible on the pane.
     pub(super) fn metric_color(&self, metric: Metric) -> u32 {
@@ -541,13 +551,23 @@ impl CompiApp {
         modal_text_color(self.theme.terminal().ansi[metric.palette_index()], colors)
     }
 
-    pub(super) fn totals_event(&mut self, generation: u64, event: TotalsEvent) {
+    pub(super) fn totals_event(
+        &mut self,
+        source: &MonitorSource,
+        generation: u64,
+        event: TotalsEvent,
+    ) {
         let paused = self.monitor.paused;
-        let feed = &mut self.monitor.totals;
-        if !feed.slot.is_current(generation) {
+        let Some(feed) = self
+            .monitor
+            .sources
+            .get_mut(source)
+            .map(|feeds| &mut feeds.totals)
+            .filter(|feed| feed.slot.is_current(generation))
+        else {
             // A watcher stopped since.
             return;
-        }
+        };
         // While paused, what is drawn (`frozen`) stays as it was; only the live history
         // behind it changes.
         match event {
@@ -585,36 +605,39 @@ impl CompiApp {
         width: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
-        if let Some(message) = self.totals_message() {
+        let feeds = self.monitor.feeds(&pane.source);
+        if let Some(message) = self.totals_message(&feeds.totals) {
             return message;
         }
-        let grid = layout::overview_layout(width, self.overview_memory().is_some());
+        let grid = layout::overview_layout(width, overview_memory(feeds).is_some());
         // The keyboard highlight moves on the grid drawn.
         pane.card_rows.set(grid.rows);
         self.monitor_scroll_page(
             "monitor-overview",
             grid.padding,
             grid.content_width,
+            feeds.totals.state == FeedState::Stale,
             self.overview_cards(&OverviewHost::Pane(pane_id.clone()), &grid, pane.card, cx),
         )
     }
 
-    /// Settings → Monitor, `width` wide: Overview's cards without the rail, header or a
-    /// scroll of their own. A card opens Monitor on its page.
+    /// Settings → Monitor, `width` wide: Overview's cards of the daemon's host without
+    /// the rail, header or a scroll of their own. A card opens Monitor on its page.
     pub(in crate::gui::workspace) fn render_settings_monitor(
         &self,
         width: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        if let Some(message) = self.totals_message() {
+        let feeds = self.monitor.feeds(&MonitorSource::Host);
+        if let Some(message) = self.totals_message(&feeds.totals) {
             return settings_card(&colors)
                 .h(px(SETTINGS_MESSAGE_HEIGHT))
                 .child(message)
                 .into_any_element();
         }
-        let grid = layout::overview_grid(width, self.overview_memory().is_some());
-        let stale = self.monitor.totals.state == FeedState::Stale;
+        let grid = layout::overview_grid(width, overview_memory(feeds).is_some());
+        let stale = feeds.totals.state == FeedState::Stale;
         div()
             .min_w_0()
             .flex()
@@ -635,14 +658,14 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The memory Memory by type divides, when the host reports its kinds.
-    fn overview_memory(&self) -> Option<&MemoryTotals> {
-        self.monitor
-            .totals
-            .shown()
-            .latest()
-            .and_then(|sample| sample.memory.as_ref())
-            .filter(|memory| !memory.kinds.is_empty())
+    /// The feeds Overview draws where `host` shows it: its pane's source, or the
+    /// daemon's host in Settings.
+    fn overview_feeds(&self, host: &OverviewHost) -> &SourceFeeds {
+        let source = match host {
+            OverviewHost::Pane(pane_id) => self.monitor.panes.get(pane_id).map(|pane| &pane.source),
+            OverviewHost::Settings => None,
+        };
+        self.monitor.feeds(source.unwrap_or(&MonitorSource::Host))
     }
 
     /// Overview's cards on `grid`, each at its exact width, rows of equal height;
@@ -654,10 +677,11 @@ impl CompiApp {
         highlighted: Option<OverviewCard>,
         cx: &Context<Self>,
     ) -> Div {
-        let feed = &self.monitor.totals;
+        let feeds = self.overview_feeds(host);
+        let feed = &feeds.totals;
         let history = feed.shown();
         let latest = history.latest();
-        let memory = self.overview_memory();
+        let memory = overview_memory(feeds);
         let rows = grid.rows.iter().map(|row| {
             div()
                 .flex()
@@ -695,9 +719,8 @@ impl CompiApp {
         div().flex().flex_col().gap(px(grid.gap)).children(rows)
     }
 
-    /// A message in place of a page that draws totals, while they are not there.
-    pub(super) fn totals_message(&self) -> Option<AnyElement> {
-        let feed = &self.monitor.totals;
+    /// A message in place of a page that draws `feed`'s totals, while they are not there.
+    pub(super) fn totals_message(&self, feed: &TotalsFeed) -> Option<AnyElement> {
         if !feed.shown().is_empty() {
             return None;
         }
@@ -714,15 +737,15 @@ impl CompiApp {
     }
 
     /// A page that scrolls: `padding` around `content`, which is `content_width` wide
-    /// and centred.
+    /// and centred, under the stale note when its samples stopped coming (`stale`).
     pub(super) fn monitor_scroll_page(
         &self,
         id: &'static str,
         padding: f32,
         content_width: f32,
+        stale: bool,
         content: Div,
     ) -> AnyElement {
-        let stale = self.monitor.totals.state == FeedState::Stale;
         div()
             .flex_1()
             .min_h_0()
@@ -816,7 +839,7 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let feed = &self.monitor.processes;
+        let feed = &self.overview_feeds(host).processes;
         let memory = &feed.memory;
         let inner = (width - 2.0 * CARD_INSET).max(1.0);
         let height = layout::treemap_height(inner);
@@ -1325,9 +1348,9 @@ impl CompiApp {
         color(modal_text_color(palette.ansi[index], colors))
     }
 
-    /// The host line of Monitor's nav: the processor and how long the host has been up.
-    pub(super) fn monitor_host_detail(&self) -> Option<String> {
-        let feed = &self.monitor.totals;
+    /// The host line of Monitor's nav: `feed`'s processor and how long its host has been
+    /// up.
+    pub(super) fn monitor_host_detail(&self, feed: &TotalsFeed) -> Option<String> {
         let host = feed.host.as_ref()?;
         let uptime = host
             .booted_at_ms

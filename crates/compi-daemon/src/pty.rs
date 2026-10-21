@@ -40,6 +40,19 @@ impl PtySession {
         duplicate_fd(fd)
     }
 
+    /// The POSIX session every process of the terminal is in unless it left: the child's
+    /// PID, as the child is its session's leader.
+    #[cfg(unix)]
+    pub fn session_id(&self) -> libc::pid_t {
+        self.native.session_id
+    }
+
+    /// Another handle to the job every process of the terminal is in.
+    #[cfg(windows)]
+    pub fn job(&self) -> Result<std::os::windows::io::OwnedHandle> {
+        self.native.job()
+    }
+
     pub fn take_io(&mut self) -> Result<(PtyWriter, PtyReader)> {
         #[cfg(unix)]
         {

@@ -1,19 +1,25 @@
-//! Monitor: a content pane showing the daemon host's usage. A nav rail on the left lists
-//! the pages (Overview, Processes, then the hardware with live values) above the host;
-//! a header line names the page and holds the range and pause controls.
+//! Monitor: a content pane showing a source's usage: the daemon's host or, on a
+//! Windows daemon, a WSL 2 distribution. A nav rail on the left lists the pages
+//! (Overview, Processes, then the hardware with live values) above the source's host;
+//! a header line names the page and the source (a menu of them where the daemon lists
+//! more than its host) and holds the range and pause controls.
 //!
-//! The pane's page lives in the daemon (`PaneContent::Monitor`), so it persists with
-//! the pane, and is sent the way Settings sends its section. The range, pause, search,
-//! filter, sort and selection are this window's.
+//! The pane's page and source live in the daemon (`PaneContent::Monitor`), so they
+//! persist with the pane, and are sent the way Settings sends its section. The range,
+//! pause, search, filter, sort, selection and the Processes table's columns are this
+//! window's.
 //!
-//! Three watchers per window feed it (`watch`): the host's totals while any Monitor pane
-//! or Settings → Monitor is drawn; its processes, and the apps' icons (`icons`), while a
-//! drawn pane shows Overview (Memory by app) or Processes, or Settings → Monitor (which
-//! draws Overview's cards) is drawn. Pausing freezes what is drawn while samples keep
-//! arriving; resuming jumps to the newest.
+//! Watchers per source feed it (`watch`): a source's totals while a Monitor pane
+//! showing it, or Settings → Monitor (the host's), is drawn; its processes while a
+//! drawn pane on it shows Overview (Memory by app) or Processes, or Settings → Monitor
+//! (which draws Overview's cards) is drawn; and one window-wide fetcher of the apps'
+//! icons (`icons`). Totals and process IDs of two sources never mix. Pausing freezes
+//! what is drawn while samples keep arriving; resuming jumps to the newest.
 use super::*;
 use crate::gui::controls::IconName;
+use crate::monitor::history::ProcessHistory;
 use crate::monitor::totals::Span;
+use compi_protocol::system_metrics::MonitorSource;
 use compi_protocol::{MonitorContent, MonitorPage, PaneContent};
 use gpui::Entity;
 use gpui_component::Sizable as _;
@@ -21,7 +27,9 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use std::cell::Cell;
 use std::sync::mpsc;
 
+mod columns;
 mod icons;
+mod inspector;
 mod overview;
 mod processes;
 mod resources;
@@ -29,6 +37,7 @@ mod watch;
 
 use crate::monitor::apps::RowKey;
 use crate::monitor::layout::{self, CardMove, OverviewCard, OverviewRows};
+use columns::ColumnDrag;
 use icons::{ICON_QUEUE, IconCache, IconsEvent};
 use overview::{Metric, TotalsFeed};
 use processes::{ProcessFeed, ProcessList};
@@ -64,13 +73,15 @@ enum MonitorTarget {
     App(RowKey),
 }
 
-/// What a window's watchers report, tagged with the watcher's generation.
+/// What a window's watchers report, tagged with their source and generation.
 pub(in crate::gui) enum MonitorEvent {
     Processes {
+        source: MonitorSource,
         generation: u64,
         event: ProcessesEvent,
     },
     Totals {
+        source: MonitorSource,
         generation: u64,
         /// Boxed: a totals sample is several times the size of the other events.
         event: Box<TotalsEvent>,
@@ -95,11 +106,12 @@ enum FeedState {
 struct MonitorPane {
     /// Keyboard focus of the pane; the search field sits inside it.
     focus: FocusHandle,
-    /// The page shown. It is sent to the daemon when it differs from `persisted`, the
-    /// page the daemon last reported; `sent` is the one on its way.
+    /// The page and source shown. They are sent to the daemon when they differ from
+    /// `persisted`, what the daemon last reported; `sent` is what is on its way.
     page: MonitorPage,
-    persisted: MonitorPage,
-    sent: Option<MonitorPage>,
+    source: MonitorSource,
+    persisted: MonitorContent,
+    sent: Option<MonitorContent>,
     /// Overview's card with the keyboard highlight.
     card: Option<OverviewCard>,
     /// Overview's grid at its last draw: the highlight moves on it.
@@ -107,25 +119,84 @@ struct MonitorPane {
     list: ProcessList,
 }
 
+impl MonitorPane {
+    fn content(&self) -> MonitorContent {
+        MonitorContent {
+            page: self.page,
+            source: self.source.clone(),
+        }
+    }
+}
+
+/// What a window shows of one source.
+#[derive(Default)]
+struct SourceFeeds {
+    processes: ProcessFeed,
+    totals: TotalsFeed,
+    /// Each live process's recent CPU and memory, for the inspector.
+    history: ProcessHistory,
+}
+
+impl SourceFeeds {
+    fn is_watched(&self) -> bool {
+        self.processes.slot.is_running() || self.totals.slot.is_running()
+    }
+}
+
+/// The sources the daemon lists, read once per window on a thread of its own.
+#[derive(Default)]
+enum SourceList {
+    #[default]
+    Unread,
+    Reading,
+    /// The host first. Empty when the daemon could not list them: the host alone.
+    Listed(Vec<MonitorSource>),
+}
+
 /// The Monitor panes of this window and what they share.
 #[derive(Default)]
 pub(in crate::gui) struct MonitorUi {
     panes: HashMap<PaneId, MonitorPane>,
-    processes: ProcessFeed,
-    totals: TotalsFeed,
+    /// The feeds of each source a pane (or Settings → Monitor) shows or showed until
+    /// its watchers stopped.
+    sources: HashMap<MonitorSource, SourceFeeds>,
+    /// Stands in for a source with no feeds yet: nothing read.
+    unread: SourceFeeds,
     icons: IconCache,
+    listed: SourceList,
+    /// One row per process rather than per app: "Group by app" is off in this window.
+    flat: bool,
     /// How much history the graphs show.
     span: Span,
     paused: bool,
     /// What the next Monitor pane drawn opens on: set when Settings → Monitor opens
     /// Monitor from a card before the pane has client state.
     pending: Option<MonitorTarget>,
+    /// A Processes header being resized or moved.
+    column_drag: Option<ColumnDrag>,
 }
 
 impl MonitorUi {
     /// The app icons this window holds, so its sprite atlas keeps them while it does.
     pub(in crate::gui) fn icon_images(&self) -> impl Iterator<Item = &Arc<RenderImage>> {
         self.icons.images()
+    }
+
+    fn feeds(&self, source: &MonitorSource) -> &SourceFeeds {
+        self.sources.get(source).unwrap_or(&self.unread)
+    }
+
+    /// The sources the selector offers: the daemon's list, and `current` where the
+    /// list no longer has it.
+    fn selectable_sources(&self, current: &MonitorSource) -> Vec<MonitorSource> {
+        let mut sources = match &self.listed {
+            SourceList::Listed(sources) if !sources.is_empty() => sources.clone(),
+            _ => vec![MonitorSource::Host],
+        };
+        if !sources.contains(current) {
+            sources.push(current.clone());
+        }
+        sources
     }
 }
 
@@ -188,6 +259,8 @@ impl CompiApp {
             self.focus_pane(pane_id.clone());
             match target {
                 Some(target) if self.monitor.panes.contains_key(&pane_id) => {
+                    // Settings → Monitor's cards are the host's.
+                    self.set_monitor_source(&pane_id, MonitorSource::Host);
                     self.show_monitor_target(&pane_id, target);
                 }
                 target => self.monitor.pending = target,
@@ -283,105 +356,98 @@ impl CompiApp {
     fn show_monitor_target(&mut self, pane_id: &PaneId, target: MonitorTarget) {
         match target {
             MonitorTarget::Page(page) => self.set_monitor_page(pane_id, page),
-            MonitorTarget::App(key) => self.reveal_process_row(pane_id, key),
+            MonitorTarget::App(key) => {
+                self.reveal_process_row(pane_id, key);
+            }
         }
     }
 
-    /// Before drawing: state for each Monitor pane shown, its page sent to the daemon
-    /// when it changed, and the watchers running while wanted (Settings → Monitor
-    /// wants the ones a pane showing Overview does).
+    /// Before drawing: state for each Monitor pane shown, its page and source sent to
+    /// the daemon when they changed, the watchers of each source running while wanted
+    /// (Settings → Monitor wants the host's that a pane showing Overview does), the
+    /// daemon's sources read once, and the inspectors shown asking about their process.
     pub(super) fn prepare_monitor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = &self.workspace else {
             return;
         };
-        let page_of = |pane: &PaneId| match content::find_pane_content(workspace, pane) {
-            Some(PaneContent::Monitor(monitor)) => Some(monitor.page),
+        let content_of = |pane: &PaneId| match content::find_pane_content(workspace, pane) {
+            Some(PaneContent::Monitor(monitor)) => Some(monitor.clone()),
             _ => None,
         };
         let moving = self.views.moving_from();
         self.monitor
             .panes
-            .retain(|pane, _| page_of(pane).is_some() || moving == Some(pane));
-        let shown: Vec<(PaneId, MonitorPage)> = self
+            .retain(|pane, _| content_of(pane).is_some() || moving == Some(pane));
+        let shown: Vec<(PaneId, MonitorContent)> = self
             .shown_content_panes()
-            .filter_map(|pane| Some((pane.clone(), page_of(pane)?)))
+            .filter_map(|pane| Some((pane.clone(), content_of(pane)?)))
             .collect();
         for (pane_id, daemon) in &shown {
-            let daemon = *daemon;
-            match self.monitor.panes.get_mut(pane_id) {
-                None => {
-                    let pane = self.new_monitor_pane(pane_id, daemon, window, cx);
-                    self.monitor.panes.insert(pane_id.clone(), pane);
-                    if let Some(target) = self.monitor.pending.take() {
-                        self.show_monitor_target(pane_id, target);
-                    }
-                }
-                Some(pane) => {
-                    if pane.sent == Some(daemon) {
-                        pane.sent = None;
-                        pane.persisted = daemon;
-                    } else if pane.sent.is_some() && !self.mutation_pending {
-                        // The change did not apply; show what the daemon has.
-                        pane.sent = None;
-                        pane.persisted = daemon;
-                        pane.page = daemon;
-                    } else if pane.sent.is_none() && daemon != pane.persisted {
-                        pane.persisted = daemon;
-                        pane.page = daemon;
-                    }
-                }
-            }
-            let Some(pane) = self.monitor.panes.get_mut(pane_id) else {
-                continue;
-            };
-            if pane.page != pane.persisted && pane.sent.is_none() && !self.mutation_pending {
-                pane.sent = Some(pane.page);
-                let content = PaneContent::Monitor(MonitorContent { page: pane.page });
-                self.mutate(
-                    WorkspaceMutation::UpdateContent {
-                        pane_id: pane_id.clone(),
-                        content,
-                    },
-                    false,
-                );
-            }
+            self.sync_monitor_pane(pane_id, daemon, window, cx);
         }
         let settings = self.settings_row_shown(super::settings::MONITOR_ROW);
-        // Overview's Memory by app needs the processes too; resource pages do not.
-        let processes_wanted = settings
-            || shown.iter().any(|(pane_id, _)| {
-                self.monitor.panes.get(pane_id).is_some_and(|pane| {
-                    matches!(pane.page, MonitorPage::Overview | MonitorPage::Processes)
-                })
-            });
-        let context = WatchContext {
+        // Per source, whether its totals and its processes are wanted. Overview's Memory
+        // by app needs the processes too; resource pages do not.
+        let mut wanted: HashMap<MonitorSource, (bool, bool)> = HashMap::new();
+        if settings {
+            wanted.insert(MonitorSource::Host, (true, true));
+        }
+        for (pane_id, _) in &shown {
+            if let Some(pane) = self.monitor.panes.get(pane_id) {
+                let want = wanted.entry(pane.source.clone()).or_default();
+                want.0 = true;
+                want.1 |= matches!(pane.page, MonitorPage::Overview | MonitorPage::Processes);
+            }
+        }
+        let icons_wanted = wanted.values().any(|&(_, processes)| processes);
+        for source in wanted.keys() {
+            self.monitor.sources.entry(source.clone()).or_default();
+        }
+        let mut linger = false;
+        // (source, its processes rather than its totals, generation, stop signal)
+        let mut started = Vec::new();
+        for (source, feeds) in &mut self.monitor.sources {
+            let (totals, processes) = wanted.get(source).copied().unwrap_or_default();
+            for (processes, change) in [
+                (false, feeds.totals.slot.want(totals)),
+                (true, feeds.processes.slot.want(processes)),
+            ] {
+                match change {
+                    SlotChange::Start(generation, stop) => {
+                        started.push((source.clone(), processes, generation, stop));
+                    }
+                    SlotChange::Linger => linger = true,
+                    SlotChange::Unchanged => {}
+                }
+            }
+        }
+        let host = WatchContext {
             target: self.target.clone(),
+            source: MonitorSource::Host,
             sender: self.event_tx.clone(),
             quiesced: self.update_quiesced.clone(),
             connection_guard: self.update_connection_guard.clone(),
         };
-        let mut linger = false;
-        match self.monitor.totals.slot.want(settings || !shown.is_empty()) {
-            SlotChange::Start(generation, stop) => {
-                self.monitor.totals.reset(FeedState::Connecting);
-                watch::watch_totals(context.clone(), generation, stop);
+        for (source, processes, generation, stop) in started {
+            let context = WatchContext {
+                source,
+                ..host.clone()
+            };
+            if processes {
+                self.reset_process_feed(&context.source, FeedState::Connecting);
+                watch::watch_processes(context, generation, stop);
+            } else {
+                if let Some(feeds) = self.monitor.sources.get_mut(&context.source) {
+                    feeds.totals.reset(FeedState::Connecting);
+                }
+                watch::watch_totals(context, generation, stop);
             }
-            SlotChange::Linger => linger = true,
-            SlotChange::Unchanged => {}
         }
-        match self.monitor.processes.slot.want(processes_wanted) {
-            SlotChange::Start(generation, stop) => {
-                self.reset_process_feed(FeedState::Connecting);
-                watch::watch_processes(context.clone(), generation, stop);
-            }
-            SlotChange::Linger => linger = true,
-            SlotChange::Unchanged => {}
-        }
-        match self.monitor.icons.slot.want(processes_wanted) {
+        match self.monitor.icons.slot.want(icons_wanted) {
             SlotChange::Start(generation, stop) => {
                 let (requests, asked) = mpsc::sync_channel(ICON_QUEUE);
                 self.monitor.icons.start(requests);
-                watch::watch_icons(context, generation, stop, asked);
+                watch::watch_icons(host, generation, stop, asked);
             }
             SlotChange::Linger => linger = true,
             SlotChange::Unchanged => {}
@@ -398,49 +464,179 @@ impl CompiApp {
             })
             .detach();
         }
+        if !shown.is_empty() {
+            self.read_monitor_sources(cx);
+        }
+        let inspected: Vec<PaneId> = shown.into_iter().map(|(pane_id, _)| pane_id).collect();
+        self.request_inspections(&inspected, cx);
+    }
+
+    /// Brings pane `pane_id`'s state in line with `daemon`, what the daemon holds,
+    /// creating it when the pane is new, and sends the page or source shown when the
+    /// daemon has another.
+    fn sync_monitor_pane(
+        &mut self,
+        pane_id: &PaneId,
+        daemon: &MonitorContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mutation_pending = self.mutation_pending;
+        match self.monitor.panes.get_mut(pane_id) {
+            None => {
+                let pane = self.new_monitor_pane(pane_id, daemon.clone(), window, cx);
+                self.monitor.panes.insert(pane_id.clone(), pane);
+                if let Some(target) = self.monitor.pending.take() {
+                    // Pending targets come from Settings → Monitor, which shows the host.
+                    self.set_monitor_source(pane_id, MonitorSource::Host);
+                    self.show_monitor_target(pane_id, target);
+                }
+            }
+            Some(pane) => {
+                let adopt = if pane.sent.as_ref() == Some(daemon) {
+                    pane.sent = None;
+                    pane.persisted = daemon.clone();
+                    false
+                } else if pane.sent.is_some() && !mutation_pending {
+                    // The change did not apply; show what the daemon has.
+                    pane.sent = None;
+                    pane.persisted = daemon.clone();
+                    true
+                } else if pane.sent.is_none() && *daemon != pane.persisted {
+                    pane.persisted = daemon.clone();
+                    true
+                } else {
+                    false
+                };
+                if adopt {
+                    pane.page = daemon.page;
+                    self.set_monitor_source(pane_id, daemon.source.clone());
+                }
+            }
+        }
+        let Some(pane) = self.monitor.panes.get_mut(pane_id) else {
+            return;
+        };
+        let content = pane.content();
+        if content != pane.persisted && pane.sent.is_none() && !mutation_pending {
+            pane.sent = Some(content.clone());
+            self.mutate(
+                WorkspaceMutation::UpdateContent {
+                    pane_id: pane_id.clone(),
+                    content: PaneContent::Monitor(content),
+                },
+                false,
+            );
+        }
     }
 
     fn new_monitor_pane(
         &self,
         pane_id: &PaneId,
-        page: MonitorPage,
+        content: MonitorContent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> MonitorPane {
+        let list = self.new_process_list(pane_id, &content.source, window, cx);
         MonitorPane {
             focus: cx.focus_handle(),
-            page,
-            persisted: page,
+            page: content.page,
+            source: content.source.clone(),
+            persisted: content,
             sent: None,
             card: None,
             card_rows: Cell::new(&[]),
-            list: self.new_process_list(pane_id, window, cx),
+            list,
         }
     }
 
-    /// Stops each watcher no pane has wanted for [`LINGER`]; whether one stopped.
+    /// Reads the daemon's sources once per window, on a thread; until then, and if it
+    /// can't list them, the host alone is offered.
+    fn read_monitor_sources(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.monitor.listed, SourceList::Unread) {
+            return;
+        }
+        self.monitor.listed = SourceList::Reading;
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let sources = cx
+                .background_executor()
+                .spawn(async move {
+                    (|| -> crate::Result<_> { target.connect()?.monitor_sources() })()
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.monitor.listed = SourceList::Listed(sources.unwrap_or_default());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Shows `source` in Monitor pane `pane_id`: its own processes, nothing selected.
+    /// The daemon learns it before the next draw.
+    fn set_monitor_source(&mut self, pane_id: &PaneId, source: MonitorSource) {
+        let MonitorUi {
+            panes,
+            sources,
+            unread,
+            flat,
+            ..
+        } = &mut self.monitor;
+        let Some(pane) = panes.get_mut(pane_id) else {
+            return;
+        };
+        if pane.source == source {
+            return;
+        }
+        let feed = &sources.get(&source).unwrap_or(unread).processes;
+        pane.list.show_source(feed, *flat);
+        pane.source = source;
+    }
+
+    /// Stops each watcher no pane has wanted for [`LINGER`]; whether one stopped. A
+    /// source no pane shows and nothing watches keeps nothing.
     fn expire_monitor_watchers(&mut self) -> bool {
-        let totals = self.monitor.totals.slot.expire();
-        if totals {
-            self.monitor.totals.reset(FeedState::Connecting);
+        let mut stopped = false;
+        let mut processes = Vec::new();
+        for (source, feeds) in &mut self.monitor.sources {
+            if feeds.totals.slot.expire() {
+                feeds.totals.reset(FeedState::Connecting);
+                stopped = true;
+            }
+            if feeds.processes.slot.expire() {
+                processes.push(source.clone());
+                stopped = true;
+            }
         }
-        let processes = self.monitor.processes.slot.expire();
-        if processes {
-            self.reset_process_feed(FeedState::Connecting);
+        for source in processes {
+            self.reset_process_feed(&source, FeedState::Connecting);
         }
-        let icons = self.monitor.icons.slot.expire();
-        if icons {
+        let MonitorUi { panes, sources, .. } = &mut self.monitor;
+        sources.retain(|source, feeds| {
+            feeds.is_watched() || panes.values().any(|pane| pane.source == *source)
+        });
+        if self.monitor.icons.slot.expire() {
             self.monitor.icons.stop();
+            stopped = true;
         }
-        totals || processes || icons
+        stopped
     }
 
     pub(super) fn monitor_event(&mut self, event: MonitorEvent) {
         match event {
-            MonitorEvent::Processes { generation, event } => {
-                self.processes_event(generation, event)
-            }
-            MonitorEvent::Totals { generation, event } => self.totals_event(generation, *event),
+            MonitorEvent::Processes {
+                source,
+                generation,
+                event,
+            } => self.processes_event(&source, generation, event),
+            MonitorEvent::Totals {
+                source,
+                generation,
+                event,
+            } => self.totals_event(&source, generation, *event),
             MonitorEvent::Icons { generation, event } => {
                 if self.monitor.icons.slot.is_current(generation) {
                     self.monitor.icons.event(event);
@@ -459,7 +655,9 @@ impl CompiApp {
 
     fn set_monitor_paused(&mut self, paused: bool) {
         self.monitor.paused = paused;
-        self.monitor.totals.freeze(paused);
+        for feeds in self.monitor.sources.values_mut() {
+            feeds.totals.freeze(paused);
+        }
         if !paused {
             self.resume_processes();
         }
@@ -651,7 +849,7 @@ impl CompiApp {
             MonitorPage::Processes => self.render_processes_page(pane_id, pane, page_width, cx),
             page => Metric::of_page(page).map_or_else(
                 || div().into_any_element(),
-                |metric| self.render_monitor_resource(pane_id, metric, page_width, cx),
+                |metric| self.render_monitor_resource(pane_id, pane, metric, page_width, cx),
             ),
         };
         let key_pane = pane_id.clone();
@@ -688,7 +886,7 @@ impl CompiApp {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(self.render_monitor_header(pane, page_width, cx))
+                    .child(self.render_monitor_header(pane_id, pane, page_width, cx))
                     .child(page),
             )
             .into_any_element()
@@ -705,7 +903,8 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let latest = self.monitor.totals.shown().latest();
+        let feeds = self.monitor.feeds(&pane.source);
+        let latest = feeds.totals.shown().latest();
         let entry = |index: usize,
                      page: MonitorPage,
                      icon: IconName,
@@ -792,11 +991,16 @@ impl CompiApp {
                 latest.map(|latest| metric.nav_value(latest)),
             )
         });
-        let host = self.monitor.totals.host.as_ref();
-        let host_name = host
-            .and_then(|host| host.host_name.as_deref())
-            .map(crate::monitor::display_line);
-        let detail = self.monitor_host_detail();
+        let host_name = match &pane.source {
+            MonitorSource::Host => feeds
+                .totals
+                .host
+                .as_ref()
+                .and_then(|host| host.host_name.as_deref())
+                .map(crate::monitor::display_line),
+            wsl => Some(crate::monitor::source_label(wsl, None)),
+        };
+        let detail = self.monitor_host_detail(&feeds.totals);
         div()
             .flex_none()
             .w(px(if compact {
@@ -825,7 +1029,7 @@ impl CompiApp {
                 MonitorPage::Processes,
                 IconName::List,
                 None,
-                self.process_count().map(|count| Some(count.to_string())),
+                feeds.processes.count().map(|count| Some(count.to_string())),
             ))
             .child(if compact {
                 div()
@@ -878,9 +1082,57 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The header line: the page's title and the host, then the range and pause.
+    /// How the selector and header name `source`: the host by its name once known.
+    fn monitor_source_label(&self, source: &MonitorSource) -> String {
+        let host_name = self
+            .monitor
+            .feeds(&MonitorSource::Host)
+            .totals
+            .host
+            .as_ref()
+            .and_then(|host| host.host_name.as_deref());
+        crate::monitor::source_label(source, host_name)
+    }
+
+    /// The source menu under the header's selector: every source the daemon lists,
+    /// the pane's checked.
+    fn open_monitor_source_menu(
+        &mut self,
+        pane_id: &PaneId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.monitor.panes.get(pane_id) else {
+            return;
+        };
+        let entries = self
+            .monitor
+            .selectable_sources(&pane.source)
+            .into_iter()
+            .map(|source| {
+                let checked = source == pane.source;
+                let label = self.monitor_source_label(&source);
+                let pane_id = pane_id.clone();
+                controls::menu_item(
+                    label,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_monitor_source(&pane_id, source.clone());
+                        cx.notify();
+                    }),
+                )
+                .checked(checked)
+                .into()
+            })
+            .collect();
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
+    /// The header line: the page's title and the source (a menu of the daemon's
+    /// sources where it lists more than its host), then the range and pause.
     fn render_monitor_header(
         &self,
+        pane_id: &PaneId,
         pane: &MonitorPane,
         width: f32,
         cx: &Context<Self>,
@@ -888,14 +1140,19 @@ impl CompiApp {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         let paused = self.monitor.paused;
-        let host = self
-            .monitor
-            .totals
-            .host
-            .as_ref()
-            .and_then(|host| host.host_name.as_deref())
-            .map(crate::monitor::display_line)
-            .filter(|_| width >= HEADER_SUBTITLE_MIN_WIDTH);
+        let label = self.monitor_source_label(&pane.source);
+        let selector = (self.monitor.selectable_sources(&pane.source).len() > 1).then(|| {
+            let pane_id = pane_id.clone();
+            controls::text_button("monitor-source", label.clone())
+                .header()
+                .ghost()
+                .icon(IconName::ChevronDown)
+                .tooltip("Source")
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    this.open_monitor_source_menu(&pane_id, event.position(), window, cx);
+                }))
+        });
+        let host = (selector.is_none() && width >= HEADER_SUBTITLE_MIN_WIDTH).then_some(label);
         let spans = (pane.page != MonitorPage::Processes).then(|| {
             controls::segmented(
                 "monitor-span",
@@ -939,6 +1196,7 @@ impl CompiApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(page_title(pane.page)),
             )
+            .children(selector)
             .child(
                 div()
                     .flex_1()

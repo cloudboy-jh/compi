@@ -236,6 +236,7 @@ fn wants_json(raw: &[String]) -> bool {
                 | "--format"
                 | "--history"
                 | "--search"
+                | "--source"
                 | "--with"
         ) {
             args.next();
@@ -457,7 +458,8 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
                 }
             }
             "--cwd" | "--name" | "--panes" | "--layout" | "--index" | "--cols" | "--rows"
-            | "--text" | "--key" | "--scope" | "--format" | "--history" | "--search" => {
+            | "--text" | "--key" | "--scope" | "--format" | "--history" | "--search"
+            | "--source" => {
                 let value = iterator
                     .next()
                     .ok_or_else(|| CliError::usage(format!("{arg} requires a value")))?
@@ -480,7 +482,7 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
                     options.with.push(iterator.next().unwrap().clone());
                 }
             }
-            "--right" | "--down" | "--check" | "--group" => {
+            "--right" | "--down" | "--check" | "--group" | "--force" => {
                 if !options.switches.insert(arg.clone()) {
                     return Err(CliError::usage(format!("duplicate {arg}")));
                 }
@@ -617,12 +619,21 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         return presentation(&target, options, crate::cli_window::Action::List);
     }
     let mut client = target.connect_existing().map_err(|error| CliError::new(5, "daemon_unavailable", format!("cannot connect to existing daemon: {error}; open Compi first or select the correct instance")))?;
-    if command == "monitor" && matches!(action, Some("totals" | "list")) {
-        // Data reads need no workspace and no window.
-        return if action == Some("totals") {
-            metrics::totals(&mut client, options)
-        } else {
-            metrics::list(&mut client, options)
+    if command == "monitor"
+        && matches!(
+            action,
+            Some("totals" | "list" | "sources" | "inspect" | "quit")
+        )
+    {
+        // Data reads and process actions need no window; only inspect reads the
+        // workspace, for the pane of a process's terminal.
+        return match action.unwrap() {
+            "totals" => metrics::totals(&mut client, options),
+            "list" => metrics::list(&mut client, options),
+            "sources" => metrics::sources(&mut client),
+            "inspect" => metrics::inspect(&mut client, options),
+            "quit" => metrics::quit(&mut client, options),
+            _ => unreachable!(),
         };
     }
     let mut state = client.workspace()?;
@@ -1613,9 +1624,13 @@ fn validate(
             &["--cwd", "--panes", "--layout"],
             &["--right", "--down"],
         ),
-        ("monitor", Some("totals")) => (2, 2, &["--history"], &[]),
-        ("monitor", Some("list")) => (2, 2, &["--search"], &["--group"]),
-        ("files" | "edit" | "settings" | "monitor", _) => (1, 2, &[], &[]),
+        ("monitor", Some("totals")) => (2, 2, &["--history", "--source"], &[]),
+        ("monitor", Some("list")) => (2, 2, &["--search", "--source"], &["--group"]),
+        ("monitor", Some("sources")) => (2, 2, &[], &[]),
+        ("monitor", Some("inspect")) => (3, 3, &["--source"], &[]),
+        ("monitor", Some("quit")) => (3, 3, &["--source"], &["--force"]),
+        ("monitor", _) => (1, 2, &["--source"], &[]),
+        ("files" | "edit" | "settings", _) => (1, 2, &[], &[]),
         // `diff [PATH]` and `diff COMMIT [PATH]`.
         ("diff", _) => (1, 3, &[], &[]),
         ("command", Some("list")) => (2, 2, &[], &[]),
@@ -1695,11 +1710,18 @@ fn validate(
             "send requires exactly one of --text or --key",
         ));
     }
-    if command == "monitor"
-        && action == Some("totals")
-        && let Some(range) = options.values.get("--history")
-    {
-        metrics::span(range)?;
+    if command == "monitor" {
+        if action == Some("totals")
+            && let Some(range) = options.values.get("--history")
+        {
+            metrics::span(range)?;
+        }
+        if let Some(name) = options.values.get("--source") {
+            metrics::source(name)?;
+        }
+        if matches!(action, Some("inspect" | "quit")) {
+            metrics::pid(&options.args[2])?;
+        }
     }
     if command == "command"
         && action == Some("run")
@@ -2084,6 +2106,59 @@ mod tests {
         assert_eq!(options.values["--search"], "a b");
     }
     #[test]
+    fn monitor_sources_inspect_and_quit_take_a_pid_and_a_source() {
+        for accepted in [
+            &["monitor", "sources"][..],
+            &["--json", "monitor", "sources"],
+            &["monitor", "inspect", "4120"],
+            &["monitor", "inspect", "0", "--source", "host"],
+            &["monitor", "quit", "4120"],
+            &["monitor", "quit", "4120", "--force", "--json"],
+            &[
+                "monitor",
+                "quit",
+                "--force",
+                "4120",
+                "--source",
+                "wsl:Ubuntu-24.04",
+            ],
+            &["monitor", "totals", "--source", "wsl:Ubuntu"],
+            &["monitor", "list", "--source", "host", "--group"],
+            &["monitor", "processes", "--source", "wsl:Debian"],
+            &["monitor", "--source", "host"],
+        ] {
+            assert!(validated(accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            &["monitor", "sources", "extra"][..],
+            &["monitor", "sources", "--source", "host"],
+            &["monitor", "inspect"],
+            &["monitor", "inspect", "-1"],
+            &["monitor", "inspect", "pid"],
+            &["monitor", "inspect", "4294967296"],
+            &["monitor", "inspect", "1", "2"],
+            &["monitor", "inspect", "1", "--force"],
+            &["monitor", "quit"],
+            &["monitor", "quit", "1", "--force", "--force"],
+            &["monitor", "quit", "1", "--group"],
+            &["monitor", "list", "--source", "wsl:"],
+            &["monitor", "list", "--source", "wsl:a/b"],
+            &["monitor", "totals", "--source", "Ubuntu"],
+            &["monitor", "--source"],
+            &["monitor", "cpu", "--source", "local"],
+            &["settings", "--source", "host"],
+            &["pane", "close", "--force"],
+        ] {
+            assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
+        }
+        // --source takes a value, so a source named "--json" is not the output mode.
+        let args = ["monitor", "list", "--source", "--json"].map(str::to_owned);
+        assert!(!wants_json(&args));
+        let options = validated(&["monitor", "quit", "7", "--force"]).unwrap();
+        assert!(options.switches.contains("--force"));
+        assert_eq!(options.args, ["monitor", "quit", "7"]);
+    }
+    #[test]
     fn help_covers_the_new_forms() {
         for (command, action, usage) in [
             ("command", Some("list"), "Usage: compi command list"),
@@ -2092,14 +2167,29 @@ mod tests {
             (
                 "monitor",
                 Some("totals"),
-                "Usage: compi monitor totals [--history 1m|5m|15m|1h]",
+                "Usage: compi monitor totals [--history 1m|5m|15m|1h] [--source SOURCE]",
             ),
             (
                 "monitor",
                 Some("list"),
-                "Usage: compi monitor list [--group] [--search TEXT]",
+                "Usage: compi monitor list [--group] [--search TEXT] [--source SOURCE]",
             ),
-            ("monitor", Some("processes"), "Usage: compi monitor [PAGE]"),
+            ("monitor", Some("sources"), "Usage: compi monitor sources"),
+            (
+                "monitor",
+                Some("inspect"),
+                "Usage: compi monitor inspect PID [--source SOURCE]",
+            ),
+            (
+                "monitor",
+                Some("quit"),
+                "Usage: compi monitor quit PID [--force] [--source SOURCE]",
+            ),
+            (
+                "monitor",
+                Some("processes"),
+                "Usage: compi monitor [PAGE] [--source SOURCE]",
+            ),
         ] {
             assert!(
                 help::text(command, action).starts_with(usage),
@@ -2107,7 +2197,7 @@ mod tests {
             );
         }
         let top = help::text("", None);
-        assert!(top.contains("monitor [PAGE]/totals/list; command list/run;"));
+        assert!(top.contains("monitor [PAGE]/totals/list/sources/inspect/quit; command list/run;"));
     }
     #[test]
     fn close_reports_unsaved_files_of_closing_files_from_every_window() {

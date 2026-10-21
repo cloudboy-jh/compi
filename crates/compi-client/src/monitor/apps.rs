@@ -413,6 +413,7 @@ mod tests {
                     id: format!("/Applications/{app}.app"),
                     name: app.into(),
                 }),
+                surface: None,
             }),
         }
     }

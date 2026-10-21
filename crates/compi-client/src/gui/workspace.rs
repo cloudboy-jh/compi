@@ -351,6 +351,17 @@ pub(super) enum Overlay {
         revision: u64,
         consent: compi_protocol::LifecycleConsent,
     },
+    /// Quit (or, `force`, Force quit) Monitor's process `(pid, start_time)` of `source`,
+    /// named `name`; `in_terminal` when it runs in a Compi terminal. Cancel starts
+    /// focused.
+    ConfirmQuitProcess {
+        source: compi_protocol::system_metrics::MonitorSource,
+        pid: u32,
+        start_time: u64,
+        name: String,
+        force: bool,
+        in_terminal: bool,
+    },
     Tabs {
         hidden_only: bool,
     },
@@ -3566,6 +3577,7 @@ impl CompiApp {
             Some(
                 Overlay::Confirm { .. }
                     | Overlay::ConfirmDiscard { .. }
+                    | Overlay::ConfirmQuitProcess { .. }
                     | Overlay::Unsaved { .. }
                     | Overlay::Diagnostics
                     | Overlay::Arrangements { .. }
@@ -4208,6 +4220,17 @@ impl CompiApp {
                     window,
                     cx,
                 );
+            }
+            Overlay::ConfirmQuitProcess {
+                source,
+                pid,
+                start_time,
+                name,
+                force,
+                ..
+            } => {
+                self.dismiss_overlay();
+                self.quit_process(source, (pid, start_time), name, force, cx);
             }
             Overlay::ConfirmDaemonRestart {
                 revision, consent, ..
@@ -6958,6 +6981,11 @@ impl CompiApp {
             cx.notify();
             return;
         }
+        if self.drag_monitor_column(event.position.x) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.sidebar_drag {
             // The pointer holds the seam (Compact) or the middle of the gap (Comfy).
             let offset = if self.comfy() { PANE_GUTTER * 1.5 } else { 0.0 };
@@ -7044,6 +7072,10 @@ impl CompiApp {
             return;
         }
         if self.workspace_scroll_drag.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.finish_monitor_column_drag() {
             cx.notify();
             return;
         }

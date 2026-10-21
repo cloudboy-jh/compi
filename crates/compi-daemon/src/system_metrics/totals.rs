@@ -1,12 +1,14 @@
-//! System totals for Monitor's Overview and resource pages: sampled every 2 s for as long
-//! as the daemon runs, keeping the last hour, so every range is filled when a Monitor pane
-//! opens. A sample costs a few milliseconds, most of it reading disk counters.
+//! System totals for Monitor's Overview and resource pages. The host's are sampled every
+//! 2 s for as long as the daemon runs, keeping the last hour, so every range is filled when
+//! a Monitor pane opens; a sample costs a few milliseconds, most of it reading disk
+//! counters. A WSL distribution's arrive from its collector while it is watched.
 //!
 //! The history keeps the totals only; the newest sample's breakdowns (per-core CPU,
 //! volumes, interfaces) are kept once, beside it, and attached when it is sent.
 
 mod gpu;
 
+use super::Sampling;
 use compi_protocol::system_metrics::{
     CpuTotals, DiskTotals, HostInfo, MemoryKind, MemoryKindName, MemoryTotals, NetworkInterface,
     NetworkTotals, TOTALS_HISTORY, TOTALS_INTERVAL_MS, TotalsDetail, TotalsSample, Volume,
@@ -30,29 +32,42 @@ pub struct SystemTotalsHub {
 }
 
 struct HubState {
-    host: HostInfo,
+    /// `None` until the source has described itself: a WSL distribution's collector does
+    /// once it runs.
+    host: Option<HostInfo>,
     history: VecDeque<Arc<TotalsSample>>,
     /// The newest sample's detail, which the history does not keep.
     detail: Option<Box<TotalsDetail>>,
+    /// Why the source cannot be sampled, until its collector starts again.
+    failure: Option<String>,
+    /// Counts a WSL distribution's collectors, so one that has stopped changes nothing.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    epoch: u64,
+    /// The sequence the next sample numbered here is given.
+    next_sequence: u64,
 }
 
 impl SystemTotalsHub {
-    pub fn shared() -> &'static Self {
-        static HUB: LazyLock<SystemTotalsHub> = LazyLock::new(|| SystemTotalsHub::new(host_info()));
+    pub fn shared() -> &'static Arc<Self> {
+        static HUB: LazyLock<Arc<SystemTotalsHub>> =
+            LazyLock::new(|| Arc::new(SystemTotalsHub::new(Some(host_info()))));
         &HUB
     }
 
-    fn new(host: HostInfo) -> Self {
+    pub(super) fn new(host: Option<HostInfo>) -> Self {
         Self {
             state: Mutex::new(HubState {
                 host,
                 history: VecDeque::with_capacity(TOTALS_HISTORY),
                 detail: None,
+                failure: None,
+                epoch: 0,
+                next_sequence: 0,
             }),
         }
     }
 
-    /// Samples until `stopping` is set.
+    /// Samples the host until `stopping` is set.
     pub fn start(&'static self, stopping: Arc<AtomicBool>) {
         thread::Builder::new()
             .name("compi-system-totals".into())
@@ -80,23 +95,73 @@ impl SystemTotalsHub {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn publish(&self, mut sample: TotalsSample) {
-        let detail = sample.detail.take();
+    fn publish(&self, sample: TotalsSample) {
+        self.lock().push(sample);
+    }
+}
+
+/// What a WSL distribution's collector reports, which only a Windows daemon runs.
+#[cfg_attr(not(windows), allow(dead_code))]
+impl SystemTotalsHub {
+    /// A new collector starts: what the last one sampled is forgotten, and what it reports
+    /// under the returned epoch is kept. Sequences continue, so no watch goes back.
+    pub(super) fn begin(&self) -> u64 {
         let mut state = self.lock();
-        if state.history.len() == TOTALS_HISTORY {
-            state.history.pop_front();
-        }
-        state.history.push_back(Arc::new(sample));
-        state.detail = detail;
+        state.epoch += 1;
+        state.host = None;
+        state.history.clear();
+        state.detail = None;
+        state.failure = None;
+        state.epoch
     }
 
-    /// The host and every kept sample, oldest first, the newest with its detail, and a
-    /// watch that continues after them.
-    pub fn watch(&self) -> (HostInfo, Vec<TotalsSample>, SystemTotalsWatch) {
+    /// The collector of `epoch` describes its source.
+    pub(super) fn describe(&self, epoch: u64, host: HostInfo) {
+        let mut state = self.lock();
+        if state.epoch == epoch {
+            state.host = Some(host);
+            state.failure = None;
+        }
+    }
+
+    /// The collector of `epoch` sampled; the sample is numbered after the last one.
+    pub(super) fn publish_numbered(&self, epoch: u64, mut sample: TotalsSample) {
+        let mut state = self.lock();
+        if state.epoch == epoch {
+            sample.sequence = state.next_sequence;
+            state.push(sample);
+        }
+    }
+
+    /// The collector of `epoch` could not sample its source.
+    pub(super) fn fail(&self, epoch: u64, reason: String) {
+        let mut state = self.lock();
+        if state.epoch == epoch && state.host.is_none() {
+            state.failure = Some(reason);
+        }
+    }
+}
+
+impl SystemTotalsHub {
+    /// A watch of these totals, which keeps `sampling` (a WSL distribution's collector)
+    /// running while it lasts.
+    pub fn watch(self: &Arc<Self>, sampling: Option<Sampling>) -> SystemTotalsWatch {
+        SystemTotalsWatch {
+            hub: self.clone(),
+            next: None,
+            _sampling: sampling,
+        }
+    }
+
+    /// The host and every kept sample, oldest first, the newest with its detail, once the
+    /// source has described itself.
+    fn opened(&self) -> Option<Result<(HostInfo, Vec<TotalsSample>), String>> {
         let state = self.lock();
-        let history = state.with_detail(state.history.iter());
-        let next = history.last().map_or(0, |sample| sample.sequence + 1);
-        (state.host.clone(), history, SystemTotalsWatch { next })
+        if let Some(failure) = &state.failure {
+            return Some(Err(failure.clone()));
+        }
+        let host = state.host.clone()?;
+        Some(Ok((host, state.with_detail(state.history.iter()))))
     }
 
     /// Kept samples from `next` on, oldest first, the newest with its detail.
@@ -109,6 +174,17 @@ impl SystemTotalsHub {
 }
 
 impl HubState {
+    /// Keeps `sample`, its detail beside the history.
+    fn push(&mut self, mut sample: TotalsSample) {
+        let detail = sample.detail.take();
+        if self.history.len() == TOTALS_HISTORY {
+            self.history.pop_front();
+        }
+        self.next_sequence = sample.sequence + 1;
+        self.history.push_back(Arc::new(sample));
+        self.detail = detail;
+    }
+
     /// Copies of `samples`, which end with the newest, that one given the detail.
     fn with_detail<'a>(
         &self,
@@ -122,22 +198,36 @@ impl HubState {
     }
 }
 
-/// Which sample a connection is sent next.
+/// What one watching connection has been sent.
 pub struct SystemTotalsWatch {
-    next: u64,
+    hub: Arc<SystemTotalsHub>,
+    /// The sample this connection is sent next, once it has been answered.
+    next: Option<u64>,
+    _sampling: Option<Sampling>,
 }
 
 impl SystemTotalsWatch {
-    /// Samples this connection has not been sent, oldest first, the newest with its
-    /// detail. A connection more than an hour behind continues from the oldest kept
-    /// sample.
+    /// The source's host and kept samples, oldest first, the newest with its detail, once
+    /// the source has described itself (at once for the daemon's host); `Err` when it
+    /// cannot be sampled. Samples after them are then `pending`.
+    pub fn open(&mut self) -> Option<Result<(HostInfo, Vec<TotalsSample>), String>> {
+        let opened = self.hub.opened()?;
+        if let Ok((_, history)) = &opened {
+            self.next = Some(history.last().map_or(0, |sample| sample.sequence + 1));
+        }
+        Some(opened)
+    }
+
+    /// Samples this connection has not been sent since it was opened, oldest first, the
+    /// newest with its detail. A connection more than an hour behind continues from the
+    /// oldest kept sample.
     pub fn pending(&self) -> Vec<TotalsSample> {
-        SystemTotalsHub::shared().since(self.next)
+        self.next.map_or_else(Vec::new, |next| self.hub.since(next))
     }
 
     /// The sample numbered `sequence` was sent.
     pub fn delivered(&mut self, sequence: u64) {
-        self.next = sequence + 1;
+        self.next = Some(sequence + 1);
     }
 }
 
@@ -325,7 +415,7 @@ fn hardware_interfaces<'a>(
     list
 }
 
-fn network_totals(interfaces: &[NetworkInterface]) -> Option<NetworkTotals> {
+pub(super) fn network_totals(interfaces: &[NetworkInterface]) -> Option<NetworkTotals> {
     if interfaces.is_empty() {
         return None;
     }
@@ -342,7 +432,7 @@ fn network_totals(interfaces: &[NetworkInterface]) -> Option<NetworkTotals> {
 
 /// The volume's label where the host has one, else its mount point's last part, else
 /// the mount point (`/`, `C:\`).
-fn volume_name(label: Option<&str>, mount_point: &str) -> String {
+pub(super) fn volume_name(label: Option<&str>, mount_point: &str) -> String {
     label
         .filter(|label| !label.is_empty())
         .or_else(|| Path::new(mount_point).file_name()?.to_str())
@@ -366,28 +456,98 @@ fn mounted_volumes(disks: &Disks) -> Vec<Volume> {
         };
         (device.into_owned(), volume)
     });
-    user_volumes(mounted, &platform::system_mount())
+    user_volumes(
+        mounted,
+        &platform::system_mount(),
+        platform::user_volume,
+        platform::MOUNTS_SHARE_DEVICES,
+    )
 }
 
 /// The volumes a user stores files on from what is mounted, each `(device, volume)`: the
-/// one at `system` first and the rest by mount point.
-fn user_volumes(mounted: impl Iterator<Item = (String, Volume)>, system: &str) -> Vec<Volume> {
+/// one at `system` first and the rest by mount point. Where `share_devices`, a device
+/// mounted again (a bind mount, another subvolume) is shown once, at its first mount point
+/// in that order.
+pub(super) fn user_volumes(
+    mounted: impl Iterator<Item = (String, Volume)>,
+    system: &str,
+    user_volume: fn(&Volume) -> bool,
+    share_devices: bool,
+) -> Vec<Volume> {
     let mut mounted: Vec<(String, Volume)> = mounted
-        .filter(|(_, volume)| volume.total_bytes > 0 && platform::user_volume(volume))
+        .filter(|(_, volume)| volume.total_bytes > 0 && user_volume(volume))
         .collect();
     let order = |a: &Volume, b: &Volume| {
         (a.mount_point != system)
             .cmp(&(b.mount_point != system))
             .then_with(|| a.mount_point.cmp(&b.mount_point))
     };
-    if platform::MOUNTS_SHARE_DEVICES {
-        // A device mounted again (a bind mount, another subvolume) is shown once, at its
-        // first mount point in the order shown.
+    if share_devices {
         mounted.sort_by(|(a_device, a), (b_device, b)| a_device.cmp(b_device).then(order(a, b)));
         mounted.dedup_by(|(later, _), (first, _)| later == first);
     }
     mounted.sort_by(|(_, a), (_, b)| order(a, b));
     mounted.into_iter().map(|(_, volume)| volume).collect()
+}
+
+/// Linux: real file systems outside the system's own mounts; removable media under
+/// `/run/media` count.
+pub(super) fn linux_user_volume(volume: &Volume) -> bool {
+    /// Kernel and memory file systems, and those that only repackage others.
+    const PSEUDO_FILE_SYSTEMS: &[&str] = &[
+        "autofs",
+        "binfmt_misc",
+        "bpf",
+        "cgroup",
+        "cgroup2",
+        "configfs",
+        "debugfs",
+        "devpts",
+        "devtmpfs",
+        "efivarfs",
+        "fuse.gvfsd-fuse",
+        "fuse.portal",
+        "fuse.snapfuse",
+        "fusectl",
+        "hugetlbfs",
+        "mqueue",
+        "nsfs",
+        "overlay",
+        "proc",
+        "pstore",
+        "ramfs",
+        "rpc_pipefs",
+        "securityfs",
+        "squashfs",
+        "sysfs",
+        "tmpfs",
+        "tracefs",
+    ];
+    /// Where the system mounts what is not the user's files.
+    const SYSTEM_MOUNTS: &[&str] = &[
+        "/boot",
+        "/dev",
+        "/proc",
+        "/run",
+        "/snap",
+        "/sys",
+        "/var/lib/docker",
+        "/var/snap",
+    ];
+    let file_system = volume.file_system.as_deref().unwrap_or_default();
+    if PSEUDO_FILE_SYSTEMS.contains(&file_system) {
+        return false;
+    }
+    let mount = volume.mount_point.as_str();
+    mount.starts_with("/run/media/") || !under_any(mount, SYSTEM_MOUNTS)
+}
+
+/// Whether `path` is one of `roots` or inside one.
+pub(super) fn under_any(path: &str, roots: &[&str]) -> bool {
+    roots.iter().any(|root| {
+        path.strip_prefix(root)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
 }
 
 /// Busy share of each logical CPU between two readings, 0 to 100; none when the CPUs
@@ -411,7 +571,7 @@ fn core_shares(before: &[platform::CoreTicks], after: &[platform::CoreTicks]) ->
         .collect()
 }
 
-fn per_second(bytes: u64, elapsed: Duration) -> u64 {
+pub(super) fn per_second(bytes: u64, elapsed: Duration) -> u64 {
     (bytes as f64 / elapsed.as_secs_f64().max(0.001)).round() as u64
 }
 
@@ -420,8 +580,7 @@ fn kind(kind: MemoryKindName, bytes: u64) -> MemoryKind {
 }
 
 /// Used, Cached and Free from what is available and how much of it is cache.
-#[cfg(not(target_os = "macos"))]
-fn used_cached_free(total: u64, available: u64, cache: u64) -> Vec<MemoryKind> {
+pub(super) fn used_cached_free(total: u64, available: u64, cache: u64) -> Vec<MemoryKind> {
     let available = available.min(total);
     let cached = cache.min(available);
     vec![
@@ -602,70 +761,13 @@ mod platform {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
-    use compi_protocol::system_metrics::{CpuTotals, MemoryKind, MemoryPressure, Volume};
+    use compi_protocol::system_metrics::{CpuTotals, MemoryKind, MemoryPressure};
 
     /// Disk names are devices, such as `/dev/nvme0n1p2`, not labels.
     pub const VOLUME_LABELS: bool = false;
     pub const MOUNTS_SHARE_DEVICES: bool = true;
 
-    /// Kernel and memory file systems, and those that only repackage others.
-    const PSEUDO_FILE_SYSTEMS: &[&str] = &[
-        "autofs",
-        "binfmt_misc",
-        "bpf",
-        "cgroup",
-        "cgroup2",
-        "configfs",
-        "debugfs",
-        "devpts",
-        "devtmpfs",
-        "efivarfs",
-        "fuse.gvfsd-fuse",
-        "fuse.portal",
-        "fuse.snapfuse",
-        "fusectl",
-        "hugetlbfs",
-        "mqueue",
-        "nsfs",
-        "overlay",
-        "proc",
-        "pstore",
-        "ramfs",
-        "rpc_pipefs",
-        "securityfs",
-        "squashfs",
-        "sysfs",
-        "tmpfs",
-        "tracefs",
-    ];
-
-    /// Where the system mounts what is not the user's files.
-    const SYSTEM_MOUNTS: &[&str] = &[
-        "/boot",
-        "/dev",
-        "/proc",
-        "/run",
-        "/snap",
-        "/sys",
-        "/var/lib/docker",
-        "/var/snap",
-    ];
-
-    /// Real file systems outside the system's own mounts; removable media under
-    /// `/run/media` count.
-    pub fn user_volume(volume: &Volume) -> bool {
-        let file_system = volume.file_system.as_deref().unwrap_or_default();
-        if PSEUDO_FILE_SYSTEMS.contains(&file_system) {
-            return false;
-        }
-        let mount = volume.mount_point.as_str();
-        mount.starts_with("/run/media/")
-            || !SYSTEM_MOUNTS.iter().any(|system| {
-                mount
-                    .strip_prefix(system)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-            })
-    }
+    pub(super) use super::linux_user_volume as user_volume;
 
     #[derive(Clone, Copy)]
     pub struct CpuTicks {
@@ -721,20 +823,14 @@ mod platform {
         Some(host)
     }
 
-    /// A `cpu` or `cpuN` line: user nice system idle iowait irq softirq steal.
     fn parse_cpu_line(line: &str) -> Option<(&str, CpuTicks)> {
-        let mut fields = line.split_whitespace();
-        let label = fields.next().filter(|label| label.starts_with("cpu"))?;
-        let mut values = [0u64; 8];
-        for (value, field) in values.iter_mut().zip(fields) {
-            *value = field.parse().ok()?;
-        }
+        let (label, ticks) = super::super::procfs::cpu_line(line)?;
         Some((
             label,
             CpuTicks {
-                user: values[0] + values[1],
-                system: values[2] + values[5] + values[6] + values[7],
-                idle: values[3] + values[4],
+                user: ticks.user,
+                system: ticks.system,
+                idle: ticks.idle,
             },
         ))
     }
@@ -886,7 +982,7 @@ mod platform {
 }
 
 /// Shares of all CPU time spent by programs and by the kernel, as percentages.
-fn cpu_share(user: u64, system: u64, idle: u64) -> Option<CpuTotals> {
+pub(super) fn cpu_share(user: u64, system: u64, idle: u64) -> Option<CpuTotals> {
     let total = user + system + idle;
     (total > 0).then(|| CpuTotals {
         user: (user as f64 * 100.0 / total as f64) as f32,
@@ -905,7 +1001,6 @@ mod tests {
         assert_eq!(cpu_share(0, 0, 0), None);
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn cache_is_bounded_by_what_is_available() {
         let kinds = used_cached_free(100, 40, 60);
@@ -1002,6 +1097,8 @@ mod tests {
                 .into_iter()
                 .map(|volume| (volume.mount_point.clone(), volume)),
             "/",
+            platform::user_volume,
+            platform::MOUNTS_SHARE_DEVICES,
         );
         let mounts: Vec<&str> = shown.iter().map(|v| v.mount_point.as_str()).collect();
         assert_eq!(mounts, ["/", "/Volumes/Archive", "/Volumes/Backup"]);
@@ -1025,6 +1122,8 @@ mod tests {
                 .into_iter()
                 .map(|(device, volume)| (device.to_owned(), volume)),
             "/",
+            platform::user_volume,
+            platform::MOUNTS_SHARE_DEVICES,
         );
         let mounts: Vec<&str> = shown.iter().map(|v| v.mount_point.as_str()).collect();
         assert_eq!(mounts, ["/", "/data", "/run/media/me/USB"]);
@@ -1118,7 +1217,7 @@ mod tests {
 
     #[test]
     fn only_the_newest_sample_carries_its_detail() {
-        let hub = SystemTotalsHub::new(HostInfo::default());
+        let hub = Arc::new(SystemTotalsHub::new(Some(HostInfo::default())));
         let sample = |sequence: u64, core: f32| TotalsSample {
             sequence,
             detail: Some(Box::new(TotalsDetail {
@@ -1134,7 +1233,7 @@ mod tests {
             hub.lock().history.iter().all(|kept| kept.detail.is_none()),
             "the history keeps no detail"
         );
-        let (_, history, _) = hub.watch();
+        let (_, history) = hub.watch(None).open().unwrap().unwrap();
         let cores: Vec<Option<Vec<f32>>> = history
             .iter()
             .map(|s| s.detail.as_ref().map(|detail| detail.cores.clone()))
@@ -1160,7 +1259,8 @@ mod tests {
                 ..TotalsSample::default()
             });
         }
-        let (_, history, mut watch) = hub.watch();
+        let mut watch = hub.watch(None);
+        let (_, history) = watch.open().unwrap().unwrap();
         assert_eq!(history.last().unwrap().sequence, base + 2);
         assert!(watch.pending().is_empty());
         hub.publish(TotalsSample {
@@ -1174,5 +1274,38 @@ mod tests {
         );
         watch.delivered(pending[0].sequence);
         assert!(watch.pending().is_empty());
+    }
+
+    #[test]
+    fn a_collectors_totals_open_once_it_describes_its_source() {
+        let hub = Arc::new(SystemTotalsHub::new(None));
+        let epoch = hub.begin();
+        let mut watch = hub.watch(None);
+        assert_eq!(watch.open(), None, "not described yet");
+        assert!(watch.pending().is_empty(), "nothing before it opens");
+        hub.publish_numbered(epoch, TotalsSample::default());
+        let host = HostInfo {
+            host_name: Some("wsl".into()),
+            ..HostInfo::default()
+        };
+        hub.describe(epoch, host.clone());
+        let (described, history) = watch.open().unwrap().unwrap();
+        assert_eq!(described, host);
+        assert_eq!(history.iter().map(|s| s.sequence).collect::<Vec<_>>(), [0]);
+        hub.publish_numbered(epoch, TotalsSample::default());
+        assert_eq!(watch.pending()[0].sequence, 1);
+
+        // A later collector starts over without going back; a stopped one changes nothing.
+        let later = hub.begin();
+        hub.publish_numbered(epoch, TotalsSample::default());
+        hub.fail(epoch, "stopped".into());
+        assert!(watch.pending().is_empty());
+        let mut fresh = hub.watch(None);
+        assert_eq!(fresh.open(), None);
+        hub.fail(later, "WSL is not running".into());
+        assert_eq!(fresh.open(), Some(Err("WSL is not running".into())));
+        hub.describe(later, host);
+        hub.publish_numbered(later, TotalsSample::default());
+        assert_eq!(watch.pending()[0].sequence, 2);
     }
 }

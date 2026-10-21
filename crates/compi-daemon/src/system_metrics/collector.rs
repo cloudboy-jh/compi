@@ -2,7 +2,8 @@
 //! own calls for what sysinfo leaves out (thread counts, applications, and on macOS other
 //! users' processes, which the kernel withholds from a non-root daemon).
 
-use super::{Collect, Collected};
+use super::sessions::SurfaceSessions;
+use super::{Collect, Collected, cut_text};
 use compi_protocol::system_metrics::{
     AppGroup, MAX_COMMAND_BYTES, Process, ProcessDetails, ProcessSample,
 };
@@ -51,7 +52,7 @@ impl HostCollector {
 }
 
 impl Collect for HostCollector {
-    fn collect(&mut self) -> Collected {
+    fn collect(&mut self) -> Option<Collected> {
         let Self {
             system,
             names,
@@ -74,6 +75,8 @@ impl Collect for HostCollector {
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
         let extra = platform::Extra::sample(system.processes().keys().map(|pid| pid.as_u32()));
         let mut previous = std::mem::take(known);
+        // Read only when a process is new, which most samples have none of.
+        let mut sessions: Option<SurfaceSessions> = None;
         let mut processes = Vec::with_capacity(system.processes().len());
         for (pid, process) in system.processes() {
             let pid = pid.as_u32();
@@ -101,6 +104,9 @@ impl Collect for HostCollector {
                     app_group: executable.as_deref().and_then(app_group),
                     executable,
                     restricted: !readable,
+                    surface: sessions
+                        .get_or_insert_with(SurfaceSessions::current)
+                        .surface_of(pid),
                 })
             });
             let parent_pid = process.parent().map(|parent| parent.as_u32());
@@ -131,12 +137,12 @@ impl Collect for HostCollector {
             known.insert(key, details.clone());
             processes.push(Process { sample, details });
         }
-        Collected {
+        Some(Collected {
             sampled_at_ms,
             logical_cpus: *logical_cpus,
             apps_known: platform::APPS_KNOWN,
             processes,
-        }
+        })
     }
 }
 
@@ -205,12 +211,7 @@ fn command_line(arguments: &[std::ffi::OsString]) -> Option<String> {
             command.push(' ');
         }
         command.push_str(&argument.to_string_lossy());
-        if command.len() >= MAX_COMMAND_BYTES {
-            let mut end = MAX_COMMAND_BYTES;
-            while !command.is_char_boundary(end) {
-                end -= 1;
-            }
-            command.truncate(end);
+        if cut_text(&mut command, MAX_COMMAND_BYTES) {
             break;
         }
     }
@@ -701,7 +702,7 @@ mod tests {
     #[test]
     fn the_host_collector_sees_this_process() {
         let mut collector = HostCollector::new();
-        let first = collector.collect();
+        let first = collector.collect().expect("the host is always sampled");
         let own = std::process::id();
         let mine = first
             .processes
@@ -717,7 +718,7 @@ mod tests {
         assert!(mine.sample.memory_bytes.is_some_and(|bytes| bytes > 0));
         assert!(mine.sample.threads.is_some_and(|threads| threads >= 1));
         std::thread::sleep(Duration::from_millis(200));
-        let second = collector.collect();
+        let second = collector.collect().unwrap();
         let mine = second
             .processes
             .iter()

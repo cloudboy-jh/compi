@@ -1,7 +1,7 @@
 //! How Monitor's pages divide their width, kept pure: the Overview grid (how many
 //! columns, how wide a card, where each card sits and what the keyboard reaches from
-//! it) and the resource pages' figure grid, per-core grid, graph height and Memory by
-//! type ring.
+//! it), the resource pages' figure grid, per-core grid, graph height and Memory by
+//! type ring, and where the Processes page puts its inspector.
 //!
 //! Widths are whole pixels, so columns and gaps never add up past the content.
 
@@ -307,6 +307,31 @@ pub fn ring_layout(card_width: f32) -> (bool, f32) {
     )
 }
 
+/// A Processes page this wide shows the inspector beside the table.
+pub const INSPECTOR_BESIDE_FROM: f32 = 720.0;
+/// The inspector's width beside the table.
+pub const INSPECTOR_WIDTH: f32 = 320.0;
+
+/// Where a Processes page shows what is selected.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Inspector {
+    /// At the right, the table keeping `table_width`.
+    Beside { table_width: f32 },
+    /// A page of its own, opened from a row, with Back to the table.
+    FullPage,
+}
+
+/// How a Processes page `page_width` wide shows the inspector.
+pub fn inspector_layout(page_width: f32) -> Inspector {
+    if page_width >= INSPECTOR_BESIDE_FROM {
+        Inspector::Beside {
+            table_width: page_width - INSPECTOR_WIDTH,
+        }
+    } else {
+        Inspector::FullPage
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +351,19 @@ mod tests {
     /// The page width whose content is exactly `content` wide (wide padding).
     fn page(content: f32) -> f32 {
         content + 48.0
+    }
+
+    #[test]
+    fn the_inspector_sits_beside_wide_tables_and_takes_the_page_of_narrow_ones() {
+        assert_eq!(inspector_layout(719.0), Inspector::FullPage);
+        assert_eq!(
+            inspector_layout(720.0),
+            Inspector::Beside { table_width: 400.0 }
+        );
+        assert_eq!(
+            inspector_layout(1200.0),
+            Inspector::Beside { table_width: 880.0 }
+        );
     }
 
     #[test]

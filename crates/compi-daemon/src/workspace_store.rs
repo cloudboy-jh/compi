@@ -870,6 +870,7 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compi_protocol::system_metrics::MonitorSource;
     use compi_protocol::{
         ContentEnvironment, ContentTab, FolderContent, GitScope, MonitorContent, MonitorPage,
         PaneContent, PaneSide, PaneView, SettingsContent, SettingsSection, SplitAxis,
@@ -1345,7 +1346,7 @@ mod tests {
     }
 
     /// `content_workspace` with Settings and Monitor panes beside the files pane, in
-    /// both arrangements.
+    /// both arrangements; the Monitor watches a WSL distribution.
     fn content_kinds_workspace() -> StoredWorkspace {
         let (mut workspace, files) = content_workspace(SurfaceStatus::Lost);
         let settings = LayoutNode::Content {
@@ -1358,6 +1359,9 @@ mod tests {
             pane_id: PaneId::new("pane-4"),
             content: PaneContent::Monitor(MonitorContent {
                 page: MonitorPage::Processes,
+                source: MonitorSource::Wsl {
+                    distribution: "Ubuntu".into(),
+                },
             }),
         };
         let terminal = LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1"));
@@ -1519,6 +1523,7 @@ mod tests {
         let view = PaneView {
             content: PaneContent::Monitor(MonitorContent {
                 page: MonitorPage::Processes,
+                source: MonitorSource::Host,
             }),
             side: PaneSide::Terminal,
         };

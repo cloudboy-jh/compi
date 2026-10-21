@@ -161,18 +161,33 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "compi settings terminal",
         ),
         ("monitor", Some("totals")) => (
-            "monitor totals [--history 1m|5m|15m|1h]",
-            "Print the host's totals from the daemon, with no window: CPU, memory used and available, swap, GPU, disk read/write and network down/up of the newest sample. --history adds every sample of that span ending at the newest (one every 2 seconds, up to an hour). --json returns {host, samples} with the protocol's host info and samples, oldest first; only the newest carries the per-core, volume and interface detail. Exits 1 with no_sample when the daemon has sampled nothing within 5 seconds.",
+            "monitor totals [--history 1m|5m|15m|1h] [--source SOURCE]",
+            "Print the host's totals from the daemon, with no window: CPU, memory used and available, swap, GPU, disk read/write and network down/up of the newest sample. --history adds every sample of that span ending at the newest (one every 2 seconds, up to an hour). --source host|wsl:NAME reads that source instead of the daemon's host (see compi monitor sources); an unknown one exits 2 with unknown_source. --json returns {source, host, samples} with the protocol's source, host info and samples, oldest first; only the newest carries the per-core, volume and interface detail. Exits 1 with no_sample when the daemon has sampled nothing within 5 seconds.",
             "compi --json monitor totals --history 5m",
         ),
         ("monitor", Some("list")) => (
-            "monitor list [--group] [--search TEXT]",
-            "Print the host's processes from the daemon, with no window, busiest first as Monitor's Processes table sorts them: PID, name, CPU (share of the whole machine), memory and user. Waits for the first sample with CPU values (about half a second). --search keeps processes whose name, command line, executable, user or PID contains every word, ignoring case. --group shows one row per app with its process count and sums; a search naming the app keeps all its processes. --json returns {sampled_at_ms, logical_cpus, apps_known, processes} (each process with its details and cpu_share) and, with --group, groups (id, name, pids and sums). Exits 1 with no_sample when no sample arrives within 5 seconds.",
+            "monitor list [--group] [--search TEXT] [--source SOURCE]",
+            "Print the host's processes from the daemon, with no window, busiest first as Monitor's Processes table sorts them: PID, name, CPU (share of the whole machine), memory and user. Waits for the first sample with CPU values (about half a second). --search keeps processes whose name, command line, executable, user or PID contains every word, ignoring case. --group shows one row per app with its process count and sums; a search naming the app keeps all its processes. --source host|wsl:NAME lists that source's processes instead of the daemon's host (see compi monitor sources); an unknown one exits 2 with unknown_source. --json returns {source, sampled_at_ms, logical_cpus, apps_known, processes} (each process with its details and cpu_share) and, with --group, groups (id, name, pids and sums). Exits 1 with no_sample when no sample arrives within 5 seconds.",
             "compi monitor list --group --search safari",
         ),
+        ("monitor", Some("sources")) => (
+            "monitor sources",
+            "List what Monitor can watch from the daemon, one per line as --source names it: host first, then, on a Windows daemon, wsl:NAME for each WSL 2 distribution. --json returns {sources} in the protocol's shape ({\"type\":\"host\"}, {\"type\":\"wsl\",\"distribution\":NAME}).",
+            "compi monitor sources",
+        ),
+        ("monitor", Some("inspect")) => (
+            "monitor inspect PID [--source SOURCE]",
+            "Print one process from a sample of the daemon's host (or --source host|wsl:NAME), with what the sample leaves out: name, PID, start time and how long it has run, user, state, working directory, executable, every argument, parent, CPU (share of the whole machine), memory and, when it runs in a Compi terminal, that terminal's surface and pane. --json returns the process as monitor list gives it, plus source, sampled_at_ms, inspection {state, working_directory, arguments, arguments_cut}, surface and pane_id. Exits 1 with no_process when no process has that PID, process_gone when it exits before it is read, and 2 with unknown_source for an unknown source.",
+            "compi monitor inspect 4120",
+        ),
+        ("monitor", Some("quit")) => (
+            "monitor quit PID [--force] [--source SOURCE]",
+            "Ask a process of the daemon's host (or --source host|wsl:NAME) to quit, as Monitor's Quit does: SIGTERM, or on Windows a close request to its windows. --force ends it at once (SIGKILL, or TerminateProcess), and unsaved work in it is lost. Asks first, naming the process and whether it runs in a Compi terminal; without a terminal to ask on it exits 4 with confirmation_required, and there is no bypass. The daemon signals only the process the PID named when it was looked up, never its group. Prints what was sent; --json returns {source, pid, start_time, name, force, outcome}. Exits 1 with no_process (no such PID), process_gone (it exited, or the PID was reused, first), permission_denied, no_window (Windows: nothing to close; use --force) or refused (the daemon will not signal it, with the reason); 2 with unknown_source for an unknown source; 4 with cancelled when the answer is not yes.",
+            "compi monitor quit 4120",
+        ),
         ("monitor", _) => (
-            "monitor [PAGE]\n       compi monitor totals [--history RANGE]\n       compi monitor list [--group] [--search TEXT]",
-            "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, gpu, disk or network; without it the pane keeps the page it shows, else Overview. From a Monitor pane (--pane), that pane changes page. monitor totals and monitor list print Monitor's data for scripts with no window; see compi monitor totals --help and compi monitor list --help.",
+            "monitor [PAGE] [--source SOURCE]\n       compi monitor totals [--history RANGE] [--source SOURCE]\n       compi monitor list [--group] [--search TEXT] [--source SOURCE]\n       compi monitor sources\n       compi monitor inspect PID [--source SOURCE]\n       compi monitor quit PID [--force] [--source SOURCE]",
+            "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, gpu, disk or network; without it the pane keeps the page it shows, else Overview. --source host|wsl:NAME shows that source (see compi monitor sources); without it the pane keeps the source it shows, else the daemon's host. From a Monitor pane (--pane), that pane changes page or source. monitor totals, list and inspect print Monitor's data for scripts with no window, monitor sources lists the sources and monitor quit quits a process; see each one's --help.",
             "compi monitor processes",
         ),
         ("command", Some("run")) => (
@@ -227,7 +242,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         _ => (
             "[GLOBAL OPTIONS] COMMAND [ARGS]",
-            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; settings; monitor [PAGE]/totals/list; command list/run; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
+            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; settings; monitor [PAGE]/totals/list/sources/inspect/quit; command list/run; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
             "compi --instance dev --json workspace list",
         ),
     };

@@ -5,7 +5,9 @@ mod kitty;
 
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
-use compi_protocol::system_metrics::{ProcessOwner, ProcessTable, SystemSample, TotalsSample};
+use compi_protocol::system_metrics::{
+    MonitorSource, ProcessOwner, ProcessTable, QuitOutcome, SystemSample, TotalsSample,
+};
 use compi_protocol::{
     ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, FolderContent,
     LayoutNode, PROTOCOL_VERSION, PaneContent, PaneSide, PaneView, ScreenSnapshot, ServerEvent,
@@ -1079,7 +1081,7 @@ fn watched_system_metrics_report_the_daemon_and_send_details_once_per_connection
     let mut daemon = DaemonGuard::start();
     let daemon_pid = daemon.child.id();
     let mut watcher = daemon.client();
-    watcher.watch_system_metrics().unwrap();
+    watcher.watch_system_metrics(MonitorSource::Host).unwrap();
     let mut table = ProcessTable::default();
 
     // The first sample names every process; the daemon is the user's own.
@@ -1119,7 +1121,7 @@ fn watched_system_metrics_report_the_daemon_and_send_details_once_per_connection
 
     // Another connection is told everything again.
     let mut other = daemon.client();
-    other.watch_system_metrics().unwrap();
+    other.watch_system_metrics(MonitorSource::Host).unwrap();
     let sample = next_sample(&mut other);
     assert!(
         sample
@@ -1129,6 +1131,86 @@ fn watched_system_metrics_report_the_daemon_and_send_details_once_per_connection
     );
 
     drop((watcher, other));
+    daemon.shutdown();
+}
+
+#[test]
+fn processes_in_a_surface_name_it_and_can_be_inspected_and_quit() {
+    let mut daemon = DaemonGuard::start();
+    let daemon_pid = daemon.child.id();
+    let mut control = daemon.client();
+    let session = control
+        .create_surface(80, 24, Some(daemon.directory.to_str().unwrap().to_owned()))
+        .unwrap();
+    let mut attached = Controller::attach(&daemon, &session, 80, 24);
+    attached.input(b"stty -echo; sleep 300 & echo $! > sleeper.pid\r");
+    let pid = read_pid(&daemon.directory.join("sleeper.pid")) as u32;
+
+    // A process in the surface's session names the surface; the daemon is in none.
+    let mut watcher = daemon.client();
+    watcher.watch_system_metrics(MonitorSource::Host).unwrap();
+    let processes = ProcessTable::default().apply(next_sample(&mut watcher).processes);
+    let sleeper = processes
+        .iter()
+        .find(|process| process.sample.pid == pid)
+        .expect("the sleeper is sampled");
+    assert_eq!(sleeper.details.surface.as_ref(), Some(&session.id));
+    let own = processes
+        .iter()
+        .find(|process| process.sample.pid == daemon_pid)
+        .unwrap();
+    assert_eq!(own.details.surface, None);
+
+    let started = sleeper.sample.start_time;
+    let inspection = control
+        .inspect_process(MonitorSource::Host, pid, started)
+        .unwrap()
+        .expect("the sleeper is running");
+    assert_eq!(
+        inspection.arguments,
+        Some(vec!["sleep".to_owned(), "300".to_owned()])
+    );
+    assert_eq!(
+        inspection.working_directory.map(PathBuf::from),
+        Some(daemon.directory.canonicalize().unwrap())
+    );
+    assert_eq!(
+        control
+            .inspect_process(MonitorSource::Host, pid, started + 1)
+            .unwrap(),
+        None
+    );
+
+    // Quitting checks the start time first and never signals the daemon itself.
+    let quit = |control: &mut DaemonClient, pid: u32, started: u64| {
+        control
+            .quit_process(MonitorSource::Host, pid, started, false)
+            .unwrap()
+    };
+    assert_eq!(quit(&mut control, pid, started + 1), QuitOutcome::Gone);
+    assert!(process_running(pid as libc::pid_t));
+    assert!(matches!(
+        quit(&mut control, daemon_pid, own.sample.start_time),
+        QuitOutcome::Refused { .. }
+    ));
+    assert_eq!(quit(&mut control, pid, started), QuitOutcome::Sent);
+    let deadline = Instant::now() + TIMEOUT;
+    while process_running(pid as libc::pid_t) {
+        assert!(Instant::now() < deadline, "the sleeper did not quit");
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    // A Unix daemon has no WSL distributions to watch.
+    assert_eq!(control.monitor_sources().unwrap(), [MonitorSource::Host]);
+    let wsl = MonitorSource::Wsl {
+        distribution: "Ubuntu".into(),
+    };
+    let error = control.watch_system_totals(wsl).unwrap_err();
+    assert_eq!(
+        error.downcast::<DaemonError>().unwrap().code,
+        ErrorCode::InvalidRequest
+    );
+    drop((attached, watcher));
     daemon.shutdown();
 }
 
@@ -1155,7 +1237,7 @@ fn next_sample(client: &mut DaemonClient) -> SystemSample {
 fn system_totals_arrive_in_order_after_the_kept_history() {
     let mut daemon = DaemonGuard::start();
     let mut watcher = daemon.client();
-    let (host, history) = watcher.watch_system_totals().unwrap();
+    let (host, history) = watcher.watch_system_totals(MonitorSource::Host).unwrap();
     assert!(host.logical_cpus >= 1);
     // The daemon samples from the start, whether or not anyone watches.
     let mut previous = history.last().map(|sample| sample.sequence);
@@ -1182,7 +1264,7 @@ fn system_totals_arrive_in_order_after_the_kept_history() {
     // A later watcher is given the history the first one saw arrive, with the detail on
     // the newest sample only.
     let mut other = daemon.client();
-    let (_, history) = other.watch_system_totals().unwrap();
+    let (_, history) = other.watch_system_totals(MonitorSource::Host).unwrap();
     assert!(
         history
             .iter()

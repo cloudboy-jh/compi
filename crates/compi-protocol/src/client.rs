@@ -704,25 +704,86 @@ impl DaemonClient {
         }
     }
 
-    /// Starts receiving `SystemSampled` events on this connection. Use a connection of
-    /// its own and drop it to stop: the daemon samples only while someone watches.
-    pub fn watch_system_metrics(&mut self) -> Result<()> {
-        match self.request_bounded(ClientMessage::WatchSystemMetrics, Duration::from_secs(5))? {
+    /// Starts receiving `SystemSampled` events of `source` on this connection. Use a
+    /// connection of its own and drop it to stop: the daemon samples only while someone
+    /// watches.
+    pub fn watch_system_metrics(
+        &mut self,
+        source: crate::system_metrics::MonitorSource,
+    ) -> Result<()> {
+        match self.request_bounded(
+            ClientMessage::WatchSystemMetrics { source },
+            Duration::from_secs(10),
+        )? {
             ServerMessage::SystemMetricsWatching => Ok(()),
             message => Err(unexpected_response(message)),
         }
     }
 
-    /// Starts receiving `SystemTotalsSampled` events on this connection, after returning
-    /// the host and the last hour of totals, oldest first.
+    /// Starts receiving `SystemTotalsSampled` events of `source` on this connection, after
+    /// returning its host and kept totals, oldest first.
     pub fn watch_system_totals(
         &mut self,
+        source: crate::system_metrics::MonitorSource,
     ) -> Result<(
         crate::system_metrics::HostInfo,
         Vec<crate::system_metrics::TotalsSample>,
     )> {
-        match self.request_bounded(ClientMessage::WatchSystemTotals, Duration::from_secs(5))? {
+        match self.request_bounded(
+            ClientMessage::WatchSystemTotals { source },
+            Duration::from_secs(10),
+        )? {
             ServerMessage::SystemTotalsWatching { host, history } => Ok((host, history)),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// What Monitor can watch from this daemon: the host first, then any WSL distributions.
+    pub fn monitor_sources(&mut self) -> Result<Vec<crate::system_metrics::MonitorSource>> {
+        match self.request_bounded(ClientMessage::ListMonitorSources, Duration::from_secs(10))? {
+            ServerMessage::MonitorSourcesListed { sources } => Ok(sources),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// What a sample leaves out for the process `(pid, start_time)`; `None` once it is gone.
+    pub fn inspect_process(
+        &mut self,
+        source: crate::system_metrics::MonitorSource,
+        pid: u32,
+        start_time: u64,
+    ) -> Result<Option<crate::system_metrics::ProcessInspection>> {
+        match self.request_bounded(
+            ClientMessage::InspectProcess {
+                source,
+                pid,
+                start_time,
+            },
+            Duration::from_secs(10),
+        )? {
+            ServerMessage::ProcessInspected { inspection } => Ok(inspection),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Asks the process `(pid, start_time)` to quit, or with `force` ends it.
+    pub fn quit_process(
+        &mut self,
+        source: crate::system_metrics::MonitorSource,
+        pid: u32,
+        start_time: u64,
+        force: bool,
+    ) -> Result<crate::system_metrics::QuitOutcome> {
+        match self.request_bounded(
+            ClientMessage::QuitProcess {
+                source,
+                pid,
+                start_time,
+                force,
+            },
+            Duration::from_secs(10),
+        )? {
+            ServerMessage::ProcessQuitAnswered { outcome } => Ok(outcome),
             message => Err(unexpected_response(message)),
         }
     }

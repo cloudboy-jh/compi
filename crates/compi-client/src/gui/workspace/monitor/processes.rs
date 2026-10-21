@@ -1,49 +1,65 @@
-//! Monitor's Processes page: the host's processes in a virtualized table, one row per
+//! Monitor's Processes page: a source's processes in a virtualized table, one row per
 //! app by default ("Group by app", per window) with its processes beneath it when
-//! expanded.
+//! expanded, and the inspector of the selected row beside it (or on a page of its own
+//! in a narrow pane; `inspector`).
 //!
 //! Which rows a pane shows, in what order and how their values read is pure
 //! (`crate::monitor` and `crate::monitor::apps`); the search, filter, sort, expanded
-//! apps and selection are this window's, per pane. While the pointer is over the table
-//! its rows keep their order (values update in place, newcomers go last, leavers go),
-//! and the table sorts again when the pointer leaves or the sort, search or filter
-//! changes.
+//! apps and selection are this window's, per pane, and the columns (`columns`) the
+//! window's. While the pointer is over the table its rows keep their order (values
+//! update in place, newcomers go last, leavers go), and the table sorts again when the
+//! pointer leaves or the sort, search or filter changes.
+use super::inspector::Inspection;
 use super::*;
 use crate::monitor::apps::{
     self, Arranged, Group, GroupUser, MemoryByApp, RowKey, RowKind, TableRow, View,
 };
-use crate::monitor::{self as listing, Column, Direction, Filter, Search, Sort, Step};
+use crate::monitor::layout::{Inspector, inspector_layout};
+use crate::monitor::{self as listing, Column, Filter, ProcessKey, Search, Sort, Step};
 use compi_protocol::system_metrics::{Process, ProcessDetails};
 use gpui::{ScrollStrategy, UniformListScrollHandle, uniform_list};
 
 /// One table row.
 const ROW_HEIGHT: f32 = 24.0;
 /// The table's inset from the page's edges.
-const TABLE_INSET: f32 = 12.0;
+pub(super) const TABLE_INSET: f32 = 12.0;
 /// Narrower than this, the toolbar drops its process count.
 const TOOLBAR_COUNT_MIN_WIDTH: f32 = 480.0;
 /// Longest command line a name's tooltip shows.
 const TOOLTIP_COMMAND_CHARS: usize = 400;
 /// A row's app icon, and the room a fold chevron takes before it.
-const ROW_ICON: f32 = 16.0;
+pub(super) const ROW_ICON: f32 = 16.0;
 const FOLD_WIDTH: f32 = 16.0;
 /// Apps Memory by app shows by name; the rest are Other.
 const MEMORY_APPS: usize = 7;
 
-/// The window's processes, shared by its Monitor panes.
+/// A source's processes, shared by the window's Monitor panes showing it.
 #[derive(Default)]
 pub(super) struct ProcessFeed {
     pub(super) slot: WatchSlot,
     pub(super) state: FeedState,
     pub(super) processes: Vec<Process>,
-    logical_cpus: u32,
+    pub(super) logical_cpus: u32,
     apps_known: bool,
     /// The newest sample while Monitor is paused, shown when it resumes.
     pending: Option<ProcessesSample>,
-    /// One row per process rather than per app: "Group by app" is off in this window.
-    flat: bool,
     /// Memory by app over the processes shown, for Overview.
     pub(super) memory: MemoryByApp,
+}
+
+impl ProcessFeed {
+    /// How many processes the source runs, once known.
+    pub(super) fn count(&self) -> Option<usize> {
+        matches!(self.state, FeedState::Live | FeedState::Stale).then_some(self.processes.len())
+    }
+
+    /// The process `key` names, while it runs.
+    pub(super) fn find(&self, key: &ProcessKey) -> Option<(usize, &Process)> {
+        self.processes
+            .iter()
+            .enumerate()
+            .find(|(_, process)| listing::key(process) == *key)
+    }
 }
 
 /// One pane's view of the processes.
@@ -51,10 +67,10 @@ pub(super) struct ProcessList {
     pub(super) search: Entity<InputState>,
     query: Search,
     filter: Filter,
-    sort: Sort,
+    pub(super) sort: Sort,
     /// The rows shown, their keys and the apps they refer to.
-    table: Arranged,
-    selected: Option<RowKey>,
+    pub(super) table: Arranged,
+    pub(super) selected: Option<RowKey>,
     /// Apps whose processes show beneath them, by group id.
     expanded: HashSet<String>,
     /// The pointer is over the table, so its rows keep their order.
@@ -62,7 +78,41 @@ pub(super) struct ProcessList {
     scroll: UniformListScrollHandle,
     /// Rows the table showed at its last draw: Page Up and Page Down move by it.
     page_rows: usize,
+    /// The page was wide enough at its last draw for the inspector beside the table.
+    pub(super) wide: Cell<bool>,
+    /// The selection's page of its own is open (narrow panes; Back closes it).
+    pub(super) detail: bool,
+    /// What the daemon said of the selected process, while an inspector shows it.
+    pub(super) inspection: Option<Inspection>,
+    /// The table's width at its last draw, for header drags.
+    pub(super) table_width: Cell<f32>,
     _events: Subscription,
+}
+
+impl ProcessList {
+    /// The process selected, when the selection is one rather than an app.
+    pub(super) fn selected_process(&self) -> Option<ProcessKey> {
+        match self.selected {
+            Some(RowKey::Process(key)) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// Whether an inspector shows the selection: beside a wide table, or on its page.
+    pub(super) fn inspecting(&self) -> bool {
+        self.selected.is_some() && (self.wide.get() || self.detail)
+    }
+
+    /// The pane now shows another source's `feed`: what was selected and expanded
+    /// there means nothing here.
+    pub(super) fn show_source(&mut self, feed: &ProcessFeed, flat: bool) {
+        self.selected = None;
+        self.detail = false;
+        self.inspection = None;
+        self.expanded.clear();
+        arrange(self, feed, flat, false);
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
 }
 
 /// Filter that the feed can answer: Apps means nothing where the host can't tell apps.
@@ -74,15 +124,16 @@ fn effective_filter(filter: Filter, apps_known: bool) -> Filter {
     }
 }
 
-/// Orders `list`'s rows from `feed`: held in their last order while the pointer is over
-/// the table and `hold`, else sorted. A selection no longer shown moves to the row that
-/// now shows it (an app that became a single process), else is cleared.
-fn arrange(list: &mut ProcessList, feed: &ProcessFeed, hold: bool) {
+/// Orders `list`'s rows from `feed`, by app unless `flat`: held in their last order
+/// while the pointer is over the table and `hold`, else sorted. A selection no longer
+/// shown moves to the row that now shows it (an app that became a single process),
+/// else is cleared.
+fn arrange(list: &mut ProcessList, feed: &ProcessFeed, flat: bool, hold: bool) {
     let view = View {
         filter: effective_filter(list.filter, feed.apps_known),
         search: &list.query,
         sort: list.sort,
-        grouped: !feed.flat,
+        grouped: !flat,
         expanded: &list.expanded,
     };
     let held = (hold && list.pointer).then_some(list.table.keys.as_slice());
@@ -91,6 +142,42 @@ fn arrange(list: &mut ProcessList, feed: &ProcessFeed, hold: bool) {
     if let Some(selected) = list.selected.take() {
         list.selected = apps::find_row(&list.table, &feed.processes, &selected)
             .map(|row| list.table.keys[row].clone());
+    }
+    if list.selected.is_none() {
+        list.detail = false;
+    }
+}
+
+/// Pane `pane_id`'s list, the processes of its source and whether the window lists
+/// them one row per process.
+fn pane_list<'a>(
+    ui: &'a mut MonitorUi,
+    pane_id: &PaneId,
+) -> Option<(&'a mut ProcessList, &'a ProcessFeed, bool)> {
+    let MonitorUi {
+        panes,
+        sources,
+        unread,
+        flat,
+        ..
+    } = ui;
+    let pane = panes.get_mut(pane_id)?;
+    let feed = &sources.get(&pane.source).unwrap_or(unread).processes;
+    Some((&mut pane.list, feed, *flat))
+}
+
+/// Every list showing `source`, rearranged from its feed.
+fn arrange_source(ui: &mut MonitorUi, source: &MonitorSource, hold: bool) {
+    let MonitorUi {
+        panes,
+        sources,
+        unread,
+        flat,
+        ..
+    } = ui;
+    let feed = &sources.get(source).unwrap_or(unread).processes;
+    for pane in panes.values_mut().filter(|pane| pane.source == *source) {
+        arrange(&mut pane.list, feed, *flat, hold);
     }
 }
 
@@ -204,15 +291,12 @@ fn process_search_events(
             return;
         }
         let query = Search::new(&search.read(cx).value());
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut this.monitor;
-        let Some(list) = panes.get_mut(&changed).map(|pane| &mut pane.list) else {
+        let Some((list, feed, flat)) = pane_list(&mut this.monitor, &changed) else {
             return;
         };
         if list.query != query {
             list.query = query;
-            arrange(list, processes, false);
+            arrange(list, feed, flat, false);
             list.scroll.scroll_to_item(0, ScrollStrategy::Top);
             cx.notify();
         }
@@ -223,6 +307,7 @@ impl CompiApp {
     pub(super) fn new_process_list(
         &self,
         pane_id: &PaneId,
+        source: &MonitorSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> ProcessList {
@@ -239,98 +324,153 @@ impl CompiApp {
             pointer: false,
             scroll: UniformListScrollHandle::new(),
             page_rows: 1,
+            wide: Cell::new(false),
+            detail: false,
+            inspection: None,
+            table_width: Cell::new(0.0),
             _events: events,
         };
-        arrange(&mut list, &self.monitor.processes, false);
+        arrange(
+            &mut list,
+            &self.monitor.feeds(source).processes,
+            self.monitor.flat,
+            false,
+        );
         list
     }
 
-    /// Forgets every process: what is not current is not shown.
-    pub(super) fn reset_process_feed(&mut self, state: FeedState) {
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut self.monitor;
+    /// Forgets every process of `source`: what is not current is not shown.
+    pub(super) fn reset_process_feed(&mut self, source: &MonitorSource, state: FeedState) {
+        let Some(feeds) = self.monitor.sources.get_mut(source) else {
+            return;
+        };
+        let processes = &mut feeds.processes;
         processes.state = state;
         processes.processes.clear();
         processes.memory = MemoryByApp::default();
         processes.pending = None;
-        for pane in panes.values_mut() {
-            arrange(&mut pane.list, processes, false);
-        }
+        feeds.history.clear();
+        arrange_source(&mut self.monitor, source, false);
     }
 
-    pub(super) fn processes_event(&mut self, generation: u64, event: ProcessesEvent) {
-        if !self.monitor.processes.slot.is_current(generation) {
+    pub(super) fn processes_event(
+        &mut self,
+        source: &MonitorSource,
+        generation: u64,
+        event: ProcessesEvent,
+    ) {
+        let paused = self.monitor.paused;
+        let Some(feeds) = self
+            .monitor
+            .sources
+            .get_mut(source)
+            .filter(|feeds| feeds.processes.slot.is_current(generation))
+        else {
             // A watcher stopped since.
             return;
-        }
+        };
         match event {
-            ProcessesEvent::Connecting => self.reset_process_feed(FeedState::Connecting),
-            ProcessesEvent::Failed(error) => self.reset_process_feed(FeedState::Failed(error)),
+            ProcessesEvent::Connecting => self.reset_process_feed(source, FeedState::Connecting),
+            ProcessesEvent::Failed(error) => {
+                self.reset_process_feed(source, FeedState::Failed(error));
+            }
             ProcessesEvent::Stale => {
-                let feed = &mut self.monitor.processes;
-                if feed.state == FeedState::Live {
-                    feed.state = FeedState::Stale;
+                if feeds.processes.state == FeedState::Live {
+                    feeds.processes.state = FeedState::Stale;
                 }
             }
             ProcessesEvent::Sampled(sample) => {
+                // History records every sample, paused or not.
+                feeds.history.record(&sample.processes);
                 // Paused, the table and Memory by app keep what they show until Monitor
                 // resumes; the first sample always shows, so a pause never leaves them
                 // empty.
-                if self.monitor.paused && !self.monitor.processes.processes.is_empty() {
-                    self.monitor.processes.pending = Some(sample);
+                if paused && !feeds.processes.processes.is_empty() {
+                    feeds.processes.pending = Some(sample);
                 } else {
-                    self.show_process_sample(sample);
+                    self.show_process_sample(source, sample);
                 }
             }
         }
     }
 
-    fn show_process_sample(&mut self, sample: ProcessesSample) {
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut self.monitor;
+    fn show_process_sample(&mut self, source: &MonitorSource, sample: ProcessesSample) {
+        let Some(processes) = self
+            .monitor
+            .sources
+            .get_mut(source)
+            .map(|feeds| &mut feeds.processes)
+        else {
+            return;
+        };
         processes.state = FeedState::Live;
         processes.processes = sample.processes;
         processes.logical_cpus = sample.logical_cpus;
         processes.apps_known = sample.apps_known;
         processes.memory = apps::memory_by_app(&processes.processes, MEMORY_APPS);
-        for pane in panes.values_mut() {
-            arrange(&mut pane.list, processes, true);
-        }
+        arrange_source(&mut self.monitor, source, true);
     }
 
-    /// Monitor resumed: the newest sample received while paused shows.
+    /// Monitor resumed: the newest sample of each source received while paused shows.
     pub(super) fn resume_processes(&mut self) {
-        if let Some(sample) = self.monitor.processes.pending.take() {
-            self.show_process_sample(sample);
+        let pending: Vec<(MonitorSource, ProcessesSample)> = self
+            .monitor
+            .sources
+            .iter_mut()
+            .filter_map(|(source, feeds)| Some((source.clone(), feeds.processes.pending.take()?)))
+            .collect();
+        for (source, sample) in pending {
+            self.show_process_sample(&source, sample);
         }
     }
 
-    /// How many processes the host runs, once known.
-    pub(super) fn process_count(&self) -> Option<usize> {
-        let feed = &self.monitor.processes;
-        matches!(feed.state, FeedState::Live | FeedState::Stale).then_some(feed.processes.len())
+    /// Opens the Processes page on `key` (an app from Memory by app, or a process the
+    /// inspector links to): its app expanded, its row selected and scrolled into view.
+    /// Whether a row shows it; the search or filter may hide it.
+    pub(super) fn reveal_process_row(&mut self, pane_id: &PaneId, key: RowKey) -> bool {
+        self.set_monitor_page(pane_id, MonitorPage::Processes);
+        let Some((list, feed, flat)) = pane_list(&mut self.monitor, pane_id) else {
+            return false;
+        };
+        let app = match &key {
+            RowKey::Group(id) => Some(id.clone()),
+            RowKey::Process(key) => feed
+                .find(key)
+                .and_then(|(_, process)| process.details.app_group.as_ref())
+                .map(|app| app.id.clone()),
+        };
+        if let Some(app) = app.filter(|_| !flat) {
+            list.expanded.insert(app);
+        }
+        arrange(list, feed, flat, false);
+        let Some(row) = apps::find_row(&list.table, &feed.processes, &key) else {
+            return false;
+        };
+        list.selected = Some(list.table.keys[row].clone());
+        list.scroll.scroll_to_item(row, ScrollStrategy::Center);
+        true
     }
 
-    /// Opens the Processes page on `key` (an app from Memory by app): the app expanded,
-    /// its row selected and scrolled into view.
-    pub(super) fn reveal_process_row(&mut self, pane_id: &PaneId, key: RowKey) {
-        self.set_monitor_page(pane_id, MonitorPage::Processes);
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut self.monitor;
-        let Some(list) = panes.get_mut(pane_id).map(|pane| &mut pane.list) else {
+    /// Selects process `key` in pane `pane_id`, clearing the search and filter when
+    /// they hide it.
+    pub(super) fn select_process(
+        &mut self,
+        pane_id: &PaneId,
+        key: ProcessKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reveal_process_row(pane_id, RowKey::Process(key)) {
+            return;
+        }
+        let Some(pane) = self.monitor.panes.get_mut(pane_id) else {
             return;
         };
-        if let RowKey::Group(id) = &key {
-            list.expanded.insert(id.clone());
-        }
-        arrange(list, processes, false);
-        if let Some(row) = apps::find_row(&list.table, &processes.processes, &key) {
-            list.selected = Some(list.table.keys[row].clone());
-            list.scroll.scroll_to_item(row, ScrollStrategy::Center);
-        }
+        pane.list.filter = Filter::All;
+        pane.list.query = Search::default();
+        let search = pane.list.search.clone();
+        search.update(cx, |search, cx| search.set_value("", window, cx));
+        self.reveal_process_row(pane_id, RowKey::Process(key));
     }
 
     /// The focused Monitor pane's search field has the keyboard.
@@ -415,14 +555,11 @@ impl CompiApp {
     }
 
     fn set_process_filter(&mut self, pane_id: &PaneId, filter: Filter) {
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut self.monitor;
-        if let Some(list) = panes.get_mut(pane_id).map(|pane| &mut pane.list)
+        if let Some((list, feed, flat)) = pane_list(&mut self.monitor, pane_id)
             && list.filter != filter
         {
             list.filter = filter;
-            arrange(list, processes, false);
+            arrange(list, feed, flat, false);
             list.scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
     }
@@ -430,24 +567,26 @@ impl CompiApp {
     /// Turns "Group by app" on or off in this window.
     fn set_group_by_app(&mut self, grouped: bool) {
         let MonitorUi {
-            panes, processes, ..
+            panes,
+            sources,
+            unread,
+            flat,
+            ..
         } = &mut self.monitor;
-        if processes.flat != grouped {
+        if *flat != grouped {
             return;
         }
-        processes.flat = !grouped;
+        *flat = !grouped;
         for pane in panes.values_mut() {
-            arrange(&mut pane.list, processes, false);
+            let feed = &sources.get(&pane.source).unwrap_or(unread).processes;
+            arrange(&mut pane.list, feed, *flat, false);
         }
     }
 
     /// Expands or collapses app `id` (`open`, or the other way when `None`). The rows
     /// keep their order while the pointer is over the table.
     fn fold_process_group(&mut self, pane_id: &PaneId, id: &str, open: Option<bool>) {
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut self.monitor;
-        let Some(list) = panes.get_mut(pane_id).map(|pane| &mut pane.list) else {
+        let Some((list, feed, flat)) = pane_list(&mut self.monitor, pane_id) else {
             return;
         };
         let open = open.unwrap_or(!list.expanded.contains(id));
@@ -457,7 +596,7 @@ impl CompiApp {
             list.expanded.remove(id)
         };
         if changed {
-            arrange(list, processes, true);
+            arrange(list, feed, flat, true);
             if let Some(row) = list
                 .selected
                 .as_ref()
@@ -519,13 +658,10 @@ impl CompiApp {
         }
     }
 
-    fn sort_process_table(&mut self, pane_id: &PaneId, column: Column) {
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut self.monitor;
-        if let Some(list) = panes.get_mut(pane_id).map(|pane| &mut pane.list) {
+    pub(super) fn sort_process_table(&mut self, pane_id: &PaneId, column: Column) {
+        if let Some((list, feed, flat)) = pane_list(&mut self.monitor, pane_id) {
             list.sort = list.sort.clicked(column);
-            arrange(list, processes, false);
+            arrange(list, feed, flat, false);
             if let Some(at) = list
                 .selected
                 .as_ref()
@@ -538,10 +674,7 @@ impl CompiApp {
 
     /// The pointer entered or left the table; leaving sorts it again.
     fn hover_process_table(&mut self, pane_id: &PaneId, hovered: bool) -> bool {
-        let MonitorUi {
-            panes, processes, ..
-        } = &mut self.monitor;
-        let Some(list) = panes.get_mut(pane_id).map(|pane| &mut pane.list) else {
+        let Some((list, feed, flat)) = pane_list(&mut self.monitor, pane_id) else {
             return false;
         };
         if list.pointer == hovered {
@@ -549,9 +682,25 @@ impl CompiApp {
         }
         list.pointer = hovered;
         if !hovered {
-            arrange(list, processes, false);
+            arrange(list, feed, flat, false);
         }
         !hovered
+    }
+
+    /// Opens the selection's page of its own, where the pane is too narrow for the
+    /// inspector beside the table; whether it opened.
+    pub(super) fn open_process_detail(&mut self, pane_id: &PaneId) -> bool {
+        let Some(list) = self
+            .monitor
+            .panes
+            .get_mut(pane_id)
+            .map(|pane| &mut pane.list)
+            .filter(|list| list.selected.is_some() && !list.wide.get())
+        else {
+            return false;
+        };
+        list.detail = true;
+        true
     }
 
     /// Keys on the Processes page that its search field left alone; whether it took
@@ -566,10 +715,23 @@ impl CompiApp {
         let Some(list) = self.monitor.panes.get(pane_id).map(|pane| &pane.list) else {
             return false;
         };
-        let (page_rows, search, has_selection) =
-            (list.page_rows, list.search.clone(), list.selected.is_some());
+        // The selection's page shows only in a narrow pane.
+        let (page_rows, search, has_selection, detail) = (
+            list.page_rows,
+            list.search.clone(),
+            list.selected.is_some(),
+            list.detail && !list.wide.get(),
+        );
+        let process_selected = list.selected_process().is_some();
         let modifiers = &key.modifiers;
         let plain = !modifiers.control && !modifiers.alt && !modifiers.platform;
+        if detail && key.key == "escape" && plain {
+            // Back to the table first.
+            if let Some(pane) = self.monitor.panes.get_mut(pane_id) {
+                pane.list.detail = false;
+            }
+            return true;
+        }
         let step = match key.key.as_str() {
             "up" => Some(Step::Up),
             "down" => Some(Step::Down),
@@ -586,6 +748,9 @@ impl CompiApp {
         }
         if plain && !modifiers.shift && self.fold_key(pane_id, &key.key) {
             return true;
+        }
+        if key.key == "enter" && plain && !modifiers.shift && process_selected {
+            return self.open_process_detail(pane_id);
         }
         if key.key == "escape" && plain && !search.read(cx).value().is_empty() {
             search.update(cx, |search, cx| search.set_value("", window, cx));
@@ -612,7 +777,8 @@ impl CompiApp {
     }
 
     /// The Processes page `width` pixels wide: search, filters and count, then the table
-    /// or what stands in for it.
+    /// or what stands in for it, with the selection's inspector beside it on a wide
+    /// page. A narrow page shows the selection's page of its own instead once opened.
     pub(super) fn render_processes_page(
         &self,
         pane_id: &PaneId,
@@ -621,8 +787,21 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let feed = &self.monitor.processes;
+        let feeds = self.monitor.feeds(&pane.source);
+        let feed = &feeds.processes;
         let list = &pane.list;
+        let placement = inspector_layout(width);
+        list.wide.set(placement != Inspector::FullPage);
+        let live = matches!(feed.state, FeedState::Live | FeedState::Stale);
+        if live && list.detail && list.selected.is_some() && placement == Inspector::FullPage {
+            return self.render_process_detail_page(pane_id, pane, feeds, cx);
+        }
+        let beside = match placement {
+            Inspector::Beside { table_width } if live && list.selected.is_some() => {
+                Some(table_width)
+            }
+            _ => None,
+        };
         let body = match &feed.state {
             FeedState::Connecting => self.monitor_message("Reading processes…", None),
             FeedState::Failed(error) => self.monitor_message(
@@ -641,7 +820,7 @@ impl CompiApp {
                 )
             }
             FeedState::Live | FeedState::Stale => {
-                self.render_process_table(pane_id, list, width, cx)
+                self.render_process_table(pane_id, list, beside.unwrap_or(width), cx)
             }
         };
         div()
@@ -650,11 +829,31 @@ impl CompiApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(self.render_process_toolbar(pane_id, list, width, cx))
+            .child(self.render_process_toolbar(pane_id, list, feed, width, cx))
             .when(feed.state == FeedState::Stale, |page| {
                 page.child(self.monitor_stale_note())
             })
-            .child(body)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .child(div().flex_1().min_w_0().min_h_0().flex().child(body))
+                    .when(beside.is_some(), |page| {
+                        page.child(
+                            div()
+                                .flex_none()
+                                .w(px(layout::INSPECTOR_WIDTH))
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .border_l_1()
+                                .border_color(color(colors.border))
+                                .child(self.render_inspector(pane_id, pane, feeds, cx)),
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -663,12 +862,12 @@ impl CompiApp {
         &self,
         pane_id: &PaneId,
         list: &ProcessList,
+        feed: &ProcessFeed,
         width: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let feed = &self.monitor.processes;
         let current = effective_filter(list.filter, feed.apps_known);
         let filters = controls::segmented(
             "monitor-filter",
@@ -686,7 +885,7 @@ impl CompiApp {
                         }))
                 }),
         );
-        let grouped = !feed.flat;
+        let grouped = !self.monitor.flat;
         let group_switch = div()
             .flex_none()
             .flex()
@@ -745,7 +944,8 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The column headings (click to sort) over the rows, drawn as they scroll in.
+    /// The column headings (click to sort, drag to move, drag a seam to resize,
+    /// right-click to show or hide columns) over the rows, drawn as they scroll in.
     fn render_process_table(
         &self,
         pane_id: &PaneId,
@@ -754,41 +954,20 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let columns = listing::visible_columns(width - 2.0 * TABLE_INSET);
+        let layout = &self.state.monitor_columns;
+        let table_width = (width - 2.0 * TABLE_INSET).max(0.0);
+        list.table_width.set(table_width);
+        let columns: Vec<(Column, f32)> = layout
+            .visible_columns(table_width)
+            .into_iter()
+            .map(|column| (column, layout.width(column)))
+            .collect();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let headings = columns.iter().enumerate().map(|(index, &column)| {
-            let sorted = list.sort.column == column;
-            let arrow = sorted.then(|| {
-                controls::glyph(
-                    match list.sort.direction {
-                        Direction::Ascending => IconName::ArrowUp,
-                        Direction::Descending => IconName::ArrowDown,
-                    },
-                    muted,
-                )
-            });
-            // The arrow sits on the inner side: before right-aligned labels, after others.
-            let (before, after) = if column.numeric() {
-                (arrow, None)
-            } else {
-                (None, arrow)
-            };
-            let pane_id = pane_id.clone();
-            process_cell(div().id(("monitor-column", index)), column)
-                .gap_1()
-                .cursor_pointer()
-                .rounded_sm()
-                .hover(move |style| style.bg(color(colors.surface_hover)))
-                .when(sorted, |cell| cell.font_weight(FontWeight::SEMIBOLD))
-                .children(before)
-                .child(column.label())
-                .children(after)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.sort_process_table(&pane_id, column);
-                    cx.notify();
-                }))
+        let headings = columns.iter().enumerate().map(|(index, &(column, width))| {
+            self.render_column_header(pane_id, list, (index, column, width), &columns, cx)
         });
         let header = div()
+            .id("monitor-columns")
             .flex_none()
             .h(px(ROW_HEIGHT + 4.0))
             .px(px(TABLE_INSET))
@@ -798,6 +977,13 @@ impl CompiApp {
             .border_color(color(colors.border))
             .text_size(px(UI_MICRO_TEXT_SIZE))
             .text_color(muted)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.open_columns_menu(event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .children(headings);
         let list_pane = pane_id.clone();
         let hover_pane = pane_id.clone();
@@ -854,7 +1040,12 @@ impl CompiApp {
     ) -> Stateful<Div> {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let cell = process_cell(div().id(("monitor-name", index)), Column::Name).gap_1();
+        let cell = process_cell(
+            div().id(("monitor-name", index)),
+            Column::Name,
+            listing::NAME_MIN_WIDTH,
+        )
+        .gap_1();
         match row.kind {
             RowKind::Group(group) => {
                 let group = &table.groups[group];
@@ -921,20 +1112,23 @@ impl CompiApp {
         }
     }
 
-    /// The table rows in `range`. The selection is filled in the accent while the table
-    /// has the keyboard (`keyboard`), quieter otherwise.
+    /// The table rows in `range`, with `columns` at their widths. The selection is
+    /// filled in the accent while the table has the keyboard (`keyboard`), quieter
+    /// otherwise. A double click opens a narrow pane's page of the row; a right click
+    /// its menu.
     fn render_process_rows(
         &self,
         pane_id: &PaneId,
-        columns: &[Column],
+        columns: &[(Column, f32)],
         range: Range<usize>,
         keyboard: bool,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
-        let Some(list) = self.monitor.panes.get(pane_id).map(|pane| &pane.list) else {
+        let Some(pane) = self.monitor.panes.get(pane_id) else {
             return Vec::new();
         };
-        let feed = &self.monitor.processes;
+        let list = &pane.list;
+        let feed = &self.monitor.feeds(&pane.source).processes;
         let table = &list.table;
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
@@ -949,51 +1143,59 @@ impl CompiApp {
                 let row = *table.rows.get(index)?;
                 let key = table.keys.get(index)?.clone();
                 let selected = list.selected.as_ref() == Some(&key);
-                let cells = columns.iter().enumerate().map(|(position, &column)| {
-                    if column == Column::Name {
-                        return self
-                            .render_name_cell(
-                                pane_id,
-                                index,
-                                row,
-                                table,
-                                &feed.processes,
-                                !feed.flat,
-                                cx,
-                            )
-                            .into_any_element();
-                    }
-                    let text = match row.kind {
-                        RowKind::Process(process) => {
-                            process_cell_text(&feed.processes[process], column, feed.logical_cpus)
+                let cells = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &(column, cell_width))| {
+                        if column == Column::Name {
+                            return self
+                                .render_name_cell(
+                                    pane_id,
+                                    index,
+                                    row,
+                                    table,
+                                    &feed.processes,
+                                    !self.monitor.flat,
+                                    cx,
+                                )
+                                .into_any_element();
                         }
-                        RowKind::Group(group) => {
-                            group_cell_text(&table.groups[group], column, feed.logical_cpus)
+                        let text = match row.kind {
+                            RowKind::Process(process) => process_cell_text(
+                                &feed.processes[process],
+                                column,
+                                feed.logical_cpus,
+                            ),
+                            RowKind::Group(group) => {
+                                group_cell_text(&table.groups[group], column, feed.logical_cpus)
+                            }
+                        };
+                        let cell = process_cell(
+                            div().id(("monitor-cell", index * width + position)),
+                            column,
+                            cell_width,
+                        );
+                        match text {
+                            CellText::Value(text) => cell.child(cell_text(text)),
+                            CellText::Quiet(text) => cell.text_color(muted).child(cell_text(text)),
+                            CellText::Unavailable { withheld: true } => cell
+                                .text_color(muted)
+                                .child(UNAVAILABLE)
+                                .tooltip(controls::tooltip(
+                                    "Not available",
+                                    Some(
+                                        "This host doesn't let Compi read other users' processes"
+                                            .into(),
+                                    ),
+                                    None,
+                                )),
+                            CellText::Unavailable { withheld: false } => {
+                                cell.text_color(muted).child(UNAVAILABLE)
+                            }
                         }
-                    };
-                    let cell =
-                        process_cell(div().id(("monitor-cell", index * width + position)), column);
-                    match text {
-                        CellText::Value(text) => cell.child(cell_text(text)),
-                        CellText::Quiet(text) => cell.text_color(muted).child(cell_text(text)),
-                        CellText::Unavailable { withheld: true } => cell
-                            .text_color(muted)
-                            .child(UNAVAILABLE)
-                            .tooltip(controls::tooltip(
-                                "Not available",
-                                Some(
-                                    "This host doesn't let Compi read other users' processes"
-                                        .into(),
-                                ),
-                                None,
-                            )),
-                        CellText::Unavailable { withheld: false } => {
-                            cell.text_color(muted).child(UNAVAILABLE)
-                        }
-                    }
-                    .into_any_element()
-                });
-                let pane = pane_id.clone();
+                        .into_any_element()
+                    });
+                let (pane, menu_pane, menu_key) = (pane_id.clone(), pane_id.clone(), key.clone());
                 Some(
                     div()
                         .id(("monitor-row", index))
@@ -1006,13 +1208,29 @@ impl CompiApp {
                         .when(!selected, |row| {
                             row.hover(move |style| style.bg(color(colors.surface_hover)))
                         })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             if let Some(ui) = this.monitor.panes.get_mut(&pane) {
                                 ui.list.selected = Some(key.clone());
                                 window.focus(&ui.focus, cx);
                             }
+                            if event.click_count() == 2 {
+                                this.open_process_detail(&pane);
+                            }
                             cx.notify();
                         }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.open_process_row_menu(
+                                    &menu_pane,
+                                    menu_key.clone(),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        )
                         .children(cells)
                         .into_any_element(),
                 )
@@ -1021,9 +1239,9 @@ impl CompiApp {
     }
 }
 
-/// A table cell of `column`: Name takes the room the others leave; amounts are
-/// right-aligned. One line, cut with an ellipsis.
-fn process_cell(cell: Stateful<Div>, column: Column) -> Stateful<Div> {
+/// A table cell of `column`, `width` wide: Name takes the room the others leave, at
+/// least `width`; amounts are right-aligned. One line, cut with an ellipsis.
+pub(super) fn process_cell(cell: Stateful<Div>, column: Column, width: f32) -> Stateful<Div> {
     let cell = cell
         .h_full()
         .px_2()
@@ -1033,9 +1251,9 @@ fn process_cell(cell: Stateful<Div>, column: Column) -> Stateful<Div> {
         .whitespace_nowrap()
         .text_ellipsis();
     let cell = if column == Column::Name {
-        cell.flex_1().min_w(px(listing::NAME_MIN_WIDTH))
+        cell.flex_1().min_w(px(width))
     } else {
-        cell.flex_none().w(px(column.width()))
+        cell.flex_none().w(px(width))
     };
     if column.numeric() {
         cell.justify_end()

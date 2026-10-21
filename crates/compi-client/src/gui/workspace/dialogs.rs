@@ -262,6 +262,27 @@ impl CompiApp {
                 "End work and restart daemon",
             ),
             Some(Overlay::Confirm { title, action, .. }) => (*action, title.clone(), *action),
+            Some(Overlay::ConfirmQuitProcess {
+                pid,
+                name,
+                force,
+                in_terminal,
+                ..
+            }) => {
+                let mut message = if *force {
+                    format!("Force quit {name} (PID {pid})? Unsaved work in it is lost.")
+                } else {
+                    format!("Quit {name} (PID {pid})?")
+                };
+                if *in_terminal {
+                    message.push_str(" It runs in a Compi terminal.");
+                }
+                if *force {
+                    ("Force quit process", message, "Force quit")
+                } else {
+                    ("Quit process", message, "Quit")
+                }
+            }
             _ => ("", String::new(), ""),
         };
         self.render_centered_scrim(
@@ -1016,6 +1037,7 @@ impl CompiApp {
                 Overlay::Confirm { .. }
                     | Overlay::ConfirmDaemonRestart { .. }
                     | Overlay::ConfirmDiscard { .. }
+                    | Overlay::ConfirmQuitProcess { .. }
             )
         ) {
             match key.key.as_str() {
@@ -1080,7 +1102,11 @@ impl CompiApp {
             self.render_image_inspector(cx)
         } else if matches!(
             self.overlay,
-            Some(Overlay::Confirm { .. } | Overlay::ConfirmDaemonRestart { .. })
+            Some(
+                Overlay::Confirm { .. }
+                    | Overlay::ConfirmDaemonRestart { .. }
+                    | Overlay::ConfirmQuitProcess { .. }
+            )
         ) {
             self.render_confirmation_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Unsaved { .. })) {

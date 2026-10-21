@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 #[cfg(windows)]
@@ -44,6 +44,8 @@ const CLIENT_RECOVERY_QUEUE_BYTES: usize = 2 * frame::MAX_SCREEN_PAYLOAD;
 const CLIENT_QUEUE_BYTES: usize = CLIENT_RECOVERY_QUEUE_BYTES + frame::MAX_PAYLOAD;
 const MAX_PENDING_LATENCY_IDS: usize = 4_096;
 static NEXT_ATTACHMENT: AtomicU64 = AtomicU64::new(1);
+/// Every surface spawned, so Monitor can tell which processes run in one.
+static SPAWNED: Mutex<Vec<Weak<Surface>>> = Mutex::new(Vec::new());
 
 pub struct SurfaceManager {
     surfaces: Arc<Mutex<HashMap<SurfaceId, Arc<Surface>>>>,
@@ -76,6 +78,12 @@ pub struct Surface {
     metadata: crate::metadata::MetadataCache,
     shell_executable: Option<String>,
     distribution: Option<String>,
+    /// The PTY's session, which every process of the terminal is in unless it left.
+    #[cfg(unix)]
+    session_id: libc::pid_t,
+    /// The job every process of the terminal is in.
+    #[cfg(windows)]
+    job: OwnedHandle,
     #[cfg(unix)]
     metadata_fd: std::fs::File,
     program_status: Arc<ProgramStatusHub>,
@@ -512,6 +520,17 @@ impl SurfaceManager {
     }
 }
 
+/// Every spawned surface that is still current: running, or ended but still its pane's.
+pub(crate) fn live_surfaces() -> Vec<Arc<Surface>> {
+    let mut spawned = SPAWNED.lock().unwrap_or_else(PoisonError::into_inner);
+    spawned.retain(|surface| surface.strong_count() > 0);
+    spawned
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|surface| !surface.retired.load(Ordering::Acquire))
+        .collect()
+}
+
 impl Default for SurfaceManager {
     fn default() -> Self {
         Self::new()
@@ -618,6 +637,10 @@ impl Surface {
             );
         }
         #[cfg(unix)]
+        let session_id = pty.session_id();
+        #[cfg(windows)]
+        let job = pty.job()?;
+        #[cfg(unix)]
         let metadata_fd = pty.metadata_fd()?;
         let (input, mut output) = pty.take_io()?;
         let (command_sender, command_receiver) = sync_channel(64);
@@ -687,9 +710,18 @@ impl Surface {
             shell_executable,
             distribution,
             #[cfg(unix)]
+            session_id,
+            #[cfg(windows)]
+            job,
+            #[cfg(unix)]
             metadata_fd,
             program_status,
         });
+        {
+            let mut spawned = SPAWNED.lock().unwrap_or_else(PoisonError::into_inner);
+            spawned.retain(|surface| surface.strong_count() > 0);
+            spawned.push(Arc::downgrade(&surface));
+        }
 
         let output_surface = surface.clone();
         let output_thread = thread::spawn(move || {
@@ -1665,6 +1697,30 @@ impl Surface {
         if let Ok(mut worker) = self.worker.lock() {
             worker.take();
         }
+    }
+
+    pub(crate) fn surface_id(&self) -> &SurfaceId {
+        &self.id
+    }
+
+    /// The PTY's session, which every process of the terminal is in unless it left.
+    #[cfg(unix)]
+    pub(crate) fn session_id(&self) -> libc::pid_t {
+        self.session_id
+    }
+
+    /// The job every process of the terminal is in.
+    #[cfg(windows)]
+    pub(crate) fn job(&self) -> &OwnedHandle {
+        &self.job
+    }
+
+    /// The WSL distribution the terminal runs in and its shell's PID there, once the shell
+    /// has reported it. The shell leads the session its programs run in.
+    #[cfg(windows)]
+    pub(crate) fn wsl_shell(&self) -> Option<(&str, u32)> {
+        let shell_pid = self.state.lock().ok()?.terminal.shell_pid()?;
+        Some((self.distribution.as_deref()?, shell_pid))
     }
 
     fn retire(&self) {

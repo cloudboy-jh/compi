@@ -1,8 +1,8 @@
 //! Monitor, kept pure: which processes a pane shows, in what order, and how values
-//! read (here), the totals history its graphs draw from ([`totals`]), the newest
-//! sample's breakdowns the resource pages list ([`detail`]) and how its pages divide
-//! their width ([`layout`]). The pane (`gui::workspace::monitor`) draws them; nothing
-//! here talks to the daemon or GPUI.
+//! read (here), the totals history its graphs draw from ([`totals`]), each process's
+//! recent CPU and memory ([`history`]), the newest sample's breakdowns the resource
+//! pages list ([`detail`]) and how its pages divide their width ([`layout`]). The pane
+//! (`gui::workspace::monitor`) draws them; nothing here talks to the daemon or GPUI.
 //!
 //! A value the host would not give is `None` and reads as unavailable, never as zero.
 //! Sorting puts unavailable values last in either direction, and breaks ties by name,
@@ -10,13 +10,15 @@
 
 pub mod apps;
 pub mod detail;
+pub mod history;
 pub mod layout;
 pub mod totals;
 pub mod treemap;
 
-use compi_protocol::system_metrics::{Process, ProcessOwner};
+use compi_protocol::system_metrics::{MonitorSource, Process, ProcessOwner};
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Names a process across samples: a pid the host reuses has another start time.
 pub type ProcessKey = (u32, u64);
@@ -60,7 +62,8 @@ impl Column {
         }
     }
 
-    /// The column's width in pixels; Name takes what the others leave.
+    /// The column's width in pixels before the user drags it; Name takes what the
+    /// others leave, at least this.
     pub const fn width(self) -> f32 {
         match self {
             Self::Name => NAME_MIN_WIDTH,
@@ -71,6 +74,23 @@ impl Column {
             Self::Pid => 64.0,
             Self::User => 104.0,
         }
+    }
+
+    /// How the column is named in saved client state.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::Threads => "threads",
+            Self::CpuTime => "cpu_time",
+            Self::Pid => "pid",
+            Self::User => "user",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|column| column.key() == key)
     }
 
     /// Amounts read right-aligned; names and users left.
@@ -93,11 +113,9 @@ pub const NAME_MIN_WIDTH: f32 = 160.0;
 /// What a narrow table gives up first, in order; Name, CPU, Memory and PID stay.
 const DROP_ORDER: [Column; 3] = [Column::User, Column::Threads, Column::CpuTime];
 
-/// The columns a table `width` pixels wide shows: every column while Name keeps its
-/// minimum, else without User, then Threads, then CPU time.
-pub fn visible_columns(width: f32) -> Vec<Column> {
-    fit_columns(&Column::ALL, &DROP_ORDER, width, Column::width)
-}
+/// Widths a column can be dragged to.
+pub const MIN_COLUMN_WIDTH: f32 = 48.0;
+pub const MAX_COLUMN_WIDTH: f32 = 480.0;
 
 /// The columns of `all` a table `width` pixels wide shows, in their order: every one
 /// while their widths fit, else without each of `drop_order` in turn until they do (or
@@ -117,6 +135,208 @@ pub fn fit_columns<C: Copy + PartialEq>(
         columns.retain(|column| column != dropped);
     }
     columns
+}
+
+/// How a window arranges the Processes table's columns: their order, the ones hidden
+/// and the widths dragged. Name comes first, is never hidden and takes the room the
+/// others leave, so it keeps no width. Every field holds only what differs from the
+/// default, so the default layout is empty; loading drops unknown columns and clamps
+/// widths to [`MIN_COLUMN_WIDTH`]..=[`MAX_COLUMN_WIDTH`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SavedColumns", into = "SavedColumns")]
+pub struct ColumnLayout {
+    /// Every column in the order drawn, Name first; empty for [`Column::ALL`]'s order.
+    order: Vec<Column>,
+    hidden: Vec<Column>,
+    widths: Vec<(Column, f32)>,
+}
+
+/// [`ColumnLayout`] as saved: columns by [`Column::key`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SavedColumns {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    order: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    widths: BTreeMap<String, f32>,
+}
+
+impl From<SavedColumns> for ColumnLayout {
+    fn from(saved: SavedColumns) -> Self {
+        let known = |keys: &[String]| -> Vec<Column> {
+            keys.iter()
+                .filter_map(|key| Column::from_key(key))
+                .collect()
+        };
+        let mut layout = Self {
+            order: known(&saved.order),
+            hidden: known(&saved.hidden),
+            widths: saved
+                .widths
+                .iter()
+                .filter_map(|(key, &width)| Some((Column::from_key(key)?, width)))
+                .collect(),
+        };
+        layout.normalize();
+        layout
+    }
+}
+
+impl From<ColumnLayout> for SavedColumns {
+    fn from(layout: ColumnLayout) -> Self {
+        let keys = |columns: &[Column]| columns.iter().map(|column| column.key().into()).collect();
+        Self {
+            order: keys(&layout.order),
+            hidden: keys(&layout.hidden),
+            widths: layout
+                .widths
+                .iter()
+                .map(|&(column, width)| (column.key().into(), width))
+                .collect(),
+        }
+    }
+}
+
+impl ColumnLayout {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Every column in the order drawn, hidden ones included.
+    pub fn order(&self) -> &[Column] {
+        if self.order.is_empty() {
+            &Column::ALL
+        } else {
+            &self.order
+        }
+    }
+
+    pub fn is_hidden(&self, column: Column) -> bool {
+        self.hidden.contains(&column)
+    }
+
+    /// The width `column` is drawn at, Name's being its least.
+    pub fn width(&self, column: Column) -> f32 {
+        self.widths
+            .iter()
+            .find(|(saved, _)| *saved == column)
+            .map_or_else(|| column.width(), |&(_, width)| width)
+    }
+
+    /// The columns a table `width` pixels wide shows: the ones not hidden, in order,
+    /// while Name keeps its least width, else without User, then Threads, then CPU time.
+    pub fn visible_columns(&self, width: f32) -> Vec<Column> {
+        let shown: Vec<Column> = self
+            .order()
+            .iter()
+            .copied()
+            .filter(|&column| !self.is_hidden(column))
+            .collect();
+        fit_columns(&shown, &DROP_ORDER, width, |column| self.width(column))
+    }
+
+    /// Drags `column` to `width` (clamped); Name takes the rest and has none.
+    pub fn set_width(&mut self, column: Column, width: f32) {
+        if column == Column::Name || !width.is_finite() {
+            return;
+        }
+        self.widths.retain(|(saved, _)| *saved != column);
+        self.widths
+            .push((column, width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)));
+        self.normalize();
+    }
+
+    /// Hides or shows `column`; Name always shows.
+    pub fn set_hidden(&mut self, column: Column, hidden: bool) {
+        self.hidden.retain(|saved| *saved != column);
+        if hidden {
+            self.hidden.push(column);
+        }
+        self.normalize();
+    }
+
+    /// Moves `column` before `before`, or last when `None`; nothing moves before Name,
+    /// and Name does not move.
+    pub fn move_before(&mut self, column: Column, before: Option<Column>) {
+        if column == Column::Name || before == Some(column) {
+            return;
+        }
+        let mut order = self.order().to_vec();
+        order.retain(|saved| *saved != column);
+        let at = before
+            .and_then(|before| order.iter().position(|saved| *saved == before))
+            .map_or(order.len(), |at| at.max(1));
+        order.insert(at, column);
+        self.order = order;
+        self.normalize();
+    }
+
+    /// Keeps the invariants: a full order with Name first (empty when it is the
+    /// default), Name never hidden, each column at most once, widths in range and only
+    /// where they differ from the default.
+    fn normalize(&mut self) {
+        if !self.order.is_empty() {
+            let mut order = vec![Column::Name];
+            for column in self.order.iter().chain(Column::ALL.iter()) {
+                if !order.contains(column) {
+                    order.push(*column);
+                }
+            }
+            self.order = if order == Column::ALL {
+                Vec::new()
+            } else {
+                order
+            };
+        }
+        let mut hidden = Vec::new();
+        for &column in &self.hidden {
+            if column != Column::Name && !hidden.contains(&column) {
+                hidden.push(column);
+            }
+        }
+        hidden.sort_by_key(|column| Column::ALL.iter().position(|known| known == column));
+        self.hidden = hidden;
+        let mut widths: Vec<(Column, f32)> = Vec::new();
+        for &(column, width) in &self.widths {
+            if column == Column::Name
+                || !width.is_finite()
+                || widths.iter().any(|(saved, _)| *saved == column)
+            {
+                continue;
+            }
+            let width = width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
+            if width != column.width() {
+                widths.push((column, width));
+            }
+        }
+        widths.sort_by_key(|(column, _)| Column::ALL.iter().position(|known| known == column));
+        self.widths = widths;
+    }
+}
+
+/// Where a header dragged `offset` pixels along the `drawn` columns (each at the width
+/// it was drawn) lands: before the column now under its middle, or last (`None`). It
+/// never lands before Name.
+pub fn reorder_target(drawn: &[(Column, f32)], moving: Column, offset: f32) -> Option<Column> {
+    let mut start = 0.0;
+    let mut moving_width = 0.0;
+    for &(column, width) in drawn {
+        if column == moving {
+            moving_width = width;
+            break;
+        }
+        start += width;
+    }
+    let middle = start + moving_width / 2.0 + offset;
+    let mut x = 0.0;
+    for &(column, width) in drawn.iter().filter(|(column, _)| *column != moving) {
+        if column != Column::Name && middle < x + width / 2.0 {
+            return Some(column);
+        }
+        x += width;
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -531,6 +751,139 @@ pub fn display_line(text: &str) -> String {
         .collect()
 }
 
+/// The source as the selector and the header name it: the host by `host_name` (or
+/// "This host" before it is known), a distribution as "WSL: Ubuntu".
+pub fn source_label(source: &MonitorSource, host_name: Option<&str>) -> String {
+    match source {
+        MonitorSource::Host => host_name.map_or_else(|| "This host".to_owned(), display_line),
+        MonitorSource::Wsl { distribution } => format!("WSL: {}", display_line(distribution)),
+    }
+}
+
+/// The process that started `processes[at]`, while it runs: the one with its parent's
+/// pid that started no later (an older pid's owner is another process).
+pub fn parent(processes: &[Process], at: usize) -> Option<usize> {
+    let child = &processes.get(at)?.sample;
+    let parent_pid = child.parent_pid?;
+    processes.iter().position(|process| {
+        process.sample.pid == parent_pid
+            && process.sample.pid != child.pid
+            && process.sample.start_time <= child.start_time
+    })
+}
+
+/// The running processes `processes[at]` started, by pid.
+pub fn children(processes: &[Process], at: usize) -> Vec<usize> {
+    let Some(parent) = processes.get(at).map(|process| &process.sample) else {
+        return Vec::new();
+    };
+    let mut children: Vec<usize> = processes
+        .iter()
+        .enumerate()
+        .filter(|(_, process)| {
+            process.sample.parent_pid == Some(parent.pid)
+                && process.sample.pid != parent.pid
+                && process.sample.start_time >= parent.start_time
+        })
+        .map(|(index, _)| index)
+        .collect();
+    children.sort_by_key(|&index| processes[index].sample.pid);
+    children
+}
+
+/// `unix_seconds` as "2026-10-20 14:05:09", `offset_seconds` east of UTC.
+pub fn format_time_at_offset(unix_seconds: u64, offset_seconds: i64) -> String {
+    let local = unix_seconds.saturating_add_signed(offset_seconds);
+    let (year, month, day) = crate::updates::civil_date(local);
+    let time = local % 86_400;
+    format!(
+        "{year}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        time / 3600,
+        time % 3600 / 60,
+        time % 60
+    )
+}
+
+/// `unix_seconds` in this machine's time zone, as [`format_time_at_offset`] writes it.
+pub fn format_local_time(unix_seconds: u64) -> String {
+    format_time_at_offset(unix_seconds, local_offset(unix_seconds))
+}
+
+/// How long a process started at `start_time` has run by `now` (Unix seconds):
+/// "running for 45s", "12m", "3h 25m" or "2d 4h".
+pub fn format_running_for(start_time: u64, now: u64) -> String {
+    let seconds = now.saturating_sub(start_time);
+    let span = match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        _ => format_uptime(seconds),
+    };
+    format!("running for {span}")
+}
+
+/// Seconds this machine's time zone is east of UTC at `unix_seconds`; 0 where it can't
+/// be read.
+#[cfg(unix)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "`c_long` is 32 bits on some targets"
+)]
+fn local_offset(unix_seconds: u64) -> i64 {
+    let Ok(time) = libc::time_t::try_from(unix_seconds) else {
+        return 0;
+    };
+    // SAFETY: `localtime_r` only writes the `tm` it is given.
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&time, &mut local) }.is_null() {
+        return 0;
+    }
+    i64::from(local.tm_gmtoff)
+}
+
+#[cfg(windows)]
+fn local_offset(unix_seconds: u64) -> i64 {
+    use windows::Win32::Foundation::SYSTEMTIME;
+    use windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
+    let (year, month, day) = crate::updates::civil_date(unix_seconds);
+    let (Ok(year), Ok(month), Ok(day)) = (
+        u16::try_from(year),
+        u16::try_from(month),
+        u16::try_from(day),
+    ) else {
+        return 0;
+    };
+    let time = unix_seconds % 86_400;
+    let universal = SYSTEMTIME {
+        wYear: year,
+        wMonth: month,
+        wDay: day,
+        wHour: (time / 3600) as u16,
+        wMinute: (time % 3600 / 60) as u16,
+        wSecond: (time % 60) as u16,
+        ..SYSTEMTIME::default()
+    };
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: both pointers name live SYSTEMTIMEs; `None` asks for the current zone.
+    if unsafe { SystemTimeToTzSpecificLocalTime(None, &universal, &mut local) }.is_err() {
+        return 0;
+    }
+    let seconds = |time: &SYSTEMTIME| {
+        i64::from(time.wHour) * 3600 + i64::from(time.wMinute) * 60 + i64::from(time.wSecond)
+    };
+    // A zone is less than a day from UTC, so the dates differ by a day at most.
+    let days = match (local.wYear, local.wMonth, local.wDay).cmp(&(year, month, day)) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    };
+    days * 86_400 + seconds(&local) - seconds(&universal)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_offset(_unix_seconds: u64) -> i64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +911,7 @@ mod tests {
                 app: false,
                 restricted: false,
                 app_group: None,
+                surface: None,
             }),
         }
     }
@@ -772,6 +1126,7 @@ mod tests {
 
     #[test]
     fn narrow_tables_drop_user_then_threads_then_cpu_time() {
+        let visible_columns = |width| ColumnLayout::default().visible_columns(width);
         let all: f32 = Column::ALL.iter().map(|column| column.width()).sum();
         assert_eq!(visible_columns(all), Column::ALL);
         let without = |dropped: &[Column]| -> Vec<Column> {
@@ -791,6 +1146,129 @@ mod tests {
             visible_columns(0.0),
             [Column::Name, Column::Cpu, Column::Memory, Column::Pid]
         );
+    }
+
+    #[test]
+    fn saved_column_layouts_keep_known_columns_name_first_and_widths_in_range() {
+        let layout: ColumnLayout = serde_json::from_value(serde_json::json!({
+            "order": ["pid", "bogus", "name", "cpu", "pid"],
+            "hidden": ["name", "user", "user", "nope"],
+            "widths": { "cpu": 10.0, "memory": 9999.0, "name": 300.0, "threads": 68.0, "x": 1.0 },
+        }))
+        .unwrap();
+        use Column::*;
+        assert_eq!(
+            layout.order(),
+            [Name, Pid, Cpu, Memory, Threads, CpuTime, User]
+        );
+        assert!(layout.is_hidden(User) && !layout.is_hidden(Name));
+        assert_eq!(layout.width(Cpu), MIN_COLUMN_WIDTH);
+        assert_eq!(layout.width(Memory), MAX_COLUMN_WIDTH);
+        assert_eq!(layout.width(Name), NAME_MIN_WIDTH);
+        assert_eq!(layout.width(Threads), Threads.width());
+        let saved = serde_json::to_value(&layout).unwrap();
+        assert_eq!(
+            saved["widths"],
+            serde_json::json!({ "cpu": 48.0, "memory": 480.0 })
+        );
+        assert_eq!(
+            serde_json::from_value::<ColumnLayout>(saved).unwrap(),
+            layout
+        );
+        assert_eq!(
+            serde_json::to_value(ColumnLayout::default()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn user_columns_fit_in_their_order_and_narrow_tables_still_drop() {
+        use Column::*;
+        let mut layout = ColumnLayout::default();
+        layout.set_hidden(User, true);
+        layout.set_hidden(Name, true);
+        layout.move_before(Pid, Some(Cpu));
+        layout.move_before(Name, None);
+        layout.set_width(Cpu, 100.0);
+        let shown = [Name, Pid, Cpu, Memory, Threads, CpuTime];
+        assert_eq!(layout.visible_columns(f32::MAX), shown);
+        let needed: f32 = shown.iter().map(|&column| layout.width(column)).sum();
+        assert_eq!(
+            layout.visible_columns(needed - 1.0),
+            [Name, Pid, Cpu, Memory, CpuTime]
+        );
+        // Nothing goes before Name.
+        layout.move_before(Memory, Some(Name));
+        assert_eq!(layout.order()[..2], [Name, Memory]);
+        layout.move_before(Memory, None);
+        assert_eq!(layout.order().last(), Some(&Memory));
+        // Putting everything back is the default layout, which saves nothing.
+        layout.set_hidden(User, false);
+        layout.set_width(Cpu, Cpu.width());
+        for column in Column::ALL {
+            layout.move_before(column, None);
+        }
+        assert!(layout.is_default());
+    }
+
+    #[test]
+    fn a_dragged_header_lands_before_the_column_under_its_middle() {
+        use Column::*;
+        let drawn = [(Name, 200.0), (Cpu, 64.0), (Memory, 84.0), (Pid, 64.0)];
+        // Barely moved: still before Memory, where it was.
+        assert_eq!(reorder_target(&drawn, Cpu, 5.0), Some(Memory));
+        assert_eq!(reorder_target(&drawn, Cpu, 60.0), Some(Pid));
+        assert_eq!(reorder_target(&drawn, Cpu, 1000.0), None);
+        // Dragged over Name, it stays after it.
+        assert_eq!(reorder_target(&drawn, Pid, -400.0), Some(Cpu));
+    }
+
+    #[test]
+    fn parents_and_children_follow_parent_pids_not_reused_ones() {
+        let at = |pid: u32, start: u64, parent: Option<u32>| {
+            let mut process = process(pid, "p", None, None);
+            process.sample.start_time = start;
+            process.sample.parent_pid = parent;
+            process
+        };
+        let processes = vec![
+            at(10, 100, Some(1)),
+            at(11, 110, Some(10)),
+            at(12, 120, Some(10)),
+            // Names pid 10 as its parent but started before it: that was another 10.
+            at(13, 90, Some(10)),
+            at(14, 130, Some(11)),
+        ];
+        let pids = |rows: Vec<usize>| -> Vec<u32> {
+            rows.into_iter()
+                .map(|row| processes[row].sample.pid)
+                .collect()
+        };
+        assert_eq!(pids(children(&processes, 0)), [11, 12]);
+        assert_eq!(pids(children(&processes, 1)), [14]);
+        assert_eq!(parent(&processes, 4), Some(1));
+        assert_eq!(parent(&processes, 3), None);
+        assert_eq!(parent(&processes, 0), None);
+    }
+
+    #[test]
+    fn start_times_read_in_a_zone_and_as_time_running() {
+        assert_eq!(format_time_at_offset(0, 0), "1970-01-01 00:00:00");
+        assert_eq!(
+            format_time_at_offset(1_700_000_000, -5 * 3600),
+            "2023-11-14 17:13:20"
+        );
+        assert_eq!(
+            format_time_at_offset(1_700_000_000, 3 * 3600),
+            "2023-11-15 01:13:20"
+        );
+        assert_eq!(format_running_for(100, 145), "running for 45s");
+        assert_eq!(format_running_for(0, 720), "running for 12m");
+        assert_eq!(
+            format_running_for(0, 3 * 3600 + 25 * 60),
+            "running for 3h 25m"
+        );
+        assert_eq!(format_running_for(200, 100), "running for 0s");
     }
 
     #[test]

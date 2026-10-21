@@ -2,8 +2,9 @@
 //! they run from. A terminal shows it as its view, in place of its shell, which keeps
 //! running underneath; a Settings or Monitor content pane changes its own section or page.
 use super::content::{self, Placed};
-use super::{CliError, Options, Output, submit, targets};
+use super::{CliError, Options, Output, metrics, submit, targets};
 use crate::{DaemonClient, cli_window::Action, connection::ConnectionTarget};
+use compi_protocol::system_metrics::MonitorSource;
 use compi_protocol::{
     LayoutNode, MonitorContent, MonitorPage, PaneContent, PaneSide, SettingsContent,
     SettingsSection, WorkspaceMutation, WorkspaceSnapshot,
@@ -34,7 +35,20 @@ pub(super) fn run(
         .expect("targets resolve only leaf nodes")
         .clone();
     let current = leaf.content();
-    let content = wanted(command, options.args.get(1).map(String::as_str), current)?;
+    let source = options
+        .values
+        .get("--source")
+        .map(|name| metrics::source(name))
+        .transpose()?;
+    let content = wanted(
+        command,
+        options.args.get(1).map(String::as_str),
+        source.clone(),
+        current,
+    )?;
+    if let Some(source) = &source {
+        metrics::known(client, source)?;
+    }
     let mutation = match &leaf {
         LayoutNode::Pane { view, .. } => {
             let shown = view
@@ -74,21 +88,29 @@ pub(super) fn run(
             format!("Settings · {}", settings.section.label()),
             json!({"section": section_name(settings.section)}),
         ),
-        PaneContent::Monitor(monitor) => (
-            format!(
-                "Monitor · {}",
-                match monitor.page {
-                    MonitorPage::Overview => "Overview",
-                    MonitorPage::Processes => "Processes",
-                    MonitorPage::Cpu => "CPU",
-                    MonitorPage::Memory => "Memory",
-                    MonitorPage::Gpu => "GPU",
-                    MonitorPage::Disk => "Disk",
-                    MonitorPage::Network => "Network",
-                }
-            ),
-            json!({"page": page_name(monitor.page)}),
-        ),
+        PaneContent::Monitor(monitor) => {
+            let page = match monitor.page {
+                MonitorPage::Overview => "Overview",
+                MonitorPage::Processes => "Processes",
+                MonitorPage::Cpu => "CPU",
+                MonitorPage::Memory => "Memory",
+                MonitorPage::Gpu => "GPU",
+                MonitorPage::Disk => "Disk",
+                MonitorPage::Network => "Network",
+            };
+            (
+                match &monitor.source {
+                    MonitorSource::Host => format!("Monitor · {page}"),
+                    MonitorSource::Wsl { distribution } => {
+                        format!("Monitor · {page} · WSL: {distribution}")
+                    }
+                },
+                json!({
+                    "page": page_name(monitor.page),
+                    "source": metrics::source_name(&monitor.source),
+                }),
+            )
+        }
         PaneContent::Files(_) => unreachable!("only Settings and Monitor are asked for"),
     };
     let (text, mut value) = content::report(
@@ -106,10 +128,11 @@ pub(super) fn run(
 }
 
 /// What `command` shows: the named section or page, else the one the pane already shows,
-/// else the first.
+/// else the first. Monitor's `source` follows the same rule, else the host.
 fn wanted(
     command: &str,
     name: Option<&str>,
+    source: Option<MonitorSource>,
     current: Option<&PaneContent>,
 ) -> Result<PaneContent, CliError> {
     Ok(if command == "settings" {
@@ -130,6 +153,10 @@ fn wanted(
         };
         PaneContent::Settings(SettingsContent { section })
     } else {
+        let shown = match current {
+            Some(PaneContent::Monitor(monitor)) => Some(monitor),
+            _ => None,
+        };
         let page = match name {
             Some(name) => PAGES
                 .iter()
@@ -141,12 +168,12 @@ fn wanted(
                         PAGES.map(|(name, _)| name).join(", ")
                     ))
                 })?,
-            None => match current {
-                Some(PaneContent::Monitor(monitor)) => monitor.page,
-                _ => MonitorPage::default(),
-            },
+            None => shown.map(|monitor| monitor.page).unwrap_or_default(),
         };
-        PaneContent::Monitor(MonitorContent { page })
+        let source = source
+            .or_else(|| shown.map(|monitor| monitor.source.clone()))
+            .unwrap_or_default();
+        PaneContent::Monitor(MonitorContent { page, source })
     })
 }
 
@@ -168,44 +195,99 @@ mod tests {
 
     #[test]
     fn names_pick_a_section_or_page_and_omitted_ones_keep_what_shows() {
-        let monitor = |page| PaneContent::Monitor(MonitorContent { page });
+        let monitor = |page| {
+            PaneContent::Monitor(MonitorContent {
+                page,
+                source: MonitorSource::Host,
+            })
+        };
         let settings = |section| PaneContent::Settings(SettingsContent { section });
         assert_eq!(
-            wanted("settings", Some("Monitor"), None).unwrap(),
+            wanted("settings", Some("Monitor"), None, None).unwrap(),
             settings(SettingsSection::Monitor)
         );
         assert_eq!(
-            wanted("settings", None, Some(&settings(SettingsSection::Keyboard))).unwrap(),
+            wanted(
+                "settings",
+                None,
+                None,
+                Some(&settings(SettingsSection::Keyboard))
+            )
+            .unwrap(),
             settings(SettingsSection::Keyboard)
         );
         // Another kind of view says nothing about the section.
         assert_eq!(
-            wanted("settings", None, Some(&monitor(MonitorPage::Disk))).unwrap(),
+            wanted("settings", None, None, Some(&monitor(MonitorPage::Disk))).unwrap(),
             settings(SettingsSection::default())
         );
         assert_eq!(
-            wanted("monitor", Some("cpu"), None).unwrap(),
+            wanted("monitor", Some("cpu"), None, None).unwrap(),
             monitor(MonitorPage::Cpu)
         );
         assert_eq!(
-            wanted("monitor", None, Some(&monitor(MonitorPage::Network))).unwrap(),
+            wanted("monitor", None, None, Some(&monitor(MonitorPage::Network))).unwrap(),
             monitor(MonitorPage::Network)
         );
         assert_eq!(
-            wanted("monitor", None, None).unwrap(),
+            wanted("monitor", None, None, None).unwrap(),
             monitor(MonitorPage::Overview)
         );
         // The section saved as "performance" is named for what it shows.
         assert_eq!(
-            wanted("settings", Some("performance"), None)
+            wanted("settings", Some("performance"), None, None)
                 .unwrap_err()
                 .exit,
             2
         );
         assert_eq!(
-            wanted("monitor", Some("gpu"), None).unwrap(),
+            wanted("monitor", Some("gpu"), None, None).unwrap(),
             monitor(MonitorPage::Gpu)
         );
-        assert_eq!(wanted("monitor", Some("fans"), None).unwrap_err().exit, 2);
+        assert_eq!(
+            wanted("monitor", Some("fans"), None, None)
+                .unwrap_err()
+                .exit,
+            2
+        );
+    }
+
+    #[test]
+    fn a_monitor_pane_keeps_its_source_unless_one_is_named() {
+        let ubuntu = MonitorSource::Wsl {
+            distribution: "Ubuntu".into(),
+        };
+        let shown = PaneContent::Monitor(MonitorContent {
+            page: MonitorPage::Cpu,
+            source: ubuntu.clone(),
+        });
+        // A page alone keeps the source; a source alone keeps the page.
+        assert_eq!(
+            wanted("monitor", Some("disk"), None, Some(&shown)).unwrap(),
+            PaneContent::Monitor(MonitorContent {
+                page: MonitorPage::Disk,
+                source: ubuntu.clone(),
+            })
+        );
+        assert_eq!(
+            wanted("monitor", None, Some(MonitorSource::Host), Some(&shown)).unwrap(),
+            PaneContent::Monitor(MonitorContent {
+                page: MonitorPage::Cpu,
+                source: MonitorSource::Host,
+            })
+        );
+        // A terminal or Settings view has no source to keep: the host.
+        let settings = PaneContent::Settings(SettingsContent::default());
+        assert_eq!(
+            wanted("monitor", None, None, Some(&settings)).unwrap(),
+            PaneContent::Monitor(MonitorContent::default())
+        );
+        assert_eq!(
+            wanted("monitor", Some("gpu"), Some(ubuntu.clone()), None).unwrap(),
+            PaneContent::Monitor(MonitorContent {
+                page: MonitorPage::Gpu,
+                source: ubuntu,
+            })
+        );
     }
 }

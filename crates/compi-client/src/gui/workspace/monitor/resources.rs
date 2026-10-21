@@ -45,16 +45,18 @@ struct ResourcePage {
 }
 
 impl CompiApp {
-    /// A resource page `width` wide: the metric's figures, its history over the range,
-    /// then its breakdown.
+    /// A resource page `width` wide of `pane`'s source: the metric's figures, its
+    /// history over the range, then its breakdown.
     pub(super) fn render_monitor_resource(
         &self,
         pane_id: &PaneId,
+        pane: &MonitorPane,
         metric: Metric,
         width: f32,
         cx: &Context<Self>,
     ) -> AnyElement {
-        if let Some(message) = self.totals_message() {
+        let feed = &self.monitor.feeds(&pane.source).totals;
+        if let Some(message) = self.totals_message(feed) {
             return message;
         }
         let colors = *self.colors();
@@ -62,23 +64,24 @@ impl CompiApp {
         let (padding, content_width) = layout::page_frame(width);
         let gap = layout::gap(content_width);
         let inner = (content_width - 2.0 * CARD_INSET).max(1.0);
-        let feed = &self.monitor.totals;
+        let stale = feed.state == FeedState::Stale;
         let latest = feed.shown().latest();
         if metric == Metric::Gpu && latest.is_some_and(|latest| latest.gpu.is_none()) {
             return self.monitor_scroll_page(
                 "monitor-resource",
                 padding,
                 content_width,
+                stale,
                 div().child(self.render_gpu_unavailable()),
             );
         }
         let data = card(metric, latest, feed.host.as_ref());
         let page = match metric {
-            Metric::Cpu => self.cpu_page(data.subtitle, inner, gap),
-            Metric::Memory => self.memory_page(data.subtitle, pane_id, content_width, cx),
-            Metric::Gpu => self.gpu_page(data.figures),
-            Metric::Disk => self.disk_page(data.subtitle, data.figures, inner),
-            Metric::Network => self.network_page(data.subtitle, data.figures, inner),
+            Metric::Cpu => self.cpu_page(feed, data.subtitle, inner, gap),
+            Metric::Memory => self.memory_page(feed, data.subtitle, pane_id, content_width, cx),
+            Metric::Gpu => self.gpu_page(feed, data.figures),
+            Metric::Disk => self.disk_page(feed, data.subtitle, data.figures, inner),
+            Metric::Network => self.network_page(feed, data.subtitle, data.figures, inner),
         };
         let figure_columns = layout::figure_columns(inner, page.figures.len());
         let figures_card = settings_card(&colors)
@@ -152,6 +155,7 @@ impl CompiApp {
             "monitor-resource",
             padding,
             content_width,
+            stale,
             div()
                 .flex()
                 .flex_col()
@@ -164,8 +168,7 @@ impl CompiApp {
 
     /// CPU: in use, user, system and the logical CPUs, the processor as caption; user
     /// over system; each logical CPU's bar.
-    fn cpu_page(&self, label: String, inner: f32, gap: f32) -> ResourcePage {
-        let feed = &self.monitor.totals;
+    fn cpu_page(&self, feed: &TotalsFeed, label: String, inner: f32, gap: f32) -> ResourcePage {
         let history = feed.shown();
         let latest = history.latest();
         let samples = self.monitor.span.samples();
@@ -209,12 +212,13 @@ impl CompiApp {
     /// type, where the host divides its memory into kinds.
     fn memory_page(
         &self,
+        feed: &TotalsFeed,
         label: String,
         pane_id: &PaneId,
         content_width: f32,
         cx: &Context<Self>,
     ) -> ResourcePage {
-        let history = self.monitor.totals.shown();
+        let history = feed.shown();
         let memory = history.latest().and_then(|sample| sample.memory.as_ref());
         let used = history.window(self.monitor.span.samples(), |sample| {
             sample.memory.as_ref().and_then(totals::memory_used_percent)
@@ -276,10 +280,10 @@ impl CompiApp {
 
     /// GPU: utilization with the GPU's name as caption, its memory as figures and a
     /// bar; utilization over time.
-    fn gpu_page(&self, figures: [Figure; 3]) -> ResourcePage {
+    fn gpu_page(&self, feed: &TotalsFeed, figures: [Figure; 3]) -> ResourcePage {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let history = self.monitor.totals.shown();
+        let history = feed.shown();
         let gpu = history.latest().and_then(|sample| sample.gpu.as_ref());
         let utilization = history.window(self.monitor.span.samples(), totals::gpu_utilization);
         let memory = div()
@@ -323,8 +327,14 @@ impl CompiApp {
 
     /// Disk: the system disk's free and total space, rates and bytes written, its name
     /// as caption; reading and writing over time; the volumes.
-    fn disk_page(&self, label: String, rates: [Figure; 3], inner: f32) -> ResourcePage {
-        let history = self.monitor.totals.shown();
+    fn disk_page(
+        &self,
+        feed: &TotalsFeed,
+        label: String,
+        rates: [Figure; 3],
+        inner: f32,
+    ) -> ResourcePage {
+        let history = feed.shown();
         let samples = self.monitor.span.samples();
         let disk = history.latest().and_then(|sample| sample.disk.as_ref());
         let read = history.window(samples, |sample| {
@@ -370,8 +380,14 @@ impl CompiApp {
 
     /// Network: downloading, uploading and the totals; both rates over time; the
     /// interfaces.
-    fn network_page(&self, label: String, rest: [Figure; 3], inner: f32) -> ResourcePage {
-        let history = self.monitor.totals.shown();
+    fn network_page(
+        &self,
+        feed: &TotalsFeed,
+        label: String,
+        rest: [Figure; 3],
+        inner: f32,
+    ) -> ResourcePage {
+        let history = feed.shown();
         let samples = self.monitor.span.samples();
         let network = history.latest().and_then(|sample| sample.network);
         let received = history.window(samples, |sample| {

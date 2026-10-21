@@ -57,7 +57,11 @@ use std::fmt;
 // Version 31 adds commit diffs: `ReadGitCommit` looks up one commit and lists its changes
 // against its first parent, `GitScope::Commit` names such a change (and a diff tab showing
 // it), and `GitRevision::Commit` / `GitRevision::Parent` read a file's two sides.
-pub const PROTOCOL_VERSION: u32 = 31;
+// Version 32 finishes Monitor: a `MonitorSource` (the daemon's host or, on Windows, a WSL
+// distribution) on every watch and on `MonitorContent`, `ListMonitorSources`,
+// `InspectProcess`, `QuitProcess` aimed at `(pid, start_time)`, and the Compi surface a
+// process runs in (`ProcessDetails::surface`).
+pub const PROTOCOL_VERSION: u32 = 32;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -388,12 +392,41 @@ pub enum ClientMessage {
         surface_id: SurfaceId,
         expected_lifetime: ProcessLifetimeId,
     },
-    /// Answers `SystemMetricsWatching`, then sends `SystemSampled` every few seconds while
-    /// this connection stays open. Sampling runs only while some connection watches.
-    WatchSystemMetrics,
-    /// Answers `SystemTotalsWatching` with the host and the last hour of totals, then sends
+    /// Answers `SystemMetricsWatching`, then sends `SystemSampled` of `source` every few
+    /// seconds while this connection stays open. Sampling runs only while some connection
+    /// watches.
+    WatchSystemMetrics {
+        #[serde(default)]
+        source: system_metrics::MonitorSource,
+    },
+    /// Answers `SystemTotalsWatching` with `source`'s host and its kept totals (the last hour
+    /// for the daemon's host; a WSL distribution's start when this watch does), then sends
     /// each later sample as `SystemTotalsSampled`, in order, while this connection stays open.
-    WatchSystemTotals,
+    WatchSystemTotals {
+        #[serde(default)]
+        source: system_metrics::MonitorSource,
+    },
+    /// What Monitor can watch from this daemon, answered by `MonitorSourcesListed`: the host
+    /// first, then (on Windows) each WSL 2 distribution.
+    ListMonitorSources,
+    /// The details a sample leaves out for the process `(pid, start_time)` of `source`,
+    /// answered by `ProcessInspected`.
+    InspectProcess {
+        #[serde(default)]
+        source: system_metrics::MonitorSource,
+        pid: u32,
+        start_time: u64,
+    },
+    /// Asks the process `(pid, start_time)` of `source` to quit, or with `force` ends it.
+    /// The daemon checks it is still that process right before signalling it, signals only
+    /// it (never its group or children), and answers `ProcessQuitAnswered`.
+    QuitProcess {
+        #[serde(default)]
+        source: system_metrics::MonitorSource,
+        pid: u32,
+        start_time: u64,
+        force: bool,
+    },
     /// The icon of an application the daemon named in an `AppGroup`, answered by `AppIcon`.
     GetAppIcon {
         group_id: String,
@@ -516,6 +549,16 @@ pub enum ServerMessage {
     ProgramStatusWatching,
     ProgramStatusAcknowledged,
     SystemMetricsWatching,
+    MonitorSourcesListed {
+        sources: Vec<system_metrics::MonitorSource>,
+    },
+    /// `None` when the process is gone or its PID now names another process.
+    ProcessInspected {
+        inspection: Option<system_metrics::ProcessInspection>,
+    },
+    ProcessQuitAnswered {
+        outcome: system_metrics::QuitOutcome,
+    },
     SystemTotalsWatching {
         host: system_metrics::HostInfo,
         history: Vec<system_metrics::TotalsSample>,
@@ -1167,7 +1210,8 @@ impl PaneContent {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Files(folder) => folder.validate(),
-            Self::Settings(_) | Self::Monitor(_) => Ok(()),
+            Self::Settings(_) => Ok(()),
+            Self::Monitor(monitor) => monitor.source.validate(),
         }
     }
 
@@ -1218,12 +1262,17 @@ pub struct SettingsContent {
     pub section: SettingsSection,
 }
 
-/// A content pane showing Monitor, open at `page`. What it shows is the daemon's host; how
-/// it is sorted, filtered and which range it shows is each window's own.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// A content pane showing Monitor of `source`, open at `page`. How it is sorted, filtered
+/// and which range it shows is each window's own.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MonitorContent {
     #[serde(default)]
     pub page: MonitorPage,
+    #[serde(
+        default,
+        skip_serializing_if = "system_metrics::MonitorSource::is_host"
+    )]
+    pub source: system_metrics::MonitorSource,
 }
 
 /// Monitor's pages, in the order they are listed.
