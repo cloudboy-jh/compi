@@ -150,6 +150,21 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "Open FILE in the selected terminal's Files view, in place of the shell, and put the cursor on LINE (default 1; COL is accepted and ignored). The view keeps the files it has open; its folder stays when it holds FILE, else becomes the shell's directory when that holds FILE, else FILE's folder. From a content pane (--pane), that pane opens FILE and keeps its folder. A missing or unreadable FILE is reported by the editor. An existing folder without :LINE, or no FILE, browses it like files. With no Compi window showing the tab the view still opens and a note says it was not shown.",
             "compi edit src/main.rs:42",
         ),
+        ("notes", Some("search")) => (
+            "notes search QUERY [FOLDER]",
+            "Search Markdown contents, filenames and heading titles under FOLDER (default: the pane's current directory), without a GUI. Matches are case-insensitive and print FILE:LINE:TEXT. --json returns root, environment, query, hits, partial and warnings. Unreadable files and scan limits are visible warnings, not silently complete results.",
+            "compi --json notes search 'project plan' ./notes",
+        ),
+        ("notes", Some("backlinks")) => (
+            "notes backlinks FILE [FOLDER]",
+            "List source lines containing wiki links to FILE in FOLDER (default: the pane's current directory), without a GUI. FILE resolves relative to the notebook root, with optional Markdown extension and unique basename/title fallback; ambiguous or missing targets fail. [[target#heading|label]] links count, but inline, fenced and indented code do not. --json returns root, environment, file, hits, partial and warnings.",
+            "compi --json notes backlinks decisions ./notes",
+        ),
+        ("notes", _) => (
+            "notes [FILE|FOLDER] [--edit]",
+            "Open a Markdown FILE in the existing Files/editor view, rendered by default; --edit selects its source instead. A FOLDER, or no argument, browses like compi files. Paths resolve in the selected pane's environment against its current directory, like edit. Notes remain ordinary .md/.markdown files, with no notebook database or persisted index. Notebook search/backlinks recursively read at most 4,096 notes, 2,048 directories, 32,768 entries, 64 directory levels and 32 MiB of text, with a 15-second scan budget; .git, target and node_modules are skipped and directory symlinks are not followed. Incomplete scans report warnings.",
+            "compi notes ./notes/plan.md",
+        ),
         ("diff", _) => (
             "diff [PATH[:LINE[:COL]]]\n       compi diff COMMIT [PATH[:LINE[:COL]]]",
             "Show PATH's uncommitted change as a diff tab in the selected terminal's Files view, in place of the shell, scrolled to LINE of the new side (COL is accepted and ignored). The unstaged change (work tree against the index) wins over the staged one (index against HEAD). PATH resolves like edit; the view's folder stays when it lies in the repository and holds PATH, else becomes the repository's top level. From a content pane (--pane) inside the repository, that pane shows the diff. Without PATH, the repository of the shell's directory lists its changes in the view's Changes sidebar. With COMMIT (a revision such as HEAD~1, a branch or an id), the diff is what that commit changed in PATH against its first parent, read-only; without PATH its changed files show in a section of their own at the top of the Changes sidebar. A lone argument is PATH when that file has uncommitted changes, else COMMIT when Git knows it. --json adds repo, commit (the full id), short and summary for a commit, with path and line, or changes (the count). Exits 1 with not_a_repository outside a Git work tree, unknown_commit when COMMIT names no commit, and no_changes when PATH has no uncommitted change (or names no commit) or COMMIT did not change PATH. Git is only read: files, the index and other Git state never change.",
@@ -242,7 +257,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         _ => (
             "[GLOBAL OPTIONS] COMMAND [ARGS]",
-            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; settings; monitor [PAGE]/totals/list/sources/inspect/quit; command list/run; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
+            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; notes [FILE|FOLDER]/search/backlinks; diff; settings; monitor [PAGE]/totals/list/sources/inspect/quit; command list/run; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
             "compi --instance dev --json workspace list",
         ),
     };

@@ -27,6 +27,8 @@ use gpui_component::input::{
 };
 use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
+pub(in crate::gui) mod notes;
+
 /// Width of the folder sidebar beside an open tab.
 pub(super) const SIDEBAR_WIDTH: f32 = 220.0;
 pub(super) const FILE_TAB_HEIGHT: f32 = 30.0;
@@ -131,6 +133,7 @@ pub(super) struct PaneUi {
     pub(super) diffs: HashMap<ContentTab, DiffTab>,
     /// A new-side line to reveal in a diff tab once its diff exists.
     pub(super) diff_reveal: Option<(ContentTab, u32)>,
+    pub(super) notes: notes::NotesUi,
 }
 
 struct OpenFile {
@@ -479,6 +482,7 @@ impl PaneUi {
             repo: RepoStatus::new(root),
             diffs: HashMap::new(),
             diff_reveal: None,
+            notes: notes::NotesUi::default(),
         }
     }
 
@@ -961,6 +965,9 @@ impl CompiApp {
         theme.scrollbar_thumb = color(colors.muted).opacity(0.4);
         theme.scrollbar_thumb_hover = color(colors.muted);
         controls::sync_theme(theme, &colors);
+        theme.link = color(colors.accent);
+        theme.table_head = color(colors.surface_hover);
+        theme.table_head_foreground = color(colors.foreground);
         theme.tokens = ThemeTokens::from(&theme.colors);
         let mut highlight = if applied.dark {
             HighlightTheme::default_dark()
@@ -1067,6 +1074,7 @@ impl CompiApp {
             }
         }
         self.apply_reveals(window, cx);
+        self.prepare_note_views(window, cx);
     }
 
     fn prepare_pane(&mut self, pane_id: PaneId, content: FolderContent, cx: &mut Context<Self>) {
@@ -1550,6 +1558,7 @@ impl CompiApp {
                 self.focused_content()
                     .and_then(|content| content.active_file())
                     .filter(|_| self.content.released.as_ref() != Some(pane_id))
+                    .filter(|active| !ui.notes.is_rendered(active))
                     .and_then(|active| ui.editor(active))
                     .map_or_else(|| ui.focus.clone(), |editor| editor.state.focus_handle(cx))
             }
@@ -2907,6 +2916,11 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.note_key(pane_id, &event.keystroke, window, cx) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let Some(ui) = self.content.panes.get(pane_id) else {
             return;
         };
@@ -2940,6 +2954,7 @@ impl CompiApp {
                     .as_ref()
                     .and_then(|workspace| find_content(workspace, pane_id))
                     .and_then(|content| content.active_file())
+                    .filter(|active| !ui.notes.is_rendered(active))
                     .and_then(|active| ui.editor(active))
                     .map(|editor| editor.state.focus_handle(cx));
                 if let Some(path) = saving_as {
@@ -3943,9 +3958,12 @@ impl CompiApp {
         ui: &PaneUi,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        if ui.notes.is_rendered(path) && ui.editor(path).is_some() {
+            return self.render_note_body(pane_id, path, ui, div().into_any_element(), cx);
+        }
         let colors = *self.colors();
         let area = div().flex_1().min_w_0().h_full();
-        match ui.files.get(path).map(|file| &file.body) {
+        let body = match ui.files.get(path).map(|file| &file.body) {
             Some(FileBody::Ready(editor)) => area
                 .relative()
                 // The editor's own context menu, not the palette, answers a right click.
@@ -4041,6 +4059,11 @@ impl CompiApp {
                 .text_color(color(colors.muted))
                 .child(format!("Opening {}…", file_name(path)))
                 .into_any_element(),
+        };
+        if crate::notes::is_markdown(path) && ui.editor(path).is_some() {
+            self.render_note_body(pane_id, path, ui, body, cx)
+        } else {
+            body
         }
     }
 }

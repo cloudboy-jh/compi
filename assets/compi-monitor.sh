@@ -3,12 +3,15 @@
 # and /proc, so no Linux binary is shipped.
 #
 #   stream               a header, then one sample every 2 seconds until the daemon kills it
-#   inspect PID START    the process's state, working directory and arguments
-#   quit PID START TERM|KILL
+#   inspect PID START BOOT_TIME
+#                        the process's state, working directory and arguments
+#   quit PID START TERM|KILL BOOT_TIME
 #                        signals the process, if it is still the one that started at START
 #
 # START is a start time in Unix seconds, as the stream reports it: boot time plus the
 # process's start in clock ticks over CLK_TCK, rounded down.
+# BOOT_TIME is the stream header's epoch, not a fresh /proc/stat reading: WSL clock
+# synchronization can shift btime while the same processes keep running.
 #
 # The stream writes tab-separated lines, names and command lines with tabs and line breaks
 # turned to spaces:
@@ -192,7 +195,8 @@ BEGIN {
 inspect | quit)
     case $2 in '' | *[!0-9]*) exit 2 ;; esac
     case $3 in '' | *[!0-9]*) exit 2 ;; esac
-    btime=$(awk '$1 == "btime" { print $2 }' /proc/stat)
+    if [ "$1" = inspect ]; then btime=$4; else btime=$5; fi
+    case $btime in '' | *[!0-9]*) exit 2 ;; esac
     if ! started "$2" || [ "$start" != "$3" ]; then
         if [ "$1" = inspect ]; then printf 'gone\0'; else echo gone; fi
         exit 0

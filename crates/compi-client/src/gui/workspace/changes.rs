@@ -826,6 +826,34 @@ fn list_rows(
     (rows, order)
 }
 
+/// Bracket navigation stays in the active review: one commit, or the working tree.
+fn adjacent_diff<'a>(
+    changes: &'a Listed<'_>,
+    order: &[usize],
+    path: Option<&str>,
+    scope: &GitScope,
+    forward: bool,
+) -> Option<&'a GitChange> {
+    let mut relevant =
+        order
+            .iter()
+            .map(|&index| &changes[index])
+            .filter(|change| match (scope, &change.scope) {
+                (GitScope::Commit(active), GitScope::Commit(candidate)) => active == candidate,
+                (GitScope::Commit(_), _) | (_, GitScope::Commit(_)) => false,
+                _ => true,
+            });
+    let at = relevant
+        .clone()
+        .position(|change| Some(change.path.as_str()) == path && change.scope == *scope);
+    let next = match at {
+        Some(at) if forward => at + 1,
+        Some(at) => at.checked_sub(1)?,
+        None => 0,
+    };
+    relevant.nth(next)
+}
+
 fn row_key(row: &ListRow, changes: Listed<'_>) -> RowKey {
     match row {
         ListRow::Section { scope, .. } => RowKey::Section(scope.clone()),
@@ -2990,9 +3018,9 @@ impl CompiApp {
         }
     }
 
-    /// `[` and `]` in Diff mode: the previous or next change in list order, across
-    /// sections, in its file's tab. A file not open takes the place of the current tab when
-    /// that tab was only reviewed (its file never edited), else opens beside it.
+    /// `[` and `]` in Diff mode: the previous or next change in the active commit,
+    /// or across the working tree's sections. An unedited file's tab is reused;
+    /// otherwise the next diff opens beside it.
     fn step_diff(&mut self, pane_id: &PaneId, forward: bool) {
         let Some(mut content) = self
             .workspace
@@ -3014,26 +3042,22 @@ impl CompiApp {
         };
         let editing = ui.editor(&path).is_some();
         let status = &mut ui.repo;
+        if let GitScope::Commit(id) = &scope
+            && status.shown_commit.as_ref() != Some(id)
+        {
+            status.shown_commit = Some(id.clone());
+            status.rebuild(tree);
+        }
         let relative = status
             .repo_of(&scope)
             .and_then(|repo| repo_relative(repo, &path));
         let listed = status.listed();
-        let order: Vec<&GitChange> = status.order.iter().map(|&index| &listed[index]).collect();
-        let Some(last) = order.len().checked_sub(1) else {
+        let Some(next) =
+            adjacent_diff(&listed, &status.order, relative.as_deref(), &scope, forward)
+        else {
             return;
         };
-        let at = order.iter().position(|change| {
-            Some(change.path.as_str()) == relative.as_deref() && change.scope == scope
-        });
-        let next = match at {
-            Some(at) if forward => (at + 1).min(last),
-            Some(at) => at.saturating_sub(1),
-            None => 0,
-        };
-        if Some(next) == at {
-            return;
-        }
-        let (next_path, next_scope) = (order[next].path.clone(), order[next].scope.clone());
+        let (next_path, next_scope) = (next.path.clone(), next.scope.clone());
         let Some(repo) = status.repo_of(&next_scope).map(str::to_owned) else {
             return;
         };
@@ -4062,6 +4086,7 @@ impl CompiApp {
     ) -> AnyElement {
         let file = tab.path();
         let diff = tab.diff_scope().is_some();
+        let rendered = !diff && ui.notes.is_rendered(file);
         let edit_reason = tab
             .diff_scope()
             .and_then(|scope| ui.repo.change(file, scope))
@@ -4069,13 +4094,15 @@ impl CompiApp {
         let diff_reason = (!diff).then(|| ui.repo.diff_unavailable(file)).flatten();
         let (pane, path) = (pane_id.clone(), file.to_owned());
         let mut edit = text_button("file-mode-edit", "Edit")
-            .selected(!diff)
+            .selected(!diff && !rendered)
             .detail("Edits the file at the line in view")
             .disabled_because(edit_reason)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 if diff {
                     this.edit_from_diff(&pane, &path, window, cx);
                     cx.notify();
+                } else if rendered {
+                    this.set_note_mode(&pane, &path, false, window, cx);
                 }
             }));
         let (pane, path) = (pane_id.clone(), file.to_owned());
@@ -4096,7 +4123,20 @@ impl CompiApp {
             edit = edit.key(key);
             show_diff = show_diff.key(key);
         }
-        controls::segmented("file-mode", [edit, show_diff]).into_any_element()
+        let mut modes = vec![edit];
+        if !diff && crate::notes::is_markdown(file) {
+            let (pane, path) = (pane_id.clone(), file.to_owned());
+            modes.push(
+                text_button("file-mode-render", "Render")
+                    .selected(rendered)
+                    .detail("Renders this editor's Markdown without changing the file")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_note_mode(&pane, &path, true, window, cx);
+                    })),
+            );
+        }
+        modes.push(show_diff);
+        controls::segmented("file-mode", modes).into_any_element()
     }
 
     /// Path, kind, scope (`staged`, or the commit), line counts and what the diff compares;
@@ -4434,6 +4474,35 @@ mod tests {
             time: 0,
             changes: Vec::new(),
             truncated: false,
+        }
+    }
+
+    #[test]
+    fn bracket_navigation_never_leaves_the_active_review() {
+        use GitChangeKind::Modified;
+        use GitScope::{Staged, Unstaged};
+        let scope = GitScope::Commit(ID.into());
+        let committed = [
+            change(scope.clone(), Modified, "a.rs"),
+            change(scope.clone(), Modified, "z.rs"),
+        ];
+        let working = [
+            change(Unstaged, Modified, "a.rs"),
+            change(Staged, Modified, "b.rs"),
+        ];
+        let listed = Listed {
+            commit: &committed,
+            working: &working,
+        };
+        for tree in [false, true] {
+            let (_, order) = list_rows(listed, Some(ID), tree, &Folds::default());
+            let next = adjacent_diff(&listed, &order, Some("a.rs"), &scope, true).unwrap();
+            assert_eq!((&next.scope, next.path.as_str()), (&scope, "z.rs"));
+            assert!(adjacent_diff(&listed, &order, Some("z.rs"), &scope, true).is_none());
+            assert!(adjacent_diff(&listed, &order, Some("a.rs"), &scope, false).is_none());
+            assert!(adjacent_diff(&listed, &order, Some("a.rs"), &Unstaged, false).is_none());
+            let next = adjacent_diff(&listed, &order, Some("a.rs"), &Unstaged, true).unwrap();
+            assert_eq!((&next.scope, next.path.as_str()), (&Staged, "b.rs"));
         }
     }
 

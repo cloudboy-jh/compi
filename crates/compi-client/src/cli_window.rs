@@ -40,6 +40,12 @@ pub enum Action {
         file: String,
         line: u32,
     },
+    /// Open a Markdown note in the existing Files editor and select its display mode.
+    RevealNote {
+        pane_id: PaneId,
+        file: String,
+        rendered: bool,
+    },
     /// Focus the content pane `pane_id` and show its diff tab of repository path `path`
     /// (`/`-separated, relative to the top level of the pane's repository) in `scope` (a
     /// commit by its full id), with the 1-based new-side `line` scrolled into view.

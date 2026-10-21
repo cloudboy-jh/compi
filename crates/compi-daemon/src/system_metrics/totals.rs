@@ -124,6 +124,16 @@ impl SystemTotalsHub {
         }
     }
 
+    /// The boot epoch used by the current collector's process identities. WSL's live
+    /// `/proc/stat` boot epoch can shift when its clock is synchronized.
+    pub(super) fn sampled_boot_time(&self) -> Option<u64> {
+        self.lock()
+            .host
+            .as_ref()?
+            .booted_at_ms
+            .map(|time| time / 1000)
+    }
+
     /// The collector of `epoch` sampled; the sample is numbered after the last one.
     pub(super) fn publish_numbered(&self, epoch: u64, mut sample: TotalsSample) {
         let mut state = self.lock();
@@ -1282,13 +1292,16 @@ mod tests {
         let epoch = hub.begin();
         let mut watch = hub.watch(None);
         assert_eq!(watch.open(), None, "not described yet");
+        assert_eq!(hub.sampled_boot_time(), None);
         assert!(watch.pending().is_empty(), "nothing before it opens");
         hub.publish_numbered(epoch, TotalsSample::default());
         let host = HostInfo {
             host_name: Some("wsl".into()),
+            booted_at_ms: Some(1_792_553_694_000),
             ..HostInfo::default()
         };
         hub.describe(epoch, host.clone());
+        assert_eq!(hub.sampled_boot_time(), Some(1_792_553_694));
         let (described, history) = watch.open().unwrap().unwrap();
         assert_eq!(described, host);
         assert_eq!(history.iter().map(|s| s.sequence).collect::<Vec<_>>(), [0]);
@@ -1297,6 +1310,11 @@ mod tests {
 
         // A later collector starts over without going back; a stopped one changes nothing.
         let later = hub.begin();
+        assert_eq!(
+            hub.sampled_boot_time(),
+            None,
+            "a new collector forgets the old epoch"
+        );
         hub.publish_numbered(epoch, TotalsSample::default());
         hub.fail(epoch, "stopped".into());
         assert!(watch.pending().is_empty());

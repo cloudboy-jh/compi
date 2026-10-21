@@ -102,6 +102,7 @@ pub(in crate::gui) fn dispatch(
         if matches!(
             request.action,
             Action::RevealFile { .. }
+                | Action::RevealNote { .. }
                 | Action::RevealDiff { .. }
                 | Action::ShowChanges { .. }
                 | Action::FocusPane { .. }
@@ -225,7 +226,7 @@ pub(in crate::gui) fn dispatch(
                         }
                         Ok(Ok(false)) => {
                             let _ = completion.sender.send(Err(match request.action {
-                                Action::RevealFile { .. } => "The pane did not show the file before the request expired; open it in the pane first",
+                                Action::RevealFile { .. } | Action::RevealNote { .. } => "The pane did not show the file before the request expired; open it in the pane first",
                                 Action::RevealDiff { .. } => "The pane did not show the diff before the request expired; open it in the pane first",
                                 Action::ShowChanges { .. } => "The pane was not shown before the request expired; show its tab first",
                                 _ => "Pane ID does not exist in this window's daemon workspace",
@@ -380,7 +381,10 @@ impl CompiApp {
             .ok_or("Window has no authoritative workspace")?;
         let tab_id = match action {
             Action::List => return Err("Listing is not a window mutation".into()),
-            Action::RevealFile { .. } | Action::RevealDiff { .. } | Action::ShowChanges { .. } => {
+            Action::RevealFile { .. }
+            | Action::RevealNote { .. }
+            | Action::RevealDiff { .. }
+            | Action::ShowChanges { .. } => {
                 unreachable!("dispatch polls reveals")
             }
             Action::FocusTab { tab_id } | Action::DetachTab { tab_id } => tab_id.clone(),
@@ -565,6 +569,7 @@ impl CompiApp {
             }
             Action::List
             | Action::RevealFile { .. }
+            | Action::RevealNote { .. }
             | Action::RevealDiff { .. }
             | Action::ShowChanges { .. } => unreachable!(),
         }
@@ -598,7 +603,9 @@ impl CompiApp {
     ) -> crate::Result<bool> {
         let pane_id = match action {
             Action::FocusPane { pane_id } => pane_id,
-            Action::RevealFile { .. } => return self.reveal_presentation(action, window, cx),
+            Action::RevealFile { .. } | Action::RevealNote { .. } => {
+                return self.reveal_presentation(action, window, cx);
+            }
             _ => return self.changes_presentation(action, window, cx),
         };
         let known = self.workspace.as_ref().is_some_and(|workspace| {
@@ -627,13 +634,18 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> crate::Result<bool> {
-        let Action::RevealFile {
-            pane_id,
-            file,
-            line,
-        } = action
-        else {
-            unreachable!("polled_presentation passes only file reveals here");
+        let (pane_id, file, line, rendered) = match action {
+            Action::RevealFile {
+                pane_id,
+                file,
+                line,
+            } => (pane_id, file, *line, false),
+            Action::RevealNote {
+                pane_id,
+                file,
+                rendered,
+            } => (pane_id, file, 1, *rendered),
+            _ => unreachable!("polled_presentation passes only file reveals here"),
         };
         if self.overlay.is_some() {
             return Err("Close the active GUI menu or dialog before controlling this window; CLI requests cannot bypass confirmation".into());
@@ -702,12 +714,14 @@ impl CompiApp {
             environment,
             None,
             Some(file.clone()),
-            Some(*line),
+            Some(line),
             false,
             window,
             cx,
         );
         self.rebuild_layout(window, true);
+        self.prepare_content(window, cx);
+        self.set_note_mode(pane_id, file, rendered, window, cx);
         self.save_state();
         window.focus(&self.focus_handle, cx);
         cx.activate(true);

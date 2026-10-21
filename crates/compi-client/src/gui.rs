@@ -589,6 +589,7 @@ enum UiEvent {
         target: String,
         result: Result<compi_protocol::FileVersion, workspace::content::SaveFailure>,
     },
+    Notes(workspace::content::notes::NoteEvent),
     /// Every save the unsaved-changes prompt started (by batch id) has finished.
     UnsavedSaved(u64),
     UnsavedBackupsListed(Vec<workspace::unsaved::BackupEntry>),

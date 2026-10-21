@@ -52,9 +52,15 @@ pub fn inspect(
     pid: u32,
     start_time: u64,
 ) -> Result<Option<ProcessInspection>, String> {
+    let boot_time = sampled_boot_time(distribution)?.to_string();
     let output = run(
         distribution,
-        &["inspect", &pid.to_string(), &start_time.to_string()],
+        &[
+            "inspect",
+            &pid.to_string(),
+            &start_time.to_string(),
+            &boot_time,
+        ],
     )?;
     parse_inspection(&output)
 }
@@ -73,11 +79,25 @@ pub fn quit(
         });
     }
     let signal = if force { "KILL" } else { "TERM" };
+    let boot_time = sampled_boot_time(distribution)?.to_string();
     let output = run(
         distribution,
-        &["quit", &pid.to_string(), &start_time.to_string(), signal],
+        &[
+            "quit",
+            &pid.to_string(),
+            &start_time.to_string(),
+            signal,
+            &boot_time,
+        ],
     )?;
     parse_quit(&output)
+}
+
+fn sampled_boot_time(distribution: &str) -> Result<u64, String> {
+    hubs(distribution)
+        .1
+        .sampled_boot_time()
+        .ok_or_else(|| format!("WSL distribution {distribution} has not been sampled"))
 }
 
 /// `wsl.exe` running the script in `distribution` with `arguments`; the caller pipes the

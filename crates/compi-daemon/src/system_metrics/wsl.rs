@@ -823,6 +823,51 @@ E
         assert!(parse_inspection(b"").is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inspection_uses_the_sampled_epoch_without_relaxing_lifetime_checks() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let ticks: u64 = procfs::stat_fields(&stat).unwrap()[19].parse().unwrap();
+        let clock = Command::new("getconf").arg("CLK_TCK").output().unwrap();
+        assert!(clock.status.success());
+        let hz = String::from_utf8(clock.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Deliberately unrelated to today's /proc/stat btime, as after WSL clock sync.
+        let sampled_epoch = 1_760_000_000;
+        let started = procfs::start_seconds(sampled_epoch, ticks, hz);
+        let inspect = |start_time: u64| {
+            let mut child = Command::new("/bin/sh")
+                .args([
+                    "-s",
+                    "inspect",
+                    &std::process::id().to_string(),
+                    &start_time.to_string(),
+                    &sampled_epoch.to_string(),
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(SCRIPT.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            parse_inspection(&output.stdout).unwrap()
+        };
+        assert!(inspect(started).is_some());
+        assert!(inspect(started + 1).is_none());
+    }
+
     #[test]
     fn quit_answers_and_wsl_failures_are_read() {
         assert_eq!(parse_quit(b"sent\n"), Ok(QuitOutcome::Sent));

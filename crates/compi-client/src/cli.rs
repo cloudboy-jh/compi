@@ -6,6 +6,7 @@ mod content;
 mod diff;
 mod help;
 mod metrics;
+mod notes;
 mod palette;
 mod targets;
 #[cfg(any(windows, target_os = "macos"))]
@@ -32,6 +33,7 @@ const COMMANDS: &[&str] = &[
     "split",
     "files",
     "edit",
+    "notes",
     "diff",
     "settings",
     "monitor",
@@ -482,7 +484,7 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
                     options.with.push(iterator.next().unwrap().clone());
                 }
             }
-            "--right" | "--down" | "--check" | "--group" | "--force" => {
+            "--right" | "--down" | "--check" | "--group" | "--force" | "--edit" => {
                 if !options.switches.insert(arg.clone()) {
                     return Err(CliError::usage(format!("duplicate {arg}")));
                 }
@@ -995,6 +997,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         }
         "split" => return split(&mut client, &mut state, options, &config),
         "files" | "edit" => return content::run(&mut client, &state, &target, options),
+        "notes" => return notes::run(&mut client, &state, &target, options),
         "diff" => return diff::run(&mut client, &state, &target, options),
         "settings" | "monitor" => return view::run(&mut client, &state, &target, options),
         "command" => return palette::run(&state, &target, options),
@@ -1631,6 +1634,8 @@ fn validate(
         ("monitor", Some("quit")) => (3, 3, &["--source"], &["--force"]),
         ("monitor", _) => (1, 2, &["--source"], &[]),
         ("files" | "edit" | "settings", _) => (1, 2, &[], &[]),
+        ("notes", Some("search" | "backlinks")) => (3, 4, &[], &[]),
+        ("notes", _) => (1, 2, &[], &["--edit"]),
         // `diff [PATH]` and `diff COMMIT [PATH]`.
         ("diff", _) => (1, 3, &[], &[]),
         ("command", Some("list")) => (2, 2, &[], &[]),

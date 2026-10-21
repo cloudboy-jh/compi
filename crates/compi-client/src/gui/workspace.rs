@@ -2010,6 +2010,7 @@ impl CompiApp {
                 target,
                 result,
             } => self.content_file_saved(pane_id, path, target, result, cx),
+            UiEvent::Notes(event) => self.note_event(event, cx),
             UiEvent::UnsavedSaved(batch) => self.unsaved_saved(batch, cx),
             UiEvent::UnsavedBackupsListed(backups) => self.offer_backups(backups),
             UiEvent::PromptResponded {
@@ -2208,12 +2209,10 @@ impl CompiApp {
                         let changed_geometry = old.cols != delta.cols || old.rows != delta.rows;
                         if changed_geometry {
                             view.selection = None;
-                            view.scroll_offset = 0;
-                            view.new_lines = 0;
                             view.pending_scroll = None;
                             view.selecting = false;
-                        } else if let Some(ScrollbackChange::Append { evicted, rows }) =
-                            &delta.scrollback
+                        }
+                        if let Some(ScrollbackChange::Append { evicted, rows }) = &delta.scrollback
                         {
                             let (offset, selection) = crate::viewport::follow_append(
                                 old.scrollback.len(),
@@ -2228,7 +2227,9 @@ impl CompiApp {
                             view.selection = selection;
                             // A pending reprint is found by its text once applied.
                             if view.pending_scroll.is_none() && view.scroll_offset > 0 {
-                                view.new_lines = view.new_lines.saturating_add(rows.len());
+                                if !changed_geometry {
+                                    view.new_lines = view.new_lines.saturating_add(rows.len());
+                                }
                                 view.scroll_offset = offset;
                             }
                         } else if view.pending_scroll.is_none()
@@ -2247,9 +2248,11 @@ impl CompiApp {
                             );
                             match offset {
                                 Some(offset) => {
-                                    view.new_lines = view
-                                        .new_lines
-                                        .saturating_add(offset.saturating_sub(view.scroll_offset));
+                                    if !changed_geometry {
+                                        view.new_lines = view.new_lines.saturating_add(
+                                            offset.saturating_sub(view.scroll_offset),
+                                        );
+                                    }
                                     view.scroll_offset = offset;
                                 }
                                 None => {
@@ -2276,10 +2279,23 @@ impl CompiApp {
                                 && old.scrollback == snapshot.scrollback
                                 && old.cells == snapshot.cells
                         });
+                        let resized_offset = view.mirror.snapshot().and_then(|old| {
+                            (old.cols != snapshot.cols || old.rows != snapshot.rows)
+                                .then(|| {
+                                    crate::viewport::anchored_scroll_offset(
+                                        &old.scrollback,
+                                        &snapshot.scrollback,
+                                        view.scroll_offset,
+                                    )
+                                })
+                                .flatten()
+                        });
                         if !valid {
                             view.selection = None;
-                            view.scroll_offset = 0;
-                            view.new_lines = 0;
+                            view.scroll_offset = resized_offset.unwrap_or(0);
+                            if resized_offset.is_none() {
+                                view.new_lines = 0;
+                            }
                             view.pending_scroll = None;
                             view.selecting = false;
                         }
@@ -4910,6 +4926,7 @@ impl CompiApp {
             .on_mouse_move(cx.listener(Self::on_workspace_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_workspace_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_workspace_mouse_up))
+            .child(gpui_base::TextSelectionLayer)
             .child(self.render_titlebar(window, cx))
             .child(
                 div()
