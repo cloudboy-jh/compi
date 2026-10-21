@@ -12,6 +12,7 @@ Done: phase 0, GPUI upgrade (`2e2b9fe`); phase 1, content panes (`4b458be`); pha
 - Not seen live: the Recover unsaved edits list; moving a tab with unsaved edits to another window; the `e` expand-all key; the `conflicted` gutter label; the Stale notice; a hook error under the commit box; a confirmed discard; hunk staging through the UI on a `/mnt/c` repo.
 - Gaps to keep or drop: text selection in diffs; diff settings are not saved between sessions; tooltips can linger after a click changes the layout (GPUI); long folder names squeeze their icon in the Files tree; the tab strip scrolls sideways without an indicator; material-light's muted text is below AA (4.2:1 opaque, 2.8:1 with transparency).
 - Standalone developer/probe daemon launches from a supervised Compi shell can inherit `COMPI_SUPERVISOR_PID` and report a shutdown timeout after their own daemon has exited, while waiting for the unrelated installed supervisor. The integration fixture now clears this variable; developer/probe launcher isolation remains open.
+- After 0.3.0, investigate Windows compile time (requested 2026-10-21): measure cold/warm check, product and bootstrapper builds, then improve cache coverage and avoid duplicate compilation where safe. Keep native release qualification intact; no build-system changes in the release cut.
 
 ## Next
 
