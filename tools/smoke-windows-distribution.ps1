@@ -82,6 +82,7 @@ New-Item -ItemType Directory -Force -Path $unknownProject | Out-Null
 $unknownProjectSentinel = Join-Path $unknownProject 'preservation-sentinel.txt'
 [System.IO.File]::WriteAllText($unknownProjectSentinel, $sentinelValue)
 if (-not $ProbePath) {
+    Write-Host 'Building package smoke diagnostics'
     & cargo build --locked -p compi-client --example compi-probe --example compi-update-smoke
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build verification diagnostics' }
     $ProbePath = Join-Path $projectRoot 'target\debug\examples\compi-probe.exe'
@@ -89,6 +90,27 @@ if (-not $ProbePath) {
 $probe = (Resolve-Path -LiteralPath $ProbePath).Path
 if (-not $UpdateDriver) { $UpdateDriver = Join-Path $projectRoot 'target\debug\examples\compi-update-smoke.exe' }
 $startupLog = Join-Path $env:COMPI_DATA_DIR 'client-startup.log'
+
+function Invoke-Probe {
+    param([string[]]$Arguments, [string]$Label)
+    $stdout = Join-Path $evidence "$Label-probe.out.log"
+    $stderr = Join-Path $evidence "$Label-probe.err.log"
+    Write-Host "[$([DateTime]::UtcNow.ToString('o'))] Probe $Label"
+    $process = Start-Process -FilePath $probe -ArgumentList $Arguments -PassThru -NoNewWindow `
+        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    try {
+        if (-not $process.WaitForExit(60000)) {
+            $process.Kill()
+            $process.WaitForExit(5000) | Out-Null
+            throw "Probe $Label exceeded 60 seconds; inspect $stdout and $stderr"
+        }
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "Probe $Label failed ($($process.ExitCode)); inspect $stdout and $stderr"
+        }
+        Get-Content -LiteralPath $stdout -Raw
+    } finally { $process.Dispose() }
+}
 
 function Wait-Condition {
     param([scriptblock]$Condition, [string]$Description, [int]$Seconds = 60)
@@ -150,6 +172,8 @@ function Invoke-ClientSmoke {
     $payload = Resolve-PayloadDirectory $Directory
     $client = $null
     $daemon = $null
+    $smokeError = $null
+    $script:observedClient = $null
     $previousEnvironment = @{}
     foreach ($key in @('COMPI_PERF_LOG', 'COMPI_PERF_SAMPLE')) {
         $previousEnvironment[$key] = [Environment]::GetEnvironmentVariable($key)
@@ -158,11 +182,14 @@ function Invoke-ClientSmoke {
         $identity = $null
         foreach ($launch in 1..2) {
             $sample = "$instance-$launch"
+            $script:observedClient = $null
             $env:COMPI_PERF_LOG = '1'
             $env:COMPI_PERF_SAMPLE = $sample
+            Write-Host "[$([DateTime]::UtcNow.ToString('o'))] $Label launch $launch starting packaged GUI"
             $launcher = Start-Process -FilePath (Join-Path $Directory 'compi.exe') -ArgumentList @('--instance', $instance) -PassThru
+            Write-Host "$Label launch $launch waiting for first terminal frame"
             Wait-Condition -Description "$Label launch $launch initial terminal snapshot" -Condition {
-                $candidates = @(Get-CimInstance Win32_Process -Filter "Name = 'compi.exe'" |
+                $candidates = @(Get-CimInstance Win32_Process -Filter "Name = 'compi.exe'" -OperationTimeoutSec 10 |
                     Where-Object { $_.ExecutablePath -eq (Join-Path $payload 'compi.exe') -and $_.CommandLine -match "--instance $instance(?:\s|$)" })
                 if ($candidates.Count -eq 1) { $script:observedClient = Get-Process -Id $candidates[0].ProcessId }
                 if (-not (Test-Path $startupLog)) { return $false }
@@ -171,8 +198,7 @@ function Invoke-ClientSmoke {
             }
             $client = $script:observedClient
             $launcher.Dispose()
-            $workspaceJson = & $probe --instance $instance workspace
-            if ($LASTEXITCODE -ne 0) { throw 'Packaged client did not establish a readable workspace' }
+            $workspaceJson = Invoke-Probe -Arguments @('--existing', '--instance', $instance, 'workspace') -Label "$Label-$launch-workspace"
             $workspaceJson | Set-Content (Join-Path $evidence "$Label-$launch-workspace.json")
             $workspace = $workspaceJson | ConvertFrom-Json
             $surfaces = @($workspace.surfaces)
@@ -182,7 +208,7 @@ function Invoke-ClientSmoke {
             $currentIdentity = "$($workspace.server_id)/$($workspace.server_generation)/$($surfaces[0].id)/$($surfaces[0].process_lifetime_id)"
             if ($launch -eq 1) {
                 $identity = $currentIdentity
-                $matches = @(Get-CimInstance Win32_Process -Filter "Name = 'compi-daemon.exe'" |
+                $matches = @(Get-CimInstance Win32_Process -Filter "Name = 'compi-daemon.exe'" -OperationTimeoutSec 10 |
                     Where-Object { $_.CommandLine -match "--instance $instance(?:\s|$)" })
                 if ($matches.Count -ne 1 -or $matches[0].ExecutablePath -ne (Join-Path $payload 'compi-daemon.exe')) {
                     throw 'Client did not start its packaged sibling daemon'
@@ -191,6 +217,7 @@ function Invoke-ClientSmoke {
             } elseif ($identity -ne $currentIdentity) {
                 throw 'Relaunch replaced the existing terminal or daemon identity'
             }
+            Write-Host "$Label launch $launch closing packaged GUI"
             if (-not $client.CloseMainWindow()) { throw 'Native client window could not be closed' }
             if (-not $client.WaitForExit(10000)) { throw 'Native client did not close' }
             $client.Dispose()
@@ -198,20 +225,36 @@ function Invoke-ClientSmoke {
         }
         Write-Host "${Label}: native launch, running attached PTY, sibling daemon, and same-process reconnect passed"
     }
+    catch {
+        $smokeError = $_
+        throw
+    }
     finally {
-        if ($client -and -not $client.HasExited) { $client.Kill(); $client.WaitForExit(5000) | Out-Null }
-        if (-not $daemon) {
-            $owned = @(Get-CimInstance Win32_Process -Filter "Name = 'compi-daemon.exe'" |
-                Where-Object {
-                    $_.ExecutablePath -eq (Join-Path $payload 'compi-daemon.exe') -and
-                    $_.CommandLine -match "--instance $instance(?:\s|$)"
-                })
-            if ($owned.Count -eq 1) { $daemon = Get-Process -Id $owned[0].ProcessId }
-        }
-        & $probe --instance $instance shutdown
-        if ($daemon -and -not $daemon.WaitForExit(10000)) { $daemon.Kill(); $daemon.WaitForExit(5000) | Out-Null }
-        foreach ($key in $previousEnvironment.Keys) {
-            [Environment]::SetEnvironmentVariable($key, $previousEnvironment[$key])
+        try {
+            if (-not $client -and $smokeError) { $client = $script:observedClient }
+            if ($client -and -not $client.HasExited) { $client.Kill(); $client.WaitForExit(5000) | Out-Null }
+            if (-not $daemon) {
+                $owned = @(Get-CimInstance Win32_Process -Filter "Name = 'compi-daemon.exe'" -OperationTimeoutSec 10 |
+                    Where-Object {
+                        $_.ExecutablePath -eq (Join-Path $payload 'compi-daemon.exe') -and
+                        $_.CommandLine -match "--instance $instance(?:\s|$)"
+                    })
+                if ($owned.Count -eq 1) { $daemon = Get-Process -Id $owned[0].ProcessId }
+            }
+            if ($daemon -and -not $daemon.HasExited) {
+                try {
+                    Invoke-Probe -Arguments @('--existing', '--instance', $instance, 'shutdown') -Label "$Label-shutdown" | Out-Host
+                } finally {
+                    if (-not $daemon.WaitForExit(10000)) { $daemon.Kill(); $daemon.WaitForExit(5000) | Out-Null }
+                }
+            }
+        } catch {
+            if (-not $smokeError) { throw }
+            Write-Host "Package smoke cleanup also failed: $_"
+        } finally {
+            foreach ($key in $previousEnvironment.Keys) {
+                [Environment]::SetEnvironmentVariable($key, $previousEnvironment[$key])
+            }
         }
     }
 }

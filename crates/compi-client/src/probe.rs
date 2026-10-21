@@ -59,7 +59,8 @@ pub fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&client.workspace()?)?);
                 Ok(())
             }
-            _ => Err("--existing supports only the workspace command".into()),
+            Some("shutdown") if args.len() == 1 => shutdown(&target),
+            _ => Err("--existing supports only workspace and shutdown".into()),
         };
     }
 
@@ -810,7 +811,7 @@ fn soak(target: &ConnectionTarget, duration: Duration) -> Result<()> {
 }
 
 fn shutdown(target: &ConnectionTarget) -> Result<()> {
-    let mut client = target.connect()?;
+    let mut client = target.connect_existing()?;
     client.shutdown_daemon()?;
     println!("daemon stopping");
     Ok(())

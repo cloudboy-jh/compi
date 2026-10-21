@@ -152,11 +152,11 @@ function Stop-OwnedDefault {
     $processes = @(Get-OwnedProcesses | Where-Object { $_.Name -eq 'compi-daemon.exe' -and $_.CommandLine -notmatch '--instance(?:\s|=)' })
     if ($processes.Count) {
         if (-not $probe) { throw 'Cannot safely stop installed default daemon without existing-only probe' }
-        & $probe --existing --instance '' workspace | Set-Content -LiteralPath (Join-Path $run 'default-before-stop.json')
+        & $probe --existing workspace | Set-Content -LiteralPath (Join-Path $run 'default-before-stop.json')
         if ($LASTEXITCODE -ne 0) { throw 'Owned default processes exist without an inspectable endpoint' }
         $workspace = Get-Content -LiteralPath (Join-Path $run 'default-before-stop.json') -Raw | ConvertFrom-Json
         if (@($workspace.surfaces).Count -ne 0) { throw 'Refusing to stop default daemon with live shell work' }
-        & $probe --existing --instance '' shutdown
+        & $probe --existing shutdown
         if ($LASTEXITCODE -ne 0) { throw 'Owned default shutdown failed' }
     }
     Wait-Condition -Description 'owned idle default daemon and supervisor exit' -Condition {
@@ -200,7 +200,7 @@ try {
     # Authenticate the historical release with its published Ed25519 Setup envelope,
     # then require exact version, URL, byte length, and SHA before executing anything.
     $baselineMetadata = Join-Path $run 'official-0.3.0-setup-metadata.json'
-    Invoke-WebRequest -Uri 'https://github.com/cloudboy-jh/compi/releases/download/v0.3.0/compi-setup-windows-x86_64.json' -OutFile $baselineMetadata
+    Invoke-WebRequest -Uri 'https://github.com/cloudboy-jh/compi/releases/download/v0.3.0/compi-setup-windows-x86_64.json' -OutFile $baselineMetadata -TimeoutSec 120
     & python -c 'import cryptography' 2>$null
     if ($LASTEXITCODE -ne 0) {
         & python -m pip install cryptography
@@ -221,7 +221,7 @@ print(json.dumps(m['setup']))
     if ($LASTEXITCODE -ne 0) { throw 'Official 0.3.0 Setup signature/schema verification failed' }
     $baseline = $verifiedSetup | ConvertFrom-Json
     $baselineSetup = Join-Path $run 'Compi-0.3.0-Setup.exe'
-    Invoke-WebRequest -Uri $baseline.url -OutFile $baselineSetup
+    Invoke-WebRequest -Uri $baseline.url -OutFile $baselineSetup -TimeoutSec 120
     if ((Get-Item -LiteralPath $baselineSetup).Length -ne $baseline.size -or (Hash $baselineSetup) -ne $baseline.sha256) {
         throw 'Authenticated official 0.3.0 Setup size/SHA mismatch'
     }
