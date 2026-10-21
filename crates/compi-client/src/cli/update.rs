@@ -83,6 +83,11 @@ pub(super) fn run(options: &Options) -> Result<Output, CliError> {
         if human {
             println!("Downloaded and verified · {}", updates::format_size(size));
         }
+    } else if retained_retry_needed(checked.prepared.as_ref().expect("ready update is prepared"))? {
+        // Give this command a fresh transaction identity instead of mistaking the
+        // previous Prepared error for the outcome of its new GUI handoff.
+        let retried = service.run(Operation::Reinstall, |_| {});
+        finished(retried, "update_download_failed")?;
     }
     restart(&service, options, &version)
 }
@@ -140,28 +145,38 @@ fn restart(service: &UpdateService, options: &Options, version: &str) -> Result<
             let _ = io::stdout().flush();
         }
         match wait_for_restart(&prepared, &outcome)? {
-            CommandOutcome::Started => {
+            RestartOutcome::Complete => {
                 return Ok(Output::Report {
-                    text: String::new(),
+                    text: format!("Compi {version} installed and reopened.\n"),
                     value: json!({
-                        "current": RUNNING,
+                        "current": version,
+                        "previous": RUNNING,
                         "version": version,
-                        "restarting": true,
+                        "restarting": false,
+                        "applied": true,
+                        "reopened": true,
                         "ending_shells": listed.iter().map(Shell::json).collect::<Vec<_>>(),
                     }),
                 });
             }
-            CommandOutcome::ShellsChanged => {
+            RestartOutcome::ShellsChanged => {
                 if human {
                     println!("More shells are running now.");
                 }
             }
-            CommandOutcome::Failed { message } => return Err(failed(message)),
         }
     }
     Err(failed(
         "Compi couldn't start the restart. Try again, or restart from Settings → Updates.".into(),
     ))
+}
+
+fn retained_retry_needed(prepared: &PreparedUpdate) -> Result<bool, CliError> {
+    let journal = compi_update::operation_status(&prepared.target)
+        .map_err(|error| failed(format!("Couldn't read update progress: {error}")))?;
+    Ok(journal.is_some_and(|journal| {
+        journal.phase == compi_update::JournalStage::Prepared && journal.error.is_some()
+    }))
 }
 
 fn failed(message: String) -> CliError {
@@ -272,25 +287,81 @@ fn open_compi(options: &Options, instance: Option<&str>) -> Result<(), CliError>
     }
 }
 
-fn wait_for_restart(prepared: &PreparedUpdate, outcome: &Path) -> Result<CommandOutcome, CliError> {
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        if let Some(outcome) = updates::take_command_outcome(outcome) {
-            return Ok(outcome);
-        }
-        // The update helper took over before the window could report.
-        if compi_update::operation_status(&prepared.target)
-            .ok()
-            .flatten()
-            .is_some_and(|journal| journal.phase != compi_update::JournalStage::Prepared)
+#[derive(Debug, PartialEq, Eq)]
+enum RestartOutcome {
+    Complete,
+    ShellsChanged,
+}
+
+/// A helper handoff is only progress. Complete is persisted after every new GUI attaches.
+fn restart_status(
+    prepared: &PreparedUpdate,
+    journal: Option<&compi_update::Journal>,
+    outcome: Option<CommandOutcome>,
+) -> Result<Option<RestartOutcome>, CliError> {
+    if let Some(journal) = journal {
+        if journal.manifest.version != prepared.version
+            || journal.stage != prepared.stage
+            || journal.target.root != prepared.target.root
+            || journal.target.kind != prepared.target.kind
         {
-            return Ok(CommandOutcome::Started);
+            return Err(failed(
+                "The update transaction changed before this restart was confirmed.".into(),
+            ));
+        }
+        if let Some(error) = &journal.error {
+            let context = if journal.phase == compi_update::JournalStage::RolledBack {
+                "The update failed and was rolled back"
+            } else {
+                "The update did not finish installing and reopening Compi"
+            };
+            return Err(failed(format!("{context}: {error}")));
+        }
+        match journal.phase {
+            compi_update::JournalStage::Complete => return Ok(Some(RestartOutcome::Complete)),
+            compi_update::JournalStage::RolledBack => {
+                return Err(failed(
+                    "The update did not install; Compi was rolled back.".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    match outcome {
+        Some(CommandOutcome::ShellsChanged) => Ok(Some(RestartOutcome::ShellsChanged)),
+        Some(CommandOutcome::Failed { message }) => Err(failed(message)),
+        Some(CommandOutcome::Started) | None => Ok(None),
+    }
+}
+
+fn wait_for_restart(prepared: &PreparedUpdate, outcome: &Path) -> Result<RestartOutcome, CliError> {
+    wait_for_restart_until(prepared, outcome, Instant::now() + Duration::from_secs(180))
+}
+
+fn wait_for_restart_until(
+    prepared: &PreparedUpdate,
+    outcome: &Path,
+    deadline: Instant,
+) -> Result<RestartOutcome, CliError> {
+    loop {
+        let journal = compi_update::operation_status(&prepared.target)
+            .map_err(|error| failed(format!("Couldn't read update progress: {error}")))?;
+        if let Some(finished) = restart_status(
+            prepared,
+            journal.as_ref(),
+            updates::take_command_outcome(outcome),
+        )? {
+            return Ok(finished);
         }
         if Instant::now() >= deadline {
             return Err(CliError::new(
                 1,
                 "update_unconfirmed",
-                "Compi didn't confirm the restart; see Settings → Updates",
+                format!(
+                    "Compi didn't confirm that {} installed and reopened. Journal: {}",
+                    prepared.version,
+                    prepared.journal_path.display()
+                ),
             ));
         }
         thread::sleep(Duration::from_millis(100));
@@ -451,5 +522,191 @@ mod tests {
                 "{answer:?}"
             );
         }
+    }
+
+    struct RestartFixture {
+        root: std::path::PathBuf,
+        prepared: PreparedUpdate,
+        outcome: std::path::PathBuf,
+        journal: compi_update::Journal,
+    }
+
+    impl RestartFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "compi-cli-update-{}",
+                compi_update::new_receipt_token()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let state = root.join(".compi-update");
+            std::fs::create_dir_all(&state).unwrap();
+            let attempt = "a".repeat(32);
+            let target = compi_update::InstallTarget {
+                kind: compi_update::InstallationKind::InstalledWindows,
+                root: root.clone(),
+            };
+            let prepared = PreparedUpdate {
+                journal_path: state.join("journal.json"),
+                target: target.clone(),
+                version: "0.3.0".into(),
+                stage: state.join(format!("stage-{attempt}")).join("payload"),
+            };
+            let journal = compi_update::Journal {
+                schema: 1,
+                attempt,
+                target,
+                manifest: compi_update::ReleaseManifest {
+                    schema: 1,
+                    product: "compi".into(),
+                    version: prepared.version.clone(),
+                    platform: "windows-x86_64".into(),
+                    minimum_os: "10".into(),
+                    release_notes: String::new(),
+                    daemon_protocol: 14,
+                    qualified_daemon_versions: vec!["0.2.0".into()],
+                    minimum_persistence: 1,
+                    artifact: compi_update::Artifact {
+                        url: String::new(),
+                        size: 1,
+                        sha256: String::new(),
+                    },
+                    setup: None,
+                },
+                signed: compi_update::SignedManifest {
+                    payload: String::new(),
+                    signature: String::new(),
+                },
+                stage: prepared.stage.clone(),
+                prior_selection: None,
+                phase: compi_update::JournalStage::Prepared,
+                backup: None,
+                retained_backups: Vec::new(),
+                prior_task: None,
+                error: None,
+            };
+            Self {
+                root,
+                prepared,
+                outcome: state.join("command-outcome.json"),
+                journal,
+            }
+        }
+
+        fn observe(&self, outcome: Option<CommandOutcome>) -> Result<RestartOutcome, CliError> {
+            std::fs::write(
+                &self.prepared.journal_path,
+                serde_json::to_vec(&self.journal).unwrap(),
+            )
+            .unwrap();
+            if let Some(outcome) = outcome {
+                std::fs::write(&self.outcome, serde_json::to_vec(&outcome).unwrap()).unwrap();
+            }
+            // Exercise the real persisted-status consumer, without sleeps or live processes.
+            wait_for_restart_until(&self.prepared, &self.outcome, Instant::now())
+        }
+    }
+
+    impl Drop for RestartFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn retained_prepared_failure_is_restaged_before_a_new_cli_handoff() {
+        let mut fixture = RestartFixture::new();
+        fixture.observe(None).unwrap_err();
+        assert!(!retained_retry_needed(&fixture.prepared).unwrap());
+        fixture.journal.error = Some("previous activation failed".into());
+        fixture.observe(None).unwrap_err();
+        assert!(retained_retry_needed(&fixture.prepared).unwrap());
+        // Do not turn an in-progress or terminal transaction into an implicit retry.
+        for phase in [
+            compi_update::JournalStage::Activating,
+            compi_update::JournalStage::Relaunching,
+            compi_update::JournalStage::Complete,
+            compi_update::JournalStage::RolledBack,
+        ] {
+            fixture.journal.phase = phase;
+            fixture.observe(None).unwrap_err();
+            assert!(
+                !retained_retry_needed(&fixture.prepared).unwrap(),
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn helper_handoff_and_pending_journal_never_report_installed_success() {
+        let mut fixture = RestartFixture::new();
+        for phase in [
+            compi_update::JournalStage::Prepared,
+            compi_update::JournalStage::Activating,
+            compi_update::JournalStage::Activated,
+            compi_update::JournalStage::Relaunching,
+        ] {
+            fixture.journal.phase = phase;
+            for outcome in [None, Some(CommandOutcome::Started)] {
+                let error = fixture.observe(outcome).unwrap_err();
+                assert_eq!(error.code, "update_unconfirmed", "{phase:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_matching_completed_candidate_reports_success() {
+        let mut fixture = RestartFixture::new();
+        fixture.journal.phase = compi_update::JournalStage::Complete;
+        assert_eq!(fixture.observe(None).unwrap(), RestartOutcome::Complete);
+        fixture.journal.manifest.version = "0.2.0".into();
+        let error = fixture.observe(Some(CommandOutcome::Started)).unwrap_err();
+        assert_eq!(error.code, "update_failed");
+        fixture.journal.manifest.version = fixture.prepared.version.clone();
+        fixture.prepared.stage = fixture.root.join("another-stage");
+        assert_eq!(fixture.observe(None).unwrap_err().code, "update_failed");
+    }
+
+    #[test]
+    fn persisted_activation_and_reopen_failures_override_helper_started() {
+        let mut fixture = RestartFixture::new();
+        for phase in [
+            compi_update::JournalStage::Prepared,
+            compi_update::JournalStage::Activating,
+            compi_update::JournalStage::Relaunching,
+            compi_update::JournalStage::Complete,
+            compi_update::JournalStage::RolledBack,
+        ] {
+            fixture.journal.phase = phase;
+            fixture.journal.error = Some("owned task or GUI attachment failed".into());
+            let error = fixture.observe(Some(CommandOutcome::Started)).unwrap_err();
+            assert_eq!(error.code, "update_failed");
+            assert!(
+                error
+                    .message
+                    .contains("owned task or GUI attachment failed")
+            );
+        }
+        fixture.journal.error = None;
+        let error = fixture.observe(None).unwrap_err();
+        assert_eq!(error.code, "update_failed");
+    }
+
+    #[test]
+    fn restart_handoff_preserves_consent_and_host_failures() {
+        let fixture = RestartFixture::new();
+        assert_eq!(
+            fixture
+                .observe(Some(CommandOutcome::ShellsChanged))
+                .unwrap(),
+            RestartOutcome::ShellsChanged
+        );
+        let error = fixture
+            .observe(Some(CommandOutcome::Failed {
+                message: "Task belongs to another installation or generation".into(),
+            }))
+            .unwrap_err();
+        assert_eq!(error.code, "update_failed");
+        assert!(error.message.contains("another installation or generation"));
     }
 }

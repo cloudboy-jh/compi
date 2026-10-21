@@ -47,6 +47,22 @@ fn run() -> compi_client::Result<()> {
             println!("{}", serde_json::to_string(&hosts)?);
             Ok(())
         }
+        Some("install") if args.len() == 4 => {
+            let outcome = PathBuf::from(&args[3]);
+            if !outcome.is_absolute() || outcome.exists() {
+                return Err("Smoke install outcome must be a new absolute owned path".into());
+            }
+            let outcome = outcome.parent().ok_or("Outcome has no parent")?.canonicalize()?
+                .join(outcome.file_name().ok_or("Outcome has no file name")?);
+            let hosts: Vec<_> = update_hosts()?.into_iter()
+                .filter(|host| host.instance.as_deref() == Some(args[1].as_str())).collect();
+            if hosts.len() != 1 {
+                return Err(format!("Expected exactly one test GUI host, found {}", hosts.len()).into());
+            }
+            compi_client::window_host::request_update_install(
+                &hosts[0], args[2].clone(), Vec::new(), outcome,
+            )
+        }
         Some("prepare") if args.len() == 6 => {
             let handoff = PathBuf::from(&args[2]);
             let rollback_handoff = PathBuf::from(&args[3]);
@@ -105,7 +121,7 @@ fn run() -> compi_client::Result<()> {
                 Ok(_) => Err("Cancelled preparation unexpectedly produced an installable journal".into()),
             }
         }
-        _ => Err("Usage: compi-update-smoke import-theme FILE | hosts INSTANCE | seed-shell INSTANCE COMMAND | prepare INSTANCE HANDOFF ROLLBACK_HANDOFF VERSION HOSTS | release HOSTS HANDOFF | abort HOSTS HANDOFF | cancel-stage METADATA ARTIFACT CURRENT_VERSION".into()),
+        _ => Err("Usage: compi-update-smoke import-theme FILE | hosts INSTANCE | install INSTANCE VERSION OUTCOME | seed-shell INSTANCE COMMAND | prepare INSTANCE HANDOFF ROLLBACK_HANDOFF VERSION HOSTS | release HOSTS HANDOFF | abort HOSTS HANDOFF | cancel-stage METADATA ARTIFACT CURRENT_VERSION".into()),
     }
 }
 

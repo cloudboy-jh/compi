@@ -102,6 +102,20 @@ jobs:
       - name: Verify portable artifact
         shell: pwsh
         run: .\tools\smoke-windows-distribution.ps1
+      - name: Verify installed Setup migration and in-app update
+        shell: pwsh
+        run: .\tools\smoke-windows-installed-update.ps1 -DistributionDirectory target/distribution
+      - name: Preserve installed-update qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installed-update-qualification
+          path: |
+            target/distribution-smoke/installed-*/**/*.json
+            target/distribution-smoke/installed-*/**/*.log
+            target/distribution-smoke/installed-*/**/*.xml
+            target/distribution-smoke/installed-*/**/*.png
+          if-no-files-found: ignore
       - name: Remove imported publisher certificate
         if: always()
         shell: pwsh

@@ -23,6 +23,8 @@ Open **Settings → Updates** or run **Check for Updates** from the command pale
 
 An update that can keep the running daemon relaunches clients into their saved views without ending shells. If a local daemon restart is required, Compi asks for consent and ends its shells; save your work first. The local updater never restarts remote daemons.
 
+Installing an update includes reopening Compi; starting the helper is not completion. Installation ownership is checked before windows close or a consented daemon stops. A failed activation or new-build attachment records the error and reopens the previous saved views when safe. If the previous views cannot reopen safely, the update journal and worker log retain the failure and recovery details.
+
 See the current [release notes](release-notes.md) for version-specific update instructions.
 
 ## Repair and removal

@@ -572,6 +572,30 @@ $ErrorActionPreference='Stop'
 $id=[Security.Principal.WindowsIdentity]::GetCurrent()
 $name='Compi Daemon-'+$id.User.Value
 $allowed=@({paths})
+function Normalize-OwnedPath([string]$value) {{
+    $path=$value
+    if ($path.StartsWith('"') -and $path.EndsWith('"') -and $path.Length -ge 2) {{
+        $path=$path.Substring(1,$path.Length-2)
+    }}
+    if ($path.Contains('"')) {{ throw 'Invalid quoted task executable' }}
+    $path=$path.Replace('/','\')
+    if ($path.StartsWith('\\?\UNC\',[StringComparison]::OrdinalIgnoreCase)) {{
+        $path='\\'+$path.Substring(8)
+    }} elseif ($path.StartsWith('\\?\',[StringComparison]::OrdinalIgnoreCase)) {{
+        $path=$path.Substring(4)
+    }}
+    if ($path.StartsWith('\\.\') -or $path.StartsWith('\\?\') -or
+        ($path -notmatch '^[A-Za-z]:\\' -and $path -notmatch '^\\\\[^\\]+\\[^\\]+\\')) {{
+        throw 'Task executable must use an absolute drive or UNC path'
+    }}
+    # Extended paths preserve trailing dots/spaces and dot components that ordinary
+    # Win32 paths can reinterpret. Refuse these instead of equating different files.
+    foreach ($component in ($path -split '\\')) {{
+        if ($component -match '[. ]$') {{ throw 'Ambiguous task executable path component' }}
+    }}
+    return [IO.Path]::GetFullPath($path)
+}}
+$allowed=@($allowed | ForEach-Object {{ Normalize-OwnedPath $_ }})
 # Windows reports a task's principal as a SID, DOMAIN\user, or a bare user name
 # ("johns"); compare the resolved SID so the account's own task is never "foreign".
 function Assert-Owner($owner, $commands) {{
@@ -579,11 +603,11 @@ function Assert-Owner($owner, $commands) {{
     if ($owner -notlike 'S-1-*') {{
         try {{ $ownerSid=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }} catch {{ $ownerSid=$null }}
     }}
-    $mine=($ownerSid -eq $id.User.Value) -or ($owner -eq $id.Name) -or ($owner -eq ($id.Name -split '\\')[-1])
+    $mine=($ownerSid -eq $id.User.Value)
     if (-not $mine) {{ throw 'Task belongs to another Windows account' }}
     if (@($commands).Count -ne 1) {{ throw 'Task does not have exactly one owned daemon action' }}
     foreach ($command in $commands) {{
-        $path=[IO.Path]::GetFullPath($command.Trim('"'))
+        $path=Normalize-OwnedPath $command
         if (-not ($allowed | Where-Object {{ [string]::Equals($_,$path,[StringComparison]::OrdinalIgnoreCase) }})) {{
             throw 'Task belongs to another installation or generation'
         }}
@@ -672,7 +696,7 @@ if ($t) {
     };
     // Accept only our old/new current action, but constrain retained XML to the old action.
     let script = format!(
-        "{current_guard}\n$allowed=@('{previous}')\nif ($name -ne '{quoted_name}') {{ throw 'Prior task belongs to another user' }}\n{restore}"
+        "{current_guard}\n$allowed=@(Normalize-OwnedPath '{previous}')\nif ($name -ne '{quoted_name}') {{ throw 'Prior task belongs to another user' }}\n{restore}"
     );
     let result = task_powershell(&script).map(|_| ());
     let _ = fs::remove_file(&path);
@@ -833,9 +857,15 @@ fn rollback(path: &Path, journal: &mut Journal) -> Result<()> {
     journal.phase = JournalStage::RolledBack;
     atomic_json(path, journal)
 }
-pub fn launch_worker(prepared: &PreparedUpdate, request: &RelaunchRequest) -> Result<Child> {
-    validate_request(request)?;
+/// Check activation ownership before releasing GUI hosts or stopping the default daemon.
+pub fn preflight_activation(prepared: &PreparedUpdate, replace_default_daemon: bool) -> Result<()> {
     let _lock = OperationLock::acquire(&prepared.target.root)?;
+    preflight_activation_locked(prepared, replace_default_daemon).map(|_| ())
+}
+fn preflight_activation_locked(
+    prepared: &PreparedUpdate,
+    replace_default_daemon: bool,
+) -> Result<Journal> {
     let journal: Journal = read_json(&prepared.journal_path, 1024 * 1024)?;
     validate_journal(&prepared.journal_path, &journal)?;
     if journal.phase != JournalStage::Prepared || journal.manifest.version != prepared.version {
@@ -850,6 +880,15 @@ pub fn launch_worker(prepared: &PreparedUpdate, request: &RelaunchRequest) -> Re
         ));
     }
     validate_activation_baseline(&journal)?;
+    if journal.target.kind == InstallationKind::InstalledWindows && replace_default_daemon {
+        snapshot_owned_task(&journal)?;
+    }
+    Ok(journal)
+}
+pub fn launch_worker(prepared: &PreparedUpdate, request: &RelaunchRequest) -> Result<Child> {
+    validate_request(request)?;
+    let _lock = OperationLock::acquire(&prepared.target.root)?;
+    let journal = preflight_activation_locked(prepared, request.replace_default_daemon)?;
     let request_path =
         state_dir(&prepared.target.root).join(format!("request-{}.json", journal.attempt));
     atomic_json(&request_path, request)?;
@@ -978,6 +1017,24 @@ fn process_alive(pid: u32) -> Result<bool> {
         Ok(status.success())
     }
 }
+fn wait_for_old_hosts(request: &RelaunchRequest) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
+    loop {
+        let mut alive = false;
+        for &pid in &request.old_process_ids {
+            alive |= process_alive(pid)?;
+        }
+        if !alive {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(err(
+                "Old GUI hosts did not exit within deadline; close Compi hosts using this installation and retry",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 pub fn apply(
     journal_path: &Path,
     request: &RelaunchRequest,
@@ -992,64 +1049,69 @@ pub fn apply(
     if journal.phase != JournalStage::Prepared {
         return Err(err("Journal is not ready; run recovery before retrying"));
     }
-    validate_activation_baseline(&journal)?;
     let config = ReleaseConfig::compiled()?;
     let verified = verify_manifest(&serde_json::to_vec(&journal.signed)?, &config)?;
     if serde_json::to_vec(&verified.manifest)? != serde_json::to_vec(&journal.manifest)? {
         return Err(err("Journal manifest differs from publisher signature"));
     }
-    ensure_newer_than_selected(&journal.target, &journal.manifest.version)?;
-    let package = journal.stage.parent().unwrap().join("package.zip");
-    verify_package(&package, &journal.manifest.artifact)?;
-    if journal.stage.exists() {
-        fs::remove_dir_all(&journal.stage)?;
-    }
-    archive::extract(
-        &package,
-        &journal.stage,
-        &Cancellation::new(),
-        &mut progress,
-    )?;
-    validate_payload(&journal.target, &journal.stage)?;
-    let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
-    while request
-        .old_process_ids
-        .iter()
-        .map(|&pid| process_alive(pid))
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .any(|&alive| alive)
-    {
-        if Instant::now() >= deadline {
-            return Err(err(
-                "Old GUI hosts did not exit within deadline; close Compi hosts using this installation and retry",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    validate_host_inventory(&journal.target, &request.old_process_ids)?;
-    progress(event(
-        UpdatePhase::Activating,
-        0,
-        None,
-        "Activating verified full payload; old daemon payload retained",
-    ));
-    if journal.target.kind == InstallationKind::MacBundle {
-        journal.backup =
-            Some(state_dir(&journal.target.root).join(format!("previous-{}.app", journal.attempt)));
-        let backup = journal.backup.as_ref().unwrap();
-        if !journal.retained_backups.contains(backup) {
-            journal.retained_backups.push(backup.clone());
-        }
-    }
-    if journal.target.kind == InstallationKind::InstalledWindows && request.replace_default_daemon {
-        journal.prior_task = Some(snapshot_owned_task(&journal)?);
-    }
-    validate_journal(journal_path, &journal)?;
+    apply_authenticated(journal_path, request, &mut journal, &mut progress)
+}
+fn begin_activation(journal_path: &Path, journal: &mut Journal) -> Result<()> {
+    // A retained Prepared failure can be retried with fresh handoffs. Clear it only
+    // after this attempt's checks pass, before any replacement GUI can observe it.
+    journal.error = None;
     journal.phase = JournalStage::Activating;
-    atomic_json(journal_path, &journal)?;
+    atomic_json(journal_path, journal)
+}
+// Only entered after journal ownership and the retained publisher signature are authenticated.
+fn apply_authenticated(
+    journal_path: &Path,
+    request: &RelaunchRequest,
+    journal: &mut Journal,
+    mut progress: impl FnMut(UpdateEvent),
+) -> Result<()> {
+    let mut activation_started = false;
     let mut new_gui_exit_confirmed = true;
     let result: Result<()> = (|| {
+        validate_activation_baseline(journal)?;
+        ensure_newer_than_selected(&journal.target, &journal.manifest.version)?;
+        let package = journal.stage.parent().unwrap().join("package.zip");
+        verify_package(&package, &journal.manifest.artifact)?;
+        if journal.stage.exists() {
+            fs::remove_dir_all(&journal.stage)?;
+        }
+        archive::extract(
+            &package,
+            &journal.stage,
+            &Cancellation::new(),
+            &mut progress,
+        )?;
+        validate_payload(&journal.target, &journal.stage)?;
+        wait_for_old_hosts(request)?;
+        validate_host_inventory(&journal.target, &[])?;
+        progress(event(
+            UpdatePhase::Activating,
+            0,
+            None,
+            "Activating verified full payload; old daemon payload retained",
+        ));
+        if journal.target.kind == InstallationKind::MacBundle {
+            journal.backup = Some(
+                state_dir(&journal.target.root).join(format!("previous-{}.app", journal.attempt)),
+            );
+            let backup = journal.backup.as_ref().unwrap();
+            if !journal.retained_backups.contains(backup) {
+                journal.retained_backups.push(backup.clone());
+            }
+        }
+        if journal.target.kind == InstallationKind::InstalledWindows
+            && request.replace_default_daemon
+        {
+            journal.prior_task = Some(snapshot_owned_task(journal)?);
+        }
+        validate_journal(journal_path, journal)?;
+        begin_activation(journal_path, journal)?;
+        activation_started = true;
         match journal.target.kind {
             InstallationKind::MacBundle => {
                 if journal.target.root.starts_with("/Volumes") {
@@ -1071,11 +1133,11 @@ pub fn apply(
                 let selection = Selection {
                     schema: 1,
                     version: journal.manifest.version.clone(),
-                    task_version: selected_task_version(&journal, request.replace_default_daemon),
+                    task_version: selected_task_version(journal, request.replace_default_daemon),
                 };
                 atomic_json(&journal.target.root.join("selection.json"), &selection)?;
                 if journal.prior_task.is_some() {
-                    install_verified_task(&journal)?;
+                    install_verified_task(journal)?;
                 }
             }
         }
@@ -1119,8 +1181,28 @@ pub fn apply(
         Ok(())
     })();
     if let Err(failure) = result {
+        if !activation_started {
+            journal.phase = JournalStage::Prepared;
+        }
         journal.error = Some(failure.to_string());
         atomic_json(journal_path, &journal)?;
+        if !activation_started {
+            // The parent may still be releasing its hosts. Never create duplicate old views,
+            // undo a changed selection, or alter a task that failed ownership validation.
+            let safe = wait_for_old_hosts(request)
+                .and_then(|_| validate_host_inventory(&journal.target, &[]))
+                .and_then(|_| validate_activation_baseline(journal));
+            if let Err(blocked) = safe {
+                journal.error = Some(format!(
+                    "{failure}; activation was not started; prior GUI reopen deferred: {blocked}; {}; handoffs retained; journal: {}",
+                    manual_recovery(request),
+                    journal_path.display()
+                ));
+                atomic_json(journal_path, journal)?;
+                return Err(err(journal.error.clone().unwrap()));
+            }
+            return finish_prior_relaunch(journal_path, journal, request, &failure);
+        }
         if !new_gui_exit_confirmed {
             return Err(err(format!(
                 "{failure}; GUI exit is unconfirmed: close only the worker-spawned GUI hosts before recovery; unsafe rollback was not attempted; journal: {}",
@@ -1128,7 +1210,7 @@ pub fn apply(
             )));
         }
         if request.replace_default_daemon
-            && let Err(blocked) = stop_replacement_daemons(&journal)
+            && let Err(blocked) = stop_replacement_daemons(journal)
         {
             journal.error = Some(format!("{failure}; rollback deferred: {blocked}"));
             atomic_json(journal_path, &journal)?;
@@ -1144,32 +1226,32 @@ pub fn apply(
             None,
             "Restoring prior payload and exact previous GUI views",
         ));
-        if let Err(rollback) = rollback(journal_path, &mut journal) {
+        if let Err(rollback) = rollback(journal_path, journal) {
             return Err(err(format!(
                 "{failure}; rollback also failed: {rollback}; journal: {}",
                 journal_path.display()
             )));
         }
-        match relaunch_prior(&journal.target, request) {
-            Ok(()) => {
-                journal.error = Some(format!(
-                    "{failure}; previous client build restored and exact views attached"
-                ));
-                atomic_json(journal_path, &journal)?;
-                return Err(err(journal.error.clone().unwrap()));
-            }
-            Err(restore) => {
-                let recovery = manual_recovery(request);
-                journal.error = Some(format!(
-                    "{failure}; prior payload restored, but old GUI attachment recovery failed: {restore}; {recovery}; handoffs retained; journal: {}",
-                    journal_path.display()
-                ));
-                atomic_json(journal_path, &journal)?;
-                return Err(err(journal.error.clone().unwrap()));
-            }
-        }
+        return finish_prior_relaunch(journal_path, journal, request, &failure);
     }
     Ok(())
+}
+fn finish_prior_relaunch(
+    journal_path: &Path,
+    journal: &mut Journal,
+    request: &RelaunchRequest,
+    failure: &Error,
+) -> Result<()> {
+    journal.error = Some(match relaunch_prior(&journal.target, request) {
+        Ok(()) => format!("{failure}; previous client build restored and exact views attached"),
+        Err(restore) => format!(
+            "{failure}; prior payload unchanged or restored, but old GUI attachment recovery failed: {restore}; {}; handoffs retained; journal: {}",
+            manual_recovery(request),
+            journal_path.display()
+        ),
+    });
+    atomic_json(journal_path, journal)?;
+    Err(err(journal.error.clone().unwrap()))
 }
 struct LaunchSpec<'a> {
     executable: &'a Path,
@@ -1777,6 +1859,125 @@ mod tests {
         assert_eq!(selected_task_version(&staged, false), "0.9.0");
         assert_eq!(selected_task_version(&staged, true), "2.0.0");
     }
+    #[cfg(windows)]
+    fn run_task_guard(
+        root: &str,
+        action: &str,
+        foreign_account: bool,
+        include_new: bool,
+    ) -> Result<()> {
+        let target = InstallTarget {
+            kind: InstallationKind::InstalledWindows,
+            root: PathBuf::from(root),
+        };
+        let previous = Selection {
+            schema: 1,
+            version: "1.0.0".into(),
+            task_version: "1.0.0".into(),
+        };
+        let journal = journal(target, Some(previous), JournalStage::Prepared);
+        let owner = if foreign_account {
+            "'S-1-0-0'"
+        } else {
+            "([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value"
+        };
+        // Shadow the read cmdlet only. Execute the production guard in native PowerShell
+        // without consulting, registering, deleting, or stopping any real scheduled task.
+        let script = format!(
+            r#"
+function Get-ScheduledTask {{
+    param($ErrorAction)
+    [pscustomobject]@{{
+        TaskName=('Compi Daemon-'+([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value)
+        TaskPath='\'
+        Principal=[pscustomobject]@{{UserId={owner}}}
+        Actions=@([pscustomobject]@{{Execute='{action}'}})
+    }}
+}}
+{guard}
+$allowed=@($allowed | ForEach-Object {{ Normalize-OwnedPath ('"'+$_+'"') }})
+if ($t) {{ Assert-Owner $t.Principal.UserId @($t.Actions | ForEach-Object {{ $_.Execute }}) }}
+"#,
+            action = action.replace('\'', "''"),
+            guard = task_guard_script(&journal, include_new)?,
+        );
+        task_powershell(&script).map(|_| ())
+    }
+    #[cfg(windows)]
+    #[test]
+    fn powershell_task_guard_normalizes_both_drive_and_unc_paths() {
+        for (normal, extended) in [
+            (r"C:\Compi", r"\\?\C:\Compi"),
+            (r"\\server\share\Compi", r"\\?\UNC\server\share\Compi"),
+            (
+                r"\\server.example\share\Compi",
+                r"\\?\UNC\server.example\share\Compi",
+            ),
+        ] {
+            for root in [normal, extended] {
+                for action_root in [normal, extended] {
+                    let action = format!(r"{action_root}\versions\1.0.0\compi-daemon.exe");
+                    run_task_guard(root, &action, false, false).unwrap();
+                    run_task_guard(
+                        root,
+                        &format!("\"{}\"", action.to_uppercase()),
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn powershell_task_guard_rejects_foreign_root_generation_account_and_device_paths() {
+        for root in [r"C:\Compi", r"\\?\C:\Compi"] {
+            for action in [
+                r"C:\OtherCompi\versions\1.0.0\compi-daemon.exe",
+                r"C:\Compi-foreign\versions\1.0.0\compi-daemon.exe",
+                r"\\other\share\Compi\versions\1.0.0\compi-daemon.exe",
+                r"C:\Compi\versions\0.9.0\compi-daemon.exe",
+                r"C:\Compi\versions\2.0.0\compi-daemon.exe",
+                r"versions\1.0.0\compi-daemon.exe",
+                r"\\.\C:\Compi\versions\1.0.0\compi-daemon.exe",
+                r"\\?\C:\Compi.\versions\1.0.0\compi-daemon.exe",
+                r"\\?\C:\Compi \versions\1.0.0\compi-daemon.exe",
+                r"\\?\C:\Other\..\Compi\versions\1.0.0\compi-daemon.exe",
+            ] {
+                assert!(
+                    run_task_guard(root, action, false, false).is_err(),
+                    "{action}"
+                );
+            }
+            let old = r"C:\Compi\versions\1.0.0\compi-daemon.exe";
+            assert!(run_task_guard(root, old, true, false).is_err());
+            run_task_guard(
+                root,
+                r"C:\Compi\versions\2.0.0\compi-daemon.exe",
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(
+                run_task_guard(
+                    root,
+                    r"C:\Other\versions\2.0.0\compi-daemon.exe",
+                    false,
+                    true
+                )
+                .is_err()
+            );
+        }
+        for action in [
+            r"\\other\share\Compi\versions\1.0.0\compi-daemon.exe",
+            r"\\server\other\Compi\versions\1.0.0\compi-daemon.exe",
+            r"\\server\share\Other\versions\1.0.0\compi-daemon.exe",
+            r"\\?\UNC\server\share\Compi\versions\0.9.0\compi-daemon.exe",
+        ] {
+            assert!(run_task_guard(r"\\?\UNC\server\share\Compi", action, false, false).is_err());
+        }
+    }
 
     #[test]
     fn later_mac_staging_preserves_older_and_latest_retained_bundles() {
@@ -2014,6 +2215,215 @@ mod tests {
         assert!(error.error.to_string().contains("launch failed"));
         assert!(error.all_exited);
         assert!(!receipt.exists());
+    }
+    fn early_failure_fixture(directory: &Path) -> (PathBuf, Journal, RelaunchRequest) {
+        let target = InstallTarget {
+            kind: InstallationKind::PortableWindows,
+            root: directory.join("Compi"),
+        };
+        let previous = Selection {
+            schema: 1,
+            version: "1.0.0".into(),
+            task_version: "0.9.0".into(),
+        };
+        fs::create_dir_all(&target.root).unwrap();
+        restore_selection(&target.root, Some(&previous)).unwrap();
+        let journal = journal(target.clone(), Some(previous), JournalStage::Prepared);
+        let path = state_dir(&target.root).join("journal.json");
+        atomic_json(&path, &journal).unwrap();
+        let host = |name: &str| RelaunchHost {
+            arguments: vec![
+                "--update-restore".into(),
+                directory
+                    .join(format!("{name}-handoff.json"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            receipt_path: directory.join(format!("{name}-receipt.json")),
+            receipt_token: new_receipt_token(),
+        };
+        let request = RelaunchRequest {
+            old_process_ids: Vec::new(),
+            hosts: vec![host("new")],
+            rollback_hosts: vec![RollbackHost {
+                executable: target.root.join("versions/1.0.0/compi.exe"),
+                version: "1.0.0".into(),
+                host: host("prior"),
+            }],
+            replace_default_daemon: true,
+            timeout_seconds: 1,
+        };
+        (path, journal, request)
+    }
+    #[test]
+    fn authenticated_pre_activation_failure_persists_error_and_prior_reopen_failure() {
+        let directory = tempdir();
+        let (path, mut journal, request) = early_failure_fixture(directory.path());
+        let previous = journal.prior_selection.clone();
+        let _operation = OperationLock::acquire(&journal.target.root).unwrap();
+        // Enter immediately after publisher authentication; the retained package is missing.
+        let failure = apply_authenticated(&path, &request, &mut journal, |_| {}).unwrap_err();
+        let saved: Journal = read_json(&path, 1024 * 1024).unwrap();
+        assert_eq!(saved.phase, JournalStage::Prepared);
+        assert_eq!(saved.error.as_deref(), Some(failure.to_string().as_str()));
+        assert!(
+            failure
+                .to_string()
+                .contains("Prior GUI executable is unavailable")
+        );
+        assert!(failure.to_string().contains("handoffs retained"));
+        assert_eq!(read_selection(&journal.target.root).unwrap(), previous);
+        assert!(saved.prior_task.is_none());
+        assert!(!request.hosts[0].receipt_path.exists());
+    }
+    #[test]
+    fn accepted_activation_retry_clears_previous_failure_before_relaunch() {
+        let directory = tempdir();
+        let (path, mut journal, request) = early_failure_fixture(directory.path());
+        let _operation = OperationLock::acquire(&journal.target.root).unwrap();
+        apply_authenticated(&path, &request, &mut journal, |_| {}).unwrap_err();
+        assert!(
+            read_json::<Journal>(&path, 1024 * 1024)
+                .unwrap()
+                .error
+                .is_some()
+        );
+        // Exercise the actual accepted-retry commit separately from executable launch.
+        begin_activation(&path, &mut journal).unwrap();
+        let accepted: Journal = read_json(&path, 1024 * 1024).unwrap();
+        assert_eq!(accepted.phase, JournalStage::Activating);
+        assert!(accepted.error.is_none());
+        assert!(journal.error.is_none());
+    }
+    #[test]
+    fn authenticated_pre_activation_failure_does_not_duplicate_a_live_old_gui() {
+        let directory = tempdir();
+        let (path, mut journal, mut request) = early_failure_fixture(directory.path());
+        request.old_process_ids.push(std::process::id());
+        let previous = journal.prior_selection.clone();
+        let _operation = OperationLock::acquire(&journal.target.root).unwrap();
+        let failure = apply_authenticated(&path, &request, &mut journal, |_| {}).unwrap_err();
+        assert!(failure.to_string().contains("prior GUI reopen deferred"));
+        assert!(failure.to_string().contains("Old GUI hosts did not exit"));
+        let saved: Journal = read_json(&path, 1024 * 1024).unwrap();
+        assert_eq!(saved.phase, JournalStage::Prepared);
+        assert_eq!(saved.error.as_deref(), Some(failure.to_string().as_str()));
+        assert_eq!(read_selection(&journal.target.root).unwrap(), previous);
+        assert!(!request.rollback_hosts[0].host.receipt_path.exists());
+    }
+    #[test]
+    fn authenticated_stale_baseline_failure_never_restores_an_obsolete_selection() {
+        let directory = tempdir();
+        let (path, mut journal, request) = early_failure_fixture(directory.path());
+        let intervening = Selection {
+            schema: 1,
+            version: "1.5.0".into(),
+            task_version: "1.5.0".into(),
+        };
+        restore_selection(&journal.target.root, Some(&intervening)).unwrap();
+        let _operation = OperationLock::acquire(&journal.target.root).unwrap();
+        let failure = apply_authenticated(&path, &request, &mut journal, |_| {}).unwrap_err();
+        assert!(failure.to_string().contains("restage"));
+        assert!(failure.to_string().contains("prior GUI reopen deferred"));
+        assert_eq!(
+            read_selection(&journal.target.root).unwrap(),
+            Some(intervening)
+        );
+        let saved: Journal = read_json(&path, 1024 * 1024).unwrap();
+        assert_eq!(saved.error.as_deref(), Some(failure.to_string().as_str()));
+        assert_eq!(saved.phase, JournalStage::Prepared);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_pre_activation_failure_reopens_exact_prior_views_and_waits_for_readiness() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir();
+        let (path, mut journal, mut request) = early_failure_fixture(directory.path());
+        let executable = &request.rollback_hosts[0].executable;
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(
+            executable,
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --update-restore) restore="$2"; shift 2 ;;
+        --view-marker) marker="$2"; shift 2 ;;
+        --update-receipt) receipt="$2"; shift 2 ;;
+        --update-receipt-token) token="$2"; shift 2 ;;
+        *) exit 2 ;;
+    esac
+done
+cat "$restore" > "$marker"
+printf '{"token":"%s","version":"1.0.0","attached":true,"error":null}\n' "$token" > "$receipt"
+count=0
+while [ ! -e "$marker.stop" ] && [ "$count" -lt 200 ]; do
+    sleep 0.05
+    count=$((count+1))
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+        struct StopHosts(Vec<PathBuf>);
+        impl Drop for StopHosts {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = fs::write(path, "");
+                }
+            }
+        }
+        let mut stop = StopHosts(Vec::new());
+        let mut old = Vec::new();
+        for index in 0..2 {
+            let handoff = directory.path().join(format!("view-{index}.json"));
+            let marker = directory.path().join(format!("restored-{index}.json"));
+            fs::write(&handoff, format!("exact view {index}")).unwrap();
+            stop.0.push(marker.with_extension("json.stop"));
+            let mut host = request.rollback_hosts[0].clone();
+            host.host.arguments = vec![
+                "--update-restore".into(),
+                handoff.to_string_lossy().into_owned(),
+                "--view-marker".into(),
+                marker.to_string_lossy().into_owned(),
+            ];
+            host.host.receipt_path = directory.path().join(format!("prior-{index}-ready.json"));
+            host.host.receipt_token = new_receipt_token();
+            old.push(host);
+        }
+        request.rollback_hosts = old;
+        request.hosts.push(RelaunchHost {
+            arguments: vec!["--update-restore".into(), "second-new-view.json".into()],
+            receipt_path: directory.path().join("second-new-ready.json"),
+            receipt_token: new_receipt_token(),
+        });
+        request.timeout_seconds = 5;
+        validate_request(&request).unwrap();
+        let _operation = OperationLock::acquire(&journal.target.root).unwrap();
+        let failure = apply_authenticated(&path, &request, &mut journal, |_| {}).unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("previous client build restored and exact views attached")
+        );
+        for (index, old) in request.rollback_hosts.iter().enumerate() {
+            assert_eq!(
+                fs::read_to_string(directory.path().join(format!("restored-{index}.json")))
+                    .unwrap(),
+                format!("exact view {index}")
+            );
+            let ready: ReadinessReceipt = read_json(&old.host.receipt_path, 16384).unwrap();
+            assert_eq!(ready.token, old.host.receipt_token);
+            assert_eq!(ready.version, "1.0.0");
+            assert!(ready.attached);
+        }
+        let saved: Journal = read_json(&path, 1024 * 1024).unwrap();
+        assert_eq!(saved.phase, JournalStage::Prepared);
+        assert_eq!(saved.error.as_deref(), Some(failure.to_string().as_str()));
+        assert_eq!(
+            read_selection(&journal.target.root).unwrap(),
+            journal.prior_selection
+        );
+        assert!(request.hosts.iter().all(|host| !host.receipt_path.exists()));
     }
     #[test]
     fn journal_cannot_redirect_recovery_into_unowned_stage() {

@@ -28,6 +28,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('root', 'artifact', 'metadata', 'probe', 'driver', 'evidence'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--installed-fixture', action='store_true',
+                        help='Exercise real installed task replacement only on an owned GitHub-hosted Windows runner')
     args = parser.parse_args()
     if sys.platform not in ('win32', 'darwin'):
         parser.error('Run on native Windows x64/WSL2 or Apple Silicon macOS')
@@ -37,6 +39,41 @@ def main():
     if owned.get('root') != str(root) or not owned.get('nonce'):
         parser.error('Root is not a script-owned disposable package copy')
     windows = sys.platform == 'win32'
+    installed = args.installed_fixture
+    if installed:
+        if not windows or os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted':
+            parser.error('Installed fixture requires native GitHub-hosted Windows')
+        sid = subprocess.check_output(
+            ['powershell.exe', '-NoProfile', '-Command',
+             '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'], text=True).strip()
+        expected = Path(os.environ['LOCALAPPDATA']) / 'Programs' / 'Compi'
+        if root != expected.resolve() or owned.get('sid') != sid or owned.get('fixture') != 'installed-update':
+            parser.error('Installed root/account is not owned by this qualification')
+        if not (root / 'Compi-Setup.exe').is_file():
+            parser.error('Installed fixture must retain its real Setup registration')
+        if any(os.environ.get(name) for name in ('COMPI_DATA_DIR', 'COMPI_RUNTIME_DIR', 'COMPI_CONFIG_FILE', 'COMPI_INSTANCE')):
+            parser.error('Installed fixture must use the actual disposable account environment')
+        preflight = r'''
+$ErrorActionPreference='Stop'
+$root=Join-Path $env:LOCALAPPDATA 'Programs\Compi'
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$r=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi'
+$s=Get-Content -LiteralPath (Join-Path $root 'selection.json') -Raw | ConvertFrom-Json
+$t=Get-ScheduledTask -TaskName ('Compi Daemon-'+$sid) -TaskPath '\'
+$owner=$t.Principal.UserId
+if ($owner -notlike 'S-1-*') { $owner=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+$actions=@($t.Actions)
+$expected=Join-Path $root ('versions\'+$s.task_version+'\compi-daemon.exe')
+if ($owner -ne $sid -or [IO.Path]::GetFullPath($r.InstallLocation).TrimEnd('\') -ne $root -or
+    $actions.Count -ne 1 -or $actions[0].Execute.Trim('"') -ne $expected -or
+    $actions[0].Arguments -ne '--supervise') { throw 'Installed task/registration is not exactly owned' }
+$default=@(Get-CimInstance Win32_Process -Filter "Name = 'compi-daemon.exe'" | Where-Object {
+    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase) -and
+    $_.CommandLine -notmatch '--instance(?:\s|=)'
+})
+if ($default.Count) { throw 'Installed cycle requires no running default daemon; never stop unreviewed work here' }
+'''
+        subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', preflight], check=True)
     platform = 'windows-x86_64' if windows else 'macos-aarch64'
     if windows:
         before_selection = json.loads((root / 'selection.json').read_bytes())
@@ -62,15 +99,17 @@ def main():
     profile = run_root / 'profile'
     profile.mkdir(mode=0o700)
     environment = os.environ.copy()
+    environment.pop('COMPI_SUPERVISOR_PID', None)
     if windows:
-        environment['LOCALAPPDATA'] = str(profile)
-        data = profile / 'Compi'
+        if not installed:
+            environment['LOCALAPPDATA'] = str(profile)
+        data = Path(environment['LOCALAPPDATA']) / 'Compi'
     else:
         data = profile / 'data'
         # Unix socket paths are limited to ~104 bytes; keep the runtime dir short.
         runtime = Path(tempfile.mkdtemp(prefix='compi-cycle-', dir='/tmp')).resolve()
         environment.update(COMPI_DATA_DIR=str(data), COMPI_RUNTIME_DIR=str(runtime))
-    data.mkdir(mode=0o700)
+    data.mkdir(mode=0o700, exist_ok=installed)
     sentinels = {}
     for filename in ('config.toml', 'external-project.txt'):
         path = (data if filename != 'external-project.txt' else profile) / filename
@@ -84,6 +123,10 @@ def main():
     # must be qualified before this driver is added; never claim this is Gatekeeper proof.
     instance = 'upd-' + uuid.uuid4().hex[:16]
     nonce = uuid.uuid4().hex[:12]
+    if installed:
+        (run_root / 'ownership.json').write_text(json.dumps({
+            'schema': 1, 'root': str(root), 'sid': sid, 'nonce': owned['nonce'],
+            'instance': instance, 'daemon': str(daemon_path)}))
     launched = []
     log = (run_root / 'gui.log').open('wb')
 
@@ -95,6 +138,37 @@ def main():
         if check and result.returncode:
             raise RuntimeError(f'Command failed ({result.returncode}): {command}: {result.stderr}')
         return result
+
+    task_observations = []
+
+    def task_snapshot(label, version):
+        if not installed:
+            return None
+        script = r'''
+$ErrorActionPreference='Stop'
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$r=Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi'
+$t=Get-ScheduledTask -TaskName ('Compi Daemon-'+$sid) -TaskPath '\'
+$owner=$t.Principal.UserId
+if ($owner -notlike 'S-1-*') { $owner=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+@{sid=$sid;owner_sid=$owner;name=$t.TaskName;path=$t.TaskPath;actions=@($t.Actions | Select-Object Execute,Arguments);root=$r.InstallLocation;xml=(Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath).Trim()} | ConvertTo-Json -Depth 5 -Compress
+'''
+        value = json.loads(run('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script).stdout)
+        actions = value['actions']
+        expected = root / 'versions' / version / 'compi-daemon.exe'
+        if (value['sid'] != sid or value['owner_sid'] != sid or value['path'] != '\\'
+                or len(actions) != 1 or actions[0]['Execute'].startswith('\\\\?\\')
+                or Path(actions[0]['Execute'].strip('"')).resolve() != expected.resolve()
+                or actions[0]['Arguments'] != '--supervise'
+                or Path(value['root']).resolve() != root):
+            raise RuntimeError('Installed registration/task escaped the owned account, root, or selected generation')
+        task_observations.append({'label': label, 'selection': json.loads((root / 'selection.json').read_bytes()),
+                                  'task': value})
+        return value
+
+    initial_task = task_snapshot('before-cycle', current)
+    if installed and before_selection['task_version'] != current:
+        raise RuntimeError('Fixture must start with the current selected task generation')
 
     theme_source = profile / 'custom-theme-source.json'
     theme_source.write_text(json.dumps({
@@ -203,6 +277,31 @@ def main():
             if run('/bin/ps', '-p', str(pid), '-o', 'lstart=').stdout.strip() != original['CreationDate']:
                 raise RuntimeError('Update replaced the daemon process identity')
 
+    def capture_windows(label):
+        if not windows:
+            return
+        current_hosts = hosts()
+        if len(current_hosts) != 1:
+            raise RuntimeError('Native capture requires one exactly-owned GUI host')
+        image = str(run_root / (label + '.png')).replace("'", "''")
+        script = f'''
+$ErrorActionPreference='Stop'
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class UpdateSmokeWindow {{ [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out Rect r); public struct Rect {{ public int Left, Top, Right, Bottom; }} }}'
+[void][UpdateSmokeWindow]::SetProcessDPIAware()
+$window=(Get-Process -Id {current_hosts[0]['pid']}).MainWindowHandle
+if ($window -eq [IntPtr]::Zero) {{ throw 'Owned GUI has no native window' }}
+[void][UpdateSmokeWindow]::SetForegroundWindow($window)
+Start-Sleep -Milliseconds 500
+$rect=New-Object UpdateSmokeWindow+Rect
+if (-not [UpdateSmokeWindow]::GetWindowRect($window,[ref]$rect)) {{ throw 'Cannot inspect owned GUI bounds' }}
+$bitmap=New-Object Drawing.Bitmap ($rect.Right-$rect.Left),($rect.Bottom-$rect.Top)
+$graphics=[Drawing.Graphics]::FromImage($bitmap)
+try {{ $graphics.CopyFromScreen($rect.Left,$rect.Top,0,0,$bitmap.Size); $bitmap.Save('{image}',[Drawing.Imaging.ImageFormat]::Png) }}
+finally {{ $graphics.Dispose(); $bitmap.Dispose() }}
+'''
+        run('powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script)
+
     def unchanged_install():
         if windows:
             if json.loads((root / 'selection.json').read_bytes()) != before_selection:
@@ -214,8 +313,13 @@ def main():
                 raise RuntimeError(f'Operation changed preserved data: {path}')
 
     def stage(metadata=args.metadata, artifact=args.artifact, check=True):
-        return run(worker, 'stage', '--root', root, '--metadata', metadata,
-                   '--artifact', artifact, '--platform', platform, '--current-version', current, check=check)
+        result = run(worker, 'stage', '--root', root, '--metadata', metadata,
+                     '--artifact', artifact, '--platform', platform, '--current-version', current, check=check)
+        if installed and result.returncode == 0:
+            journal = json.loads(Path(result.stdout.strip().splitlines()[-1]).read_text())
+            if journal['target']['kind'] != 'InstalledWindows' or not journal['target']['root'].startswith('\\\\?\\'):
+                raise RuntimeError('Installed staging did not use the actual canonical installed target')
+        return result
 
     def inspect():
         value = json.loads(run(args.probe, '--instance', instance, 'surface', 'inspect', workspace()['surfaces'][0]['id']).stdout)
@@ -270,7 +374,7 @@ def main():
             raise RuntimeError('Trust rejection or cancellation ended active work')
         assert_daemon(daemon_identity)
 
-        def apply(label, fail=False):
+        def failed_apply(label, preactivation=False):
             handoff = run_root / f'{label}-handoff.json'
             rollback_handoff = run_root / f'{label}-rollback-handoff.json'
             host_file = run_root / f'{label}-hosts.json'
@@ -282,7 +386,7 @@ def main():
             token = uuid.uuid4().hex + uuid.uuid4().hex
             rollback_receipt = run_root / f'{label}-rollback-receipt.json'
             rollback_token = uuid.uuid4().hex + uuid.uuid4().hex
-            restore_path = run_root / 'deliberately-absent-handoff.json' if fail else handoff
+            restore_path = handoff if preactivation else run_root / 'deliberately-absent-handoff.json'
             request = {'old_process_ids': [host['pid'] for host in current_hosts],
                        'hosts': [{'arguments': ['--update-restore', str(restore_path)],
                                   'receipt_path': str(receipt), 'receipt_token': token}],
@@ -291,42 +395,135 @@ def main():
                                            'host': {'arguments': ['--update-restore', str(rollback_handoff)],
                                                     'receipt_path': str(rollback_receipt),
                                                     'receipt_token': rollback_token}}],
-                       # The smoke keeps a compatible live daemon, so the client would preserve it.
-                       'replace_default_daemon': False,
+                       # A named compatible shell remains alive, but no default daemon
+                       # is running: the actual installed client must replace its task.
+                       'replace_default_daemon': installed,
                        # Covers old-GUI exit plus the deliberately failing restore; macOS GUI exit can exceed 10 s.
-                       'timeout_seconds': 30 if fail else 45}
+                       'timeout_seconds': 30}
             request_path = run_root / f'{label}-request.json'
             request_path.write_text(json.dumps(request))
+            if preactivation:
+                retained = Path(json.loads(journal.read_text())['stage']).parent / 'package.zip'
+                with retained.open('r+b') as stream:
+                    byte = stream.read(1)
+                    stream.seek(0)
+                    stream.write(bytes([byte[0] ^ 1]))
             with (run_root / f'{label}-worker.log').open('wb') as output:
-                helper = subprocess.Popen([str(worker), 'apply', '--journal', str(journal), '--request', str(request_path)], env=environment, stdout=output, stderr=output)
+                observer = None
+                if installed and not preactivation:
+                    observed_path = run_root / f'{label}-new-task.json'
+                    ready_path = run_root / f'{label}-observer-ready'
+                    def ps_quote(value):
+                        return "'" + str(value).replace("'", "''") + "'"
+                    # Initialize a fast, persistent COM observer before activation:
+                    # a failed GUI can roll back faster than spawning PowerShell.
+                    observer_script = f'''
+$ErrorActionPreference='Stop'
+$service=New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+$folder=$service.GetFolder('\\')
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$name='Compi Daemon-'+$sid
+$expected={ps_quote(root / 'versions' / candidate['version'] / 'compi-daemon.exe')}
+[IO.File]::WriteAllText({ps_quote(ready_path)},'ready')
+$deadline=[DateTime]::UtcNow.AddSeconds(60)
+while ([DateTime]::UtcNow -lt $deadline) {{
+    $t=$folder.GetTask($name)
+    $action=$t.Definition.Actions.Item(1)
+    if ($action.Path.Trim('"') -eq $expected) {{
+        $owner=$t.Definition.Principal.UserId
+        if ($owner -notlike 'S-1-*') {{ $owner=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }}
+        if ($owner -ne $sid -or $t.Definition.Actions.Count -ne 1 -or $action.Arguments -ne '--supervise') {{ throw 'Replacement task is not owned' }}
+        $selection=Get-Content -LiteralPath {ps_quote(root / 'selection.json')} -Raw | ConvertFrom-Json
+        $r=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Compi'
+        $value=@{{label='failed-relaunch-new-task';selection=$selection;task=@{{sid=$sid;owner_sid=$owner;name=$name;path='\\';root=$r.InstallLocation;actions=@(@{{Execute=$action.Path;Arguments=$action.Arguments}});xml=$t.Xml.Trim()}}}}
+        [IO.File]::WriteAllText({ps_quote(observed_path)},($value | ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
+        exit 0
+    }}
+    Start-Sleep -Milliseconds 10
+}}
+throw 'Never observed the real installed replacement task before rollback'
+'''
+                    observer = subprocess.Popen(
+                        ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', observer_script],
+                        env=environment, stdout=output, stderr=output)
                 try:
-                    run(driver, 'release', host_file, handoff)
-                except Exception:
-                    run(driver, 'abort', host_file, handoff, check=False)
-                    raise
-                code = helper.wait(timeout=90)
-            if fail:
-                if code == 0:
-                    raise RuntimeError('Missing real restore handoff falsely reported activation success')
-                run(worker, 'recover', '--root', root)
-                unchanged_install()
-                observed = json.loads(rollback_receipt.read_text())
-                if observed.get('token') != rollback_token or observed.get('version') != current or not observed.get('attached') or observed.get('error'):
-                    raise RuntimeError('Rollback did not prove actual old-build exact-slot attachment')
-                if identity(wait('old B exact-slot attachment after rollback', attached)) != original_identity:
-                    raise RuntimeError('Failed relaunch/rollback changed shell or workspace identity')
-            else:
-                if code != 0:
-                    raise RuntimeError(f'Worker activation failed; inspect {run_root}')
-                observed = json.loads(receipt.read_text())
-                if observed.get('token') != token or observed.get('version') != candidate['version'] or not observed.get('attached') or observed.get('error'):
-                    raise RuntimeError('No actual C GUI attachment readiness proof')
-                if identity(wait('C attached to B daemon/shell', attached)) != original_identity:
-                    raise RuntimeError('Compatible update replaced live daemon/shell/workspace identity')
+                    if observer:
+                        wait('installed task observer initialized', ready_path.exists, timeout=20)
+                    helper = subprocess.Popen([str(worker), 'apply', '--journal', str(journal), '--request', str(request_path)], env=environment, stdout=output, stderr=output)
+                    try:
+                        run(driver, 'release', host_file, handoff)
+                    except Exception:
+                        run(driver, 'abort', host_file, handoff, check=False)
+                        raise
+                    if observer:
+                        if observer.wait(timeout=65) != 0:
+                            raise RuntimeError('Failed to observe actual new installed task before rollback')
+                        task_observations.append(json.loads(observed_path.read_text()))
+                    code = helper.wait(timeout=90)
+                finally:
+                    if observer and observer.poll() is None:
+                        observer.kill()
+                        observer.wait(timeout=10)
+            if code == 0:
+                raise RuntimeError('Injected update failure falsely reported activation success')
+            failed_journal = json.loads(journal.read_text())
+            if installed:
+                (run_root / f'{label}-journal.json').write_text(json.dumps(failed_journal, indent=2) + '\n')
+            if not failed_journal.get('error'):
+                raise RuntimeError('Update failure was not persisted for the reopened GUI and CLI')
+            run(worker, 'recover', '--root', root)
+            if installed:
+                restored_task = task_snapshot(label + '-old-task-restored', current)
+                if restored_task['xml'] != initial_task['xml']:
+                    raise RuntimeError('Failure did not restore the exact old task registration')
+                if not preactivation and not failed_journal.get('prior_task'):
+                    raise RuntimeError('Injected restore failure never captured the installed task')
+            unchanged_install()
+            observed = json.loads(rollback_receipt.read_text())
+            if observed.get('token') != rollback_token or observed.get('version') != current or not observed.get('attached') or observed.get('error'):
+                raise RuntimeError('Failure did not prove actual old-build exact-slot attachment')
+            if identity(wait('old B exact-slot attachment after failure', attached)) != original_identity:
+                raise RuntimeError('Failed update changed shell or workspace identity')
+            capture_windows(label + '-reopened')
             assert_daemon(daemon_identity)
 
-        apply('failed-relaunch', fail=True)
-        apply('compatible-update')
+        failed_apply('failed-preactivation', preactivation=True)
+        failed_apply('failed-relaunch')
+        result = stage()
+        journal = Path(result.stdout.strip().splitlines()[-1])
+        outcome = root / '.compi-update' / ('cli-install-' + uuid.uuid4().hex + '.json')
+        # Use the same reviewed GUI install entrypoint as Settings and `compi update`;
+        # do not substitute a successful direct worker call for the in-app path.
+        run(driver, 'install', instance, candidate['version'], outcome)
+
+        def installed_and_reopened():
+            status = json.loads(journal.read_text())
+            if status.get('error'):
+                raise RuntimeError('GUI update failed: ' + status['error'])
+            if outcome.exists():
+                reported = json.loads(outcome.read_text())
+                if reported.get('outcome') == 'failed':
+                    raise RuntimeError('GUI refused install: ' + reported['message'])
+            return status if status['phase'] == 'Complete' else None
+
+        completed = wait('reviewed GUI install and actual new-build attachment', installed_and_reopened, timeout=180)
+        request = json.loads((journal.parent / ('request-' + completed['attempt'] + '.json')).read_text())
+        if installed:
+            if request['replace_default_daemon'] is not True:
+                raise RuntimeError('Real GUI install did not request installed default task replacement')
+            task_snapshot('successful-new-task', candidate['version'])
+            selected = json.loads((root / 'selection.json').read_bytes())
+            if selected['version'] != candidate['version'] or selected['task_version'] != candidate['version']:
+                raise RuntimeError('Successful GUI install did not select both new installed generations')
+        for host in request['hosts']:
+            observed = json.loads(Path(host['receipt_path']).read_text())
+            if observed.get('token') != host['receipt_token'] or observed.get('version') != candidate['version'] or not observed.get('attached') or observed.get('error'):
+                raise RuntimeError('No actual C GUI attachment readiness proof')
+        if identity(wait('C attached to B daemon/shell', attached)) != original_identity:
+            raise RuntimeError('Compatible GUI update replaced daemon/shell/workspace identity')
+        assert_daemon(daemon_identity)
+        capture_windows('installed-and-reopened')
         # After success driver still belongs to B. Use the registry root scope but
         # restore the diagnostic into the current Mac bundle for final owned cleanup.
         if not windows:
@@ -344,7 +541,17 @@ def main():
                     'from_artifact_sha256': owned.get('artifact_sha256'),
                     'before_output': before_output, 'after_output': after_output,
                     'observed': ['signature-rejection', 'digest-rejection', 'cancelled-stage',
-                                 'failed-real-restore-rollback', 'journal-recovery', 'compatible-real-GUI-restore']}
+                                 'failed-preactivation-real-GUI-reopen', 'failed-real-restore-rollback',
+                                 'journal-recovery', 'reviewed-in-app-install-and-real-GUI-restore']}
+        if installed:
+            evidence.update(installation_kind='InstalledWindows', fixture=True,
+                            account_sid=sid, task_observations=task_observations,
+                            stable_helper_sha256=digest(worker),
+                            baseline_fixture_gui_sha256=digest(gui),
+                            baseline_fixture_daemon_sha256=digest(daemon_path),
+                            fixture_source_setup_sha256=owned.get('source_setup_sha256'))
+            evidence['observed'].extend(['real-installed-task-replacement',
+                                         'exact-old-task-rollback', 'new-task-same-account-and-root'])
         (run_root / 'evidence.json').write_text(json.dumps(evidence, indent=2) + '\n')
         succeeded = True
         print(f'PASS {current}->{candidate["version"]}; exact hashes and readiness evidence: {run_root / "evidence.json"}')
@@ -353,7 +560,7 @@ def main():
             if not windows and not driver.exists():
                 shutil.copy2(args.driver, driver)
             close_gui()
-            run(args.probe, '--instance', instance, 'shutdown', check=False)
+            run(args.probe, '--existing', '--instance', instance, 'shutdown', check=installed)
             for process in launched:
                 process.wait(timeout=10)
         finally:

@@ -529,7 +529,7 @@ struct CommandInstall {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum CommandOutcome {
-    /// The update helper took over; Compi is restarting.
+    /// The update helper took over; this is a handoff, not installed/reopened success.
     Started,
     /// More shells would end than the command listed; it asks again.
     ShellsChanged,
@@ -731,10 +731,35 @@ impl UpdateService {
             if readiness_receipt().is_some() {
                 let refreshed = state.clone();
                 thread::spawn(move || {
-                    // The worker finalizes the journal after all actual host receipts arrive.
-                    thread::sleep(Duration::from_secs(2));
-                    if let Err(error) = restore_pending(&refreshed) {
-                        log(&format!("Restoring update state failed: {error}"));
+                    // The worker finalizes only after all new GUI hosts actually attach.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+                    loop {
+                        thread::sleep(Duration::from_secs(2));
+                        if let Err(error) = restore_pending(&refreshed) {
+                            log(&format!("Confirming reopened update failed: {error}"));
+                            let mut snapshot = refreshed.lock();
+                            snapshot.installing = false;
+                            snapshot.failure = Some(Failure {
+                                operation: Operation::Install,
+                                message: "Couldn't confirm that the update installed and reopened"
+                                    .into(),
+                            });
+                            break;
+                        }
+                        let mut snapshot = refreshed.lock();
+                        if !snapshot.installing {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            log("Update completion was not confirmed within 180 seconds");
+                            snapshot.installing = false;
+                            snapshot.failure = Some(Failure {
+                                operation: Operation::Install,
+                                message: "Update installation and reopening weren't confirmed"
+                                    .into(),
+                            });
+                            break;
+                        }
                     }
                 });
             }
@@ -1011,8 +1036,8 @@ impl UpdateService {
         });
     }
 
-    /// Runs a check or download for `compi update` and waits for it; `observe` sees
-    /// the state while it runs.
+    /// Runs a check, download or retained-package retry for `compi update` and waits
+    /// for it; `observe` sees the state while it runs.
     pub fn run(
         &self,
         operation: Operation,
@@ -1021,6 +1046,7 @@ impl UpdateService {
         let request = match operation {
             Operation::Check => Request::Check,
             Operation::Download => Request::Download,
+            Operation::Reinstall => Request::Reinstall,
             _ => return Err(format!("{operation:?} does not run from a command")),
         };
         // A failure restored from the last update must not pass for this operation's.
@@ -1406,6 +1432,12 @@ fn activate(
         if cancellation.is_cancelled() {
             return Err("Update cancelled before daemon shutdown or activation".into());
         }
+        let replace_default_daemon = snapshot.replace_default_daemon(&current);
+        compi_update::preflight_activation(prepared, replace_default_daemon)
+            .map_err(|error| error.to_string())?;
+        if cancellation.is_cancelled() {
+            return Err("Update cancelled before daemon shutdown or activation".into());
+        }
         report(UpdateEvent {
             phase: UpdatePhase::Activating,
             completed: 0,
@@ -1442,7 +1474,7 @@ fn activate(
             old_process_ids: hosts.iter().map(|host| host.pid).collect(),
             hosts: requests,
             rollback_hosts: rollback_requests,
-            replace_default_daemon: snapshot.replace_default_daemon(&remaining),
+            replace_default_daemon,
             timeout_seconds: 60,
         };
         let child = manager
@@ -1493,48 +1525,66 @@ fn verified_journal_release(journal: &compi_update::Journal) -> Result<Available
 
 fn restore_pending(state: &Mutex<UpdateSnapshot>) -> Result<(), String> {
     let target = InstallTarget::detect().map_err(|error| error.to_string())?;
-    let prepared = if readiness_receipt().is_none() {
-        compi_update::pending_update(&target).map_err(|error| error.to_string())?
-    } else {
-        None
-    };
-    let Some(journal) =
+    let Some(mut journal) =
         compi_update::operation_status(&target).map_err(|error| error.to_string())?
     else {
         return Ok(());
     };
-    let recovery_available = journal.phase == compi_update::JournalStage::RolledBack;
+    // Surface a persisted failure even if verifying the retained package now fails.
+    restore_journal_status(&mut state.lock(), &journal);
+    let prepared = if readiness_receipt().is_none() {
+        let prepared = compi_update::pending_update(&target).map_err(|error| error.to_string())?;
+        // Recovery may have changed an interrupted transaction to RolledBack.
+        journal = compi_update::operation_status(&target)
+            .map_err(|error| error.to_string())?
+            .ok_or("Update journal disappeared during recovery")?;
+        prepared
+    } else {
+        None
+    };
     if let Some(error) = &journal.error {
         log(&format!(
             "Last update failed: {error}. Journal: {}",
             compi_update::operation_journal_path(&target).display()
         ));
     }
-    let release = if prepared.is_some() || recovery_available {
+    let release = if prepared.is_some() || journal.phase == compi_update::JournalStage::RolledBack {
         Some(Arc::new(verified_journal_release(&journal)?))
     } else {
         None
     };
     let mut snapshot = state.lock();
-    snapshot.recovery_available = recovery_available;
-    if journal.error.is_some() {
-        snapshot.failure = Some(if recovery_available {
+    restore_journal_status(&mut snapshot, &journal);
+    if release.is_some() {
+        snapshot.release = release;
+        snapshot.prepared = prepared;
+    }
+    Ok(())
+}
+
+fn restore_journal_status(snapshot: &mut UpdateSnapshot, journal: &compi_update::Journal) {
+    use compi_update::JournalStage;
+    snapshot.recovery_available = journal.phase == JournalStage::RolledBack;
+    snapshot.installing = journal.error.is_none()
+        && matches!(
+            journal.phase,
+            JournalStage::Activating | JournalStage::Activated | JournalStage::Relaunching
+        );
+    if journal.error.is_some() || snapshot.recovery_available {
+        snapshot.failure = Some(if snapshot.recovery_available {
             Failure {
                 operation: Operation::Reinstall,
                 message: "Last update didn't install · Compi was restored".into(),
             }
         } else {
             Failure {
-                operation: Operation::Check,
-                message: "Last update didn't finish".into(),
+                operation: Operation::Install,
+                message: "Last update didn't finish installing and reopening Compi".into(),
             }
         });
+    } else if journal.phase == JournalStage::Complete {
+        snapshot.failure = None;
     }
-    if release.is_some() {
-        snapshot.release = release;
-        snapshot.prepared = prepared;
-    }
-    Ok(())
 }
 
 fn apply_checked_release(snapshot: &mut UpdateSnapshot, release: Option<AvailableRelease>) {
@@ -1696,6 +1746,78 @@ mod tests {
             }),
             ..UpdateSnapshot::default()
         }
+    }
+
+    fn status_journal(phase: compi_update::JournalStage) -> compi_update::Journal {
+        let snapshot = candidate();
+        let prepared = snapshot.prepared.unwrap();
+        compi_update::Journal {
+            schema: 1,
+            attempt: "a".repeat(32),
+            target: prepared.target,
+            manifest: snapshot.release.unwrap().manifest.clone(),
+            signed: compi_update::SignedManifest {
+                payload: String::new(),
+                signature: String::new(),
+            },
+            stage: prepared.stage,
+            prior_selection: None,
+            phase,
+            backup: None,
+            retained_backups: Vec::new(),
+            prior_task: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn reopened_gui_keeps_installing_until_journal_completes() {
+        let mut snapshot = UpdateSnapshot::default();
+        for phase in [
+            compi_update::JournalStage::Activating,
+            compi_update::JournalStage::Activated,
+            compi_update::JournalStage::Relaunching,
+        ] {
+            restore_journal_status(&mut snapshot, &status_journal(phase));
+            let view = snapshot.view(0, |_| None);
+            assert!(snapshot.installing);
+            assert_eq!(view.button, None);
+            assert!(!view.failed);
+        }
+        restore_journal_status(
+            &mut snapshot,
+            &status_journal(compi_update::JournalStage::Complete),
+        );
+        assert!(!snapshot.installing);
+        assert!(!snapshot.view(0, |_| None).failed);
+    }
+
+    #[test]
+    fn persisted_prepared_and_rollback_failures_are_visible_in_gui() {
+        let mut snapshot = candidate();
+        for phase in [
+            compi_update::JournalStage::Prepared,
+            compi_update::JournalStage::Relaunching,
+            compi_update::JournalStage::RolledBack,
+        ] {
+            let mut journal = status_journal(phase);
+            journal.error = Some("Task ownership or GUI reopening failed".into());
+            snapshot.installing = true;
+            restore_journal_status(&mut snapshot, &journal);
+            let view = snapshot.view(0, |_| None);
+            assert!(!snapshot.installing);
+            assert!(view.failed);
+            assert_eq!(view.button, Some(UpdateButton::TryAgain));
+            assert_eq!(
+                snapshot.recovery_available,
+                phase == compi_update::JournalStage::RolledBack
+            );
+        }
+        restore_journal_status(
+            &mut snapshot,
+            &status_journal(compi_update::JournalStage::RolledBack),
+        );
+        assert!(snapshot.view(0, |_| None).failed);
     }
 
     fn daemon() -> LifecycleStatus {

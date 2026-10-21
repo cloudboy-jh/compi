@@ -148,6 +148,8 @@ Compi 0.1.7 · 0.1.8 available
 
 `compi update` downloads and verifies the same signed package as **Settings → Updates**, on one progress line. It then lists the shells a restart would end, saying so when the shell you typed in is one of them, and asks `Restart now? [y/N]`. Only `y` restarts. The running Compi window performs the restart exactly as the Updates page does: it saves the windows, ends only the listed shells and reopens into the new version, so a listed shell running the command closes with it. With no window open, Compi opens first. Without an interactive terminal, for example from a script or agent, the command stops after the download with exit 4; restart from a terminal or **Settings → Updates**. There is no bypass. `--json` reports the same results, and builds without a release verification key report that updates are unavailable.
 
+If the invoking shell survives the restart, the command waits for the new GUI to confirm attachment before reporting success. A helper handoff, rollback or unconfirmed reopen is not success. Successful `--json` output includes `applied: true`, `reopened: true`, `restarting: false`, the installed `current` version and the `previous` version.
+
 ## Tab and pane metadata
 
 **Settings → Interface → Tab metadata** controls directory, active process, Git branch/changes, and dimensions independently. Directory is on by default; other fields are off. A manual tab label remains primary. Otherwise the focused pane (or first layout pane) supplies the caption; split tabs keep a pane-count badge and a separate dirty/stale indication. Captions truncate and retain the last meaningful value when metadata is unavailable. Full per-pane metadata is available through CLI inspection; diagnostic hover cards are removed.
