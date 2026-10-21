@@ -36,6 +36,8 @@ The bootstrapper is a separate Cargo workspace. Run its behavioral library tests
 
 For 0.3.0, native qualification receipts, metadata signing and compatible-cycle checks use daemon protocol 32. The update-qualified client presentation format remains 5; it is separate from daemon workspace format 7.
 
+If a tag push does not start Actions, run `gh workflow run release.yml --ref main -f release_tag=vMAJOR.MINOR.PATCH`. All jobs check out that existing tag, rerun native qualification, sign its artifacts and create a draft for deliberate publication. Omitting `release_tag` retains the build-only dry run.
+
 Use `tools/smoke-windows-distribution.ps1 -Install` only in a disposable Windows account/runner: it exercises real MSI registration, task management, repair and removal, and refuses an existing developer install. Without `-Install` it checks only the portable package. `tools/smoke-macos-bundle.sh` requires a native Apple Silicon Mac. Neither cross-compilation nor library tests qualify installation/uninstallation. The release workflow runs only the portable and copied-bundle smokes.
 
 For a genuine compatible B→C cycle, build both versioned packages with the same disposable verification key and sign C's complete artifact metadata with B's exact daemon version qualified. Compile the development-only `compi-probe` and `compi-update-smoke` examples from B. Point the cycle script only at an extracted disposable B root carrying the smoke ownership receipt, never the live installation:

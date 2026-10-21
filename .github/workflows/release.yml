@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing vMAJOR.MINOR.PATCH tag to build and draft; omit for a build-only dry run"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -11,6 +16,7 @@ permissions:
 env:
   COMPI_UPDATE_PUBLIC_KEY: ${{ vars.COMPI_UPDATE_PUBLIC_KEY }}
   COMPI_UPDATE_REPOSITORY: ${{ github.repository }}
+  RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
 
 jobs:
   windows:
@@ -18,11 +24,11 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Check release notes match the tag
-        if: github.ref_type == 'tag'
+        if: env.RELEASE_TAG != ''
         shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           heading=$(head -n 1 docs/user/release-notes.md | tr -d '\r')
           test "$heading" = "# ${RELEASE_TAG#v}" || { echo "docs/user/release-notes.md must start with '# ${RELEASE_TAG#v}', found '$heading'"; exit 1; }
@@ -88,7 +94,7 @@ jobs:
       - name: Build Windows distribution
         shell: pwsh
         env:
-          EXPECTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          EXPECTED_TAG: ${{ env.RELEASE_TAG }}
         run: |
           $officialRelease = [bool]$env:EXPECTED_TAG
           .\tools\build-installer.ps1 -SigningCertificateThumbprint $env:COMPI_SIGNING_THUMBPRINT -ExpectedTag $env:EXPECTED_TAG -RequireUpdateKey:$officialRelease
@@ -121,6 +127,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -166,7 +174,7 @@ jobs:
           rm -f "$RUNNER_TEMP/compi-signing.p12"
       - name: Build macOS distribution
         env:
-          EXPECTED_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          EXPECTED_TAG: ${{ env.RELEASE_TAG }}
         shell: bash
         run: |
           arguments=()
@@ -200,13 +208,15 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with:
@@ -222,7 +232,6 @@ jobs:
       - name: Sign verified native release metadata
         env:
           COMPI_UPDATE_SIGNING_KEY: ${{ secrets.COMPI_UPDATE_SIGNING_KEY }}
-          RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
           test -n "$COMPI_UPDATE_PUBLIC_KEY" || { echo 'Missing public verification key repository variable'; exit 1; }
@@ -237,6 +246,7 @@ jobs:
       - name: Create draft GitHub release for deliberate human publication
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           draft: true
           body_path: docs/user/release-notes.md
           fail_on_unmatched_files: true
