@@ -19,6 +19,7 @@
 - The terminal retains the configured scrollback, including the full default 10,000 lines, instead of an effectively much smaller history.
 - Fractional wheel movement accumulates correctly, and pagers can use alternate-screen wheel scrolling.
 - Moving between diff files stays within the active commit or working-tree review.
+- Ended Windows terminals release Monitor's job handle while keeping their final screen available.
 
 ## Limitations
 

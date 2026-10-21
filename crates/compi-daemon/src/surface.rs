@@ -81,9 +81,9 @@ pub struct Surface {
     /// The PTY's session, which every process of the terminal is in unless it left.
     #[cfg(unix)]
     session_id: libc::pid_t,
-    /// The job every process of the terminal is in.
+    /// Monitor's job handle, released after the terminal's process cleanup succeeds.
     #[cfg(windows)]
-    job: OwnedHandle,
+    job: Mutex<Option<OwnedHandle>>,
     #[cfg(unix)]
     metadata_fd: std::fs::File,
     program_status: Arc<ProgramStatusHub>,
@@ -712,7 +712,7 @@ impl Surface {
             #[cfg(unix)]
             session_id,
             #[cfg(windows)]
-            job,
+            job: Mutex::new(Some(job)),
             #[cfg(unix)]
             metadata_fd,
             program_status,
@@ -986,6 +986,13 @@ impl Surface {
         // Retain the final grid, not a live trace file, after this process ends.
         if let Ok(mut trace) = self.trace.lock() {
             trace.take();
+        }
+        #[cfg(windows)]
+        if !cleanup_failed {
+            self.job
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
         }
 
         let client = if let Ok(mut state) = self.state.lock() {
@@ -1659,6 +1666,11 @@ impl Surface {
             })?;
             pending.take();
             drop(pending);
+            #[cfg(windows)]
+            self.job
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
             let exit_code = {
                 let mut state = self.state.lock().map_err(|_| {
                     SurfaceError::Internal("surface state lock was poisoned".into())
@@ -1709,10 +1721,26 @@ impl Surface {
         self.session_id
     }
 
-    /// The job every process of the terminal is in.
+    /// Check membership while holding the job alive against terminal cleanup.
     #[cfg(windows)]
-    pub(crate) fn job(&self) -> &OwnedHandle {
-        &self.job
+    pub(crate) fn contains_process(&self, process: &OwnedHandle) -> bool {
+        use windows::Win32::System::JobObjects::IsProcessInJob;
+        use windows::core::BOOL;
+
+        let job = self.job.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(job) = job.as_ref() else {
+            return false;
+        };
+        let mut inside = BOOL(0);
+        unsafe {
+            IsProcessInJob(
+                HANDLE(process.as_raw_handle()),
+                Some(HANDLE(job.as_raw_handle())),
+                &mut inside,
+            )
+        }
+        .is_ok()
+            && inside.as_bool()
     }
 
     /// The WSL distribution the terminal runs in and its shell's PID there, once the shell

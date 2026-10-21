@@ -31,11 +31,8 @@ impl SurfaceSessions {
     /// The surface whose job the host process `pid` is in.
     #[cfg(windows)]
     pub fn surface_of(&self, pid: u32) -> Option<SurfaceId> {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::JobObjects::IsProcessInJob;
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
         use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-        use windows::core::BOOL;
 
         if self.0.is_empty() {
             return None;
@@ -44,18 +41,7 @@ impl SurfaceSessions {
         let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
         self.0
             .iter()
-            .find(|surface| {
-                let mut inside = BOOL(0);
-                unsafe {
-                    IsProcessInJob(
-                        HANDLE(process.as_raw_handle()),
-                        Some(HANDLE(surface.job().as_raw_handle())),
-                        &mut inside,
-                    )
-                }
-                .is_ok()
-                    && inside.as_bool()
-            })
+            .find(|surface| surface.contains_process(&process))
             .map(|surface| surface.surface_id().clone())
     }
 

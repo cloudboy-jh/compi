@@ -59,6 +59,8 @@ impl DaemonGuard {
     fn spawn(instance: &str) -> Child {
         Command::new(env!("CARGO_BIN_EXE_compi-daemon"))
             .args(["--instance", instance])
+            // This fixture launches a standalone daemon, not the shell's supervisor child.
+            .env_remove("COMPI_SUPERVISOR_PID")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
