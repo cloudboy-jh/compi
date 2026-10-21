@@ -70,7 +70,8 @@ jobs:
           $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'compi-test-localappdata'
           New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
           try {
-            cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -p compi-update -- --test-threads=1
+            # Handle-count leak regression stays in core-ci; it is not a release-artifact gate.
+            cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -p compi-update -- --test-threads=1 --skip repeated_surface_cycles_release_daemon_process_handles
             if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
           } finally { $env:LOCALAPPDATA = $accountLocalAppData }
           python tools/check-dependencies.py --target x86_64-pc-windows-msvc
