@@ -43,14 +43,10 @@ pub fn selected_text(
     }
     let mut result = String::new();
     let last_row = end.row.min(row_count - 1);
-    for (row_index, row) in snapshot
-        .scrollback
-        .iter()
-        .chain(&snapshot.cells)
-        .enumerate()
-        .take(last_row + 1)
-        .skip(start.row)
-    {
+    for row_index in start.row..=last_row {
+        let Some(row) = row_at(snapshot, row_index) else {
+            break;
+        };
         let first = if row_index == start.row { start.col } else { 0 };
         let last = if row_index == end.row {
             end.col.saturating_add(1)
@@ -125,7 +121,7 @@ pub fn line_selection(snapshot: Option<&ScreenSnapshot>, point: GridPoint) -> Op
 mod tests {
     use super::*;
     use crate::viewport::inherited_working_directory;
-    use compi_protocol::{Color, CursorState, Row, TerminalModes, TextAttributes};
+    use compi_protocol::{Color, CursorState, HistoryRow, Row, TerminalModes, TextAttributes};
 
     fn row(text: &str, wrapped: bool) -> Row {
         Row {
@@ -150,7 +146,7 @@ mod tests {
             cols: 4,
             rows: cells.len() as u16,
             cells,
-            scrollback,
+            scrollback: scrollback.iter().map(HistoryRow::from_row).collect(),
             cursor: CursorState::default(),
             modes: TerminalModes::default(),
             title: String::new(),
@@ -202,6 +198,26 @@ mod tests {
         assert_eq!(
             selected_text(Some(&screen), selection).as_deref(),
             Some("b cde ")
+        );
+    }
+
+    #[test]
+    fn history_rows_select_at_the_screen_width() {
+        let screen = snapshot(
+            vec![row("x", false), row("ab  ", false)],
+            vec![row("cd", false)],
+        );
+        let line = line_selection(Some(&screen), GridPoint { row: 1, col: 1 }).unwrap();
+        assert_eq!(line.head, GridPoint { row: 1, col: 3 });
+        let word = word_selection(Some(&screen), GridPoint { row: 1, col: 0 }).unwrap();
+        assert_eq!((word.anchor.col, word.head.col), (0, 1));
+        let selection = Some(Selection {
+            anchor: GridPoint { row: 0, col: 0 },
+            head: GridPoint { row: 2, col: 3 },
+        });
+        assert_eq!(
+            selected_text(Some(&screen), selection).as_deref(),
+            Some("x\nab\ncd")
         );
     }
 }

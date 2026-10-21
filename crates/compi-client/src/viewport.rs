@@ -1,14 +1,29 @@
-use compi_protocol::{Row, ScreenSnapshot};
+use compi_protocol::{HistoryRow, Row, ScreenSnapshot};
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::selection::GridPoint;
+use crate::ScreenMirror;
+use crate::selection::{GridPoint, Selection};
 
-pub fn row_at(snapshot: &ScreenSnapshot, row: usize) -> Option<&Row> {
-    if row < snapshot.scrollback.len() {
-        snapshot.scrollback.get(row)
-    } else {
-        snapshot.cells.get(row - snapshot.scrollback.len())
+/// Absolute row `row` (history first, then the screen), history rows expanded to the
+/// screen's width.
+pub fn row_at(snapshot: &ScreenSnapshot, row: usize) -> Option<Cow<'_, Row>> {
+    match row.checked_sub(snapshot.scrollback.len()) {
+        None => snapshot
+            .scrollback
+            .get(row)
+            .map(|history| Cow::Owned(history.to_row(usize::from(snapshot.cols)))),
+        Some(row) => snapshot.cells.get(row).map(Cow::Borrowed),
+    }
+}
+
+fn wrapped_at(snapshot: &ScreenSnapshot, row: usize) -> bool {
+    match row.checked_sub(snapshot.scrollback.len()) {
+        None => snapshot.scrollback.get(row).is_some_and(|row| row.wrapped),
+        Some(row) => snapshot.cells.get(row).is_some_and(|row| row.wrapped),
     }
 }
 
@@ -16,101 +31,197 @@ pub fn visible_base(snapshot: &ScreenSnapshot, scroll_offset: usize) -> usize {
     snapshot.scrollback.len() - scroll_offset.min(snapshot.scrollback.len())
 }
 
-pub fn visible_rows(
-    snapshot: &ScreenSnapshot,
+/// Where a view is after a history of `len` rows lost `evicted` rows at its front and
+/// gained `appended` at its end. Scrolled up, the reading row stays put, or the view
+/// shows the top of the history if that row was evicted. A selection follows its rows
+/// and is dropped if any of them was evicted.
+pub fn follow_append(
+    len: usize,
+    evicted: usize,
+    appended: usize,
     scroll_offset: usize,
-) -> (impl Iterator<Item = &Row>, usize) {
-    let base = visible_base(snapshot, scroll_offset);
-    let rows = snapshot
-        .scrollback
-        .iter()
-        .chain(&snapshot.cells)
-        .skip(base)
-        .take(snapshot.cells.len());
-    (rows, base)
+    selection: Option<Selection>,
+) -> (usize, Option<Selection>) {
+    let evicted = evicted.min(len);
+    let shown = scroll_offset.min(len);
+    let offset = if scroll_offset == 0 {
+        0
+    } else if len - shown >= evicted {
+        shown + appended
+    } else {
+        len - evicted + appended
+    };
+    let selection = selection.and_then(|selection| {
+        let (start, _) = selection.ordered();
+        (start.row >= evicted).then(|| Selection {
+            anchor: GridPoint {
+                row: selection.anchor.row - evicted,
+                ..selection.anchor
+            },
+            head: GridPoint {
+                row: selection.head.row - evicted,
+                ..selection.head
+            },
+        })
+    });
+    (offset, selection)
+}
+
+/// History rows by index: the history held, a replacement for it, or a viewport kept
+/// to match against a later one.
+pub trait HistoryRows {
+    fn count(&self) -> usize;
+    fn row(&self, index: usize) -> Option<&HistoryRow>;
+}
+
+impl HistoryRows for [HistoryRow] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn row(&self, index: usize) -> Option<&HistoryRow> {
+        self.get(index)
+    }
+}
+
+impl HistoryRows for VecDeque<HistoryRow> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn row(&self, index: usize) -> Option<&HistoryRow> {
+        self.get(index)
+    }
+}
+
+/// Whether `new` is `old` with rows appended.
+pub fn extends(old: &(impl HistoryRows + ?Sized), new: &(impl HistoryRows + ?Sized)) -> bool {
+    old.count() <= new.count() && (0..old.count()).all(|index| old.row(index) == new.row(index))
 }
 
 /// A clear and its reprint can arrive in separate frames. Keep only the reading
 /// viewport briefly, not another copy of the history. An actual clear expires.
 pub struct PendingScroll {
-    pub rows: Vec<Row>,
+    pub rows: Arc<[Row]>,
     pub base: usize,
+    /// `rows` compact, to find them in a later history.
+    anchor: Vec<HistoryRow>,
     deadline: Instant,
     previous_offset: usize,
 }
 
 impl PendingScroll {
-    pub fn new(snapshot: &ScreenSnapshot, offset: usize, now: Instant) -> Self {
-        let (rows, base) = visible_rows(snapshot, offset);
-        Self {
-            rows: rows.cloned().collect(),
+    pub fn new(mirror: &ScreenMirror, offset: usize, now: Instant) -> Option<Self> {
+        let (rows, base) = mirror.visible_rows(offset)?;
+        Some(Self {
+            anchor: rows.iter().map(HistoryRow::from_row).collect(),
+            rows,
             base,
             deadline: now + Duration::from_millis(250),
             previous_offset: offset,
-        }
+        })
     }
 
     pub fn expired(&self, now: Instant) -> bool {
         now >= self.deadline
     }
 
-    pub fn recover(&self, history: &[Row]) -> Option<(usize, usize)> {
-        let base = matching_base(&self.rows, 0, history)?;
-        let offset = history.len().saturating_sub(base);
+    pub fn recover(&self, history: &(impl HistoryRows + ?Sized)) -> Option<(usize, usize)> {
+        let base = matching_base(self.anchor.as_slice(), 0, history)?;
+        let offset = history.count().saturating_sub(base);
         Some((offset, offset.saturating_sub(self.previous_offset)))
     }
 }
 
-/// Keep the top reading row, using its neighbours to disambiguate repeated
-/// prompts/blank lines. No allocation or whole-history clone on streaming output.
+/// Keep the top reading row of a history replaced by `new`, using its neighbours to
+/// disambiguate repeated prompts/blank lines. Compares compact rows; expands none.
 /// None means that the reading row is no longer in the received history.
-pub fn anchored_scroll_offset(old: &[Row], new: &[Row], offset: usize) -> Option<usize> {
+pub fn anchored_scroll_offset(
+    old: &(impl HistoryRows + ?Sized),
+    new: &(impl HistoryRows + ?Sized),
+    offset: usize,
+) -> Option<usize> {
     if offset == 0 {
         return Some(0);
     }
-    if new.starts_with(old) {
-        return Some(offset.saturating_add(new.len() - old.len()).min(new.len()));
+    if extends(old, new) {
+        return Some(
+            offset
+                .saturating_add(new.count() - old.count())
+                .min(new.count()),
+        );
     }
-    let base = old.len().saturating_sub(offset);
-    matching_base(old, base, new).map(|base| new.len().saturating_sub(base))
+    let base = old.count().saturating_sub(offset);
+    matching_base(old, base, new).map(|base| new.count().saturating_sub(base))
 }
 
-fn same_row_text(left: &Row, right: &Row) -> bool {
-    left.wrapped == right.wrapped
-        && left.cells.len() == right.cells.len()
-        && left
+/// Each kept cell's text and width.
+fn cells(row: &HistoryRow) -> impl Iterator<Item = (&str, u8)> {
+    let mut offset = 0;
+    (0..row.len()).map(move |index| {
+        let (len, width) = row
             .cells
-            .iter()
-            .zip(&right.cells)
-            .all(|(left, right)| left.text == right.text && left.width == right.width)
+            .get(index)
+            .map_or((1, 1), |(len, width)| (usize::from(*len), *width));
+        let text = row.text.get(offset..offset + len).unwrap_or_default();
+        offset += len;
+        (text, width)
+    })
 }
 
-fn matching_base(old: &[Row], base: usize, new: &[Row]) -> Option<usize> {
+/// The same cell texts and widths, the trailing blanks a compact row drops counted as
+/// the default blanks they were.
+fn same_row_text(left: &HistoryRow, right: &HistoryRow) -> bool {
+    if left.wrapped != right.wrapped {
+        return false;
+    }
+    if left.cells.is_empty() && right.cells.is_empty() {
+        return left.text.trim_end_matches(' ') == right.text.trim_end_matches(' ');
+    }
+    let blank = (" ", 1);
+    let (mut left, mut right) = (cells(left), cells(right));
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (left, right) if left.unwrap_or(blank) != right.unwrap_or(blank) => return false,
+            _ => {}
+        }
+    }
+}
+
+fn matching_base(
+    old: &(impl HistoryRows + ?Sized),
+    base: usize,
+    new: &(impl HistoryRows + ?Sized),
+) -> Option<usize> {
     // Prefer text over a blank top row, but never jump to unrelated offscreen text.
-    let anchor = (base..old.len().min(base + 4))
+    let anchor = (base..old.count().min(base + 4))
         .find(|&index| {
-            old[index]
-                .cells
-                .iter()
-                .any(|cell| !cell.text.trim().is_empty())
+            old.row(index)
+                .is_some_and(|row| !row.text.trim().is_empty())
         })
         .unwrap_or(base);
-    let row = old.get(anchor)?;
+    let row = old.row(anchor)?;
     let mut best = None;
-    for (index, candidate) in new.iter().enumerate() {
-        if !same_row_text(row, candidate) {
+    for index in 0..new.count() {
+        if !new
+            .row(index)
+            .is_some_and(|candidate| same_row_text(row, candidate))
+        {
             continue;
         }
         let mut context = 0;
         for distance in 1..=3 {
             if anchor >= distance
                 && index >= distance
-                && same_row_text(&old[anchor - distance], &new[index - distance])
+                && let (Some(left), Some(right)) =
+                    (old.row(anchor - distance), new.row(index - distance))
+                && same_row_text(left, right)
             {
                 context += 1;
             }
             if let (Some(left), Some(right)) =
-                (old.get(anchor + distance), new.get(index + distance))
+                (old.row(anchor + distance), new.row(index + distance))
                 && same_row_text(left, right)
             {
                 context += 1;
@@ -140,18 +251,21 @@ pub fn visible_row(rows: i16, row: usize) -> usize {
     row.min(rows.saturating_sub(1) as usize)
 }
 
-pub fn hyperlink_at(snapshot: Option<&ScreenSnapshot>, point: GridPoint) -> Option<&str> {
-    row_at(snapshot?, point.row)?
-        .cells
-        .get(point.col)?
-        .hyperlink
-        .as_deref()
+fn hyperlink_at(snapshot: &ScreenSnapshot, point: GridPoint) -> Option<String> {
+    Some(
+        row_at(snapshot, point.row)?
+            .cells
+            .get(point.col)?
+            .hyperlink
+            .as_deref()?
+            .to_owned(),
+    )
 }
 
 pub fn web_link_at(snapshot: Option<&ScreenSnapshot>, point: GridPoint) -> Option<String> {
     let snapshot = snapshot?;
-    if let Some(uri) = hyperlink_at(Some(snapshot), point).filter(|uri| is_allowed_hyperlink(uri)) {
-        return Some(uri.to_owned());
+    if let Some(uri) = hyperlink_at(snapshot, point).filter(|uri| is_allowed_hyperlink(uri)) {
+        return Some(uri);
     }
     let (line, clicked) = logical_line(snapshot, point)?;
     let (token_start, token) = token_at(&line, &clicked);
@@ -175,11 +289,11 @@ fn logical_line(snapshot: &ScreenSnapshot, point: GridPoint) -> Option<(String, 
         return None;
     }
     let mut first_row = point.row;
-    while first_row > 0 && row_at(snapshot, first_row - 1).is_some_and(|row| row.wrapped) {
+    while first_row > 0 && wrapped_at(snapshot, first_row - 1) {
         first_row -= 1;
     }
     let mut last_row = point.row;
-    while last_row + 1 < row_count && row_at(snapshot, last_row).is_some_and(|row| row.wrapped) {
+    while last_row + 1 < row_count && wrapped_at(snapshot, last_row) {
         last_row += 1;
     }
 
@@ -224,8 +338,8 @@ pub struct FileLocation {
 /// plain text (see `file_location`) that the click lands on. Web links are not files.
 pub fn file_link_at(snapshot: Option<&ScreenSnapshot>, point: GridPoint) -> Option<FileLocation> {
     let snapshot = snapshot?;
-    if let Some(uri) = hyperlink_at(Some(snapshot), point) {
-        return file_uri_path(uri).map(|path| FileLocation { path, line: None });
+    if let Some(uri) = hyperlink_at(snapshot, point) {
+        return file_uri_path(&uri).map(|path| FileLocation { path, line: None });
     }
     let (line, clicked) = logical_line(snapshot, point)?;
     let (token_start, token) = token_at(&line, &clicked);
@@ -422,7 +536,7 @@ mod tests {
             cols: rows.first().map_or(0, |row| row.cells.len()) as u16,
             rows: rows.len() as u16,
             cells: rows,
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
             cursor: Default::default(),
             modes: Default::default(),
             title: String::new(),
@@ -432,14 +546,75 @@ mod tests {
         }
     }
 
-    fn history(range: Range<usize>) -> Vec<Row> {
+    fn line(index: usize) -> Row {
+        row(&format!("line {index:04}"), false)
+    }
+
+    fn history(range: Range<usize>) -> VecDeque<HistoryRow> {
         range
-            .map(|index| row(&format!("line {index:04}"), false))
+            .map(|index| HistoryRow::from_row(&line(index)))
             .collect()
     }
 
     #[test]
-    fn streaming_and_eviction_keep_the_reading_row() {
+    fn appends_keep_the_reading_row_until_evicted_and_move_the_selection_with_its_rows() {
+        let mut rows = history(0..100);
+        // Reading line 70, lines 72 to 75 selected.
+        let mut offset = 30;
+        let mut selection = Some(Selection {
+            anchor: GridPoint { row: 75, col: 3 },
+            head: GridPoint { row: 72, col: 1 },
+        });
+        for step in 1..=5 {
+            let len = rows.len();
+            rows.extend(history(85 + 15 * step..100 + 15 * step));
+            let evicted = rows.len() - 100;
+            rows.drain(..evicted);
+            (offset, selection) = follow_append(len, evicted, 15, offset, selection);
+            let first = 15 * step;
+            if first <= 70 {
+                assert_eq!(rows[rows.len() - offset], HistoryRow::from_row(&line(70)));
+            } else {
+                assert_eq!(offset, rows.len(), "the reading row left: the top shows");
+            }
+            match selection {
+                Some(selection) => {
+                    assert_eq!(
+                        selection.anchor,
+                        GridPoint {
+                            row: 75 - first,
+                            col: 3
+                        }
+                    );
+                    assert_eq!(
+                        selection.head,
+                        GridPoint {
+                            row: 72 - first,
+                            col: 1
+                        }
+                    );
+                }
+                None => assert!(first > 72, "dropped only once a selected row left"),
+            }
+        }
+        assert_eq!(selection.map(|selection| selection.head.row), None);
+
+        // Live output stays live; rows only appended move neither view nor selection.
+        let on_screen = Some(Selection {
+            anchor: GridPoint { row: 101, col: 0 },
+            head: GridPoint { row: 103, col: 2 },
+        });
+        let (offset, kept) = follow_append(100, 0, 4, 0, on_screen);
+        assert_eq!(offset, 0);
+        assert_eq!(
+            kept.map(|selection| selection.ordered()),
+            on_screen.map(|s| s.ordered())
+        );
+        assert_eq!(follow_append(100, 0, 4, 10, None).0, 14);
+    }
+
+    #[test]
+    fn replaced_history_keeps_the_reading_row_by_its_text() {
         let old = history(0..100);
         for new in [history(0..110), history(10..110)] {
             let offset = anchored_scroll_offset(&old, &new, 50).unwrap();
@@ -448,17 +623,52 @@ mod tests {
         }
         assert_eq!(anchored_scroll_offset(&old, &history(60..160), 50), None);
         assert_eq!(anchored_scroll_offset(&old, &history(10..110), 0), Some(0));
+        assert!(extends(&old, &history(0..101)));
+        assert!(!extends(&old, &history(1..101)));
+    }
+
+    #[test]
+    fn compact_rows_compare_by_text_whatever_blanks_or_styles_they_keep() {
+        let plain = HistoryRow::from_row(&row("abc   ", false));
+        let mut styled_blank = row("abc ", false);
+        styled_blank.cells[3].background = compi_protocol::Color::Indexed(4);
+        let styled_blank = HistoryRow::from_row(&styled_blank);
+        assert_ne!(plain.len(), styled_blank.len());
+        assert!(same_row_text(&plain, &styled_blank));
+        let mut wide = row("a界 ", false);
+        wide.cells[1].width = 2;
+        wide.cells[2] = compi_protocol::Cell {
+            text: "".into(),
+            width: 0,
+            ..Default::default()
+        };
+        let wide = HistoryRow::from_row(&wide);
+        assert!(same_row_text(&wide, &wide.clone()));
+        assert!(!same_row_text(
+            &wide,
+            &HistoryRow::from_row(&row("a界", false))
+        ));
+        assert!(!same_row_text(
+            &plain,
+            &HistoryRow::from_row(&row("abc", true))
+        ));
+        assert!(!same_row_text(
+            &plain,
+            &HistoryRow::from_row(&row("abcd", false))
+        ));
     }
 
     #[test]
     fn redraw_keeps_text_anchor_and_disambiguates_repeated_lines() {
+        let repeated = HistoryRow::from_row(&row("repeated ", false));
+        let mut recolored = row("repeated ", false);
+        recolored.cells[0].foreground = compi_protocol::Color::Indexed(2);
         let mut old = history(0..30);
-        old[8] = row("repeated ", false);
-        old[18] = old[8].clone();
+        old[8] = repeated.clone();
+        old[18] = repeated.clone();
         let mut new = history(5..35);
-        new[3] = old[8].clone();
-        new[13] = old[18].clone();
-        new[13].cells[0].foreground = compi_protocol::Color::Indexed(2);
+        new[3] = repeated;
+        new[13] = HistoryRow::from_row(&recolored);
         assert_eq!(anchored_scroll_offset(&old, &new, 12), Some(17));
         let mut reprint = history(0..5);
         reprint.extend(old.iter().cloned());
@@ -467,16 +677,22 @@ mod tests {
 
     #[test]
     fn split_clear_and_reprint_recovers_but_real_clear_expires() {
-        let mut screen = snapshot(history(100..110));
+        let mut screen = snapshot((100..110).map(line).collect());
         screen.scrollback = history(0..100);
+        let mut mirror = ScreenMirror::default();
+        mirror.apply(compi_protocol::ScreenMessage::Snapshot { snapshot: screen });
         let now = Instant::now();
-        let pending = PendingScroll::new(&screen, 50, now);
-        assert_eq!(pending.recover(&[]), None);
+        let pending = PendingScroll::new(&mirror, 50, now).unwrap();
+        assert_eq!(pending.recover(&VecDeque::new()), None);
         assert_eq!(pending.recover(&history(0..40)), None);
         assert_eq!(pending.recover(&history(0..110)), Some((60, 10)));
         assert!(!pending.expired(now + Duration::from_millis(249)));
         assert!(pending.expired(now + Duration::from_millis(250)));
-        assert!(same_row_text(&pending.rows[0], &screen.scrollback[50]));
+        assert_eq!(pending.base, 50);
+        assert_eq!(
+            pending.rows.as_ref(),
+            (50..60).map(line).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -494,6 +710,34 @@ mod tests {
             Some("https://example.com/oauth?a=1")
         );
         assert!(web_link_at(Some(&snapshot), GridPoint { row: 0, col: 2 }).is_none());
+    }
+
+    #[test]
+    fn links_wrap_from_history_onto_the_screen() {
+        // A soft-wrapped row fills the width; the screen row after it continues the line.
+        let mut start = row("see https://example", true);
+        start.cells[0].hyperlink = Some("file://host/notes.txt".into());
+        let mut screen = snapshot(vec![row(".com/a and b", false)]);
+        screen.cols = 19;
+        screen.scrollback = [
+            HistoryRow::from_row(&row("older", false)),
+            HistoryRow::from_row(&start),
+        ]
+        .into_iter()
+        .collect();
+        let at = |row, col| web_link_at(Some(&screen), GridPoint { row, col });
+        assert_eq!(at(1, 6).as_deref(), Some("https://example.com/a"));
+        assert_eq!(at(2, 3).as_deref(), Some("https://example.com/a"));
+        assert_eq!(at(2, 9), None);
+        assert_eq!(at(0, 10), None);
+        assert_eq!(
+            file_link_at(Some(&screen), GridPoint { row: 1, col: 0 }),
+            Some(FileLocation {
+                path: "/notes.txt".into(),
+                line: None,
+            })
+        );
+        assert_eq!(row_at(&screen, 1).unwrap().cells.len(), 19);
     }
 
     fn file(token: &str) -> Option<(String, Option<u32>)> {

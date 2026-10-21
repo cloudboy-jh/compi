@@ -1,31 +1,42 @@
-use compi_protocol::{Color, Row, ScreenSnapshot};
+use compi_protocol::{Color, Row, ScreenSnapshot, TextAttributes};
+use std::borrow::{Borrow, Cow};
 use std::fmt::Write;
 
 /// Join soft-wrapped physical rows; preserve spaces, wide glyphs and all hard breaks.
+/// History rows are rebuilt at the screen's width, so their trailing blanks remain.
 pub fn render(snapshot: &ScreenSnapshot, scrollback: bool, ansi: bool) -> String {
+    let width = usize::from(snapshot.cols);
     render_rows(
         snapshot
             .scrollback
             .iter()
             .filter(|_| scrollback)
-            .chain(&snapshot.cells),
+            .map(|row| Cow::Owned(row.to_row(width)))
+            .chain(snapshot.cells.iter().map(Cow::Borrowed)),
         ansi,
     )
 }
 
-fn render_rows<'a>(rows: impl Iterator<Item = &'a Row>, ansi: bool) -> String {
+fn render_rows<R: Borrow<Row>>(rows: impl Iterator<Item = R>, ansi: bool) -> String {
     let mut result = String::new();
     let mut rows = rows.peekable();
-    let mut previous_style = None;
-    let mut previous_link = None;
+    // Owned: a history row is rebuilt for its turn and gone after it.
+    let mut previous_style: Option<(Color, Color, TextAttributes)> = None;
+    let mut previous_link: Option<String> = None;
     while let Some(row) = rows.next() {
+        let row = row.borrow();
         for cell in &row.cells {
             if cell.width == 0 {
                 continue;
             }
             if ansi {
                 let style = (cell.foreground, cell.background, &cell.attributes);
-                if previous_style != Some(style) {
+                if previous_style
+                    .as_ref()
+                    .is_none_or(|(foreground, background, attributes)| {
+                        (*foreground, *background, attributes) != style
+                    })
+                {
                     result.push_str("\x1b[0m");
                     for (enabled, code) in [
                         (cell.attributes.bold, 1),
@@ -43,17 +54,18 @@ fn render_rows<'a>(rows: impl Iterator<Item = &'a Row>, ansi: bool) -> String {
                     }
                     color(&mut result, cell.foreground, true);
                     color(&mut result, cell.background, false);
-                    previous_style = Some(style);
+                    previous_style =
+                        Some((cell.foreground, cell.background, cell.attributes.clone()));
                 }
                 let link = cell.hyperlink.as_deref();
-                if previous_link != link {
+                if previous_link.as_deref() != link {
                     if previous_link.is_some() {
                         result.push_str("\x1b]8;;\x1b\\");
                     }
                     if let Some(link) = link {
                         let _ = write!(result, "\x1b]8;;{link}\x1b\\");
                     }
-                    previous_link = link;
+                    previous_link = link.map(str::to_owned);
                 }
             }
             result.push_str(&cell.text);
@@ -163,5 +175,70 @@ mod tests {
         let ansi = render_rows(rows.iter(), true);
         assert!(ansi.contains("\x1b[1m\x1b[38;2;1;2;3m"));
         assert!(ansi.ends_with("y\x1b[0m"));
+    }
+
+    #[test]
+    fn scrollback_capture_matches_the_full_rows_it_was_kept_from() {
+        let row = |text: &str, wrapped: bool| {
+            let mut row = Row::blank(6);
+            for (cell, character) in row.cells.iter_mut().zip(text.chars()) {
+                cell.text = character.to_string().into();
+            }
+            row.wrapped = wrapped;
+            row
+        };
+        let mut styled = row("ab", false);
+        styled.cells[1].hyperlink = Some("https://example.com".into());
+        styled.cells[4].background = Color::Indexed(1);
+        let mut wide = row("界", true);
+        wide.cells[0].width = 2;
+        wide.cells[1] = Cell {
+            text: "".into(),
+            width: 0,
+            ..Cell::default()
+        };
+        let history = [
+            row("one  ", false),
+            styled,
+            wide,
+            row("", false),
+            row("tail", false),
+        ];
+        let screen = vec![row("$ ", false), row("", false)];
+        let snapshot = ScreenSnapshot {
+            sequence: 1,
+            cols: 6,
+            rows: 2,
+            cells: screen.clone(),
+            scrollback: history
+                .iter()
+                .map(compi_protocol::HistoryRow::from_row)
+                .collect(),
+            cursor: Default::default(),
+            modes: Default::default(),
+            title: String::new(),
+            current_directory: None,
+            images: Vec::new(),
+            placements: Vec::new(),
+        };
+        for ansi in [false, true] {
+            assert_eq!(
+                render(&snapshot, true, ansi),
+                render_rows(history.iter().chain(&screen), ansi)
+            );
+            assert_eq!(
+                render(&snapshot, false, ansi),
+                render_rows(screen.iter(), ansi)
+            );
+        }
+        // Trailing blanks stay; the soft-wrapped wide row joins the blank row after it.
+        assert_eq!(
+            render(&snapshot, true, false),
+            format!(
+                "one   \nab    \n界{}\ntail  \n$     \n{}",
+                " ".repeat(10),
+                " ".repeat(6)
+            )
+        );
     }
 }

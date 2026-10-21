@@ -3,9 +3,9 @@ pub mod trace;
 
 use base64::Engine;
 use compi_protocol::{
-    Cell, Color, CursorShape, CursorState, DEFAULT_GRAPHICS_BYTES, KittyImage, KittyPlacement,
-    MAX_DECODED_IMAGE_BYTES, MAX_GRAPHICS_BYTES, MouseMode, Row, RowUpdate, ShellAction,
-    TerminalModes, TextAttributes,
+    Cell, Color, CursorShape, CursorState, DEFAULT_GRAPHICS_BYTES, HistoryRow, KittyImage,
+    KittyPlacement, MAX_DECODED_IMAGE_BYTES, MAX_GRAPHICS_BYTES, MouseMode, Row, RowUpdate,
+    ScrollbackChange, ShellAction, TerminalModes, TextAttributes,
 };
 use flate2::read::ZlibDecoder;
 use smol_str::SmolStr;
@@ -17,7 +17,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vte::{Params, Parser, Perform};
 
-pub const MAX_SCROLLBACK_BYTES: usize = 1024 * 1024;
+/// Bytes of memory a history line may hold on average: the history evicts its oldest rows
+/// once it holds more than `scrollback_lines × HISTORY_BYTES_PER_LINE`. Measured for
+/// 10,000 lines at 80 columns: plain text about 160 bytes a line, colored compiler and
+/// `ls` output about 320, wide CJK about 510, so the default limit keeps all of them.
+pub const HISTORY_BYTES_PER_LINE: usize = 512;
+const DEFAULT_HISTORY_LINES: usize = 10_000;
 const MAX_GRAPHICS_TRANSFERS: usize = 64;
 const MAX_GRAPHICS_IMAGES: usize = 1024;
 const MAX_GRAPHICS_PLACEMENTS: usize = 4096;
@@ -39,7 +44,7 @@ pub struct Snapshot {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<Row>,
-    pub scrollback: Vec<Row>,
+    pub scrollback: VecDeque<HistoryRow>,
     pub cursor: CursorState,
     pub modes: TerminalModes,
     pub title: String,
@@ -54,7 +59,7 @@ pub struct Delta {
     pub cols: u16,
     pub rows: u16,
     pub row_updates: Vec<RowUpdate>,
-    pub scrollback: Option<Vec<Row>>,
+    pub scrollback: Option<ScrollbackChange>,
     pub cursor: CursorState,
     pub modes: TerminalModes,
     pub title: String,
@@ -68,32 +73,136 @@ pub struct Delta {
 
 struct Buffer {
     rows: Vec<Row>,
-    scrollback: VecDeque<Row>,
-    scrollback_bytes: usize,
-    scrollback_line_limit: usize,
 }
 
 impl Buffer {
     fn new(cols: usize, rows: usize) -> Self {
         Self {
             rows: vec![Row::blank(cols); rows],
-            scrollback: VecDeque::new(),
-            scrollback_bytes: 0,
-            scrollback_line_limit: 10_000,
+        }
+    }
+}
+
+/// The main screen's history, oldest row first, and running counts of how it changed.
+struct History {
+    rows: VecDeque<HistoryRow>,
+    /// The rows' [`HistoryRow::memory`], summed.
+    bytes: usize,
+    line_limit: usize,
+    /// Rows pushed and evicted so far.
+    appended: u64,
+    evicted: u64,
+    /// Changes other than pushing and evicting: a clear, a reset, a resize that rewrapped
+    /// rows or took them back onto the screen.
+    replaced: u64,
+}
+
+/// Where a [`History`]'s counts stood when a change baseline was taken.
+#[derive(Clone, Copy)]
+struct HistoryMark {
+    appended: u64,
+    evicted: u64,
+    replaced: u64,
+}
+
+impl History {
+    fn new() -> Self {
+        Self {
+            rows: VecDeque::new(),
+            bytes: 0,
+            line_limit: DEFAULT_HISTORY_LINES,
+            appended: 0,
+            evicted: 0,
+            replaced: 0,
         }
     }
 
-    fn push_scrollback(&mut self, row: Row) {
-        self.scrollback_bytes += row_memory(&row);
-        self.scrollback.push_back(row);
-        while self.scrollback_bytes > MAX_SCROLLBACK_BYTES
-            || self.scrollback.len() > self.scrollback_line_limit
-        {
-            let Some(removed) = self.scrollback.pop_front() else {
+    fn push(&mut self, row: &Row) {
+        self.push_compact(HistoryRow::from_row(row));
+    }
+
+    fn push_compact(&mut self, row: HistoryRow) {
+        if self.line_limit == 0 {
+            return;
+        }
+        self.bytes += row.memory();
+        self.rows.push_back(row);
+        self.appended += 1;
+        self.evicted += self.evict();
+    }
+
+    /// Drops the oldest rows until the history fits its limits; returns how many it dropped.
+    fn evict(&mut self) -> u64 {
+        let byte_limit = self.line_limit.saturating_mul(HISTORY_BYTES_PER_LINE);
+        let mut evicted = 0;
+        while self.rows.len() > self.line_limit || self.bytes > byte_limit {
+            let Some(row) = self.rows.pop_front() else {
                 break;
             };
-            self.scrollback_bytes = self.scrollback_bytes.saturating_sub(row_memory(&removed));
+            self.bytes -= row.memory();
+            evicted += 1;
         }
+        evicted
+    }
+
+    fn replace(&mut self, rows: VecDeque<HistoryRow>) {
+        self.bytes = rows.iter().map(HistoryRow::memory).sum();
+        self.rows = rows;
+        self.replaced += 1;
+        self.evict();
+    }
+
+    fn clear(&mut self) {
+        if !self.rows.is_empty() {
+            self.replace(VecDeque::new());
+        }
+    }
+
+    /// Removes the newest `count` rows, oldest first.
+    fn take_newest(&mut self, count: usize) -> VecDeque<HistoryRow> {
+        let taken = self.rows.split_off(self.rows.len() - count);
+        if !taken.is_empty() {
+            self.bytes -= taken.iter().map(HistoryRow::memory).sum::<usize>();
+            self.replaced += 1;
+        }
+        taken
+    }
+
+    fn mark(&self) -> HistoryMark {
+        HistoryMark {
+            appended: self.appended,
+            evicted: self.evicted,
+            replaced: self.replaced,
+        }
+    }
+
+    /// How a client holding the history as of `mark` catches up: the rows pushed since,
+    /// after dropping the rows evicted since, when every pushed row is still held;
+    /// otherwise the whole history.
+    fn change_since(&self, mark: HistoryMark) -> Option<ScrollbackChange> {
+        if self.replaced == mark.replaced {
+            let appended = self.appended - mark.appended;
+            let evicted = self.evicted - mark.evicted;
+            if appended == 0 && evicted == 0 {
+                return None;
+            }
+            if let Ok(appended) = usize::try_from(appended)
+                && appended <= self.rows.len()
+                && let Ok(evicted) = u32::try_from(evicted)
+            {
+                return Some(ScrollbackChange::Append {
+                    evicted,
+                    rows: self
+                        .rows
+                        .range(self.rows.len() - appended..)
+                        .cloned()
+                        .collect(),
+                });
+            }
+        }
+        Some(ScrollbackChange::Replace {
+            rows: self.rows.iter().cloned().collect(),
+        })
     }
 }
 
@@ -213,7 +322,7 @@ struct ChangeBaseline {
     /// Rows that differed from `row_hashes` at some point while updates were held;
     /// a snapshot may have shown them, so they are resent even if they changed back.
     dirty_rows: Vec<bool>,
-    scrollback_generation: u64,
+    history: HistoryMark,
     graphics_generation: u64,
     image_generation: u64,
     cursor: CursorState,
@@ -227,6 +336,8 @@ pub struct TerminalState {
     input_state: InputState,
     main: Buffer,
     alternate: Buffer,
+    /// The main screen's history; the alternate screen keeps none.
+    history: History,
     active_alternate: bool,
     cursor: CursorState,
     saved_cursor: CursorState,
@@ -244,7 +355,6 @@ pub struct TerminalState {
     scroll_bottom: usize,
     pending_wrap: bool,
     sequence: u64,
-    scrollback_generation: u64,
     graphics_generation: u64,
     image_generation: u64,
     replies: Vec<Vec<u8>>,
@@ -272,6 +382,7 @@ impl TerminalState {
             input_state: InputState::Normal,
             main: Buffer::new(cols, rows),
             alternate: Buffer::new(cols, rows),
+            history: History::new(),
             active_alternate: false,
             cursor: CursorState {
                 visible: true,
@@ -298,7 +409,6 @@ impl TerminalState {
             clipboard_writes: Vec::new(),
             shell_action: None,
             images: HashMap::new(),
-            scrollback_generation: 0,
             graphics_generation: 0,
             image_generation: 0,
             placements: Vec::new(),
@@ -313,18 +423,16 @@ impl TerminalState {
     }
 
     pub fn set_resource_limits(&mut self, scrollback_lines: usize, graphics_bytes: usize) {
-        self.main.scrollback_line_limit = scrollback_lines;
-        self.alternate.scrollback_line_limit = scrollback_lines;
+        self.history.line_limit = scrollback_lines;
         self.graphics_byte_limit = graphics_bytes.min(MAX_GRAPHICS_BYTES);
     }
 
     pub fn clear_scrollback(&mut self) {
-        self.main.scrollback.clear();
-        self.main.scrollback_bytes = 0;
+        self.history.clear();
         self.prune_history_placements();
-        self.scrollback_generation = self.scrollback_generation.saturating_add(1);
         self.sequence = self.sequence.saturating_add(1);
     }
+
     pub fn set_diagnostic_context(&mut self, session_id: &str, trace_label: Option<&str>) {
         self.diagnostics.context = match trace_label {
             Some(label) => format!("session={session_id},trace={label}"),
@@ -361,7 +469,12 @@ impl TerminalState {
         &mut self.program_status
     }
 
-    pub fn snapshot(&self) -> Snapshot {
+    /// The whole screen for the controlling client. Updates still held back by
+    /// synchronized output count history changes from here, since the client now holds it.
+    pub fn snapshot(&mut self) -> Snapshot {
+        if let Some(held) = &mut self.held_change {
+            held.history = self.history.mark();
+        }
         self.snapshot_with_graphics(true, true)
     }
 
@@ -394,9 +507,9 @@ impl TerminalState {
             rows: self.rows() as u16,
             cells: self.buffer().rows.clone(),
             scrollback: if include_scrollback {
-                self.main.scrollback.iter().cloned().collect()
+                self.history.rows.clone()
             } else {
-                Vec::new()
+                VecDeque::new()
             },
             cursor: self.cursor,
             modes: self.modes.clone(),
@@ -520,21 +633,21 @@ impl TerminalState {
             .held_change
             .take()
             .unwrap_or_else(|| self.change_baseline());
-        let old_scrollback = self.main.scrollback.len();
+        let old_history = self.history.rows.len();
         let cursor_in_main = (!self.active_alternate).then(|| {
             (
-                old_scrollback + usize::from(self.cursor.row),
+                old_history + usize::from(self.cursor.row),
                 usize::from(self.cursor.col),
             )
         });
-        let source_rows = old_scrollback + self.main.rows.len();
+        let source_rows = old_history + self.main.rows.len();
         let placement_anchors: Vec<_> = self
             .placements
             .iter()
             .enumerate()
             .filter(|(_, placement)| !placement.alternate_screen)
             .filter_map(|(index, placement)| {
-                let row = i64::try_from(old_scrollback).ok()? + i64::from(placement.row);
+                let row = i64::try_from(old_history).ok()? + i64::from(placement.row);
                 (row >= 0 && usize::try_from(row).ok()? < source_rows).then_some((
                     index,
                     (usize::try_from(row).unwrap(), usize::from(placement.col)),
@@ -545,8 +658,24 @@ impl TerminalState {
             .iter()
             .map(|(_, anchor)| *anchor)
             .collect();
-        let (reflowed_cursor, mapped_anchors) =
-            reflow_main_buffer(&mut self.main, cols, rows, cursor_in_main, &anchors);
+        let (reflowed_cursor, mapped_anchors) = if cols == self.cols() {
+            resize_main_rows(
+                &mut self.main,
+                &mut self.history,
+                rows,
+                cursor_in_main,
+                &anchors,
+            )
+        } else {
+            reflow_main_buffer(
+                &mut self.main,
+                &mut self.history,
+                cols,
+                rows,
+                cursor_in_main,
+                &anchors,
+            )
+        };
         let mut keep = vec![true; self.placements.len()];
         let mut graphics_changed = false;
         for ((index, _), mapped) in placement_anchors.into_iter().zip(mapped_anchors) {
@@ -574,8 +703,9 @@ impl TerminalState {
             });
             self.graphics_generation = self.graphics_generation.saturating_add(1);
         }
+        // Anchors the resize pushed out of the history go with their rows.
+        self.prune_history_placements();
         resize_buffer_cells(&mut self.alternate, cols, rows);
-        self.scrollback_generation = self.scrollback_generation.saturating_add(1);
         if let Some((row, col)) = reflowed_cursor {
             self.cursor.row = row.min(rows.saturating_sub(1)) as u16;
             self.cursor.col = col.min(cols.saturating_sub(1)) as u16;
@@ -598,7 +728,7 @@ impl TerminalState {
             active_alternate: self.active_alternate,
             row_hashes: self.buffer().rows.iter().map(row_hash).collect(),
             dirty_rows: Vec::new(),
-            scrollback_generation: self.scrollback_generation,
+            history: self.history.mark(),
             graphics_generation: self.graphics_generation,
             image_generation: self.image_generation,
             cursor: self.cursor,
@@ -616,12 +746,12 @@ impl TerminalState {
         let all_rows = before.cols != self.cols()
             || before.rows != self.rows()
             || before.active_alternate != self.active_alternate;
-        let scrollback_changed = before.scrollback_generation != self.scrollback_generation;
+        let scrollback = self.history.change_since(before.history);
         let graphics_changed = before.graphics_generation != self.graphics_generation;
         let changed = all_rows
             || before.row_hashes != row_hashes
             || before.dirty_rows.contains(&true)
-            || scrollback_changed
+            || scrollback.is_some()
             || graphics_changed
             || before.cursor != self.cursor
             || before.modes != self.modes
@@ -669,7 +799,7 @@ impl TerminalState {
             cols: self.cols() as u16,
             rows: self.rows() as u16,
             row_updates,
-            scrollback: scrollback_changed.then(|| self.main.scrollback.iter().cloned().collect()),
+            scrollback,
             cursor: self.cursor,
             modes: self.modes.clone(),
             title: self.title.clone(),
@@ -972,8 +1102,7 @@ impl TerminalState {
                 removed
             };
             if !active_alt && top == 0 {
-                self.main.push_scrollback(removed);
-                self.scrollback_generation = self.scrollback_generation.saturating_add(1);
+                self.history.push(&removed);
             }
             let mut moved_placement = false;
             for placement in &mut self.placements {
@@ -993,7 +1122,7 @@ impl TerminalState {
     }
 
     fn prune_history_placements(&mut self) {
-        let min_row = -(self.main.scrollback.len() as i32);
+        let min_row = -(self.history.rows.len() as i32);
         let before = self.placements.len();
         self.placements.retain(|placement| {
             placement.row
@@ -1052,10 +1181,8 @@ impl TerminalState {
                     self.clear_row_range(index, 0, cols);
                 }
                 if mode == 3 {
-                    self.main.scrollback.clear();
-                    self.main.scrollback_bytes = 0;
+                    self.history.clear();
                     self.prune_history_placements();
-                    self.scrollback_generation = self.scrollback_generation.saturating_add(1);
                 }
             }
             _ => self.unsupported("erase display", mode),
@@ -1944,16 +2071,19 @@ impl Perform for TerminalState {
             b'c' => {
                 let cols = self.cols() as u16;
                 let rows = self.rows() as u16;
-                let diagnostics = std::mem::take(&mut self.diagnostics);
-                let shell_pid = self.shell_pid;
+                let previous = std::mem::replace(self, Self::new(cols, rows));
+                self.diagnostics = previous.diagnostics;
+                self.shell_pid = previous.shell_pid;
                 // A full reset removes every record; the set lives on so its generation
                 // keeps counting and watchers see the change.
-                let mut program_status = std::mem::take(&mut self.program_status);
-                program_status.clear();
-                *self = Self::new(cols, rows);
-                self.diagnostics = diagnostics;
-                self.shell_pid = shell_pid;
-                self.program_status = program_status;
+                self.program_status = previous.program_status;
+                self.program_status.clear();
+                // The configured limits stay, and clients see the reset as the next frame:
+                // one whose history replaces theirs with nothing.
+                self.graphics_byte_limit = previous.graphics_byte_limit;
+                self.sequence = previous.sequence;
+                self.history = previous.history;
+                self.history.clear();
             }
             b'=' => self.modes.application_keypad = true,
             b'>' => self.modes.application_keypad = false,
@@ -2065,57 +2195,139 @@ fn flat_params(params: &Params) -> Vec<u16> {
         .collect()
 }
 
-fn row_memory(row: &Row) -> usize {
-    row.cells
-        .iter()
-        .map(|cell| 32 + cell.text.len() + cell.hyperlink.as_ref().map_or(0, |uri| uri.len()))
-        .sum::<usize>()
-        + 1
-}
 fn row_hash(row: &Row) -> u64 {
     let mut hasher = DefaultHasher::new();
     row.hash(&mut hasher);
     hasher.finish()
 }
 
+/// Where a resize put the cursor, as a screen row and column, and each anchor, as a row
+/// relative to the new screen's top (negative in the history) and a column.
 type ReflowResult = (Option<(usize, usize)>, Vec<Option<(i32, u16)>>);
-type LogicalLine = (Vec<Cell>, Option<usize>, Vec<(usize, usize)>);
 
+/// How many of the main screen's rows, history first, a resize keeps: rows below the last
+/// one holding content, the cursor or an anchor are unused space, not lines.
+fn used_rows(
+    history: &History,
+    screen: &[Row],
+    cursor: Option<(usize, usize)>,
+    anchors: &[(usize, usize)],
+) -> usize {
+    let total = history.rows.len() + screen.len();
+    if cursor.is_none() && anchors.is_empty() {
+        return total;
+    }
+    let blank = Cell::default();
+    let last_content_row = screen
+        .iter()
+        .rposition(|row| row.wrapped || row.cells.iter().any(|cell| cell != &blank))
+        .map(|row| history.rows.len() + row)
+        .or_else(|| {
+            history
+                .rows
+                .iter()
+                .rposition(|row| row.wrapped || !row.is_empty())
+        });
+    let last_cursor_row = cursor.map(|(row, _)| row);
+    let last_anchor_row = anchors.iter().map(|(row, _)| *row).max();
+    let last_used_row = [last_content_row, last_cursor_row, last_anchor_row]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(0);
+    last_used_row.saturating_add(1).min(total)
+}
+
+/// `(row, col)`, a row of the rows a resize kept, as a row relative to the screen starting
+/// at `screen_start`.
+fn screen_anchor(
+    (row, col): (usize, usize),
+    screen_start: usize,
+    cols: usize,
+) -> Option<(i32, u16)> {
+    let relative = i64::try_from(row).ok()? - i64::try_from(screen_start).ok()?;
+    Some((
+        i32::try_from(relative).ok()?,
+        u16::try_from(col.min(cols.saturating_sub(1))).ok()?,
+    ))
+}
+
+/// Gives the main screen `rows` rows at its width. Every row keeps its cells, so the
+/// history only gains the rows leaving the top of the screen, or gives its newest rows
+/// back when the screen grows.
+fn resize_main_rows(
+    buffer: &mut Buffer,
+    history: &mut History,
+    rows: usize,
+    cursor: Option<(usize, usize)>,
+    anchors: &[(usize, usize)],
+) -> ReflowResult {
+    let cols = buffer.rows.first().map_or(1, |row| row.cells.len());
+    let old_history = history.rows.len();
+    let used = used_rows(history, &buffer.rows, cursor, anchors);
+    let screen_start = used.saturating_sub(rows);
+    if screen_start >= old_history {
+        buffer.rows.truncate(used - old_history);
+        for row in buffer.rows.drain(..screen_start - old_history) {
+            history.push(&row);
+        }
+    } else {
+        // History rows past the last used row are unused space too.
+        let taken = history.take_newest(old_history - screen_start);
+        let screen = std::mem::take(&mut buffer.rows);
+        buffer.rows = taken
+            .iter()
+            .map(|row| row.to_row(cols))
+            .chain(screen)
+            .take(used - screen_start)
+            .collect();
+    }
+    buffer.rows.resize(rows, Row::blank(cols));
+    (
+        cursor.map(|(row, col)| (row.saturating_sub(screen_start), col)),
+        anchors
+            .iter()
+            .map(|anchor| screen_anchor(*anchor, screen_start, cols))
+            .collect(),
+    )
+}
+
+/// Rewraps the main screen and its history at `cols` columns and `rows` rows. The history
+/// keeps its rows, gaining those leaving the top of the screen, unless a line in it wraps
+/// differently; then the rewrapped rows replace it.
 fn reflow_main_buffer(
     buffer: &mut Buffer,
+    history: &mut History,
     cols: usize,
     rows: usize,
     cursor: Option<(usize, usize)>,
     anchors: &[(usize, usize)],
 ) -> ReflowResult {
-    let mut source: Vec<Row> = buffer
-        .scrollback
-        .drain(..)
-        .chain(buffer.rows.drain(..))
-        .collect();
-    if cursor.is_some() || !anchors.is_empty() {
-        let blank = Cell::default();
-        let last_content_row = source
-            .iter()
-            .rposition(|row| row.wrapped || row.cells.iter().any(|cell| cell != &blank));
-        let last_cursor_row = cursor.map(|(row, _)| row);
-        let last_anchor_row = anchors.iter().map(|(row, _)| *row).max();
-        let last_used_row = [last_content_row, last_cursor_row, last_anchor_row]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(0);
-        source.truncate(last_used_row.saturating_add(1).min(source.len()));
-    }
+    let old_cols = buffer.rows.first().map_or(1, |row| row.cells.len());
+    let used = used_rows(history, &buffer.rows, cursor, anchors);
     let mut anchors_by_row = BTreeMap::<usize, Vec<(usize, usize)>>::new();
     for (index, (row, col)) in anchors.iter().copied().enumerate() {
         anchors_by_row.entry(row).or_default().push((index, col));
     }
-    let mut logical_lines: Vec<LogicalLine> = Vec::new();
+    let mut rewrap = Rewrap {
+        cols,
+        lines: 0,
+        rows: Vec::new(),
+        cursor: None,
+        anchors: vec![None; anchors.len()],
+    };
     let mut line_cells = Vec::new();
     let mut line_cursor = None;
     let mut line_anchors = Vec::new();
-    for (row_index, row) in source.into_iter().enumerate() {
+    // History rows are rebuilt one at a time; only the line being rewrapped is expanded.
+    let screen = std::mem::take(&mut buffer.rows);
+    let source = history
+        .rows
+        .iter()
+        .map(|row| row.to_row(old_cols))
+        .chain(screen)
+        .take(used);
+    for (row_index, row) in source.enumerate() {
         if let Some((cursor_row, cursor_col)) = cursor
             && cursor_row == row_index
         {
@@ -2134,24 +2346,69 @@ fn reflow_main_buffer(
         if !row.wrapped {
             trim_reflow_line(&mut line_cells, line_cursor, &line_anchors);
             line_anchors.sort_by_key(|(_, offset)| *offset);
-            logical_lines.push((
-                std::mem::take(&mut line_cells),
-                line_cursor.take(),
-                std::mem::take(&mut line_anchors),
-            ));
+            rewrap.line(&line_cells, line_cursor.take(), &line_anchors);
+            line_cells.clear();
+            line_anchors.clear();
         }
     }
-    if !line_cells.is_empty() || logical_lines.is_empty() {
+    if !line_cells.is_empty() || rewrap.lines == 0 {
         trim_reflow_line(&mut line_cells, line_cursor, &line_anchors);
         line_anchors.sort_by_key(|(_, offset)| *offset);
-        logical_lines.push((line_cells, line_cursor, line_anchors));
+        rewrap.line(&line_cells, line_cursor, &line_anchors);
     }
 
-    let mut physical_rows = Vec::new();
-    let mut mapped_cursor = None;
-    let mut mapped_anchors = vec![None; anchors.len()];
-    for (cells, cursor_offset, line_anchors) in logical_lines {
-        let line_start = physical_rows.len();
+    let Rewrap {
+        rows: mut physical_rows,
+        cursor: mapped_cursor,
+        anchors: mapped_anchors,
+        ..
+    } = rewrap;
+    if physical_rows.len() < rows {
+        physical_rows.resize(rows, HistoryRow::default());
+    }
+    let screen_start = physical_rows.len() - rows;
+    buffer.rows = physical_rows
+        .drain(screen_start..)
+        .map(|row| row.to_row(cols))
+        .collect();
+    let old_history = history.rows.len();
+    if physical_rows.len() >= old_history
+        && history
+            .rows
+            .iter()
+            .zip(&physical_rows)
+            .all(|(old, new)| old == new)
+    {
+        for row in physical_rows.into_iter().skip(old_history) {
+            history.push_compact(row);
+        }
+    } else {
+        history.replace(physical_rows.into());
+    }
+    (
+        mapped_cursor.map(|(row, col)| (row.saturating_sub(screen_start), col)),
+        mapped_anchors
+            .into_iter()
+            .map(|mapped| screen_anchor(mapped?, screen_start, cols))
+            .collect(),
+    )
+}
+
+/// Wraps logical lines into rows `cols` wide, mapping the cursor's and anchors' cell
+/// offsets in each line to `(row, col)` in the rows.
+struct Rewrap {
+    cols: usize,
+    lines: usize,
+    rows: Vec<HistoryRow>,
+    cursor: Option<(usize, usize)>,
+    anchors: Vec<Option<(usize, usize)>>,
+}
+
+impl Rewrap {
+    fn line(&mut self, cells: &[Cell], cursor_offset: Option<usize>, anchors: &[(usize, usize)]) {
+        let cols = self.cols;
+        self.lines += 1;
+        let line_start = self.rows.len();
         let mut row = Row::blank(cols);
         let mut col = 0;
         let mut source_col = 0;
@@ -2161,24 +2418,21 @@ fn reflow_main_buffer(
             let width = usize::from(cell.width.max(1));
             if col + width > cols {
                 row.wrapped = true;
-                physical_rows.push(row);
+                self.rows.push(HistoryRow::from_row(&row));
                 row = Row::blank(cols);
                 col = 0;
             }
-            if cursor_offset.is_some_and(|offset| {
-                offset >= source_col && offset < source_col.saturating_add(width)
-            }) {
-                mapped_cursor = Some((
-                    physical_rows.len(),
-                    col + cursor_offset.unwrap().saturating_sub(source_col),
-                ));
+            if let Some(offset) = cursor_offset
+                && offset >= source_col
+                && offset < source_col.saturating_add(width)
+            {
+                self.cursor = Some((self.rows.len(), col + offset - source_col));
             }
-            while let Some((index, offset)) = line_anchors.get(next_anchor).copied()
+            while let Some((index, offset)) = anchors.get(next_anchor).copied()
                 && offset < source_col.saturating_add(width)
             {
                 if offset >= source_col {
-                    mapped_anchors[index] =
-                        Some((physical_rows.len(), col + offset.saturating_sub(source_col)));
+                    self.anchors[index] = Some((self.rows.len(), col + offset - source_col));
                 }
                 next_anchor += 1;
             }
@@ -2202,57 +2456,19 @@ fn reflow_main_buffer(
             source_col += width;
         }
         if cursor_offset == Some(cells.len()) {
-            mapped_cursor = Some((physical_rows.len(), col.min(cols.saturating_sub(1))));
+            self.cursor = Some((self.rows.len(), col.min(cols.saturating_sub(1))));
         }
-        while let Some((index, offset)) = line_anchors.get(next_anchor).copied() {
+        while let Some((index, offset)) = anchors.get(next_anchor).copied() {
             if offset == cells.len() {
-                mapped_anchors[index] =
-                    Some((physical_rows.len(), col.min(cols.saturating_sub(1))));
+                self.anchors[index] = Some((self.rows.len(), col.min(cols.saturating_sub(1))));
             }
             next_anchor += 1;
         }
-        physical_rows.push(row);
-        if mapped_cursor.is_none() && cursor_offset.is_some() {
-            mapped_cursor = Some((line_start, 0));
+        self.rows.push(HistoryRow::from_row(&row));
+        if self.cursor.is_none() && cursor_offset.is_some() {
+            self.cursor = Some((line_start, 0));
         }
     }
-
-    while physical_rows.len() < rows {
-        physical_rows.push(Row::blank(cols));
-    }
-    let viewport_start = physical_rows.len().saturating_sub(rows);
-    let viewport = physical_rows.split_off(viewport_start);
-    buffer.scrollback = physical_rows.into();
-    buffer.rows = viewport;
-    buffer.scrollback_bytes = buffer.scrollback.iter().map(row_memory).sum();
-    let mut removed_rows = 0;
-    while buffer.scrollback_bytes > MAX_SCROLLBACK_BYTES
-        || buffer.scrollback.len() > buffer.scrollback_line_limit
-    {
-        let Some(removed) = buffer.scrollback.pop_front() else {
-            break;
-        };
-        removed_rows += 1;
-        buffer.scrollback_bytes = buffer.scrollback_bytes.saturating_sub(row_memory(&removed));
-    }
-    let mapped_anchors = mapped_anchors
-        .into_iter()
-        .map(|mapped| {
-            let (row, col) = mapped?;
-            if row < removed_rows {
-                return None;
-            }
-            let relative = i64::try_from(row).ok()? - i64::try_from(viewport_start).ok()?;
-            Some((
-                i32::try_from(relative).ok()?,
-                u16::try_from(col.min(cols.saturating_sub(1))).ok()?,
-            ))
-        })
-        .collect();
-    (
-        mapped_cursor.map(|(row, col)| (row.saturating_sub(viewport_start), col)),
-        mapped_anchors,
-    )
 }
 
 fn trim_reflow_line(cells: &mut Vec<Cell>, cursor: Option<usize>, anchors: &[(usize, usize)]) {
@@ -2332,6 +2548,25 @@ mod tests {
 
     fn visible_text(snapshot: &Snapshot, row: usize) -> String {
         row_text(&snapshot.cells[row])
+    }
+
+    fn history_text(row: &HistoryRow) -> String {
+        row_text(&row.to_row(0))
+    }
+
+    /// A delta's history change: `Some(evicted)` and the appended rows' text for an
+    /// append, `None` and the whole history's text for a replacement.
+    fn history_change(delta: &Delta) -> Option<(Option<u32>, Vec<String>)> {
+        Some(match delta.scrollback.as_ref()? {
+            ScrollbackChange::Append { evicted, rows } => {
+                (Some(*evicted), rows.iter().map(history_text).collect())
+            }
+            ScrollbackChange::Replace { rows } => (None, rows.iter().map(history_text).collect()),
+        })
+    }
+
+    fn history_texts(terminal: &TerminalState) -> Vec<String> {
+        terminal.history.rows.iter().map(history_text).collect()
     }
 
     #[test]
@@ -2670,8 +2905,8 @@ mod tests {
         let narrow_text: Vec<_> = narrow
             .scrollback
             .iter()
-            .chain(&narrow.cells)
-            .map(row_text)
+            .map(history_text)
+            .chain(narrow.cells.iter().map(row_text))
             .filter(|text| !text.is_empty())
             .collect();
         assert_eq!(narrow_text, ["abcd", "efgh"]);
@@ -2682,8 +2917,8 @@ mod tests {
         let wide_text: Vec<_> = wide
             .scrollback
             .iter()
-            .chain(&wide.cells)
-            .map(row_text)
+            .map(history_text)
+            .chain(wide.cells.iter().map(row_text))
             .filter(|text| !text.is_empty())
             .collect();
         assert_eq!(wide_text, ["abcdefgh"]);
@@ -2728,7 +2963,8 @@ mod tests {
         terminal.advance(b"prompt");
 
         for rows in [40, 12, 30, 8, 24] {
-            terminal.resize(20, rows);
+            let delta = terminal.resize(20, rows).unwrap();
+            assert_eq!(delta.scrollback, None);
         }
 
         let snapshot = terminal.snapshot();
@@ -2954,15 +3190,186 @@ mod tests {
     }
 
     #[test]
-    fn bounds_scrollback_by_memory() {
-        let mut terminal = TerminalState::new(16, 2);
+    fn history_keeps_ten_thousand_lines_at_eighty_columns_by_default() {
+        let mut terminal = TerminalState::new(80, 24);
         let mut output = Vec::new();
-        for index in 0..8_000 {
-            output.extend_from_slice(format!("{index:08}\r\n").as_bytes());
+        for index in 0..12_000 {
+            output.extend_from_slice(
+                format!(
+                    "{index:06} {}\r\n",
+                    "compiling crate with a long line ".repeat(2)
+                )
+                .as_bytes(),
+            );
         }
         terminal.advance(&output);
-        assert!(terminal.main.scrollback_bytes <= MAX_SCROLLBACK_BYTES);
-        assert!(terminal.main.scrollback.len() < 8_000);
+        assert_eq!(terminal.history.rows.len(), DEFAULT_HISTORY_LINES);
+        assert!(
+            history_texts(&terminal)
+                .last()
+                .is_some_and(|text| text.starts_with("011976 compiling"))
+        );
+        assert_eq!(
+            terminal.history.bytes,
+            terminal
+                .history
+                .rows
+                .iter()
+                .map(HistoryRow::memory)
+                .sum::<usize>()
+        );
+        assert!(terminal.history.bytes <= DEFAULT_HISTORY_LINES * HISTORY_BYTES_PER_LINE);
+    }
+
+    #[test]
+    fn history_bytes_bound_rows_heavier_than_the_per_line_budget() {
+        let mut terminal = TerminalState::new(80, 2);
+        terminal.set_resource_limits(100, MAX_GRAPHICS_BYTES);
+        let mut output = Vec::new();
+        for _ in 0..100 {
+            // Every cell its own colour: one style run per cell.
+            for color in 0..80 {
+                output.extend_from_slice(format!("\x1b[38;5;{color}mx").as_bytes());
+            }
+            output.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        terminal.advance(&output);
+        assert!(terminal.history.bytes <= 100 * HISTORY_BYTES_PER_LINE);
+        assert!(!terminal.history.rows.is_empty());
+        assert!(terminal.history.rows.len() < 100);
+        assert!(
+            history_texts(&terminal)
+                .iter()
+                .all(|text| *text == "x".repeat(80))
+        );
+        assert_eq!(
+            terminal.history.evicted,
+            terminal.history.appended - terminal.history.rows.len() as u64
+        );
+    }
+
+    #[test]
+    fn deltas_append_history_rows_and_count_evictions() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_resource_limits(3, MAX_GRAPHICS_BYTES);
+        let (delta, _) = terminal.advance(b"a\r\nb\r\nc\r\nd");
+        assert_eq!(
+            history_change(&delta.unwrap()),
+            Some((Some(0), vec!["a".into(), "b".into()]))
+        );
+        // Printing on the screen says nothing about the history.
+        let (delta, _) = terminal.advance(b"!");
+        assert_eq!(delta.unwrap().scrollback, None);
+        let (delta, _) = terminal.advance(b"\r\ne\r\nf");
+        assert_eq!(
+            history_change(&delta.unwrap()),
+            Some((Some(1), vec!["c".into(), "d!".into()]))
+        );
+        assert_eq!(history_texts(&terminal), ["b", "c", "d!"]);
+        // More rows than the history holds: no row the client holds survives.
+        let (delta, _) = terminal.advance(b"\r\n1\r\n2\r\n3\r\n4\r\n5");
+        assert_eq!(
+            history_change(&delta.unwrap()),
+            Some((None, vec!["1".into(), "2".into(), "3".into()]))
+        );
+    }
+
+    #[test]
+    fn held_frames_accumulate_history_from_what_the_client_holds() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_resource_limits(4, MAX_GRAPHICS_BYTES);
+        terminal.advance(b"a\r\nb\r\n");
+        assert_eq!(history_texts(&terminal), ["a"]);
+        assert!(terminal.advance(b"\x1b[?2026hc\r\nd\r\n").0.is_none());
+        assert!(terminal.advance(b"e\r\nf\r\n").0.is_none());
+        let delta = terminal.advance(b"\x1b[?2026l").0.unwrap();
+        assert_eq!(
+            history_change(&delta),
+            Some((
+                Some(1),
+                vec!["b".into(), "c".into(), "d".into(), "e".into()]
+            ))
+        );
+
+        // A snapshot taken while a frame is held is what the client holds from then on.
+        assert!(terminal.advance(b"\x1b[?2026hg\r\n").0.is_none());
+        let snapshot = terminal.snapshot();
+        assert_eq!(
+            snapshot
+                .scrollback
+                .iter()
+                .map(history_text)
+                .collect::<Vec<_>>(),
+            ["c", "d", "e", "f"]
+        );
+        assert!(terminal.advance(b"h\r\n").0.is_none());
+        let delta = terminal.finish_synchronized_output().unwrap();
+        assert_eq!(delta.sequence, snapshot.sequence + 1);
+        assert_eq!(history_change(&delta), Some((Some(1), vec!["g".into()])));
+    }
+
+    #[test]
+    fn clears_and_resets_replace_history_and_keep_limits_and_sequence() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_resource_limits(5, 8);
+        terminal.advance(b"one\r\ntwo\r\nthree");
+        assert_eq!(history_texts(&terminal), ["one"]);
+        let delta = terminal.advance(b"\x1b[3J").0.unwrap();
+        assert_eq!(history_change(&delta), Some((None, Vec::new())));
+        // Clearing an empty history changes nothing about it.
+        let delta = terminal.advance(b"x\x1b[3J").0.unwrap();
+        assert_eq!(delta.scrollback, None);
+
+        terminal.advance(b"\r\nfour\r\nfive");
+        assert!(!terminal.history.rows.is_empty());
+        let sequence = terminal.snapshot().sequence;
+        let delta = terminal.advance(b"\x1bc").0.unwrap();
+        assert_eq!(delta.sequence, sequence + 1);
+        assert_eq!(history_change(&delta), Some((None, Vec::new())));
+        assert_eq!(terminal.graphics_byte_limit, 8);
+        terminal.advance(b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+        assert_eq!(history_texts(&terminal), ["2", "3", "4", "5", "6"]);
+
+        let sequence = terminal.snapshot().sequence;
+        terminal.clear_scrollback();
+        assert!(terminal.history.rows.is_empty());
+        assert_eq!(terminal.snapshot().sequence, sequence + 1);
+        // The clear command's snapshot carries the empty history; the next frame appends.
+        let delta = terminal.advance(b"\r\n9").0.unwrap();
+        assert_eq!(history_change(&delta), Some((Some(0), vec!["7".into()])));
+    }
+
+    #[test]
+    fn resizes_resend_history_only_when_it_rewraps_or_shrinks() {
+        let mut terminal = TerminalState::new(10, 3);
+        terminal.advance(b"short\r\nabcdefghijklmno\r\nx\r\ny\r\nz");
+        assert_eq!(history_texts(&terminal), ["short", "abcdefghij", "klmno"]);
+
+        // Fewer rows: the top screen row scrolls into the history.
+        let delta = terminal.resize(10, 2).unwrap();
+        assert_eq!(history_change(&delta), Some((Some(0), vec!["x".into()])));
+        // More rows: the screen takes the newest history rows back.
+        let delta = terminal.resize(10, 4).unwrap();
+        assert_eq!(
+            history_change(&delta),
+            Some((None, vec!["short".into(), "abcdefghij".into()]))
+        );
+        assert_eq!(visible_text(&terminal.snapshot(), 0), "klmno");
+        // Narrower: the wrapped line rewraps.
+        let delta = terminal.resize(5, 4).unwrap();
+        assert_eq!(
+            history_change(&delta),
+            Some((None, vec!["short".into(), "abcde".into(), "fghij".into()]))
+        );
+
+        // History whose lines all fit both widths is left alone.
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.advance(b"aa\r\nbb\r\ncc");
+        for cols in [12, 4, 10] {
+            let delta = terminal.resize(cols, 2).unwrap();
+            assert_eq!(delta.scrollback, None, "{cols} columns");
+        }
+        assert_eq!(history_texts(&terminal), ["aa"]);
     }
 
     #[test]
@@ -2997,7 +3404,11 @@ mod tests {
         terminal.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let before = terminal.snapshot();
         assert_eq!(
-            before.scrollback.iter().map(row_text).collect::<Vec<_>>(),
+            before
+                .scrollback
+                .iter()
+                .map(history_text)
+                .collect::<Vec<_>>(),
             ["two", "three"]
         );
         terminal.clear_scrollback();
@@ -3007,15 +3418,7 @@ mod tests {
         assert_eq!(cleared.cursor, before.cursor);
         assert!(cleared.sequence > before.sequence);
         terminal.advance(b"\r\nsix");
-        assert_eq!(
-            terminal
-                .snapshot()
-                .scrollback
-                .iter()
-                .map(row_text)
-                .collect::<Vec<_>>(),
-            ["four"]
-        );
+        assert_eq!(history_texts(&terminal), ["four"]);
     }
 
     #[test]

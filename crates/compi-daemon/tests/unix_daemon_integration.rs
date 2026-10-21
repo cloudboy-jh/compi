@@ -373,7 +373,9 @@ impl Controller {
 
 fn snapshot_text(snapshot: &ScreenSnapshot) -> String {
     let mut text = String::new();
-    for row in snapshot.scrollback.iter().chain(&snapshot.cells) {
+    let cols = usize::from(snapshot.cols);
+    let history = snapshot.scrollback.iter().map(|row| row.to_row(cols));
+    for row in history.chain(snapshot.cells.iter().cloned()) {
         for cell in row.cells.iter().filter(|cell| cell.width != 0) {
             text.push_str(&cell.text);
         }

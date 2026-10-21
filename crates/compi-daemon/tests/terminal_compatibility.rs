@@ -1,7 +1,7 @@
 use compi_client::{MirrorApply, ScreenMirror};
 use compi_daemon::screen;
-use compi_daemon::terminal::TerminalState;
-use compi_protocol::ScreenMessage;
+use compi_daemon::terminal::{Delta, TerminalState};
+use compi_protocol::{ScreenMessage, ScrollbackChange};
 
 #[test]
 fn sequence_gap_preserves_known_state_until_snapshot_recovery() {
@@ -149,4 +149,118 @@ fn clearing_history_removes_only_history_image_anchors() {
     let after = terminal.snapshot();
     assert_eq!(after.images, before.images);
     assert_eq!(after.placements, vec![before.placements[1]]);
+}
+
+/// A small deterministic generator, so a failing run replays exactly.
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, bound: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % bound
+    }
+}
+
+fn apply(replica: &mut ScreenMirror, delta: Option<Delta>) {
+    if let Some(delta) = delta {
+        assert_eq!(
+            replica.apply(ScreenMessage::Delta {
+                delta: screen::delta(delta)
+            }),
+            MirrorApply::Applied
+        );
+    }
+}
+
+fn lines(random: &mut Lcg) -> Vec<u8> {
+    let mut output = Vec::new();
+    for _ in 0..random.below(12) {
+        match random.below(4) {
+            0 => output.extend_from_slice(b"\x1b[1;31merror\x1b[0m: "),
+            1 => output.extend_from_slice("漢字かな ".as_bytes()),
+            2 => output.extend_from_slice(b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07 "),
+            _ => {}
+        }
+        let length = random.below(30) as usize;
+        output.extend((0..length).map(|index| b'a' + (index % 26) as u8));
+        output.extend_from_slice(b"\r\n");
+    }
+    output
+}
+
+#[test]
+fn replica_history_follows_appends_evictions_held_frames_resizes_and_clears() {
+    let mut terminal = TerminalState::new(20, 5);
+    terminal.set_resource_limits(40, 1024);
+    let mut replica = ScreenMirror::default();
+    replica.apply(ScreenMessage::Snapshot {
+        snapshot: screen::snapshot(terminal.snapshot()),
+    });
+    let mut random = Lcg(7);
+    let (mut appends, mut replaces) = (0, 0);
+    for step in 0..3_000 {
+        match random.below(20) {
+            0 => {
+                let cols = 4 + random.below(30) as u16;
+                let rows = 2 + random.below(8) as u16;
+                let delta = terminal.resize(cols, rows);
+                apply(&mut replica, delta);
+            }
+            1 => {
+                let rows = terminal.snapshot().rows;
+                let cols = terminal.snapshot().cols;
+                let delta = terminal.resize(cols, rows % 9 + 2);
+                apply(&mut replica, delta);
+            }
+            2 => apply(&mut replica, terminal.advance(b"\x1b[3J").0),
+            3 if step % 7 == 0 => {
+                terminal.clear_scrollback();
+                replica.apply(ScreenMessage::Snapshot {
+                    snapshot: screen::snapshot(terminal.snapshot()),
+                });
+            }
+            4 if step % 5 == 0 => apply(&mut replica, terminal.advance(b"\x1bc").0),
+            5..=7 => {
+                // Synchronized output held over several reads, sometimes with a
+                // snapshot (an attach or gap recovery) taken in the middle.
+                let mut output = b"\x1b[?2026h".to_vec();
+                output.extend(lines(&mut random));
+                assert!(terminal.advance(&output).0.is_none());
+                for _ in 0..random.below(4) {
+                    if random.below(3) == 0 {
+                        replica.apply(ScreenMessage::Snapshot {
+                            snapshot: screen::snapshot(terminal.snapshot()),
+                        });
+                    }
+                    assert!(terminal.advance(&lines(&mut random)).0.is_none());
+                }
+                let delta = if random.below(2) == 0 {
+                    terminal.advance(b"\x1b[?2026l").0
+                } else {
+                    terminal.finish_synchronized_output()
+                };
+                apply(&mut replica, delta);
+            }
+            _ => {
+                let (delta, _) = terminal.advance(&lines(&mut random));
+                match delta.as_ref().and_then(|delta| delta.scrollback.as_ref()) {
+                    Some(ScrollbackChange::Append { .. }) => appends += 1,
+                    Some(ScrollbackChange::Replace { .. }) => replaces += 1,
+                    None => {}
+                }
+                apply(&mut replica, delta);
+            }
+        }
+        assert_eq!(
+            replica.snapshot(),
+            Some(&screen::snapshot(terminal.snapshot())),
+            "step {step}"
+        );
+    }
+    // Plain output appends; it replaces only when one read scrolls past the whole history.
+    assert!(appends > 1_000, "{appends} appends");
+    assert!(replaces < appends / 10, "{replaces} replaces");
 }

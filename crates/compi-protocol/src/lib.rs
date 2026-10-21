@@ -16,9 +16,10 @@ pub mod system_metrics;
 pub mod wsl;
 
 pub use screen::{
-    Cell, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode, Row, RowUpdate,
-    ScreenDelta, ScreenMessage, ScreenSnapshot, ShellAction, TerminalFrame, TerminalModes,
-    TextAttributes, decode_screen, decode_terminal_frame, encode_screen, encode_terminal_frame,
+    Cell, Color, CursorShape, CursorState, HistoryRow, KittyImage, KittyPlacement, MouseMode, Row,
+    RowUpdate, ScreenDelta, ScreenMessage, ScreenSnapshot, ScrollbackChange, ShellAction, StyleRun,
+    TerminalFrame, TerminalModes, TextAttributes, decode_screen, decode_terminal_frame,
+    encode_screen, encode_terminal_frame,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -50,7 +51,10 @@ use std::fmt;
 // of its shell while the shell keeps running underneath at its size. It also adds Monitor's
 // GPU totals, available memory, the GPU page and the newest sample's per-core, volume and
 // interface breakdowns.
-pub const PROTOCOL_VERSION: u32 = 29;
+// Version 30 keeps history rows compactly (`HistoryRow`) and sends history changes
+// incrementally (`ScrollbackChange`): rows scrolled in and how many left the front, the
+// whole history only on attach, a real clear, a reset or a reflowing resize.
+pub const PROTOCOL_VERSION: u32 = 30;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every

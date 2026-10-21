@@ -2201,10 +2201,30 @@ impl CompiApp {
                             view.new_lines = 0;
                             view.pending_scroll = None;
                             view.selecting = false;
-                        } else if view.pending_scroll.is_none()
-                            && let Some(history) = &delta.scrollback
+                        } else if let Some(ScrollbackChange::Append { evicted, rows }) =
+                            &delta.scrollback
                         {
-                            if !history.starts_with(&old.scrollback) {
+                            let (offset, selection) = crate::viewport::follow_append(
+                                old.scrollback.len(),
+                                *evicted as usize,
+                                rows.len(),
+                                view.scroll_offset,
+                                view.selection,
+                            );
+                            if selection.is_none() {
+                                view.selecting = false;
+                            }
+                            view.selection = selection;
+                            // A pending reprint is found by its text once applied.
+                            if view.pending_scroll.is_none() && view.scroll_offset > 0 {
+                                view.new_lines = view.new_lines.saturating_add(rows.len());
+                                view.scroll_offset = offset;
+                            }
+                        } else if view.pending_scroll.is_none()
+                            && let Some(ScrollbackChange::Replace { rows }) = &delta.scrollback
+                        {
+                            let history = rows.as_slice();
+                            if !crate::viewport::extends(&old.scrollback, history) {
                                 // Absolute selection coordinates are uncertain after a rewrite.
                                 view.selection = None;
                                 view.selecting = false;
@@ -2223,12 +2243,11 @@ impl CompiApp {
                                 }
                                 None => {
                                     if history.len() < old.scrollback.len() {
-                                        view.pending_scroll =
-                                            Some(crate::viewport::PendingScroll::new(
-                                                old,
-                                                view.scroll_offset,
-                                                Instant::now(),
-                                            ));
+                                        view.pending_scroll = crate::viewport::PendingScroll::new(
+                                            &view.mirror,
+                                            view.scroll_offset,
+                                            Instant::now(),
+                                        );
                                     }
                                     view.scroll_offset = 0;
                                     if view.pending_scroll.is_none() {
@@ -7653,11 +7672,16 @@ impl SurfaceView {
         }
         if saved.selection.is_some_and(|points| {
             points.iter().any(|[row, col]| {
-                let row = snapshot.scrollback.get(*row).or_else(|| {
-                    row.checked_sub(snapshot.scrollback.len())
-                        .and_then(|row| snapshot.cells.get(row))
-                });
-                *col >= usize::from(snapshot.cols) || row.is_none_or(|row| *col >= row.cells.len())
+                // History rows are as wide as the screen.
+                *col >= usize::from(snapshot.cols)
+                    || row
+                        .checked_sub(snapshot.scrollback.len())
+                        .is_some_and(|row| {
+                            snapshot
+                                .cells
+                                .get(row)
+                                .is_none_or(|row| *col >= row.cells.len())
+                        })
             })
         }) {
             return;

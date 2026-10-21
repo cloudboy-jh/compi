@@ -32,7 +32,7 @@ On Windows/WSL2, the tree can browse a shell directory linked into a mounted Win
 - Scroll over a terminal pane without changing keyboard focus. While output continues, Compi keeps the text you are reading in place while it remains in retained history, including when older rows are evicted or a program redraws its history.
 - **↓ N new lines** appears when output arrives while you are scrolled up. Click it, or type into the terminal, to return to live output.
 - Wheel and trackpad fractions accumulate per pane instead of rounding every event up. Applications with mouse reporting receive whole wheel reports; alternate-screen pagers such as `less` receive Up/Down keys otherwise. Programs can disable that fallback with DECSET 1007 (`ESC[?1007l`) and re-enable it with `ESC[?1007h`; it starts enabled.
-- Hold Shift to use local scrolling instead of sending wheel input to an application. The existing 1 MiB scrollback memory cap still applies; retaining the full configured line count is separate work.
+- Hold Shift to use local scrolling instead of sending wheel input to an application. Each pane keeps the configured history, 10,000 lines by default (`[limits] scrollback_lines`), within about 512 bytes per line on average; only unusually styled or wide output fills that sooner.
 
 ## Shell lifecycle and recovery
 

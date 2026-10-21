@@ -1009,7 +1009,10 @@ impl Surface {
     }
 
     fn recover_screen(&self, final_screen: bool) {
-        let Ok(state) = self.state.lock() else { return };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let state = &mut *state;
         let Some((sink, _)) = state.client.as_ref().filter(|_| state.client_ready) else {
             return;
         };
@@ -1370,10 +1373,11 @@ impl Surface {
         request_id: u64,
     ) -> std::result::Result<(), SurfaceError> {
         self.validate_target(target)?;
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| SurfaceError::Internal("surface state lock was poisoned".into()))?;
+        let state = &mut *state;
         let Some((sink, _attachment_id)) = state.client.as_ref().filter(|(sink, attachment_id)| {
             attachment_id == &target.attachment_id && sink.is_alive()
         }) else {

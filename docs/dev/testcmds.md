@@ -201,7 +201,7 @@ Run these commands in WSL Bash inside an attached 100x30 Compi terminal; they us
 |---|---|---|
 | Count and resize | `for i in $(seq 1 100); do echo "$i"; sleep 0.1; done` while resizing | Every integer appears once, in order; no gaps, overlap, or stale cells. |
 | Sustained output | `timeout 10s yes '0123456789 abcdefghijklmnopqrstuvwxyz'` | Client stays responsive; prompt returns; scrollback remains coherent and bounded. |
-| Large corpus | `seq 1 100000 > /tmp/compi-100k.txt; time cat /tmp/compi-100k.txt` | Final line is `100000`; no parser hang or unbounded memory/handle growth. Earlier lines may be evicted by the 1 MiB scrollback cap. |
+| Large corpus | `seq 1 100000 > /tmp/compi-100k.txt; time cat /tmp/compi-100k.txt` | Final line is `100000`; no parser hang or unbounded memory/handle growth. Scrolling up reaches `90001` (the default 10,000 history lines, plus the screen); `compi pane capture --scope scrollback` shows the same. |
 | Rapid cancel | `yes 'COMPI-CANCEL'` then `Ctrl+C` after three seconds | Output stops promptly; one clean prompt appears; no partial escape sequence. |
 | Wide wrap | `printf '=%.0s' {1..500}; echo` | Text wraps at terminal width without missing or duplicated cells. |
 | Combining marks | `printf 'e\u0301 a\u0308 n\u0303\n'` | Decomposed graphemes remain attached to their base character. |

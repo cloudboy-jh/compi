@@ -23,15 +23,14 @@ use lifecycle::PaneError;
 mod workspace;
 use crate::typography::TerminalTypography;
 use crate::viewport::{
-    file_link_at, inherited_working_directory, visible_row, visible_rows, visible_to_absolute,
-    web_link_at,
+    file_link_at, inherited_working_directory, visible_row, visible_to_absolute, web_link_at,
 };
 use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use base64::Engine as _;
 use compi_protocol::perf;
 use compi_protocol::{
     Cell, ClientMessage, Color, CursorShape, CursorState, KittyImage, KittyPlacement, MouseMode,
-    Row, ScreenMessage, ScreenSnapshot, ServerMessage, SurfaceId, SurfaceStatus,
+    Row, ScreenMessage, ScreenSnapshot, ScrollbackChange, ServerMessage, SurfaceId, SurfaceStatus,
 };
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, Corners, ElementInputHandler,
@@ -1914,7 +1913,9 @@ impl Render for CompiApp {
 
 #[derive(Clone)]
 struct PaintModel {
-    visible_rows: Vec<Row>,
+    /// Shared with the mirror's cache of the expanded window: frames between screen
+    /// updates neither expand nor copy rows.
+    visible_rows: Arc<[Row]>,
     base_row: usize,
     scrollback_len: usize,
     cursor: CursorState,
@@ -1940,8 +1941,7 @@ impl PaintModel {
         let (visible_rows, base_row) = if let Some(pending) = &tab.pending_scroll {
             (pending.rows.clone(), pending.base)
         } else {
-            let (rows, base) = visible_rows(snapshot, tab.scroll_offset);
-            (rows.cloned().collect(), base)
+            tab.mirror.visible_rows(tab.scroll_offset)?
         };
         Some(Self {
             visible_rows,
@@ -3064,8 +3064,8 @@ fn snapshot_contains_marker(snapshot: Option<&ScreenSnapshot>, marker: &str) -> 
         snapshot
             .scrollback
             .iter()
-            .chain(&snapshot.cells)
-            .any(|row| {
+            .any(|row| row.text.contains(marker))
+            || snapshot.cells.iter().any(|row| {
                 row.cells
                     .iter()
                     .map(|cell| cell.text.as_str())
