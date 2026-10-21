@@ -53,6 +53,12 @@ pub enum Action {
     ShowChanges {
         pane_id: PaneId,
     },
+    /// Focus `pane_id`, then run the palette command with registry id `command` in its
+    /// window, as the palette would: a command that asks first opens its dialog there.
+    RunCommand {
+        pane_id: PaneId,
+        command: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +104,11 @@ impl Request {
             && !compi_protocol::is_repo_path(path)
         {
             return Err("diff paths are relative to the repository top level".into());
+        }
+        if let Action::RunCommand { command, .. } = &self.action
+            && crate::commands::by_id(command).is_none()
+        {
+            return Err(format!("unknown palette command {command:?}").into());
         }
         Ok(())
     }
@@ -165,6 +176,10 @@ pub struct Applied {
 pub struct Response {
     pub windows: Vec<WindowInfo>,
     pub applied: Option<Applied>,
+    /// Why the window did not run a `RunCommand`'s command: the palette's reason it is
+    /// disabled there. Nothing was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 }
 
 /// Never starts a GUI, creates a shell, or assumes a window when several match.

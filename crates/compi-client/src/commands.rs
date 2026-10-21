@@ -316,8 +316,6 @@ impl Command {
         }
     }
 
-    // Only the desktop GUI (Windows/macOS) renders command descriptions.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub(crate) const fn description(self) -> Option<&'static str> {
         use Command::*;
         match self {

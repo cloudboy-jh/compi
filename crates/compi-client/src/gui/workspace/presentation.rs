@@ -14,6 +14,8 @@ struct ResizeStep {
 struct PresentationChange {
     destination: Option<String>,
     resize: VecDeque<ResizeStep>,
+    /// Why a `RunCommand`'s command did not run: the palette's reason it is disabled.
+    disabled: Option<&'static str>,
 }
 
 type PendingResize = (gpui::WindowHandle<CompiApp>, Applied, VecDeque<ResizeStep>);
@@ -69,6 +71,7 @@ pub(in crate::gui) fn dispatch(
             let _ = completion.sender.send(Ok(Response {
                 windows,
                 applied: None,
+                disabled_reason: None,
             }));
             return Ok(None);
         }
@@ -124,7 +127,8 @@ pub(in crate::gui) fn dispatch(
             let windows = inventory(&request.target, cx);
             let _ = completion.sender.send(Ok(Response {
                 windows,
-                applied: Some(applied),
+                applied: change.disabled.is_none().then_some(applied),
+                disabled_reason: change.disabled.map(str::to_owned),
             }));
             Ok(None)
         }
@@ -174,7 +178,7 @@ pub(in crate::gui) fn dispatch(
                     match checked {
                         Ok(Ok(true)) => {
                             let response = cx.update(|cx| Response {
-                                windows: inventory(&request.target, cx), applied: Some(applied),
+                                windows: inventory(&request.target, cx), applied: Some(applied), disabled_reason: None,
                             });
                             let _ = completion.sender.send(Ok(response));
                             return;
@@ -209,6 +213,7 @@ pub(in crate::gui) fn dispatch(
                             let response = cx.update(|cx| Response {
                                 windows: inventory(&request.target, cx),
                                 applied: Some(applied),
+                                disabled_reason: None,
                             });
                             let _ = completion.sender.send(Ok(response));
                             return;
@@ -380,6 +385,7 @@ impl CompiApp {
             }
             Action::FocusTab { tab_id } | Action::DetachTab { tab_id } => tab_id.clone(),
             Action::FocusPane { pane_id }
+            | Action::RunCommand { pane_id, .. }
             | Action::ResizePane { pane_id, .. }
             | Action::ZoomPane { pane_id }
             | Action::UnzoomPane { pane_id }
@@ -448,6 +454,35 @@ impl CompiApp {
                 return Ok(PresentationChange {
                     destination: Some(id),
                     resize,
+                    disabled: None,
+                });
+            }
+            Action::RunCommand { pane_id, command } => {
+                let command = commands::by_id(command)
+                    .ok_or("Unknown palette command; see compi command list")?
+                    .command;
+                if !self.state.is_floating(pane_id) {
+                    self.select_terminal(tab_id, false);
+                }
+                self.focus_pane(pane_id.clone());
+                if self.focused_pane() != Some(pane_id) {
+                    return Err("Pane could not receive GUI focus".into());
+                }
+                self.rebuild_layout(window, true);
+                self.save_state();
+                // Focus the window first, so a dialog the command opens has the keys.
+                window.focus(&self.focus_handle, cx);
+                cx.activate(true);
+                self.report_focus(window.is_window_active());
+                let disabled = command.disabled_reason(&self.command_context(cx));
+                if disabled.is_none() {
+                    self.execute(command, window, cx);
+                }
+                cx.notify();
+                return Ok(PresentationChange {
+                    destination: None,
+                    resize,
+                    disabled,
                 });
             }
             Action::FocusPane { pane_id } => {
@@ -549,6 +584,7 @@ impl CompiApp {
         Ok(PresentationChange {
             destination: None,
             resize,
+            disabled: None,
         })
     }
 

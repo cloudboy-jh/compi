@@ -5,6 +5,8 @@ mod changes;
 mod content;
 mod diff;
 mod help;
+mod metrics;
+mod palette;
 mod targets;
 #[cfg(any(windows, target_os = "macos"))]
 mod update;
@@ -40,6 +42,7 @@ const COMMANDS: &[&str] = &[
     "theme",
     "update",
     "changes",
+    "command",
     "help",
 ];
 static NEXT_MUTATION: AtomicU64 = AtomicU64::new(1);
@@ -231,6 +234,8 @@ fn wants_json(raw: &[String]) -> bool {
                 | "--key"
                 | "--scope"
                 | "--format"
+                | "--history"
+                | "--search"
                 | "--with"
         ) {
             args.next();
@@ -341,13 +346,29 @@ fn unknown_command(word: &str) -> CliError {
 
 /// The command closest to `word`, if close enough to be a typo of it.
 fn suggestion(word: &str) -> Option<&'static str> {
+    closest(word, COMMANDS.iter().copied())
+}
+
+/// The candidate closest to `word`, if close enough to be a typo of it.
+fn closest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let limit = word.chars().count().max(3) / 3;
-    COMMANDS
-        .iter()
-        .map(|command| (edit_distance(word, command), *command))
+    candidates
+        .into_iter()
+        .map(|candidate| (edit_distance(word, candidate), candidate))
         .filter(|(distance, _)| *distance <= limit)
         .min_by_key(|(distance, _)| *distance)
-        .map(|(_, command)| command)
+        .map(|(_, candidate)| candidate)
+}
+
+/// A `command run` id the palette does not have.
+fn unknown_palette_command(id: &str) -> CliError {
+    let hint = match closest(id, crate::commands::REGISTRY.iter().map(|spec| spec.id)) {
+        Some(command) => format!("did you mean '{command}'? See"),
+        None => "see".to_owned(),
+    };
+    CliError::usage(format!(
+        "unknown palette command '{id}'; {hint} compi command list for commands"
+    ))
 }
 
 /// Levenshtein distance that also counts an adjacent transposition as one edit.
@@ -436,7 +457,7 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
                 }
             }
             "--cwd" | "--name" | "--panes" | "--layout" | "--index" | "--cols" | "--rows"
-            | "--text" | "--key" | "--scope" | "--format" => {
+            | "--text" | "--key" | "--scope" | "--format" | "--history" | "--search" => {
                 let value = iterator
                     .next()
                     .ok_or_else(|| CliError::usage(format!("{arg} requires a value")))?
@@ -459,7 +480,7 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
                     options.with.push(iterator.next().unwrap().clone());
                 }
             }
-            "--right" | "--down" | "--check" => {
+            "--right" | "--down" | "--check" | "--group" => {
                 if !options.switches.insert(arg.clone()) {
                     return Err(CliError::usage(format!("duplicate {arg}")));
                 }
@@ -540,6 +561,9 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
             json!({"builtins":arrangement::Builtin::ALL.map(|preset| preset.id()),"named":config.layout_presets}),
         ));
     }
+    if command == "command" && action == Some("list") {
+        return Ok(palette::list(&config.keybindings));
+    }
     // Validate presets/counts before connecting, and certainly before mutation.
     if command == "split" && options.values.contains_key("--panes") {
         number(options, "--panes", 1, 256)?;
@@ -593,6 +617,14 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         return presentation(&target, options, crate::cli_window::Action::List);
     }
     let mut client = target.connect_existing().map_err(|error| CliError::new(5, "daemon_unavailable", format!("cannot connect to existing daemon: {error}; open Compi first or select the correct instance")))?;
+    if command == "monitor" && matches!(action, Some("totals" | "list")) {
+        // Data reads need no workspace and no window.
+        return if action == Some("totals") {
+            metrics::totals(&mut client, options)
+        } else {
+            metrics::list(&mut client, options)
+        };
+    }
     let mut state = client.workspace()?;
     if command == "tab" && action == Some("move") {
         targets::validate_context(
@@ -954,6 +986,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         "files" | "edit" => return content::run(&mut client, &state, &target, options),
         "diff" => return diff::run(&mut client, &state, &target, options),
         "settings" | "monitor" => return view::run(&mut client, &state, &target, options),
+        "command" => return palette::run(&state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
             let surface = pane_surface(&state, &surface_id)?.clone();
@@ -1580,7 +1613,11 @@ fn validate(
             &["--cwd", "--panes", "--layout"],
             &["--right", "--down"],
         ),
+        ("monitor", Some("totals")) => (2, 2, &["--history"], &[]),
+        ("monitor", Some("list")) => (2, 2, &["--search"], &["--group"]),
         ("files" | "edit" | "diff" | "settings" | "monitor", _) => (1, 2, &[], &[]),
+        ("command", Some("list")) => (2, 2, &[], &[]),
+        ("command", Some("run")) => (3, 3, &[], &[]),
         ("layout", Some(_)) => (2, 2, &[], &[]),
         ("run", _) => (2, usize::MAX, &[], &[]),
         ("attach" | "detach", _) => (1, 1, &[], &[]),
@@ -1655,6 +1692,18 @@ fn validate(
         return Err(CliError::usage(
             "send requires exactly one of --text or --key",
         ));
+    }
+    if command == "monitor"
+        && action == Some("totals")
+        && let Some(range) = options.values.get("--history")
+    {
+        metrics::span(range)?;
+    }
+    if command == "command"
+        && action == Some("run")
+        && crate::commands::by_id(&options.args[2]).is_none()
+    {
+        return Err(unknown_palette_command(&options.args[2]));
     }
     if command == "theme" && options.connect.is_some() {
         return Err(CliError::usage(
@@ -1944,6 +1993,117 @@ mod tests {
         ] {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }
+    }
+    fn validated(args: &[&str]) -> std::result::Result<Options, CliError> {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
+        parse(&args).and_then(|options| {
+            let command = options.args[0].clone();
+            validate(&options, &command, options.args.get(1).map(String::as_str))?;
+            Ok(options)
+        })
+    }
+    #[test]
+    fn command_list_and_run_take_only_their_arguments() {
+        for accepted in [
+            &["command", "list"][..],
+            &["--json", "command", "list"],
+            &["command", "list", "--json"],
+            &["command", "run", "open_settings"],
+            &["--json", "command", "run", "split_right"],
+            &["--pane", "pane-1", "command", "run", "remove_pane"],
+            &["--window", "primary", "command", "run", "open_monitor"],
+        ] {
+            assert!(validated(accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            &["command"][..],
+            &["command", "show"],
+            &["command", "list", "extra"],
+            &["command", "run"],
+            &["command", "run", "open_settings", "split_right"],
+            &["command", "run", "open_settings", "--group"],
+            &["command", "list", "--search", "tab"],
+        ] {
+            assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
+        }
+        let error = validated(&["command", "run", "open_setings"]).unwrap_err();
+        assert_eq!(error.exit, 2);
+        assert_eq!(error.code, "invalid_arguments");
+        assert_eq!(
+            error.message,
+            "unknown palette command 'open_setings'; did you mean 'open_settings'? See compi command list for commands"
+        );
+        assert_eq!(
+            unknown_palette_command("xyzzy").message,
+            "unknown palette command 'xyzzy'; see compi command list for commands"
+        );
+        assert_eq!(suggestion("comand"), Some("command"));
+    }
+    #[test]
+    fn monitor_data_forms_take_their_options_and_pages_take_none() {
+        for accepted in [
+            &["monitor", "totals"][..],
+            &["--json", "monitor", "totals", "--history", "5m"],
+            &["monitor", "totals", "--history", "1h"],
+            &["monitor", "list"],
+            &["monitor", "list", "--group"],
+            &["monitor", "list", "--search", "safari web", "--json"],
+            &["monitor", "list", "--group", "--search", "--json"],
+            &["monitor", "processes"],
+            &["monitor"],
+        ] {
+            assert!(validated(accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            &["monitor", "totals", "--history", "2h"][..],
+            &["monitor", "totals", "--history"],
+            &["monitor", "totals", "--group"],
+            &["monitor", "totals", "--search", "x"],
+            &["monitor", "totals", "extra"],
+            &["monitor", "list", "--history", "1m"],
+            &["monitor", "list", "--group", "--group"],
+            &["monitor", "list", "--search", "a", "--search", "b"],
+            &["monitor", "list", "extra"],
+            &["monitor", "processes", "--history", "1m"],
+            &["monitor", "cpu", "--group"],
+            &["monitor", "--search", "safari"],
+        ] {
+            assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
+        }
+        // A search for "--json" is the search, not the output mode.
+        let args = ["monitor", "list", "--search", "--json"].map(str::to_owned);
+        assert!(!wants_json(&args));
+        assert_eq!(parse(&args).unwrap().values["--search"], "--json");
+        let options = validated(&["monitor", "list", "--group", "--search", "a b"]).unwrap();
+        assert!(options.switches.contains("--group"));
+        assert_eq!(options.values["--search"], "a b");
+    }
+    #[test]
+    fn help_covers_the_new_forms() {
+        for (command, action, usage) in [
+            ("command", Some("list"), "Usage: compi command list"),
+            ("command", None, "Usage: compi command list"),
+            ("command", Some("run"), "Usage: compi command run ID"),
+            (
+                "monitor",
+                Some("totals"),
+                "Usage: compi monitor totals [--history 1m|5m|15m|1h]",
+            ),
+            (
+                "monitor",
+                Some("list"),
+                "Usage: compi monitor list [--group] [--search TEXT]",
+            ),
+            ("monitor", Some("processes"), "Usage: compi monitor [PAGE]"),
+        ] {
+            assert!(
+                help::text(command, action).starts_with(usage),
+                "{command} {action:?}"
+            );
+        }
+        let top = help::text("", None);
+        assert!(top.contains("monitor [PAGE]/totals/list; command list/run;"));
     }
     #[test]
     fn close_reports_unsaved_files_of_closing_files_from_every_window() {

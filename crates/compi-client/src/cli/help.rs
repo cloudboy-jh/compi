@@ -160,10 +160,30 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "Show Settings in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. SECTION is appearance, interface, terminal, keyboard, monitor, updates or advanced; without it the pane keeps the section it shows, else Appearance. From a Settings pane (--pane), that pane changes section.",
             "compi settings terminal",
         ),
+        ("monitor", Some("totals")) => (
+            "monitor totals [--history 1m|5m|15m|1h]",
+            "Print the host's totals from the daemon, with no window: CPU, memory used and available, swap, GPU, disk read/write and network down/up of the newest sample. --history adds every sample of that span ending at the newest (one every 2 seconds, up to an hour). --json returns {host, samples} with the protocol's host info and samples, oldest first; only the newest carries the per-core, volume and interface detail. Exits 1 with no_sample when the daemon has sampled nothing within 5 seconds.",
+            "compi --json monitor totals --history 5m",
+        ),
+        ("monitor", Some("list")) => (
+            "monitor list [--group] [--search TEXT]",
+            "Print the host's processes from the daemon, with no window, busiest first as Monitor's Processes table sorts them: PID, name, CPU (share of the whole machine), memory and user. Waits for the first sample with CPU values (about half a second). --search keeps processes whose name, command line, executable, user or PID contains every word, ignoring case. --group shows one row per app with its process count and sums; a search naming the app keeps all its processes. --json returns {sampled_at_ms, logical_cpus, apps_known, processes} (each process with its details and cpu_share) and, with --group, groups (id, name, pids and sums). Exits 1 with no_sample when no sample arrives within 5 seconds.",
+            "compi monitor list --group --search safari",
+        ),
         ("monitor", _) => (
-            "monitor [PAGE]",
-            "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, gpu, disk or network; without it the pane keeps the page it shows, else Overview. From a Monitor pane (--pane), that pane changes page.",
+            "monitor [PAGE]\n       compi monitor totals [--history RANGE]\n       compi monitor list [--group] [--search TEXT]",
+            "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, gpu, disk or network; without it the pane keeps the page it shows, else Overview. From a Monitor pane (--pane), that pane changes page. monitor totals and monitor list print Monitor's data for scripts with no window; see compi monitor totals --help and compi monitor list --help.",
             "compi monitor processes",
+        ),
+        ("command", Some("run")) => (
+            "command run ID",
+            "Run the palette command ID (see command list) in the Compi window that shows the selected pane's tab (--window selects another), with that pane focused first, as if chosen from the palette there. A command that asks first, such as Close pane, opens its dialog in the window; there is no bypass. A command disabled there exits 1 with command_disabled and the palette's reason; an unknown ID exits 2. --json returns {command, name, pane_id, window_id}.",
+            "compi command run open_settings",
+        ),
+        ("command", _) => (
+            "command list\n       compi command run ID",
+            "List every palette command: its ID, name and this platform's shortcut with configured keybindings applied, with no window needed. --json returns {platform, commands} with each command's id, name, category, shortcut (null when unbound), default_shortcut and description (null when it has none). Run one with command run ID.",
+            "compi --json command list",
         ),
         ("layout", _) => (
             "layout list | PRESET | mirror | flip | restore",
@@ -207,7 +227,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         _ => (
             "[GLOBAL OPTIONS] COMMAND [ARGS]",
-            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; settings; monitor; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
+            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; diff; settings; monitor [PAGE]/totals/list; command list/run; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
             "compi --instance dev --json workspace list",
         ),
     };
