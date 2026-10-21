@@ -27,12 +27,12 @@ jobs:
     # Windows runs serialized WSL regressions and a separate release daemon build.
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       - name: Check workspace formatting
@@ -87,7 +87,7 @@ jobs:
         run: cargo build --locked --release -p compi-daemon --bin compi-daemon
       - name: Preserve failed terminal runtime traces
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: terminal-traces-${{ matrix.os }}
           path: ${{ runner.temp }}/compi-terminal-traces
@@ -97,7 +97,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the native Mac client and sibling daemon

@@ -29,9 +29,15 @@ $existingRegistrations = @(foreach ($hive in @('HKCU:', 'HKLM:')) {
         }
     }
 })
-if ((Test-Path -LiteralPath $root) -or (Test-Path -LiteralPath $data) -or
-    (Test-Path -LiteralPath $registration) -or $existingRegistrations.Count -or $existingTasks.Count -or $existingProcesses.Count) {
-    throw 'Refusing an account with existing Compi files, data, registration, daemon, GUI, or task'
+$existing = @(
+    if (Test-Path -LiteralPath $root) { "install root $root" }
+    if (Test-Path -LiteralPath $data) { "data $data [$((@(Get-ChildItem -LiteralPath $data -Force | Select-Object -First 10 -ExpandProperty Name)) -join ', ')]" }
+    $existingRegistrations | ForEach-Object { "registration $_" }
+    $existingTasks | ForEach-Object { "task $($_.TaskPath)$($_.TaskName)" }
+    $existingProcesses | ForEach-Object { "process $($_.Name) pid $($_.ProcessId) $($_.ExecutablePath)" }
+)
+if ($existing.Count) {
+    throw "Refusing an account with existing Compi state:`n  $($existing -join "`n  ")"
 }
 foreach ($name in @('COMPI_DATA_DIR', 'COMPI_RUNTIME_DIR', 'COMPI_CONFIG_FILE', 'COMPI_INSTANCE', 'COMPI_SUPERVISOR_PID')) {
     if ([Environment]::GetEnvironmentVariable($name)) { throw "Refusing inherited ${name}: fixture must use the actual disposable runner account" }

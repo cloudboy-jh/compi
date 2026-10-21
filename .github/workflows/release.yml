@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.release_tag || github.ref }}
       - name: Check release notes match the tag
@@ -40,10 +40,10 @@ jobs:
           workspaces: |
             . -> target/installer/product
             installer/bootstrapper -> ../../target/installer/bootstrapper-target
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.x'
       - name: Provision default WSL2 distribution
@@ -64,8 +64,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Formatting failed' }
           cargo clippy --locked --workspace --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
-          cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -p compi-update -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+          # Daemon tests write instance metadata under %LOCALAPPDATA%\Compi. Keep the
+          # runner account fresh for the installed-update qualification below.
+          $accountLocalAppData = $env:LOCALAPPDATA
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'compi-test-localappdata'
+          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
+          try {
+            cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -p compi-update -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+          } finally { $env:LOCALAPPDATA = $accountLocalAppData }
           python tools/check-dependencies.py --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Dependency boundaries failed' }
       - name: Import Windows signing certificate
@@ -109,7 +116,7 @@ jobs:
         run: .\tools\smoke-windows-installed-update.ps1 -DistributionDirectory target/distribution
       - name: Preserve installed-update qualification evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-installed-update-qualification
           path: |
@@ -127,12 +134,12 @@ jobs:
           }
       - name: Preserve Windows packaging diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-packaging-diagnostics
           path: target/distribution-smoke/
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: distribution-Windows-x64
           path: target/distribution/*
@@ -142,11 +149,11 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.x'
       - uses: Swatinem/rust-cache@v2
@@ -212,12 +219,12 @@ jobs:
           rm -f "$RUNNER_TEMP/compi-signing.p12"
       - name: Preserve macOS packaging diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: macos-packaging-diagnostics
           path: target/distribution-smoke/
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: distribution-macOS-arm64
           path: target/distribution/*
@@ -230,11 +237,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: distribution-*
           merge-multiple: true
@@ -260,7 +267,7 @@ jobs:
           test -f compi-setup-windows-x86_64.json || { echo 'Missing signed Setup metadata'; exit 1; }
           sha256sum compi-update-*.json compi-setup-*.json >> SHA256SUMS.txt
       - name: Create draft GitHub release for deliberate human publication
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: true
