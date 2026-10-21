@@ -285,7 +285,7 @@ fn merged(
             // The file's one tab takes the mode asked for, keeping its place and path.
             let tab = match open_tab(&content, file, windows) {
                 Some(index) => {
-                    let shown = content.tabs[index].with_diff(tab.diff_scope());
+                    let shown = content.tabs[index].with_diff(tab.diff_scope().cloned());
                     content.tabs[index] = shown.clone();
                     shown
                 }

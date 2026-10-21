@@ -41,17 +41,20 @@ pub enum Action {
         line: u32,
     },
     /// Focus the content pane `pane_id` and show its diff tab of repository path `path`
-    /// (`/`-separated, relative to the top level of the pane's repository) in `scope`,
-    /// with the 1-based new-side `line` scrolled into view.
+    /// (`/`-separated, relative to the top level of the pane's repository) in `scope` (a
+    /// commit by its full id), with the 1-based new-side `line` scrolled into view.
     RevealDiff {
         pane_id: PaneId,
         path: String,
         scope: GitScope,
         line: Option<u32>,
     },
-    /// Focus the content pane `pane_id` and switch its sidebar to the Changes list.
+    /// Focus the content pane `pane_id` and switch its sidebar to the Changes list, with
+    /// the changes of the commit with full id `commit` above the working tree's.
     ShowChanges {
         pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
     },
     /// Focus `pane_id`, then run the palette command with registry id `command` in its
     /// window, as the palette would: a command that asks first opens its dialog there.
@@ -104,6 +107,18 @@ impl Request {
             && !compi_protocol::is_repo_path(path)
         {
             return Err("diff paths are relative to the repository top level".into());
+        }
+        if let Action::RevealDiff {
+            scope: GitScope::Commit(commit),
+            ..
+        }
+        | Action::ShowChanges {
+            commit: Some(commit),
+            ..
+        } = &self.action
+            && !compi_protocol::is_commit_id(commit)
+        {
+            return Err("commits are named by their full id".into());
         }
         if let Action::RunCommand { command, .. } = &self.action
             && crate::commands::by_id(command).is_none()
@@ -222,5 +237,47 @@ fn send(
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(action: Action) -> Request {
+        Request {
+            target: TargetIdentity {
+                instance: None,
+                connect: None,
+            },
+            window: None,
+            action,
+        }
+    }
+
+    #[test]
+    fn commits_travel_by_their_full_id() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let pane_id = PaneId::new("pane");
+        let show = |commit: &str| Action::ShowChanges {
+            pane_id: pane_id.clone(),
+            commit: Some(commit.to_owned()),
+        };
+        let reveal = |commit: &str| Action::RevealDiff {
+            pane_id: pane_id.clone(),
+            path: "src/main.rs".into(),
+            scope: GitScope::Commit(commit.to_owned()),
+            line: None,
+        };
+        assert!(request(show(id)).validate().is_ok());
+        assert!(request(reveal(id)).validate().is_ok());
+        for short in ["0123456", "HEAD", &id.to_uppercase()] {
+            assert!(request(show(short)).validate().is_err(), "{short}");
+            assert!(request(reveal(short)).validate().is_err(), "{short}");
+        }
+        // An older CLI's request names no commit.
+        let older: Action =
+            serde_json::from_str(r#"{"action":"show_changes","pane_id":"pane"}"#).unwrap();
+        assert!(matches!(older, Action::ShowChanges { commit: None, .. }));
     }
 }

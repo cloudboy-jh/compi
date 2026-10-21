@@ -718,21 +718,22 @@ impl CompiApp {
 
     /// Applies `Action::RevealDiff` and `Action::ShowChanges`: `Ok(false)` until this window
     /// has the pane, a diff tab as the active tab (the CLI's own change makes it so), and
-    /// for the Changes list the pane drawn.
+    /// for the Changes list the pane drawn. A commit's diff or Changes section waits for the
+    /// commit's read in the pane itself.
     fn changes_presentation(
         &mut self,
         action: &Action,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> crate::Result<bool> {
-        let (pane_id, diff) = match action {
+        let (pane_id, diff, commit) = match action {
             Action::RevealDiff {
                 pane_id,
                 path,
                 scope,
                 line,
-            } => (pane_id, Some((path, *scope, *line))),
-            Action::ShowChanges { pane_id } => (pane_id, None),
+            } => (pane_id, Some((path, scope, *line)), None),
+            Action::ShowChanges { pane_id, commit } => (pane_id, None, commit.as_ref()),
             _ => unreachable!("polled_presentation passes only diff reveals and Changes here"),
         };
         if self.overlay.is_some() {
@@ -804,14 +805,17 @@ impl CompiApp {
         match diff {
             // `open_diff` waits for a pane not drawn yet, or for its first Git read.
             Some((path, scope, line)) => {
-                self.open_diff(pane_id, path.clone(), Some(scope), line, window, cx)
+                self.open_diff(pane_id, path.clone(), Some(scope.clone()), line, window, cx)
             }
             None if !self.content.panes.contains_key(pane_id) => {
                 self.rebuild_layout(window, true);
                 cx.notify();
                 return Ok(false);
             }
-            None => self.show_changes_list(pane_id, window, cx),
+            None => match commit {
+                Some(id) => self.show_commit_changes(pane_id, id.clone(), window, cx),
+                None => self.show_changes_list(pane_id, window, cx),
+            },
         }
         self.rebuild_layout(window, true);
         self.save_state();

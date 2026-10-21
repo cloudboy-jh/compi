@@ -25,7 +25,7 @@ Shells that keep running when you close the window, with an editor, diffs and Gi
 
 - Every uncommitted change, unstaged and staged, side by side or inline, with the changed words highlighted.
 - One tab per file: switch between Edit and Diff with Ctrl+Shift+D and stay on the same line.
-- Git marks in the editor's gutter as you type. Jump between changes with Alt+F5, or open a change from the terminal with `compi diff path:line`.
+- Git marks in the editor's gutter as you type. Jump between changes with Alt+F5, open a change from the terminal with `compi diff path:line`, or a past commit with `compi diff HEAD~1`.
 
 ## Commit
 

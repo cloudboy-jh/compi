@@ -15,11 +15,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Version 10 adds `RunCommand`, which `compi command run` sends, and the response's
-// `disabled_reason`. Version 9 adds `RevealDiff` and `ShowChanges`, which `compi diff`
-// sends. Version 8 reports each content pane's `unsaved_files` in window listings,
-// which `pane close`, `tab close` and `workspace close` consult before closing.
-const VERSION: u32 = 10;
+// Version 11 lets `ShowChanges` carry a commit and `RevealDiff` a commit scope, which
+// `compi diff COMMIT` sends. Version 10 adds `RunCommand`, which `compi command run`
+// sends, and the response's `disabled_reason`. Version 9 adds `RevealDiff` and
+// `ShowChanges`, which `compi diff` sends. Version 8 reports each content pane's
+// `unsaved_files` in window listings, which `pane close`, `tab close` and
+// `workspace close` consult before closing.
+const VERSION: u32 = 11;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);

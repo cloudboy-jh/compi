@@ -28,8 +28,9 @@ use windows::core::PCWSTR;
 /// Format 5 (protocol 28) adds the Monitor kind, stored so older daemons can read the
 /// file far enough to refuse it (see `readable_by_older_formats`). Format 6 (protocol 29)
 /// lets a terminal leaf carry a content `view`; older daemons ignore the key and reach
-/// their format check.
-const FORMAT_VERSION: u32 = 6;
+/// their format check. Format 7 (protocol 31) adds commit diff tabs, also stored so older
+/// daemons can refuse the file.
+const FORMAT_VERSION: u32 = 7;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -152,7 +153,11 @@ impl WorkspaceStore {
                         value["format_version"] = 6.into();
                     }
                     if value.get("format_version") == Some(&serde_json::Value::from(6)) {
+                        value["format_version"] = 7.into();
+                    }
+                    if value.get("format_version") == Some(&serde_json::Value::from(7)) {
                         restore_monitors(&mut value);
+                        restore_commit_diffs(&mut value);
                     }
                     serde_json::from_value::<Manifest>(value)
                 });
@@ -474,18 +479,24 @@ fn migrate_content_kinds(value: &mut serde_json::Value) {
     }
 }
 
+/// Older daemons parse the whole file before their format check, and a newer shape they
+/// fail to parse would quarantine the file, dropping every pane. So newer shapes are
+/// written in older ones (`mark_monitors`, `hide_commit_diffs`), which lets those daemons
+/// parse far enough to refuse the format and keep the file. Loading undoes both.
+fn readable_by_older_formats(value: &mut serde_json::Value) {
+    mark_monitors(value);
+    hide_commit_diffs(value);
+}
+
 /// A format-3 daemon (protocol 26) reads every content leaf as a folder: it needs an
 /// `environment` and a `root` and ignores other keys. A format-4 daemon (protocol 27) knows
-/// only the `files` and `settings` kinds. Either would fail to parse a newer leaf and
-/// quarantine the file, dropping every pane, before it reached its format check. So a
-/// Monitor leaf is written as a Settings leaf marked `shows: monitor`, and Settings
-/// leaves get placeholder `environment` and `root`, which lets both parse far enough to
-/// refuse the format and keep the file. Loading ignores the placeholders and
-/// `restore_monitors` undoes the marking.
-fn readable_by_older_formats(value: &mut serde_json::Value) {
+/// only the `files` and `settings` kinds. So a Monitor leaf is written as a Settings leaf
+/// marked `shows: monitor`, and Settings leaves get placeholder `environment` and `root`.
+/// Loading ignores the placeholders and `restore_monitors` undoes the marking.
+fn mark_monitors(value: &mut serde_json::Value) {
     use serde_json::Value;
     match value {
-        Value::Array(items) => items.iter_mut().for_each(readable_by_older_formats),
+        Value::Array(items) => items.iter_mut().for_each(mark_monitors),
         Value::Object(object) => {
             if object.get("type").and_then(Value::as_str) == Some("content")
                 && let Some(Value::Object(content)) = object.get_mut("content")
@@ -503,14 +514,14 @@ fn readable_by_older_formats(value: &mut serde_json::Value) {
                 }
                 return;
             }
-            object.values_mut().for_each(readable_by_older_formats);
+            object.values_mut().for_each(mark_monitors);
         }
         _ => {}
     }
 }
 
-/// Undoes `readable_by_older_formats` for Monitor leaves, keeping their own fields (the
-/// page). Every layout copy is walked.
+/// Undoes `mark_monitors`, keeping a Monitor leaf's own fields (the page). Every layout copy
+/// is walked.
 fn restore_monitors(value: &mut serde_json::Value) {
     use serde_json::Value;
     match value {
@@ -528,6 +539,55 @@ fn restore_monitors(value: &mut serde_json::Value) {
                 return;
             }
             object.values_mut().for_each(restore_monitors);
+        }
+        _ => {}
+    }
+}
+
+/// A format-6 daemon (protocol 29) knows only the unstaged and staged diff modes. So a
+/// commit diff tab, `diff: { commit: id }`, is written as its file's Edit tab carrying the id
+/// as `diff_commit`, a key that daemon ignores; `restore_commit_diffs` puts it back. Every
+/// files content is walked: content leaves and terminal views, in every layout copy.
+fn hide_commit_diffs(value: &mut serde_json::Value) {
+    walk_tabs(value, &mut |tab| {
+        if let Some(id) = tab.get("diff").and_then(|diff| diff.get("commit")).cloned() {
+            tab.remove("diff");
+            tab.insert("diff_commit".into(), id);
+        }
+    });
+}
+
+/// Undoes `hide_commit_diffs`.
+fn restore_commit_diffs(value: &mut serde_json::Value) {
+    walk_tabs(value, &mut |tab| {
+        if let Some(id) = tab.remove("diff_commit") {
+            tab.insert("diff".into(), serde_json::json!({ "commit": id }));
+        }
+    });
+}
+
+/// Calls `visit` on every tab, open or active, of every files content within `value`.
+fn walk_tabs(
+    value: &mut serde_json::Value,
+    visit: &mut impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    use serde_json::Value;
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(|item| walk_tabs(item, visit)),
+        Value::Object(object) => {
+            if object.get("kind").and_then(Value::as_str) == Some("files") {
+                let tabs = object.get_mut("tabs").and_then(Value::as_array_mut);
+                for tab in tabs.into_iter().flatten() {
+                    if let Value::Object(tab) = tab {
+                        visit(tab);
+                    }
+                }
+                if let Some(Value::Object(active)) = object.get_mut("active") {
+                    visit(active);
+                }
+                return;
+            }
+            object.values_mut().for_each(|item| walk_tabs(item, visit));
         }
         _ => {}
     }
@@ -1517,23 +1577,27 @@ mod tests {
     }
 
     #[test]
-    fn format_5_files_load_as_format_6() {
-        let path = test_path("format-5");
+    fn format_5_and_6_files_load_as_format_7() {
         let expected = content_kinds_workspace();
-        // As a format-5 daemon wrote it: Monitor leaves marked for older daemons.
-        let mut manifest = serde_json::to_value(Manifest {
-            format_version: 5,
-            workspace: expected.clone(),
-        })
-        .unwrap();
-        readable_by_older_formats(&mut manifest);
-        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        for format in [5, 6] {
+            let path = test_path(&format!("format-{format}"));
+            // As a format-5 or format-6 daemon wrote it: Monitor leaves marked for older
+            // daemons.
+            let mut manifest = serde_json::to_value(Manifest {
+                format_version: format,
+                workspace: expected.clone(),
+            })
+            .unwrap();
+            readable_by_older_formats(&mut manifest);
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
-        let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
-        assert_eq!(workspace.sessions, expected.sessions);
-        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved["format_version"], 6);
-        let _ = fs::remove_file(path);
+            let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+            assert_eq!(workspace.sessions, expected.sessions);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["format_version"], 7);
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -1586,6 +1650,181 @@ mod tests {
         let old: OldManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(old.format_version, FORMAT_VERSION);
         assert_eq!(old.workspace.sessions[0].tabs.len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// `content_kinds_workspace` with the files pane showing a commit diff, and the
+    /// terminal carrying a files view that has one open, in both arrangements.
+    fn commit_diffs_workspace() -> StoredWorkspace {
+        let mut workspace = content_kinds_workspace();
+        let diff = ContentTab::diff("/home/user/project/b.rs", GitScope::Commit(COMMIT.into()));
+        let files = FolderContent {
+            environment: ContentEnvironment::Host,
+            root: "/project".into(),
+            tabs: vec![
+                ContentTab::edit("/project/a.rs"),
+                ContentTab::diff("/project/b.rs", GitScope::Commit(COMMIT.into())),
+            ],
+            active: Some(ContentTab::edit("/project/a.rs")),
+        };
+        let view = PaneView {
+            content: PaneContent::Files(files),
+            side: PaneSide::Terminal,
+        };
+        fn visit(node: &mut LayoutNode, diff: &ContentTab, view: &PaneView) {
+            match node {
+                LayoutNode::Split { first, second, .. } => {
+                    visit(first, diff, view);
+                    visit(second, diff, view);
+                }
+                LayoutNode::Pane { view: slot, .. } => *slot = Some(view.clone()),
+                LayoutNode::Content {
+                    content: PaneContent::Files(folder),
+                    ..
+                } => {
+                    folder.tabs.push(diff.clone());
+                    folder.active = Some(diff.clone());
+                }
+                LayoutNode::Content { .. } => {}
+            }
+        }
+        let tab = &mut workspace.sessions[0].tabs[0];
+        visit(&mut tab.layout, &diff, &view);
+        visit(tab.previous_layout.as_mut().unwrap(), &diff, &view);
+        workspace
+    }
+
+    #[test]
+    fn commit_diff_tabs_survive_reopen() {
+        let path = test_path("commit-diffs");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let workspace = commit_diffs_workspace();
+        store.commit(&workspace).unwrap();
+        // Stored as Edit tabs carrying the commit, for older daemons.
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let layout = &saved["workspace"]["sessions"][0]["tabs"][0]["layout"];
+        let hidden = serde_json::json!({
+            "type": "file",
+            "path": "/home/user/project/b.rs",
+            "diff_commit": COMMIT,
+        });
+        let files = &layout["second"]["first"]["content"];
+        assert_eq!(files["tabs"][1], hidden);
+        assert_eq!(files["active"], hidden);
+        let view = &layout["first"]["view"]["content"];
+        assert_eq!(view["tabs"][1]["diff_commit"], COMMIT);
+        assert!(view["tabs"][1].get("diff").is_none());
+        let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.sessions, workspace.sessions);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_format_6_daemon_reaches_its_version_check_on_commit_diffs() {
+        // Protocol 30's shapes, as far as a format-6 daemon parses a layout.
+        #[derive(Deserialize)]
+        struct OldManifest {
+            format_version: u32,
+            workspace: OldWorkspace,
+        }
+        #[derive(Deserialize)]
+        struct OldWorkspace {
+            sessions: Vec<OldSession>,
+        }
+        #[derive(Deserialize)]
+        struct OldSession {
+            tabs: Vec<OldTab>,
+        }
+        #[derive(Deserialize)]
+        struct OldTab {
+            layout: OldLayout,
+            previous_layout: Option<OldLayout>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldLayout {
+            Pane {
+                view: Option<OldView>,
+            },
+            Content {
+                content: OldContent,
+            },
+            Split {
+                first: Box<OldLayout>,
+                second: Box<OldLayout>,
+            },
+        }
+        #[derive(Deserialize)]
+        struct OldView {
+            content: OldContent,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum OldContent {
+            Files(OldFolder),
+            Settings(#[allow(dead_code)] SettingsContent),
+            Monitor(#[allow(dead_code)] MonitorContent),
+        }
+        #[derive(Deserialize)]
+        struct OldFolder {
+            #[serde(default)]
+            tabs: Vec<OldFileTab>,
+            active: Option<OldFileTab>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldFileTab {
+            File { diff: Option<OldScope> },
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldScope {
+            Unstaged,
+            Staged,
+        }
+        /// Each tab of every files content, open or active: whether it is a diff.
+        fn diffs(node: &OldLayout) -> Vec<bool> {
+            let folder = |content: &OldContent| match content {
+                OldContent::Files(folder) => folder
+                    .tabs
+                    .iter()
+                    .chain(&folder.active)
+                    .map(|OldFileTab::File { diff }| {
+                        matches!(diff, Some(OldScope::Unstaged | OldScope::Staged))
+                    })
+                    .collect(),
+                OldContent::Settings(_) | OldContent::Monitor(_) => Vec::new(),
+            };
+            match node {
+                OldLayout::Pane { view } => {
+                    view.iter().flat_map(|view| folder(&view.content)).collect()
+                }
+                OldLayout::Content { content } => folder(content),
+                OldLayout::Split { first, second } => [diffs(first), diffs(second)].concat(),
+            }
+        }
+
+        let workspace = commit_diffs_workspace();
+        // Without the rewrite, a commit diff would fail to parse and quarantine the file.
+        let plain = serde_json::to_value(Manifest {
+            format_version: FORMAT_VERSION,
+            workspace: workspace.clone(),
+        })
+        .unwrap();
+        assert!(serde_json::from_value::<OldManifest>(plain).is_err());
+
+        let path = test_path("commit-diff-downgrade");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        store.commit(&workspace).unwrap();
+        let old: OldManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old.format_version, FORMAT_VERSION);
+        let tab = &old.workspace.sessions[0].tabs[0];
+        // The view's tabs and active one, then the files pane's; every commit diff reads as
+        // an Edit tab.
+        assert_eq!(diffs(&tab.layout), [false; 6]);
+        assert_eq!(diffs(tab.previous_layout.as_ref().unwrap()), [false; 6]);
         let _ = fs::remove_file(path);
     }
 }

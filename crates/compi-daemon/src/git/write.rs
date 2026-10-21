@@ -496,7 +496,7 @@ mod tests {
                 &ContentEnvironment::Host,
                 self.0.to_str().unwrap(),
                 path,
-                GitRevision::Index,
+                &GitRevision::Index,
             )
             .unwrap()
             {

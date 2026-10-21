@@ -54,7 +54,10 @@ use std::fmt;
 // Version 30 keeps history rows compactly (`HistoryRow`) and sends history changes
 // incrementally (`ScrollbackChange`): rows scrolled in and how many left the front, the
 // whole history only on attach, a real clear, a reset or a reflowing resize.
-pub const PROTOCOL_VERSION: u32 = 30;
+// Version 31 adds commit diffs: `ReadGitCommit` looks up one commit and lists its changes
+// against its first parent, `GitScope::Commit` names such a change (and a diff tab showing
+// it), and `GitRevision::Commit` / `GitRevision::Parent` read a file's two sides.
+pub const PROTOCOL_VERSION: u32 = 31;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -304,6 +307,15 @@ pub enum ClientMessage {
         environment: ContentEnvironment,
         path: String,
     },
+    /// One commit of the Git work tree holding `path`, a folder or file: `commit` is any
+    /// revision Git resolves to a commit (`HEAD~2`, a branch, an abbreviated id; see
+    /// `is_revision`). Its changes are against its first parent; a root commit's against
+    /// nothing.
+    ReadGitCommit {
+        environment: ContentEnvironment,
+        path: String,
+        commit: String,
+    },
     /// One side of a changed file: `path` is relative to the repository top level `repo`.
     ReadGitFile {
         environment: ContentEnvironment,
@@ -440,6 +452,9 @@ pub enum ServerMessage {
     /// `None` when the path is not inside a Git work tree.
     GitChangesRead {
         changes: Option<GitChanges>,
+    },
+    GitCommitRead {
+        lookup: GitCommitLookup,
     },
     GitFileRead {
         content: GitFileContent,
@@ -613,14 +628,17 @@ pub enum FileState {
     Missing,
 }
 
-/// Which comparison a change belongs to, as in `git status`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+/// Which comparison a change belongs to, as in `git status`, or the commit it was made in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum GitScope {
     /// The work tree against the index.
     Unstaged,
     /// The index against `HEAD`.
     Staged,
+    /// A commit against its first parent (nothing for a root commit), by its full id (see
+    /// `is_commit_id`). Read-only: nothing is staged, unstaged or discarded in it.
+    Commit(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -637,12 +655,17 @@ pub enum GitChangeKind {
 }
 
 /// Which version of a repository file to read.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum GitRevision {
     Head,
     Index,
     WorkTree,
+    /// The file as the commit with this full id left it.
+    Commit(String),
+    /// The file in the first parent of the commit with this full id; `Missing` for a root
+    /// commit.
+    Parent(String),
 }
 
 /// One changed path in one scope. A path changed both in the index and in the work tree
@@ -682,6 +705,43 @@ pub struct GitChanges {
     pub ahead: u32,
     pub behind: u32,
     /// Unstaged entries first, then staged; each group sorted by path.
+    pub changes: Vec<GitChange>,
+    /// More than `MAX_GIT_CHANGES` entries; the list was cut.
+    pub truncated: bool,
+}
+
+/// The answer to `ReadGitCommit`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GitCommitLookup {
+    /// `path` is not inside a Git work tree.
+    NotRepository,
+    /// The revision names no commit in that repository.
+    Unknown,
+    Found {
+        commit: Box<GitCommit>,
+    },
+}
+
+/// One commit and what it changed against its first parent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitCommit {
+    /// Absolute repository top level in the request's environment.
+    pub repo: String,
+    /// The full commit id.
+    pub id: String,
+    /// The id abbreviated as Git abbreviates it in this repository.
+    pub short: String,
+    /// The first parent's full id; `None` for a root commit.
+    pub parent: Option<String>,
+    /// The commit has more than one parent; its changes are against the first.
+    pub merge: bool,
+    /// The message's first line.
+    pub summary: String,
+    pub author: String,
+    /// Author time, in seconds since the Unix epoch.
+    pub time: i64,
+    /// Every change with scope `Commit(id)` and `stamp` the commit id, sorted by path.
     pub changes: Vec<GitChange>,
     /// More than `MAX_GIT_CHANGES` entries; the list was cut.
     pub truncated: bool,
@@ -805,6 +865,26 @@ pub fn is_repo_path(path: &str) -> bool {
         && !path.starts_with('/')
         && !path.contains('\0')
         && !path.split('/').any(|part| part == "..")
+}
+
+/// The longest revision `ReadGitCommit` accepts.
+pub const MAX_GIT_REVISION_BYTES: usize = 256;
+
+/// Whether `revision` may be handed to Git as a revision: non-empty, at most
+/// `MAX_GIT_REVISION_BYTES`, not starting with `-` (an option), and free of whitespace, control
+/// characters and `:` (which would name a path inside a revision).
+pub fn is_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= MAX_GIT_REVISION_BYTES
+        && !revision.starts_with('-')
+        && !revision
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ':')
+}
+
+/// Whether `id` is a full commit id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
+pub fn is_commit_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1240,9 +1320,9 @@ impl ContentTab {
     }
 
     /// The comparison shown in Diff mode, `None` in Edit mode.
-    pub fn diff_scope(&self) -> Option<GitScope> {
+    pub fn diff_scope(&self) -> Option<&GitScope> {
         let Self::File { diff, .. } = self;
-        *diff
+        diff.as_ref()
     }
 
     /// The same file in another mode.
@@ -1284,6 +1364,14 @@ impl FolderContent {
             if !seen.insert(tab.path()) {
                 return Err(format!("content file {} is listed twice", tab.path()));
             }
+            if let Some(GitScope::Commit(id)) = tab.diff_scope()
+                && !is_commit_id(id)
+            {
+                return Err(format!(
+                    "content file {} shows a commit that is not a full commit id",
+                    tab.path()
+                ));
+            }
         }
         if let Some(active) = &self.active
             && !self.tabs.contains(active)
@@ -1312,7 +1400,7 @@ impl FolderContent {
     }
 
     /// The active tab's path and comparison when it shows a diff (Diff mode).
-    pub fn active_diff(&self) -> Option<(&str, GitScope)> {
+    pub fn active_diff(&self) -> Option<(&str, &GitScope)> {
         let tab = self.active.as_ref()?;
         Some((tab.path(), tab.diff_scope()?))
     }
@@ -2076,7 +2164,7 @@ mod content_tests {
         assert_eq!(shown.active_file(), None);
         assert_eq!(
             shown.active_diff(),
-            Some(("/home/user/project/src/main.rs", GitScope::Staged))
+            Some(("/home/user/project/src/main.rs", &GitScope::Staged))
         );
         let json = serde_json::to_value(&shown).unwrap();
         assert_eq!(
@@ -2111,5 +2199,50 @@ mod content_tests {
         // A folder with nothing open omits both fields.
         let folder = serde_json::to_value(content(&[], None)).unwrap();
         assert!(folder.get("tabs").is_none() && folder.get("active").is_none());
+    }
+
+    #[test]
+    fn a_commit_diff_tab_names_its_commit_by_full_id() {
+        let id = "0c73f58aa1b2c3d4e5f60718293a4b5c6d7e8f90";
+        let tab = ContentTab::diff("/repo/src/a.rs", GitScope::Commit(id.into()));
+        let shown = FolderContent {
+            tabs: vec![tab.clone()],
+            active: Some(tab),
+            ..content(&[], None)
+        };
+        assert!(shown.validate().is_ok());
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["active"]["diff"], serde_json::json!({ "commit": id }));
+        assert_eq!(
+            serde_json::from_value::<FolderContent>(json).unwrap(),
+            shown
+        );
+        // Only a resolved id is kept: an abbreviation or a branch name is refused.
+        for named in ["0c73f58", "main", "HEAD~1", &id.to_uppercase()] {
+            let tab = ContentTab::diff("/repo/src/a.rs", GitScope::Commit(named.into()));
+            let content = FolderContent {
+                tabs: vec![tab],
+                ..content(&[], None)
+            };
+            assert!(content.validate().is_err(), "{named}");
+        }
+    }
+
+    #[test]
+    fn revisions_cannot_pass_as_options_or_paths() {
+        for accepted in [
+            "HEAD",
+            "HEAD~2",
+            "main",
+            "0c73f58",
+            "origin/main^",
+            "v0.2.0",
+        ] {
+            assert!(is_revision(accepted), "{accepted}");
+        }
+        for rejected in ["", "-p", "--all", "HEAD:src/a.rs", "a b", "a\0b", "a\nb"] {
+            assert!(!is_revision(rejected), "{rejected:?}");
+        }
+        assert!(!is_revision(&"a".repeat(MAX_GIT_REVISION_BYTES + 1)));
     }
 }

@@ -151,9 +151,9 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "compi edit src/main.rs:42",
         ),
         ("diff", _) => (
-            "diff [PATH[:LINE[:COL]]]",
-            "Show PATH's uncommitted change as a diff tab in the selected terminal's Files view, in place of the shell, scrolled to LINE of the new side (COL is accepted and ignored). The unstaged change (work tree against the index) wins over the staged one (index against HEAD). PATH resolves like edit; the view's folder stays when it lies in the repository and holds PATH, else becomes the repository's top level. From a content pane (--pane) inside the repository, that pane shows the diff. Without PATH, the repository of the shell's directory lists its changes in the view's Changes sidebar. Exits 1 with not_a_repository outside a Git work tree and no_changes when PATH has no uncommitted change. Git is only read: files, the index and other Git state never change.",
-            "compi diff src/layout.rs:40",
+            "diff [PATH[:LINE[:COL]]]\n       compi diff COMMIT [PATH[:LINE[:COL]]]",
+            "Show PATH's uncommitted change as a diff tab in the selected terminal's Files view, in place of the shell, scrolled to LINE of the new side (COL is accepted and ignored). The unstaged change (work tree against the index) wins over the staged one (index against HEAD). PATH resolves like edit; the view's folder stays when it lies in the repository and holds PATH, else becomes the repository's top level. From a content pane (--pane) inside the repository, that pane shows the diff. Without PATH, the repository of the shell's directory lists its changes in the view's Changes sidebar. With COMMIT (a revision such as HEAD~1, a branch or an id), the diff is what that commit changed in PATH against its first parent, read-only; without PATH its changed files show in a section of their own at the top of the Changes sidebar. A lone argument is PATH when that file has uncommitted changes, else COMMIT when Git knows it. --json adds repo, commit (the full id), short and summary for a commit, with path and line, or changes (the count). Exits 1 with not_a_repository outside a Git work tree, unknown_commit when COMMIT names no commit, and no_changes when PATH has no uncommitted change (or names no commit) or COMMIT did not change PATH. Git is only read: files, the index and other Git state never change.",
+            "compi diff HEAD~1 src/main.rs",
         ),
         ("settings", _) => (
             "settings [SECTION]",

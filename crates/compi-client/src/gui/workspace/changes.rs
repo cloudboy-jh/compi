@@ -6,6 +6,10 @@
 //! stamp moves and replaced in place, keeping scroll, context and find. Reading never
 //! writes: the daemon reads with Git's optional locks off.
 //!
+//! A commit's changes against its first parent (`compi diff COMMIT`) show in a section of
+//! their own above those (`show_commit_changes`) and open as read-only diff tabs. A commit
+//! is read once, when the section or a tab first needs it, as it never changes.
+//!
 //! Writes are explicit actions only (`git_write`): stage, unstage and discard on list rows,
 //! section headers and diff tab headers, a hunk's button in a diff tab, and the commit box
 //! above the list. Discarding asks first, naming the files. A write's controls show a
@@ -27,8 +31,8 @@ use crate::content_path::{repo_relative, work_tree_path};
 use crate::diff::{HunkWrite, Side, Whitespace, set_index_lines};
 use crate::gui::controls::{self, ChipTone, Control, IconName, icon_button, text_button};
 use compi_protocol::{
-    ContentEnvironment, ContentTab, GitAction, GitChange, GitChangeKind, GitChanges,
-    GitFileContent, GitRevision, GitScope, GitWriteResult, PaneContent,
+    ContentEnvironment, ContentTab, FolderContent, GitAction, GitChange, GitChangeKind, GitChanges,
+    GitCommit, GitCommitLookup, GitFileContent, GitRevision, GitScope, GitWriteResult, PaneContent,
 };
 use gpui::{
     AnyElement, ClickEvent, Entity, ScrollStrategy, SharedString, UniformListScrollHandle,
@@ -91,7 +95,8 @@ pub(super) struct RepoStatus {
     scroll: UniformListScrollHandle,
     /// The list's width at the last draw, for eliding folder names.
     list_width: Cell<f32>,
-    /// A diff asked for before the folder was read: path, scope and line for `open_diff`.
+    /// A diff asked for before the folder (or its commit) was read: path, scope and line
+    /// for `open_diff`.
     pub(super) pending_open: Option<(String, Option<GitScope>, Option<u32>)>,
     /// The folder tree's marks for the latest listing, by tree path; see `tree_marks`.
     marks: HashMap<String, TreeMark>,
@@ -107,6 +112,20 @@ pub(super) struct RepoStatus {
     outcome: Option<Outcome>,
     /// The keyboard selection: what the row shows, and where it was last.
     selected: Option<(RowKey, usize)>,
+    /// Commits read for the list and for diff tabs, by full id. Never read again: a commit
+    /// does not change.
+    commits: HashMap<String, CommitState>,
+    /// The commit whose changes the list shows above the working tree's, by full id.
+    shown_commit: Option<String>,
+}
+
+/// A commit read for the list or a diff tab.
+enum CommitState {
+    Reading,
+    /// The repository has no such commit.
+    Unknown,
+    Failed(String),
+    Ready(GitCommit),
 }
 
 /// The commit message being written, and the Amend toggle.
@@ -184,8 +203,8 @@ impl InFlight {
         })
     }
 
-    fn names(&self, scope: GitScope, path: &str) -> bool {
-        self.scope == scope && self.paths.iter().any(|named| named == path)
+    fn names(&self, scope: &GitScope, path: &str) -> bool {
+        self.scope == *scope && self.paths.iter().any(|named| named == path)
     }
 }
 
@@ -274,7 +293,7 @@ enum ListRow {
         depth: usize,
         collapsed: bool,
     },
-    /// A change, by index into the listing.
+    /// A change, by index through `Listed`.
     File { change: usize, depth: usize },
 }
 
@@ -284,6 +303,35 @@ enum RowKey {
     Section(GitScope),
     Folder(GitScope, String),
     File(GitScope, String),
+}
+
+/// The changes the list shows: the shown commit's, then the working tree's. A list row
+/// names a change by its index through both.
+#[derive(Clone, Copy, Default)]
+struct Listed<'a> {
+    commit: &'a [GitChange],
+    working: &'a [GitChange],
+}
+
+impl<'a> Listed<'a> {
+    fn iter(self) -> impl Iterator<Item = &'a GitChange> {
+        self.commit.iter().chain(self.working)
+    }
+
+    fn len(self) -> usize {
+        self.commit.len() + self.working.len()
+    }
+}
+
+impl std::ops::Index<usize> for Listed<'_> {
+    type Output = GitChange;
+
+    fn index(&self, index: usize) -> &GitChange {
+        match index.checked_sub(self.commit.len()) {
+            Some(working) => &self.working[working],
+            None => &self.commit[index],
+        }
+    }
 }
 
 /// What Left or Right does on a selected row.
@@ -319,6 +367,8 @@ impl RepoStatus {
             reread: false,
             outcome: None,
             selected: None,
+            commits: HashMap::new(),
+            shown_commit: None,
         }
     }
 
@@ -328,10 +378,13 @@ impl RepoStatus {
     }
 
     /// The folder's view moved to another pane: a read on its way answers the old one,
-    /// so the next refresh reads again, and the commit box's events are bound anew.
+    /// so the next refresh reads again (commits being read too), and the commit box's
+    /// events are bound anew.
     pub(super) fn moved(&mut self) {
         self.reading = None;
         self.marked = false;
+        self.commits
+            .retain(|_, state| !matches!(state, CommitState::Reading));
         if let Some(commit) = &mut self.commit {
             commit.moved = true;
         }
@@ -350,15 +403,77 @@ impl RepoStatus {
             .map_or(&[], |listing| listing.changes.as_slice())
     }
 
+    /// The commit `id`, once read.
+    fn ready_commit(&self, id: &str) -> Option<&GitCommit> {
+        match self.commits.get(id)? {
+            CommitState::Ready(commit) => Some(commit),
+            _ => None,
+        }
+    }
+
+    /// The commit of a `Commit` scope, once read; `None` for the other scopes.
+    fn commit_of(&self, scope: &GitScope) -> Option<&GitCommit> {
+        match scope {
+            GitScope::Commit(id) => self.ready_commit(id),
+            _ => None,
+        }
+    }
+
+    /// What the list shows: the shown commit's changes once read, then the working tree's.
+    fn listed(&self) -> Listed<'_> {
+        let commit = self
+            .shown_commit
+            .as_deref()
+            .and_then(|id| self.ready_commit(id));
+        Listed {
+            commit: commit.map_or(&[], |commit| commit.changes.as_slice()),
+            working: self.changes(),
+        }
+    }
+
+    /// The top level of the repository whose changes in `scope` are read.
+    fn repo_of(&self, scope: &GitScope) -> Option<&str> {
+        match scope {
+            GitScope::Commit(id) => self.ready_commit(id).map(|commit| commit.repo.as_str()),
+            _ => self.listing().map(|listing| listing.repo.as_str()),
+        }
+    }
+
+    /// `repo_of(scope)`, else the listing's top level while a commit is being read: where
+    /// a diff tab's path is placed.
+    fn diff_repo(&self, scope: &GitScope) -> Option<&str> {
+        self.repo_of(scope)
+            .or_else(|| self.listing().map(|listing| listing.repo.as_str()))
+    }
+
     /// The change the tab of absolute `file` shows in Diff mode against `scope`, if the
-    /// listing has it.
-    pub(super) fn change(&self, file: &str, scope: GitScope) -> Option<&GitChange> {
-        let listing = self.listing()?;
-        let path = repo_relative(&listing.repo, file)?;
-        listing
-            .changes
+    /// listing (or the commit, once read) has it.
+    pub(super) fn change(&self, file: &str, scope: &GitScope) -> Option<&GitChange> {
+        let changes = match scope {
+            GitScope::Commit(id) => &self.ready_commit(id)?.changes,
+            _ => &self.listing()?.changes,
+        };
+        let path = repo_relative(self.repo_of(scope)?, file)?;
+        changes
             .iter()
-            .find(|change| change.scope == scope && change.path == path)
+            .find(|change| change.scope == *scope && change.path == path)
+    }
+
+    /// Forgets the commits neither the list, a tab of `content` nor a diff waiting to open
+    /// shows.
+    pub(super) fn retain_commits(&mut self, content: &FolderContent) {
+        let shown = self.shown_commit.as_deref();
+        let waiting = match &self.pending_open {
+            Some((_, Some(GitScope::Commit(id)), _)) => Some(id.as_str()),
+            _ => None,
+        };
+        self.commits.retain(|id, _| {
+            shown == Some(id.as_str())
+                || waiting == Some(id.as_str())
+                || content.tabs.iter().any(
+                    |tab| matches!(tab.diff_scope(), Some(GitScope::Commit(used)) if used == id),
+                )
+        });
     }
 
     /// Why absolute `file`'s tab cannot switch to Diff mode: no uncommitted change of it in
@@ -379,14 +494,16 @@ impl RepoStatus {
     /// Lists the rows again; the selection keeps its row, or the fold hiding it, or the
     /// place it had.
     fn rebuild(&mut self, tree: bool) {
-        let (rows, order) = list_rows(self.changes(), tree, &self.folds);
+        let selected = self.selected.take();
+        let listed = self.listed();
+        let (rows, order) = list_rows(listed, self.shown_commit.as_deref(), tree, &self.folds);
+        let selected = selected.and_then(|(key, was)| {
+            let at = reselect(&rows, listed, &key, was)?;
+            Some((row_key(&rows[at], listed), at))
+        });
         self.rows = rows;
         self.order = order;
-        let selected = self.selected.take();
-        self.selected = selected.and_then(|(key, was)| {
-            let at = reselect(&self.rows, self.changes(), &key, was)?;
-            Some((row_key(&self.rows[at], self.changes()), at))
-        });
+        self.selected = selected;
     }
 
     /// The selected row's index.
@@ -397,13 +514,13 @@ impl RepoStatus {
     /// Selects row `at` and scrolls the list to it.
     fn select_row(&mut self, at: usize) {
         if let Some(row) = self.rows.get(at) {
-            self.selected = Some((row_key(row, self.changes()), at));
+            self.selected = Some((row_key(row, self.listed()), at));
             self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
     }
 
     /// A stage or unstage of `path` out of `scope` is on its way.
-    fn moving(&self, scope: GitScope, path: &str) -> bool {
+    fn moving(&self, scope: &GitScope, path: &str) -> bool {
         self.in_flight
             .iter()
             .any(|write| !write.discard && write.names(scope, path))
@@ -413,14 +530,14 @@ impl RepoStatus {
     fn discarding(&self, path: &str) -> bool {
         self.in_flight
             .iter()
-            .any(|write| write.discard && write.names(GitScope::Unstaged, path))
+            .any(|write| write.discard && write.names(&GitScope::Unstaged, path))
     }
 
     /// A section's Stage all or Unstage all is on its way.
-    fn moving_section(&self, scope: GitScope) -> bool {
+    fn moving_section(&self, scope: &GitScope) -> bool {
         self.in_flight
             .iter()
-            .any(|write| write.section && write.scope == scope)
+            .any(|write| write.section && write.scope == *scope)
     }
 
     /// Takes a fresh listing; whether anything shown changed.
@@ -468,10 +585,10 @@ impl RepoStatus {
 
     /// Unfolds what hides the change of `path` in `scope`, selects it and scrolls the list
     /// to it.
-    fn reveal(&mut self, path: &str, scope: GitScope, tree: bool) {
-        let mut unfolded = self.folds.sections.remove(&scope);
+    fn reveal(&mut self, path: &str, scope: &GitScope, tree: bool) {
+        let mut unfolded = self.folds.sections.remove(scope);
         self.folds.folders.retain(|(folded, folder)| {
-            let hides = *folded == scope
+            let hides = folded == scope
                 && path
                     .strip_prefix(folder.as_str())
                     .is_some_and(|rest| rest.starts_with('/'));
@@ -481,12 +598,9 @@ impl RepoStatus {
         if unfolded {
             self.rebuild(tree);
         }
-        let key = RowKey::File(scope, path.to_owned());
-        if let Some(row) = self
-            .rows
-            .iter()
-            .position(|row| row_is(row, self.changes(), &key))
-        {
+        let key = RowKey::File(scope.clone(), path.to_owned());
+        let listed = self.listed();
+        if let Some(row) = self.rows.iter().position(|row| row_is(row, listed, &key)) {
             self.select_row(row);
         }
     }
@@ -556,12 +670,30 @@ fn tree_marks(root: &str, listing: &GitChanges) -> HashMap<String, TreeMark> {
     marks
 }
 
-/// What a diff tab compares, in words, when its change is not listed.
-fn scope_baseline(scope: GitScope) -> &'static str {
+/// What a diff tab compares, in words, when its change is not listed. `commit` is the
+/// commit of a `Commit` scope, once read.
+fn scope_baseline(scope: &GitScope, commit: Option<&GitCommit>) -> Cow<'static, str> {
     match scope {
-        GitScope::Unstaged => "Working tree vs index",
-        GitScope::Staged => "Index vs HEAD",
+        GitScope::Unstaged => "Working tree vs index".into(),
+        GitScope::Staged => "Index vs HEAD".into(),
+        GitScope::Commit(id) => commit_baseline(id, commit).into(),
     }
+}
+
+/// What the diff of commit `id` compares: `abc1234 against its parent` (its first parent
+/// for a merge), or `abc1234, the first commit`. `commit` is `id`'s, once read.
+fn commit_baseline(id: &str, commit: Option<&GitCommit>) -> String {
+    let short = commit.map_or_else(|| short_id(id), |commit| commit.short.as_str());
+    match commit {
+        Some(commit) if commit.parent.is_none() => format!("{short}, the first commit"),
+        Some(commit) if commit.merge => format!("{short} against its first parent"),
+        _ => format!("{short} against its parent"),
+    }
+}
+
+/// Full commit id `id` abbreviated for a commit not read yet.
+fn short_id(id: &str) -> &str {
+    id.get(..7).unwrap_or(id)
 }
 
 /// A folder of the tree being built, borrowing the listing's paths.
@@ -584,7 +716,7 @@ impl<'a> TreeFolder<'a> {
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &self,
-        scope: GitScope,
+        scope: &GitScope,
         prefix: &str,
         depth: usize,
         hidden: bool,
@@ -608,10 +740,10 @@ impl<'a> TreeFolder<'a> {
             } else {
                 format!("{prefix}/{label}")
             };
-            let collapsed = folds.folders.contains(&(scope, path.clone()));
+            let collapsed = folds.folders.contains(&(scope.clone(), path.clone()));
             if !hidden {
                 rows.push(ListRow::Folder {
-                    scope,
+                    scope: scope.clone(),
                     path: path.clone(),
                     label,
                     depth,
@@ -639,23 +771,33 @@ impl<'a> TreeFolder<'a> {
     }
 }
 
-/// The list of `changes`: a section per scope that has changes, Unstaged first, holding
-/// its changes in path order or, as a tree, in folders. Also every change in that order,
-/// folded or not.
-fn list_rows(changes: &[GitChange], tree: bool, folds: &Folds) -> (Vec<ListRow>, Vec<usize>) {
+/// The list of `changes`: the section of the shown `commit` (by full id; shown while it is
+/// read, too), then a section per working scope that has changes, Unstaged first, each
+/// holding its changes in path order or, as a tree, in folders. Also every change in that
+/// order, folded or not.
+fn list_rows(
+    changes: Listed<'_>,
+    commit: Option<&str>,
+    tree: bool,
+    folds: &Folds,
+) -> (Vec<ListRow>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut order = Vec::with_capacity(changes.len());
-    for scope in [GitScope::Unstaged, GitScope::Staged] {
+    let sections = commit
+        .map(|id| GitScope::Commit(id.to_owned()))
+        .into_iter()
+        .chain([GitScope::Unstaged, GitScope::Staged]);
+    for scope in sections {
         let count = changes
             .iter()
             .filter(|change| change.scope == scope)
             .count();
-        if count == 0 {
+        if count == 0 && !matches!(scope, GitScope::Commit(_)) {
             continue;
         }
         let collapsed = folds.sections.contains(&scope);
         rows.push(ListRow::Section {
-            scope,
+            scope: scope.clone(),
             count,
             collapsed,
         });
@@ -668,7 +810,7 @@ fn list_rows(changes: &[GitChange], tree: bool, folds: &Folds) -> (Vec<ListRow>,
             for (index, change) in members {
                 root.insert(&change.path, index);
             }
-            root.emit(scope, "", 0, collapsed, folds, &mut rows, &mut order);
+            root.emit(&scope, "", 0, collapsed, folds, &mut rows, &mut order);
         } else {
             for (index, _) in members {
                 order.push(index);
@@ -684,19 +826,19 @@ fn list_rows(changes: &[GitChange], tree: bool, folds: &Folds) -> (Vec<ListRow>,
     (rows, order)
 }
 
-fn row_key(row: &ListRow, changes: &[GitChange]) -> RowKey {
+fn row_key(row: &ListRow, changes: Listed<'_>) -> RowKey {
     match row {
-        ListRow::Section { scope, .. } => RowKey::Section(*scope),
-        ListRow::Folder { scope, path, .. } => RowKey::Folder(*scope, path.clone()),
+        ListRow::Section { scope, .. } => RowKey::Section(scope.clone()),
+        ListRow::Folder { scope, path, .. } => RowKey::Folder(scope.clone(), path.clone()),
         ListRow::File { change, .. } => {
             let change = &changes[*change];
-            RowKey::File(change.scope, change.path.clone())
+            RowKey::File(change.scope.clone(), change.path.clone())
         }
     }
 }
 
 /// Whether `row` shows what `key` names.
-fn row_is(row: &ListRow, changes: &[GitChange], key: &RowKey) -> bool {
+fn row_is(row: &ListRow, changes: Listed<'_>, key: &RowKey) -> bool {
     match (row, key) {
         (ListRow::Section { scope, .. }, RowKey::Section(wanted)) => scope == wanted,
         (ListRow::Folder { scope, path, .. }, RowKey::Folder(wanted, folder)) => {
@@ -712,7 +854,7 @@ fn row_is(row: &ListRow, changes: &[GitChange], key: &RowKey) -> bool {
 /// Where the selection of `key`, last at row `was`, goes in `rows`: its row; else the
 /// folded section or folder hiding it; else the row now at its place (the next one, when
 /// its change left), or the last.
-fn reselect(rows: &[ListRow], changes: &[GitChange], key: &RowKey, was: usize) -> Option<usize> {
+fn reselect(rows: &[ListRow], changes: Listed<'_>, key: &RowKey, was: usize) -> Option<usize> {
     if let Some(at) = rows.iter().position(|row| row_is(row, changes, key)) {
         return Some(at);
     }
@@ -791,11 +933,11 @@ fn sideways(rows: &[ListRow], at: usize, open: bool) -> Sideways {
 
 /// The paths staging or unstaging the changes of `scope` names, only those inside
 /// `folder` when given; sorted, once each.
-fn scope_paths(changes: &[GitChange], scope: GitScope, folder: Option<&str>) -> Vec<String> {
+fn scope_paths(changes: &[GitChange], scope: &GitScope, folder: Option<&str>) -> Vec<String> {
     let mut paths: Vec<String> = changes
         .iter()
         .filter(|change| {
-            change.scope == scope
+            change.scope == *scope
                 && folder.is_none_or(|folder| {
                     change
                         .path
@@ -812,13 +954,15 @@ fn scope_paths(changes: &[GitChange], scope: GitScope, folder: Option<&str>) -> 
 
 /// What `s` (`Unstaged`) or `u` (`Staged`) moves on `row`: its file, or every file of its
 /// folder or section, when the row is in that section.
-fn row_paths(row: &ListRow, changes: &[GitChange], scope: GitScope) -> Vec<String> {
+fn row_paths(row: &ListRow, changes: Listed<'_>, scope: &GitScope) -> Vec<String> {
     match row {
-        ListRow::Section { scope: at, .. } if *at == scope => scope_paths(changes, scope, None),
+        ListRow::Section { scope: at, .. } if at == scope => {
+            scope_paths(changes.working, scope, None)
+        }
         ListRow::Folder {
             scope: at, path, ..
-        } if *at == scope => scope_paths(changes, scope, Some(path.as_str())),
-        ListRow::File { change, .. } if changes[*change].scope == scope => {
+        } if at == scope => scope_paths(changes.working, scope, Some(path.as_str())),
+        ListRow::File { change, .. } if changes[*change].scope == *scope => {
             change_paths(&changes[*change]).collect()
         }
         _ => Vec::new(),
@@ -832,7 +976,13 @@ fn sides(change: &GitChange) -> [Option<(&str, GitRevision)>; 2] {
     use GitRevision::*;
     let path = change.path.as_str();
     let old_path = change.old_path.as_deref().unwrap_or(path);
-    match (change.scope, change.kind) {
+    match (&change.scope, change.kind) {
+        (GitScope::Commit(id), Added) => [None, Some((path, Commit(id.clone())))],
+        (GitScope::Commit(id), Deleted) => [Some((path, Parent(id.clone()))), None],
+        (GitScope::Commit(id), _) => [
+            Some((old_path, Parent(id.clone()))),
+            Some((path, Commit(id.clone()))),
+        ],
         (_, Conflicted) => [Some((path, Head)), Some((path, WorkTree))],
         (_, Untracked) | (GitScope::Unstaged, Added) => [None, Some((path, WorkTree))],
         (GitScope::Unstaged, Deleted) => [Some((path, Index)), None],
@@ -844,17 +994,22 @@ fn sides(change: &GitChange) -> [Option<(&str, GitRevision)>; 2] {
 }
 
 /// Why the tab of `change`'s file cannot switch to Edit: the change deletes the file, so
-/// there is no new side to edit.
+/// there is no new side to edit (see `sides`).
 fn edit_disabled(change: &GitChange) -> Option<&'static str> {
-    sides(change)[1]
-        .is_none()
+    (change.kind == GitChangeKind::Deleted)
         .then_some("This change deletes the file, so there is nothing to edit")
 }
 
 /// How hunks of `change`'s diff move, and the index path they change: staged from an
 /// unstaged diff, unstaged from a staged one. `None` when the diff does not compare two
-/// versions of one file in the index (added, deleted, untracked or conflicted files).
+/// versions of one file in the index (added, deleted, untracked or conflicted files) and
+/// for a commit's diff, which is read-only.
 fn hunk_target(change: &GitChange) -> Option<(HunkWrite, String)> {
+    let stage = match change.scope {
+        GitScope::Unstaged => true,
+        GitScope::Staged => false,
+        GitScope::Commit(_) => return None,
+    };
     if matches!(
         change.kind,
         GitChangeKind::Conflicted | GitChangeKind::Untracked
@@ -864,9 +1019,10 @@ fn hunk_target(change: &GitChange) -> Option<(HunkWrite, String)> {
     let [Some((old, _)), Some((new, _))] = sides(change) else {
         return None;
     };
-    Some(match change.scope {
-        GitScope::Unstaged => (HunkWrite::Stage, old.to_owned()),
-        GitScope::Staged => (HunkWrite::Unstage, new.to_owned()),
+    Some(if stage {
+        (HunkWrite::Stage, old.to_owned())
+    } else {
+        (HunkWrite::Unstage, new.to_owned())
     })
 }
 
@@ -911,17 +1067,16 @@ fn commit_refusal(staged: bool, amend: bool, has_summary: bool) -> Option<&'stat
     }
 }
 
-/// What a change compares, in words.
-fn baseline(change: &GitChange) -> String {
-    let comparison = match (change.kind, change.scope) {
-        (GitChangeKind::Untracked, _) => return "New file (untracked)".into(),
-        (GitChangeKind::Conflicted, _) => return "Conflicted · working tree vs HEAD".into(),
-        (_, GitScope::Unstaged) => "Working tree vs index",
-        (_, GitScope::Staged) => "Index vs HEAD",
+/// What a change compares, in words. `commit` is the commit of a `Commit` scope, once read.
+fn baseline(change: &GitChange, commit: Option<&GitCommit>) -> String {
+    let comparison = match change.kind {
+        GitChangeKind::Untracked => return "New file (untracked)".into(),
+        GitChangeKind::Conflicted => return "Conflicted · working tree vs HEAD".into(),
+        _ => scope_baseline(&change.scope, commit),
     };
     match &change.old_path {
         Some(old) => format!("{old} → {} · {comparison}", change.path),
-        None => comparison.into(),
+        None => comparison.into_owned(),
     }
 }
 
@@ -958,13 +1113,6 @@ pub(super) fn kind_color(kind: GitChangeKind, colors: &ThemeColors) -> u32 {
         GitChangeKind::Modified | GitChangeKind::TypeChanged => colors.modified,
         GitChangeKind::Renamed | GitChangeKind::Copied => colors.accent,
         GitChangeKind::Conflicted => colors.error,
-    }
-}
-
-fn scope_label(scope: GitScope) -> &'static str {
-    match scope {
-        GitScope::Unstaged => "Unstaged",
-        GitScope::Staged => "Staged",
     }
 }
 
@@ -1090,9 +1238,10 @@ impl CompiApp {
 
     /// Shows the diff of repository path `path` in its file's tab of the content pane
     /// `pane_id` (Diff mode), opening the tab or switching the one open. Without `scope`, the
-    /// unstaged change wins over the staged one; a file with neither leaves a message. `line`
-    /// (1-based, new side) is scrolled into view, now or once the diff is built. Asked before
-    /// the folder was read, it happens when the read lands.
+    /// unstaged change wins over the staged one; a file with neither leaves a message, as
+    /// does a file a `Commit` scope's commit did not change. `line` (1-based, new side) is
+    /// scrolled into view, now or once the diff is built. Asked before the folder (or the
+    /// commit) was read, it happens when the read lands.
     pub(in crate::gui) fn open_diff(
         &mut self,
         pane_id: &PaneId,
@@ -1119,49 +1268,91 @@ impl CompiApp {
             cx.notify();
             return;
         };
-        let listing = match &ui.repo.listing {
-            Listing::Ready(listing) => listing,
-            Listing::Reading => {
-                ui.repo.pending_open = Some((path, scope, line));
-                self.request_repo_listing(pane_id, window, cx);
-                return;
-            }
-            Listing::NotRepo => {
-                self.global_error = Some(format!("Not a Git repository: {}", content.root));
-                return;
-            }
-            Listing::Failed(error) => {
-                self.global_error = Some(format!("Cannot read the Git changes: {error}"));
-                return;
-            }
-        };
-        let listed = |scope: GitScope| {
-            listing
-                .changes
-                .iter()
-                .any(|change| change.scope == scope && change.path == path)
-        };
-        let scope = match scope {
-            Some(scope) => scope,
-            None => match [GitScope::Unstaged, GitScope::Staged]
-                .into_iter()
-                .find(|scope| listed(*scope))
-            {
-                Some(scope) => scope,
-                None => {
-                    self.global_error =
-                        Some(format!("{} has no uncommitted changes", file_name(&path)));
+        let (repo, scope) = match scope {
+            Some(GitScope::Commit(id)) => {
+                let commit = match ui.repo.commits.get(&id) {
+                    Some(CommitState::Ready(commit)) => commit,
+                    Some(CommitState::Reading) => {
+                        ui.repo.pending_open = Some((path, Some(GitScope::Commit(id)), line));
+                        return;
+                    }
+                    None => {
+                        ui.repo.pending_open =
+                            Some((path, Some(GitScope::Commit(id.clone())), line));
+                        self.request_commit(pane_id, id, window, cx);
+                        return;
+                    }
+                    Some(CommitState::Unknown) => {
+                        self.global_error =
+                            Some(format!("No commit {} in this repository", short_id(&id)));
+                        cx.notify();
+                        return;
+                    }
+                    Some(CommitState::Failed(error)) => {
+                        self.global_error =
+                            Some(format!("Cannot read commit {}: {error}", short_id(&id)));
+                        cx.notify();
+                        return;
+                    }
+                };
+                if !commit.changes.iter().any(|change| change.path == path) {
+                    self.global_error = Some(format!(
+                        "{} is not changed in {}",
+                        file_name(&path),
+                        commit.short
+                    ));
                     cx.notify();
                     return;
                 }
-            },
+                (commit.repo.clone(), GitScope::Commit(id))
+            }
+            scope => {
+                let listing = match &ui.repo.listing {
+                    Listing::Ready(listing) => listing,
+                    Listing::Reading => {
+                        ui.repo.pending_open = Some((path, scope, line));
+                        self.request_repo_listing(pane_id, window, cx);
+                        return;
+                    }
+                    Listing::NotRepo => {
+                        self.global_error = Some(format!("Not a Git repository: {}", content.root));
+                        return;
+                    }
+                    Listing::Failed(error) => {
+                        self.global_error = Some(format!("Cannot read the Git changes: {error}"));
+                        return;
+                    }
+                };
+                let listed = |scope: &GitScope| {
+                    listing
+                        .changes
+                        .iter()
+                        .any(|change| change.scope == *scope && change.path == path)
+                };
+                let scope = match scope {
+                    Some(scope) => scope,
+                    None => match [GitScope::Unstaged, GitScope::Staged]
+                        .into_iter()
+                        .find(|scope| listed(scope))
+                    {
+                        Some(scope) => scope,
+                        None => {
+                            self.global_error =
+                                Some(format!("{} has no uncommitted changes", file_name(&path)));
+                            cx.notify();
+                            return;
+                        }
+                    },
+                };
+                (listing.repo.clone(), scope)
+            }
         };
         // The file's tab, whatever path spelling it was opened with, else the work-tree path.
         let file = content
             .files()
-            .find(|open| repo_relative(&listing.repo, open).as_deref() == Some(path.as_str()))
-            .map_or_else(|| work_tree_path(&listing.repo, &path), str::to_owned);
-        ui.repo.reveal(&path, scope, tree);
+            .find(|open| repo_relative(&repo, open).as_deref() == Some(path.as_str()))
+            .map_or_else(|| work_tree_path(&repo, &path), str::to_owned);
+        ui.repo.reveal(&path, &scope, tree);
         let tab = ContentTab::diff(file.clone(), scope);
         if let Some(line) = line {
             match ui.diffs.get(&tab).and_then(DiffTab::view) {
@@ -1367,6 +1558,145 @@ impl CompiApp {
         cx.notify();
     }
 
+    /// Shows the changes of the commit with full id `id` at the top of `pane_id`'s Changes
+    /// list, unfolded and selected, in place of a commit shown before; reads the commit
+    /// unless it is read or on its way. The sidebar switches to the list.
+    pub(super) fn show_commit_changes(
+        &mut self,
+        pane_id: &PaneId,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tree = self.content.changes.tree;
+        let content = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id));
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        let status = &mut ui.repo;
+        let section = GitScope::Commit(id.clone());
+        status.folds.sections.remove(&section);
+        status.shown_commit = Some(id.clone());
+        if let Some(content) = content {
+            status.retain_commits(content);
+        }
+        let read = matches!(status.commits.get(&id), None | Some(CommitState::Failed(_)));
+        status.rebuild(tree);
+        let (listed, key) = (status.listed(), RowKey::Section(section));
+        if let Some(row) = status.rows.iter().position(|row| row_is(row, listed, &key)) {
+            status.select_row(row);
+        }
+        if read {
+            self.request_commit(pane_id, id, window, cx);
+        }
+        self.show_changes_list(pane_id, window, cx);
+    }
+
+    /// The commit section's ×: the list shows the working tree's changes alone again. Diff
+    /// tabs of the commit keep it.
+    fn close_commit_section(&mut self, pane_id: &PaneId) {
+        let tree = self.content.changes.tree;
+        let content = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id));
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        ui.repo.shown_commit = None;
+        if let Some(content) = content {
+            ui.repo.retain_commits(content);
+        }
+        ui.repo.rebuild(tree);
+    }
+
+    /// Reads the commit with full id `id` from `pane_id`'s folder, on a background thread.
+    fn request_commit(
+        &mut self,
+        pane_id: &PaneId,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        ui.repo.commits.insert(id.clone(), CommitState::Reading);
+        let (environment, root) = (ui.environment.clone(), ui.repo.root.clone());
+        let target = self.target.clone();
+        let pane_id = pane_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = {
+                let (root, id) = (root.clone(), id.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        (|| -> crate::Result<_> {
+                            target.connect()?.read_git_commit(environment, root, id)
+                        })()
+                        .map_err(|error| error.to_string())
+                    })
+                    .await
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.commit_read(&pane_id, &root, &id, result, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The answer to `request_commit`, unless the commit was dropped meanwhile. A diff
+    /// waiting for the commit opens.
+    fn commit_read(
+        &mut self,
+        pane_id: &PaneId,
+        root: &str,
+        id: &str,
+        result: Result<GitCommitLookup, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tree = self.content.changes.tree;
+        let Some(status) = self
+            .content
+            .panes
+            .get_mut(pane_id)
+            .map(|ui| &mut ui.repo)
+            .filter(|status| status.root == root)
+        else {
+            return;
+        };
+        let Some(state) = status
+            .commits
+            .get_mut(id)
+            .filter(|state| matches!(state, CommitState::Reading))
+        else {
+            return;
+        };
+        *state = match result {
+            Ok(GitCommitLookup::Found { commit }) => CommitState::Ready(*commit),
+            Ok(GitCommitLookup::Unknown) => CommitState::Unknown,
+            Ok(GitCommitLookup::NotRepository) => {
+                CommitState::Failed("This folder is not in a Git repository".into())
+            }
+            Err(error) => CommitState::Failed(error),
+        };
+        if status.shown_commit.as_deref() == Some(id) {
+            status.rebuild(tree);
+        }
+        let waiting = status.pending_open.take_if(
+            |(_, scope, _)| matches!(scope, Some(GitScope::Commit(waiting)) if waiting == id),
+        );
+        if let Some((path, scope, line)) = waiting {
+            self.open_diff(pane_id, path, scope, line, window, cx);
+        }
+        cx.notify();
+    }
+
     /// Diff this file (Ctrl+Shift+D): the focused pane's open file switches to Diff mode
     /// against the index, else its staged change, at the editor's cursor line; in Diff mode
     /// it returns to editing at the line in view.
@@ -1472,9 +1802,10 @@ impl CompiApp {
         );
     }
 
-    /// Before drawing: the active diff tab of each shown pane is read when its change is
-    /// new or moved, every diff takes the window's colors and font and the hunk button its
-    /// change allows, and each shown Changes list gets its commit box.
+    /// Before drawing: each shown pane's commit (its list's and its active diff tab's) is
+    /// read when it is not known, the active diff tab of each shown pane is read when its
+    /// change is new or moved, every diff takes the window's colors and font and the hunk
+    /// button its change allows, and each shown Changes list gets its commit box.
     pub(super) fn prepare_diff_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active: Vec<(PaneId, ContentTab)> = match &self.workspace {
             Some(workspace) => self
@@ -1488,6 +1819,31 @@ impl CompiApp {
                 .collect(),
             None => Vec::new(),
         };
+        let mut unread: Vec<(PaneId, String)> = Vec::new();
+        for pane_id in self.shown_content_panes() {
+            let Some(status) = self.content.panes.get(pane_id).map(|ui| &ui.repo) else {
+                continue;
+            };
+            let tab_commit = active
+                .iter()
+                .filter(|(active, _)| active == pane_id)
+                .find_map(|(_, tab)| match tab.diff_scope() {
+                    Some(GitScope::Commit(id)) => Some(id.as_str()),
+                    _ => None,
+                });
+            for id in status.shown_commit.as_deref().into_iter().chain(tab_commit) {
+                if !status.commits.contains_key(id)
+                    && !unread
+                        .iter()
+                        .any(|(waiting, known)| waiting == pane_id && known == id)
+                {
+                    unread.push((pane_id.clone(), id.to_owned()));
+                }
+            }
+        }
+        for (pane_id, id) in unread {
+            self.request_commit(&pane_id, id, window, cx);
+        }
         for (pane_id, tab) in active {
             self.load_diff(&pane_id, &tab, window, cx);
         }
@@ -1598,7 +1954,7 @@ impl CompiApp {
             .repo
             .change(tab.path(), scope)
             .cloned()
-            .zip(ui.repo.listing().map(|listing| listing.repo.clone()))
+            .zip(ui.repo.repo_of(scope).map(str::to_owned))
         else {
             return;
         };
@@ -1910,12 +2266,23 @@ impl CompiApp {
         }
     }
 
-    /// Try again after a failed read of the folder or of the active diff.
+    /// Try again after a failed read of the folder, of a commit or of the active diff.
     fn retry_repo(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let mut failed = Vec::new();
         if let Some(ui) = self.content.panes.get_mut(pane_id) {
             for state in ui.diffs.values_mut() {
                 state.failed = None;
             }
+            failed.extend(
+                ui.repo
+                    .commits
+                    .iter()
+                    .filter(|(_, state)| matches!(state, CommitState::Failed(_)))
+                    .map(|(id, _)| id.clone()),
+            );
+        }
+        for id in failed {
+            self.request_commit(pane_id, id, window, cx);
         }
         self.request_repo_listing(pane_id, window, cx);
     }
@@ -2131,11 +2498,12 @@ impl CompiApp {
     }
 
     /// Stages (`Unstaged` changes) or unstages (`Staged` changes) `changes` of the
-    /// repository `pane_id` lists; `section` when they are all of the section's.
+    /// repository `pane_id` lists; `section` when they are all of the section's. A commit's
+    /// changes stay where they are.
     fn move_changes(
         &mut self,
         pane_id: &PaneId,
-        scope: GitScope,
+        scope: &GitScope,
         paths: Vec<String>,
         section: bool,
         window: &mut Window,
@@ -2150,6 +2518,7 @@ impl CompiApp {
         let action = match scope {
             GitScope::Unstaged => GitAction::Stage { paths },
             GitScope::Staged => GitAction::Unstage { paths },
+            GitScope::Commit(_) => return,
         };
         let origin = if section {
             WriteOrigin::Section
@@ -2160,7 +2529,7 @@ impl CompiApp {
     }
 
     /// The paths of every listed change in `scope`, for a section's Stage all / Unstage all.
-    fn section_paths(&self, pane_id: &PaneId, scope: GitScope) -> Vec<String> {
+    fn section_paths(&self, pane_id: &PaneId, scope: &GitScope) -> Vec<String> {
         self.repo_changes(pane_id)
             .map(|listing| scope_paths(&listing.changes, scope, None))
             .unwrap_or_default()
@@ -2194,9 +2563,9 @@ impl CompiApp {
         );
     }
 
-    /// Right-click on a Changes row. A file: open its diff or the file, stage or
-    /// unstage it, discard it (asking first). A section or folder row: the pane's
-    /// actions.
+    /// Right-click on a Changes row. A file: open its diff or the file, copy its path,
+    /// stage or unstage it, discard it (asking first); a commit's file only opens and
+    /// copies. A section or folder row: the pane's actions.
     fn open_change_row_menu(
         &mut self,
         pane_id: &PaneId,
@@ -2208,11 +2577,14 @@ impl CompiApp {
         let Some(ui) = self.content.panes.get_mut(pane_id) else {
             return;
         };
-        let change = match (&ui.repo.listing, ui.repo.rows.get(index)) {
-            (Listing::Ready(listing), Some(ListRow::File { change, .. })) => listing
-                .changes
-                .get(*change)
-                .map(|change| (listing.repo.clone(), change.clone())),
+        let change = match ui.repo.rows.get(index) {
+            Some(ListRow::File { change, .. }) => {
+                let listed = ui.repo.listed();
+                let change = &listed[*change];
+                ui.repo
+                    .repo_of(&change.scope)
+                    .map(|repo| (repo.to_owned(), change.clone()))
+            }
             _ => None,
         };
         let Some((repo, change)) = change else {
@@ -2221,21 +2593,22 @@ impl CompiApp {
         };
         ui.repo.select_row(index);
         let environment = ui.environment.clone();
-        let (scope, kind) = (change.scope, change.kind);
+        let kind = change.kind;
+        let file = work_tree_path(&repo, &change.path);
         let mut entries: Vec<controls::MenuEntry> = Vec::new();
-        let (pane, path) = (pane_id.clone(), change.path.clone());
+        let (pane, path, scope) = (pane_id.clone(), change.path.clone(), change.scope.clone());
         entries.push(
             controls::menu_item(
                 "Open diff",
                 cx.listener(move |this, _, window, cx| {
-                    this.open_diff(&pane, path.clone(), Some(scope), None, window, cx);
+                    this.open_diff(&pane, path.clone(), Some(scope.clone()), None, window, cx);
                     cx.notify();
                 }),
             )
             .into(),
         );
         if kind != GitChangeKind::Deleted {
-            let (pane, file) = (pane_id.clone(), work_tree_path(&repo, &change.path));
+            let (pane, file) = (pane_id.clone(), file.clone());
             entries.push(
                 controls::menu_item(
                     "Open file",
@@ -2256,22 +2629,33 @@ impl CompiApp {
                 .into(),
             );
         }
-        entries.push(controls::MenuEntry::Separator);
-        let (pane, paths) = (pane_id.clone(), change_paths(&change).collect::<Vec<_>>());
         entries.push(
-            controls::menu_item(
-                match (scope, kind) {
-                    (GitScope::Staged, _) => "Unstage",
-                    (_, GitChangeKind::Conflicted) => "Stage (marks it resolved)",
-                    _ => "Stage",
-                },
-                cx.listener(move |this, _, window, cx| {
-                    this.move_changes(&pane, scope, paths.clone(), false, window, cx);
-                }),
-            )
+            controls::menu_item("Copy path", move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(file.clone()));
+            })
             .into(),
         );
-        if scope == GitScope::Unstaged && kind != GitChangeKind::Conflicted {
+        entries.push(controls::MenuEntry::Separator);
+        let move_label = match (&change.scope, kind) {
+            (GitScope::Commit(_), _) => None,
+            (GitScope::Staged, _) => Some("Unstage"),
+            (_, GitChangeKind::Conflicted) => Some("Stage (marks it resolved)"),
+            _ => Some("Stage"),
+        };
+        if let Some(label) = move_label {
+            let (pane, paths) = (pane_id.clone(), change_paths(&change).collect::<Vec<_>>());
+            let scope = change.scope.clone();
+            entries.push(
+                controls::menu_item(
+                    label,
+                    cx.listener(move |this, _, window, cx| {
+                        this.move_changes(&pane, &scope, paths.clone(), false, window, cx);
+                    }),
+                )
+                .into(),
+            );
+        }
+        if change.scope == GitScope::Unstaged && kind != GitChangeKind::Conflicted {
             let pane = pane_id.clone();
             entries.push(
                 controls::menu_item(
@@ -2306,7 +2690,7 @@ impl CompiApp {
         let Some((write, index_path, repo)) = tab.diff_scope().and_then(|scope| {
             let status = &self.content.panes.get(pane_id)?.repo;
             let (write, index_path) = hunk_target(status.change(tab.path(), scope)?)?;
-            Some((write, index_path, status.listing()?.repo.clone()))
+            Some((write, index_path, status.repo_of(scope)?.to_owned()))
         }) else {
             // Nothing to write: the hunk's button stops waiting.
             if let Some(state) = self
@@ -2510,8 +2894,8 @@ impl CompiApp {
                 };
                 let row = &status.rows[at];
                 let section = matches!(row, ListRow::Section { .. });
-                let paths = row_paths(row, status.changes(), scope);
-                self.move_changes(pane_id, scope, paths, section, window, cx);
+                let paths = row_paths(row, status.listed(), &scope);
+                self.move_changes(pane_id, &scope, paths, section, window, cx);
                 true
             }
             "delete" => {
@@ -2519,7 +2903,7 @@ impl CompiApp {
                     return false;
                 };
                 if let ListRow::File { change, .. } = status.rows[at] {
-                    let change = status.changes()[change].clone();
+                    let change = status.listed()[change].clone();
                     if change.scope == GitScope::Unstaged
                         && change.kind != GitChangeKind::Conflicted
                     {
@@ -2548,7 +2932,7 @@ impl CompiApp {
             .repo
             .rows
             .get(at)
-            .map(|row| row_key(row, ui.repo.changes()))
+            .map(|row| row_key(row, ui.repo.listed()))
         else {
             return;
         };
@@ -2620,7 +3004,7 @@ impl CompiApp {
         };
         let Some((path, scope)) = content
             .active_diff()
-            .map(|(path, scope)| (path.to_owned(), scope))
+            .map(|(path, scope)| (path.to_owned(), scope.clone()))
         else {
             return;
         };
@@ -2630,23 +3014,17 @@ impl CompiApp {
         };
         let editing = ui.editor(&path).is_some();
         let status = &mut ui.repo;
-        let Some(listing) = status.listing() else {
-            return;
-        };
-        let repo = listing.repo.clone();
-        let relative = repo_relative(&repo, &path);
-        let changes = status.changes();
-        let order: Vec<(&str, GitScope)> = status
-            .order
-            .iter()
-            .map(|&index| (changes[index].path.as_str(), changes[index].scope))
-            .collect();
+        let relative = status
+            .repo_of(&scope)
+            .and_then(|repo| repo_relative(repo, &path));
+        let listed = status.listed();
+        let order: Vec<&GitChange> = status.order.iter().map(|&index| &listed[index]).collect();
         let Some(last) = order.len().checked_sub(1) else {
             return;
         };
-        let at = order
-            .iter()
-            .position(|&(listed, at)| Some(listed) == relative.as_deref() && at == scope);
+        let at = order.iter().position(|change| {
+            Some(change.path.as_str()) == relative.as_deref() && change.scope == scope
+        });
         let next = match at {
             Some(at) if forward => (at + 1).min(last),
             Some(at) => at.saturating_sub(1),
@@ -2655,8 +3033,11 @@ impl CompiApp {
         if Some(next) == at {
             return;
         }
-        let (next_path, next_scope) = (order[next].0.to_owned(), order[next].1);
-        status.reveal(&next_path, next_scope, tree);
+        let (next_path, next_scope) = (order[next].path.clone(), order[next].scope.clone());
+        let Some(repo) = status.repo_of(&next_scope).map(str::to_owned) else {
+            return;
+        };
+        status.reveal(&next_path, &next_scope, tree);
         let file = content
             .files()
             .find(|open| repo_relative(&repo, open).as_deref() == Some(next_path.as_str()))
@@ -2683,7 +3064,7 @@ impl CompiApp {
     /// `[`/`]` step through the changes, `s` stages the file of an unstaged diff and `u`
     /// unstages the file of a staged one, Ctrl/Cmd+F finds in the diff, and the diff takes
     /// the rest it knows (`n`/`p` move through hunks, Enter on the current hunk is its
-    /// Stage hunk or Unstage hunk button).
+    /// Stage hunk or Unstage hunk button). A commit's diff stages nothing.
     pub(super) fn diff_tab_key_down(
         &mut self,
         pane_id: &PaneId,
@@ -2705,7 +3086,7 @@ impl CompiApp {
                 "u" => Some(GitScope::Staged),
                 _ => None,
             };
-            if wanted.is_some() && wanted == tab.diff_scope() {
+            if wanted.is_some() && wanted.as_ref() == tab.diff_scope() {
                 self.move_tab_file(pane_id, tab, window, cx);
                 return true;
             }
@@ -2904,7 +3285,8 @@ impl CompiApp {
                     .children(self.remote_controls(pane_id, Ok(listing), cx))
                     .child(tree_button),
             );
-        let body = if listing.changes.is_empty() {
+        // A commit's section shows whether or not the working tree has changes.
+        let body = if listing.changes.is_empty() && repo.shown_commit.is_none() {
             self.changes_message(
                 "No changes",
                 Some(("The working tree and index match HEAD".into(), colors.muted)),
@@ -2941,22 +3323,30 @@ impl CompiApp {
             .child(header)
             .children(self.render_commit_box(pane_id, repo, listing, cx))
             .child(body)
-            .when(listing.truncated, |list| {
-                list.child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(color(colors.border))
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                        .text_color(color(colors.muted))
-                        .child(format!(
-                            "Showing the first {} changes",
-                            compi_protocol::MAX_GIT_CHANGES
-                        )),
-                )
-            })
+            .when(
+                listing.truncated
+                    || repo
+                        .shown_commit
+                        .as_deref()
+                        .and_then(|id| repo.ready_commit(id))
+                        .is_some_and(|commit| commit.truncated),
+                |list| {
+                    list.child(
+                        div()
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(color(colors.border))
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .child(format!(
+                                "Showing the first {} changes",
+                                compi_protocol::MAX_GIT_CHANGES
+                            )),
+                    )
+                },
+            )
             .into_any_element()
     }
 
@@ -3106,7 +3496,9 @@ impl CompiApp {
     }
 
     /// The list rows in `range`, drawn as the list scrolls to them. While `keyboard` (the
-    /// pane itself has the keyboard) the selected row shows an outline and its actions.
+    /// pane itself has the keyboard) the selected row shows an outline and its actions. A
+    /// commit's section names the commit (its author and date in the tooltip), or how
+    /// reading it goes, and closes with its ×; its files have no actions.
     fn render_change_rows(
         &self,
         pane_id: &PaneId,
@@ -3117,18 +3509,19 @@ impl CompiApp {
         let Some(repo) = self.content.panes.get(pane_id).map(|ui| &ui.repo) else {
             return Vec::new();
         };
-        let Listing::Ready(listing) = &repo.listing else {
+        if !matches!(repo.listing, Listing::Ready(_)) {
             return Vec::new();
-        };
+        }
         let Some(rows) = repo.rows.get(range.clone()) else {
             return Vec::new();
         };
+        let listed = repo.listed();
         let active = self
             .workspace
             .as_ref()
             .and_then(|workspace| find_content(workspace, pane_id))
             .and_then(|content| content.active_diff())
-            .and_then(|(file, scope)| Some((repo_relative(&listing.repo, file)?, scope)));
+            .and_then(|(file, scope)| Some((repo_relative(repo.repo_of(scope)?, file)?, scope)));
         let colors = *self.colors();
         let tree = self.content.changes.tree;
         let row_height = self
@@ -3195,24 +3588,106 @@ impl CompiApp {
                     .whitespace_nowrap();
                 match row {
                     ListRow::Section {
+                        scope: GitScope::Commit(id),
+                        count,
+                        collapsed,
+                    } => {
+                        let (short, summary, tint) = match repo.commits.get(id) {
+                            Some(CommitState::Ready(commit)) => (
+                                commit.short.as_str(),
+                                commit.summary.clone(),
+                                colors.foreground,
+                            ),
+                            Some(CommitState::Unknown) => {
+                                (short_id(id), "Unknown commit".to_owned(), colors.error)
+                            }
+                            Some(CommitState::Failed(error)) => {
+                                (short_id(id), format!("Cannot read: {error}"), colors.error)
+                            }
+                            None | Some(CommitState::Reading) => {
+                                (short_id(id), "Reading…".to_owned(), colors.muted)
+                            }
+                        };
+                        let tooltip = repo.ready_commit(id).map(|commit| {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |since| since.as_secs());
+                            let when = crate::updates::time_since(
+                                u64::try_from(commit.time).unwrap_or(0),
+                                now,
+                            );
+                            controls::tooltip(
+                                format!("{} {}", commit.short, commit.summary),
+                                Some(format!("{} · {when}", commit.author).into()),
+                                None,
+                            )
+                        });
+                        let ready = tooltip.is_some();
+                        let closer = pane_id.clone();
+                        let close = icon_button(
+                            ("changes-commit-close", index),
+                            IconName::X,
+                            "Close this commit",
+                        )
+                        .tab_stop(false)
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.close_commit_section(&closer);
+                                cx.notify();
+                            },
+                        ));
+                        base.pl(px(TREE_INSET))
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .hover(move |style| style.text_color(color(colors.foreground)))
+                            .when_some(tooltip, |row, tooltip| row.tooltip(tooltip))
+                            .child(
+                                item.child(fold_chevron(*collapsed, color(colors.muted)))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .font_family(mono.clone())
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(short.to_owned()),
+                                    )
+                                    .child(
+                                        div()
+                                            .ml_2()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_color(color(tint))
+                                            .child(summary),
+                                    )
+                                    .child(div().flex_1())
+                                    .when(ready, |item| {
+                                        item.child(
+                                            div().flex_none().ml_2().child(count.to_string()),
+                                        )
+                                    }),
+                            )
+                            .child(div().flex_none().child(close))
+                            .into_any_element()
+                    }
+                    ListRow::Section {
                         scope,
                         count,
                         collapsed,
                     } => {
-                        let scope = *scope;
-                        let (icon, title, key) = match scope {
-                            GitScope::Unstaged => (IconName::Plus, "Stage all", "s"),
-                            GitScope::Staged => (IconName::Minus, "Unstage all", "u"),
+                        let (icon, title, key, label) = match scope {
+                            GitScope::Unstaged => (IconName::Plus, "Stage all", "s", "Unstaged"),
+                            GitScope::Staged => (IconName::Minus, "Unstage all", "u", "Staged"),
+                            GitScope::Commit(_) => unreachable!("drawn by the arm above"),
                         };
                         let moving = repo.moving_section(scope);
-                        let mover = pane_id.clone();
+                        let (mover, scope) = (pane_id.clone(), scope.clone());
                         let move_all = icon_button(("changes-section-move", index), icon, title)
                             .key(key)
                             .tab_stop(false)
                             .loading(moving)
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                let paths = this.section_paths(&mover, scope);
-                                this.move_changes(&mover, scope, paths, true, window, cx);
+                                let paths = this.section_paths(&mover, &scope);
+                                this.move_changes(&mover, &scope, paths, true, window, cx);
                             }));
                         base.pl(px(TREE_INSET))
                             .text_size(px(UI_MICRO_TEXT_SIZE))
@@ -3220,11 +3695,7 @@ impl CompiApp {
                             .hover(move |style| style.text_color(color(colors.foreground)))
                             .child(
                                 item.child(fold_chevron(*collapsed, color(colors.muted)))
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(scope_label(scope)),
-                                    )
+                                    .child(div().font_weight(FontWeight::SEMIBOLD).child(label))
                                     .child(div().ml_2().child(count.to_string())),
                             )
                             .child(row_controls(chosen || moving, &colors, [move_all]))
@@ -3256,9 +3727,9 @@ impl CompiApp {
                         )
                         .into_any_element(),
                     ListRow::File { change, depth } => {
-                        let change = &listing.changes[*change];
+                        let change = &listed[*change];
                         let open = active.as_ref().is_some_and(|(path, scope)| {
-                            *path == change.path && *scope == change.scope
+                            *path == change.path && **scope == change.scope
                         });
                         let (folder, name) = split_path(&change.path);
                         let level = if tree { *depth } else { 0 };
@@ -3283,13 +3754,13 @@ impl CompiApp {
                         let folder = (!tree && !folder.is_empty())
                             .then(|| truncate_middle(folder, (room / MICRO_GLYPH_WIDTH) as usize))
                             .filter(|folder| folder.chars().count() >= 4);
-                        let scope = change.scope;
+                        let scope = &change.scope;
                         let deleted = change.kind == GitChangeKind::Deleted;
                         let kind = change.kind;
                         let moving = repo.moving(scope, &change.path);
                         let discarding = repo.discarding(&change.path);
                         let mut actions = Vec::new();
-                        if scope == GitScope::Unstaged && kind != GitChangeKind::Conflicted {
+                        if *scope == GitScope::Unstaged && kind != GitChangeKind::Conflicted {
                             let (discarder, discarded) = (pane_id.clone(), change.clone());
                             actions.push(
                                 icon_button(
@@ -3315,38 +3786,46 @@ impl CompiApp {
                                 )),
                             );
                         }
-                        let (mover, paths) =
-                            (pane_id.clone(), change_paths(change).collect::<Vec<_>>());
-                        let (icon, key) = match scope {
-                            GitScope::Unstaged => (IconName::Plus, "s"),
-                            GitScope::Staged => (IconName::Minus, "u"),
+                        let mover = match scope {
+                            GitScope::Unstaged => Some((IconName::Plus, "s")),
+                            GitScope::Staged => Some((IconName::Minus, "u")),
+                            GitScope::Commit(_) => None,
                         };
-                        actions.push(
-                            icon_button(
-                                ("changes-row-move", index),
-                                icon,
-                                match (scope, kind) {
-                                    (GitScope::Staged, _) => "Unstage",
-                                    (_, GitChangeKind::Conflicted) => "Stage (marks it resolved)",
-                                    _ => "Stage",
-                                },
-                            )
-                            .key(key)
-                            .tab_stop(false)
-                            .loading(moving)
-                            .on_click(cx.listener(
-                                move |this, _: &ClickEvent, window, cx| {
-                                    this.move_changes(
-                                        &mover,
-                                        scope,
-                                        paths.clone(),
-                                        false,
-                                        window,
-                                        cx,
-                                    );
-                                },
-                            )),
-                        );
+                        if let Some((icon, key)) = mover {
+                            let (mover, scope, paths) = (
+                                pane_id.clone(),
+                                scope.clone(),
+                                change_paths(change).collect::<Vec<_>>(),
+                            );
+                            actions.push(
+                                icon_button(
+                                    ("changes-row-move", index),
+                                    icon,
+                                    match (&scope, kind) {
+                                        (GitScope::Staged, _) => "Unstage",
+                                        (_, GitChangeKind::Conflicted) => {
+                                            "Stage (marks it resolved)"
+                                        }
+                                        _ => "Stage",
+                                    },
+                                )
+                                .key(key)
+                                .tab_stop(false)
+                                .loading(moving)
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.move_changes(
+                                            &mover,
+                                            &scope,
+                                            paths.clone(),
+                                            false,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            );
+                        }
                         let actions_shown = chosen || moving || discarding;
                         base.pl(px(inset))
                             .when(tree, |row| {
@@ -3421,24 +3900,27 @@ impl CompiApp {
             .collect()
     }
 
-    /// What a tab in Diff mode compares, for its tooltip: `src/a.rs · working tree vs index`.
+    /// What a tab in Diff mode compares, for its tooltip: `src/a.rs · working tree vs index`,
+    /// `src/a.rs · abc1234 against its parent`.
     pub(super) fn diff_tab_baseline(ui: &PaneUi, tab: &ContentTab) -> Option<String> {
         let scope = tab.diff_scope()?;
         let file = tab.path();
         let path = ui
             .repo
-            .listing()
-            .and_then(|listing| repo_relative(&listing.repo, file))
+            .diff_repo(scope)
+            .and_then(|repo| repo_relative(repo, file))
             .unwrap_or_else(|| file.to_owned());
-        let compared = ui
-            .repo
-            .change(file, scope)
-            .map_or_else(|| scope_baseline(scope).to_owned(), baseline);
+        let commit = ui.repo.commit_of(scope);
+        let compared = ui.repo.change(file, scope).map_or_else(
+            || scope_baseline(scope, commit).into_owned(),
+            |change| baseline(change, commit),
+        );
         Some(format!("{path} · {}", lowercase_first(&compared)))
     }
 
     /// A tab's body in Diff mode: the change's header with the Edit / Diff switch and the
-    /// diff controls, then its diff or what keeps it from showing.
+    /// diff controls, then its diff or what keeps it from showing: the folder's listing
+    /// or, for a commit's diff, the commit not read yet.
     pub(super) fn render_diff_tab(
         &self,
         pane_id: &PaneId,
@@ -3453,11 +3935,12 @@ impl CompiApp {
         // The repository path once the listing places the file, else the path as opened.
         let relative = ui
             .repo
-            .listing()
-            .and_then(|listing| repo_relative(&listing.repo, file));
+            .diff_repo(scope)
+            .and_then(|repo| repo_relative(repo, file));
         let path = relative.as_deref().unwrap_or(file);
         let colors = *self.colors();
         let change = ui.repo.change(file, scope);
+        let commit = ui.repo.commit_of(scope);
         let state = ui.diffs.get(tab);
         let body = div().flex_1().min_h_0().relative().flex().flex_col();
         let muted_line = |text: String| {
@@ -3472,30 +3955,58 @@ impl CompiApp {
                 .child(text)
                 .into_any_element()
         };
-        let body = match (&ui.repo.listing, change) {
-            (Listing::Reading, _) => muted_line("Reading changes…".into()),
-            (Listing::NotRepo, _) => muted_line(format!("Not a Git repository: {}", ui.repo.root)),
-            (Listing::Failed(_), _) => {
-                self.changes_message("Cannot read the changes", None, Some(pane_id), cx)
-            }
-            (Listing::Ready(_), _) if relative.is_none() => {
-                muted_line(format!("Not in this folder's repository: {file}"))
-            }
-            (Listing::Ready(_), None) => self.changes_message(
-                "No changes",
-                Some((
-                    format!(
-                        "{} · {}",
-                        split_path(path).1,
-                        scope_baseline(scope).to_lowercase()
-                    ),
-                    colors.muted,
+        let unread = match scope {
+            GitScope::Commit(id) => match ui.repo.commits.get(id) {
+                Some(CommitState::Ready(_)) => None,
+                None | Some(CommitState::Reading) => {
+                    Some(muted_line(format!("Reading commit {}…", short_id(id))))
+                }
+                Some(CommitState::Unknown) => Some(muted_line(format!(
+                    "No commit {} in this repository",
+                    short_id(id)
+                ))),
+                Some(CommitState::Failed(error)) => Some(self.changes_message(
+                    "Cannot read the commit",
+                    Some((error.clone(), colors.error)),
+                    Some(pane_id),
+                    cx,
                 )),
-                None,
-                cx,
-            ),
-            (Listing::Ready(_), Some(_)) => {
-                match state {
+            },
+            _ => match &ui.repo.listing {
+                Listing::Reading => Some(muted_line("Reading changes…".into())),
+                Listing::NotRepo => Some(muted_line(format!(
+                    "Not a Git repository: {}",
+                    ui.repo.root
+                ))),
+                Listing::Failed(_) => {
+                    Some(self.changes_message("Cannot read the changes", None, Some(pane_id), cx))
+                }
+                Listing::Ready(_) => None,
+            },
+        };
+        let body =
+            match (unread, change) {
+                (Some(message), _) => message,
+                (None, _) if relative.is_none() => {
+                    muted_line(format!("Not in this folder's repository: {file}"))
+                }
+                (None, None) => self.changes_message(
+                    match scope {
+                        GitScope::Commit(_) => "Not changed in this commit",
+                        _ => "No changes",
+                    },
+                    Some((
+                        format!(
+                            "{} · {}",
+                            split_path(path).1,
+                            scope_baseline(scope, commit).to_lowercase()
+                        ),
+                        colors.muted,
+                    )),
+                    None,
+                    cx,
+                ),
+                (None, Some(_)) => match state {
                     Some(DiffTab {
                         failed: Some((_, error)),
                         ..
@@ -3526,9 +4037,8 @@ impl CompiApp {
                         shown: Some(shown), ..
                     }) => body.child(shown.view.clone()).into_any_element(),
                     _ => body.into_any_element(),
-                }
-            }
-        };
+                },
+            };
         div()
             .flex_1()
             .min_w_0()
@@ -3589,8 +4099,9 @@ impl CompiApp {
         controls::segmented("file-mode", [edit, show_diff]).into_any_element()
     }
 
-    /// Path, kind, scope, line counts and what the diff compares; the Edit / Diff switch,
-    /// how diffs show; Stage or Unstage, and Discard.
+    /// Path, kind, scope (`staged`, or the commit), line counts and what the diff compares;
+    /// the Edit / Diff switch, how diffs show; Stage or Unstage, and Discard, but for a
+    /// commit's diff.
     #[allow(clippy::too_many_arguments)]
     fn render_diff_header(
         &self,
@@ -3598,7 +4109,7 @@ impl CompiApp {
         ui: &PaneUi,
         tab: &ContentTab,
         path: &str,
-        scope: GitScope,
+        scope: &GitScope,
         change: Option<&GitChange>,
         state: Option<&DiffTab>,
         cx: &Context<Self>,
@@ -3616,7 +4127,18 @@ impl CompiApp {
             .and_then(|view| view.read(cx).stats())
             .or(change.and_then(|change| change.added.zip(change.removed)))
             .map(|(added, removed)| (u64::from(added), u64::from(removed)));
-        let compared = change.map_or_else(|| scope_baseline(scope).to_owned(), baseline);
+        let commit = ui.repo.commit_of(scope);
+        let compared = change.map_or_else(
+            || scope_baseline(scope, commit).into_owned(),
+            |change| baseline(change, commit),
+        );
+        let scope_chip = match scope {
+            GitScope::Unstaged => None,
+            GitScope::Staged => Some("staged"),
+            GitScope::Commit(id) => {
+                Some(commit.map_or_else(|| short_id(id), |commit| commit.short.as_str()))
+            }
+        };
         let (title, detail) = (path.to_owned(), SharedString::from(compared.clone()));
         let expanded = shown
             .as_ref()
@@ -3690,19 +4212,22 @@ impl CompiApp {
             });
         }
         let mode_switch = self.render_mode_switch(pane_id, ui, tab, cx);
-        // The diff reads the saved file (or the index), never the editor's buffer.
-        let unsaved = ui.editor(tab.path()).is_some_and(|editor| editor.dirty);
+        // The diff reads the saved file (or the index), never the editor's buffer; a
+        // commit's diff reads neither.
+        let unsaved = !matches!(scope, GitScope::Commit(_))
+            && ui.editor(tab.path()).is_some_and(|editor| editor.dirty);
         let status = self.content.panes.get(pane_id).map(|ui| &ui.repo);
-        let (move_label, move_key, move_detail) = match scope {
-            GitScope::Unstaged => ("Stage", "s", "Adds the whole file to the index"),
-            GitScope::Staged => ("Unstage", "u", "Takes the whole file out of the index"),
+        let mover = match scope {
+            GitScope::Unstaged => Some(("Stage", "s", "Adds the whole file to the index")),
+            GitScope::Staged => Some(("Unstage", "u", "Takes the whole file out of the index")),
+            GitScope::Commit(_) => None,
         };
         let (move_pane, move_tab) = (pane_id.clone(), tab.clone());
-        let move_button = change.map(|_| {
-            text_button("diff-move-file", move_label)
+        let move_button = change.zip(mover).map(|(_, (label, key, detail))| {
+            text_button("diff-move-file", label)
                 .header()
-                .key(move_key)
-                .detail(move_detail)
+                .key(key)
+                .detail(detail)
                 .loading(status.is_some_and(|status| status.moving(scope, path)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.move_tab_file(&move_pane, &move_tab, window, cx);
@@ -3780,8 +4305,8 @@ impl CompiApp {
                             ChipTone::Tint(kind_color(change.kind, &colors)),
                         ))
                     })
-                    .when(scope == GitScope::Staged, |header| {
-                        header.child(controls::chip("staged", ChipTone::Neutral))
+                    .when_some(scope_chip, |header, chip| {
+                        header.child(controls::chip(chip.to_owned(), ChipTone::Neutral))
                     })
                     .when(unsaved, |header| {
                         header.child(controls::chip("Unsaved edits not shown", ChipTone::Neutral))
@@ -3879,6 +4404,39 @@ mod tests {
         }
     }
 
+    /// The working tree's `changes` as the list shows them, with no commit.
+    fn working(changes: &[GitChange]) -> Listed<'_> {
+        Listed {
+            commit: &[],
+            working: changes,
+        }
+    }
+
+    fn working_rows(
+        changes: &[GitChange],
+        tree: bool,
+        folds: &Folds,
+    ) -> (Vec<ListRow>, Vec<usize>) {
+        list_rows(working(changes), None, tree, folds)
+    }
+
+    const ID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn commit(parent: Option<&str>, merge: bool) -> GitCommit {
+        GitCommit {
+            repo: "/home/me/proj".into(),
+            id: ID.into(),
+            short: "0123456".into(),
+            parent: parent.map(str::to_owned),
+            merge,
+            summary: "Fix the layout".into(),
+            author: "Me".into(),
+            time: 0,
+            changes: Vec::new(),
+            truncated: false,
+        }
+    }
+
     #[test]
     fn tree_marks_key_tree_paths_below_the_pane_folder() {
         use GitChangeKind::{Added, Deleted, Modified};
@@ -3946,7 +4504,7 @@ mod tests {
             change(Unstaged, Modified, "crates/client/src/lib.rs"),
             change(Unstaged, Modified, "docs/guide/intro.md"),
         ];
-        let (rows, order) = list_rows(&changes, true, &Folds::default());
+        let (rows, order) = working_rows(&changes, true, &Folds::default());
         let labels: Vec<String> = rows
             .iter()
             .map(|row| match row {
@@ -3975,7 +4533,7 @@ mod tests {
         folds
             .folders
             .insert((Unstaged, "crates/client/src".to_owned()));
-        let (folded, folded_order) = list_rows(&changes, true, &folds);
+        let (folded, folded_order) = working_rows(&changes, true, &folds);
         assert_eq!(folded.len(), 5);
         assert!(matches!(
             &folded[1],
@@ -3995,7 +4553,7 @@ mod tests {
             change(GitScope::Unstaged, Untracked, "new.rs"),
             change(GitScope::Staged, Modified, "b.rs"),
         ];
-        let (rows, order) = list_rows(&changes, false, &Folds::default());
+        let (rows, order) = working_rows(&changes, false, &Folds::default());
         assert_eq!(
             rows,
             [
@@ -4026,10 +4584,10 @@ mod tests {
         assert_eq!(order, [0, 1, 2]);
         let mut folds = Folds::default();
         folds.sections.insert(GitScope::Unstaged);
-        let (rows, order) = list_rows(&changes, false, &folds);
+        let (rows, order) = working_rows(&changes, false, &folds);
         assert_eq!(rows.len(), 3);
         assert_eq!(order, [0, 1, 2]);
-        let (rows, _) = list_rows(&changes[2..], false, &Folds::default());
+        let (rows, _) = working_rows(&changes[2..], false, &Folds::default());
         assert!(matches!(
             rows[0],
             ListRow::Section {
@@ -4037,6 +4595,79 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_commit_section_leads_and_shows_without_working_changes() {
+        use GitChangeKind::*;
+        let scope = GitScope::Commit(ID.into());
+        let committed = [
+            change(scope.clone(), Added, "src/new.rs"),
+            change(scope.clone(), Modified, "src/old.rs"),
+        ];
+        let working = [change(GitScope::Staged, Modified, "b.rs")];
+        let listed = Listed {
+            commit: &committed,
+            working: &working,
+        };
+        let (rows, order) = list_rows(listed, Some(ID), false, &Folds::default());
+        assert_eq!(
+            rows,
+            [
+                ListRow::Section {
+                    scope: scope.clone(),
+                    count: 2,
+                    collapsed: false
+                },
+                ListRow::File {
+                    change: 0,
+                    depth: 0
+                },
+                ListRow::File {
+                    change: 1,
+                    depth: 0
+                },
+                ListRow::Section {
+                    scope: GitScope::Staged,
+                    count: 1,
+                    collapsed: false
+                },
+                ListRow::File {
+                    change: 2,
+                    depth: 0
+                },
+            ]
+        );
+        assert_eq!(order, [0, 1, 2]);
+        assert_eq!(listed[2].path, "b.rs");
+        assert_eq!(
+            row_key(&rows[2], listed),
+            RowKey::File(scope.clone(), "src/old.rs".into())
+        );
+        // Nothing to stage or unstage in a commit.
+        assert!(row_paths(&rows[0], listed, &GitScope::Staged).is_empty());
+        assert!(row_paths(&rows[1], listed, &GitScope::Unstaged).is_empty());
+        // No working changes: the commit's section alone, and while it is read, empty.
+        let (rows, _) = list_rows(
+            Listed {
+                commit: &committed,
+                working: &[],
+            },
+            Some(ID),
+            true,
+            &Folds::default(),
+        );
+        assert_eq!(rows.len(), 4);
+        let (rows, order) = list_rows(Listed::default(), Some(ID), false, &Folds::default());
+        assert_eq!(
+            rows,
+            [ListRow::Section {
+                scope,
+                count: 0,
+                collapsed: false
+            }]
+        );
+        assert!(order.is_empty());
     }
 
     #[test]
@@ -4072,6 +4703,28 @@ mod tests {
         assert_eq!(
             sides(&change(GitScope::Unstaged, Conflicted, "a")),
             [Some(("a", Head)), Some(("a", WorkTree))]
+        );
+        let scope = GitScope::Commit(ID.into());
+        let (at, before) = (Commit(ID.into()), Parent(ID.into()));
+        assert_eq!(
+            sides(&change(scope.clone(), Added, "a")),
+            [None, Some(("a", at.clone()))]
+        );
+        assert_eq!(
+            sides(&change(scope.clone(), Deleted, "a")),
+            [Some(("a", before.clone())), None]
+        );
+        assert_eq!(
+            sides(&change(scope.clone(), Modified, "a")),
+            [Some(("a", before.clone())), Some(("a", at.clone()))]
+        );
+        let renamed = GitChange {
+            old_path: Some("old.rs".into()),
+            ..change(scope, Renamed, "new.rs")
+        };
+        assert_eq!(
+            sides(&renamed),
+            [Some(("old.rs", before)), Some(("new.rs", at))]
         );
     }
 
@@ -4132,32 +4785,62 @@ mod tests {
         ] {
             assert_eq!(hunk_target(&change(scope, kind, "a.rs")), None, "{kind:?}");
         }
+        // A commit's diff is read-only.
+        for kind in [Modified, Renamed, Added] {
+            let committed = change(GitScope::Commit(ID.into()), kind, "a.rs");
+            assert_eq!(hunk_target(&committed), None, "{kind:?}");
+        }
     }
 
     #[test]
     fn baselines_name_what_is_compared() {
         use GitChangeKind::*;
         assert_eq!(
-            baseline(&change(GitScope::Unstaged, Modified, "a")),
+            baseline(&change(GitScope::Unstaged, Modified, "a"), None),
             "Working tree vs index"
         );
         assert_eq!(
-            baseline(&change(GitScope::Staged, Added, "a")),
+            baseline(&change(GitScope::Staged, Added, "a"), None),
             "Index vs HEAD"
         );
         assert_eq!(
-            baseline(&change(GitScope::Unstaged, Untracked, "a")),
+            baseline(&change(GitScope::Unstaged, Untracked, "a"), None),
             "New file (untracked)"
         );
         assert_eq!(
-            baseline(&change(GitScope::Unstaged, Conflicted, "a")),
+            baseline(&change(GitScope::Unstaged, Conflicted, "a"), None),
             "Conflicted · working tree vs HEAD"
         );
         let mut renamed = change(GitScope::Staged, Renamed, "src/new.rs");
         renamed.old_path = Some("src/old.rs".into());
         assert_eq!(
-            baseline(&renamed),
+            baseline(&renamed, None),
             "src/old.rs → src/new.rs · Index vs HEAD"
+        );
+        let scope = GitScope::Commit(ID.into());
+        let modified = change(scope.clone(), Modified, "a");
+        let parent = "fedcba9876543210fedcba9876543210fedcba98";
+        assert_eq!(
+            baseline(&modified, Some(&commit(Some(parent), false))),
+            "0123456 against its parent"
+        );
+        assert_eq!(
+            baseline(&modified, Some(&commit(Some(parent), true))),
+            "0123456 against its first parent"
+        );
+        assert_eq!(
+            baseline(&modified, Some(&commit(None, false))),
+            "0123456, the first commit"
+        );
+        // Before the commit is read, its id stands in.
+        assert_eq!(scope_baseline(&scope, None), "0123456 against its parent");
+        let renamed = GitChange {
+            old_path: Some("old.rs".into()),
+            ..change(scope, Renamed, "new.rs")
+        };
+        assert_eq!(
+            baseline(&renamed, Some(&commit(Some(parent), false))),
+            "old.rs → new.rs · 0123456 against its parent"
         );
     }
 
@@ -4200,7 +4883,7 @@ mod tests {
     fn left_and_right_fold_or_move_out_and_in() {
         let changes = selection_changes();
         // 0 Unstaged, 1 src/, 2 a.rs, 3 b.rs, 4 README.md, 5 Staged, 6 src/, 7 a.rs.
-        let (rows, _) = list_rows(&changes, true, &Folds::default());
+        let (rows, _) = working_rows(&changes, true, &Folds::default());
         assert_eq!(rows.len(), 8);
         assert_eq!(sideways(&rows, 0, false), Sideways::Toggle);
         assert_eq!(sideways(&rows, 0, true), Sideways::Select(1));
@@ -4211,7 +4894,7 @@ mod tests {
         assert_eq!(sideways(&rows, 4, false), Sideways::Select(0));
         let mut folds = Folds::default();
         folds.sections.insert(GitScope::Staged);
-        let (folded, _) = list_rows(&changes, true, &folds);
+        let (folded, _) = working_rows(&changes, true, &folds);
         assert_eq!(sideways(&folded, 5, true), Sideways::Toggle);
         assert_eq!(sideways(&folded, 5, false), Sideways::Stay);
     }
@@ -4220,51 +4903,54 @@ mod tests {
     fn the_selection_keeps_its_row_across_listings_and_folds() {
         use GitScope::{Staged, Unstaged};
         let changes = selection_changes();
-        let (rows, _) = list_rows(&changes, true, &Folds::default());
+        let listed = working(&changes);
+        let (rows, _) = working_rows(&changes, true, &Folds::default());
         let b = RowKey::File(Unstaged, "src/b.rs".into());
-        assert_eq!(reselect(&rows, &changes, &b, 0), Some(3));
-        assert_eq!(row_key(&rows[3], &changes), b);
+        assert_eq!(reselect(&rows, listed, &b, 0), Some(3));
+        assert_eq!(row_key(&rows[3], listed), b);
         assert_eq!(
-            reselect(&rows, &changes, &RowKey::Folder(Staged, "src".into()), 0),
+            reselect(&rows, listed, &RowKey::Folder(Staged, "src".into()), 0),
             Some(6)
         );
         // A fold hiding the row takes the selection.
         let mut folds = Folds::default();
         folds.folders.insert((Unstaged, "src".into()));
-        let (folded, _) = list_rows(&changes, true, &folds);
-        assert_eq!(reselect(&folded, &changes, &b, 3), Some(1));
+        let (folded, _) = working_rows(&changes, true, &folds);
+        assert_eq!(reselect(&folded, listed, &b, 3), Some(1));
         folds.sections.insert(Unstaged);
-        let (folded, _) = list_rows(&changes, true, &folds);
-        assert_eq!(reselect(&folded, &changes, &b, 3), Some(0));
+        let (folded, _) = working_rows(&changes, true, &folds);
+        assert_eq!(reselect(&folded, listed, &b, 3), Some(0));
         // Staged: the row now at its place.
         let mut staged = changes.clone();
         staged[1].scope = Staged;
-        let (rows, _) = list_rows(&staged, true, &Folds::default());
-        assert_eq!(reselect(&rows, &staged, &b, 3), Some(3));
+        let listed = working(&staged);
+        let (rows, _) = working_rows(&staged, true, &Folds::default());
+        assert_eq!(reselect(&rows, listed, &b, 3), Some(3));
         assert_eq!(
-            row_key(&rows[3], &staged),
+            row_key(&rows[3], listed),
             RowKey::File(Unstaged, "README.md".into())
         );
-        assert_eq!(reselect(&rows, &staged, &b, 40), Some(rows.len() - 1));
-        assert_eq!(reselect(&[], &staged, &b, 3), None);
+        assert_eq!(reselect(&rows, listed, &b, 40), Some(rows.len() - 1));
+        assert_eq!(reselect(&[], listed, &b, 3), None);
     }
 
     #[test]
     fn s_and_u_move_the_selected_rows_changes() {
         use GitScope::{Staged, Unstaged};
         let changes = selection_changes();
-        let (rows, _) = list_rows(&changes, true, &Folds::default());
+        let listed = working(&changes);
+        let (rows, _) = working_rows(&changes, true, &Folds::default());
         assert_eq!(
-            row_paths(&rows[0], &changes, Unstaged),
+            row_paths(&rows[0], listed, &Unstaged),
             ["README.md", "src/a.rs", "src/b.rs"]
         );
-        assert!(row_paths(&rows[0], &changes, Staged).is_empty());
+        assert!(row_paths(&rows[0], listed, &Staged).is_empty());
         assert_eq!(
-            row_paths(&rows[1], &changes, Unstaged),
+            row_paths(&rows[1], listed, &Unstaged),
             ["src/a.rs", "src/b.rs"]
         );
-        assert_eq!(row_paths(&rows[7], &changes, Staged), ["src/a.rs"]);
-        assert!(row_paths(&rows[7], &changes, Unstaged).is_empty());
+        assert_eq!(row_paths(&rows[7], listed, &Staged), ["src/a.rs"]);
+        assert!(row_paths(&rows[7], listed, &Unstaged).is_empty());
     }
 
     #[test]
@@ -4279,8 +4965,8 @@ mod tests {
         )
         .expect("a discard is in flight");
         assert!(discard.discard);
-        assert!(discard.names(GitScope::Unstaged, "new.rs"));
-        assert!(!discard.names(GitScope::Staged, "a.rs"));
+        assert!(discard.names(&GitScope::Unstaged, "new.rs"));
+        assert!(!discard.names(&GitScope::Staged, "a.rs"));
         let unstage = InFlight::of(
             2,
             &GitAction::Unstage {
@@ -4290,7 +4976,7 @@ mod tests {
         )
         .expect("an unstage is in flight");
         assert!(!unstage.discard && unstage.section);
-        assert!(unstage.names(GitScope::Staged, "a.rs"));
+        assert!(unstage.names(&GitScope::Staged, "a.rs"));
         assert!(InFlight::of(3, &GitAction::LastMessage, false).is_none());
     }
 }

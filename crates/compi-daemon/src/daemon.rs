@@ -1058,6 +1058,21 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
                     }
                 }
+                ClientMessage::ReadGitCommit {
+                    environment,
+                    path,
+                    commit,
+                } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| crate::git::read_commit(&environment, &path, &commit))
+                    {
+                        Ok(lookup) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::GitCommitRead { lookup },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::ReadGitFile {
                     environment,
                     repo,
@@ -1065,7 +1080,7 @@ fn handle_connection(
                     revision,
                 } => {
                     match without_target(target.as_ref())
-                        .and_then(|()| crate::git::read_file(&environment, &repo, &path, revision))
+                        .and_then(|()| crate::git::read_file(&environment, &repo, &path, &revision))
                     {
                         Ok(content) => sink.send_control(&ServerControl {
                             request_id: Some(request_id),

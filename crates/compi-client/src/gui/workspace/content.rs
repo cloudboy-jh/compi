@@ -1281,6 +1281,7 @@ impl CompiApp {
                     });
                     // A diff stays while its file is open, so Edit and Diff switch back fast.
                     ui.diffs.retain(|tab, _| content.tab(tab.path()).is_some());
+                    ui.repo.retain_commits(content);
                     true
                 }
                 None => {

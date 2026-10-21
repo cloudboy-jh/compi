@@ -3,11 +3,11 @@ use crate::frame;
 use crate::program_status::SurfaceProgramStatus;
 use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, DirectoryEntry, ErrorCode,
-    FileContent, FileState, FileVersion, GitAction, GitBranches, GitChanges, GitFileContent,
-    GitRevision, GitWriteResult, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES, MutationId,
-    MutationReceipt, MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME, SearchEntry,
-    ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation,
-    WorkspaceSnapshot, decode_server, decode_terminal_frame, encode_client,
+    FileContent, FileState, FileVersion, GitAction, GitBranches, GitChanges, GitCommitLookup,
+    GitFileContent, GitRevision, GitWriteResult, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES,
+    MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME,
+    SearchEntry, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget,
+    WorkspaceMutation, WorkspaceSnapshot, decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
@@ -874,6 +874,24 @@ impl DaemonClient {
     ) -> Result<Option<GitChanges>> {
         match self.request(ClientMessage::ReadGitChanges { environment, path })? {
             ServerMessage::GitChangesRead { changes } => Ok(changes),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// One commit of the Git work tree holding `path`, with its changes against its first
+    /// parent; `commit` is a revision (see `is_revision`).
+    pub fn read_git_commit(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+        commit: String,
+    ) -> Result<GitCommitLookup> {
+        match self.request(ClientMessage::ReadGitCommit {
+            environment,
+            path,
+            commit,
+        })? {
+            ServerMessage::GitCommitRead { lookup } => Ok(lookup),
             message => Err(unexpected_response(message)),
         }
     }

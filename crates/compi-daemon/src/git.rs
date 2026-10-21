@@ -1,9 +1,11 @@
-//! Git state of content-pane repositories: uncommitted changes and branches. Reads take no
-//! index refresh and no optional locks; the explicit writes of `write` run one at a time per
-//! repository.
+//! Git state of content-pane repositories: uncommitted changes, commits and branches. Reads
+//! take no index refresh and no optional locks; the explicit writes of `write` run one at a
+//! time per repository.
 
+mod commit;
 mod write;
 
+pub use commit::read_commit;
 pub use write::write;
 
 use crate::content_files::{self, Failure};
@@ -11,7 +13,7 @@ use base64::Engine;
 use compi_protocol::{
     ContentEnvironment, ErrorCode, GitBranch, GitBranches, GitChange, GitChangeKind, GitChanges,
     GitFileContent, GitImageFormat, GitRevision, GitScope, MAX_CONTENT_FILE_BYTES,
-    MAX_GIT_BRANCHES, MAX_GIT_CHANGES, MAX_GIT_IMAGE_BYTES, is_repo_path,
+    MAX_GIT_BRANCHES, MAX_GIT_CHANGES, MAX_GIT_IMAGE_BYTES, is_commit_id, is_repo_path,
 };
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -44,6 +46,7 @@ const GIT_WRITE_ENV: [(&str, &str); 3] = [
     ("GIT_EDITOR", "true"),
 ];
 
+const TOP_LEVEL: &[&str] = &["rev-parse", "--show-toplevel"];
 const STATUS: &[&str] = &[
     "status",
     "--porcelain=v2",
@@ -93,22 +96,14 @@ pub fn read_changes(
     environment: &ContentEnvironment,
     path: &str,
 ) -> Result<Option<GitChanges>, Failure> {
-    let root = content_files::resolve(environment, path)?;
-    let folder = if fs::metadata(&root.host).is_ok_and(|metadata| metadata.is_file()) {
-        Path::new(&root.shell).parent().map_or_else(
-            || root.shell.clone(),
-            |parent| parent.to_string_lossy().into_owned(),
-        )
-    } else {
-        root.shell.clone()
-    };
+    let folder = work_folder(environment, path)?;
     let site = Site::of(environment, &folder);
     let (git_environment, git_folder) = (&site.environment, site.folder.as_str());
     let (top, status, unstaged, staged) = thread::scope(|scope| {
         let spawn = |args: &'static [&'static str], limit: usize| {
             scope.spawn(move || git(git_environment, git_folder, args, limit))
         };
-        let top = spawn(&["rev-parse", "--show-toplevel"], MAX_TOP_LEVEL_BYTES);
+        let top = spawn(TOP_LEVEL, MAX_TOP_LEVEL_BYTES);
         let status = spawn(STATUS, MAX_LISTING_BYTES);
         let unstaged = spawn(UNSTAGED_NUMSTAT, MAX_LISTING_BYTES);
         let staged = spawn(STAGED_NUMSTAT, MAX_LISTING_BYTES);
@@ -119,36 +114,9 @@ pub fn read_changes(
             joined(staged),
         )
     });
-    let top = top?;
-    if !top.success {
-        if top.stderr.contains("not a git repository")
-            || top.stderr.contains("must be run in a work tree")
-        {
-            return Ok(None);
-        }
-        return Err(top.failure("could not find the repository"));
-    }
-    let top = String::from_utf8_lossy(&top.stdout)
-        .trim_end_matches(['\n', '\r'])
-        .to_owned();
-    // `repo` is the top level in the request's environment, `work_tree` where git ran.
-    #[cfg(windows)]
-    let (repo, work_tree) = match (&site.environment, environment) {
-        (ContentEnvironment::Host, ContentEnvironment::Wsl { .. }) => {
-            let work_tree = top.replace('/', "\\");
-            let repo = wsl_top_level(&folder, &site.folder, &work_tree).ok_or_else(|| {
-                (
-                    ErrorCode::Internal,
-                    format!("could not find {work_tree} in WSL from {folder}"),
-                )
-            })?;
-            (repo, work_tree)
-        }
-        (ContentEnvironment::Host, _) => (top.replace('/', "\\"), top.replace('/', "\\")),
-        _ => (top.clone(), top),
+    let Some((repo, work_tree)) = top_level(top?, environment, &site, &folder)? else {
+        return Ok(None);
     };
-    #[cfg(unix)]
-    let (repo, work_tree) = (top.clone(), top);
     let status = listing(status?, "could not read the status")?;
     let unstaged = parse_numstat(&listing(unstaged?, "could not count unstaged lines")?.stdout);
     let staged = parse_numstat(&listing(staged?, "could not count staged lines")?.stdout);
@@ -163,10 +131,11 @@ pub fn read_changes(
     let changes = entries
         .into_iter()
         .map(|entry| {
-            let counts = match (entry.scope, entry.kind) {
+            let counts = match (&entry.scope, entry.kind) {
                 (_, GitChangeKind::Untracked | GitChangeKind::Conflicted) => None,
                 (GitScope::Unstaged, _) => unstaged.get(&entry.path),
                 (GitScope::Staged, _) => staged.get(&entry.path),
+                (GitScope::Commit(_), _) => unreachable!("`git status` lists no commit"),
             };
             let (added, removed) = counts.copied().unwrap_or_default();
             let stamp = if entry.in_work_tree {
@@ -199,6 +168,59 @@ pub fn read_changes(
         changes,
         truncated,
     }))
+}
+
+/// The folder `path` names, or the one holding it when it is a file.
+fn work_folder(environment: &ContentEnvironment, path: &str) -> Result<String, Failure> {
+    let root = content_files::resolve(environment, path)?;
+    if fs::metadata(&root.host).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(Path::new(&root.shell).parent().map_or_else(
+            || root.shell.clone(),
+            |parent| parent.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(root.shell)
+}
+
+/// The repository top level from `TOP_LEVEL` run at `site` for the request's `folder`: `repo`
+/// in the request's environment and `work_tree` where git runs. `None` when `folder` is not
+/// inside a Git work tree.
+#[cfg_attr(unix, expect(unused_variables))]
+fn top_level(
+    top: Run,
+    environment: &ContentEnvironment,
+    site: &Site,
+    folder: &str,
+) -> Result<Option<(String, String)>, Failure> {
+    if !top.success {
+        if top.stderr.contains("not a git repository")
+            || top.stderr.contains("must be run in a work tree")
+        {
+            return Ok(None);
+        }
+        return Err(top.failure("could not find the repository"));
+    }
+    let top = String::from_utf8_lossy(&top.stdout)
+        .trim_end_matches(['\n', '\r'])
+        .to_owned();
+    #[cfg(windows)]
+    let paths = match (&site.environment, environment) {
+        (ContentEnvironment::Host, ContentEnvironment::Wsl { .. }) => {
+            let work_tree = top.replace('/', "\\");
+            let repo = wsl_top_level(folder, &site.folder, &work_tree).ok_or_else(|| {
+                (
+                    ErrorCode::Internal,
+                    format!("could not find {work_tree} in WSL from {folder}"),
+                )
+            })?;
+            (repo, work_tree)
+        }
+        (ContentEnvironment::Host, _) => (top.replace('/', "\\"), top.replace('/', "\\")),
+        _ => (top.clone(), top),
+    };
+    #[cfg(unix)]
+    let paths = (top.clone(), top);
+    Ok(Some(paths))
 }
 
 /// The local and remote-tracking branches of the repository whose top level is `repo`.
@@ -272,19 +294,22 @@ pub fn read_file(
     environment: &ContentEnvironment,
     repo: &str,
     path: &str,
-    revision: GitRevision,
+    revision: &GitRevision,
 ) -> Result<GitFileContent, Failure> {
     let repo = content_files::resolve(environment, repo)?.shell;
     let site = Site::of(environment, &repo);
     let (environment, repo) = (&site.environment, site.folder.as_str());
     check_path(environment, path)?;
     let limit = read_limit(path);
-    // Head and index blobs are filtered as a checkout would write them, so their line
-    // endings match the work tree's.
+    // Blobs are filtered as a checkout would write them, so their line endings match the
+    // work tree's.
     let object = match revision {
         GitRevision::Head => format!("HEAD:{path}"),
         GitRevision::Index => format!(":0:{path}"),
         GitRevision::WorkTree => return read_work_tree(environment, repo, path, limit),
+        GitRevision::Commit(id) => format!("{}:{path}", check_commit_id(id)?),
+        // A root commit has no `^`: git finds no such object, which reads as `Missing`.
+        GitRevision::Parent(id) => format!("{}^:{path}", check_commit_id(id)?),
     };
     let blob = git(
         environment,
@@ -923,6 +948,17 @@ fn check_path(environment: &ContentEnvironment, path: &str) -> Result<(), Failur
     Ok(())
 }
 
+/// Rejects `id` unless it is a full commit id, which git cannot read as an option or a path.
+fn check_commit_id(id: &str) -> Result<&str, Failure> {
+    if !is_commit_id(id) {
+        return Err((
+            ErrorCode::InvalidRequest,
+            format!("{id:?} is not a full commit id"),
+        ));
+    }
+    Ok(id)
+}
+
 /// Git on the daemon host, or inside a WSL distribution of a Windows daemon, with the read
 /// or the write environment.
 fn git_command(environment: &ContentEnvironment, reading: bool) -> Result<Command, Failure> {
@@ -960,6 +996,7 @@ fn git_command(environment: &ContentEnvironment, reading: bool) -> Result<Comman
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compi_protocol::{GitCommit, GitCommitLookup};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1001,7 +1038,7 @@ mod tests {
             .iter()
             .map(|entry| {
                 (
-                    entry.scope,
+                    entry.scope.clone(),
                     entry.kind,
                     entry.path.as_str(),
                     entry.old_path.as_deref(),
@@ -1161,7 +1198,21 @@ mod tests {
         }
 
         fn read(&self, path: &str, revision: GitRevision) -> GitFileContent {
-            read_file(&ContentEnvironment::Host, &self.root(), path, revision).unwrap()
+            read_file(&ContentEnvironment::Host, &self.root(), path, &revision).unwrap()
+        }
+
+        /// The commit `revision` names, which must exist.
+        fn commit(&self, revision: &str) -> GitCommit {
+            match read_commit(&ContentEnvironment::Host, &self.root(), revision).unwrap() {
+                GitCommitLookup::Found { commit } => *commit,
+                other => panic!("{revision} found no commit: {other:?}"),
+            }
+        }
+
+        /// The full id of the commit `revision` names.
+        fn id(&self, revision: &str) -> String {
+            let output = self.command(&["rev-parse", revision]).output().unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
         }
     }
 
@@ -1190,7 +1241,7 @@ mod tests {
             .iter()
             .map(|change| {
                 (
-                    change.scope,
+                    change.scope.clone(),
                     change.kind,
                     change.path.as_str(),
                     change.added,
@@ -1248,8 +1299,8 @@ mod tests {
 
         let first = repo.changes();
         assert!(first.head.is_some());
-        let scopes: Vec<_> = first.changes.iter().map(|change| change.scope).collect();
-        assert_eq!(scopes, [GitScope::Unstaged, GitScope::Staged]);
+        let scopes: Vec<_> = first.changes.iter().map(|change| &change.scope).collect();
+        assert_eq!(scopes, [&GitScope::Unstaged, &GitScope::Staged]);
         assert_eq!(repo.read("file.txt", GitRevision::Head), text("head\n"));
         assert_eq!(repo.read("file.txt", GitRevision::Index), text("index\n"));
         assert_eq!(
@@ -1270,7 +1321,7 @@ mod tests {
                     &ContentEnvironment::Host,
                     &repo.root(),
                     path,
-                    GitRevision::Head
+                    &GitRevision::Head
                 )
                 .is_err(),
                 "accepted {path:?}"
@@ -1363,5 +1414,229 @@ mod tests {
         );
         let listing = read_branches(&ContentEnvironment::Host, &clone.root()).unwrap();
         assert!(listing.branches.iter().all(|branch| !branch.current));
+    }
+
+    /// A change's kind, path, old path and line counts.
+    type Listed<'a> = (
+        GitChangeKind,
+        &'a str,
+        Option<&'a str>,
+        Option<u32>,
+        Option<u32>,
+    );
+
+    fn summary(commit: &GitCommit) -> Vec<Listed<'_>> {
+        commit
+            .changes
+            .iter()
+            .map(|change| {
+                (
+                    change.kind,
+                    change.path.as_str(),
+                    change.old_path.as_deref(),
+                    change.added,
+                    change.removed,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_commit_lists_its_changes_against_its_parent() {
+        let Some(repo) = Repo::new() else {
+            return;
+        };
+        // Unborn, `HEAD` names no commit yet.
+        assert_eq!(
+            read_commit(&ContentEnvironment::Host, &repo.root(), "HEAD").unwrap(),
+            GitCommitLookup::Unknown
+        );
+        let moved: String = (1..=10).map(|line| format!("line {line}\n")).collect();
+        repo.write("a.txt", "one\n");
+        repo.write("gone.txt", "gone\n");
+        repo.write("old.txt", &moved);
+        repo.write("data.bin", "\0one");
+        repo.git(&["add", "."]).unwrap();
+        repo.commit_at("root", 1_000_000_000);
+        repo.write("a.txt", "one\ntwo\n");
+        fs::remove_file(repo.0.join("gone.txt")).unwrap();
+        fs::remove_file(repo.0.join("old.txt")).unwrap();
+        repo.write("new.txt", &moved.replace("line 10", "line ten"));
+        repo.write("added.txt", "added\n");
+        repo.write("data.bin", "\0two");
+        repo.git(&["add", "-A"]).unwrap();
+        repo.commit_at("Second\n\nWith a body.", 1_000_000_100);
+
+        let id = repo.id("HEAD");
+        let commit = repo.commit("HEAD");
+        assert_eq!(commit.repo, repo.changes().repo);
+        assert_eq!(commit.id, id);
+        assert!(id.starts_with(&commit.short) && commit.short.len() < id.len());
+        assert_eq!(commit.parent, Some(repo.id("HEAD~1")));
+        assert!(!commit.merge);
+        assert_eq!(
+            (commit.summary.as_str(), commit.author.as_str(), commit.time),
+            ("Second", "Compi", 1_000_000_100)
+        );
+        use GitChangeKind::*;
+        assert_eq!(
+            summary(&commit),
+            [
+                (Modified, "a.txt", None, Some(1), Some(0)),
+                (Added, "added.txt", None, Some(1), Some(0)),
+                (Modified, "data.bin", None, None, None),
+                (Deleted, "gone.txt", None, Some(0), Some(1)),
+                (Renamed, "new.txt", Some("old.txt"), Some(1), Some(1)),
+            ]
+        );
+        assert!(
+            commit.changes.iter().all(|change| {
+                change.scope == GitScope::Commit(id.clone()) && change.stamp == id
+            })
+        );
+        assert!(!commit.truncated);
+        // Any revision naming the commit finds it, from a file of the work tree too.
+        let inside = repo.0.join("a.txt");
+        assert_eq!(
+            read_commit(
+                &ContentEnvironment::Host,
+                inside.to_str().unwrap(),
+                &commit.short
+            )
+            .unwrap(),
+            GitCommitLookup::Found {
+                commit: Box::new(commit.clone())
+            }
+        );
+
+        // Both sides of each change.
+        let (after, before) = (GitRevision::Commit(id.clone()), GitRevision::Parent(id));
+        assert_eq!(repo.read("a.txt", after.clone()), text("one\ntwo\n"));
+        assert_eq!(repo.read("a.txt", before.clone()), text("one\n"));
+        assert_eq!(
+            repo.read("added.txt", before.clone()),
+            GitFileContent::Missing
+        );
+        assert_eq!(
+            repo.read("gone.txt", after.clone()),
+            GitFileContent::Missing
+        );
+        assert_eq!(repo.read("gone.txt", before.clone()), text("gone\n"));
+        assert_eq!(repo.read("old.txt", before), text(&moved));
+        assert_eq!(
+            repo.read("data.bin", after),
+            GitFileContent::Binary { len: 4 }
+        );
+
+        // The root commit lists everything it holds as added, against nothing.
+        let root = repo.commit("HEAD~1");
+        assert_eq!((root.parent.as_deref(), root.merge), (None, false));
+        assert_eq!(root.summary, "root");
+        assert_eq!(
+            summary(&root),
+            [
+                (Added, "a.txt", None, Some(1), Some(0)),
+                (Added, "data.bin", None, None, None),
+                (Added, "gone.txt", None, Some(1), Some(0)),
+                (Added, "old.txt", None, Some(10), Some(0)),
+            ]
+        );
+        assert_eq!(
+            repo.read("a.txt", GitRevision::Parent(root.id.clone())),
+            GitFileContent::Missing
+        );
+        assert_eq!(
+            repo.read("a.txt", GitRevision::Commit(root.id)),
+            text("one\n")
+        );
+
+        for unknown in ["nope", "HEAD~2", "a.txt", "HEAD^{tree}"] {
+            assert_eq!(
+                read_commit(&ContentEnvironment::Host, &repo.root(), unknown).unwrap(),
+                GitCommitLookup::Unknown,
+                "{unknown}"
+            );
+        }
+        // Options, paths inside a revision and blanks never reach git.
+        for refused in ["--all", "-h", "HEAD:a.txt", "HEAD a.txt", ""] {
+            let (code, _) =
+                read_commit(&ContentEnvironment::Host, &repo.root(), refused).unwrap_err();
+            assert_eq!(code, ErrorCode::InvalidRequest, "{refused:?}");
+        }
+        // Reads take full ids only.
+        let short = commit.short.clone();
+        let upper = commit.id.to_uppercase();
+        for revision in [
+            GitRevision::Commit("HEAD".into()),
+            GitRevision::Commit(short),
+            GitRevision::Commit(upper),
+            GitRevision::Parent("--output=x".into()),
+        ] {
+            let (code, _) =
+                read_file(&ContentEnvironment::Host, &repo.root(), "a.txt", &revision).unwrap_err();
+            assert_eq!(code, ErrorCode::InvalidRequest, "{revision:?}");
+        }
+
+        // Outside a work tree there is no repository to look in.
+        assert_eq!(
+            read_commit(
+                &ContentEnvironment::Host,
+                repo.0.join(".git").to_str().unwrap(),
+                "HEAD"
+            )
+            .unwrap(),
+            GitCommitLookup::NotRepository
+        );
+    }
+
+    #[test]
+    fn a_merge_lists_its_changes_against_its_first_parent() {
+        let Some(repo) = Repo::new() else {
+            return;
+        };
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .unwrap();
+        repo.write("base.txt", "base\n");
+        repo.git(&["add", "."]).unwrap();
+        repo.commit_at("base", 1_000_000_000);
+        repo.git(&["switch", "-q", "-c", "side"]).unwrap();
+        repo.write("side.txt", "side\n");
+        repo.git(&["add", "."]).unwrap();
+        repo.commit_at("side", 1_000_000_100);
+        repo.git(&["switch", "-q", "main"]).unwrap();
+        repo.write("main.txt", "main\n");
+        repo.git(&["add", "."]).unwrap();
+        repo.commit_at("main", 1_000_000_200);
+        repo.git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-edit",
+            "--no-gpg-sign",
+            "side",
+        ])
+        .unwrap();
+
+        let merge = repo.commit("HEAD");
+        assert!(merge.merge);
+        assert_eq!(merge.parent, Some(repo.id("HEAD^1")));
+        assert_eq!(
+            summary(&merge),
+            [(GitChangeKind::Added, "side.txt", None, Some(1), Some(0))]
+        );
+        // The parent side is the first parent's.
+        let id = merge.id;
+        assert_eq!(
+            repo.read("side.txt", GitRevision::Parent(id.clone())),
+            GitFileContent::Missing
+        );
+        assert_eq!(
+            repo.read("main.txt", GitRevision::Parent(id.clone())),
+            text("main\n")
+        );
+        assert_eq!(
+            repo.read("side.txt", GitRevision::Commit(id)),
+            text("side\n")
+        );
     }
 }

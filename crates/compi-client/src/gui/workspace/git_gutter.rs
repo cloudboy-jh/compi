@@ -115,11 +115,12 @@ impl GitGutter {
     }
 }
 
-/// Where the file `rel` stands in `changes`, and so what its index version is keyed by.
+/// Where the file `rel` stands in `changes` (the working listing, which holds no commit's
+/// changes), and so what its index version is keyed by.
 fn file_status(changes: &GitChanges, rel: &str) -> Status {
     let mut staged = None;
     for change in changes.changes.iter().filter(|change| change.path == rel) {
-        match (change.scope, change.kind) {
+        match (&change.scope, change.kind) {
             (_, GitChangeKind::Conflicted) => return Status::Conflicted,
             (GitScope::Unstaged, GitChangeKind::Untracked | GitChangeKind::Added) => {
                 return Status::Untracked;
@@ -132,6 +133,7 @@ fn file_status(changes: &GitChanges, rel: &str) -> Status {
                 };
             }
             (GitScope::Staged, _) => staged = Some(&change.stamp),
+            (GitScope::Commit(_), _) => {}
         }
     }
     // The index matches the work tree: its version changes with the staged change, or

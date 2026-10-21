@@ -398,7 +398,7 @@ fn checked_status(last: Option<u64>, now: u64) -> String {
 }
 
 /// "just now", "5 min ago", "3 h ago", "yesterday", then a date.
-fn time_since(then: u64, now: u64) -> String {
+pub(crate) fn time_since(then: u64, now: u64) -> String {
     let elapsed = now.saturating_sub(then);
     match elapsed {
         0..60 => "just now".into(),

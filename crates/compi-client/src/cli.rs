@@ -1615,7 +1615,9 @@ fn validate(
         ),
         ("monitor", Some("totals")) => (2, 2, &["--history"], &[]),
         ("monitor", Some("list")) => (2, 2, &["--search"], &["--group"]),
-        ("files" | "edit" | "diff" | "settings" | "monitor", _) => (1, 2, &[], &[]),
+        ("files" | "edit" | "settings" | "monitor", _) => (1, 2, &[], &[]),
+        // `diff [PATH]` and `diff COMMIT [PATH]`.
+        ("diff", _) => (1, 3, &[], &[]),
         ("command", Some("list")) => (2, 2, &[], &[]),
         ("command", Some("run")) => (3, 3, &[], &[]),
         ("layout", Some(_)) => (2, 2, &[], &[]),
@@ -1959,7 +1961,7 @@ mod tests {
         }
     }
     #[test]
-    fn view_commands_take_at_most_one_argument() {
+    fn view_commands_take_only_their_arguments() {
         let validated = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
             assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
@@ -1976,6 +1978,8 @@ mod tests {
             &["--pane", "pane-1", "edit", "--", "-notes.md"],
             &["diff"],
             &["--json", "diff", "src/layout.rs:40"],
+            &["diff", "HEAD~1"],
+            &["--json", "diff", "HEAD~1", "src/layout.rs:40"],
             &["settings"],
             &["settings", "terminal"],
             &["--json", "monitor", "processes"],
@@ -1986,7 +1990,7 @@ mod tests {
             &["edit", "a.rs", "b.rs"][..],
             &["files", "--right"],
             &["edit", "a.rs", "--cwd", "/tmp"],
-            &["diff", "a.rs", "b.rs"],
+            &["diff", "HEAD", "a.rs", "b.rs"],
             &["diff", "--staged"],
             &["settings", "terminal", "fonts"],
             &["monitor", "--page", "cpu"],
