@@ -33,8 +33,6 @@ jobs:
           heading=$(head -n 1 docs/user/release-notes.md | tr -d '\r')
           test "$heading" = "# ${RELEASE_TAG#v}" || { echo "docs/user/release-notes.md must start with '# ${RELEASE_TAG#v}', found '$heading'"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -55,27 +53,12 @@ jobs:
       - name: Prepare pinned Microsoft ConPTY runtime
         shell: pwsh
         run: .\tools\prepare-conpty.ps1
-      - name: Verify source and runtime prerequisites
+      # fmt, clippy, tests and dependency boundaries run in core-ci on every push.
+      - name: Require working WSL runtime
         shell: pwsh
         run: |
           wsl.exe --exec /bin/bash -lc true
           if ($LASTEXITCODE -ne 0) { throw 'A working default WSL2 distribution is required' }
-          cargo fmt --all -- --check
-          if ($LASTEXITCODE -ne 0) { throw 'Formatting failed' }
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
-          # Daemon tests write instance metadata under %LOCALAPPDATA%\Compi. Keep the
-          # runner account fresh for the installed-update qualification below.
-          $accountLocalAppData = $env:LOCALAPPDATA
-          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'compi-test-localappdata'
-          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
-          try {
-            # Handle-count leak regression stays in core-ci; it is not a release-artifact gate.
-            cargo test --locked -p compi-protocol -p compi-daemon -p compi-client -p compi-update -- --test-threads=1 --skip repeated_surface_cycles_release_daemon_process_handles
-            if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
-          } finally { $env:LOCALAPPDATA = $accountLocalAppData }
-          python tools/check-dependencies.py --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { throw 'Dependency boundaries failed' }
       - name: Import Windows signing certificate
         shell: pwsh
         env:
@@ -107,6 +90,9 @@ jobs:
           $officialRelease = [bool]$env:EXPECTED_TAG
           .\tools\build-installer.ps1 -SigningCertificateThumbprint $env:COMPI_SIGNING_THUMBPRINT -ExpectedTag $env:EXPECTED_TAG -RequireUpdateKey:$officialRelease
           Rename-Item target/distribution/SHA256SUMS.txt SHA256SUMS-Windows-x64.txt
+      # Compile outside the bounded smoke step; the smoke's own cargo build is then a no-op.
+      - name: Build package smoke diagnostics
+        run: cargo build --locked -p compi-client --example compi-probe --example compi-update-smoke
       - name: Verify portable artifact
         timeout-minutes: 10
         shell: pwsh
