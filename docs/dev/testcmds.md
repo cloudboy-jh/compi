@@ -28,10 +28,13 @@ cargo test --locked -p compi-daemon --test daemon_integration -- --test-threads=
 
 The daemon build does not require GPUI or `GPUI_FXC_PATH`. A failed WSL readiness check is missing runtime coverage, not a reason to count skipped daemon tests as passing. The Windows integration cases run one at a time on shared WSL2 runners: simultaneous guest startups have returned `0xffffffff` without diagnostic output, even though individual tests run. The commands in Tier 1 below require a working default WSL distribution for the full integration suite.
 The 16 MiB output-backpressure case allows two minutes for shell output to complete on a debug CI runner; ordinary control-path waits remain 30 seconds.
+Core CI allows 60 minutes on Windows for the serialized WSL suite and headless release build; Linux and macOS retain 20 minutes. The previous 20-minute Windows limit expired during daemon regressions without a reported test failure.
 
 ### Installer and in-app update qualification
 
 The bootstrapper is a separate Cargo workspace. Run its behavioral library tests with `cargo test --locked --manifest-path installer/bootstrapper/Cargo.toml --lib -- --test-threads=1`; testing its embedded-MSI binary additionally requires the generated `installer/bootstrapper/payload/Compi.msi`. The packaging script creates and removes that build input.
+
+For 0.3.0, native qualification receipts, metadata signing and compatible-cycle checks use daemon protocol 32. The update-qualified client presentation format remains 5; it is separate from daemon workspace format 7.
 
 Use `tools/smoke-windows-distribution.ps1 -Install` only in a disposable Windows account/runner: it exercises real MSI registration, task management, repair and removal, and refuses an existing developer install. Without `-Install` it checks only the portable package. `tools/smoke-macos-bundle.sh` requires a native Apple Silicon Mac. Neither cross-compilation nor library tests qualify installation/uninstallation. The release workflow runs only the portable and copied-bundle smokes.
 

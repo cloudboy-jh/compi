@@ -24,7 +24,8 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Windows runs serialized WSL regressions and a separate release daemon build.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

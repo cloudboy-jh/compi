@@ -1,25 +1,35 @@
-# 0.2.0
+# 0.3.0
 
-- Monitor: see what your machine is doing beside your terminal
-- CPU, memory, disk and network at a glance, with the last hour of history
-- Processes grouped by app, with their icons
+- Files, editing, diffs, Settings and Monitor in your terminal's own pane
+- Full scrollback that stays put while output arrives
+- Markdown notes with diagrams, maths, wikilinks and backlinks
 
 ## New
 
-- Monitor opens from the palette as a pane that splits, floats and closes like any pane. It shows the machine Compi's server runs on, so a connected host shows that host.
-- Overview has a card for CPU, memory, disk and network with its recent history, plus Memory by type and Memory by app. Click a card for its page. Pick 1m, 5m, 15m or 1h, or pause the graphs. Cards rearrange into three, two or one column as the pane's width allows.
-- History is kept for the last hour even while Monitor is closed, so graphs are full when you open it.
-- Processes lists every process with search, All / Apps / My processes / System filters and sortable columns. Group by app gathers each app's processes, helpers included on macOS, under one row with the app's icon and their totals. Rows hold still while the pointer is over the table.
+- Open a view in place without losing the shell underneath. Use Ctrl/Cmd+Shift+E or the pane menu to switch between Files and the terminal; move a view to its own pane when you want both visible.
+- Monitor adds CPU, memory, GPU, disk and network detail pages, per-core and per-device views, and a process inspector with recent history. Quit and Force quit require confirmation and check process identity. Process columns can be resized, reordered and hidden, with choices saved.
+- Monitor Windows or an individual WSL distribution without mixing their totals or processes. Connected SSH windows monitor their connected host. Settings now includes a Monitor overview; performance diagnostics live under Advanced.
+- Review a historical commit with `compi diff COMMIT [PATH[:LINE]]`. Commit reviews are read-only and compare against the first parent.
+- Markdown files have Edit, Render and Diff modes in the existing editor. Render tables, task lists, callouts, Mermaid diagrams and LaTeX maths offline. Follow wikilinks and use the Notes panel for search and backlinks.
+- `compi notes [FILE|FOLDER] [--edit]`, `notes search` and `notes backlinks` expose notes from the CLI, including JSON output. Commands, Settings, Monitor totals, processes, sources, inspection and confirmed process quitting are also reachable from the CLI.
 
 ## Fixes
 
-- Programs that mark their own prompts, such as Pi, keep showing that they are working instead of losing their status mid-run.
+- Scrolling keeps your reading position through new output, redraws, history eviction and window resizing. A new-lines indicator takes you back to live output.
+- The terminal retains the configured scrollback, including the full default 10,000 lines, instead of an effectively much smaller history.
+- Fractional wheel movement accumulates correctly, and pagers can use alternate-screen wheel scrolling.
+- Moving between diff files stays within the active commit or working-tree review.
 
 ## Limitations
 
-- macOS doesn't let Compi read threads of other users' processes; they show a dash.
-- App icons come from macOS and Windows apps; Linux hosts show initials.
+- Render mode is local to the window, not restored after a client restart. Use `compi notes FILE` or Render to reopen it.
+- Toggling a task in Render saves the whole current editor buffer, including other unsaved edits. Normal undo and file-conflict protection still apply.
+- Unsupported or invalid diagrams and maths show an error with their source. Rendering does not load external files or packages.
+- macOS cannot read threads of other users' processes; those values show a dash. Linux app groups use initials rather than native app icons.
+- Physical trackpad/mouse qualification, macOS visual and IME checks, and SSH note-file qualification remain open.
+- Windows packages are not publisher-signed. The macOS app is ad-hoc signed, not notarized. Operating-system trust warnings may appear; signed update metadata does not replace publisher signing.
 
 ## Updating
 
 - Updating ends running shells. Save your work first.
+- This release changes the daemon protocol and workspace format. Restart Compi and its daemon together; older versions cannot read the new workspace format. Do not downgrade an existing workspace without a backup.
