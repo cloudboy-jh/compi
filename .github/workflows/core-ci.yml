@@ -26,6 +26,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Windows runs serialized WSL regressions and a separate release daemon build.
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
+    env:
+      # CI reads panic messages, not debuggers: no debug info makes debug builds compile
+      # and link faster and keeps the cache small (Windows writes large PDBs).
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
