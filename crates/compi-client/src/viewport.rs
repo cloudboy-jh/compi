@@ -99,6 +99,12 @@ pub fn extends(old: &(impl HistoryRows + ?Sized), new: &(impl HistoryRows + ?Siz
     old.count() <= new.count() && (0..old.count()).all(|index| old.row(index) == new.row(index))
 }
 
+/// How long a clear waits for its reprint before the view returns to live output.
+pub const REPRINT_GRACE: Duration = Duration::from_millis(250);
+/// The same just after a resize: the program redraws once it hears the new size, which
+/// takes a round trip through the shell.
+pub const RESIZE_REPRINT_GRACE: Duration = Duration::from_secs(1);
+
 /// A clear and its reprint can arrive in separate frames. Keep only the reading
 /// viewport briefly, not another copy of the history. An actual clear expires.
 pub struct PendingScroll {
@@ -106,18 +112,30 @@ pub struct PendingScroll {
     pub base: usize,
     /// `rows` compact, to find them in a later history.
     anchor: Vec<HistoryRow>,
+    /// The width `rows` were wrapped at.
+    cols: usize,
+    /// The history length `base` was in, to place a repeated match.
+    history_len: usize,
     deadline: Instant,
     previous_offset: usize,
 }
 
 impl PendingScroll {
-    pub fn new(mirror: &ScreenMirror, offset: usize, now: Instant) -> Option<Self> {
+    pub fn new(
+        mirror: &ScreenMirror,
+        offset: usize,
+        now: Instant,
+        grace: Duration,
+    ) -> Option<Self> {
         let (rows, base) = mirror.visible_rows(offset)?;
+        let snapshot = mirror.snapshot();
         Some(Self {
             anchor: rows.iter().map(HistoryRow::from_row).collect(),
             rows,
             base,
-            deadline: now + Duration::from_millis(250),
+            cols: snapshot.map_or(0, |snapshot| usize::from(snapshot.cols)),
+            history_len: snapshot.map_or(0, |snapshot| snapshot.scrollback.len()),
+            deadline: now + grace,
             previous_offset: offset,
         })
     }
@@ -126,8 +144,21 @@ impl PendingScroll {
         now >= self.deadline
     }
 
-    pub fn recover(&self, history: &(impl HistoryRows + ?Sized)) -> Option<(usize, usize)> {
-        let base = matching_base(self.anchor.as_slice(), 0, history)?;
+    /// Where the kept viewport is in `history`, wrapped at `cols`.
+    pub fn recover(
+        &self,
+        history: &(impl HistoryRows + ?Sized),
+        cols: usize,
+    ) -> Option<(usize, usize)> {
+        let base = matching_base(self.anchor.as_slice(), 0, history).or_else(|| {
+            let expected = proportional(self.base, self.history_len, history.count());
+            word_base(
+                (self.anchor.as_slice(), self.cols),
+                0,
+                (history, cols),
+                expected,
+            )
+        })?;
         let offset = history.count().saturating_sub(base);
         Some((offset, offset.saturating_sub(self.previous_offset)))
     }
@@ -135,10 +166,13 @@ impl PendingScroll {
 
 /// Keep the top reading row of a history replaced by `new`, using its neighbours to
 /// disambiguate repeated prompts/blank lines. Compares compact rows; expands none.
-/// None means that the reading row is no longer in the received history.
+/// When no row matches (the terminal or the program rewrapped the text at another
+/// width), the reading position is found by its words, each history read at the width
+/// its rows were wrapped at. None means that the reading text is no longer in the
+/// received history.
 pub fn anchored_scroll_offset(
-    old: &(impl HistoryRows + ?Sized),
-    new: &(impl HistoryRows + ?Sized),
+    (old, old_cols): (&(impl HistoryRows + ?Sized), usize),
+    (new, new_cols): (&(impl HistoryRows + ?Sized), usize),
     offset: usize,
 ) -> Option<usize> {
     if offset == 0 {
@@ -152,7 +186,12 @@ pub fn anchored_scroll_offset(
         );
     }
     let base = old.count().saturating_sub(offset);
-    matching_base(old, base, new).map(|base| new.count().saturating_sub(base))
+    matching_base(old, base, new)
+        .or_else(|| {
+            let expected = proportional(base, old.count(), new.count());
+            word_base((old, old_cols), base, (new, new_cols), expected)
+        })
+        .map(|base| new.count().saturating_sub(base))
 }
 
 /// Each kept cell's text and width.
@@ -233,6 +272,111 @@ fn matching_base(
         }
     }
     best.map(|(_, base)| base)
+}
+
+/// Most words a reading position is found by when its rows no longer match: enough to
+/// span distinctive text, so a reprint still arriving cannot match it early where the
+/// same phrase repeats.
+const ANCHOR_WORDS: usize = 48;
+/// Fewest: a shorter run of words could match unrelated text.
+const MIN_ANCHOR_WORDS: usize = 4;
+
+/// `row` of a history `from` rows long, at the same place in one `to` rows long.
+fn proportional(row: usize, from: usize, to: usize) -> usize {
+    if from == 0 {
+        return 0;
+    }
+    (row as u128 * to as u128 / from as u128) as usize
+}
+
+/// Up to `limit` words of `rows`, wrapped at `cols`, from row `start`, each with the
+/// row it starts in. Soft wraps join, so a word split by the terminal is one word; a
+/// wrapped row shorter than `cols` ended in blanks its compact form dropped, so it ends
+/// a word. A word continuing from the row before `start` is not counted. Words keep
+/// only what lies between their first and last letter or digit, and those with neither
+/// (borders, bullets, rules) are left out, so text rewrapped at another width, by the
+/// terminal or by the program that printed it, gives the same words.
+fn words(
+    (rows, cols): (&(impl HistoryRows + ?Sized), usize),
+    start: usize,
+    limit: usize,
+) -> Vec<(String, usize)> {
+    fn finish(word: &mut String, row: usize, output: &mut Vec<(String, usize)>) {
+        let key = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if !key.is_empty() {
+            output.push((key.to_owned(), row));
+        }
+        word.clear();
+    }
+    // Whether a row's last word goes on into the next row.
+    let continues = |row: &HistoryRow| row.wrapped && row.len() >= cols;
+    let mut output = Vec::new();
+    let mut word = String::new();
+    let mut word_row = start;
+    // A row continuing a soft-wrapped word starts mid-word.
+    let mut skipping = start > 0 && rows.row(start - 1).is_some_and(continues);
+    for index in start..rows.count() {
+        let Some(row) = rows.row(index) else {
+            break;
+        };
+        for character in row.text.chars() {
+            if character.is_whitespace() {
+                skipping = false;
+                if !word.is_empty() {
+                    finish(&mut word, word_row, &mut output);
+                    if output.len() >= limit {
+                        return output;
+                    }
+                }
+            } else if !skipping {
+                if word.is_empty() {
+                    word_row = index;
+                }
+                word.push(character);
+            }
+        }
+        if !continues(row) {
+            skipping = false;
+            if !word.is_empty() {
+                finish(&mut word, word_row, &mut output);
+                if output.len() >= limit {
+                    return output;
+                }
+            }
+        }
+    }
+    if !word.is_empty() {
+        finish(&mut word, word_row, &mut output);
+    }
+    output.truncate(limit);
+    output
+}
+
+/// Where the words from row `base` of `old` start in `new`, as `new`'s base: the
+/// occurrence nearest row `expected` when they repeat.
+fn word_base(
+    old: (&(impl HistoryRows + ?Sized), usize),
+    base: usize,
+    new: (&(impl HistoryRows + ?Sized), usize),
+    expected: usize,
+) -> Option<usize> {
+    let anchor = words(old, base, ANCHOR_WORDS);
+    if anchor.len() < MIN_ANCHOR_WORDS {
+        return None;
+    }
+    // Rows above the first word stay above it.
+    let lead = anchor[0].1 - base;
+    let stream = words(new, 0, usize::MAX);
+    stream
+        .windows(anchor.len())
+        .filter(|window| {
+            window
+                .iter()
+                .zip(&anchor)
+                .all(|((found, _), (wanted, _))| found == wanted)
+        })
+        .map(|window| window[0].1.saturating_sub(lead))
+        .min_by_key(|row| row.abs_diff(expected))
 }
 
 pub fn visible_to_absolute(
@@ -617,12 +761,18 @@ mod tests {
     fn replaced_history_keeps_the_reading_row_by_its_text() {
         let old = history(0..100);
         for new in [history(0..110), history(10..110)] {
-            let offset = anchored_scroll_offset(&old, &new, 50).unwrap();
+            let offset = anchored_scroll_offset((&old, 9), (&new, 9), 50).unwrap();
             assert!(same_row_text(&old[50], &new[new.len() - offset]));
             assert_eq!(offset, 60);
         }
-        assert_eq!(anchored_scroll_offset(&old, &history(60..160), 50), None);
-        assert_eq!(anchored_scroll_offset(&old, &history(10..110), 0), Some(0));
+        assert_eq!(
+            anchored_scroll_offset((&old, 9), (&history(60..160), 9), 50),
+            None
+        );
+        assert_eq!(
+            anchored_scroll_offset((&old, 9), (&history(10..110), 9), 0),
+            Some(0)
+        );
         assert!(extends(&old, &history(0..101)));
         assert!(!extends(&old, &history(1..101)));
     }
@@ -669,10 +819,13 @@ mod tests {
         let mut new = history(5..35);
         new[3] = repeated;
         new[13] = HistoryRow::from_row(&recolored);
-        assert_eq!(anchored_scroll_offset(&old, &new, 12), Some(17));
+        assert_eq!(anchored_scroll_offset((&old, 9), (&new, 9), 12), Some(17));
         let mut reprint = history(0..5);
         reprint.extend(old.iter().cloned());
-        assert_eq!(anchored_scroll_offset(&old, &reprint, 12), Some(12));
+        assert_eq!(
+            anchored_scroll_offset((&old, 9), (&reprint, 9), 12),
+            Some(12)
+        );
     }
 
     #[test]
@@ -682,10 +835,10 @@ mod tests {
         let mut mirror = ScreenMirror::default();
         mirror.apply(compi_protocol::ScreenMessage::Snapshot { snapshot: screen });
         let now = Instant::now();
-        let pending = PendingScroll::new(&mirror, 50, now).unwrap();
-        assert_eq!(pending.recover(&VecDeque::new()), None);
-        assert_eq!(pending.recover(&history(0..40)), None);
-        assert_eq!(pending.recover(&history(0..110)), Some((60, 10)));
+        let pending = PendingScroll::new(&mirror, 50, now, REPRINT_GRACE).unwrap();
+        assert_eq!(pending.recover(&VecDeque::new(), 9), None);
+        assert_eq!(pending.recover(&history(0..40), 9), None);
+        assert_eq!(pending.recover(&history(0..110), 9), Some((60, 10)));
         assert!(!pending.expired(now + Duration::from_millis(249)));
         assert!(pending.expired(now + Duration::from_millis(250)));
         assert_eq!(pending.base, 50);
@@ -693,6 +846,185 @@ mod tests {
             pending.rows.as_ref(),
             (50..60).map(line).collect::<Vec<_>>()
         );
+    }
+
+    /// `paragraphs` as a program prints them at `width`: each word-wrapped, inside
+    /// `│ … │` borders, continuation lines indented by two.
+    fn program_wrapped(paragraphs: &[&str], width: usize) -> VecDeque<HistoryRow> {
+        let inner = width - 4;
+        let mut rows = VecDeque::new();
+        for paragraph in paragraphs {
+            let mut line = String::new();
+            for word in paragraph.split_whitespace() {
+                if !line.is_empty() && line.len() + 1 + word.len() > inner {
+                    rows.push_back(format!("│ {line:<inner$} │"));
+                    line = "  ".into();
+                }
+                if !line.trim().is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            rows.push_back(format!("│ {line:<inner$} │"));
+            rows.push_back(format!("│{}│", " ".repeat(width - 2)));
+        }
+        rows.iter()
+            .map(|text| HistoryRow::from_row(&row(text, false)))
+            .collect()
+    }
+
+    /// `text` as the terminal soft-wraps it at `width`.
+    fn soft_wrapped(text: &str, width: usize) -> VecDeque<HistoryRow> {
+        let characters: Vec<char> = text.chars().collect();
+        let chunks: Vec<String> = characters
+            .chunks(width)
+            .map(|chunk| chunk.iter().collect())
+            .collect();
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| HistoryRow::from_row(&row(chunk, index + 1 < chunks.len())))
+            .collect()
+    }
+
+    fn row_containing(rows: &VecDeque<HistoryRow>, word: &str) -> usize {
+        rows.iter().position(|row| row.text.contains(word)).unwrap()
+    }
+
+    const PARAGRAPHS: [&str; 6] = [
+        "The daemon keeps every terminal running while windows come and go.",
+        "Resizing the window asks the program to redraw at its new width, and a redraw can wrap every line differently.",
+        "Reading position alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima.",
+        "Another paragraph follows with ordinary words so the reading position has neighbours.",
+        "Then the output continues with more lines below the reading position.",
+        "Finally the prompt returns.",
+    ];
+
+    #[test]
+    fn a_program_rewrapping_its_text_keeps_the_reading_words_at_the_top() {
+        for (from, to) in [(40, 64), (64, 32)] {
+            let old = program_wrapped(&PARAGRAPHS, from);
+            let new = program_wrapped(&PARAGRAPHS, to);
+            // Reading from the row holding "alpha".
+            let base = row_containing(&old, "alpha");
+            let offset =
+                anchored_scroll_offset((&old, from), (&new, to), old.len() - base).unwrap();
+            assert_eq!(
+                new.len() - offset,
+                row_containing(&new, "alpha"),
+                "{from}→{to}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_reflow_of_a_long_line_keeps_the_reading_words() {
+        let text = PARAGRAPHS.join(" ");
+        let (from, to) = (30, 47);
+        let old = soft_wrapped(&text, from);
+        let new = soft_wrapped(&text, to);
+        for base in [5, 9, 13] {
+            // The first whole word from the reading row's first character: a row that
+            // starts mid-word is placed by the word after.
+            let start = base * from;
+            let word = if text.as_bytes()[start - 1] == b' ' {
+                start
+            } else {
+                start + text[start..].find(' ').unwrap() + 1
+            };
+            // Rows above that word's row stay above it.
+            let above = word / from - base;
+            let offset =
+                anchored_scroll_offset((&old, from), (&new, to), old.len() - base).unwrap();
+            assert_eq!(new.len() - offset, word / to - above, "row {base}");
+        }
+    }
+
+    #[test]
+    fn repeated_words_resolve_to_the_nearest_place_and_vanished_words_to_none() {
+        let section = [
+            "alpha bravo charlie delta echo foxtrot golf hotel",
+            "filler text here",
+        ];
+        let repeated = [section[0], section[1], section[1], section[0], section[1]];
+        let old = program_wrapped(&repeated, 30);
+        let new = program_wrapped(&repeated, 50);
+        // Reading the second occurrence, near the end.
+        let second = old
+            .iter()
+            .rposition(|row| row.text.contains("alpha"))
+            .unwrap();
+        let offset = anchored_scroll_offset((&old, 30), (&new, 50), old.len() - second).unwrap();
+        let expected = new
+            .iter()
+            .rposition(|row| row.text.contains("alpha"))
+            .unwrap();
+        assert_eq!(new.len() - offset, expected);
+        // A program that reprints only its last screen: the words are gone.
+        let old = program_wrapped(&PARAGRAPHS, 40);
+        let base = row_containing(&old, "alpha");
+        let last_screen = program_wrapped(&PARAGRAPHS[4..], 50);
+        assert_eq!(
+            anchored_scroll_offset((&old, 40), (&last_screen, 50), old.len() - base),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reprint_after_a_resize_recovers_the_view_by_its_words() {
+        let old = program_wrapped(&PARAGRAPHS, 40);
+        let base = row_containing(&old, "alpha");
+        let mut screen = snapshot(vec![row("$ ", false)]);
+        screen.scrollback = old.clone();
+        let mut mirror = ScreenMirror::default();
+        mirror.apply(compi_protocol::ScreenMessage::Snapshot { snapshot: screen });
+        let now = Instant::now();
+        let pending =
+            PendingScroll::new(&mirror, old.len() - base, now, RESIZE_REPRINT_GRACE).unwrap();
+        let reprint = program_wrapped(&PARAGRAPHS, 64);
+        let (offset, _) = pending.recover(&reprint, 64).unwrap();
+        assert_eq!(reprint.len() - offset, row_containing(&reprint, "alpha"));
+        assert!(!pending.expired(now + Duration::from_millis(999)));
+        assert!(pending.expired(now + RESIZE_REPRINT_GRACE));
+    }
+
+    #[test]
+    fn a_reprint_still_arriving_does_not_match_a_repeated_phrase_early() {
+        // Like a transcript of many similar messages: each body is the same vocabulary
+        // rotated, so a dozen words repeat throughout; the numbered headers do not.
+        let vocabulary = "terminal window daemon resize wrap redraw reading position scroll \
+                          history transcript program output prompt pane split float shell agent";
+        let vocabulary: Vec<&str> = vocabulary.split_whitespace().collect();
+        let paragraphs: Vec<String> = (0..120)
+            .map(|number| {
+                let body: Vec<&str> = (0..40 + number % 13)
+                    .map(|index| vocabulary[(number * 7 + index) % vocabulary.len()])
+                    .collect();
+                format!(
+                    "Paragraph {number:03} marker{number:03}: {}.",
+                    body.join(" ")
+                )
+            })
+            .collect();
+        let paragraphs: Vec<&str> = paragraphs.iter().map(String::as_str).collect();
+        let old = program_wrapped(&paragraphs, 78);
+        // Reading from inside a body, where the top rows hold only repeated words.
+        let base = row_containing(&old, "Paragraph 093") + 3;
+        let mut screen = snapshot(vec![row("$ ", false); 24]);
+        screen.scrollback = old.clone();
+        let mut mirror = ScreenMirror::default();
+        mirror.apply(compi_protocol::ScreenMessage::Snapshot { snapshot: screen });
+        let now = Instant::now();
+        let pending =
+            PendingScroll::new(&mirror, old.len() - base, now, RESIZE_REPRINT_GRACE).unwrap();
+        let reprint = program_wrapped(&paragraphs, 60);
+        let arrived: VecDeque<HistoryRow> =
+            reprint.iter().take(reprint.len() / 3).cloned().collect();
+        assert_eq!(pending.recover(&arrived, 60), None);
+        let (offset, _) = pending.recover(&reprint, 60).unwrap();
+        let paragraph =
+            row_containing(&reprint, "Paragraph 093")..row_containing(&reprint, "Paragraph 094");
+        assert!(paragraph.contains(&(reprint.len() - offset)));
     }
 
     #[test]

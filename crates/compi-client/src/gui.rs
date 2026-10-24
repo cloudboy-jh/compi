@@ -312,6 +312,8 @@ struct SurfaceView {
     scroll_offset: usize,
     new_lines: usize,
     pending_scroll: Option<crate::viewport::PendingScroll>,
+    /// When the grid last changed size: a program's reprint for it may follow.
+    resized_at: Option<Instant>,
     wheel: input::WheelAccumulator,
     selection: Option<Selection>,
     selecting: bool,

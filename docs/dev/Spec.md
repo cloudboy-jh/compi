@@ -547,7 +547,7 @@ Use readable JSON for low-rate control messages and compact binary screen payloa
 - A sequence gap requests a fresh snapshot and discards uncertain updates.
 - Reconnect verifies the complete terminal identity key and history epoch before restoring selections or cached history, as defined in [Process lifetimes and terminal identity](#process-lifetimes-and-terminal-identity).
 - History is fetched in bounded pages and cached locally; first paint does not require transferring all retained history.
-- Resize/reflow invalidates or remaps history and selection anchors explicitly.
+- Resize/reflow invalidates or remaps history and selection anchors explicitly. Today the client keeps the reading position by row text and, when no row matches because the terminal or the program rewrapped the text at the new width, by the run of words from the reading row (each history read at the width its rows were wrapped at); a clear-and-reprint within a second of a resize waits up to that second for its reprint.
 - Visible panes receive active screen streams. Hidden work receives lightweight status/title updates without unnecessary continuous grid transfer.
 - Queue overflow is handled by recoverable snapshot resynchronization, not unbounded memory or silent dropped keystrokes.
 

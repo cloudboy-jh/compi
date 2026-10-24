@@ -2209,9 +2209,14 @@ impl CompiApp {
                         let changed_geometry = old.cols != delta.cols || old.rows != delta.rows;
                         if changed_geometry {
                             view.selection = None;
-                            view.pending_scroll = None;
                             view.selecting = false;
+                            // A pending reprint is still found by its words at the new size.
+                            view.resized_at = Some(Instant::now());
                         }
+                        // A resize and the reprint it prompts move rows, not output.
+                        let resized = view
+                            .resized_at
+                            .is_some_and(|at| at.elapsed() < crate::viewport::RESIZE_REPRINT_GRACE);
                         if let Some(ScrollbackChange::Append { evicted, rows }) = &delta.scrollback
                         {
                             let (offset, selection) = crate::viewport::follow_append(
@@ -2227,7 +2232,7 @@ impl CompiApp {
                             view.selection = selection;
                             // A pending reprint is found by its text once applied.
                             if view.pending_scroll.is_none() && view.scroll_offset > 0 {
-                                if !changed_geometry {
+                                if !resized {
                                     view.new_lines = view.new_lines.saturating_add(rows.len());
                                 }
                                 view.scroll_offset = offset;
@@ -2242,13 +2247,13 @@ impl CompiApp {
                                 view.selecting = false;
                             }
                             let offset = crate::viewport::anchored_scroll_offset(
-                                &old.scrollback,
-                                history,
+                                (&old.scrollback, usize::from(old.cols)),
+                                (history, usize::from(delta.cols)),
                                 view.scroll_offset,
                             );
                             match offset {
                                 Some(offset) => {
-                                    if !changed_geometry {
+                                    if !resized {
                                         view.new_lines = view.new_lines.saturating_add(
                                             offset.saturating_sub(view.scroll_offset),
                                         );
@@ -2257,10 +2262,16 @@ impl CompiApp {
                                 }
                                 None => {
                                     if history.len() < old.scrollback.len() {
+                                        let grace = if resized {
+                                            crate::viewport::RESIZE_REPRINT_GRACE
+                                        } else {
+                                            crate::viewport::REPRINT_GRACE
+                                        };
                                         view.pending_scroll = crate::viewport::PendingScroll::new(
                                             &view.mirror,
                                             view.scroll_offset,
                                             Instant::now(),
+                                            grace,
                                         );
                                     }
                                     view.scroll_offset = 0;
@@ -2283,8 +2294,8 @@ impl CompiApp {
                             (old.cols != snapshot.cols || old.rows != snapshot.rows)
                                 .then(|| {
                                     crate::viewport::anchored_scroll_offset(
-                                        &old.scrollback,
-                                        &snapshot.scrollback,
+                                        (&old.scrollback, usize::from(old.cols)),
+                                        (&snapshot.scrollback, usize::from(snapshot.cols)),
                                         view.scroll_offset,
                                     )
                                 })
@@ -2305,13 +2316,17 @@ impl CompiApp {
                         return;
                     }
                     if let Some(pending) = &view.pending_scroll {
-                        if let Some((offset, added)) = view
-                            .mirror
-                            .snapshot()
-                            .and_then(|snapshot| pending.recover(&snapshot.scrollback))
-                        {
+                        if let Some((offset, added)) = view.mirror.snapshot().and_then(|snapshot| {
+                            pending.recover(&snapshot.scrollback, usize::from(snapshot.cols))
+                        }) {
                             view.scroll_offset = offset;
-                            view.new_lines = view.new_lines.saturating_add(added);
+                            // Rows a resize's reprint added below are not new output.
+                            let resized = view.resized_at.is_some_and(|at| {
+                                at.elapsed() < crate::viewport::RESIZE_REPRINT_GRACE
+                            });
+                            if !resized {
+                                view.new_lines = view.new_lines.saturating_add(added);
+                            }
                             view.pending_scroll = None;
                         } else if pending.expired(Instant::now()) {
                             view.pending_scroll = None;
@@ -2614,6 +2629,7 @@ impl CompiApp {
                     scroll_offset: 0,
                     new_lines: 0,
                     pending_scroll: None,
+                    resized_at: None,
                     wheel: input::WheelAccumulator::default(),
                     selection: None,
                     selecting: false,
