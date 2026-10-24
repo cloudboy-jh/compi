@@ -35,9 +35,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          # `diagnostics` holds the debug smoke diagnostics and the installed-update fixture.
           workspaces: |
             . -> target/installer/product
+            . -> target/installer/diagnostics
             installer/bootstrapper -> ../../target/installer/bootstrapper-target
+          cache-on-failure: true
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
@@ -90,13 +93,16 @@ jobs:
           $officialRelease = [bool]$env:EXPECTED_TAG
           .\tools\build-installer.ps1 -SigningCertificateThumbprint $env:COMPI_SIGNING_THUMBPRINT -ExpectedTag $env:EXPECTED_TAG -RequireUpdateKey:$officialRelease
           Rename-Item target/distribution/SHA256SUMS.txt SHA256SUMS-Windows-x64.txt
-      # Compile outside the bounded smoke step; the smoke's own cargo build is then a no-op.
+      # Compile outside the bounded smoke step, into the cached diagnostics directory the
+      # installed-update fixture also builds in.
       - name: Build package smoke diagnostics
-        run: cargo build --locked -p compi-client --example compi-probe --example compi-update-smoke
+        run: cargo build --locked -p compi-client --example compi-probe --example compi-update-smoke --target-dir target/installer/diagnostics
       - name: Verify portable artifact
         timeout-minutes: 10
         shell: pwsh
-        run: .\tools\smoke-windows-distribution.ps1
+        run: |
+          $examples = Join-Path $PWD 'target\installer\diagnostics\debug\examples'
+          .\tools\smoke-windows-distribution.ps1 -ProbePath (Join-Path $examples 'compi-probe.exe') -UpdateDriver (Join-Path $examples 'compi-update-smoke.exe')
       - name: Verify installed Setup migration and in-app update
         # Advisory until the debug-fixture GUI attach timeout is diagnosed; evidence
         # is still uploaded. Publication signs the portable qualification only.

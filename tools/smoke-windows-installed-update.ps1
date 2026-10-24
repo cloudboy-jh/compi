@@ -54,7 +54,8 @@ foreach ($path in @($setup, $portable)) { if (-not (Test-Path -LiteralPath $path
 $run = Join-Path $projectRoot ('target\distribution-smoke\installed-' + [guid]::NewGuid().ToString('N'))
 $scaffold = Join-Path $env:RUNNER_TEMP ('compi-installed-fixture-' + [guid]::NewGuid().ToString('N'))
 $source = Join-Path $scaffold 'source'
-$build = Join-Path $projectRoot 'target'
+# The release workflow caches this directory and builds its smoke diagnostics there first.
+$build = Join-Path $projectRoot 'target\installer\diagnostics'
 $privateKey = Join-Path $scaffold 'disposable-ed25519.key'
 $marker = Join-Path (Split-Path $root -Parent) '.Compi.compi-smoke-owned.json'
 $nonce = [guid]::NewGuid().ToString('N')

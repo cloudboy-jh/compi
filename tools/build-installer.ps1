@@ -92,9 +92,10 @@ $productBin = Join-Path $productTarget 'release'
 $msiPath = Join-Path $installerRoot 'Compi.msi'
 $payloadDirectory = Join-Path $projectRoot 'installer\bootstrapper\payload'
 $payloadPath = Join-Path $payloadDirectory 'Compi.msi'
-$maintenanceTarget = Join-Path $installerRoot 'maintenance-target'
-$maintenanceSource = Join-Path $maintenanceTarget 'release\compi-maintenance.exe'
+# Maintenance and Setup are two binaries of one package: one target directory compiles
+# the shared code once, and Setup relinks after the MSI it embeds exists.
 $bootstrapperTarget = Join-Path $installerRoot 'bootstrapper-target'
+$maintenanceSource = Join-Path $bootstrapperTarget 'release\compi-maintenance.exe'
 $setupSource = Join-Path $bootstrapperTarget 'release\compi-setup.exe'
 $setupName = "Compi-$version-Setup.exe"
 $setupDestination = Join-Path $OutputDirectory $setupName
@@ -140,7 +141,7 @@ try {
     Invoke-SignArtifact (Join-Path $productBin 'compi-daemon.exe')
     Invoke-SignArtifact $launcherSource
     Invoke-SignArtifact $helperSource
-    & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $maintenanceTarget
+    & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $bootstrapperTarget
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build the installed Compi maintenance surface' }
     Assert-FileVersion $maintenanceSource
     Invoke-SignArtifact $maintenanceSource
