@@ -585,6 +585,13 @@ enum UiEvent {
         request: u64,
         result: Result<workspace::content::LoadedImage, String>,
     },
+    /// A part of a large text file, or why it could not be read.
+    LargeTextPart {
+        pane_id: PaneId,
+        path: String,
+        request: u64,
+        result: Result<workspace::content::LargeTextPart, String>,
+    },
     ContentFileChecked {
         pane_id: PaneId,
         path: String,

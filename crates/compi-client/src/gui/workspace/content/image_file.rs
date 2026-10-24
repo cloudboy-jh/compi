@@ -478,7 +478,10 @@ mod tests {
         assert_eq!(svg(r#"width="240px" height="120px""#), Some((240.0, 120.0)));
         assert_eq!(svg(r#"width="12pt" height="6pt""#), Some((16.0, 8.0)));
         // Without both sizes, the view box's.
-        assert_eq!(svg(r#"width="50%" viewBox="0 0 64 32""#), Some((64.0, 32.0)));
+        assert_eq!(
+            svg(r#"width="50%" viewBox="0 0 64 32""#),
+            Some((64.0, 32.0))
+        );
         assert_eq!(svg(r#"width="0" height="10""#), None);
         assert_eq!(svg(""), None);
         assert_eq!(svg_size("not markup"), None);

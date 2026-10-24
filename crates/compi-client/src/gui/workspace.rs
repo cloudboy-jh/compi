@@ -2006,6 +2006,12 @@ impl CompiApp {
                 request,
                 result,
             } => self.content_image_loaded(&pane_id, &path, request, result),
+            UiEvent::LargeTextPart {
+                pane_id,
+                path,
+                request,
+                result,
+            } => self.large_text_part(&pane_id, &path, request, result),
             UiEvent::ContentFileChecked {
                 pane_id,
                 path,

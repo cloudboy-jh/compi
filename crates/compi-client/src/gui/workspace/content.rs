@@ -28,9 +28,12 @@ use gpui_component::input::{
 use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
 mod image_file;
+mod large_text;
 pub(in crate::gui) mod notes;
 use image_file::{ImageFile, SvgView};
 pub(in crate::gui) use image_file::{LoadedImage, is_svg};
+pub(in crate::gui) use large_text::Part as LargeTextPart;
+use large_text::{LargeText, Step};
 
 /// Width of the folder sidebar beside an open tab.
 pub(super) const SIDEBAR_WIDTH: f32 = 220.0;
@@ -162,6 +165,8 @@ enum FileBody {
     },
     /// An image the editor cannot open, shown as one.
     Image(Box<ImageFile>),
+    /// Text too large for the editor, shown read-only a part at a time.
+    LargeText(Box<LargeText>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1109,6 +1114,10 @@ impl CompiApp {
                                 }
                             }
                             FileBody::Ready(editor)
+                        }
+                        FileBody::LargeText(mut large) => {
+                            large.build(window, cx);
+                            FileBody::LargeText(large)
                         }
                         body => body,
                     };
@@ -2546,6 +2555,10 @@ impl CompiApp {
                 version,
                 writable,
             }),
+            FileContent::TooLarge {
+                len,
+                kind: FileKind::Text,
+            } => Err(FileBody::LargeText(Box::new(LargeText::new(len)))),
             FileContent::TooLarge { len, kind } => Err(image_file::image_tab(kind, len).map_or(
                 FileBody::Unopenable {
                     reason: Unopenable::TooLarge,
@@ -2609,6 +2622,7 @@ impl CompiApp {
             _ => None,
         };
         let starts_image = matches!(replacement, Some(FileBody::Image(_)));
+        let starts_text = matches!(replacement, Some(FileBody::LargeText(_)));
         if let Some(body) = replacement {
             file.body = body;
         }
@@ -2616,6 +2630,8 @@ impl CompiApp {
             let load = image.load_key();
             let environment = ui.environment.clone();
             self.request_image_load(pane_id, environment, path, load, cx);
+        } else if starts_text {
+            self.step_large_text(&pane_id, &path, Step::Start);
         }
     }
 
@@ -4058,6 +4074,7 @@ impl CompiApp {
                 .children(self.render_gutter(pane_id, path, cx))
                 .into_any_element(),
             Some(FileBody::Image(image)) => self.render_image_body(pane_id, path, Some(image), cx),
+            Some(FileBody::LargeText(large)) => self.render_large_text(pane_id, path, large, cx),
             Some(FileBody::Unopenable { reason, len, kind }) => {
                 let copied = path.to_owned();
                 area.p_3()

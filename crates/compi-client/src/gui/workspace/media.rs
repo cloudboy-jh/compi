@@ -910,8 +910,10 @@ mod tests {
     #[test]
     fn fitting_never_enlarges_and_zoom_and_pan_stay_bounded() {
         let mut view = ZoomView::default();
-        view.viewport
-            .set(Some(Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(300.0)))));
+        view.viewport.set(Some(Bounds::new(
+            point(px(0.0), px(0.0)),
+            size(px(400.0), px(300.0)),
+        )));
         // Smaller than the box: fitted at its own size.
         view.set_natural(size(100.0, 50.0));
         assert_eq!(view.scale(), Some(1.0));
@@ -929,6 +931,9 @@ mod tests {
         assert_eq!(view.pan, point(px(200.0), px(-450.0)));
         // A new image starts fitted and centred.
         view.set_natural(size(10.0, 10.0));
-        assert_eq!((view.scale(), view.pan), (Some(1.0), point(px(0.0), px(0.0))));
+        assert_eq!(
+            (view.scale(), view.pan),
+            (Some(1.0), point(px(0.0), px(0.0)))
+        );
     }
 }
