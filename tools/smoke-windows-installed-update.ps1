@@ -184,7 +184,7 @@ try {
         $env:GPUI_FXC_PATH = $fxc.FullName
     }
     # Copy only source inputs, including compile-time release notes and pinned runtime.
-    foreach ($name in @('Cargo.toml', 'Cargo.lock', 'LICENSE', 'crates', 'assets', 'docs', '.cargo')) {
+    foreach ($name in @('Cargo.toml', 'Cargo.lock', 'LICENSE', 'crates', 'vendor', 'assets', 'docs', '.cargo')) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $source -Recurse
     }
     New-Item -ItemType Directory -Path (Join-Path $source 'tools'), (Join-Path $source 'target\conpty-runtime') -Force | Out-Null
