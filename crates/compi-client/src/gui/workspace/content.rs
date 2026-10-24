@@ -8,6 +8,7 @@
 //! are compared with the disk every few seconds, so outside edits reload or warn, and
 //! a save never replaces bytes the editor has not seen. Dirty editors are backed up
 //! (see `unsaved`) and never dropped without asking.
+use super::browser::MediaSource;
 use super::changes::{ChangesSettings, DiffTab, RepoStatus, SidebarMode};
 use super::git_gutter::GitGutter;
 use super::tree::{Entry, FileTree, filter_rows};
@@ -167,6 +168,8 @@ enum FileBody {
     Image(Box<ImageFile>),
     /// Text too large for the editor, shown read-only a part at a time.
     LargeText(Box<LargeText>),
+    /// A PDF, audio or video file, shown by a system web view page.
+    Media(FileKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1061,6 +1064,40 @@ impl CompiApp {
                     })
             })
             .map(|pane| &pane.pane_id)
+    }
+
+    /// Every PDF, audio and video file open in a content pane, and whether its tab is
+    /// the active one of a shown pane.
+    pub(super) fn media_files(&self) -> Vec<((PaneId, String), MediaSource, bool)> {
+        let shown: Vec<(&PaneId, Option<&str>)> = self
+            .shown_content_panes()
+            .map(|pane_id| {
+                let content = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| find_content(workspace, pane_id));
+                (pane_id, content.and_then(|content| content.active_file()))
+            })
+            .collect();
+        let mut files = Vec::new();
+        for (pane_id, ui) in &self.content.panes {
+            let active = shown
+                .iter()
+                .find(|(shown, _)| *shown == pane_id)
+                .and_then(|(_, active)| *active);
+            for (path, file) in &ui.files {
+                if let FileBody::Media(kind) = file.body {
+                    let source = MediaSource {
+                        environment: ui.environment.clone(),
+                        path: path.clone(),
+                        kind,
+                    };
+                    let key = (pane_id.clone(), path.clone());
+                    files.push((key, source, active == Some(path.as_str())));
+                }
+            }
+        }
+        files
     }
 
     /// Before drawing: state for every visible content pane, a read for each shown file
@@ -2559,6 +2596,14 @@ impl CompiApp {
                 len,
                 kind: FileKind::Text,
             } => Err(FileBody::LargeText(Box::new(LargeText::new(len)))),
+            FileContent::TooLarge {
+                kind: kind @ (FileKind::Pdf | FileKind::Audio | FileKind::Video),
+                ..
+            }
+            | FileContent::Binary {
+                kind: kind @ (FileKind::Pdf | FileKind::Audio | FileKind::Video),
+                ..
+            } => Err(FileBody::Media(kind)),
             FileContent::TooLarge { len, kind } => Err(image_file::image_tab(kind, len).map_or(
                 FileBody::Unopenable {
                     reason: Unopenable::TooLarge,
@@ -4075,6 +4120,7 @@ impl CompiApp {
                 .into_any_element(),
             Some(FileBody::Image(image)) => self.render_image_body(pane_id, path, Some(image), cx),
             Some(FileBody::LargeText(large)) => self.render_large_text(pane_id, path, large, cx),
+            Some(FileBody::Media(_)) => self.render_media_page(pane_id, path),
             Some(FileBody::Unopenable { reason, len, kind }) => {
                 let copied = path.to_owned();
                 area.p_3()

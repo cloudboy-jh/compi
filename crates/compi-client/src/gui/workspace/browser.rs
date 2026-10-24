@@ -33,6 +33,10 @@ use std::rc::{Rc, Weak};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, PageLoadEvent, WebContext, WebView, WebViewBuilder};
 
+#[path = "browser_media.rs"]
+mod media;
+pub(in crate::gui) use media::MediaSource;
+
 /// The toolbar above the page.
 const TOOLBAR_HEIGHT: f32 = 34.0;
 /// The bar along the toolbar's foot while a page loads.
@@ -363,6 +367,8 @@ pub(in crate::gui) struct BrowserUi {
     focused: Option<PaneId>,
     /// **Open browser** ran: the next new blank pane gets the keyboard in its address.
     address_wanted: bool,
+    /// Pages of PDF, audio and video files open in file tabs.
+    media: media::MediaPages,
 }
 
 /// Every Browser pane of `tab`, with the URL the daemon holds.
@@ -685,6 +691,13 @@ impl CompiApp {
     /// and pages.
     pub(super) fn prepare_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.browser.floats.borrow_mut().clear();
+        let overlay = self.overlay.is_some()
+            || self.popup.is_some()
+            || self.context_menu.is_some()
+            || self.tab_menu.is_some()
+            || self.pane_drag.is_some()
+            || self.image_inspector.is_some();
+        self.prepare_media(overlay, window, cx);
         let mut wanted = Vec::new();
         if let Some(workspace) = &self.workspace {
             for session in &workspace.sessions {
@@ -700,15 +713,18 @@ impl CompiApp {
         let layers = &mut cx.default_global::<PageLayers>().0;
         layers.retain(|_, layer| layer.pages.iter().any(|page| page.strong_count() > 0));
         let id = Window::window_handle(window).window_id();
-        if self.browser.pages.is_empty() {
+        if self.browser.pages.is_empty() && self.browser.media.views().next().is_none() {
             layers.remove(&id);
         } else {
-            let pages = self.browser.pages.values();
+            let pages = self.browser.pages.values().map(|page| &page.view);
             layers.insert(
                 id,
                 PageLayer {
                     floats: self.browser.floats.clone(),
-                    pages: pages.map(|page| Rc::downgrade(&page.view)).collect(),
+                    pages: pages
+                        .chain(self.browser.media.views())
+                        .map(Rc::downgrade)
+                        .collect(),
                 },
             );
         }
@@ -727,12 +743,6 @@ impl CompiApp {
                 }
             }
         }
-        let overlay = self.overlay.is_some()
-            || self.popup.is_some()
-            || self.context_menu.is_some()
-            || self.tab_menu.is_some()
-            || self.pane_drag.is_some()
-            || self.image_inspector.is_some();
         let focused = self.focused_pane().cloned();
         let arrived = focused != self.browser.focused;
         self.browser.focused = focused.clone();
@@ -959,17 +969,7 @@ impl CompiApp {
             .creating
             .extend(missing.iter().map(|(pane, _)| pane.clone()));
         let events = self.page_events(window, cx);
-        let context = self
-            .browser
-            .context
-            .get_or_insert_with(|| {
-                Rc::new(RefCell::new(WebContext::new(
-                    compi_protocol::paths::data_dir()
-                        .ok()
-                        .map(|directory| directory.join("webview")),
-                )))
-            })
-            .clone();
+        let context = self.web_context();
         cx.spawn_in(window, async move |this, cx| {
             for (pane_id, url) in missing {
                 // The window, and so `parent`, may have closed since.
@@ -1002,6 +1002,20 @@ impl CompiApp {
             }
         })
         .detach();
+    }
+
+    /// The instance's web profile, made on first use.
+    fn web_context(&mut self) -> Rc<RefCell<WebContext>> {
+        self.browser
+            .context
+            .get_or_insert_with(|| {
+                Rc::new(RefCell::new(WebContext::new(
+                    compi_protocol::paths::data_dir()
+                        .ok()
+                        .map(|directory| directory.join("webview")),
+                )))
+            })
+            .clone()
     }
 
     /// A Browser pane's body: the toolbar, then the page, or why there is none.
@@ -1245,11 +1259,11 @@ impl CompiApp {
     /// Records float `index`'s frame where it is painted, then re-clips every page: pages
     /// are painted before the floats above them.
     pub(super) fn record_browser_float(&self, index: usize) -> Option<AnyElement> {
-        if self.browser.pages.is_empty() {
+        if self.browser.pages.is_empty() && self.browser.media.views().next().is_none() {
             return None;
         }
-        let pages = self.browser.pages.values();
-        let pages = pages.map(|page| page.view.clone()).collect();
+        let pages = self.browser.pages.values().map(|page| &page.view);
+        let pages = pages.chain(self.browser.media.views()).cloned().collect();
         Some(
             cut_out(self.browser.floats.clone(), pages, index)
                 .absolute()
