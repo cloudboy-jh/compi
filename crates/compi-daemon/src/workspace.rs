@@ -991,6 +991,11 @@ fn apply_mutation(
         }
         WorkspaceMutation::ShowView { pane_id, content } => {
             validate_content(content).map_err(invalid)?;
+            if content.browser().is_some() {
+                return Err(invalid(
+                    "a browser opens in a pane of its own, not in place of a shell".into(),
+                ));
+            }
             let (tab, mut leaf) = pane_leaf(&mut workspace.sessions, pane_id)
                 .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
             let view = terminal_view(&mut leaf).map_err(invalid)?;
@@ -2019,6 +2024,7 @@ fn content_kind(content: &PaneContent) -> &'static str {
         PaneContent::Files(_) => "files",
         PaneContent::Settings(_) => "settings",
         PaneContent::Monitor(_) => "monitor",
+        PaneContent::Browser(_) => "browser",
     }
 }
 
@@ -5322,6 +5328,20 @@ mod tests {
         }
         let message = reject("update-viewless", update(&terminal, host_content(&[])));
         assert!(message.contains("without a view"), "{message}");
+        // A browser opens in its own pane, never in place of a shell; nor does an
+        // invalid URL reach the workspace.
+        let browser =
+            |url: &str| PaneContent::Browser(compi_protocol::BrowserContent { url: url.into() });
+        let message = reject(
+            "show-browser",
+            show_view(&terminal, browser("http://localhost:3000/")),
+        );
+        assert!(message.contains("pane of its own"), "{message}");
+        let message = reject(
+            "open-script",
+            open_content(&terminal, browser("javascript:alert(1)")),
+        );
+        assert!(message.contains("scheme"), "{message}");
         let missing = PaneId::new("missing-pane");
         for (id, operation) in [
             ("show-missing", show_view(&missing, host_content(&[]))),

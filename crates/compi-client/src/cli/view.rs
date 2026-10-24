@@ -111,7 +111,9 @@ pub(super) fn run(
                 }),
             )
         }
-        PaneContent::Files(_) => unreachable!("only Settings and Monitor are asked for"),
+        PaneContent::Files(_) | PaneContent::Browser(_) => {
+            unreachable!("only Settings and Monitor are asked for")
+        }
     };
     let (text, mut value) = content::report(
         client,

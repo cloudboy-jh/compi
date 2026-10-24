@@ -7,6 +7,7 @@ use gpui::{
 use sha2::{Digest, Sha256};
 pub(in crate::gui) mod arrangements;
 pub(in crate::gui) mod branches;
+pub(in crate::gui) mod browser;
 pub(super) mod catalog;
 mod changes;
 pub(in crate::gui) mod content;
@@ -921,6 +922,7 @@ impl CompiApp {
             palette: palette::PaletteState::default(),
             settings: settings::SettingsUi::default(),
             monitor: monitor::MonitorUi::default(),
+            browser: browser::BrowserUi::default(),
             popup: None,
             context_menu: None,
             tab_menu: None,
@@ -3293,6 +3295,9 @@ impl CompiApp {
                 .zip(pane)
                 .and_then(|(workspace, pane)| content::find_leaf(workspace, pane)?.view())
                 .is_some(),
+            browser_pane: self
+                .focused_pane_content()
+                .is_some_and(|content| content.browser().is_some()),
             file_tab: self
                 .focused_content()
                 .is_some_and(|content| content.active_file().is_some()),
@@ -4055,6 +4060,15 @@ impl CompiApp {
             Command::OpenQuickAppearance => self.open_quick_appearance(),
             Command::OpenSettings => self.open_settings(None, None, window, cx),
             Command::OpenMonitor => self.open_monitor(window, cx),
+            Command::OpenBrowser => self.open_browser(compi_protocol::BrowserContent::BLANK.into()),
+            Command::BrowserBack => self.browser_navigate(browser::Navigation::Back),
+            Command::BrowserForward => self.browser_navigate(browser::Navigation::Forward),
+            Command::BrowserReload => self.browser_navigate(browser::Navigation::Reload),
+            Command::FocusAddressBar => {
+                if let Some(pane_id) = self.focused_pane().cloned() {
+                    self.focus_address(&pane_id, window, cx);
+                }
+            }
             Command::CheckForUpdates => {
                 self.open_settings(Some(SettingsSection::Updates), None, window, cx);
                 self.updates.check();
@@ -4507,6 +4521,9 @@ impl CompiApp {
                         }
                         compi_protocol::PaneContent::Settings(_) => ("Settings".to_owned(), None),
                         compi_protocol::PaneContent::Monitor(_) => ("Monitor".to_owned(), None),
+                        compi_protocol::PaneContent::Browser(browser) => {
+                            (self.browser_title(&pane_id, &browser.url), None)
+                        }
                     };
                     Some(TabPane {
                         floating: self.state.is_floating(&pane_id),
@@ -4797,6 +4814,7 @@ impl CompiApp {
         self.prepare_content(window, cx);
         self.prepare_settings(window, cx);
         self.prepare_monitor(window, cx);
+        self.prepare_browsers(window, cx);
         self.reconcile_keyboard_focus(window, cx);
         for view in &mut self.surface_views {
             if !view.stop.load(Ordering::Acquire) {
@@ -4956,54 +4974,63 @@ impl CompiApp {
                     .child(self.render_panes(cx)),
             )
             .when_some(notice, |root, (error, can_reconnect, dismissible)| {
+                // Pages under the banner and its margin are cut back to the panes row,
+                // as under a float above all others.
                 root.child(
                     div()
-                        .mx_2()
-                        .mb_2()
+                        .relative()
                         .flex_none()
-                        .px_3()
-                        .py_2()
-                        .bg(color(colors.surface))
-                        .border_1()
-                        .border_color(color(colors.error))
-                        .text_color(color(colors.error))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(div().min_w_0().child(error))
-                        .when(can_reconnect || dismissible, |banner| {
-                            banner.child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .gap_3()
-                                    .when(can_reconnect, |actions| {
-                                        actions.child(self.command_button(
-                                            "error-reconnect",
-                                            "Reconnect",
-                                            Command::Reconnect,
-                                            cx,
-                                        ))
-                                    })
-                                    .when(dismissible, |actions| {
-                                        actions.child(
-                                            div()
-                                                .id("dismiss-error")
-                                                .cursor_pointer()
-                                                .child("Dismiss")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if can_reconnect {
-                                                        this.connection_error = None;
-                                                    } else {
-                                                        this.global_error = None;
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    }),
-                            )
-                        }),
+                        .px_2()
+                        .pb_2()
+                        .children(self.record_browser_float(usize::MAX))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .bg(color(colors.surface))
+                                .border_1()
+                                .border_color(color(colors.error))
+                                .text_color(color(colors.error))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(div().min_w_0().child(error))
+                                .when(can_reconnect || dismissible, |banner| {
+                                    banner.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_end()
+                                            .gap_3()
+                                            .when(can_reconnect, |actions| {
+                                                actions.child(self.command_button(
+                                                    "error-reconnect",
+                                                    "Reconnect",
+                                                    Command::Reconnect,
+                                                    cx,
+                                                ))
+                                            })
+                                            .when(dismissible, |actions| {
+                                                actions.child(
+                                                    div()
+                                                        .id("dismiss-error")
+                                                        .cursor_pointer()
+                                                        .child("Dismiss")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if can_reconnect {
+                                                                    this.connection_error = None;
+                                                                } else {
+                                                                    this.global_error = None;
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                )
+                                            }),
+                                    )
+                                }),
+                        ),
                 )
             })
             .when(self.overlay.is_none(), |root| {
@@ -6684,6 +6711,7 @@ impl CompiApp {
                         outline.border_1().border_color(color(colors.border))
                     }),
             )
+            .children(self.record_browser_float(index))
             .into_any_element()
     }
 

@@ -56,6 +56,8 @@ typst-assets = { version = "=0.14.2", features = ["fonts"] }
 roxmltree = "0.20"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 raw-window-handle = "0.6"
+# Browser panes: the system webview (WebView2, WKWebView) as a child of the window.
+wry = { version = "0.57.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Without font-kit, GPUI selects NoopTextSystem on macOS.
@@ -81,6 +83,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+webview2-com = "0.39"
 
 [build-dependencies]
 serde.workspace = true

@@ -61,7 +61,8 @@ use std::fmt;
 // distribution) on every watch and on `MonitorContent`, `ListMonitorSources`,
 // `InspectProcess`, `QuitProcess` aimed at `(pid, start_time)`, and the Compi surface a
 // process runs in (`ProcessDetails::surface`).
-pub const PROTOCOL_VERSION: u32 = 32;
+// Version 33 adds Browser: a content kind showing a web page at a URL in its own pane.
+pub const PROTOCOL_VERSION: u32 = 33;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -1202,6 +1203,8 @@ pub enum PaneContent {
     Settings(SettingsContent),
     /// Monitor: the daemon host's processes.
     Monitor(MonitorContent),
+    /// A web page, shown by each client's system webview.
+    Browser(BrowserContent),
 }
 
 impl PaneContent {
@@ -1212,6 +1215,17 @@ impl PaneContent {
             Self::Files(folder) => folder.validate(),
             Self::Settings(_) => Ok(()),
             Self::Monitor(monitor) => monitor.source.validate(),
+            Self::Browser(browser) => browser.validate(),
+        }
+    }
+
+    /// What this shows, as its pane names it.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Files(_) => "Files",
+            Self::Settings(_) => "Settings",
+            Self::Monitor(_) => "Monitor",
+            Self::Browser(_) => "Browser",
         }
     }
 
@@ -1219,7 +1233,7 @@ impl PaneContent {
     pub fn folder(&self) -> Option<&FolderContent> {
         match self {
             Self::Files(folder) => Some(folder),
-            Self::Settings(_) | Self::Monitor(_) => None,
+            Self::Settings(_) | Self::Monitor(_) | Self::Browser(_) => None,
         }
     }
 
@@ -1227,7 +1241,15 @@ impl PaneContent {
     pub fn settings(&self) -> Option<&SettingsContent> {
         match self {
             Self::Settings(settings) => Some(settings),
-            Self::Files(_) | Self::Monitor(_) => None,
+            Self::Files(_) | Self::Monitor(_) | Self::Browser(_) => None,
+        }
+    }
+
+    /// The page shown, when this shows a browser.
+    pub fn browser(&self) -> Option<&BrowserContent> {
+        match self {
+            Self::Browser(browser) => Some(browser),
+            Self::Files(_) | Self::Settings(_) | Self::Monitor(_) => None,
         }
     }
 
@@ -1239,6 +1261,81 @@ impl PaneContent {
     /// Whether `other` is the same kind of content, which an update must keep.
     pub fn same_kind(&self, other: &Self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+/// The longest URL a browser pane keeps.
+pub const MAX_BROWSER_URL_BYTES: usize = 8 * 1024;
+
+/// A content pane showing the web page at `url`. Its history, scroll position and
+/// session live in each client's webview, not here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserContent {
+    pub url: String,
+}
+
+impl BrowserContent {
+    /// The blank page a new browser pane opens on.
+    pub const BLANK: &str = "about:blank";
+
+    /// The page an address typed or passed on the command line names: as given when it
+    /// has a scheme (`https://…`, `about:blank`), else an `http://` location such as
+    /// `localhost:3000` or `example.com/docs`. Surrounding spaces are ignored. Refused
+    /// as `validate` refuses.
+    pub fn from_typed(typed: &str) -> Result<Self, String> {
+        let typed = typed.trim();
+        // A scheme is letters before a colon not followed by a port number.
+        let scheme = typed.split_once(':').is_some_and(|(scheme, rest)| {
+            scheme
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                && !rest.starts_with(|c: char| c.is_ascii_digit())
+        });
+        let content = Self {
+            url: if scheme {
+                typed.to_owned()
+            } else {
+                format!("http://{typed}")
+            },
+        };
+        content.validate()?;
+        Ok(content)
+    }
+
+    /// An `http`, `https` or `file` URL, or `about:blank`, with no whitespace or control
+    /// characters. Script, data and other schemes are refused.
+    pub fn validate(&self) -> Result<(), String> {
+        let url = self.url.as_str();
+        if url.len() > MAX_BROWSER_URL_BYTES {
+            return Err(format!(
+                "browser URL is longer than {MAX_BROWSER_URL_BYTES} bytes"
+            ));
+        }
+        if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("browser URL contains whitespace or control characters".into());
+        }
+        if url.eq_ignore_ascii_case(Self::BLANK) {
+            return Ok(());
+        }
+        let (scheme, rest) = url
+            .split_once(':')
+            .ok_or_else(|| format!("browser URL {url:?} has no scheme"))?;
+        if !["http", "https", "file"]
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+        {
+            return Err(format!(
+                "browser URL scheme {scheme:?} is not http, https or file"
+            ));
+        }
+        if !rest.starts_with("//") || rest.len() == 2 {
+            return Err(format!("browser URL {url:?} names no location"));
+        }
+        Ok(())
     }
 }
 
@@ -2195,6 +2292,53 @@ mod content_tests {
         let mut root = content(&[], None);
         root.root.clear();
         assert!(root.validate().is_err());
+    }
+
+    #[test]
+    fn typed_addresses_assume_http_without_a_scheme() {
+        let typed = |text: &str| BrowserContent::from_typed(text).map(|content| content.url);
+        assert_eq!(typed("localhost:3000").unwrap(), "http://localhost:3000");
+        assert_eq!(
+            typed("  example.com/a?b ").unwrap(),
+            "http://example.com/a?b"
+        );
+        assert_eq!(typed("https://example.com").unwrap(), "https://example.com");
+        assert_eq!(typed("about:blank").unwrap(), "about:blank");
+        assert_eq!(
+            typed("file:///home/user/index.html").unwrap(),
+            "file:///home/user/index.html"
+        );
+        for refused in ["javascript:alert(1)", "data:text/html,x", "a b", ""] {
+            assert!(typed(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn browser_urls_are_web_or_file_locations_only() {
+        let check = |url: &str| PaneContent::Browser(BrowserContent { url: url.into() }).validate();
+        for url in [
+            "about:blank",
+            "http://localhost:3000/",
+            "HTTPS://example.com/a?b=c#d",
+            "file:///home/user/index.html",
+        ] {
+            assert!(check(url).is_ok(), "{url}");
+        }
+        for url in [
+            "",
+            "javascript:alert(1)",
+            "data:text/html,<p>",
+            "localhost:3000",
+            "http:example.com",
+            "https://",
+            "http://exa mple.com",
+            "http://example.com/\n",
+        ] {
+            assert!(check(url).is_err(), "{url:?}");
+        }
+        let longest = format!("http://h/{}", "a".repeat(MAX_BROWSER_URL_BYTES - 9));
+        assert!(check(&longest).is_ok());
+        assert!(check(&format!("{longest}a")).is_err());
     }
 
     #[test]

@@ -911,6 +911,8 @@ struct CompiApp {
     settings: workspace::settings::SettingsUi,
     /// Monitor panes and the window's process samples; see `monitor`.
     monitor: workspace::monitor::MonitorUi,
+    /// Browser panes' pages; see `browser`.
+    browser: workspace::browser::BrowserUi,
     popup: Option<Popup>,
     /// A menu at the pointer: a right-click, a pane's grip.
     context_menu: Option<controls::ContextMenu>,

@@ -70,6 +70,7 @@ pub(super) const fn view_label(content: &PaneContent) -> &'static str {
         PaneContent::Files(_) => "Files",
         PaneContent::Settings(_) => "Settings",
         PaneContent::Monitor(_) => "Monitor",
+        PaneContent::Browser(_) => "Browser",
     }
 }
 

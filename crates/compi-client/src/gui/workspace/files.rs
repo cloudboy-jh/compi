@@ -4,7 +4,7 @@
 use super::*;
 use crate::content_path;
 use crate::viewport::FileLocation;
-use compi_protocol::{ContentEnvironment, SurfaceInfo};
+use compi_protocol::{ContentEnvironment, PaneContent, SurfaceInfo};
 
 const UNKNOWN_DIRECTORY: &str = "The shell has not reported its current directory. Enable OSC 7 shell integration to open files from this pane.";
 const WINDOWS_SEARCH: &str =
@@ -135,10 +135,16 @@ impl CompiApp {
             });
         }
         if let Some(content) = self.focused_pane_content() {
-            return Err(if content.is_monitor() {
-                "Monitor has no folder; select a terminal or a files pane"
-            } else {
-                "Settings has no folder; select a terminal or a files pane"
+            return Err(match content {
+                PaneContent::Monitor(_) => {
+                    "Monitor has no folder; select a terminal or a files pane"
+                }
+                PaneContent::Browser(_) => {
+                    "Browser has no folder; select a terminal or a files pane"
+                }
+                PaneContent::Settings(_) | PaneContent::Files(_) => {
+                    "Settings has no folder; select a terminal or a files pane"
+                }
             });
         }
         let view = self.focused_view().ok_or("Select a pane first")?;

@@ -133,7 +133,9 @@ pub(super) fn caller<'a>(
                 .is_some_and(|view| view.side == PaneSide::View);
             let files = view.and_then(|view| match view.content {
                 PaneContent::Files(folder) => Some(folder),
-                PaneContent::Settings(_) | PaneContent::Monitor(_) => None,
+                PaneContent::Settings(_) | PaneContent::Monitor(_) | PaneContent::Browser(_) => {
+                    None
+                }
             });
             (environment, Some(surface), base, files, view_shown)
         }
@@ -147,16 +149,9 @@ pub(super) fn caller<'a>(
             Some(folder),
             false,
         ),
-        LayoutNode::Content {
-            content: content @ (PaneContent::Settings(_) | PaneContent::Monitor(_)),
-            ..
-        } => {
+        LayoutNode::Content { content, .. } => {
             let command = options.args.first().map_or("this command", String::as_str);
-            let shows = if content.is_monitor() {
-                "Monitor"
-            } else {
-                "Settings"
-            };
+            let shows = content.label();
             return Err(CliError::new(
                 3,
                 "files_pane_required",

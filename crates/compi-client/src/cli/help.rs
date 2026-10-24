@@ -205,6 +205,11 @@ pub fn text(command: &str, action: Option<&str>) -> String {
             "Show Monitor in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. PAGE is overview, processes, cpu, memory, gpu, disk or network; without it the pane keeps the page it shows, else Overview. --source host|wsl:NAME shows that source (see compi monitor sources); without it the pane keeps the source it shows, else the daemon's host. From a Monitor pane (--pane), that pane changes page or source. monitor totals, list and inspect print Monitor's data for scripts with no window, monitor sources lists the sources and monitor quit quits a process; see each one's --help.",
             "compi monitor processes",
         ),
+        ("browse", _) => (
+            "browse URL [--down]",
+            "Open URL in a Browser pane beside the selected terminal (below it with --down); the shell stays as it is. URL is an http, https or file URL, or about:blank; without a scheme, http:// is assumed, so localhost:3000 opens http://localhost:3000. From a Browser pane (--pane), that pane goes to URL. The page is the system web view's (WebView2 on Windows, WKWebView on macOS), with one persistent profile per instance. --json returns {pane_id, url, shown, not_shown, receipt, workspace}.",
+            "compi browse localhost:3000",
+        ),
         ("command", Some("run")) => (
             "command run ID",
             "Run the palette command ID (see command list) in the Compi window that shows the selected pane's tab (--window selects another), with that pane focused first, as if chosen from the palette there. A command that asks first, such as Close pane, opens its dialog in the window; there is no bypass. A command disabled there exits 1 with command_disabled and the palette's reason; an unknown ID exits 2. --json returns {command, name, pane_id, window_id}.",
@@ -257,7 +262,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         _ => (
             "[GLOBAL OPTIONS] COMMAND [ARGS]",
-            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; notes [FILE|FOLDER]/search/backlinks; diff; settings; monitor [PAGE]/totals/list/sources/inspect/quit; command list/run; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
+            "Commands: workspace list/show/create/rename/close; tab list/open/rename/focus/move/detach/close/merge/unmerge; pane list/show/focus/resize/swap/zoom/unzoom/float/dock/close/terminate/send/capture; window list; split; files; edit; notes [FILE|FOLDER]/search/backlinks; diff; settings; monitor [PAGE]/totals/list/sources/inspect/quit; browse URL; command list/run; layout; run; attach; detach; theme install; update; changes. compi --version prints the version; compi changes prints what changed in it. Bare compi and existing GUI flags continue to open the native application. Use COMMAND ACTION --help for individual help.",
             "compi --instance dev --json workspace list",
         ),
     };

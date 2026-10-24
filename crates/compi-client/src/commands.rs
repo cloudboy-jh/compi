@@ -159,6 +159,11 @@ registry! {
     RestartDaemon, "restart_daemon", "Restart daemon", None, None;
     OpenDiagnostics, "open_diagnostics", "Open diagnostics", None, None;
     OpenMonitor, "open_monitor", "Monitor", None, None;
+    OpenBrowser, "open_browser", "Open browser", None, None;
+    BrowserBack, "browser_back", "Back", None, None;
+    BrowserForward, "browser_forward", "Forward", None, None;
+    BrowserReload, "browser_reload", "Reload page", None, None;
+    FocusAddressBar, "focus_address_bar", "Focus address bar", None, None;
     Quit, "quit", "Quit Compi", Some("cmd-q"), Some("ctrl-shift-q");
 }
 
@@ -241,6 +246,8 @@ pub struct CommandContext {
     pub content_pane: bool,
     /// The focused pane is a terminal carrying a view, shown or not.
     pub pane_view: bool,
+    /// The focused pane shows a web page.
+    pub browser_pane: bool,
     /// The focused content pane shows a file tab in Edit mode.
     pub file_tab: bool,
     /// The focused content pane shows a file tab in Diff mode.
@@ -297,7 +304,8 @@ impl Command {
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
-            | SwapPaneDown | RemovePane => CommandCategory::Panes,
+            | SwapPaneDown | RemovePane | OpenBrowser | BrowserBack | BrowserForward
+            | BrowserReload | FocusAddressBar => CommandCategory::Panes,
             ShowFiles | ShowChanges | DiffThisFile | NextChange | PreviousChange | GitFetch
             | GitPull | GitPush | SwitchBranch | CreateBranch | OpenFile | NewEditor
             | RecoverUnsavedEdits => CommandCategory::Files,
@@ -402,6 +410,7 @@ impl Command {
             OpenMonitor => Some(
                 "Shows the processes running where your terminals run, with their CPU and memory.",
             ),
+            OpenBrowser => Some("Opens a web page in a pane beside the focused one."),
             _ => None,
         }
     }
@@ -449,6 +458,10 @@ impl Command {
             OpenMonitor => {
                 "task manager processes activity monitor resources top htop cpu memory threads pid kill end usage"
             }
+            OpenBrowser => "web page url localhost preview site dev server http",
+            BrowserBack | BrowserForward => "browser web page history navigate",
+            BrowserReload => "browser web page refresh stop",
+            FocusAddressBar => "browser web page url location navigate go",
             _ => "",
         }
     }
@@ -461,6 +474,12 @@ impl Command {
     }
     pub fn disabled_reason(self, c: &CommandContext) -> Option<&'static str> {
         use Command::*;
+        if matches!(
+            self,
+            BrowserBack | BrowserForward | BrowserReload | FocusAddressBar
+        ) {
+            return (!c.browser_pane).then_some("Select a browser pane first");
+        }
         let local = matches!(
             self,
             OpenPalette
@@ -480,6 +499,7 @@ impl Command {
                 | Reconnect
                 | OpenDiagnostics
                 | OpenMonitor
+                | OpenBrowser
                 | Quit
         );
         if local {

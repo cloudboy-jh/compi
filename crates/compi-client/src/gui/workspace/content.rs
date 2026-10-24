@@ -1514,6 +1514,7 @@ impl CompiApp {
                     .any(|ui| ui.owns(&focused, window, cx))
                 || self.settings_owns(&focused, window, cx)
                 || self.monitor_owns(&focused, window, cx)
+                || self.browser_owns(&focused, cx)
         });
         if !ours {
             return;
@@ -1543,6 +1544,13 @@ impl CompiApp {
             Some(pane_id) if self.monitor_pane_focus(pane_id).is_some() => {
                 let Some(wanted) = self.monitor_keyboard(pane_id, window, cx) else {
                     // Its search field or the pane already has the keyboard.
+                    return;
+                };
+                wanted
+            }
+            Some(pane_id) if self.browser_pane_focus(pane_id).is_some() => {
+                let Some(wanted) = self.browser_keyboard(pane_id, window, cx) else {
+                    // Its address field or the pane already has the keyboard.
                     return;
                 };
                 wanted
@@ -3087,6 +3095,10 @@ impl CompiApp {
             .when(monitor, |pane| {
                 pane.child(self.render_monitor_pane(&pane_id, rect.width, cx))
             })
+            .when(
+                pane_content.is_some_and(|content| content.browser().is_some()),
+                |pane| pane.child(self.render_browser_body(&pane_id, cx)),
+            )
             .when_some(
                 content.zip(ui).filter(|_| {
                     self.file_tree

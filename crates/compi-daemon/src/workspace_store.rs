@@ -29,8 +29,9 @@ use windows::core::PCWSTR;
 /// file far enough to refuse it (see `readable_by_older_formats`). Format 6 (protocol 29)
 /// lets a terminal leaf carry a content `view`; older daemons ignore the key and reach
 /// their format check. Format 7 (protocol 31) adds commit diff tabs, also stored so older
-/// daemons can refuse the file.
-const FORMAT_VERSION: u32 = 7;
+/// daemons can refuse the file. Format 8 (protocol 33) adds the Browser kind, stored the
+/// way Monitor is.
+const FORMAT_VERSION: u32 = 8;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -156,7 +157,10 @@ impl WorkspaceStore {
                         value["format_version"] = 7.into();
                     }
                     if value.get("format_version") == Some(&serde_json::Value::from(7)) {
-                        restore_monitors(&mut value);
+                        value["format_version"] = 8.into();
+                    }
+                    if value.get("format_version") == Some(&serde_json::Value::from(8)) {
+                        restore_newer_kinds(&mut value);
                         restore_commit_diffs(&mut value);
                     }
                     serde_json::from_value::<Manifest>(value)
@@ -481,29 +485,38 @@ fn migrate_content_kinds(value: &mut serde_json::Value) {
 
 /// Older daemons parse the whole file before their format check, and a newer shape they
 /// fail to parse would quarantine the file, dropping every pane. So newer shapes are
-/// written in older ones (`mark_monitors`, `hide_commit_diffs`), which lets those daemons
-/// parse far enough to refuse the format and keep the file. Loading undoes both.
+/// written in older ones (`mark_newer_kinds`, `hide_commit_diffs`), which lets those
+/// daemons parse far enough to refuse the format and keep the file. Loading undoes both.
 fn readable_by_older_formats(value: &mut serde_json::Value) {
-    mark_monitors(value);
+    mark_newer_kinds(value);
     hide_commit_diffs(value);
 }
 
+/// Content kinds newer than Settings, written as marked Settings leaves.
+const NEWER_KINDS: [&str; 2] = ["monitor", "browser"];
+
 /// A format-3 daemon (protocol 26) reads every content leaf as a folder: it needs an
 /// `environment` and a `root` and ignores other keys. A format-4 daemon (protocol 27) knows
-/// only the `files` and `settings` kinds. So a Monitor leaf is written as a Settings leaf
-/// marked `shows: monitor`, and Settings leaves get placeholder `environment` and `root`.
-/// Loading ignores the placeholders and `restore_monitors` undoes the marking.
-fn mark_monitors(value: &mut serde_json::Value) {
+/// only the `files` and `settings` kinds, and a format-7 one not `browser`. So a Monitor or
+/// Browser leaf is written as a Settings leaf marked `shows: monitor` or `shows: browser`,
+/// and Settings leaves get placeholder `environment` and `root`. Loading ignores the
+/// placeholders and `restore_newer_kinds` undoes the marking.
+fn mark_newer_kinds(value: &mut serde_json::Value) {
     use serde_json::Value;
     match value {
-        Value::Array(items) => items.iter_mut().for_each(mark_monitors),
+        Value::Array(items) => items.iter_mut().for_each(mark_newer_kinds),
         Value::Object(object) => {
             if object.get("type").and_then(Value::as_str) == Some("content")
                 && let Some(Value::Object(content)) = object.get_mut("content")
             {
-                if content.get("kind").and_then(Value::as_str) == Some("monitor") {
+                if let Some(kind) = content
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .filter(|kind| NEWER_KINDS.contains(kind))
+                    .map(str::to_owned)
+                {
                     content.insert("kind".into(), Value::from("settings"));
-                    content.insert("shows".into(), Value::from("monitor"));
+                    content.insert("shows".into(), Value::from(kind));
                     content.insert("section".into(), Value::from("appearance"));
                 }
                 if content.get("kind").and_then(Value::as_str) == Some("settings") {
@@ -514,31 +527,36 @@ fn mark_monitors(value: &mut serde_json::Value) {
                 }
                 return;
             }
-            object.values_mut().for_each(mark_monitors);
+            object.values_mut().for_each(mark_newer_kinds);
         }
         _ => {}
     }
 }
 
-/// Undoes `mark_monitors`, keeping a Monitor leaf's own fields (the page). Every layout copy
-/// is walked.
-fn restore_monitors(value: &mut serde_json::Value) {
+/// Undoes `mark_newer_kinds`, keeping a leaf's own fields (Monitor's page, Browser's
+/// URL). Every layout copy is walked.
+fn restore_newer_kinds(value: &mut serde_json::Value) {
     use serde_json::Value;
     match value {
-        Value::Array(items) => items.iter_mut().for_each(restore_monitors),
+        Value::Array(items) => items.iter_mut().for_each(restore_newer_kinds),
         Value::Object(object) => {
             if object.get("type").and_then(Value::as_str) == Some("content")
                 && let Some(Value::Object(content)) = object.get_mut("content")
             {
-                if content.get("shows").and_then(Value::as_str) == Some("monitor") {
+                if let Some(kind) = content
+                    .get("shows")
+                    .and_then(Value::as_str)
+                    .filter(|kind| NEWER_KINDS.contains(kind))
+                    .map(str::to_owned)
+                {
                     for placeholder in ["shows", "section", "environment", "root"] {
                         content.remove(placeholder);
                     }
-                    content.insert("kind".into(), Value::from("monitor"));
+                    content.insert("kind".into(), Value::from(kind));
                 }
                 return;
             }
-            object.values_mut().for_each(restore_monitors);
+            object.values_mut().for_each(restore_newer_kinds);
         }
         _ => {}
     }
@@ -872,8 +890,8 @@ mod tests {
     use super::*;
     use compi_protocol::system_metrics::MonitorSource;
     use compi_protocol::{
-        ContentEnvironment, ContentTab, FolderContent, GitScope, MonitorContent, MonitorPage,
-        PaneContent, PaneSide, PaneView, SettingsContent, SettingsSection, SplitAxis,
+        BrowserContent, ContentEnvironment, ContentTab, FolderContent, GitScope, MonitorContent,
+        MonitorPage, PaneContent, PaneSide, PaneView, SettingsContent, SettingsSection, SplitAxis,
     };
 
     fn test_path(name: &str) -> PathBuf {
@@ -1345,8 +1363,8 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// `content_workspace` with Settings and Monitor panes beside the files pane, in
-    /// both arrangements; the Monitor watches a WSL distribution.
+    /// `content_workspace` with Settings, Monitor and Browser panes beside the files pane,
+    /// in both arrangements; the Monitor watches a WSL distribution.
     fn content_kinds_workspace() -> StoredWorkspace {
         let (mut workspace, files) = content_workspace(SurfaceStatus::Lost);
         let settings = LayoutNode::Content {
@@ -1364,6 +1382,12 @@ mod tests {
                 },
             }),
         };
+        let browser = LayoutNode::Content {
+            pane_id: PaneId::new("pane-5"),
+            content: PaneContent::Browser(BrowserContent {
+                url: "http://localhost:3000/docs?page=2".into(),
+            }),
+        };
         let terminal = LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1"));
         let split = |first: &LayoutNode, second: &LayoutNode| LayoutNode::Split {
             axis: SplitAxis::Horizontal,
@@ -1372,16 +1396,19 @@ mod tests {
             second: Box::new(second.clone()),
         };
         let tab = &mut workspace.sessions[0].tabs[0];
-        tab.layout = split(&terminal, &split(&files, &split(&settings, &monitor)));
+        tab.layout = split(
+            &terminal,
+            &split(&files, &split(&settings, &split(&monitor, &browser))),
+        );
         tab.previous_layout = Some(Box::new(split(
-            &split(&monitor, &split(&settings, &files)),
+            &split(&browser, &split(&monitor, &split(&settings, &files))),
             &terminal,
         )));
         workspace
     }
 
     #[test]
-    fn settings_and_monitor_panes_survive_reopen() {
+    fn settings_monitor_and_browser_panes_survive_reopen() {
         let path = test_path("content-kinds");
         let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
         let workspace = content_kinds_workspace();
@@ -1390,13 +1417,84 @@ mod tests {
         let panes = &saved["workspace"]["sessions"][0]["tabs"][0]["layout"]["second"]["second"];
         assert_eq!(panes["first"]["content"]["kind"], "settings");
         assert_eq!(panes["first"]["content"]["section"], "terminal");
-        // Monitor is stored as a marked Settings leaf for older daemons, and the
-        // placeholders written for them are ignored when loading.
-        assert_eq!(panes["second"]["content"]["kind"], "settings");
-        assert_eq!(panes["second"]["content"]["shows"], "monitor");
+        // Monitor and Browser are stored as marked Settings leaves for older daemons, and
+        // the placeholders written for them are ignored when loading.
+        let (monitor, browser) = (&panes["second"]["first"], &panes["second"]["second"]);
+        assert_eq!(monitor["content"]["kind"], "settings");
+        assert_eq!(monitor["content"]["shows"], "monitor");
+        assert_eq!(browser["content"]["kind"], "settings");
+        assert_eq!(browser["content"]["shows"], "browser");
+        assert_eq!(
+            browser["content"]["url"],
+            "http://localhost:3000/docs?page=2"
+        );
         assert_eq!(panes["first"]["content"]["root"], "/");
         let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
         assert_eq!(reopened.sessions, workspace.sessions);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_format_7_daemon_reaches_its_version_check_on_browser_panes() {
+        // Protocol 32's content kinds, as far as a format-7 daemon parses a layout.
+        #[derive(Deserialize)]
+        struct OldManifest {
+            format_version: u32,
+            workspace: OldWorkspace,
+        }
+        #[derive(Deserialize)]
+        struct OldWorkspace {
+            sessions: Vec<OldSession>,
+        }
+        #[derive(Deserialize)]
+        struct OldSession {
+            tabs: Vec<OldTab>,
+        }
+        #[derive(Deserialize)]
+        struct OldTab {
+            #[allow(dead_code)]
+            layout: OldLayout,
+            #[allow(dead_code)]
+            previous_layout: Option<OldLayout>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldLayout {
+            Pane {},
+            Content {
+                #[allow(dead_code)]
+                content: OldContent,
+            },
+            Split {
+                #[allow(dead_code)]
+                first: Box<OldLayout>,
+                #[allow(dead_code)]
+                second: Box<OldLayout>,
+            },
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum OldContent {
+            Files(#[allow(dead_code)] FolderContent),
+            Settings(#[allow(dead_code)] SettingsContent),
+            Monitor(#[allow(dead_code)] MonitorContent),
+        }
+
+        let workspace = content_kinds_workspace();
+        // Without the marking, the Browser leaf would fail to parse and quarantine the file.
+        let plain = serde_json::to_value(Manifest {
+            format_version: FORMAT_VERSION,
+            workspace: workspace.clone(),
+        })
+        .unwrap();
+        assert!(serde_json::from_value::<OldManifest>(plain).is_err());
+
+        let path = test_path("browser-downgrade");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        store.commit(&workspace).unwrap();
+        let old: OldManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old.format_version, FORMAT_VERSION);
+        assert_eq!(old.workspace.sessions[0].tabs.len(), 1);
         let _ = fs::remove_file(path);
     }
 
@@ -1508,10 +1606,10 @@ mod tests {
         let old: OldManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(old.format_version, FORMAT_VERSION);
         let tab = &old.workspace.sessions[0].tabs[0];
-        assert_eq!(roots(&tab.layout), ["/home/user/project", "/", "/"]);
+        assert_eq!(roots(&tab.layout), ["/home/user/project", "/", "/", "/"]);
         assert_eq!(
             roots(tab.previous_layout.as_ref().unwrap()),
-            ["/", "/", "/home/user/project"]
+            ["/", "/", "/", "/home/user/project"]
         );
         let _ = fs::remove_file(path);
     }
@@ -1582,11 +1680,11 @@ mod tests {
     }
 
     #[test]
-    fn format_5_and_6_files_load_as_format_7() {
+    fn format_5_to_7_files_load_as_format_8() {
         let expected = content_kinds_workspace();
-        for format in [5, 6] {
+        for format in [5, 6, 7] {
             let path = test_path(&format!("format-{format}"));
-            // As a format-5 or format-6 daemon wrote it: Monitor leaves marked for older
+            // As a format-5 to format-7 daemon wrote it: newer kinds marked for older
             // daemons.
             let mut manifest = serde_json::to_value(Manifest {
                 format_version: format,
@@ -1600,7 +1698,7 @@ mod tests {
             assert_eq!(workspace.sessions, expected.sessions);
             let saved: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved["format_version"], 7);
+            assert_eq!(saved["format_version"], 8);
             let _ = fs::remove_file(path);
         }
     }

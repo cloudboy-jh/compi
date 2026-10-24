@@ -12,7 +12,7 @@ default-members = [
     "crates/compi-daemon",
     "crates/compi-client",
 ]
-exclude = ["installer/bootstrapper"]
+exclude = ["installer/bootstrapper", "vendor/gpui-pre-windows"]
 
 [workspace.package]
 version = "0.3.1"
@@ -37,3 +37,9 @@ sha2 = "0.10"
 [profile.release]
 lto = "thin"
 strip = "symbols"
+
+# GPUI's Windows platform with one change: its composition target is not topmost, so a
+# browser pane's webview (a child window) draws above GPUI. See the comment at
+# `CreateTargetForHwnd` in the vendored crate; re-apply it when upgrading GPUI.
+[patch.crates-io]
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }

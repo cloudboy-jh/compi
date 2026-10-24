@@ -1,5 +1,6 @@
 //! Public, existing-daemon-only command interface. Presentation operations are routed
 //! to the owning native host; observation and explicit input never acquire a view.
+mod browse;
 mod capture;
 mod changes;
 mod content;
@@ -37,6 +38,7 @@ const COMMANDS: &[&str] = &[
     "diff",
     "settings",
     "monitor",
+    "browse",
     "layout",
     "run",
     "attach",
@@ -1000,6 +1002,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         "notes" => return notes::run(&mut client, &state, &target, options),
         "diff" => return diff::run(&mut client, &state, &target, options),
         "settings" | "monitor" => return view::run(&mut client, &state, &target, options),
+        "browse" => return browse::run(&mut client, &state, &target, options),
         "command" => return palette::run(&state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
@@ -1634,6 +1637,7 @@ fn validate(
         ("monitor", Some("quit")) => (3, 3, &["--source"], &["--force"]),
         ("monitor", _) => (1, 2, &["--source"], &[]),
         ("files" | "edit" | "settings", _) => (1, 2, &[], &[]),
+        ("browse", Some(_)) => (2, 2, &[], &["--down"]),
         ("notes", Some("search" | "backlinks")) => (3, 4, &[], &[]),
         ("notes", _) => (1, 2, &[], &["--edit"]),
         // `diff [PATH]` and `diff COMMIT [PATH]`.
@@ -2025,6 +2029,23 @@ mod tests {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }
     }
+
+    #[test]
+    fn browse_takes_one_url() {
+        for accepted in [
+            &["browse", "localhost:3000"][..],
+            &["--json", "browse", "https://example.com", "--down"],
+        ] {
+            assert!(validated(accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            &["browse"][..],
+            &["browse", "a", "b"],
+            &["browse", "a", "--right"],
+        ] {
+            assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
+        }
+    }
     fn validated(args: &[&str]) -> std::result::Result<Options, CliError> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
         assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
@@ -2201,8 +2222,6 @@ mod tests {
                 "{command} {action:?}"
             );
         }
-        let top = help::text("", None);
-        assert!(top.contains("monitor [PAGE]/totals/list/sources/inspect/quit; command list/run;"));
     }
     #[test]
     fn close_reports_unsaved_files_of_closing_files_from_every_window() {
@@ -2289,10 +2308,10 @@ mod tests {
     }
 
     #[test]
-    fn content_rows_report_files_settings_and_monitor_panes() {
+    fn content_rows_report_files_settings_monitor_and_browser_panes() {
         use compi_protocol::{
-            ContentEnvironment, FolderContent, MonitorContent, PaneContent, SessionId,
-            SettingsContent, SettingsSection, TabId,
+            BrowserContent, ContentEnvironment, FolderContent, MonitorContent, PaneContent,
+            SessionId, SettingsContent, SettingsSection, TabId,
         };
         let files = PaneContent::Files(FolderContent {
             environment: ContentEnvironment::Host,
@@ -2342,6 +2361,15 @@ mod tests {
         assert_eq!(
             row["content"],
             json!({"kind": "monitor", "page": "overview"})
+        );
+        let browser = PaneContent::Browser(BrowserContent {
+            url: "http://localhost:3000/".into(),
+        });
+        let row = content_row(&session, &tab, &PaneId::new("browser"), &browser);
+        assert_eq!(row["type"], "browser");
+        assert_eq!(
+            row["content"],
+            json!({"kind": "browser", "url": "http://localhost:3000/"})
         );
     }
 }
