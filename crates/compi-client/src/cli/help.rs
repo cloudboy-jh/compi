@@ -162,7 +162,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("notes", _) => (
             "notes [FILE|FOLDER] [--edit]",
-            "Open a Markdown FILE in the existing Files/editor view, rendered by default; --edit selects its source instead. A FOLDER, or no argument, browses like compi files. Paths resolve in the selected pane's environment against its current directory, like edit. Notes remain ordinary .md/.markdown files, with no notebook database or persisted index. Notebook search/backlinks recursively read at most 4,096 notes, 2,048 directories, 32,768 entries, 64 directory levels and 32 MiB of text, with a 15-second scan budget; .git, target and node_modules are skipped and directory symlinks are not followed. Incomplete scans report warnings.",
+            "Open a Markdown FILE in the existing Files/editor view in Read mode (formatted); --edit opens it in Edit mode instead. Either becomes the file's remembered mode in that window. A FOLDER, or no argument, browses like compi files. Paths resolve in the selected pane's environment against its current directory, like edit. Notes remain ordinary .md/.markdown files, with no notebook database or persisted index. Notebook search/backlinks recursively read at most 4,096 notes, 2,048 directories, 32,768 entries, 64 directory levels and 32 MiB of text, with a 15-second scan budget; .git, target and node_modules are skipped and directory symlinks are not followed. Incomplete scans report warnings.",
             "compi notes ./notes/plan.md",
         ),
         ("diff", _) => (

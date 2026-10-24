@@ -3304,6 +3304,10 @@ impl CompiApp {
             diff_tab: self
                 .focused_content()
                 .is_some_and(|content| content.active_diff().is_some()),
+            markdown_tab: self
+                .focused_content()
+                .and_then(|content| content.active.as_ref())
+                .is_some_and(|tab| crate::notes::is_markdown(tab.path())),
             files_reason: file_scope.as_ref().err().copied(),
             file_search_reason: file_scope
                 .as_ref()
@@ -3992,6 +3996,7 @@ impl CompiApp {
             Command::NewEditor => self.show_files(true, window, cx),
             Command::ShowChanges => self.show_changes(window, cx),
             Command::DiffThisFile => self.diff_this_file(window, cx),
+            Command::ToggleMarkdownRead => self.toggle_markdown_read(window, cx),
             Command::NextChange => self.step_editor_change(true, window, cx),
             Command::PreviousChange => self.step_editor_change(false, window, cx),
             Command::OpenFile => self.open_palette(Some(palette::Scope::Files)),
@@ -4666,6 +4671,8 @@ impl CompiApp {
     fn command_label(&self, command: Command) -> &'static str {
         if command == Command::TogglePaneZoom && self.pane_zoomed() {
             "Restore split layout"
+        } else if command == Command::ToggleMarkdownRead && self.focused_markdown_read() {
+            "Edit Markdown"
         } else if command == Command::TogglePaneFloat
             && self
                 .focused_pane()

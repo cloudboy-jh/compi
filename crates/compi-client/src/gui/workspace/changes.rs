@@ -1737,14 +1737,14 @@ impl CompiApp {
             return;
         };
         if diff {
-            self.edit_from_diff(&pane_id, &path, window, cx);
+            self.edit_from_diff(&pane_id, &path, None, window, cx);
         } else {
             self.diff_from_edit(&pane_id, &path, window, cx);
         }
     }
 
     /// Diff: the file's tab switches to Diff mode against the index, else its staged
-    /// change, at the editor's cursor line.
+    /// change, at the editor's cursor line, or in Read at the line in view.
     fn diff_from_edit(
         &mut self,
         pane_id: &PaneId,
@@ -1757,10 +1757,13 @@ impl CompiApp {
             return;
         };
         // The diff's new side is the saved file (unstaged) or the index (staged), so the
-        // cursor's line is a close guess when the buffer has unsaved edits.
-        let line = ui
-            .editor(path)
-            .map(|editor| editor.state.read(cx).cursor_position().line + 1);
+        // line is a close guess when the buffer has unsaved edits.
+        let line = if ui.notes.is_rendered(path) {
+            self.note_top_line(pane_id, path, cx)
+        } else {
+            ui.editor(path)
+                .map(|editor| editor.state.read(cx).cursor_position().line + 1)
+        };
         let relative = match &ui.repo.listing {
             Listing::Ready(listing) => repo_relative(&listing.repo, path),
             Listing::Reading => {
@@ -1783,12 +1786,14 @@ impl CompiApp {
         self.open_diff(pane_id, relative, None, line, window, cx);
     }
 
-    /// Edit: the file's tab returns to Edit mode at the line the diff shows a third of the
-    /// way down. A file the change deleted stays in Diff mode.
+    /// Edit (or Read, `read`; without one, the mode the file was last in): the file's tab
+    /// leaves Diff mode at the line the diff shows a third of the way down. A file the
+    /// change deleted stays in Diff mode.
     pub(super) fn edit_from_diff(
         &mut self,
         pane_id: &PaneId,
         path: &str,
+        read: Option<bool>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1818,6 +1823,7 @@ impl CompiApp {
             .and_then(|view| view.read(cx).line_in_view())
             .and_then(|(side, line)| (side == Side::New).then_some(line));
         let environment = ui.environment.clone();
+        let read = read.unwrap_or_else(|| ui.notes.is_rendered(path));
         self.open_content_file(
             pane_id,
             environment,
@@ -1828,6 +1834,7 @@ impl CompiApp {
             window,
             cx,
         );
+        self.set_note_mode(pane_id, path, read, line, window, cx);
     }
 
     /// Before drawing: each shown pane's commit (its list's and its active diff tab's) is
@@ -4074,9 +4081,10 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The Edit / Diff switch of a file's tab, both options keyed to Diff this file. Diff
-    /// needs an uncommitted change of the file in this folder's repository; Edit needs the
-    /// file in the working tree.
+    /// The Edit / Read / Diff switch of a file's tab (Read for Markdown only). Edit and Diff
+    /// are keyed to Diff this file, Read to Read Markdown. Diff needs an uncommitted change
+    /// of the file in this folder's repository; Edit and Read need the file in the
+    /// working tree.
     pub(super) fn render_mode_switch(
         &self,
         pane_id: &PaneId,
@@ -4086,29 +4094,30 @@ impl CompiApp {
     ) -> AnyElement {
         let file = tab.path();
         let diff = tab.diff_scope().is_some();
-        let rendered = !diff && ui.notes.is_rendered(file);
+        let read = !diff && ui.notes.is_rendered(file);
         let edit_reason = tab
             .diff_scope()
             .and_then(|scope| ui.repo.change(file, scope))
             .and_then(edit_disabled);
         let diff_reason = (!diff).then(|| ui.repo.diff_unavailable(file)).flatten();
+        let platform = crate::commands::Platform::current();
         let (pane, path) = (pane_id.clone(), file.to_owned());
         let mut edit = text_button("file-mode-edit", "Edit")
-            .selected(!diff && !rendered)
+            .selected(!diff && !read)
             .detail("Edits the file at the line in view")
             .disabled_because(edit_reason)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 if diff {
-                    this.edit_from_diff(&pane, &path, window, cx);
+                    this.edit_from_diff(&pane, &path, Some(false), window, cx);
                     cx.notify();
-                } else if rendered {
-                    this.set_note_mode(&pane, &path, false, window, cx);
+                } else if read {
+                    this.set_note_mode(&pane, &path, false, None, window, cx);
                 }
             }));
         let (pane, path) = (pane_id.clone(), file.to_owned());
         let mut show_diff = text_button("file-mode-diff", "Diff")
             .selected(diff)
-            .detail("Shows the file's uncommitted changes at the cursor's line")
+            .detail("Shows the file's uncommitted changes at the cursor's line, or in Read at the line in view")
             .disabled_because(diff_reason)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 if !diff {
@@ -4118,22 +4127,35 @@ impl CompiApp {
             }));
         if let Some(key) = crate::commands::Command::DiffThisFile
             .spec()
-            .shortcut(crate::commands::Platform::current())
+            .shortcut(platform)
         {
             edit = edit.key(key);
             show_diff = show_diff.key(key);
         }
         let mut modes = vec![edit];
-        if !diff && crate::notes::is_markdown(file) {
+        if crate::notes::is_markdown(file) {
             let (pane, path) = (pane_id.clone(), file.to_owned());
-            modes.push(
-                text_button("file-mode-render", "Render")
-                    .selected(rendered)
-                    .detail("Renders this editor's Markdown without changing the file")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_note_mode(&pane, &path, true, window, cx);
-                    })),
-            );
+            let mut show_read = text_button("file-mode-read", "Read")
+                .selected(read)
+                .detail(
+                    "Shows the Markdown formatted at the line in view, without changing the file",
+                )
+                .disabled_because(edit_reason)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if diff {
+                        this.edit_from_diff(&pane, &path, Some(true), window, cx);
+                        cx.notify();
+                    } else if !read {
+                        this.set_note_mode(&pane, &path, true, None, window, cx);
+                    }
+                }));
+            if let Some(key) = crate::commands::Command::ToggleMarkdownRead
+                .spec()
+                .shortcut(platform)
+            {
+                show_read = show_read.key(key);
+            }
+            modes.push(show_read);
         }
         modes.push(show_diff);
         controls::segmented("file-mode", modes).into_any_element()

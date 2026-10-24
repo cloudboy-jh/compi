@@ -137,6 +137,7 @@ registry! {
     NewEditor, "new_editor", "New editor", None, None;
     ShowChanges, "show_changes", "Changes", None, None;
     DiffThisFile, "diff_this_file", "Diff this file", Some("ctrl-shift-d"), Some("ctrl-shift-d");
+    ToggleMarkdownRead, "toggle_markdown_read", "Read Markdown", Some("cmd-e"), Some("ctrl-e");
     NextChange, "next_change", "Next change", Some("alt-f5"), Some("alt-f5");
     PreviousChange, "previous_change", "Previous change", Some("alt-shift-f5"), Some("alt-shift-f5");
     GitFetch, "git_fetch", "Fetch", None, None;
@@ -252,6 +253,8 @@ pub struct CommandContext {
     pub file_tab: bool,
     /// The focused content pane shows a file tab in Diff mode.
     pub diff_tab: bool,
+    /// The focused content pane's active tab is a Markdown file, in any mode.
+    pub markdown_tab: bool,
     /// Why the focused pane's folder cannot open in a content pane: a terminal that
     /// has not reported its directory.
     pub files_reason: Option<&'static str>,
@@ -306,9 +309,9 @@ impl Command {
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
             | SwapPaneDown | RemovePane | OpenBrowser | BrowserBack | BrowserForward
             | BrowserReload | FocusAddressBar => CommandCategory::Panes,
-            ShowFiles | ShowChanges | DiffThisFile | NextChange | PreviousChange | GitFetch
-            | GitPull | GitPush | SwitchBranch | CreateBranch | OpenFile | NewEditor
-            | RecoverUnsavedEdits => CommandCategory::Files,
+            ShowFiles | ShowChanges | DiffThisFile | ToggleMarkdownRead | NextChange
+            | PreviousChange | GitFetch | GitPull | GitPush | SwitchBranch | CreateBranch
+            | OpenFile | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
@@ -382,6 +385,9 @@ impl Command {
             DiffThisFile => Some(
                 "Switches the open file's tab between Edit and Diff (its uncommitted changes) at the same line; nothing is staged or changed.",
             ),
+            ToggleMarkdownRead => Some(
+                "Switches the open Markdown file between Edit and Read (formatted) at the same line; the file is not changed.",
+            ),
             NextChange | PreviousChange => Some(
                 "Moves the cursor to the next or previous change against the Git index in the open file.",
             ),
@@ -446,6 +452,7 @@ impl Command {
             NewEditor => "file folder pane content split",
             ShowChanges => "git diff review status staged unstaged uncommitted",
             DiffThisFile => "git diff compare changes review index head",
+            ToggleMarkdownRead => "markdown notes render preview formatted view edit source",
             NextChange | PreviousChange => "git diff hunk gutter jump navigate",
             GitFetch => "git remote download update origin",
             GitPull => "git remote merge rebase update origin",
@@ -786,6 +793,7 @@ impl Command {
             DiffThisFile => {
                 (!c.file_tab && !c.diff_tab).then_some("Open a file in the editor first")
             }
+            ToggleMarkdownRead => (!c.markdown_tab).then_some("Open a Markdown file first"),
             NextChange | PreviousChange => {
                 (!c.file_tab).then_some("Open a file in the editor first")
             }
@@ -875,13 +883,20 @@ pub fn resolve_key(
     overrides: &HashMap<String, String>,
 ) -> KeyRoute {
     match owner {
-        // Change navigation and Edit / Diff are the editor's; a terminal keeps those keys.
+        // Change navigation and Edit / Read / Diff are the editor's; a terminal keeps those
+        // keys (Ctrl+E is the shell's end of line).
         InputOwner::Terminal => match resolve_terminal_key(platform, key, context, overrides) {
             KeyRoute::Command(
-                Command::NextChange | Command::PreviousChange | Command::DiffThisFile,
+                Command::NextChange
+                | Command::PreviousChange
+                | Command::DiffThisFile
+                | Command::ToggleMarkdownRead,
             )
             | KeyRoute::Disabled(
-                Command::NextChange | Command::PreviousChange | Command::DiffThisFile,
+                Command::NextChange
+                | Command::PreviousChange
+                | Command::DiffThisFile
+                | Command::ToggleMarkdownRead,
                 _,
             ) => KeyRoute::Terminal,
             route => route,
@@ -1464,6 +1479,35 @@ mod tests {
             }),
             KeyRoute::Command(Command::RemovePane)
         );
+    }
+
+    #[test]
+    fn read_markdown_key_toggles_in_files_but_stays_with_the_shell() {
+        let bindings = HashMap::new();
+        let markdown = CommandContext {
+            content_pane: true,
+            file_tab: true,
+            markdown_tab: true,
+            ..ready()
+        };
+        let route = |owner, context: &CommandContext| {
+            resolve_key(Platform::Windows, ctrl("e"), owner, context, &bindings)
+        };
+        assert_eq!(route(InputOwner::Terminal, &markdown), KeyRoute::Terminal);
+        for owner in [InputOwner::Editor, InputOwner::Content] {
+            assert_eq!(
+                route(owner, &markdown),
+                KeyRoute::Command(Command::ToggleMarkdownRead)
+            );
+        }
+        let other = CommandContext {
+            markdown_tab: false,
+            ..markdown
+        };
+        assert!(matches!(
+            route(InputOwner::Editor, &other),
+            KeyRoute::Disabled(Command::ToggleMarkdownRead, _)
+        ));
     }
 
     #[test]

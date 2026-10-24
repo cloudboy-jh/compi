@@ -20,16 +20,33 @@ pub(in crate::gui) struct Asset {
 
 pub(super) type Assets = HashMap<(Kind, String), Result<Asset, String>>;
 
-pub(super) fn prepare(source: &str, dark: bool, foreground: u32, known: &Assets) -> Assets {
-    let options = markdown::ParseOptions {
+/// The constructs Kit's Markdown view parses with: GFM and math, no frontmatter. Its
+/// top-level blocks are this parse's root children, one for one.
+fn parse_options() -> markdown::ParseOptions {
+    markdown::ParseOptions {
         constructs: markdown::Constructs {
             math_text: true,
             math_flow: true,
             ..markdown::Constructs::gfm()
         },
         ..markdown::ParseOptions::gfm()
+    }
+}
+
+/// The 1-based source line each top-level block of `source` starts on, as Kit's view
+/// lists them; empty when the source does not parse.
+pub(super) fn block_lines(source: &str) -> Vec<u32> {
+    let Ok(Node::Root(root)) = markdown::to_mdast(source, &parse_options()) else {
+        return Vec::new();
     };
-    let Ok(root) = markdown::to_mdast(source, &options) else {
+    root.children
+        .iter()
+        .map(|child| child.position().map_or(1, |at| at.start.line as u32))
+        .collect()
+}
+
+pub(super) fn prepare(source: &str, dark: bool, foreground: u32, known: &Assets) -> Assets {
+    let Ok(root) = markdown::to_mdast(source, &parse_options()) else {
         return Assets::new();
     };
     let mut assets = Assets::new();

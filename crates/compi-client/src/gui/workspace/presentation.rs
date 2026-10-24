@@ -646,12 +646,12 @@ impl CompiApp {
                 pane_id,
                 file,
                 line,
-            } => (pane_id, file, *line, false),
+            } => (pane_id, file, Some(*line), false),
             Action::RevealNote {
                 pane_id,
                 file,
                 rendered,
-            } => (pane_id, file, 1, *rendered),
+            } => (pane_id, file, None, *rendered),
             _ => unreachable!("polled_presentation passes only file reveals here"),
         };
         if self.overlay.is_some() {
@@ -721,14 +721,14 @@ impl CompiApp {
             environment,
             None,
             Some(file.clone()),
-            Some(line),
+            line.or(Some(1)),
             false,
             window,
             cx,
         );
         self.rebuild_layout(window, true);
         self.prepare_content(window, cx);
-        self.set_note_mode(pane_id, file, rendered, window, cx);
+        self.set_note_mode(pane_id, file, rendered, line, window, cx);
         self.save_state();
         window.focus(&self.focus_handle, cx);
         cx.activate(true);

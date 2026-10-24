@@ -16,9 +16,25 @@ use note_render::{Assets, Kind};
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
+/// How long a Read view waits for its blocks to be laid out before placing a line by
+/// proportion, and how long it tries at all.
+const READ_PLACE_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
+const READ_PLACE_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A line to bring to the top of a file's Read view once it is laid out.
+#[derive(Clone, Copy)]
+struct PendingTop {
+    line: u32,
+    since: std::time::Instant,
+}
+
 #[derive(Default)]
 pub(in crate::gui) struct NotesUi {
     rendered: HashSet<String>,
+    /// Files this pane has taken its mode from the window's memory for; a file that
+    /// closes is forgotten here, so it opens in its remembered mode again.
+    seen: HashSet<String>,
+    pending_top: HashMap<String, PendingTop>,
     previews: HashMap<String, Preview>,
     root: String,
     notebook: Option<Notebook>,
@@ -110,11 +126,68 @@ fn update_results(ui: &mut PaneUi, path: &str, cx: &App) {
 
 struct Preview {
     original: Rope,
+    /// What the view was given: `original` with links and tasks rewritten, line for line.
+    source: Arc<str>,
+    /// The 1-based line each of the view's top-level blocks starts on.
+    blocks: Arc<Vec<u32>>,
     state: Entity<TextViewState>,
     assets: Arc<Assets>,
     request: u64,
     dark: bool,
     foreground: u32,
+}
+
+/// The 1-based line at the top of an editor's view, else its cursor's.
+fn editor_top_line(state: &EditorState) -> u32 {
+    state
+        .visible_row_range()
+        .map_or(state.cursor_position().line, |rows| rows.start as u32)
+        + 1
+}
+
+/// The 1-based source line of the block at the top of `preview`'s Read view: exact
+/// when the view's blocks are the ones parsed, else by proportion.
+fn read_top_line(preview: &Preview, cx: &App) -> Option<u32> {
+    let view = preview.state.read(cx);
+    let list = view.list_state();
+    let count = list.item_count();
+    let top = list.logical_scroll_top().item_ix.min(count.checked_sub(1)?);
+    if preview.blocks.len() == count {
+        return preview.blocks.get(top).copied();
+    }
+    let lines = preview.source.lines().count().max(1);
+    Some((top * lines / count) as u32 + 1)
+}
+
+/// Scrolls `preview`'s Read view so the block holding `line` is at its top. False while
+/// the view has not laid out the current text; once not `patient`, a view whose blocks
+/// differ from the parsed ones is placed by proportion.
+fn scroll_read_to(preview: &Preview, line: u32, patient: bool, cx: &App) -> bool {
+    let view = preview.state.read(cx);
+    if view.rendered_text().source() != &*preview.source {
+        return false;
+    }
+    let list = view.list_state();
+    let count = list.item_count();
+    let item_ix = if preview.blocks.len() == count {
+        if count == 0 {
+            return true;
+        }
+        preview
+            .blocks
+            .partition_point(|start| *start <= line)
+            .saturating_sub(1)
+    } else if !patient && count > 0 {
+        let lines = preview.source.lines().count().max(1);
+        (line.saturating_sub(1) as usize * count / lines).min(count - 1)
+    } else {
+        return false;
+    };
+    list.scroll_to(gpui::ListOffset {
+        item_ix,
+        offset_in_item: px(0.0),
+    });
+    true
 }
 
 pub(in crate::gui) enum NoteEvent {
@@ -203,34 +276,139 @@ fn decode(text: &str) -> Option<String> {
 }
 
 impl CompiApp {
+    /// Shows Markdown `path` in `pane` in Read mode (`read`) or Edit, and remembers the
+    /// mode for the file in this window. A switch keeps the place: the line at the top of
+    /// one mode is at the top of the other. `at`, a 1-based line, is gone to instead, as
+    /// a jump: in Edit it also takes the cursor.
     pub(in crate::gui) fn set_note_mode(
         &mut self,
         pane: &PaneId,
         path: &str,
-        rendered: bool,
+        read: bool,
+        at: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !model::is_markdown(path) {
             return;
         }
-        if let Some(ui) = self.content.panes.get_mut(pane) {
-            if rendered {
-                ui.notes.rendered.insert(path.to_owned());
-            } else {
-                ui.notes.rendered.remove(path);
+        let Some(ui) = self.content.panes.get_mut(pane) else {
+            return;
+        };
+        let was = ui.notes.rendered.contains(path);
+        ui.notes.seen.insert(path.to_owned());
+        if read {
+            let line = at.or_else(|| {
+                (!was)
+                    .then(|| ui.editor(path))
+                    .flatten()
+                    .map(|editor| editor_top_line(editor.state.read(cx)))
+            });
+            if let Some(line) = line {
+                let since = std::time::Instant::now();
+                ui.notes
+                    .pending_top
+                    .insert(path.to_owned(), PendingTop { line, since });
             }
-            if rendered {
-                self.content.released = Some(pane.clone());
-                window.focus(&ui.focus, cx);
+            ui.notes.rendered.insert(path.to_owned());
+            self.content.released = Some(pane.clone());
+            window.focus(&ui.focus, cx);
+        } else {
+            let line = if was {
+                at.or_else(|| {
+                    ui.notes
+                        .previews
+                        .get(path)
+                        .and_then(|preview| read_top_line(preview, cx))
+                })
             } else {
-                self.content.released = None;
-                if let Some(editor) = ui.editor(path) {
-                    window.focus(&editor.state.focus_handle(cx), cx);
+                None
+            };
+            if let Some(line) = line {
+                // A kept place only scrolls; a jump, or an editor not laid out yet, also
+                // takes the cursor there.
+                let scrolled = at.is_none()
+                    && ui.editor(path).is_some_and(|editor| {
+                        editor.state.update(cx, |state, cx| {
+                            let Some(height) = state.line_height() else {
+                                return false;
+                            };
+                            let offset = state.scroll_offset();
+                            let top = height * line.saturating_sub(1) as f32;
+                            state.set_scroll_offset(point(offset.x, -top), cx);
+                            true
+                        })
+                    });
+                if !scrolled && let Some(file) = ui.files.get_mut(path) {
+                    file.reveal = Some(line);
                 }
             }
+            ui.notes.rendered.remove(path);
+            ui.notes.pending_top.remove(path);
+            self.content.released = None;
+            if let Some(editor) = ui.editor(path) {
+                window.focus(&editor.state.focus_handle(cx), cx);
+            }
         }
+        let environment = ui.environment.clone();
+        self.state.set_reads_markdown(&environment, path, read);
+        self.save_state();
         cx.notify();
+    }
+
+    /// Read Markdown (Ctrl/Cmd+E): the focused pane's Markdown file switches between Edit
+    /// and Read; from Diff it goes to Read.
+    pub(in crate::gui) fn toggle_markdown_read(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane, tab)) = self.focused_pane().cloned().and_then(|pane| {
+            let tab = self.focused_content()?.active.clone()?;
+            Some((pane, tab))
+        }) else {
+            self.global_error = Some("Open a Markdown file first".into());
+            return;
+        };
+        let path = tab.path().to_owned();
+        if !model::is_markdown(&path) {
+            self.global_error = Some("Open a Markdown file first".into());
+            return;
+        }
+        if tab.diff_scope().is_some() {
+            self.edit_from_diff(&pane, &path, Some(true), window, cx);
+            return;
+        }
+        let read = self.focused_markdown_read();
+        self.set_note_mode(&pane, &path, !read, None, window, cx);
+    }
+
+    /// The focused pane's Markdown file shows in Read mode.
+    pub(in crate::gui) fn focused_markdown_read(&self) -> bool {
+        self.focused_pane()
+            .zip(
+                self.focused_content()
+                    .and_then(|content| content.active_file()),
+            )
+            .and_then(|(pane, path)| Some(self.content.panes.get(pane)?.notes.is_rendered(path)))
+            .unwrap_or(false)
+    }
+
+    /// The 1-based line at the top of `path`'s view in `pane`: its Read view's in Read
+    /// mode, else its editor's.
+    pub(in crate::gui) fn note_top_line(&self, pane: &PaneId, path: &str, cx: &App) -> Option<u32> {
+        let ui = self.content.panes.get(pane)?;
+        if ui.notes.rendered.contains(path)
+            && let Some(line) = ui
+                .notes
+                .previews
+                .get(path)
+                .and_then(|preview| read_top_line(preview, cx))
+        {
+            return Some(line);
+        }
+        ui.editor(path)
+            .map(|editor| editor_top_line(editor.state.read(cx)))
     }
 
     pub(super) fn prepare_note_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -263,8 +441,27 @@ impl CompiApp {
             ui.notes
                 .previews
                 .retain(|path, _| ui.files.contains_key(path));
+            ui.notes.seen.retain(|path| ui.files.contains_key(path));
+            ui.notes
+                .pending_top
+                .retain(|path, _| ui.files.contains_key(path));
             if !model::is_markdown(&path) {
                 continue;
+            }
+            // A file this pane has not shown yet opens in the mode it was last in here.
+            if !ui.notes.seen.contains(&path)
+                && let Some(file) = ui.files.get(&path)
+            {
+                ui.notes.seen.insert(path.clone());
+                if self.state.reads_markdown(&ui.environment, &path) {
+                    ui.notes.rendered.insert(path.clone());
+                    if let Some(line) = file.reveal {
+                        let since = std::time::Instant::now();
+                        ui.notes
+                            .pending_top
+                            .insert(path.clone(), PendingTop { line, since });
+                    }
+                }
             }
             if ui.notes.panel && ui.notes.search.is_none() {
                 let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search notes…"));
@@ -293,6 +490,18 @@ impl CompiApp {
             if !rendered {
                 continue;
             }
+            if let Some(pending) = ui.notes.pending_top.get(&path).copied() {
+                let waited = pending.since.elapsed();
+                let placed = ui.notes.previews.get(&path).is_some_and(|preview| {
+                    scroll_read_to(preview, pending.line, waited < READ_PLACE_PATIENCE, cx)
+                });
+                if placed || waited > READ_PLACE_LIMIT {
+                    ui.notes.pending_top.remove(&path);
+                } else {
+                    // Keep drawing until the view is laid out.
+                    cx.notify();
+                }
+            }
             let Some(editor) = ui.editor(&path) else {
                 continue;
             };
@@ -304,7 +513,8 @@ impl CompiApp {
             }) {
                 continue;
             }
-            let source = preview_source(&original.to_string());
+            let source: Arc<str> = preview_source(&original.to_string()).into();
+            let blocks = Arc::new(note_render::block_lines(&source));
             let state = match ui.notes.previews.get(&path) {
                 Some(preview) => {
                     preview
@@ -325,6 +535,8 @@ impl CompiApp {
                 path.clone(),
                 Preview {
                     original,
+                    source: source.clone(),
+                    blocks,
                     state,
                     assets: known.clone(),
                     request,
@@ -521,7 +733,7 @@ impl CompiApp {
             window,
             cx,
         );
-        self.set_note_mode(pane, path, rendered, window, cx);
+        self.set_note_mode(pane, path, rendered, Some(line), window, cx);
     }
 
     fn notes_panel(&mut self, pane: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
