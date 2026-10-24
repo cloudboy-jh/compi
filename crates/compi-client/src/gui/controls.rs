@@ -821,28 +821,42 @@ pub(super) fn tooltip(
     let title = title.into();
     move |window, cx| {
         let (title, detail) = (title.clone(), detail.clone());
-        Tooltip::element(move |_, cx| tooltip_text(title.clone(), detail.clone(), key, cx))
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .rounded(px(CONTROL_RADIUS))
-            .build(window, cx)
+        Tooltip::element(move |window, cx| {
+            tooltip_text(title.clone(), detail.clone(), key, window, cx)
+        })
+        .text_size(px(UI_SMALL_TEXT_SIZE))
+        .rounded(px(CONTROL_RADIUS))
+        .build(window, cx)
     }
 }
 
-/// The tooltip's lines. The key is drawn here rather than by Kit's tooltip, which paints
-/// it in the theme's dimmed line-number color; here it keeps AA contrast.
+/// How far Kit's tooltip popup (gpui-component 0.7.1) reaches past its content: its
+/// `px_2`/`py_0p5` padding and 1 px border.
+const TOOLTIP_INSET: (f32, f32) = (9.0, 3.0);
+
+/// The tooltip's lines, cut out of any web page they are drawn over. The key is drawn
+/// here rather than by Kit's tooltip, which paints it in the theme's dimmed line-number
+/// color; here it keeps AA contrast.
 fn tooltip_text(
     title: SharedString,
     detail: Option<SharedString>,
     key: Option<&'static str>,
+    window: &Window,
     cx: &App,
 ) -> AnyElement {
     let (colors, _) = control_theme(cx);
     let muted = color(super::modal_text_color(colors.muted, &colors));
     div()
+        .relative()
         .py_0p5()
         .flex()
         .flex_col()
         .gap_0p5()
+        .children(super::workspace::browser::above_pages(
+            TOOLTIP_INSET,
+            window,
+            cx,
+        ))
         .child(
             div()
                 .flex()

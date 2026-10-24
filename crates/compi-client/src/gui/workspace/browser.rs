@@ -6,9 +6,10 @@
 //!
 //! Since the page covers whatever GPUI draws there, it hides while the palette, a
 //! menu, a dialog, the image inspector or a pane drag is open, while its pane is not
-//! drawn and while a failed load shows its notice. Float frames and the window's error
-//! banner above a page are cut out of it (a window region on Windows); where that is
-//! unavailable the page hides while one overlaps it.
+//! drawn and while a failed load shows its notice. Float frames, the window's error
+//! banner and Compi's tooltips above a page are cut out of it (a window region on
+//! Windows); elsewhere the page hides while a float or the banner overlaps it, and
+//! tooltips stay under it.
 //!
 //! The URL lives in the daemon (`PaneContent::Browser`) and follows the page's finished
 //! loads; history, cookies and scroll position are the webview's, with one persistent
@@ -28,7 +29,7 @@ use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, PageLoadEvent, WebContext, WebView, WebViewBuilder};
 
@@ -42,6 +43,66 @@ const WEBVIEW2_RUNTIME_URL: &str = "https://developer.microsoft.com/microsoft-ed
 /// Window-coordinate frames of the floats drawn this frame, by stacking index (later
 /// floats are above earlier ones).
 type FloatFrames = Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>>;
+
+/// Each window's float frames and pages, for what GPUI draws above them from outside
+/// the workspace view (tooltips). Weak, so a closed window keeps no page alive.
+#[derive(Default)]
+struct PageLayers(HashMap<gpui::WindowId, PageLayer>);
+
+impl gpui::Global for PageLayers {}
+
+struct PageLayer {
+    floats: FloatFrames,
+    pages: Vec<Weak<PageView>>,
+}
+
+/// A frame drawn above every page: records itself where it is painted, as float
+/// `index`, then re-clips `pages`, which are painted before it.
+fn cut_out(floats: FloatFrames, pages: Vec<Rc<PageView>>, index: usize) -> gpui::Canvas<()> {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            floats.borrow_mut().push((index, bounds));
+            let floats = floats.borrow();
+            for page in &pages {
+                if !page.hidden.get() {
+                    page.clip(&floats, window.scale_factor(), false);
+                }
+            }
+        },
+    )
+}
+
+/// Cuts a tooltip's frame out of its window's pages: Kit's popup reaches `inset` past
+/// the element this is placed in (absolutely, in a relative parent). Elsewhere than
+/// Windows a cut-out hides the whole page, so tooltips stay under it there.
+pub(in crate::gui) fn above_pages(
+    inset: (f32, f32),
+    window: &Window,
+    cx: &App,
+) -> Option<AnyElement> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let layer = cx
+        .try_global::<PageLayers>()?
+        .0
+        .get(&window.window_handle().window_id())?;
+    let pages: Vec<Rc<PageView>> = layer.pages.iter().filter_map(Weak::upgrade).collect();
+    if pages.is_empty() {
+        return None;
+    }
+    let (x, y) = inset;
+    Some(
+        cut_out(layer.floats.clone(), pages, usize::MAX)
+            .absolute()
+            .left(px(-x))
+            .right(px(-x))
+            .top(px(-y))
+            .bottom(px(-y))
+            .into_any_element(),
+    )
+}
 
 /// A pane's tab-menu title when its page has none: the page's host (with its port), a
 /// `file:` URL's file name, or "Browser" for a blank page.
@@ -203,6 +264,16 @@ impl PageView {
         loading
             .clone()
             .unwrap_or_else(|| self.signals.url.borrow().clone())
+    }
+
+    /// The page's title, unless it has none or a failure notice covers WebView2's error
+    /// page, whose title it would be.
+    fn title(&self) -> Option<String> {
+        if self.signals.failure.borrow().is_some() {
+            return None;
+        }
+        let title = self.signals.title.borrow().trim().to_owned();
+        (!title.is_empty()).then_some(title)
     }
 
     fn refresh_history(&self) {
@@ -551,9 +622,32 @@ impl CompiApp {
         self.browser
             .pages
             .get(pane_id)
-            .map(|page| page.view.signals.title.borrow().trim().to_owned())
-            .filter(|title| !title.is_empty())
+            .and_then(|page| page.view.title())
             .unwrap_or_else(|| pane_title(url))
+    }
+
+    /// What Browser pane `pane_id`'s page is doing, for `window list`; `url` is the
+    /// daemon's. `None` while the page is being created.
+    pub(super) fn browser_page_info(
+        &self,
+        pane_id: &PaneId,
+        url: &str,
+    ) -> Option<crate::cli_window::PageInfo> {
+        use crate::cli_window::PageInfo;
+        let Some(page) = self.browser.pages.get(pane_id) else {
+            return self.browser.failed.get(pane_id).map(|failure| PageInfo {
+                url: url.to_owned(),
+                error: Some(failure.message.clone()),
+                ..PageInfo::default()
+            });
+        };
+        let signals = &page.view.signals;
+        Some(PageInfo {
+            url: signals.url.borrow().clone(),
+            title: page.view.title(),
+            loading: signals.loading.borrow().clone(),
+            error: signals.failure.borrow().clone(),
+        })
     }
 
     /// Whether `focused` belongs to a Browser pane: the pane or its address field.
@@ -603,6 +697,21 @@ impl CompiApp {
         self.browser.pages.retain(|pane, _| kept(pane));
         self.browser.panes.retain(|pane, _| kept(pane));
         self.browser.failed.retain(|pane, _| kept(pane));
+        let layers = &mut cx.default_global::<PageLayers>().0;
+        layers.retain(|_, layer| layer.pages.iter().any(|page| page.strong_count() > 0));
+        let id = Window::window_handle(window).window_id();
+        if self.browser.pages.is_empty() {
+            layers.remove(&id);
+        } else {
+            let pages = self.browser.pages.values();
+            layers.insert(
+                id,
+                PageLayer {
+                    floats: self.browser.floats.clone(),
+                    pages: pages.map(|page| Rc::downgrade(&page.view)).collect(),
+                },
+            );
+        }
         if wanted.is_empty() {
             self.browser.focused = None;
             return;
@@ -1139,31 +1248,15 @@ impl CompiApp {
         if self.browser.pages.is_empty() {
             return None;
         }
-        let floats = self.browser.floats.clone();
-        let pages: Vec<Rc<PageView>> = self
-            .browser
-            .pages
-            .values()
-            .map(|page| page.view.clone())
-            .collect();
+        let pages = self.browser.pages.values();
+        let pages = pages.map(|page| page.view.clone()).collect();
         Some(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    floats.borrow_mut().push((index, bounds));
-                    let floats = floats.borrow();
-                    for page in &pages {
-                        if !page.hidden.get() {
-                            page.clip(&floats, window.scale_factor(), false);
-                        }
-                    }
-                },
-            )
-            .absolute()
-            .left(px(0.0))
-            .top(px(0.0))
-            .size_full()
-            .into_any_element(),
+            cut_out(self.browser.floats.clone(), pages, index)
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .size_full()
+                .into_any_element(),
         )
     }
 }

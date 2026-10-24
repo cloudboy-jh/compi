@@ -300,23 +300,29 @@ impl CompiApp {
                     zoomed: self.zoomed_pane() == Some(&view.pane_id),
                     // A terminal's Files view keeps its edits whichever side shows.
                     unsaved_files: self.unsaved_files(&view.pane_id),
+                    page: None,
                 })
                 .chain(
                     // Content panes have no view; list the ones this window shows.
-                    shown_content.iter().map(|pane_id| PaneInfo {
-                        pane_id: (*pane_id).clone(),
-                        pane_type: self
+                    shown_content.iter().map(|pane_id| {
+                        let content = self
                             .workspace
                             .as_ref()
-                            .and_then(|workspace| content::find_pane_content(workspace, pane_id))
-                            .map_or(PaneType::Content, PaneType::of_content),
-                        surface_id: None,
-                        cols: None,
-                        rows: None,
-                        focused: self.focused_pane() == Some(*pane_id),
-                        floating: self.state.is_floating(pane_id),
-                        zoomed: self.zoomed_pane() == Some(*pane_id),
-                        unsaved_files: self.unsaved_files(pane_id),
+                            .and_then(|workspace| content::find_pane_content(workspace, pane_id));
+                        PaneInfo {
+                            pane_id: (*pane_id).clone(),
+                            pane_type: content.map_or(PaneType::Content, PaneType::of_content),
+                            surface_id: None,
+                            cols: None,
+                            rows: None,
+                            focused: self.focused_pane() == Some(*pane_id),
+                            floating: self.state.is_floating(pane_id),
+                            zoomed: self.zoomed_pane() == Some(*pane_id),
+                            unsaved_files: self.unsaved_files(pane_id),
+                            page: content
+                                .and_then(|content| content.browser())
+                                .and_then(|browser| self.browser_page_info(pane_id, &browser.url)),
+                        }
                     }),
                 )
                 .chain(
@@ -350,6 +356,7 @@ impl CompiApp {
                                 floating: self.state.is_floating(pane_id),
                                 zoomed: false,
                                 unsaved_files,
+                                page: None,
                             })
                         }),
                 )

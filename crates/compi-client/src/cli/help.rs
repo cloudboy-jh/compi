@@ -242,7 +242,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("window", Some("list")) => (
             "window list",
-            "List native window slot IDs, visible tab IDs, and pane presentation state, with each pane's type (terminal or content) and the unsaved_files of a content pane or a terminal's Files view, for the selected connection.",
+            "List native window slot IDs, visible tab IDs, and pane presentation state, with each pane's type (terminal or content), the unsaved_files of a content pane or a terminal's Files view, and a Browser pane's page (url, title, the loading address and the error of a failed load), for the selected connection.",
             "compi --instance dev --json window list",
         ),
         ("theme", Some("install")) => (

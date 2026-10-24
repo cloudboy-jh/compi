@@ -2236,6 +2236,7 @@ mod tests {
             floating: false,
             zoomed: false,
             unsaved_files: unsaved.iter().map(|path| (*path).to_owned()).collect(),
+            page: None,
         };
         let window = |id: &str, panes| WindowInfo {
             window_id: id.to_owned(),

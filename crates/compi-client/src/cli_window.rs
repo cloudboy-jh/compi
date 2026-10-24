@@ -179,6 +179,26 @@ pub struct PaneInfo {
     /// terminal's Files view; empty (and omitted) when nothing is unsaved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsaved_files: Vec<String>,
+    /// A Browser pane's page in this window; omitted for other panes and while the
+    /// page is being created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageInfo>,
+}
+
+/// What a Browser pane's page is doing in a window.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageInfo {
+    /// Where the page is; the daemon's URL when no page could start.
+    pub url: String,
+    /// The page's title, once it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Where a load in progress is going.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loading: Option<String>,
+    /// Why the last load failed, or why no page could start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindowInfo {
