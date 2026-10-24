@@ -157,12 +157,12 @@ pub struct FloatingPane {
     pub rect: FloatRect,
 }
 
-/// The most Markdown files a window remembers as last read rather than edited.
-pub const MAX_READ_MARKDOWN: usize = 256;
+/// The most files a window remembers as last read (or viewed) rather than edited.
+pub const MAX_READ_FILES: usize = 256;
 
-/// A Markdown file last shown in Read mode.
+/// A Markdown file last shown in Read mode, or an SVG in View mode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadMarkdown {
+pub struct ReadFile {
     pub environment: ContentEnvironment,
     pub path: String,
 }
@@ -196,10 +196,10 @@ pub struct ClientState {
     /// loading keeps only known columns and widths in range.
     #[serde(default, skip_serializing_if = "ColumnLayout::is_default")]
     pub monitor_columns: ColumnLayout,
-    /// Markdown files whose last mode was Read, oldest first; others open in Edit.
-    /// Additive; at most `MAX_READ_MARKDOWN`.
+    /// Markdown files whose last mode was Read, and SVGs whose last was View, oldest
+    /// first; others open in Edit. Additive; at most `MAX_READ_FILES`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub read_markdown: Vec<ReadMarkdown>,
+    pub read_files: Vec<ReadFile>,
 }
 
 impl Default for ClientState {
@@ -220,31 +220,31 @@ impl Default for ClientState {
             floating: Vec::new(),
             floating_focused: false,
             monitor_columns: ColumnLayout::default(),
-            read_markdown: Vec::new(),
+            read_files: Vec::new(),
         }
     }
 }
 
 impl ClientState {
-    /// Whether `path` in `environment` last showed in Read mode.
-    pub fn reads_markdown(&self, environment: &ContentEnvironment, path: &str) -> bool {
-        self.read_markdown
+    /// Whether `path` in `environment` last showed in Read (or View) mode.
+    pub fn reads_file(&self, environment: &ContentEnvironment, path: &str) -> bool {
+        self.read_files
             .iter()
             .any(|file| file.environment == *environment && file.path == path)
     }
 
     /// Remembers `path`'s mode: Read files are kept, most recent last, dropping the
-    /// oldest past `MAX_READ_MARKDOWN`; Edit, the default, is forgotten.
-    pub fn set_reads_markdown(&mut self, environment: &ContentEnvironment, path: &str, read: bool) {
-        self.read_markdown
+    /// oldest past `MAX_READ_FILES`; Edit, the default, is forgotten.
+    pub fn set_reads_file(&mut self, environment: &ContentEnvironment, path: &str, read: bool) {
+        self.read_files
             .retain(|file| !(file.environment == *environment && file.path == path));
         if read {
-            self.read_markdown.push(ReadMarkdown {
+            self.read_files.push(ReadFile {
                 environment: environment.clone(),
                 path: path.to_owned(),
             });
-            let excess = self.read_markdown.len().saturating_sub(MAX_READ_MARKDOWN);
-            self.read_markdown.drain(..excess);
+            let excess = self.read_files.len().saturating_sub(MAX_READ_FILES);
+            self.read_files.drain(..excess);
         }
     }
 
@@ -620,7 +620,7 @@ impl ClientState {
         self.sidebar_width = source.sidebar_width;
         self.show_fps = source.show_fps;
         self.monitor_columns = source.monitor_columns.clone();
-        self.read_markdown = source.read_markdown.clone();
+        self.read_files = source.read_files.clone();
         self.selected_session = None;
         self.selected_tabs.clear();
         self.focused_panes.clear();
@@ -1912,31 +1912,31 @@ mod tests {
     }
 
     #[test]
-    fn read_markdown_is_remembered_per_file_bounded_and_survives_restart() {
+    fn read_files_are_remembered_per_file_bounded_and_survive_restart() {
         let directory = Directory::new();
         let mut slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
         let wsl = ContentEnvironment::Wsl {
             distribution: "Ubuntu".into(),
         };
         let host = ContentEnvironment::Host;
-        slot.state.set_reads_markdown(&wsl, "/notes/a.md", true);
-        assert!(slot.state.reads_markdown(&wsl, "/notes/a.md"));
+        slot.state.set_reads_file(&wsl, "/notes/a.md", true);
+        assert!(slot.state.reads_file(&wsl, "/notes/a.md"));
         // The same path elsewhere is another file.
-        assert!(!slot.state.reads_markdown(&host, "/notes/a.md"));
-        slot.state.set_reads_markdown(&wsl, "/notes/a.md", false);
-        assert!(!slot.state.reads_markdown(&wsl, "/notes/a.md"));
-        for index in 0..=MAX_READ_MARKDOWN {
+        assert!(!slot.state.reads_file(&host, "/notes/a.md"));
+        slot.state.set_reads_file(&wsl, "/notes/a.md", false);
+        assert!(!slot.state.reads_file(&wsl, "/notes/a.md"));
+        for index in 0..=MAX_READ_FILES {
             slot.state
-                .set_reads_markdown(&host, &format!("/n/{index}.md"), true);
+                .set_reads_file(&host, &format!("/n/{index}.md"), true);
         }
         // Reading the oldest again makes it the newest, so the next one is dropped.
-        slot.state.set_reads_markdown(&host, "/n/1.md", true);
-        slot.state.set_reads_markdown(&host, "/n/extra.md", true);
-        assert_eq!(slot.state.read_markdown.len(), MAX_READ_MARKDOWN);
-        assert!(!slot.state.reads_markdown(&host, "/n/0.md"));
-        assert!(!slot.state.reads_markdown(&host, "/n/2.md"));
-        assert!(slot.state.reads_markdown(&host, "/n/1.md"));
-        assert!(slot.state.reads_markdown(&host, "/n/extra.md"));
+        slot.state.set_reads_file(&host, "/n/1.md", true);
+        slot.state.set_reads_file(&host, "/n/extra.md", true);
+        assert_eq!(slot.state.read_files.len(), MAX_READ_FILES);
+        assert!(!slot.state.reads_file(&host, "/n/0.md"));
+        assert!(!slot.state.reads_file(&host, "/n/2.md"));
+        assert!(slot.state.reads_file(&host, "/n/1.md"));
+        assert!(slot.state.reads_file(&host, "/n/extra.md"));
         let expected = slot.state.clone();
         slot.save().unwrap();
         drop(slot);

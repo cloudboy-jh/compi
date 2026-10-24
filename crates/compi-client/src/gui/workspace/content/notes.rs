@@ -137,6 +137,11 @@ struct Preview {
     foreground: u32,
 }
 
+/// Files with a Read mode beside Edit: Markdown (read formatted) and SVG (viewed drawn).
+pub(in crate::gui) fn readable(path: &str) -> bool {
+    model::is_markdown(path) || super::is_svg(path)
+}
+
 /// The 1-based line at the top of an editor's view, else its cursor's.
 fn editor_top_line(state: &EditorState) -> u32 {
     state
@@ -276,10 +281,10 @@ fn decode(text: &str) -> Option<String> {
 }
 
 impl CompiApp {
-    /// Shows Markdown `path` in `pane` in Read mode (`read`) or Edit, and remembers the
-    /// mode for the file in this window. A switch keeps the place: the line at the top of
-    /// one mode is at the top of the other. `at`, a 1-based line, is gone to instead, as
-    /// a jump: in Edit it also takes the cursor.
+    /// Shows Markdown or SVG `path` in `pane` in Read mode (`read`; View for SVG) or Edit,
+    /// and remembers the mode for the file in this window. A Markdown switch keeps the
+    /// place: the line at the top of one mode is at the top of the other. `at`, a 1-based
+    /// line, is gone to instead, as a jump: in Edit it also takes the cursor.
     pub(in crate::gui) fn set_note_mode(
         &mut self,
         pane: &PaneId,
@@ -289,7 +294,7 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !model::is_markdown(path) {
+        if !readable(path) {
             return;
         }
         let Some(ui) = self.content.panes.get_mut(pane) else {
@@ -304,7 +309,7 @@ impl CompiApp {
                     .flatten()
                     .map(|editor| editor_top_line(editor.state.read(cx)))
             });
-            if let Some(line) = line {
+            if let Some(line) = line.filter(|_| model::is_markdown(path)) {
                 let since = std::time::Instant::now();
                 ui.notes
                     .pending_top
@@ -351,13 +356,13 @@ impl CompiApp {
             }
         }
         let environment = ui.environment.clone();
-        self.state.set_reads_markdown(&environment, path, read);
+        self.state.set_reads_file(&environment, path, read);
         self.save_state();
         cx.notify();
     }
 
     /// Read Markdown (Ctrl/Cmd+E): the focused pane's Markdown file switches between Edit
-    /// and Read; from Diff it goes to Read.
+    /// and Read, an SVG between Edit and View; from Diff it goes to Read (View).
     pub(in crate::gui) fn toggle_markdown_read(
         &mut self,
         window: &mut Window,
@@ -367,12 +372,12 @@ impl CompiApp {
             let tab = self.focused_content()?.active.clone()?;
             Some((pane, tab))
         }) else {
-            self.global_error = Some("Open a Markdown file first".into());
+            self.global_error = Some("Open a Markdown or SVG file first".into());
             return;
         };
         let path = tab.path().to_owned();
-        if !model::is_markdown(&path) {
-            self.global_error = Some("Open a Markdown file first".into());
+        if !readable(&path) {
+            self.global_error = Some("Open a Markdown or SVG file first".into());
             return;
         }
         if tab.diff_scope().is_some() {
@@ -383,7 +388,7 @@ impl CompiApp {
         self.set_note_mode(&pane, &path, !read, None, window, cx);
     }
 
-    /// The focused pane's Markdown file shows in Read mode.
+    /// The focused pane's Markdown file shows in Read mode, or its SVG in View.
     pub(in crate::gui) fn focused_markdown_read(&self) -> bool {
         self.focused_pane()
             .zip(
@@ -445,7 +450,7 @@ impl CompiApp {
             ui.notes
                 .pending_top
                 .retain(|path, _| ui.files.contains_key(path));
-            if !model::is_markdown(&path) {
+            if !readable(&path) {
                 continue;
             }
             // A file this pane has not shown yet opens in the mode it was last in here.
@@ -453,7 +458,7 @@ impl CompiApp {
                 && let Some(file) = ui.files.get(&path)
             {
                 ui.notes.seen.insert(path.clone());
-                if self.state.reads_markdown(&ui.environment, &path) {
+                if self.state.reads_file(&ui.environment, &path) {
                     ui.notes.rendered.insert(path.clone());
                     if let Some(line) = file.reveal {
                         let since = std::time::Instant::now();
@@ -462,6 +467,9 @@ impl CompiApp {
                             .insert(path.clone(), PendingTop { line, since });
                     }
                 }
+            }
+            if !model::is_markdown(&path) {
+                continue;
             }
             if ui.notes.panel && ui.notes.search.is_none() {
                 let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search notes…"));

@@ -1999,7 +1999,13 @@ impl CompiApp {
                 path,
                 result,
                 backup,
-            } => self.content_file_read(pane_id, path, result, backup),
+            } => self.content_file_read(pane_id, path, result, backup, cx),
+            UiEvent::ContentImageLoaded {
+                pane_id,
+                path,
+                request,
+                result,
+            } => self.content_image_loaded(&pane_id, &path, request, result),
             UiEvent::ContentFileChecked {
                 pane_id,
                 path,
@@ -3304,10 +3310,10 @@ impl CompiApp {
             diff_tab: self
                 .focused_content()
                 .is_some_and(|content| content.active_diff().is_some()),
-            markdown_tab: self
+            readable_tab: self
                 .focused_content()
                 .and_then(|content| content.active.as_ref())
-                .is_some_and(|tab| crate::notes::is_markdown(tab.path())),
+                .is_some_and(|tab| content::notes::readable(tab.path())),
             files_reason: file_scope.as_ref().err().copied(),
             file_search_reason: file_scope
                 .as_ref()
@@ -4671,6 +4677,17 @@ impl CompiApp {
     fn command_label(&self, command: Command) -> &'static str {
         if command == Command::TogglePaneZoom && self.pane_zoomed() {
             "Restore split layout"
+        } else if command == Command::ToggleMarkdownRead
+            && self
+                .focused_content()
+                .and_then(|content| content.active.as_ref())
+                .is_some_and(|tab| content::is_svg(tab.path()))
+        {
+            if self.focused_markdown_read() {
+                "Edit SVG"
+            } else {
+                "View SVG"
+            }
         } else if command == Command::ToggleMarkdownRead && self.focused_markdown_read() {
             "Edit Markdown"
         } else if command == Command::TogglePaneFloat
@@ -4854,7 +4871,8 @@ impl CompiApp {
                     .iter()
                     .filter_map(|inspector| inspector.image.as_ref()),
             )
-            .chain(self.monitor.icon_images());
+            .chain(self.monitor.icon_images())
+            .chain(self.content.images());
         for image in images {
             let id = Arc::as_ptr(image) as usize;
             self.rendered_image_ids.insert(id);

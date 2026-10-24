@@ -578,6 +578,13 @@ enum UiEvent {
         /// The file's unsaved edits, for its first read.
         backup: Option<workspace::unsaved::Backup>,
     },
+    /// An image file's, or an SVG View's, decoded image or why there is none.
+    ContentImageLoaded {
+        pane_id: PaneId,
+        path: String,
+        request: u64,
+        result: Result<workspace::content::LoadedImage, String>,
+    },
     ContentFileChecked {
         pane_id: PaneId,
         path: String,

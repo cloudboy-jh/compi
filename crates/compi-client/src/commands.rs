@@ -253,8 +253,8 @@ pub struct CommandContext {
     pub file_tab: bool,
     /// The focused content pane shows a file tab in Diff mode.
     pub diff_tab: bool,
-    /// The focused content pane's active tab is a Markdown file, in any mode.
-    pub markdown_tab: bool,
+    /// The focused content pane's active tab is a Markdown or SVG file, in any mode.
+    pub readable_tab: bool,
     /// Why the focused pane's folder cannot open in a content pane: a terminal that
     /// has not reported its directory.
     pub files_reason: Option<&'static str>,
@@ -793,7 +793,7 @@ impl Command {
             DiffThisFile => {
                 (!c.file_tab && !c.diff_tab).then_some("Open a file in the editor first")
             }
-            ToggleMarkdownRead => (!c.markdown_tab).then_some("Open a Markdown file first"),
+            ToggleMarkdownRead => (!c.readable_tab).then_some("Open a Markdown or SVG file first"),
             NextChange | PreviousChange => {
                 (!c.file_tab).then_some("Open a file in the editor first")
             }
@@ -1487,7 +1487,7 @@ mod tests {
         let markdown = CommandContext {
             content_pane: true,
             file_tab: true,
-            markdown_tab: true,
+            readable_tab: true,
             ..ready()
         };
         let route = |owner, context: &CommandContext| {
@@ -1501,7 +1501,7 @@ mod tests {
             );
         }
         let other = CommandContext {
-            markdown_tab: false,
+            readable_tab: false,
             ..markdown
         };
         assert!(matches!(

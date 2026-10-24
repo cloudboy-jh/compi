@@ -4133,13 +4133,16 @@ impl CompiApp {
             show_diff = show_diff.key(key);
         }
         let mut modes = vec![edit];
-        if crate::notes::is_markdown(file) {
+        if super::content::notes::readable(file) {
             let (pane, path) = (pane_id.clone(), file.to_owned());
-            let mut show_read = text_button("file-mode-read", "Read")
+            let svg = super::content::is_svg(file);
+            let mut show_read = text_button("file-mode-read", if svg { "View" } else { "Read" })
                 .selected(read)
-                .detail(
-                    "Shows the Markdown formatted at the line in view, without changing the file",
-                )
+                .detail(if svg {
+                    "Shows the SVG drawn, without changing the file"
+                } else {
+                    "Shows the Markdown formatted at the line in view, without changing the file"
+                })
                 .disabled_because(edit_reason)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     if diff {

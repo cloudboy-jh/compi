@@ -27,7 +27,10 @@ use gpui_component::input::{
 };
 use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
+mod image_file;
 pub(in crate::gui) mod notes;
+use image_file::{ImageFile, SvgView};
+pub(in crate::gui) use image_file::{LoadedImage, is_svg};
 
 /// Width of the folder sidebar beside an open tab.
 pub(super) const SIDEBAR_WIDTH: f32 = 220.0;
@@ -134,6 +137,8 @@ pub(super) struct PaneUi {
     /// A new-side line to reveal in a diff tab once its diff exists.
     pub(super) diff_reveal: Option<(ContentTab, u32)>,
     pub(super) notes: notes::NotesUi,
+    /// SVG files shown in View mode, drawn from their editors' text.
+    svg_views: HashMap<String, SvgView>,
 }
 
 struct OpenFile {
@@ -155,6 +160,8 @@ enum FileBody {
         len: u64,
         kind: FileKind,
     },
+    /// An image the editor cannot open, shown as one.
+    Image(Box<ImageFile>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,21 +170,27 @@ enum Unopenable {
     Binary,
 }
 
-/// What a file the editor cannot open is, in words.
-fn describe_unopenable(reason: Unopenable, kind: FileKind) -> String {
+fn image_format_name(format: compi_protocol::ImageFormat) -> &'static str {
     use compi_protocol::ImageFormat;
+    match format {
+        ImageFormat::Png => "PNG",
+        ImageFormat::Jpeg => "JPEG",
+        ImageFormat::Gif => "GIF",
+        ImageFormat::Webp => "WebP",
+        ImageFormat::Bmp => "BMP",
+        ImageFormat::Ico => "ICO",
+        ImageFormat::Svg => "SVG",
+    }
+}
+
+/// What a file the editor cannot open is, in words. Images come here only when larger
+/// than the image limit.
+fn describe_unopenable(reason: Unopenable, kind: FileKind) -> String {
     match kind {
         FileKind::Image { format } => format!(
-            "{} image",
-            match format {
-                ImageFormat::Png => "PNG",
-                ImageFormat::Jpeg => "JPEG",
-                ImageFormat::Gif => "GIF",
-                ImageFormat::Webp => "WebP",
-                ImageFormat::Bmp => "BMP",
-                ImageFormat::Ico => "ICO",
-                ImageFormat::Svg => "SVG",
-            }
+            "{} image larger than the {} MiB image limit",
+            image_format_name(format),
+            crate::image_input::MAX_ENCODED_BYTES / (1024 * 1024)
         ),
         FileKind::Pdf => "PDF document".into(),
         FileKind::Audio => "Audio file".into(),
@@ -511,6 +524,7 @@ impl PaneUi {
             diffs: HashMap::new(),
             diff_reveal: None,
             notes: notes::NotesUi::default(),
+            svg_views: HashMap::new(),
         }
     }
 
@@ -1103,6 +1117,7 @@ impl CompiApp {
         }
         self.apply_reveals(window, cx);
         self.prepare_note_views(window, cx);
+        self.prepare_svg_views(cx);
     }
 
     fn prepare_pane(&mut self, pane_id: PaneId, content: FolderContent, cx: &mut Context<Self>) {
@@ -2512,6 +2527,7 @@ impl CompiApp {
         path: String,
         result: Result<FileContent, String>,
         backup: Option<Backup>,
+        cx: &mut Context<Self>,
     ) {
         let Some(ui) = self.content.panes.get_mut(&pane_id) else {
             return;
@@ -2530,16 +2546,22 @@ impl CompiApp {
                 version,
                 writable,
             }),
-            FileContent::TooLarge { len, kind } => Err(FileBody::Unopenable {
-                reason: Unopenable::TooLarge,
-                len,
-                kind,
-            }),
-            FileContent::Binary { len, kind } => Err(FileBody::Unopenable {
-                reason: Unopenable::Binary,
-                len,
-                kind,
-            }),
+            FileContent::TooLarge { len, kind } => Err(image_file::image_tab(kind, len).map_or(
+                FileBody::Unopenable {
+                    reason: Unopenable::TooLarge,
+                    len,
+                    kind,
+                },
+                |image| FileBody::Image(Box::new(image)),
+            )),
+            FileContent::Binary { len, kind } => Err(image_file::image_tab(kind, len).map_or(
+                FileBody::Unopenable {
+                    reason: Unopenable::Binary,
+                    len,
+                    kind,
+                },
+                |image| FileBody::Image(Box::new(image)),
+            )),
         });
         let replacement = match &mut file.body {
             FileBody::Loading => Some(match result {
@@ -2586,8 +2608,14 @@ impl CompiApp {
             }
             _ => None,
         };
+        let starts_image = matches!(replacement, Some(FileBody::Image(_)));
         if let Some(body) = replacement {
             file.body = body;
+        }
+        if starts_image && let FileBody::Image(image) = &file.body {
+            let load = image.load_key();
+            let environment = ui.environment.clone();
+            self.request_image_load(pane_id, environment, path, load, cx);
         }
     }
 
@@ -4001,6 +4029,14 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         if ui.notes.is_rendered(path) && ui.editor(path).is_some() {
+            if is_svg(path) {
+                return self.render_image_body(
+                    pane_id,
+                    path,
+                    ui.svg_views.get(path).map(|view| view.file()),
+                    cx,
+                );
+            }
             return self.render_note_body(pane_id, path, ui, div().into_any_element(), cx);
         }
         let colors = *self.colors();
@@ -4021,6 +4057,7 @@ impl CompiApp {
                 )
                 .children(self.render_gutter(pane_id, path, cx))
                 .into_any_element(),
+            Some(FileBody::Image(image)) => self.render_image_body(pane_id, path, Some(image), cx),
             Some(FileBody::Unopenable { reason, len, kind }) => {
                 let copied = path.to_owned();
                 area.p_3()

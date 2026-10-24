@@ -1,5 +1,6 @@
 use super::*;
 use crate::image_input::{self, ImageInput, ImageTarget, PreparedImage};
+use gpui::{DispatchPhase, Entity, ScrollDelta, Size};
 use std::cell::Cell as ViewportCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -29,32 +30,197 @@ pub(in crate::gui) struct InspectorState {
     name: String,
     pub(super) image: Option<Arc<RenderImage>>,
     error: Option<String>,
+    view: ZoomView,
+}
+
+/// How an image sits in its box: fitted (no larger than its natural size) or zoomed, and
+/// panned; with the box it was last drawn in. The inspector's and an image file's.
+#[derive(Default)]
+pub(in crate::gui) struct ZoomView {
+    /// The image's size at 100%, in logical pixels.
+    natural: Option<Size<f32>>,
+    /// `None` fits the image.
     zoom: Option<f32>,
     pan: Point<Pixels>,
     drag: Option<(Point<Pixels>, Point<Pixels>)>,
     viewport: Rc<ViewportCell<Option<Bounds<Pixels>>>>,
 }
 
-impl InspectorState {
-    fn scale(&self, bounds: Bounds<Pixels>) -> f32 {
-        self.zoom.unwrap_or_else(|| {
-            let Some(image) = &self.image else { return 1.0 };
-            (f32::from(bounds.size.width) / image.size(0).width.0.max(1) as f32)
-                .min(f32::from(bounds.size.height) / image.size(0).height.0.max(1) as f32)
-                .min(1.0)
-        })
+/// Where a `ZoomView` lives, for the events that reach it after its frame.
+#[derive(Clone)]
+pub(in crate::gui) enum ZoomTarget {
+    Inspector,
+    File { pane: PaneId, path: String },
+}
+
+/// The scale an image of `natural` size shows at in `bounds`: `zoom`, or fitted.
+fn view_scale(bounds: Bounds<Pixels>, natural: Size<f32>, zoom: Option<f32>) -> f32 {
+    zoom.unwrap_or_else(|| {
+        (f32::from(bounds.size.width) / natural.width.max(1.0))
+            .min(f32::from(bounds.size.height) / natural.height.max(1.0))
+            .min(1.0)
+    })
+}
+
+impl ZoomView {
+    /// Shows an image of `natural` size; a different size starts fitted.
+    pub(in crate::gui) fn set_natural(&mut self, natural: Size<f32>) {
+        if self.natural != Some(natural) {
+            self.natural = Some(natural);
+            self.zoom = None;
+            self.pan = point(px(0.0), px(0.0));
+        }
+    }
+
+    /// The scale the image showed at when last drawn.
+    pub(in crate::gui) fn scale(&self) -> Option<f32> {
+        Some(view_scale(self.viewport.get()?, self.natural?, self.zoom))
     }
 
     fn clamp_pan(&mut self, bounds: Bounds<Pixels>) {
-        let Some(image) = &self.image else { return };
-        let scale = self.scale(bounds);
-        let x =
-            ((image.size(0).width.0 as f32 * scale - f32::from(bounds.size.width)) / 2.0).max(0.0);
-        let y = ((image.size(0).height.0 as f32 * scale - f32::from(bounds.size.height)) / 2.0)
-            .max(0.0);
+        let Some(natural) = self.natural else { return };
+        let scale = view_scale(bounds, natural, self.zoom);
+        let x = ((natural.width * scale - f32::from(bounds.size.width)) / 2.0).max(0.0);
+        let y = ((natural.height * scale - f32::from(bounds.size.height)) / 2.0).max(0.0);
         self.pan.x = px(f32::from(self.pan.x).clamp(-x, x));
         self.pan.y = px(f32::from(self.pan.y).clamp(-y, y));
     }
+
+    /// Zooms by `factor` (5% to 1600%), about `anchor` or the centre; `None` fits.
+    pub(in crate::gui) fn zoom(&mut self, factor: Option<f32>, anchor: Option<Point<Pixels>>) {
+        let (Some(bounds), Some(natural)) = (self.viewport.get(), self.natural) else {
+            return;
+        };
+        let old = view_scale(bounds, natural, self.zoom);
+        self.zoom = factor.map(|factor| (old * factor).clamp(0.05, 16.0));
+        if let Some(anchor) = anchor {
+            let ratio = view_scale(bounds, natural, self.zoom) / old.max(0.0001);
+            let dx = anchor.x - bounds.center().x;
+            let dy = anchor.y - bounds.center().y;
+            self.pan = point(
+                dx - (dx - self.pan.x) * ratio,
+                dy - (dy - self.pan.y) * ratio,
+            );
+        } else {
+            self.pan = point(px(0.0), px(0.0));
+        }
+        self.clamp_pan(bounds);
+    }
+
+    /// 100%, centred.
+    pub(in crate::gui) fn actual_size(&mut self) {
+        self.zoom = Some(1.0);
+        self.pan = point(px(0.0), px(0.0));
+    }
+}
+
+/// `image` as `view` places it, filling the canvas's box: the wheel zooms about the
+/// pointer and a drag pans. Events find the view again through `target`.
+pub(in crate::gui) fn zoom_canvas(
+    image: Arc<RenderImage>,
+    view: &ZoomView,
+    target: ZoomTarget,
+    entity: Entity<CompiApp>,
+) -> impl IntoElement {
+    let viewport = view.viewport.clone();
+    let (zoom, pan) = (view.zoom, view.pan);
+    let natural = view.natural.unwrap_or_else(|| {
+        let pixels = image.size(0);
+        size(pixels.width.0 as f32, pixels.height.0 as f32)
+    });
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let scale = view_scale(bounds, natural, zoom);
+            viewport.set(Some(bounds));
+            let dimensions = size(px(natural.width * scale), px(natural.height * scale));
+            let origin = point(
+                bounds.center().x - dimensions.width / 2.0 + pan.x,
+                bounds.center().y - dimensions.height / 2.0 + pan.y,
+            );
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                let _ = window.paint_image(
+                    bounds,
+                    Bounds::new(origin, dimensions),
+                    Corners::default(),
+                    image.clone(),
+                    0,
+                    false,
+                );
+            });
+            window.on_mouse_event({
+                let (entity, target) = (entity.clone(), target.clone());
+                move |event: &MouseDownEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble
+                        && event.button == MouseButton::Left
+                        && bounds.contains(&event.position)
+                    {
+                        entity.update(cx, |this, _| {
+                            if let Some(view) = this.zoom_view(&target) {
+                                view.drag = Some((event.position, view.pan));
+                            }
+                        });
+                    }
+                }
+            });
+            window.on_mouse_event({
+                let (entity, target) = (entity.clone(), target.clone());
+                move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    entity.update(cx, |this, cx| {
+                        if let Some(view) = this.zoom_view(&target)
+                            && let Some((origin, pan)) = view.drag
+                        {
+                            if event.dragging() {
+                                view.pan = point(
+                                    pan.x + event.position.x - origin.x,
+                                    pan.y + event.position.y - origin.y,
+                                );
+                                view.clamp_pan(bounds);
+                                cx.stop_propagation();
+                                cx.notify();
+                            } else {
+                                view.drag = None;
+                            }
+                        }
+                    });
+                }
+            });
+            window.on_mouse_event({
+                let (entity, target) = (entity.clone(), target.clone());
+                move |_: &MouseUpEvent, _, _, cx| {
+                    entity.update(cx, |this, _| {
+                        if let Some(view) = this.zoom_view(&target) {
+                            view.drag = None;
+                        }
+                    })
+                }
+            });
+            window.on_mouse_event({
+                let (entity, target) = (entity.clone(), target.clone());
+                move |event: &ScrollWheelEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && bounds.contains(&event.position) {
+                        entity.update(cx, |this, cx| {
+                            // A wheel notch arrives as the system's scroll lines (often 3
+                            // to 5), a trackpad as pixels: about 1.2× to 1.4× a notch.
+                            let factor = match event.delta {
+                                ScrollDelta::Lines(lines) => (lines.y * 0.065).exp(),
+                                ScrollDelta::Pixels(pixels) => (f32::from(pixels.y) * 0.005).exp(),
+                            };
+                            if let Some(view) = this.zoom_view(&target) {
+                                view.zoom(Some(factor), Some(event.position));
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        });
+                    }
+                }
+            });
+        },
+    )
+    .size_full()
 }
 
 enum MediaJob {
@@ -333,10 +499,7 @@ impl CompiApp {
             name: image.name.clone(),
             image: None,
             error: None,
-            zoom: None,
-            pan: point(px(0.0), px(0.0)),
-            drag: None,
-            viewport: Rc::new(ViewportCell::new(None)),
+            view: ZoomView::default(),
         });
         self.image_notice = None;
         cx.notify();
@@ -352,7 +515,13 @@ impl CompiApp {
                 return;
             }
             match result {
-                Ok(image) => inspector.image = Some(image),
+                Ok(image) => {
+                    let pixels = image.size(0);
+                    inspector
+                        .view
+                        .set_natural(size(pixels.width.0 as f32, pixels.height.0 as f32));
+                    inspector.image = Some(image);
+                }
                 Err(error) => inspector.error = Some(error),
             }
         }
@@ -416,26 +585,20 @@ impl CompiApp {
     }
 
     fn zoom_inspector(&mut self, factor: Option<f32>, anchor: Option<Point<Pixels>>) {
-        let Some(inspector) = &mut self.image_inspector else {
-            return;
-        };
-        let Some(bounds) = inspector.viewport.get() else {
-            return;
-        };
-        let old = inspector.scale(bounds);
-        inspector.zoom = factor.map(|factor| (old * factor).clamp(0.05, 16.0));
-        if let Some(anchor) = anchor {
-            let ratio = inspector.scale(bounds) / old.max(0.0001);
-            let dx = anchor.x - bounds.center().x;
-            let dy = anchor.y - bounds.center().y;
-            inspector.pan = point(
-                dx - (dx - inspector.pan.x) * ratio,
-                dy - (dy - inspector.pan.y) * ratio,
-            );
-        } else {
-            inspector.pan = point(px(0.0), px(0.0));
+        if let Some(inspector) = &mut self.image_inspector {
+            inspector.view.zoom(factor, anchor);
         }
-        inspector.clamp_pan(bounds);
+    }
+
+    /// The zoom view `target` names, if it is still there.
+    pub(in crate::gui) fn zoom_view(&mut self, target: &ZoomTarget) -> Option<&mut ZoomView> {
+        match target {
+            ZoomTarget::Inspector => self
+                .image_inspector
+                .as_mut()
+                .map(|inspector| &mut inspector.view),
+            ZoomTarget::File { pane, path } => self.file_zoom_view(pane, path),
+        }
     }
 
     pub(super) fn inspector_key(
@@ -457,8 +620,7 @@ impl CompiApp {
             "0" => self.zoom_inspector(None, None),
             "1" => {
                 if let Some(inspector) = &mut self.image_inspector {
-                    inspector.zoom = Some(1.0);
-                    inspector.pan = point(px(0.0), px(0.0));
+                    inspector.view.actual_size();
                 }
             }
             "c" if key.modifiers.control || key.modifiers.platform => self.copy_inspector_image(cx),
@@ -579,110 +741,12 @@ impl CompiApp {
             return div().into_any_element();
         };
         let colors = *self.colors();
-        let viewport = inspector.viewport.clone();
-        let entity = cx.entity();
-        let image = inspector.image.clone();
-        let zoom = inspector.zoom;
-        let pan = inspector.pan;
+        let image_canvas = match inspector.image.clone() {
+            Some(image) => zoom_canvas(image, &inspector.view, ZoomTarget::Inspector, cx.entity())
+                .into_any_element(),
+            None => div().into_any_element(),
+        };
         let error = inspector.error.clone();
-        let image_canvas = canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                let scale = image.as_ref().map_or(1.0, |image| {
-                    zoom.unwrap_or_else(|| {
-                        (f32::from(bounds.size.width) / image.size(0).width.0.max(1) as f32)
-                            .min(
-                                f32::from(bounds.size.height)
-                                    / image.size(0).height.0.max(1) as f32,
-                            )
-                            .min(1.0)
-                    })
-                });
-                viewport.set(Some(bounds));
-                if let Some(image) = &image {
-                    let dimensions = size(
-                        px(image.size(0).width.0 as f32 * scale),
-                        px(image.size(0).height.0 as f32 * scale),
-                    );
-                    let origin = point(
-                        bounds.center().x - dimensions.width / 2.0 + pan.x,
-                        bounds.center().y - dimensions.height / 2.0 + pan.y,
-                    );
-                    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        let _ = window.paint_image(
-                            bounds,
-                            Bounds::new(origin, dimensions),
-                            Corners::default(),
-                            image.clone(),
-                            0,
-                            false,
-                        );
-                    });
-                }
-                window.on_mouse_event({
-                    let entity = entity.clone();
-                    move |event: &MouseDownEvent, _, _, cx| {
-                        if event.button == MouseButton::Left && bounds.contains(&event.position) {
-                            entity.update(cx, |this, cx| {
-                                if let Some(inspector) = &mut this.image_inspector {
-                                    inspector.drag = Some((event.position, inspector.pan));
-                                }
-                                cx.stop_propagation();
-                            });
-                        }
-                    }
-                });
-                window.on_mouse_event({
-                    let entity = entity.clone();
-                    move |event: &MouseMoveEvent, _, _, cx| {
-                        entity.update(cx, |this, cx| {
-                            if let Some(inspector) = &mut this.image_inspector
-                                && let Some((origin, pan)) = inspector.drag
-                            {
-                                if event.dragging() {
-                                    inspector.pan = point(
-                                        pan.x + event.position.x - origin.x,
-                                        pan.y + event.position.y - origin.y,
-                                    );
-                                    inspector.clamp_pan(bounds);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                } else {
-                                    inspector.drag = None;
-                                }
-                            }
-                        });
-                    }
-                });
-                window.on_mouse_event({
-                    let entity = entity.clone();
-                    move |_: &MouseUpEvent, _, _, cx| {
-                        entity.update(cx, |this, _| {
-                            if let Some(inspector) = &mut this.image_inspector {
-                                inspector.drag = None;
-                            }
-                        })
-                    }
-                });
-                window.on_mouse_event({
-                    let entity = entity.clone();
-                    move |event: &ScrollWheelEvent, _, _, cx| {
-                        if bounds.contains(&event.position) {
-                            entity.update(cx, |this, cx| {
-                                let delta = f32::from(event.delta.pixel_delta(px(32.0)).y);
-                                this.zoom_inspector(
-                                    Some((delta * 0.005).exp()),
-                                    Some(event.position),
-                                );
-                                cx.stop_propagation();
-                                cx.notify();
-                            });
-                        }
-                    }
-                });
-            },
-        )
-        .size_full();
         let status = self.image_notice.clone().unwrap_or_else(|| {
             if let Some(error) = error {
                 error
@@ -756,8 +820,7 @@ impl CompiApp {
                                 cx,
                                 |this, cx| {
                                     if let Some(inspector) = &mut this.image_inspector {
-                                        inspector.zoom = Some(1.0);
-                                        inspector.pan = point(px(0.0), px(0.0));
+                                        inspector.view.actual_size();
                                     }
                                     cx.notify();
                                 },
@@ -837,5 +900,35 @@ impl CompiApp {
             }))
             .child(label)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fitting_never_enlarges_and_zoom_and_pan_stay_bounded() {
+        let mut view = ZoomView::default();
+        view.viewport
+            .set(Some(Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(300.0)))));
+        // Smaller than the box: fitted at its own size.
+        view.set_natural(size(100.0, 50.0));
+        assert_eq!(view.scale(), Some(1.0));
+        // Larger: fitted to the tighter side.
+        view.set_natural(size(800.0, 1200.0));
+        assert_eq!(view.scale(), Some(0.25));
+        view.zoom(Some(1000.0), None);
+        assert_eq!(view.scale(), Some(16.0));
+        view.zoom(Some(0.0), None);
+        assert_eq!(view.scale(), Some(0.05));
+        view.actual_size();
+        // At 100% the image overhangs 200 px each side across, 450 down: a pan stops there.
+        view.pan = point(px(5000.0), px(-5000.0));
+        view.clamp_pan(view.viewport.get().unwrap());
+        assert_eq!(view.pan, point(px(200.0), px(-450.0)));
+        // A new image starts fitted and centred.
+        view.set_natural(size(10.0, 10.0));
+        assert_eq!((view.scale(), view.pan), (Some(1.0), point(px(0.0), px(0.0))));
     }
 }

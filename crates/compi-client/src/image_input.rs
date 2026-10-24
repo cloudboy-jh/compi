@@ -12,7 +12,8 @@ use image::{DynamicImage, Frame, ImageDecoder, ImageFormat, RgbaImage};
 use sha2::{Digest, Sha256};
 use smallvec::smallvec;
 
-const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+/// Largest encoded image Compi decodes, pasted or opened as a file.
+pub const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 8192;
 const STORE_BYTES: u64 = 512 * 1024 * 1024;
 const STORE_FILES: usize = 4096;
@@ -101,6 +102,16 @@ pub fn prepare(input: ImageInput, target: ImageTarget) -> Result<PreparedImage, 
 pub fn load_full_image(path: &Path) -> Result<Arc<RenderImage>, String> {
     let bytes = read_encoded(path)?;
     let (decoded, _) = decode(&bytes)?;
+    Ok(render_image(decoded.into_rgba8()))
+}
+
+/// An image file's bytes decoded for drawing, within the same limits as pasted images;
+/// icons decode too.
+pub fn decode_render(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
+    let (decoded, _) = decode_as(bytes, |format| match format {
+        ImageFormat::Ico => Ok(()),
+        format => extension(format).map(drop),
+    })?;
     Ok(render_image(decoded.into_rgba8()))
 }
 
@@ -282,11 +293,20 @@ fn read_encoded(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Decodes an image Compi can paste.
 fn decode(bytes: &[u8]) -> Result<(DynamicImage, ImageFormat), String> {
+    decode_as(bytes, |format| extension(format).map(drop))
+}
+
+/// Decodes `bytes` within the size limits when `accept` takes their format.
+fn decode_as(
+    bytes: &[u8],
+    accept: impl Fn(ImageFormat) -> Result<(), String>,
+) -> Result<(DynamicImage, ImageFormat), String> {
     check_encoded_len(bytes.len())?;
     let format = image::guess_format(bytes)
-        .map_err(|_| "Not a recognized PNG, JPEG, WebP, GIF or BMP image".to_owned())?;
-    extension(format)?;
+        .map_err(|_| "Not a recognized PNG, JPEG, WebP, GIF, BMP or ICO image".to_owned())?;
+    accept(format)?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
     limits.max_image_height = Some(MAX_DIMENSION);
@@ -315,7 +335,12 @@ fn decode(bytes: &[u8]) -> Result<(DynamicImage, ImageFormat), String> {
 }
 
 fn decode_error(error: image::ImageError) -> String {
-    format!("Cannot decode image (maximum 8192 pixels per side, 64 MiB decoded): {error}")
+    match error {
+        image::ImageError::Limits(_) => {
+            format!("Cannot decode image (maximum 8192 pixels per side, 64 MiB decoded): {error}")
+        }
+        error => format!("Cannot decode image: {error}"),
+    }
 }
 
 fn check_dimensions(width: u32, height: u32) -> Result<(), String> {
@@ -838,6 +863,23 @@ mod tests {
         );
         assert!(quote_remote_path(r"C:\image.png").is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_files_decode_compis_own_icon_and_screenshots() {
+        let size = |bytes: &[u8]| {
+            let image = decode_render(bytes).unwrap();
+            let pixels = image.size(0);
+            (pixels.width.0, pixels.height.0)
+        };
+        // The app icon holds 16 to 256 px entries; the largest shows.
+        let icon = include_bytes!("../../../assets/Compi-desktopappicon-v4.ico");
+        assert_eq!(size(icon), (256, 256));
+        // Icons open as files but are not pasted into terminals.
+        assert!(decode(icon).is_err());
+        let readme = include_bytes!("../../../assets/compi-readme.png");
+        assert_eq!(size(readme), (1280, 512));
+        assert!(decode_render(&readme[..readme.len() / 2]).is_err());
     }
 
     #[test]

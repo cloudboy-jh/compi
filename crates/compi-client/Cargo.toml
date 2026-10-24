@@ -54,7 +54,7 @@ typst = "=0.14.2"
 typst-svg = "=0.14.2"
 typst-assets = { version = "=0.14.2", features = ["fonts"] }
 roxmltree = "0.20"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"] }
 raw-window-handle = "0.6"
 # Browser panes: the system webview (WebView2, WKWebView) as a child of the window.
 wry = { version = "0.57.1", default-features = false }
