@@ -24,7 +24,9 @@
 use super::*;
 use crate::gui::controls::IconName;
 use compi_protocol::{BrowserContent, PaneContent};
-use gpui::{Bounds, Entity, FocusHandle, Keystroke, Subscription, Task, canvas};
+#[cfg(windows)]
+use gpui::Keystroke;
+use gpui::{Bounds, Entity, FocusHandle, Subscription, Task, canvas};
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
@@ -327,12 +329,17 @@ struct PageFailure {
     runtime_missing: bool,
 }
 
+/// What a page reports back. Keyboard and focus come from WebView2's own hooks, which
+/// only Windows has so far.
 enum PageEvent {
     /// The page took the keyboard.
+    #[cfg(windows)]
     Focused(PaneId),
     /// A Compi chord pressed while the page had the keyboard.
+    #[cfg(windows)]
     Key(Keystroke),
     /// Ctrl+L or F6 pressed while the page had the keyboard.
+    #[cfg(windows)]
     FocusAddress(PaneId),
     /// The page asked to open `url` in a new window; it opens in the page instead.
     Open(PaneId, String),
@@ -900,11 +907,13 @@ impl CompiApp {
                 let alive = match event {
                     // A chord reaches CompiApp's own handlers, so it is dispatched
                     // outside any update of it.
+                    #[cfg(windows)]
                     PageEvent::Key(keystroke) => cx
                         .update(|window, cx| {
                             window.dispatch_keystroke(keystroke, cx);
                         })
                         .is_ok(),
+                    #[cfg(windows)]
                     PageEvent::Focused(pane_id) => this
                         .update(cx, |this, cx| {
                             if this.focused_pane() != Some(&pane_id) {
@@ -914,6 +923,7 @@ impl CompiApp {
                             cx.notify();
                         })
                         .is_ok(),
+                    #[cfg(windows)]
                     PageEvent::FocusAddress(pane_id) => this
                         .update_in(cx, |this, window, cx| {
                             this.focus_pane(pane_id.clone());
