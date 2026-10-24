@@ -16,9 +16,9 @@ use super::unsaved::{self, Backup, Backups, SaveTicket};
 use super::*;
 use crate::gui::controls::{self, ChipTone, IconName, icon_button, text_button};
 use compi_protocol::{
-    ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
-    FolderContent, GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent, PaneSide, PaneView,
-    ServerGeneration, ServerId,
+    ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileKind, FileState,
+    FileVersion, FolderContent, GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent,
+    PaneSide, PaneView, ServerGeneration, ServerId,
 };
 use gpui::Entity;
 use gpui_component::highlighter::HighlightTheme;
@@ -153,6 +153,7 @@ enum FileBody {
     Unopenable {
         reason: Unopenable,
         len: u64,
+        kind: FileKind,
     },
 }
 
@@ -160,6 +161,33 @@ enum FileBody {
 enum Unopenable {
     TooLarge,
     Binary,
+}
+
+/// What a file the editor cannot open is, in words.
+fn describe_unopenable(reason: Unopenable, kind: FileKind) -> String {
+    use compi_protocol::ImageFormat;
+    match kind {
+        FileKind::Image { format } => format!(
+            "{} image",
+            match format {
+                ImageFormat::Png => "PNG",
+                ImageFormat::Jpeg => "JPEG",
+                ImageFormat::Gif => "GIF",
+                ImageFormat::Webp => "WebP",
+                ImageFormat::Bmp => "BMP",
+                ImageFormat::Ico => "ICO",
+                ImageFormat::Svg => "SVG",
+            }
+        ),
+        FileKind::Pdf => "PDF document".into(),
+        FileKind::Audio => "Audio file".into(),
+        FileKind::Video => "Video file".into(),
+        FileKind::Text if reason == Unopenable::TooLarge => format!(
+            "Text larger than the {} MiB editor limit",
+            MAX_CONTENT_FILE_BYTES / (1024 * 1024)
+        ),
+        FileKind::Text | FileKind::Other => "Not a text file".into(),
+    }
 }
 
 pub(super) struct FileEditor {
@@ -2502,13 +2530,15 @@ impl CompiApp {
                 version,
                 writable,
             }),
-            FileContent::TooLarge { len } => Err(FileBody::Unopenable {
+            FileContent::TooLarge { len, kind } => Err(FileBody::Unopenable {
                 reason: Unopenable::TooLarge,
                 len,
+                kind,
             }),
-            FileContent::Binary { len } => Err(FileBody::Unopenable {
+            FileContent::Binary { len, kind } => Err(FileBody::Unopenable {
                 reason: Unopenable::Binary,
                 len,
+                kind,
             }),
         });
         let replacement = match &mut file.body {
@@ -3991,7 +4021,7 @@ impl CompiApp {
                 )
                 .children(self.render_gutter(pane_id, path, cx))
                 .into_any_element(),
-            Some(FileBody::Unopenable { reason, len }) => {
+            Some(FileBody::Unopenable { reason, len, kind }) => {
                 let copied = path.to_owned();
                 area.p_3()
                     .flex()
@@ -4006,13 +4036,7 @@ impl CompiApp {
                     .child(div().text_color(color(colors.muted)).child(format!(
                         "{} · {}",
                         human_size(*len),
-                        match reason {
-                            Unopenable::TooLarge => format!(
-                                "Larger than the {} MiB editor limit",
-                                MAX_CONTENT_FILE_BYTES / (1024 * 1024)
-                            ),
-                            Unopenable::Binary => "Not a text file".to_owned(),
-                        }
+                        describe_unopenable(*reason, *kind)
                     )))
                     .child(
                         div()

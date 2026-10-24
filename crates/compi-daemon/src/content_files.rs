@@ -2,9 +2,10 @@
 //! saves that never overwrite changes made on disk after the editor read the file.
 
 use crate::file_tree::{self, Root};
+use base64::Engine as _;
 use compi_protocol::{
-    ContentEnvironment, DirectoryEntry, ErrorCode, FileContent, FileState, FileVersion,
-    MAX_CONTENT_FILE_BYTES,
+    ContentEnvironment, ContentRange, DirectoryEntry, ErrorCode, FILE_KIND_PROBE_BYTES,
+    FileContent, FileKind, FileState, FileVersion, MAX_CONTENT_FILE_BYTES, MAX_CONTENT_RANGE_BYTES,
 };
 use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
@@ -48,14 +49,24 @@ pub fn read_file(environment: &ContentEnvironment, path: &str) -> Result<FileCon
     let Some(bytes) = read_contents(&mut file, &metadata, &root)? else {
         return Ok(FileContent::TooLarge {
             len: current_len(&file, &root)?,
+            kind: FileKind::of(path, &read_head(&mut file, &root)?),
         });
     };
     let len = bytes.len() as u64;
+    // Bytes that are not text throughout are not text, whatever their start looks like.
+    let binary = |bytes: &[u8]| FileContent::Binary {
+        len,
+        kind: match FileKind::of(path, bytes) {
+            FileKind::Text => FileKind::Other,
+            kind => kind,
+        },
+    };
     if bytes[..bytes.len().min(BINARY_PROBE_BYTES)].contains(&0) {
-        return Ok(FileContent::Binary { len });
+        return Ok(binary(&bytes));
     }
-    let Ok(text) = String::from_utf8(bytes) else {
-        return Ok(FileContent::Binary { len });
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => return Ok(binary(error.as_bytes())),
     };
     let version = version_of(text.as_bytes());
     let writable = writable(&opened_path, &metadata);
@@ -65,6 +76,51 @@ pub fn read_file(environment: &ContentEnvironment, path: &str) -> Result<FileCon
         version,
         writable,
     })
+}
+
+/// Up to `len` bytes of the file from `offset`, at most `MAX_CONTENT_RANGE_BYTES`, with the
+/// file's length and modification time; none from its end on.
+pub fn read_range(
+    environment: &ContentEnvironment,
+    path: &str,
+    offset: u64,
+    len: u64,
+) -> Result<ContentRange, Failure> {
+    let root = resolve(environment, path)?;
+    let (opened_path, opened) = open(&root, &open_options(false));
+    let mut file = opened.map_err(|error| open_failure(&root, &opened_path, error))?;
+    let metadata = regular_metadata(&file, &root)?;
+    let wanted = len.min(MAX_CONTENT_RANGE_BYTES as u64);
+    let mut bytes = Vec::with_capacity(wanted.min(metadata.len().saturating_sub(offset)) as usize);
+    if wanted > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| read_failure(&root, error))?;
+        file.take(wanted)
+            .read_to_end(&mut bytes)
+            .map_err(|error| read_failure(&root, error))?;
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |time| u64::try_from(time.as_nanos()).unwrap_or(u64::MAX));
+    Ok(ContentRange {
+        len: metadata.len(),
+        modified,
+        offset,
+        base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })
+}
+
+/// The file's first `FILE_KIND_PROBE_BYTES`, read from its start.
+fn read_head(file: &mut File, root: &Root) -> Result<Vec<u8>, Failure> {
+    let mut head = Vec::with_capacity(FILE_KIND_PROBE_BYTES);
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| read_failure(root, error))?;
+    file.take(FILE_KIND_PROBE_BYTES as u64)
+        .read_to_end(&mut head)
+        .map_err(|error| read_failure(root, error))?;
+    Ok(head)
 }
 
 /// Compare the file on disk with `known`. The file is read, and its writability probed,
@@ -738,14 +794,26 @@ mod tests {
     }
 
     #[test]
-    fn oversized_and_binary_files_are_reported_without_their_contents() {
+    fn oversized_and_binary_files_are_reported_with_their_kind_without_their_contents() {
         let folder = Folder::new();
         let (large, large_name) = folder.file("large.txt");
         fs::write(&large, vec![b'a'; MAX_CONTENT_FILE_BYTES + 1]).unwrap();
         assert_eq!(
             read_file(&HOST, &large_name).unwrap(),
             FileContent::TooLarge {
-                len: MAX_CONTENT_FILE_BYTES as u64 + 1
+                len: MAX_CONTENT_FILE_BYTES as u64 + 1,
+                kind: FileKind::Text,
+            }
+        );
+        let (video, video_name) = folder.file("clip.MP4");
+        let mut bytes = b"\0\0\0\x18ftypmp42".to_vec();
+        bytes.resize(MAX_CONTENT_FILE_BYTES + 10, 0);
+        fs::write(&video, &bytes).unwrap();
+        assert_eq!(
+            read_file(&HOST, &video_name).unwrap(),
+            FileContent::TooLarge {
+                len: bytes.len() as u64,
+                kind: FileKind::Video,
             }
         );
 
@@ -753,12 +821,40 @@ mod tests {
         fs::write(&binary, [0xff, 0xfe, 0x41]).unwrap();
         assert_eq!(
             read_file(&HOST, &binary_name).unwrap(),
-            FileContent::Binary { len: 3 }
+            FileContent::Binary {
+                len: 3,
+                kind: FileKind::Other,
+            }
         );
         fs::write(&binary, "text\0more").unwrap();
         assert_eq!(
             read_file(&HOST, &binary_name).unwrap(),
-            FileContent::Binary { len: 9 }
+            FileContent::Binary {
+                len: 9,
+                kind: FileKind::Other,
+            }
+        );
+        // Text up to the first bad byte is still not text.
+        let mut almost = vec![b'a'; FILE_KIND_PROBE_BYTES * 2];
+        almost.push(0xff);
+        fs::write(&binary, &almost).unwrap();
+        assert!(matches!(
+            read_file(&HOST, &binary_name).unwrap(),
+            FileContent::Binary {
+                kind: FileKind::Other,
+                ..
+            }
+        ));
+        let (image, image_name) = folder.file("dot.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        assert_eq!(
+            read_file(&HOST, &image_name).unwrap(),
+            FileContent::Binary {
+                len: 16,
+                kind: FileKind::Image {
+                    format: compi_protocol::ImageFormat::Png
+                },
+            }
         );
 
         let (code, message) = read_file(&HOST, folder.0.to_str().unwrap()).unwrap_err();
@@ -768,6 +864,43 @@ mod tests {
         let oversized = "a".repeat(MAX_CONTENT_FILE_BYTES + 1);
         let (code, _) = write_file(&HOST, &binary_name, None, &oversized).unwrap_err();
         assert_eq!(code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn ranges_read_from_an_offset_to_the_limit_and_stop_at_the_end() {
+        use base64::Engine as _;
+        let decode = |range: &ContentRange| {
+            base64::engine::general_purpose::STANDARD
+                .decode(&range.base64)
+                .unwrap()
+        };
+        let folder = Folder::new();
+        let (path, name) = folder.file("data.bin");
+        let bytes: Vec<u8> = (0..MAX_CONTENT_RANGE_BYTES + 100)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&path, &bytes).unwrap();
+        let len = bytes.len() as u64;
+
+        let middle = read_range(&HOST, &name, 1000, 50).unwrap();
+        assert_eq!((middle.len, middle.offset), (len, 1000));
+        assert!(middle.modified > 0);
+        assert_eq!(decode(&middle), &bytes[1000..1050]);
+        // Never more than the limit, however much is asked for.
+        let most = read_range(&HOST, &name, 0, u64::MAX).unwrap();
+        assert_eq!(decode(&most), &bytes[..MAX_CONTENT_RANGE_BYTES]);
+        // Fewer at the end, none from it on.
+        let tail = read_range(&HOST, &name, len - 10, 100).unwrap();
+        assert_eq!(decode(&tail), &bytes[bytes.len() - 10..]);
+        assert!(decode(&read_range(&HOST, &name, len, 100).unwrap()).is_empty());
+        assert!(decode(&read_range(&HOST, &name, len + 5, 100).unwrap()).is_empty());
+        assert!(decode(&read_range(&HOST, &name, 0, 0).unwrap()).is_empty());
+
+        let (_, missing) = folder.file("missing.bin");
+        assert!(read_range(&HOST, &missing, 0, 10).is_err());
+        let (code, message) = read_range(&HOST, folder.0.to_str().unwrap(), 0, 10).unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidRequest);
+        assert!(message.contains("is a folder"), "{message}");
     }
 
     #[test]

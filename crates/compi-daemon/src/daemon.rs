@@ -1070,6 +1070,22 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
                     }
                 }
+                ClientMessage::ReadContentRange {
+                    environment,
+                    path,
+                    offset,
+                    len,
+                } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| content_files::read_range(&environment, &path, offset, len))
+                    {
+                        Ok(range) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ContentRangeRead { range },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::CheckContentFile {
                     environment,
                     path,

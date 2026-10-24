@@ -227,7 +227,7 @@ pub fn load(
                         text,
                     });
                 }
-                Ok(FileContent::TooLarge { len }) => notebook.warnings.push(format!(
+                Ok(FileContent::TooLarge { len, .. }) => notebook.warnings.push(format!(
                     "Skipped {path}: {len} bytes exceeds the file text limit."
                 )),
                 Ok(FileContent::Binary { .. }) => notebook

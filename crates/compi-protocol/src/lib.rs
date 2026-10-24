@@ -62,7 +62,10 @@ use std::fmt;
 // `InspectProcess`, `QuitProcess` aimed at `(pid, start_time)`, and the Compi surface a
 // process runs in (`ProcessDetails::surface`).
 // Version 33 adds Browser: a content kind showing a web page at a URL in its own pane.
-pub const PROTOCOL_VERSION: u32 = 33;
+// Version 34 adds ranged file reads (`ReadContentRange`) and the kind of a content file the
+// editor cannot open (`FileKind` on `FileContent::TooLarge` and `Binary`); `GitImageFormat`
+// becomes `ImageFormat`.
+pub const PROTOCOL_VERSION: u32 = 34;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -90,6 +93,11 @@ pub const MAX_GIT_CHANGES: usize = 5000;
 pub const MAX_GIT_BRANCHES: usize = 2000;
 /// Largest image a Git file read returns as an image, in bytes.
 pub const MAX_GIT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+/// Largest piece of a file one `ReadContentRange` returns, in bytes; as base64 it stays well
+/// within `MAX_CONTROL_PAYLOAD`.
+pub const MAX_CONTENT_RANGE_BYTES: usize = 4 * 1024 * 1024;
+/// Leading bytes of a file its `FileKind` is judged by.
+pub const FILE_KIND_PROBE_BYTES: usize = 8 * 1024;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -292,6 +300,14 @@ pub enum ClientMessage {
         environment: ContentEnvironment,
         path: String,
     },
+    /// Up to `len` bytes of a file from `offset` (at most `MAX_CONTENT_RANGE_BYTES`), with
+    /// the file's length and modification time.
+    ReadContentRange {
+        environment: ContentEnvironment,
+        path: String,
+        offset: u64,
+        len: u64,
+    },
     /// Whether the file still holds `known`; cheap while its size and modification time
     /// are unchanged.
     CheckContentFile {
@@ -477,6 +493,9 @@ pub enum ServerMessage {
     ContentFileRead {
         content: FileContent,
     },
+    ContentRangeRead {
+        range: ContentRange,
+    },
     ContentFileChecked {
         state: FileState,
     },
@@ -651,10 +670,88 @@ pub enum FileContent {
         /// Whether a save can replace the file.
         writable: bool,
     },
-    /// Larger than `MAX_CONTENT_FILE_BYTES`; nothing was read past the limit.
-    TooLarge { len: u64 },
+    /// Larger than `MAX_CONTENT_FILE_BYTES`; nothing was read past the limit but its first
+    /// `FILE_KIND_PROBE_BYTES`.
+    TooLarge { len: u64, kind: FileKind },
     /// Not UTF-8 text.
-    Binary { len: u64 },
+    Binary { len: u64, kind: FileKind },
+}
+
+/// What a file is, by its name and leading bytes: the preview that suits it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileKind {
+    Image {
+        format: ImageFormat,
+    },
+    Pdf,
+    Audio,
+    Video,
+    /// UTF-8 text, as far as the leading bytes show.
+    Text,
+    Other,
+}
+
+impl FileKind {
+    /// The kind of the file at `path` (a path in any environment's syntax) whose first
+    /// bytes are `head`; only its first `FILE_KIND_PROBE_BYTES` count. A name says what a
+    /// file should be and its leading bytes must agree; otherwise it is text or other.
+    pub fn of(path: &str, head: &[u8]) -> Self {
+        let head = &head[..head.len().min(FILE_KIND_PROBE_BYTES)];
+        let riff = |form: &[u8]| head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == form;
+        let ftyp = head.len() >= 8 && &head[4..8] == b"ftyp";
+        let ogg = head.starts_with(b"OggS");
+        let named = match extension(path).as_deref() {
+            Some("pdf") => head.starts_with(b"%PDF-").then_some(Self::Pdf),
+            Some("mp3") => (head.starts_with(b"ID3")
+                || (head.len() >= 2 && head[0] == 0xff && head[1] & 0xe0 == 0xe0))
+                .then_some(Self::Audio),
+            Some("wav") => riff(b"WAVE").then_some(Self::Audio),
+            Some("flac") => head.starts_with(b"fLaC").then_some(Self::Audio),
+            Some("ogg" | "oga" | "opus") => ogg.then_some(Self::Audio),
+            Some("m4a") => ftyp.then_some(Self::Audio),
+            Some("aac") => (head.len() >= 2 && head[0] == 0xff && head[1] & 0xf6 == 0xf0)
+                .then_some(Self::Audio),
+            Some("mp4" | "m4v" | "mov") => ftyp.then_some(Self::Video),
+            Some("webm" | "mkv") => head
+                .starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
+                .then_some(Self::Video),
+            Some("ogv") => ogg.then_some(Self::Video),
+            Some("avi") => riff(b"AVI ").then_some(Self::Video),
+            _ => ImageFormat::of_path(path)
+                .filter(|format| format.matches(head))
+                .map(|format| Self::Image { format }),
+        };
+        named.unwrap_or_else(|| {
+            // A character cut off at the end of the head does not make text binary.
+            let text = !head.contains(&0)
+                && std::str::from_utf8(head)
+                    .map_or_else(|error| error.error_len().is_none(), |_| true);
+            if text { Self::Text } else { Self::Other }
+        })
+    }
+}
+
+/// The lowercase extension of the last name in `path`, with `/` or `\` separators.
+fn extension(path: &str) -> Option<String> {
+    let name = path.rsplit(['/', '\\']).next()?;
+    let (_, extension) = name.rsplit_once('.')?;
+    Some(extension.to_ascii_lowercase())
+}
+
+/// A piece of a file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContentRange {
+    /// The file's length when read.
+    pub len: u64,
+    /// The file's modification time in nanoseconds since the Unix epoch, 0 when unknown.
+    /// With `len`, it tells a later piece whether the file changed in between.
+    pub modified: u64,
+    /// Where the piece starts.
+    pub offset: u64,
+    /// The piece as standard padded base64: the bytes asked for, fewer at the end of the
+    /// file, none from its end on.
+    pub base64: String,
 }
 
 /// A content file on disk compared with a version the client holds.
@@ -821,7 +918,7 @@ pub enum GitFileContent {
     /// An image of at most `MAX_GIT_IMAGE_BYTES`, recognised by extension and signature,
     /// as standard padded base64.
     Image {
-        format: GitImageFormat,
+        format: ImageFormat,
         base64: String,
         len: u64,
     },
@@ -833,9 +930,10 @@ pub enum GitFileContent {
     Missing,
 }
 
+/// An image format Compi recognises by a file's extension and signature.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum GitImageFormat {
+pub enum ImageFormat {
     Png,
     Jpeg,
     Gif,
@@ -843,6 +941,42 @@ pub enum GitImageFormat {
     Bmp,
     Ico,
     Svg,
+}
+
+impl ImageFormat {
+    /// The format a file at `path` should hold, by its extension.
+    pub fn of_path(path: &str) -> Option<Self> {
+        Some(match extension(path)?.as_str() {
+            "png" => Self::Png,
+            "jpg" | "jpeg" => Self::Jpeg,
+            "gif" => Self::Gif,
+            "webp" => Self::Webp,
+            "bmp" => Self::Bmp,
+            "ico" => Self::Ico,
+            "svg" => Self::Svg,
+            _ => return None,
+        })
+    }
+
+    /// Whether `bytes`, a file's start, carry this format's signature. SVG is judged by
+    /// its first `FILE_KIND_PROBE_BYTES`: markup holding `<svg` and no NUL.
+    pub fn matches(self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            Self::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            Self::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            Self::Webp => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+            Self::Bmp => bytes.starts_with(b"BM"),
+            Self::Ico => bytes.starts_with(&[0, 0, 1, 0]),
+            Self::Svg => {
+                let head = &bytes[..bytes.len().min(FILE_KIND_PROBE_BYTES)];
+                let start = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(head);
+                start.trim_ascii_start().starts_with(b"<")
+                    && !head.contains(&0)
+                    && head.windows(4).any(|window| window == b"<svg")
+            }
+        }
+    }
 }
 
 /// A write to a repository. Paths are relative to its top level, as `ReadGitFile` checks them.
@@ -2311,6 +2445,66 @@ mod content_tests {
         for refused in ["javascript:alert(1)", "data:text/html,x", "a b", ""] {
             assert!(typed(refused).is_err(), "{refused:?}");
         }
+    }
+
+    #[test]
+    fn file_kinds_need_a_name_and_bytes_that_agree() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        assert_eq!(
+            FileKind::of("/home/a/shot.PNG", png),
+            FileKind::Image {
+                format: ImageFormat::Png
+            }
+        );
+        assert_eq!(
+            FileKind::of(r"C:\Users\a\shot.png", png),
+            FileKind::Image {
+                format: ImageFormat::Png
+            }
+        );
+        // A name alone, or bytes alone, decide nothing.
+        assert_eq!(FileKind::of("shot.png", b"just text"), FileKind::Text);
+        assert_eq!(FileKind::of("shot.bin", png), FileKind::Other);
+        assert_eq!(FileKind::of("dir.png/notes", b"text"), FileKind::Text);
+        assert_eq!(FileKind::of("paper.pdf", b"%PDF-1.7\n"), FileKind::Pdf);
+        assert_eq!(FileKind::of("song.mp3", b"ID3\x04\0"), FileKind::Audio);
+        assert_eq!(
+            FileKind::of("song.mp3", &[0xff, 0xfb, 0x90]),
+            FileKind::Audio
+        );
+        assert_eq!(
+            FileKind::of("take.wav", b"RIFF\0\0\0\0WAVEfmt "),
+            FileKind::Audio
+        );
+        assert_eq!(
+            FileKind::of("take.avi", b"RIFF\0\0\0\0AVI LIST"),
+            FileKind::Video
+        );
+        assert_eq!(
+            FileKind::of("clip.mov", b"\0\0\0\x14ftypqt  "),
+            FileKind::Video
+        );
+        assert_eq!(
+            FileKind::of("voice.m4a", b"\0\0\0\x1cftypM4A "),
+            FileKind::Audio
+        );
+        assert_eq!(
+            FileKind::of("clip.webm", &[0x1a, 0x45, 0xdf, 0xa3, 1]),
+            FileKind::Video
+        );
+        assert_eq!(FileKind::of("clip.ogv", b"OggS\0\x02"), FileKind::Video);
+        assert_eq!(
+            FileKind::of("logo.svg", b"\xef\xbb\xbf <svg xmlns='x'/>"),
+            FileKind::Image {
+                format: ImageFormat::Svg
+            }
+        );
+        // A character cut off where the probe ends is still text; a bad byte is not.
+        let mut text = vec![b'a'; FILE_KIND_PROBE_BYTES - 1];
+        text.extend("é".as_bytes());
+        assert_eq!(FileKind::of("big.log", &text), FileKind::Text);
+        assert_eq!(FileKind::of("big.log", b"ab\xffcd"), FileKind::Other);
+        assert_eq!(FileKind::of("big.log", b"ab\0cd"), FileKind::Other);
     }
 
     #[test]

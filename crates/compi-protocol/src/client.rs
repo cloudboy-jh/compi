@@ -2,12 +2,13 @@ use crate::Result;
 use crate::frame;
 use crate::program_status::SurfaceProgramStatus;
 use crate::{
-    CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, DirectoryEntry, ErrorCode,
-    FileContent, FileState, FileVersion, GitAction, GitBranches, GitChanges, GitCommitLookup,
-    GitFileContent, GitRevision, GitWriteResult, IMAGE_UPLOAD_CHUNK_BYTES, MAX_IMAGE_UPLOAD_BYTES,
-    MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION, RuntimeMetrics, SCREEN_FRAME,
-    SearchEntry, ServerMessage, SurfaceId, SurfaceInfo, SurfaceStatus, TerminalTarget,
-    WorkspaceMutation, WorkspaceSnapshot, decode_server, decode_terminal_frame, encode_client,
+    CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, ContentRange, DirectoryEntry,
+    ErrorCode, FileContent, FileState, FileVersion, GitAction, GitBranches, GitChanges,
+    GitCommitLookup, GitFileContent, GitRevision, GitWriteResult, IMAGE_UPLOAD_CHUNK_BYTES,
+    MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION,
+    RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId, SurfaceInfo,
+    SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot, decode_server,
+    decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
@@ -886,6 +887,25 @@ impl DaemonClient {
     ) -> Result<FileContent> {
         match self.request(ClientMessage::ReadContentFile { environment, path })? {
             ServerMessage::ContentFileRead { content } => Ok(content),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Read up to `len` bytes of a file from `offset` (at most `MAX_CONTENT_RANGE_BYTES`).
+    pub fn read_content_range(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+        offset: u64,
+        len: u64,
+    ) -> Result<ContentRange> {
+        match self.request(ClientMessage::ReadContentRange {
+            environment,
+            path,
+            offset,
+            len,
+        })? {
+            ServerMessage::ContentRangeRead { range } => Ok(range),
             message => Err(unexpected_response(message)),
         }
     }

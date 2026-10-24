@@ -12,7 +12,7 @@ use crate::diff::{
 };
 use crate::gui::controls::{self, IconName, icon_button, text_button};
 use base64::Engine as _;
-use compi_protocol::{GitFileContent, GitImageFormat};
+use compi_protocol::{GitFileContent, ImageFormat as FileImageFormat};
 use gpui::{
     BorderStyle, ClickEvent, Div, Entity, EventEmitter, Font, HighlightStyle, Image, ImageFormat,
     ImageSource, ListAlignment, ListOffset, ListState, ObjectFit, Size, StyledImage as _,
@@ -1242,13 +1242,13 @@ fn decode_image(side: &GitFileContent) -> ImageSide {
         return ImageSide::Unreadable { len };
     };
     let (format, raster) = match format {
-        GitImageFormat::Png => (ImageFormat::Png, Some(image::ImageFormat::Png)),
-        GitImageFormat::Jpeg => (ImageFormat::Jpeg, Some(image::ImageFormat::Jpeg)),
-        GitImageFormat::Gif => (ImageFormat::Gif, Some(image::ImageFormat::Gif)),
-        GitImageFormat::Webp => (ImageFormat::Webp, Some(image::ImageFormat::WebP)),
-        GitImageFormat::Bmp => (ImageFormat::Bmp, Some(image::ImageFormat::Bmp)),
-        GitImageFormat::Ico => (ImageFormat::Ico, Some(image::ImageFormat::Ico)),
-        GitImageFormat::Svg => (ImageFormat::Svg, None),
+        FileImageFormat::Png => (ImageFormat::Png, Some(image::ImageFormat::Png)),
+        FileImageFormat::Jpeg => (ImageFormat::Jpeg, Some(image::ImageFormat::Jpeg)),
+        FileImageFormat::Gif => (ImageFormat::Gif, Some(image::ImageFormat::Gif)),
+        FileImageFormat::Webp => (ImageFormat::Webp, Some(image::ImageFormat::WebP)),
+        FileImageFormat::Bmp => (ImageFormat::Bmp, Some(image::ImageFormat::Bmp)),
+        FileImageFormat::Ico => (ImageFormat::Ico, Some(image::ImageFormat::Ico)),
+        FileImageFormat::Svg => (ImageFormat::Svg, None),
     };
     let pixels = match raster {
         Some(raster) => {

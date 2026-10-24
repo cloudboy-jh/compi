@@ -12,8 +12,8 @@ use crate::content_files::{self, Failure};
 use base64::Engine;
 use compi_protocol::{
     ContentEnvironment, ErrorCode, GitBranch, GitBranches, GitChange, GitChangeKind, GitChanges,
-    GitFileContent, GitImageFormat, GitRevision, GitScope, MAX_CONTENT_FILE_BYTES,
-    MAX_GIT_BRANCHES, MAX_GIT_CHANGES, MAX_GIT_IMAGE_BYTES, is_commit_id, is_repo_path,
+    GitFileContent, GitRevision, GitScope, ImageFormat, MAX_CONTENT_FILE_BYTES, MAX_GIT_BRANCHES,
+    MAX_GIT_CHANGES, MAX_GIT_IMAGE_BYTES, is_commit_id, is_repo_path,
 };
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -496,7 +496,7 @@ fn file_stamp(environment: &ContentEnvironment, repo: &str, path: &str) -> Strin
 
 /// Bytes read of one side: images may be larger than text.
 fn read_limit(path: &str) -> usize {
-    if image_format(path).is_some() {
+    if ImageFormat::of_path(path).is_some() {
         MAX_GIT_IMAGE_BYTES
     } else {
         MAX_CONTENT_FILE_BYTES
@@ -506,7 +506,7 @@ fn read_limit(path: &str) -> usize {
 /// Classify at most `read_limit(path)` bytes of one side.
 fn classify(path: &str, bytes: Vec<u8>) -> GitFileContent {
     let len = bytes.len() as u64;
-    if let Some(format) = image_format(path).filter(|format| has_signature(*format, &bytes)) {
+    if let Some(format) = ImageFormat::of_path(path).filter(|format| format.matches(&bytes)) {
         return GitFileContent::Image {
             format,
             base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -522,40 +522,6 @@ fn classify(path: &str, bytes: Vec<u8>) -> GitFileContent {
     match String::from_utf8(bytes) {
         Ok(text) => GitFileContent::Text { text },
         Err(_) => GitFileContent::Binary { len },
-    }
-}
-
-fn image_format(path: &str) -> Option<GitImageFormat> {
-    let (_, extension) = path.rsplit('/').next()?.rsplit_once('.')?;
-    Some(match extension.to_ascii_lowercase().as_str() {
-        "png" => GitImageFormat::Png,
-        "jpg" | "jpeg" => GitImageFormat::Jpeg,
-        "gif" => GitImageFormat::Gif,
-        "webp" => GitImageFormat::Webp,
-        "bmp" => GitImageFormat::Bmp,
-        "ico" => GitImageFormat::Ico,
-        "svg" => GitImageFormat::Svg,
-        _ => return None,
-    })
-}
-
-fn has_signature(format: GitImageFormat, bytes: &[u8]) -> bool {
-    match format {
-        GitImageFormat::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        GitImageFormat::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        GitImageFormat::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        GitImageFormat::Webp => {
-            bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
-        }
-        GitImageFormat::Bmp => bytes.starts_with(b"BM"),
-        GitImageFormat::Ico => bytes.starts_with(&[0, 0, 1, 0]),
-        GitImageFormat::Svg => {
-            let head = &bytes[..bytes.len().min(content_files::BINARY_PROBE_BYTES)];
-            let start = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(head);
-            start.trim_ascii_start().starts_with(b"<")
-                && !head.contains(&0)
-                && head.windows(4).any(|window| window == b"<svg")
-        }
     }
 }
 
