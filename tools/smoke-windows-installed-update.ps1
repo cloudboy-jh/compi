@@ -286,7 +286,7 @@ print(json.dumps(m['setup']))
     Compress-Archive -Path (Join-Path $candidateDirectory '*') -DestinationPath $candidateArchive
     & $signer sign --version $futureVersion --platform windows-x86_64 --artifact $candidateArchive `
         --url "https://github.com/cloudboy-jh/compi/releases/download/v$futureVersion/Compi-$futureVersion-Windows-x64-update.zip" `
-        --output $run --daemon-protocol 32 --qualified-daemon $version --key-file $privateKey
+        --output $run --daemon-protocol 34 --qualified-daemon $version --key-file $privateKey
     if ($LASTEXITCODE -ne 0) { throw 'Disposable candidate metadata signing failed' }
     $candidateMetadata = Join-Path $run 'compi-update-windows-x86_64.json'
     & python (Join-Path $PSScriptRoot 'smoke-update-cycle.py') --installed-fixture --root $root `

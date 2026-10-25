@@ -234,7 +234,8 @@ jobs:
   publish:
     if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: [windows, macos]
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to Ubuntu 26 on 2026-10-19 and this job has not run there.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
