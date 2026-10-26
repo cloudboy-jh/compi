@@ -1,6 +1,7 @@
-//! `compi browse URL [--down]`: a web page in a Browser pane. From a terminal it opens a
+//! `compi browse [URL] [--down]`: a web page in a Browser pane. From a terminal it opens a
 //! Browser pane beside it (below with `--down`); from a Browser pane (`--pane`) that pane
-//! goes to the URL.
+//! goes to the URL. Without a URL the page is blank, and the window puts the keyboard in
+//! its address field, where a link can be pasted without the shell's quoting.
 use super::content::{self, Placed};
 use super::{CliError, Options, Output, pane_surface, submit, targets};
 use crate::{DaemonClient, cli_window::Action, connection::ConnectionTarget};
@@ -16,9 +17,14 @@ pub(super) fn run(
     target: &ConnectionTarget,
     options: &Options,
 ) -> Result<Output, CliError> {
-    let url = BrowserContent::from_typed(&options.args[1])
-        .map_err(CliError::usage)?
-        .url;
+    let url = match options.args.get(1) {
+        Some(typed) => {
+            BrowserContent::from_typed(typed)
+                .map_err(CliError::usage)?
+                .url
+        }
+        None => BrowserContent::BLANK.to_owned(),
+    };
 
     let (_, _, leaf) = targets::pane(state, options)?;
     let content = PaneContent::Browser(BrowserContent { url: url.clone() });

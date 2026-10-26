@@ -1412,12 +1412,13 @@ impl BrowserContent {
     /// The blank page a new browser pane opens on.
     pub const BLANK: &str = "about:blank";
 
-    /// The page an address typed or passed on the command line names: as given when it
-    /// has a scheme (`https://…`, `about:blank`), else an `http://` location such as
-    /// `localhost:3000` or `example.com/docs`. Surrounding spaces are ignored. Refused
-    /// as `validate` refuses.
+    /// The page an address typed, pasted or passed on the command line names: as given
+    /// when it has a scheme (`https://…`, `about:blank`), else an `http://` location
+    /// such as `localhost:3000`, `example.com/docs` or `//example.com`. Text around a
+    /// pasted address is dropped first (see `clean_typed`). Refused as `validate`
+    /// refuses.
     pub fn from_typed(typed: &str) -> Result<Self, String> {
-        let typed = typed.trim();
+        let typed = clean_typed(typed);
         // A scheme is letters before a colon not followed by a port number.
         let scheme = typed.split_once(':').is_some_and(|(scheme, rest)| {
             scheme
@@ -1431,7 +1432,9 @@ impl BrowserContent {
         });
         let content = Self {
             url: if scheme {
-                typed.to_owned()
+                typed
+            } else if let Some(location) = typed.strip_prefix("//") {
+                format!("http://{location}")
             } else {
                 format!("http://{typed}")
             },
@@ -1469,8 +1472,70 @@ impl BrowserContent {
         if !rest.starts_with("//") || rest.len() == 2 {
             return Err(format!("browser URL {url:?} names no location"));
         }
+        if !scheme.eq_ignore_ascii_case("file") {
+            // A web address needs a host, of characters a host can hold.
+            let authority = rest[2..].split(['/', '?', '#']).next().unwrap_or_default();
+            let host = authority.rsplit('@').next().unwrap_or_default();
+            let valid = |c: char| {
+                !c.is_ascii()
+                    || c.is_ascii_alphanumeric()
+                    || matches!(c, '-' | '.' | '_' | ':' | '[' | ']' | '%')
+            };
+            if host.is_empty() || host.starts_with(':') || !host.chars().all(valid) {
+                return Err(format!("browser URL {url:?} names no valid host"));
+            }
+        }
         Ok(())
     }
+}
+
+/// What is left of a pasted address once the text around it is gone: zero-width
+/// characters and carriage returns; the line breaks of a URL wrapped over lines; prose
+/// around the first `http`, `https` or `file` URL (`Local:   http://localhost:5173/`);
+/// quotes, angle brackets and Markdown link syntax around it; and sentence punctuation
+/// or an unmatched closing bracket after it. Text with none of these is only trimmed.
+fn clean_typed(typed: &str) -> String {
+    let text: String = typed
+        .chars()
+        .filter(|c| !matches!(c, '\r' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
+        .collect();
+    let mut text = text.trim().to_owned();
+    // One address broken over lines: no line holds a space, and at most one scheme.
+    if text.contains('\n')
+        && text.matches("://").count() <= 1
+        && text
+            .lines()
+            .all(|line| !line.trim().contains(char::is_whitespace))
+    {
+        text = text.lines().map(str::trim).collect();
+    }
+    let lower = text.to_ascii_lowercase();
+    let start = ["http://", "https://", "file://"]
+        .iter()
+        .filter_map(|scheme| lower.find(scheme))
+        .min();
+    let mut address = match start {
+        Some(start) => text[start..]
+            .split(char::is_whitespace)
+            .next()
+            .unwrap_or_default(),
+        None => text.trim_start_matches(['<', '(', '[', '"', '\'', '`']),
+    };
+    loop {
+        let before = address;
+        address = address.trim_end_matches(['.', ',', ';', ':', '!', '?', '>', '"', '\'', '`']);
+        for (open, close) in [('(', ')'), ('[', ']')] {
+            if address.ends_with(close)
+                && address.matches(close).count() > address.matches(open).count()
+            {
+                address = &address[..address.len() - 1];
+            }
+        }
+        if address == before {
+            break;
+        }
+    }
+    address.to_owned()
 }
 
 /// A content pane showing files: a folder in one environment and the tabs open from it.
@@ -2448,6 +2513,54 @@ mod content_tests {
     }
 
     #[test]
+    fn pasted_addresses_lose_the_text_around_them() {
+        let typed = |text: &str| BrowserContent::from_typed(text).map(|content| content.url);
+        for (pasted, url) in [
+            ("<https://example.com/a>", "https://example.com/a"),
+            ("\"https://example.com/a\"", "https://example.com/a"),
+            ("'localhost:3000'", "http://localhost:3000"),
+            ("`https://example.com/a`", "https://example.com/a"),
+            ("(https://example.com/a)", "https://example.com/a"),
+            ("[docs](https://example.com/a)", "https://example.com/a"),
+            ("see https://example.com/a.", "https://example.com/a"),
+            ("https://example.com/a,", "https://example.com/a"),
+            (
+                "  Local:   http://localhost:5173/",
+                "http://localhost:5173/",
+            ),
+            (
+                "https://example.com/long/\n  wrapped/path",
+                "https://example.com/long/wrapped/path",
+            ),
+            ("http://localhost:3000/\r\n", "http://localhost:3000/"),
+            (
+                "\u{200B}https://example.com/a\u{FEFF}",
+                "https://example.com/a",
+            ),
+            ("//example.com/a", "http://example.com/a"),
+            // Brackets the address holds stay.
+            (
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+            ),
+            (
+                "https://example.com/a?x=1&y=2#top",
+                "https://example.com/a?x=1&y=2#top",
+            ),
+        ] {
+            assert_eq!(typed(pasted).as_deref(), Ok(url), "{pasted:?}");
+        }
+        // Still refused: prose without an address, and what no host can be.
+        for refused in [
+            "open the docs",
+            "/Users/me/site/index.html",
+            "~/site/index.html",
+        ] {
+            assert!(typed(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
     fn file_kinds_need_a_name_and_bytes_that_agree() {
         let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
         assert_eq!(
@@ -2527,6 +2640,9 @@ mod content_tests {
             "https://",
             "http://exa mple.com",
             "http://example.com/\n",
+            "http:///Users/me/index.html",
+            "http://<https://example.com>",
+            "http://:3000/",
         ] {
             assert!(check(url).is_err(), "{url:?}");
         }

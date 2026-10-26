@@ -15,12 +15,17 @@
 //! loads; history, cookies and scroll position are the webview's, with one persistent
 //! web profile per instance under its data directory. The address field shows where the
 //! page is going while it loads and where it is otherwise; Enter goes to what was typed
-//! (`BrowserContent::from_typed`), Escape puts the address back. On Windows, clicking
+//! (`BrowserContent::from_typed`), Escape puts the address back. Focus arriving at a
+//! blank page puts the keyboard in its address. On Windows, clicking
 //! into a page focuses its pane, Ctrl+L and F6 select the address, Compi's own chords
 //! (Ctrl+Shift or Alt with a key, except Alt+Left/Right, the page's back and forward,
 //! and Ctrl+Tab/T/W/Comma) are forwarded to the window while the page has the keyboard,
 //! the keyboard returns to GPUI when another pane takes focus, and a failed load shows
-//! why with Retry.
+//! why with Retry. On macOS the window's first responder says whether a page has the
+//! keyboard: a click into a page focuses its pane, and the keyboard returns to GPUI's
+//! view when another pane, the address field or an overlay takes focus, and before a
+//! page holding it hides or closes (AppKit would leave it with nothing, and every key
+//! would beep).
 use super::*;
 use crate::gui::controls::IconName;
 use compi_protocol::{BrowserContent, PaneContent};
@@ -258,10 +263,42 @@ impl PageView {
     }
 
     fn show(&self, visible: bool) {
+        if !visible {
+            // A hidden view keeps no keyboard; AppKit would leave it with nothing.
+            self.release_keyboard();
+        }
         if self.shown.get() != visible {
             let _ = self.webview.set_visible(visible);
             self.shown.set(visible);
         }
+    }
+
+    /// Hands the keyboard back to GPUI's view when the page has it.
+    fn release_keyboard(&self) {
+        #[cfg(target_os = "macos")]
+        let held = macos_page::holds_keyboard(&self.webview);
+        #[cfg(not(target_os = "macos"))]
+        let held = self.signals.native_focus.get();
+        if held {
+            let _ = self.webview.focus_parent();
+        }
+        self.signals.native_focus.set(false);
+    }
+
+    /// Follows who has the keyboard; true when the page just took it. On macOS a click
+    /// into the page takes it unseen by GPUI, and the window's first responder is the
+    /// only record of it; on Windows WebView2's focus hooks keep `native_focus` and
+    /// report a click (`PageEvent::Focused`).
+    fn sync_keyboard(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let holds = macos_page::holds_keyboard(&self.webview);
+            let took = holds && !self.signals.native_focus.get();
+            self.signals.native_focus.set(holds);
+            took
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
     }
 
     /// Where the address field shows the page: where a load is going, else where it is.
@@ -299,6 +336,13 @@ impl PageView {
         }
         #[cfg(not(windows))]
         let _ = self.webview.evaluate_script("window.stop()");
+    }
+}
+
+impl Drop for PageView {
+    fn drop(&mut self) {
+        // The page leaves the window; it must not take the keyboard with it.
+        self.release_keyboard();
     }
 }
 
@@ -345,6 +389,9 @@ enum PageEvent {
     Open(PaneId, String),
     /// A load started, finished or failed, or the title changed.
     Changed(PaneId),
+    /// A mouse button went down in the window: it may have put the keyboard in a page.
+    #[cfg(target_os = "macos")]
+    Clicked,
 }
 
 /// Toolbar actions, from its buttons and the palette.
@@ -372,8 +419,9 @@ pub(in crate::gui) struct BrowserUi {
     /// The pane focused at the last draw, to give a page the keyboard when focus
     /// arrives at its pane.
     focused: Option<PaneId>,
-    /// **Open browser** ran: the next new blank pane gets the keyboard in its address.
-    address_wanted: bool,
+    /// Reports clicks, which may put the keyboard in a page without GPUI seeing it.
+    #[cfg(target_os = "macos")]
+    click_monitor: Option<macos_page::ClickMonitor>,
     /// Pages of PDF, audio and video files open in file tabs.
     media: media::MediaPages,
 }
@@ -495,7 +543,6 @@ impl CompiApp {
     /// Opens a Browser pane at `url` beside the focused pane, or in a tab of its own
     /// when there is none. A blank one opens with the keyboard in its address.
     pub(super) fn open_browser(&mut self, url: String) {
-        self.browser.address_wanted = url == BrowserContent::BLANK;
         let content = PaneContent::Browser(BrowserContent { url });
         let beside = self.focused_pane().cloned().or_else(|| {
             let mut leaves = Vec::new();
@@ -557,11 +604,8 @@ impl CompiApp {
         let Some(pane) = self.browser.panes.get(pane_id) else {
             return;
         };
-        if let Some(page) = self.browser.pages.get(pane_id)
-            && page.view.signals.native_focus.get()
-        {
-            let _ = page.view.webview.focus_parent();
-            page.view.signals.native_focus.set(false);
+        if let Some(page) = self.browser.pages.get(pane_id) {
+            page.view.release_keyboard();
         }
         let handle = pane.address.focus_handle(cx);
         window.focus(&handle, cx);
@@ -697,6 +741,8 @@ impl CompiApp {
     /// drawn, are under an overlay or failed to load, and move the keyboard between GPUI
     /// and pages.
     pub(super) fn prepare_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        macos_page::reclaim_lost_keyboard(window);
         self.browser.floats.borrow_mut().clear();
         let overlay = self.overlay.is_some()
             || self.popup.is_some()
@@ -743,20 +789,31 @@ impl CompiApp {
             if !self.browser.panes.contains_key(pane_id) {
                 let pane = self.new_browser_pane(pane_id, url, window, cx);
                 self.browser.panes.insert(pane_id.clone(), pane);
-                if self.browser.address_wanted && url == BrowserContent::BLANK {
-                    self.browser.address_wanted = false;
-                    self.focus_pane(pane_id.clone());
-                    self.focus_address(pane_id, window, cx);
-                }
             }
         }
         let focused = self.focused_pane().cloned();
         let arrived = focused != self.browser.focused;
         self.browser.focused = focused.clone();
+        // Focus arriving at a blank page goes to its address, to type or paste one.
+        if arrived
+            && !overlay
+            && let Some(pane_id) = &focused
+            && let Some((_, daemon)) = wanted.iter().find(|(wanted, _)| wanted == pane_id)
+        {
+            let address = self
+                .browser
+                .pages
+                .get(pane_id)
+                .map_or_else(|| daemon.clone(), |page| page.view.address());
+            if address.eq_ignore_ascii_case(BrowserContent::BLANK) {
+                self.focus_address(pane_id, window, cx);
+            }
+        }
         let mutation_pending = self.mutation_pending;
         let mut update = None;
         let mut missing = Vec::new();
         let mut load_failed = None;
+        let mut clicked = None;
         for (pane_id, daemon) in &wanted {
             let Some(page) = self.browser.pages.get_mut(pane_id) else {
                 if !self.browser.creating.contains(pane_id)
@@ -817,22 +874,32 @@ impl CompiApp {
                     .is_some_and(|layout| layout.pane(pane_id).is_some());
             let failed = page.view.signals.failure.borrow().is_some();
             let hidden = !drawn || overlay || failed;
-            page.view.hidden.set(hidden);
-            if hidden {
-                page.view.show(false);
-            }
             let own = focused.as_ref() == Some(pane_id);
             let editing = self
                 .browser
                 .panes
                 .get(pane_id)
                 .is_some_and(|pane| pane.address.focus_handle(cx).is_focused(window));
-            let native = &page.view.signals.native_focus;
-            if native.get() && (!own || overlay) {
-                let _ = page.view.webview.focus_parent();
-                native.set(false);
-            } else if own && arrived && !hidden && !editing && !native.get() {
+            let took = page.view.sync_keyboard();
+            page.view.hidden.set(hidden);
+            if hidden {
+                page.view.show(false);
+            }
+            if took && !hidden && !arrived && (!own || editing) {
+                // A click put the keyboard in the page: its pane takes focus.
+                clicked = Some(pane_id.clone());
+            } else if page.view.signals.native_focus.get() && (!own || editing) {
+                page.view.release_keyboard();
+            } else if own && arrived && !hidden && !editing && !page.view.signals.native_focus.get()
+            {
                 let _ = page.view.webview.focus();
+            }
+        }
+        if let Some(pane_id) = clicked {
+            self.focus_pane(pane_id.clone());
+            self.browser.focused = Some(pane_id.clone());
+            if let Some(pane) = self.browser.panes.get(&pane_id) {
+                window.focus(&pane.focus, cx);
             }
         }
         if let Some(error) = load_failed {
@@ -902,6 +969,10 @@ impl CompiApp {
             return events.clone();
         }
         let (sender, receiver) = async_channel::unbounded::<PageEvent>();
+        #[cfg(target_os = "macos")]
+        {
+            self.browser.click_monitor = macos_page::ClickMonitor::new(window, sender.clone());
+        }
         self.browser._listener = Some(cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = receiver.recv().await {
                 let alive = match event {
@@ -951,6 +1022,9 @@ impl CompiApp {
                             cx.notify();
                         })
                         .is_ok(),
+                    // The next frame looks at who has the keyboard.
+                    #[cfg(target_os = "macos")]
+                    PageEvent::Clicked => this.update(cx, |_, cx| cx.notify()).is_ok(),
                 };
                 if !alive {
                     break;
@@ -1282,6 +1356,103 @@ impl CompiApp {
                 .size_full()
                 .into_any_element(),
         )
+    }
+}
+
+/// AppKit's keyboard: the view that has it is the window's first responder. GPUI's view
+/// takes it only when told: it does not accept it from a click.
+#[cfg(target_os = "macos")]
+mod macos_page {
+    use super::PageEvent;
+    use block2::RcBlock;
+    use gpui::Window;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use wry::{WebView, WebViewExtMacOS};
+
+    /// Whether `webview`'s page, or a view inside it, has the keyboard.
+    pub(super) fn holds_keyboard(webview: &WebView) -> bool {
+        let page = webview.webview();
+        let page: *const AnyObject = Retained::as_ptr(&page).cast();
+        unsafe {
+            let window: *mut AnyObject = msg_send![page, window];
+            if window.is_null() {
+                return false;
+            }
+            let responder: *mut AnyObject = msg_send![window, firstResponder];
+            if responder.is_null() {
+                return false;
+            }
+            let is_view: bool = msg_send![responder, isKindOfClass: class!(NSView)];
+            is_view && msg_send![responder, isDescendantOf: page]
+        }
+    }
+
+    /// GPUI's view of `window` and its NSWindow.
+    fn views(window: &Window) -> Option<(*mut AnyObject, *mut AnyObject)> {
+        let RawWindowHandle::AppKit(handle) = HasWindowHandle::window_handle(window).ok()?.as_raw()
+        else {
+            return None;
+        };
+        let view = handle.ns_view.as_ptr().cast::<AnyObject>();
+        let ns_window: *mut AnyObject = unsafe { msg_send![view, window] };
+        (!ns_window.is_null()).then_some((view, ns_window))
+    }
+
+    /// Gives the keyboard back to GPUI's view when nothing has it: AppKit hands it to the
+    /// window itself when the view holding it is removed or hidden, and every key then
+    /// only beeps.
+    pub(super) fn reclaim_lost_keyboard(window: &Window) {
+        let Some((view, ns_window)) = views(window) else {
+            return;
+        };
+        unsafe {
+            let responder: *mut AnyObject = msg_send![ns_window, firstResponder];
+            if responder.is_null() || responder == ns_window {
+                let _: bool = msg_send![ns_window, makeFirstResponder: view];
+            }
+        }
+    }
+
+    /// Reports mouse-downs in a window, which may put the keyboard in a page without
+    /// GPUI seeing them. Removed when dropped.
+    pub(super) struct ClickMonitor(Retained<AnyObject>);
+
+    impl ClickMonitor {
+        pub(super) fn new(
+            window: &Window,
+            events: async_channel::Sender<PageEvent>,
+        ) -> Option<Self> {
+            // Left, right and other mouse down.
+            const MOUSE_DOWNS: u64 = 1 << 1 | 1 << 3 | 1 << 25;
+            let (_, ns_window) = views(window)?;
+            let ours = ns_window as usize;
+            let handler = RcBlock::new(move |event: *mut AnyObject| -> *mut AnyObject {
+                let window: *mut AnyObject = unsafe { msg_send![event, window] };
+                if window as usize == ours {
+                    let _ = events.try_send(PageEvent::Clicked);
+                }
+                event
+            });
+            let monitor: Option<Retained<AnyObject>> = unsafe {
+                msg_send![
+                    class!(NSEvent),
+                    addLocalMonitorForEventsMatchingMask: MOUSE_DOWNS,
+                    handler: &*handler
+                ]
+            };
+            monitor.map(Self)
+        }
+    }
+
+    impl Drop for ClickMonitor {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![class!(NSEvent), removeMonitor: &*self.0];
+            }
+        }
     }
 }
 

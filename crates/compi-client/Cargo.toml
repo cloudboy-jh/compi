@@ -63,6 +63,8 @@ wry = { version = "0.57.1", default-features = false }
 # Without font-kit, GPUI selects NoopTextSystem on macOS.
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit"] }
 objc2 = "0.6"
+# Browser panes: a mouse-down monitor (`NSEvent` local monitors take a block).
+block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

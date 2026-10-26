@@ -292,6 +292,7 @@ impl CompiApp {
         media.active.retain(|key| kept(key));
         let focused = self.focused_pane().cloned();
         let mut missing = Vec::new();
+        let mut clicked = None;
         for (key, source, active) in open {
             let Some(view) = self.browser.media.pages.get(&key) else {
                 if active
@@ -314,6 +315,7 @@ impl CompiApp {
                         .as_ref()
                         .is_some_and(|layout| layout.pane(&key.0).is_some()));
             let hidden = !drawn || covered;
+            let took = view.sync_keyboard();
             view.hidden.set(hidden);
             if hidden {
                 view.show(false);
@@ -323,11 +325,16 @@ impl CompiApp {
             } else if active {
                 self.browser.media.active.insert(key.clone());
             }
-            let native = &view.signals.native_focus;
-            if native.get() && (focused.as_ref() != Some(&key.0) || covered || !drawn) {
-                let _ = view.webview.focus_parent();
-                native.set(false);
+            let own = focused.as_ref() == Some(&key.0);
+            if took && !hidden && !own {
+                // A click put the keyboard in the page: its pane takes focus.
+                clicked = Some(key.0.clone());
+            } else if view.signals.native_focus.get() && !own {
+                view.release_keyboard();
             }
+        }
+        if let Some(pane_id) = clicked {
+            self.focus_pane(pane_id);
         }
         if !missing.is_empty() {
             self.create_media_pages(missing, window, cx);

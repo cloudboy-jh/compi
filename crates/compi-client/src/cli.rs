@@ -1637,7 +1637,7 @@ fn validate(
         ("monitor", Some("quit")) => (3, 3, &["--source"], &["--force"]),
         ("monitor", _) => (1, 2, &["--source"], &[]),
         ("files" | "edit" | "settings", _) => (1, 2, &[], &[]),
-        ("browse", Some(_)) => (2, 2, &[], &["--down"]),
+        ("browse", _) => (1, 2, &[], &["--down"]),
         ("notes", Some("search" | "backlinks")) => (3, 4, &[], &[]),
         ("notes", _) => (1, 2, &[], &["--edit"]),
         // `diff [PATH]` and `diff COMMIT [PATH]`.
@@ -2031,18 +2031,16 @@ mod tests {
     }
 
     #[test]
-    fn browse_takes_one_url() {
+    fn browse_takes_at_most_one_url() {
         for accepted in [
-            &["browse", "localhost:3000"][..],
+            &["browse"][..],
+            &["browse", "--down"],
+            &["browse", "localhost:3000"],
             &["--json", "browse", "https://example.com", "--down"],
         ] {
             assert!(validated(accepted).is_ok(), "{accepted:?}");
         }
-        for rejected in [
-            &["browse"][..],
-            &["browse", "a", "b"],
-            &["browse", "a", "--right"],
-        ] {
+        for rejected in [&["browse", "a", "b"][..], &["browse", "a", "--right"]] {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }
     }
