@@ -6,6 +6,13 @@
 - Windows: `C:\Users\johns\OneDrive\Documents\jacksmainvault\Compi`. macOS: the same `Documents/jacksmainvault/Compi` folder inside the synced OneDrive directory.
 - The vault sets product scope and order; this repo's `docs/dev` holds the implementation detail. Borrow behaviour from references (Tern, Rex), never their layouts or look.
 
+## README scope
+
+- Keep `README.md` an evergreen introduction: what Compi is, how people and agents use it, a compact example, installation, and links to deeper documentation.
+- Never add release or feature bloat: no version-by-version highlights, changelog entries, shipped-feature announcements, roadmaps, exhaustive feature lists, command tables, or implementation/qualification history. Shipping a feature does not require adding a README section or bullet.
+- Put release details and version-specific upgrade warnings in `docs/user/release-notes.md`, installation detail in `docs/user/INSTALLATION.md`, and command syntax and behavior in `docs/user/USAGE.md`. Link instead of duplicating them.
+- Keep necessary platform requirements and signing warnings beside downloads. Describe capabilities only when they help explain the core workflow; consolidate existing copy rather than appending to it.
+
 ## One dev instance per checkout
 
 - Preview source changes only with `cargo dev`. Its instance is `compi-dev`, and it lives in `target/compi-dev`.

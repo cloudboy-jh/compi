@@ -2,43 +2,51 @@
 
 # Compi
 
-**The terminal you can live in.**
+**A native terminal workspace that any agent can drive.**
 
-Shells that keep running when you close the window, with an editor, diffs and Git beside them. Native on Windows (WSL2) and macOS.
+You and your agent share the same workspace. It can arrange terminals, run work, inspect results and open changes for you to review, all in the workspace you're looking at. Close the window and your shells keep running.
+
+Native on Windows (WSL2) and macOS. [Download Compi](https://github.com/cloudboy-jh/compi/releases).
 
 [![Core CI](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml/badge.svg?branch=main)](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml)
 
 ![Compi working on itself: an omp agent reviews Windows terminal resource cleanup beside the live TorchedLeek host Monitor and the corresponding read-only Rust commit diff](assets/compi-workspace.png)
 
-## Terminal
+## Agent control
 
-- Shells live in a background server: close the window, rebuild the client or reconnect over SSH, and they are still running.
-- Workspaces, tabs and split panes. Drag a pane to move it, swap it or send it to another tab. Float any pane.
-- Layout presets, prompt styles from Oh My Posh or Starship, themes and fonts.
+An agent running in Compi can do more than use its own shell. Through the `compi` CLI it can operate the workspace around it: make room for another task, read another terminal's output, open a local app in a browser pane or bring up a diff for your review.
 
-## Edit
+Workspace controls and palette actions share one command interface, available to any agent that can run shell commands. Compi does not choose your agent or orchestrate its work.
 
-- Open files right where you are: `compi edit src/main.rs:42`, Ctrl-click a path in any output, or the command palette show them in the terminal's own pane, and Ctrl+Shift+E flips back to the shell, still running.
-- A native code editor with syntax highlighting and search. Saves never overwrite changes made outside it, and unsaved edits survive a crash.
+### Inspect, act, read
 
-## Review
+From a Compi shell in this repository, an agent can inspect its pane, run the protocol tests and read their output:
 
-- Every uncommitted change, unstaged and staged, side by side or inline, with the changed words highlighted.
-- One tab per file: switch between Edit and Diff with Ctrl+Shift+D and stay on the same line.
-- Git marks in the editor's gutter as you type. Jump between changes with Alt+F5, open a change from the terminal with `compi diff path:line`, or a past commit with `compi diff HEAD~1`.
+```sh
+compi --json pane show
+compi run -- cargo test --locked -p compi-protocol
+compi pane capture --scope scrollback --format text
+```
 
-## Commit
+`run` submits the command without waiting; capture reads the output available so far. The agent can capture again to check progress. Inside a supported Compi shell, the CLI is on `PATH` and knows its instance and pane. Stable IDs let it target other panes, and `--json` provides structured results.
 
-- Stage files or single hunks, write the message, commit or amend.
-- See how far you are ahead or behind, switch or create branches, and fetch, pull or push in a terminal beside the editor, so logins just work.
+`compi command list` exposes the palette's actions, and `compi command run ID` invokes them. Presentation actions use an open Compi window; destructive confirmations remain in place. See the [CLI reference](docs/user/USAGE.md#command-line-workspace-control) for the full interface.
 
-## Built for scripts and agents
+## Know when a program needs you
 
-The `compi` command opens panes, sends input, reads output, and opens files and diffs, so an agent can drive the same workspace you're looking at.
+See when a program is working, waiting on you, done or failed, even in a background tab. Hover its status indicator for the message, progress and what it needs from you.
 
-Programs that speak the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501) tell Compi what they're doing. The tab shows when an agent or build is blocked on you, still working, done or failed, even in a background tab, and hovering it says why.
+Supporting programs report this through the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501). Compi displays their reports rather than guessing from terminal output, and exposes the same status through the CLI. [How program status works](docs/user/USAGE.md#program-status).
 
-## Download
+## Beyond the terminal
+
+- **Persistent workspaces.** Organize shells in tabs, splits and floating panes. Rearrange them without restarting their programs, or connect to a remote Compi server over SSH.
+- **Edit and review.** Open files beside your work, inspect diffs, stage hunks and commit. Switch between a file view and its running shell.
+- **Browser and files.** Keep a local app, readable Markdown or a file preview in the workspace instead of switching windows.
+- **Monitor.** Inspect processes and resource usage on the host or a WSL distribution.
+- **Appearance.** Choose themes, fonts and layouts, with prompt styles from Oh My Posh or Starship.
+
+## Install
 
 Get Compi from [GitHub Releases](https://github.com/cloudboy-jh/compi/releases).
 
@@ -46,6 +54,8 @@ Get Compi from [GitHub Releases](https://github.com/cloudboy-jh/compi/releases).
 - **macOS:** Apple Silicon, macOS 14+. Move the app into Applications.
 
 Windows builds are unsigned and macOS builds are ad-hoc signed, so your OS may warn on first launch. Linux runs the headless server; its window is not yet supported.
+
+See [installation](docs/user/INSTALLATION.md) for setup and [release notes](docs/user/release-notes.md) for limitations and version-specific upgrade warnings.
 
 ## Development
 
@@ -61,8 +71,9 @@ Shells in the preview survive client rebuilds. See the [development guide](docs/
 
 ## Documentation
 
-- Users: [installation](docs/user/INSTALLATION.md), [usage](docs/user/USAGE.md), [configuration](docs/user/CONFIGURATION.md), [release notes](docs/user/release-notes.md)
-- Developers: [development](docs/dev/DEVELOPMENT.md), [architecture](docs/dev/Spec.md), [next steps](docs/dev/NEXT_STEPS.md), [verification history](docs/dev/COMPLETED.md), [distribution](docs/dev/DISTRIBUTION.md), [release flow](docs/dev/RELEASE-FLOW.md), [terminal test recipes](docs/dev/testcmds.md)
+- [Usage and CLI reference](docs/user/USAGE.md)
+- [Configuration](docs/user/CONFIGURATION.md)
+- [Development](docs/dev/DEVELOPMENT.md) and [architecture](docs/dev/Spec.md)
 
 ## License
 
