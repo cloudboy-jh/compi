@@ -4081,30 +4081,40 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The Edit / Read / Diff switch of a file's tab (Read for Markdown only). Edit and Diff
-    /// are keyed to Diff this file, Read to Read Markdown. Diff needs an uncommitted change
-    /// of the file in this folder's repository; Edit and Read need the file in the
-    /// working tree.
+    /// The Edit / Read / Diff switch of a file's tab, when it offers more than one mode
+    /// (Read for Markdown and SVG only; Diff only for a file with uncommitted changes in
+    /// this folder's repository). Edit reads View for a file shown as a preview. Edit and
+    /// Diff are keyed to Diff this file, Read to Read Markdown; Edit and Read need the
+    /// file in the working tree.
     pub(super) fn render_mode_switch(
         &self,
         pane_id: &PaneId,
         ui: &PaneUi,
         tab: &ContentTab,
         cx: &Context<Self>,
-    ) -> AnyElement {
+    ) -> Option<AnyElement> {
         let file = tab.path();
         let diff = tab.diff_scope().is_some();
+        let readable = super::content::notes::readable(file);
+        let diff_available = diff || ui.repo.diff_unavailable(file).is_none();
+        if !readable && !diff_available {
+            return None;
+        }
         let read = !diff && ui.notes.is_rendered(file);
         let edit_reason = tab
             .diff_scope()
             .and_then(|scope| ui.repo.change(file, scope))
             .and_then(edit_disabled);
-        let diff_reason = (!diff).then(|| ui.repo.diff_unavailable(file)).flatten();
+        let preview = ui.previews(file);
         let platform = crate::commands::Platform::current();
         let (pane, path) = (pane_id.clone(), file.to_owned());
-        let mut edit = text_button("file-mode-edit", "Edit")
+        let mut edit = text_button("file-mode-edit", if preview { "View" } else { "Edit" })
             .selected(!diff && !read)
-            .detail("Edits the file at the line in view")
+            .detail(if preview {
+                "Shows the file"
+            } else {
+                "Edits the file at the line in view"
+            })
             .disabled_because(edit_reason)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 if diff {
@@ -4118,7 +4128,6 @@ impl CompiApp {
         let mut show_diff = text_button("file-mode-diff", "Diff")
             .selected(diff)
             .detail("Shows the file's uncommitted changes at the cursor's line, or in Read at the line in view")
-            .disabled_because(diff_reason)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 if !diff {
                     this.diff_from_edit(&pane, &path, window, cx);
@@ -4133,7 +4142,7 @@ impl CompiApp {
             show_diff = show_diff.key(key);
         }
         let mut modes = vec![edit];
-        if super::content::notes::readable(file) {
+        if readable {
             let (pane, path) = (pane_id.clone(), file.to_owned());
             let svg = super::content::is_svg(file);
             let mut show_read = text_button("file-mode-read", if svg { "View" } else { "Read" })
@@ -4160,8 +4169,10 @@ impl CompiApp {
             }
             modes.push(show_read);
         }
-        modes.push(show_diff);
-        controls::segmented("file-mode", modes).into_any_element()
+        if diff_available {
+            modes.push(show_diff);
+        }
+        Some(controls::segmented("file-mode", modes).into_any_element())
     }
 
     /// Path, kind, scope (`staged`, or the commit), line counts and what the diff compares;
@@ -4405,7 +4416,7 @@ impl CompiApp {
                     .flex_wrap()
                     .items_center()
                     .gap_1()
-                    .child(mode_switch)
+                    .children(mode_switch)
                     .child(layout)
                     .child(whitespace_button)
                     .child(context_button)

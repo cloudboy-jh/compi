@@ -589,6 +589,20 @@ impl PaneUi {
             _ => None,
         }
     }
+
+    /// Whether `path` shows as a preview (an image, media, a large text file a part at a
+    /// time, or a placeholder) rather than in the editor.
+    pub(super) fn previews(&self, path: &str) -> bool {
+        matches!(
+            self.files.get(path).map(|file| &file.body),
+            Some(
+                FileBody::Image(_)
+                    | FileBody::LargeText(_)
+                    | FileBody::Media(_)
+                    | FileBody::Unopenable { .. }
+            )
+        )
+    }
 }
 
 /// The terminal or content leaf of `pane`, in whichever tab holds it.
@@ -3819,14 +3833,8 @@ impl CompiApp {
                     .active
                     .as_ref()
                     .filter(|tab| tab.diff_scope().is_none())
-                    .map(|tab| {
-                        div()
-                            .flex_none()
-                            .pl_2()
-                            .flex()
-                            .items_center()
-                            .child(self.render_mode_switch(pane_id, ui, tab, cx))
-                    }),
+                    .and_then(|tab| self.render_mode_switch(pane_id, ui, tab, cx))
+                    .map(|switch| div().flex_none().pl_2().flex().items_center().child(switch)),
             )
             .children(
                 content
