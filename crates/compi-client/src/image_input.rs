@@ -36,7 +36,9 @@ pub enum ImageTarget {
 pub struct PreparedImage {
     /// Native, accessible original path, also used by inspector copy/save.
     pub path: PathBuf,
-    /// One quoted POSIX shell argument after local path mapping or remote upload.
+    /// The path in the shell's environment after local path mapping or remote upload.
+    pub shell_path: Option<String>,
+    /// `shell_path` as one quoted POSIX shell argument.
     pub quoted_path: Option<String>,
     pub name: String,
     pub width: u32,
@@ -79,10 +81,11 @@ pub fn prepare(input: ImageInput, target: ImageTarget) -> Result<PreparedImage, 
             persist(&root, &bytes, format)?
         }
     };
-    let quoted_path = match target {
+    let shell_path = match target {
         ImageTarget::Remote => None,
-        _ => Some(quote_posix(&target_path(&path, &target)?)?),
+        _ => Some(target_path(&path, &target)?),
     };
+    let quoted_path = shell_path.as_deref().map(quote_posix).transpose()?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -90,6 +93,7 @@ pub fn prepare(input: ImageInput, target: ImageTarget) -> Result<PreparedImage, 
         .to_owned();
     Ok(PreparedImage {
         path,
+        shell_path,
         quoted_path,
         name,
         width,

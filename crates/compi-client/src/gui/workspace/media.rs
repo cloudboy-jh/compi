@@ -282,6 +282,7 @@ static MEDIA_WORKERS: LazyLock<mpsc::SyncSender<MediaJob>> = LazyLock::new(|| {
                                     .map_err(|error| format!("Cannot upload image: {error}"))?;
                                 image.quoted_path =
                                     Some(image_input::quote_remote_path(&remote_path)?);
+                                image.shell_path = Some(remote_path);
                             }
                             Ok(image)
                         });
@@ -631,6 +632,99 @@ impl CompiApp {
         true
     }
 
+    /// Right-click on a pasted image's card: open it, open it in a pane beside its
+    /// terminal, copy its path as the shell sees it, or dismiss the card.
+    fn open_image_preview_menu(
+        &mut self,
+        id: u64,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = self.image_previews.iter().find(|preview| preview.id == id) else {
+            return;
+        };
+        let image = preview.image.clone();
+        let shell_path = preview.image.shell_path.clone();
+        let mut entries = vec![
+            controls::menu_item(
+                "Open",
+                cx.listener(move |this, _, _, cx| this.open_image_inspector(image.clone(), cx)),
+            )
+            .into(),
+            controls::menu_item(
+                "Open in pane beside",
+                cx.listener(move |this, _, _, cx| {
+                    this.open_image_beside(id);
+                    cx.notify();
+                }),
+            )
+            .into(),
+        ];
+        if let Some(path) = shell_path {
+            entries.push(controls::MenuEntry::Separator);
+            entries.push(
+                controls::menu_item("Copy path", move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                })
+                .into(),
+            );
+        }
+        entries.push(controls::MenuEntry::Separator);
+        entries.push(
+            controls::menu_item(
+                "Dismiss",
+                cx.listener(move |this, _, _, cx| {
+                    this.image_previews.retain(|preview| preview.id != id);
+                    cx.notify();
+                }),
+            )
+            .into(),
+        );
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
+    /// Opens a pasted image in a Files pane split beside its terminal, read through
+    /// the terminal's environment like any file the shell names.
+    fn open_image_beside(&mut self, id: u64) {
+        let Some(preview) = self.image_previews.iter().find(|preview| preview.id == id) else {
+            return;
+        };
+        let Some(path) = preview.image.shell_path.clone() else {
+            self.global_error = Some("The image has no path its terminal can read".into());
+            return;
+        };
+        let target = self.selected_tab().and_then(|tab| {
+            let workspace = self.workspace.as_ref()?;
+            let surface = workspace
+                .surface(&preview.surface_id)
+                .filter(|surface| surface.process_lifetime_id == preview.lifetime)?;
+            let mut leaves = Vec::new();
+            collect_leaves(&tab.layout, &mut leaves);
+            let (pane_id, _) = leaves
+                .into_iter()
+                .find(|(_, leaf)| leaf.as_ref() == Some(&preview.surface_id))?;
+            Some((
+                pane_id,
+                compi_protocol::ContentEnvironment::of_surface(surface),
+            ))
+        });
+        let Some((pane_id, environment)) = target else {
+            self.global_error = Some("The image's terminal is no longer in this tab".into());
+            return;
+        };
+        let tab = compi_protocol::ContentTab::edit(path.clone());
+        self.open_content_beside(
+            &pane_id,
+            compi_protocol::PaneContent::Files(compi_protocol::FolderContent {
+                environment,
+                root: super::content::parent_folder(&path),
+                tabs: vec![tab.clone()],
+                active: Some(tab),
+            }),
+        );
+    }
+
     pub(super) fn render_image_previews(&self, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let focused = self.focused_view();
@@ -661,6 +755,14 @@ impl CompiApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_image_inspector(image.clone(), cx)
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_image_preview_menu(id, event.position, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         gpui::img(preview.image.thumbnail.clone())
                             .w(px(56.0))
