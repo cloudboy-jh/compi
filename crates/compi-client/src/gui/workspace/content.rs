@@ -667,8 +667,9 @@ pub(super) fn content_leaves<'a>(
 }
 
 /// The content pane in `layout` to show `file` (or, without one, the folder `root`) in:
-/// one in `environment` whose root holds the file, preferring `beside` itself, then one
-/// with the file open, then the deepest root. A terminal's view stays with its shell.
+/// one in `environment` whose root holds the file or that has it open already,
+/// preferring `beside` itself, then one with the file open, then the deepest root. A
+/// terminal's view stays with its shell.
 pub(super) fn reusable_content<'a>(
     layout: &'a LayoutNode,
     beside: &PaneId,
@@ -684,8 +685,10 @@ pub(super) fn reusable_content<'a>(
             return;
         }
         let rank = match (file, root) {
-            (Some(file), _) => root_contains(&content.root, file)
-                .then(|| (content.files().any(|open| open == file), content.root.len())),
+            (Some(file), _) => {
+                let open = content.files().any(|open| open == file);
+                (open || root_contains(&content.root, file)).then_some((open, content.root.len()))
+            }
             (None, Some(root)) => same_folder(&content.root, root).then_some((true, 0)),
             (None, None) => None,
         };
@@ -4286,7 +4289,7 @@ mod tests {
             split(pane("outer", "/work", &[]), settings),
             split(
                 pane("inner", "/work/src", &[]),
-                pane("open", "/work", &["/work/src/a.rs"]),
+                pane("open", "/work", &["/work/src/a.rs", "/elsewhere/c.rs"]),
             ),
         );
         let target = |beside: &str, file: &str, environment: &ContentEnvironment| {
@@ -4309,6 +4312,16 @@ mod tests {
         assert_eq!(
             target("terminal", "/work/src/b.rs", &ContentEnvironment::Host),
             None
+        );
+        // A pane that has the file open shows it, though its folder does not hold it
+        // (`compi edit FILE --pane` keeps the pane's folder).
+        assert_eq!(
+            target("open", "/elsewhere/c.rs", &wsl).as_deref(),
+            Some("open")
+        );
+        assert_eq!(
+            target("terminal", "/elsewhere/c.rs", &wsl).as_deref(),
+            Some("open")
         );
         // A Settings pane never shows files, not even beside itself.
         assert_eq!(
