@@ -5250,18 +5250,20 @@ impl CompiApp {
             let panes = self.tab_panes(tab);
             let (primary, secondary) = self.metadata_tab_caption(tab, &panes);
             let drop_here = pane_drop.is_some_and(|tab| tab == Some(&id));
-            let program_status = (self.config.program_status.tabs)
+            let headline = (self.config.program_status.tabs)
                 .then(|| self.tab_program_headline(tab))
-                .flatten()
-                .map(|headline| {
-                    self.render_program_status(
-                        ("tab-program-status", index),
-                        headline,
-                        false,
-                        primary.clone(),
-                        self.tab_program_detail(tab),
-                    )
-                });
+                .flatten();
+            let full_title = match &secondary {
+                Some(secondary) => format!("{primary} · {secondary}"),
+                None => primary.clone(),
+            };
+            let (tooltip_title, tooltip_detail) = self.tab_tooltip(tab, &full_title, headline);
+            // Not over its own menu or while the tab is dragged.
+            let tooltip = self.tab_menu.is_none()
+                && self.context_menu.is_none()
+                && self.dragging_tab.is_none();
+            let program_status =
+                headline.map(|headline| self.program_status_glyph(headline, false));
             div()
                 .id(("terminal-tab", index))
                 .group("terminal-tab")
@@ -5326,33 +5328,48 @@ impl CompiApp {
                         cx.notify();
                     }),
                 )
-                .children(program_status)
                 .child(
+                    // Glyph and title share one hover: the full title and, when panes
+                    // report, their status. The close button keeps its own.
                     div()
+                        .id(("tab-label", index))
                         .min_w_0()
                         .flex_1()
+                        .h_full()
                         .flex()
                         .items_center()
-                        .gap_1()
+                        .gap_2()
+                        .children(program_status)
                         .child(
                             div()
                                 .min_w_0()
                                 .flex_1()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(primary),
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(primary),
+                                )
+                                .when_some(secondary, |label, secondary| {
+                                    label.child(div().flex_none().child("·")).child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_none()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(secondary),
+                                    )
+                                }),
                         )
-                        .when_some(secondary, |label, secondary| {
-                            label.child(div().flex_none().child("·")).child(
-                                div()
-                                    .min_w_0()
-                                    .flex_none()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(secondary),
-                            )
+                        .when(tooltip, |label| {
+                            label.tooltip(controls::tooltip(tooltip_title, tooltip_detail, None))
                         }),
                 )
                 .child(

@@ -233,18 +233,10 @@ impl CompiApp {
     }
 
     /// A static glyph for the state, with its progress when `show_progress` (narrow tab
-    /// chips leave it to the tooltip), and the tooltip `title` and `detail`. Static, so
-    /// status never makes the window repaint on its own.
-    pub(super) fn render_program_status(
-        &self,
-        id: impl Into<gpui::ElementId>,
-        headline: Headline,
-        show_progress: bool,
-        title: String,
-        detail: String,
-    ) -> AnyElement {
+    /// chips leave it to the tooltip). Static, so status never makes the window repaint
+    /// on its own.
+    pub(super) fn program_status_glyph(&self, headline: Headline, show_progress: bool) -> Div {
         div()
-            .id(id)
             .flex_none()
             .flex()
             .items_center()
@@ -260,12 +252,44 @@ impl CompiApp {
                     )
                 },
             )
+    }
+
+    /// `program_status_glyph` with the tooltip `title` and `detail`.
+    pub(super) fn render_program_status(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        headline: Headline,
+        show_progress: bool,
+        title: String,
+        detail: String,
+    ) -> AnyElement {
+        self.program_status_glyph(headline, show_progress)
+            .id(id)
             .tooltip(controls::tooltip(
                 format!("{title} · {}", status::headline_label(headline)),
                 (!detail.is_empty()).then(|| detail.into()),
                 None,
             ))
             .into_any_element()
+    }
+
+    /// Hover for a tab chip: its full `title`, and with the tab's `headline` the state
+    /// its panes most need the user for and every reporting pane's records.
+    pub(super) fn tab_tooltip(
+        &self,
+        tab: &WorkspaceTab,
+        title: &str,
+        headline: Option<Headline>,
+    ) -> (String, Option<SharedString>) {
+        let title = status::display_text(title);
+        let Some(headline) = headline else {
+            return (title, None);
+        };
+        let detail = self.tab_program_detail(tab);
+        (
+            format!("{title} · {}", status::headline_label(headline)),
+            (!detail.is_empty()).then(|| detail.into()),
+        )
     }
 
     /// The tiled pane's status: a dot in the top padding band, which never covers a

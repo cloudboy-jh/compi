@@ -164,7 +164,7 @@ Collection runs in the terminal's actual environment: native Unix, the selected 
 Programs that support the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501) report whether they are idle, working, blocked on you, done or failed. Compi answers their feature query, so programs that report only after asking work too.
 
 - A tab shows a glyph for the state that most needs you across its panes: blocked, then error, working, done and idle. Background tabs and other workspaces are included. A tiled pane shows a dot in its top edge, and a floating pane shows the glyph and progress in its title strip. The sidebar and palette put the state first in the tab's status line. Each of the three can be turned off under **Settings → Interface → Program status** ([configuration](CONFIGURATION.md#program-status)).
-- Hover a glyph or dot for each pane's name and every record it reported: program, title, state, what it waits for, progress and message.
+- Hover a tab for its full title, the state its panes most need you for, and each pane's name with every record it reported: program, title, state, what it waits for, progress and message. Hover a pane's dot or a floating pane's glyph for that pane's records alone.
 - Work in progress ends at the next shell prompt or when the process exits; finished and failed results stay until you press a key in that pane or close it.
 - `compi --json pane list/show` includes each terminal's `program_status` records.
 
