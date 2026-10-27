@@ -34,7 +34,7 @@ Core CI allows 60 minutes on Windows for the serialized WSL suite and headless r
 
 The bootstrapper is a separate Cargo workspace. Run its behavioral library tests with `cargo test --locked --manifest-path installer/bootstrapper/Cargo.toml --lib -- --test-threads=1`; testing its embedded-MSI binary additionally requires the generated `installer/bootstrapper/payload/Compi.msi`. The packaging script creates and removes that build input.
 
-For 0.4.0, native qualification receipts, metadata signing and compatible-cycle checks use daemon protocol 34 (0.3.x used 32). The update-qualified client presentation format remains 5; it is separate from daemon workspace format 8.
+For 0.4.x, native qualification receipts, metadata signing and compatible-cycle checks use daemon protocol 34 (0.3.x used 32). The update-qualified client presentation format remains 5; it is separate from daemon workspace format 8.
 
 If a tag push does not start Actions, run `gh workflow run release.yml --ref main -f release_tag=vMAJOR.MINOR.PATCH`. All jobs check out that existing tag, rerun native qualification, sign its artifacts and create a draft for deliberate publication. Omitting `release_tag` retains the build-only dry run.
 

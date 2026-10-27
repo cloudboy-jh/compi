@@ -1218,10 +1218,11 @@ dependencies = [
 
 [[package]]
 name = "compi-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-channel",
  "base64 0.22.1",
+ "block2 0.6.2",
  "compi-protocol",
  "compi-update",
  "gpui-base",
@@ -1257,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "compi-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",
@@ -1271,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "compi-setup"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-channel",
  "compi-client",
@@ -1290,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "compi-update"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
