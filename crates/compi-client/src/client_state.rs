@@ -167,6 +167,9 @@ pub struct ReadFile {
     pub path: String,
 }
 
+/// The most addresses a window remembers for a blank Browser pane's Recent list.
+pub const MAX_RECENT_ADDRESSES: usize = 5;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientState {
     pub version: u32,
@@ -200,6 +203,10 @@ pub struct ClientState {
     /// first; others open in Edit. Additive; at most `MAX_READ_FILES`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_files: Vec<ReadFile>,
+    /// Addresses Browser panes last settled on, most recent first, one per site (scheme,
+    /// host and port; a `file:` URL is its own). Additive; at most `MAX_RECENT_ADDRESSES`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_addresses: Vec<String>,
 }
 
 impl Default for ClientState {
@@ -221,6 +228,7 @@ impl Default for ClientState {
             floating_focused: false,
             monitor_columns: ColumnLayout::default(),
             read_files: Vec::new(),
+            recent_addresses: Vec::new(),
         }
     }
 }
@@ -246,6 +254,16 @@ impl ClientState {
             let excess = self.read_files.len().saturating_sub(MAX_READ_FILES);
             self.read_files.drain(..excess);
         }
+    }
+
+    /// Remembers `url` as the most recent address, replacing the one before it from the
+    /// same site and dropping the oldest past `MAX_RECENT_ADDRESSES`.
+    pub fn remember_address(&mut self, url: &str) {
+        let site = address_site(url);
+        self.recent_addresses
+            .retain(|recent| !address_site(recent).eq_ignore_ascii_case(site));
+        self.recent_addresses.insert(0, url.to_owned());
+        self.recent_addresses.truncate(MAX_RECENT_ADDRESSES);
     }
 
     pub fn selected_session<'a>(
@@ -621,6 +639,7 @@ impl ClientState {
         self.show_fps = source.show_fps;
         self.monitor_columns = source.monitor_columns.clone();
         self.read_files = source.read_files.clone();
+        self.recent_addresses = source.recent_addresses.clone();
         self.selected_session = None;
         self.selected_tabs.clear();
         self.focused_panes.clear();
@@ -838,6 +857,19 @@ fn locate_pane<'a>(
         .iter()
         .flat_map(|session| &session.tabs)
         .find_map(|tab| find_pane(&tab.layout, id).map(|pane| (tab, pane)))
+}
+
+/// An address's site: its scheme, host and port (`http://localhost:5173`), or a `file:`
+/// URL, or anything without a scheme, whole.
+pub fn address_site(url: &str) -> &str {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url;
+    };
+    if scheme.eq_ignore_ascii_case("file") {
+        return url;
+    }
+    let authority = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    &url[..scheme.len() + 3 + authority]
 }
 
 /// The keyboard leaves the floats when the focused front float is dropped.
@@ -1937,6 +1969,45 @@ mod tests {
         assert!(!slot.state.reads_file(&host, "/n/2.md"));
         assert!(slot.state.reads_file(&host, "/n/1.md"));
         assert!(slot.state.reads_file(&host, "/n/extra.md"));
+        let expected = slot.state.clone();
+        slot.save().unwrap();
+        drop(slot);
+        let slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        assert_eq!(slot.state, expected);
+    }
+
+    #[test]
+    fn recent_addresses_keep_one_page_per_site_newest_first_and_survive_restart() {
+        let directory = Directory::new();
+        let mut slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        slot.state.remember_address("http://localhost:5173/");
+        slot.state.remember_address("https://example.com/docs?q=1");
+        // Another page of a site replaces its last one and moves to the front.
+        slot.state.remember_address("http://LOCALHOST:5173/about");
+        // Another port is another site; a file is its own.
+        slot.state.remember_address("http://localhost:3000");
+        slot.state.remember_address("file:///home/a/index.html");
+        slot.state.remember_address("file:///home/a/other.html");
+        assert_eq!(
+            slot.state.recent_addresses,
+            [
+                "file:///home/a/other.html",
+                "file:///home/a/index.html",
+                "http://localhost:3000",
+                "http://LOCALHOST:5173/about",
+                "https://example.com/docs?q=1",
+            ]
+        );
+        slot.state.remember_address("https://example.org");
+        assert_eq!(slot.state.recent_addresses.len(), MAX_RECENT_ADDRESSES);
+        assert_eq!(slot.state.recent_addresses[0], "https://example.org");
+        assert!(
+            !slot
+                .state
+                .recent_addresses
+                .iter()
+                .any(|url| url.starts_with("https://example.com"))
+        );
         let expected = slot.state.clone();
         slot.save().unwrap();
         drop(slot);

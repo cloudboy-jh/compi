@@ -1017,6 +1017,7 @@ impl CompiApp {
                 if weak
                     .update(cx, |this, cx| {
                         this.poll_metadata(cx);
+                        this.poll_browser_home(cx);
                         let now = Instant::now();
                         let mut scroll_expired = false;
                         for view in &mut this.surface_views {

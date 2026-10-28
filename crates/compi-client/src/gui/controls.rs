@@ -97,6 +97,8 @@ gpui_kit_assets::icon_assets!(
         SlidersHorizontal,
         Command,
         Gpu,
+        Server,
+        Clock,
     ]
 );
 
@@ -1953,6 +1955,8 @@ mod tests {
             IconName::SlidersHorizontal,
             IconName::Command,
             IconName::Gpu,
+            IconName::Server,
+            IconName::Clock,
             IconName::Search,
             IconName::Folder,
             IconName::File,

@@ -207,7 +207,7 @@ pub fn text(command: &str, action: Option<&str>) -> String {
         ),
         ("browse", _) => (
             "browse [URL] [--down]",
-            "Open URL in a Browser pane beside the selected terminal (below it with --down); the shell stays as it is. URL is an http, https or file URL, or about:blank; without a scheme, http:// is assumed, so localhost:3000 opens http://localhost:3000. Text pasted around a link (quotes, <...>, a Markdown link, a Local: prefix, trailing punctuation) is dropped. Without URL the pane opens blank with the keyboard in its address field, where a link can be pasted without shell quoting. From a Browser pane (--pane), that pane goes to URL. The page is the system web view's (WebView2 on Windows, WKWebView on macOS), with one persistent profile per instance. --json returns {pane_id, url, shown, not_shown, receipt, workspace}.",
+            "Open URL in a Browser pane beside the selected terminal (below it with --down); the shell stays as it is. URL is an http, https or file URL, or about:blank; without a scheme, http:// is assumed, so localhost:3000 opens http://localhost:3000. Text pasted around a link (quotes, <...>, a Markdown link, a Local: prefix, trailing punctuation) is dropped. Without URL the pane opens on its home page (local servers your terminals printed, recent sites) with the keyboard in its address field, where a link can be pasted without shell quoting. From a Browser pane (--pane), that pane goes to URL. The page is the system web view's (WebView2 on Windows, WKWebView on macOS), with one persistent profile per instance. --json returns {pane_id, url, shown, not_shown, receipt, workspace}.",
             "compi browse 'localhost:3000/search?q=x'",
         ),
         ("command", Some("run")) => (

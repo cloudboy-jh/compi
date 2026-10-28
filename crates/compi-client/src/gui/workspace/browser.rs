@@ -15,8 +15,9 @@
 //! loads; history, cookies and scroll position are the webview's, with one persistent
 //! web profile per instance under its data directory. The address field shows where the
 //! page is going while it loads and where it is otherwise; Enter goes to what was typed
-//! (`BrowserContent::from_typed`), Escape puts the address back. Focus arriving at a
-//! blank page puts the keyboard in its address. On Windows, clicking
+//! (`BrowserContent::from_typed`), Escape puts the address back. A blank page shows
+//! Compi's home page instead (`browser_home.rs`), and focus arriving at it puts the
+//! keyboard in its address. On Windows, clicking
 //! into a page focuses its pane, Ctrl+L and F6 select the address, Compi's own chords
 //! (Ctrl+Shift or Alt with a key, except Alt+Left/Right, the page's back and forward,
 //! and Ctrl+Tab/T/W/Comma) are forwarded to the window while the page has the keyboard,
@@ -43,6 +44,8 @@ use wry::{NewWindowResponse, PageLoadEvent, WebContext, WebView, WebViewBuilder}
 #[path = "browser_media.rs"]
 mod media;
 pub(in crate::gui) use media::MediaSource;
+#[path = "browser_home.rs"]
+mod home;
 
 /// The toolbar above the page.
 const TOOLBAR_HEIGHT: f32 = 34.0;
@@ -133,6 +136,15 @@ pub(super) fn pane_title(url: &str) -> String {
 /// Whether the page may go to `url`: what a Browser pane may hold.
 fn navigable(url: &str) -> bool {
     BrowserContent { url: url.into() }.validate().is_ok()
+}
+
+/// What the address field shows for `address`: nothing for a blank page.
+fn field_text(address: &str) -> &str {
+    if address.eq_ignore_ascii_case(BrowserContent::BLANK) {
+        ""
+    } else {
+        address
+    }
 }
 
 /// What a page's callbacks report, shared with the window.
@@ -309,10 +321,20 @@ impl PageView {
             .unwrap_or_else(|| self.signals.url.borrow().clone())
     }
 
-    /// The page's title, unless it has none or a failure notice covers WebView2's error
-    /// page, whose title it would be.
+    /// The page is blank and loaded nothing that failed: its pane shows the home page.
+    /// A load from there keeps it until the load settles.
+    fn at_home(&self) -> bool {
+        self.signals
+            .url
+            .borrow()
+            .eq_ignore_ascii_case(BrowserContent::BLANK)
+            && self.signals.failure.borrow().is_none()
+    }
+
+    /// The page's title, unless it has none, shows the home page, or a failure notice
+    /// covers WebView2's error page, whose title it would be.
     fn title(&self) -> Option<String> {
-        if self.signals.failure.borrow().is_some() {
+        if self.signals.failure.borrow().is_some() || self.at_home() {
             return None;
         }
         let title = self.signals.title.borrow().trim().to_owned();
@@ -353,6 +375,10 @@ struct Page {
     persisted: String,
     /// A URL sent to the daemon and not yet seen back.
     sent: Option<String>,
+    /// The address last remembered as recent from this page.
+    recorded: String,
+    /// The pane showed its home page at the last draw.
+    home: bool,
 }
 
 /// A Browser pane's GPUI side in this window: its keyboard focus and address field.
@@ -424,6 +450,8 @@ pub(in crate::gui) struct BrowserUi {
     click_monitor: Option<macos_page::ClickMonitor>,
     /// Pages of PDF, audio and video files open in file tabs.
     media: media::MediaPages,
+    /// Blank panes' home pages.
+    home: home::HomeUi,
 }
 
 /// Every Browser pane of `tab`, with the URL the daemon holds.
@@ -619,13 +647,26 @@ impl CompiApp {
             return;
         };
         let typed = pane.address.read(cx).value().to_string();
-        let url = match BrowserContent::from_typed(&typed) {
-            Ok(content) => content.url,
+        match BrowserContent::from_typed(&typed) {
+            Ok(content) => self.browser_go(pane_id, content.url, window, cx),
             Err(error) => {
                 pane.address_error = Some(error);
                 cx.notify();
-                return;
             }
+        }
+    }
+
+    /// Browser pane `pane_id` goes to `url`, a URL it may hold, and the keyboard goes to
+    /// its page; from the home page, once the page appears.
+    pub(super) fn browser_go(
+        &mut self,
+        pane_id: &PaneId,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.browser.panes.get_mut(pane_id) else {
+            return;
         };
         pane.address_error = None;
         let focus = pane.focus.clone();
@@ -636,7 +677,9 @@ impl CompiApp {
                     cx.notify();
                     return;
                 }
-                let _ = page.view.webview.focus();
+                if !page.view.at_home() {
+                    let _ = page.view.webview.focus();
+                }
             }
             // Not created yet: the daemon's URL is where it starts.
             None => self.mutate(
@@ -663,12 +706,15 @@ impl CompiApp {
             .get(pane_id)
             .map(|page| page.view.address())
             .unwrap_or_else(|| pane.shown.clone());
-        pane.address
-            .update(cx, |field, cx| field.set_value(address.clone(), window, cx));
+        pane.address.update(cx, |field, cx| {
+            field.set_value(field_text(&address).to_owned(), window, cx)
+        });
         pane.shown = address;
         pane.address_error = None;
         window.focus(&pane.focus, cx);
-        if let Some(page) = self.browser.pages.get(pane_id) {
+        if let Some(page) = self.browser.pages.get(pane_id)
+            && !page.view.at_home()
+        {
             let _ = page.view.webview.focus();
         }
         cx.notify();
@@ -738,8 +784,8 @@ impl CompiApp {
     /// Before drawing: drop pages whose pane left this window, create pages for new
     /// panes once this frame is done, follow URL changes both ways, keep each address
     /// field on its page's address while it is not edited, hide pages that are not
-    /// drawn, are under an overlay or failed to load, and move the keyboard between GPUI
-    /// and pages.
+    /// drawn, are under an overlay, failed to load or show the home page, remember
+    /// where pages settle as recent, and move the keyboard between GPUI and pages.
     pub(super) fn prepare_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         macos_page::reclaim_lost_keyboard(window);
@@ -783,6 +829,7 @@ impl CompiApp {
         }
         if wanted.is_empty() {
             self.browser.focused = None;
+            self.browser.home.follow(None, false);
             return;
         }
         for (pane_id, url) in &wanted {
@@ -814,12 +861,35 @@ impl CompiApp {
         let mut missing = Vec::new();
         let mut load_failed = None;
         let mut clicked = None;
+        let mut remembered = Vec::new();
+        let mut entered_home = None;
+        // The home page whose tab's servers come first: the focused one, else the first.
+        let mut home_here: Option<&PaneId> = None;
+        let mut home_focused = false;
         for (pane_id, daemon) in &wanted {
+            let own = focused.as_ref() == Some(pane_id);
+            let float_index = self
+                .float_layouts
+                .iter()
+                .position(|float| &float.pane.pane_id == pane_id);
+            let drawn = float_index.is_some()
+                || self
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.pane(pane_id).is_some());
             let Some(page) = self.browser.pages.get_mut(pane_id) else {
                 if !self.browser.creating.contains(pane_id)
                     && !self.browser.failed.contains_key(pane_id)
                 {
                     missing.push((pane_id.clone(), daemon.clone()));
+                }
+                if drawn
+                    && daemon.eq_ignore_ascii_case(BrowserContent::BLANK)
+                    && !self.browser.failed.contains_key(pane_id)
+                    && (home_here.is_none() || own)
+                {
+                    home_here = Some(pane_id);
+                    home_focused |= own;
                 }
                 continue;
             };
@@ -849,37 +919,48 @@ impl CompiApp {
                 && page.view.signals.loading.borrow().is_none()
             {
                 page.sent = Some(current.clone());
-                update = Some((pane_id.clone(), current));
+                update = Some((pane_id.clone(), current.clone()));
+            }
+            // Where a page settles is the window's most recent address.
+            if current != page.recorded
+                && page.view.signals.loading.borrow().is_none()
+                && page.view.signals.failure.borrow().is_none()
+                && !current.eq_ignore_ascii_case(BrowserContent::BLANK)
+                && navigable(&current)
+            {
+                page.recorded = current.clone();
+                remembered.push(current);
             }
             // The field follows the page unless it is being edited.
-            if let Some(pane) = self.browser.panes.get_mut(pane_id) {
-                let address = page.view.address();
-                let editing = pane.address.focus_handle(cx).is_focused(window);
-                if !editing && pane.shown != address {
-                    pane.address
-                        .update(cx, |field, cx| field.set_value(address.clone(), window, cx));
-                    pane.shown = address;
-                    pane.address_error = None;
-                }
-            }
-            let float_index = self
-                .float_layouts
-                .iter()
-                .position(|float| &float.pane.pane_id == pane_id);
-            page.view.float_index.set(float_index);
-            let drawn = float_index.is_some()
-                || self
-                    .layout
-                    .as_ref()
-                    .is_some_and(|layout| layout.pane(pane_id).is_some());
-            let failed = page.view.signals.failure.borrow().is_some();
-            let hidden = !drawn || overlay || failed;
-            let own = focused.as_ref() == Some(pane_id);
             let editing = self
                 .browser
                 .panes
                 .get(pane_id)
                 .is_some_and(|pane| pane.address.focus_handle(cx).is_focused(window));
+            if let Some(pane) = self.browser.panes.get_mut(pane_id) {
+                let address = page.view.address();
+                if !editing && pane.shown != address {
+                    pane.address.update(cx, |field, cx| {
+                        field.set_value(field_text(&address).to_owned(), window, cx)
+                    });
+                    pane.shown = address;
+                    pane.address_error = None;
+                }
+            }
+            page.view.float_index.set(float_index);
+            let failed = page.view.signals.failure.borrow().is_some();
+            let home = page.view.at_home();
+            let left_home = page.home && !home;
+            if home && !page.home && own && !overlay && !editing {
+                // Back to the home page: the keyboard goes to the address.
+                entered_home = Some(pane_id.clone());
+            }
+            page.home = home;
+            if home && drawn && (home_here.is_none() || own) {
+                home_here = Some(pane_id);
+                home_focused |= own;
+            }
+            let hidden = !drawn || overlay || failed || home;
             let took = page.view.sync_keyboard();
             page.view.hidden.set(hidden);
             if hidden {
@@ -890,10 +971,25 @@ impl CompiApp {
                 clicked = Some(pane_id.clone());
             } else if page.view.signals.native_focus.get() && (!own || editing) {
                 page.view.release_keyboard();
-            } else if own && arrived && !hidden && !editing && !page.view.signals.native_focus.get()
+            } else if own
+                && (arrived || left_home)
+                && !hidden
+                && !editing
+                && !page.view.signals.native_focus.get()
             {
                 let _ = page.view.webview.focus();
             }
+        }
+        let here = home_here.and_then(|pane_id| self.browser_tab(pane_id));
+        self.browser.home.follow(here, home_focused);
+        if !remembered.is_empty() {
+            for url in &remembered {
+                self.state.remember_address(url);
+            }
+            self.save_state();
+        }
+        if let Some(pane_id) = entered_home {
+            self.focus_address(&pane_id, window, cx);
         }
         if let Some(pane_id) = clicked {
             self.focus_pane(pane_id.clone());
@@ -1065,12 +1161,15 @@ impl CompiApp {
                     this.browser.creating.remove(&pane_id);
                     match built {
                         Ok(view) => {
+                            let home = view.at_home();
                             this.browser.pages.insert(
                                 pane_id,
                                 Page {
                                     view: Rc::new(view),
                                     persisted: url,
                                     sent: None,
+                                    recorded: String::new(),
+                                    home,
                                 },
                             );
                         }
@@ -1102,8 +1201,14 @@ impl CompiApp {
             .clone()
     }
 
-    /// A Browser pane's body: the toolbar, then the page, or why there is none.
-    pub(super) fn render_browser_body(&self, pane_id: &PaneId, cx: &Context<Self>) -> AnyElement {
+    /// A Browser pane's body: the toolbar, then the page, the home page for a blank one,
+    /// or why there is none. `url` is the daemon's.
+    pub(super) fn render_browser_body(
+        &self,
+        pane_id: &PaneId,
+        url: &str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let Some(pane) = self.browser.panes.get(pane_id) else {
             return div().flex_1().into_any_element();
         };
@@ -1148,6 +1253,7 @@ impl CompiApp {
                     .into_any_element(),
                 )
             }
+            (Some(view), _) if view.at_home() => self.render_browser_home(pane_id, cx),
             (Some(view), _) => {
                 let view = view.clone();
                 let floats = self.browser.floats.clone();
@@ -1179,6 +1285,9 @@ impl CompiApp {
                     div().into_any_element()
                 },
             ),
+            (None, None) if url.eq_ignore_ascii_case(BrowserContent::BLANK) => {
+                self.render_browser_home(pane_id, cx)
+            }
             (None, None) => div()
                 .flex_1()
                 .flex()

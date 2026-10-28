@@ -3231,9 +3231,9 @@ impl CompiApp {
             .when(monitor, |pane| {
                 pane.child(self.render_monitor_pane(&pane_id, rect.width, cx))
             })
-            .when(
-                pane_content.is_some_and(|content| content.browser().is_some()),
-                |pane| pane.child(self.render_browser_body(&pane_id, cx)),
+            .when_some(
+                pane_content.and_then(|content| content.browser()),
+                |pane, browser| pane.child(self.render_browser_body(&pane_id, &browser.url, cx)),
             )
             .when_some(
                 content.zip(ui).filter(|_| {
