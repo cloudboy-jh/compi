@@ -130,6 +130,10 @@ Close confirms interactively before ending live processes or discarding unsaved 
 
 Without `--json`, commands that change something print one line, for example `New pane pane-…` after a split or `2 new panes: …` after growing a tab, and `pane send` and `run` print nothing on success. `compi --version` prints the version.
 
+In a terminal, `workspace list`, `tab list`, `pane list` and `window list` print tables, `workspace show` and `pane show` print `name: value` lines, `layout list` and `theme install` print a line or two, and `tab focus`, `pane focus`, `pane zoom` and the other window actions say what the window did. Long names, paths and addresses are shortened to fit the terminal; IDs always print whole so they can be copied. Piped or redirected, the same commands print indented JSON as before. `--json` always prints the same single line, in a terminal or not, so scripts and agents should pass it.
+
+`compi help` lists every command grouped by what it works on, with global options, output rules and exit codes. `compi help pane`, or `compi pane` alone, lists a command's actions; `compi help pane list` is the same as `compi pane list --help`. `compi --json help` returns the help text and every command as `{command, action, group, usage, summary, description, example}`. An unknown command, such as `compi commands`, says so on stderr, suggests the closest command and exits 2; it never opens the app. `compi DIR` with an existing folder still opens the app there.
+
 `compi changes` prints the running version with its headline and the other highlights, then each section of **What's new** under its title. Like `--version`, it needs no running Compi. `--json` returns `version`, `summary`, `highlights` and `sections` (each with `title` and `notes`).
 
 ```text

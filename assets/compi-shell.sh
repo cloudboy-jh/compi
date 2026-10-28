@@ -418,7 +418,8 @@ _compi_choose_directory() {
 # From a WSL terminal, Windows starts the GUI-subsystem CLI without any console of its
 # own: its output would lose carriage returns and it could never read an answer. Run it
 # on pipes instead: its output reaches the terminal through cat, typed lines reach it
-# only while it runs, and Ctrl-C ends it. COMPI_CLI_TERMINAL tells it a person is there.
+# only while it runs, and Ctrl-C ends it. COMPI_CLI_TERMINAL tells it a person is there,
+# and COMPI_CLI_COLUMNS how wide the terminal is, for tables and help.
 _compi_windows_cli() {
     local directory result
     directory=$(command mktemp -d "${TMPDIR:-/tmp}/compi-cli.XXXXXXXX") || return 1
@@ -431,7 +432,8 @@ _compi_windows_cli() {
         feeder=$!
         command cat < "$directory/out" &
         relay=$!
-        WSLENV="${WSLENV:+$WSLENV:}COMPI_CLI_TERMINAL" COMPI_CLI_TERMINAL=1 \
+        WSLENV="${WSLENV:+$WSLENV:}COMPI_CLI_TERMINAL:COMPI_CLI_COLUMNS" COMPI_CLI_TERMINAL=1 \
+            COMPI_CLI_COLUMNS="${COLUMNS:-$(command tput cols 2> /dev/null)}" \
             command "$COMPI_CLI" "$@" < "$directory/in" > "$directory/out" 2>&1 &
         cli=$!
         trap 'kill "$cli" 2> /dev/null' INT

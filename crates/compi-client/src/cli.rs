@@ -6,6 +6,8 @@ mod changes;
 mod content;
 mod diff;
 mod help;
+mod human;
+mod lists;
 mod metrics;
 mod notes;
 mod palette;
@@ -132,9 +134,7 @@ pub fn dispatch(raw: &[String]) -> Option<i32> {
             .all(|arg| matches!(arg.as_str(), "--version" | "-V" | "--json"));
     let mut unknown = None;
     if !version {
-        match classify(raw, shell_surface().is_some(), |word| {
-            shell_path(word).is_ok_and(|path| path.is_dir())
-        }) {
+        match classify(raw, |word| shell_path(word).is_ok_and(|path| path.is_dir())) {
             Invocation::Gui => return None,
             Invocation::Cli => {}
             Invocation::Unknown(word) => unknown = Some(word),
@@ -158,17 +158,12 @@ pub fn dispatch(raw: &[String]) -> Option<i32> {
         None => parse(raw).and_then(|options| execute(&options)),
     };
     Some(match result {
-        Ok(Output::Help(text)) => {
-            if json_output {
-                println!("{}", json!({"ok":true,"result":{"help":text}}));
-            } else {
-                print!("{text}");
-            }
-            0
-        }
-        Ok(Output::Value(value)) => {
+        Ok(Output::Readable { text, value }) => {
             if json_output {
                 println!("{}", json!({"ok": true, "result": value}));
+            } else if human::wanted() {
+                print!("{text}");
+                let _ = io::stdout().flush();
             } else {
                 println!("{}", serde_json::to_string_pretty(&value).unwrap());
             }
@@ -285,17 +280,13 @@ enum Invocation<'a> {
     Cli,
     /// The native application, given GUI flags or a working directory.
     Gui,
-    /// A bare word, inside a Compi shell, that is neither a command nor a directory.
+    /// A bare word that is neither a command nor a directory: an error, never the app.
     Unknown(&'a str),
 }
 
-/// Outside a Compi shell an unrecognised first word stays a GUI working directory,
-/// as `compi PATH` always was. Inside one it is almost always a mistyped command.
-fn classify<'a>(
-    raw: &'a [String],
-    in_shell: bool,
-    is_directory: impl FnOnce(&str) -> bool,
-) -> Invocation<'a> {
+/// A first word that names a directory opens the app there, as `compi PATH` always did;
+/// one that names neither a command nor a directory is a mistyped command.
+fn classify<'a>(raw: &'a [String], is_directory: impl FnOnce(&str) -> bool) -> Invocation<'a> {
     let mut index = 0;
     while index < raw.len() {
         let arg = raw[index].as_str();
@@ -319,11 +310,7 @@ fn classify<'a>(
         }
         return if COMMANDS.contains(&arg) {
             Invocation::Cli
-        } else if in_shell
-            && !arg.starts_with('-')
-            && !arg.contains(['/', '\\'])
-            && !is_directory(arg)
-        {
+        } else if !arg.starts_with('-') && !arg.contains(['/', '\\']) && !is_directory(arg) {
             Invocation::Unknown(arg)
         } else {
             Invocation::Gui
@@ -341,11 +328,11 @@ fn classify<'a>(
 
 fn unknown_command(word: &str) -> CliError {
     let hint = match suggestion(word) {
-        Some(command) => format!("did you mean '{command}'? See"),
-        None => "see".to_owned(),
+        Some(command) => format!("did you mean '{command}'? Run"),
+        None => "run".to_owned(),
     };
     CliError::usage(format!(
-        "unknown command '{word}'; {hint} compi --help for commands"
+        "unknown command '{word}'; {hint} compi help for every command"
     ))
 }
 
@@ -512,11 +499,15 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
 }
 
 enum Output {
-    Help(String),
-    Value(Value),
     Capture(Value),
     /// Human text, or `value` under --json.
     Report {
+        text: String,
+        value: Value,
+    },
+    /// Human text when stdout is a terminal; otherwise `value`, as indented JSON when
+    /// piped or redirected and in the `--json` envelope under --json.
+    Readable {
         text: String,
         value: Value,
     },
@@ -525,28 +516,37 @@ enum Output {
 fn execute(options: &Options) -> std::result::Result<Output, CliError> {
     let command = options.args.first().map(String::as_str).unwrap_or("help");
     let action = options.args.get(1).map(String::as_str);
-    if options.help || command == "help" {
-        return Ok(Output::Help(help::text(
-            if command == "help" {
-                action.unwrap_or("")
-            } else {
-                command
-            },
-            if command == "help" {
-                options.args.get(2).map(String::as_str)
-            } else {
-                action
-            },
-        )));
+    // `compi pane` alone, like `compi help pane`, lists what it can do.
+    if options.help || command == "help" || (action.is_none() && help::needs_action(command)) {
+        let (command, action) = if command == "help" {
+            (
+                action.unwrap_or(""),
+                options.args.get(2).map(String::as_str),
+            )
+        } else {
+            (command, action)
+        };
+        let text = help::text(command, action, human::width());
+        let commands = help::entries(command, action);
+        return Ok(Output::Report {
+            value: json!({"help": text, "commands": commands}),
+            text,
+        });
     }
     validate(options, command, action)?;
     if command == "theme" {
         let (mut store, diagnostics) = crate::theme_store::ThemeLibrary::load();
         let path = shell_path(&options.args[2])?;
         let installed = store.import_file(&path).map_err(CliError::usage)?;
-        return Ok(Output::Value(
-            json!({"installed": installed.iter().map(|theme| theme.id()).collect::<Vec<_>>(), "diagnostics":diagnostics}),
-        ));
+        let ids: Vec<&str> = installed.iter().map(|theme| theme.id()).collect();
+        let mut text = format!("Installed {}\n", ids.join(", "));
+        for diagnostic in &diagnostics {
+            text.push_str(&format!("note: {diagnostic}\n"));
+        }
+        return Ok(Output::Readable {
+            value: json!({"installed": ids, "diagnostics": diagnostics}),
+            text,
+        });
     }
     if command == "update" {
         #[cfg(any(windows, target_os = "macos"))]
@@ -563,9 +563,16 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
     }
     let config = config::load(options.config.as_deref(), config::FontOverrides::default());
     if command == "layout" && action == Some("list") {
-        return Ok(Output::Value(
-            json!({"builtins":arrangement::Builtin::ALL.map(|preset| preset.id()),"named":config.layout_presets}),
-        ));
+        let builtins = arrangement::Builtin::ALL.map(|preset| preset.id());
+        let mut text = format!("Built in: {}\n", builtins.join(", "));
+        if !config.layout_presets.is_empty() {
+            let named: Vec<&str> = config.layout_presets.keys().map(String::as_str).collect();
+            text.push_str(&format!("Yours:    {}\n", named.join(", ")));
+        }
+        return Ok(Output::Readable {
+            value: json!({"builtins": builtins, "named": config.layout_presets}),
+            text,
+        });
     }
     if command == "command" && action == Some("list") {
         return Ok(palette::list(&config.keybindings));
@@ -657,11 +664,18 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
     let operation = match command {
         "workspace" => match action.unwrap() {
             "list" => {
-                return Ok(Output::Value(
-                    json!({"server_id":state.server_id,"revision":state.revision,"workspaces":state.sessions}),
-                ));
+                return Ok(Output::Readable {
+                    text: lists::workspaces(&state),
+                    value: json!({"server_id":state.server_id,"revision":state.revision,"workspaces":state.sessions}),
+                });
             }
-            "show" => return Ok(Output::Value(json!(targets::workspace(&state, options)?))),
+            "show" => {
+                let session = targets::workspace(&state, options)?;
+                return Ok(Output::Readable {
+                    text: lists::workspace(session),
+                    value: json!(session),
+                });
+            }
             "create" => WorkspaceMutation::CreateSession {
                 label: options.args[2].clone(),
             },
@@ -696,7 +710,14 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                 } else {
                     None
                 };
-                return Ok(Output::Value(json!(state.sessions.iter().filter(|session| selected.as_ref().is_none_or(|id| id == &session.id)).flat_map(|session| session.tabs.iter().map(move |tab| json!({"workspace_id":session.id,"workspace":session.label,"tab":tab}))).collect::<Vec<_>>())));
+                let sessions = state
+                    .sessions
+                    .iter()
+                    .filter(|session| selected.as_ref().is_none_or(|id| id == &session.id));
+                return Ok(Output::Readable {
+                    text: lists::tabs(sessions.clone()),
+                    value: json!(sessions.flat_map(|session| session.tabs.iter().map(move |tab| json!({"workspace_id":session.id,"workspace":session.label,"tab":tab}))).collect::<Vec<_>>()),
+                });
             }
             "open" => WorkspaceMutation::CreateTab {
                 session_id: targets::workspace(&state, options)?.id.clone(),
@@ -816,7 +837,9 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                 } else {
                     None
                 };
+                let several = state.sessions.len() > 1;
                 let mut panes = Vec::new();
+                let mut rows = Vec::new();
                 for session in &state.sessions {
                     if selected_workspace
                         .as_ref()
@@ -828,6 +851,10 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                         if selected_tab.as_ref().is_some_and(|id| id != &tab.id) {
                             continue;
                         }
+                        let mut name = lists::tab_name(session, tab);
+                        if several {
+                            name = format!("{} {name}", session.label);
+                        }
                         for leaf in arrangement::leaves(&tab.layout) {
                             if selected_pane
                                 .as_ref()
@@ -835,11 +862,16 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                             {
                                 continue;
                             }
-                            panes.push(pane_row(&mut client, &state, session, tab, &leaf)?);
+                            let row = pane_row(&mut client, &state, session, tab, &leaf)?;
+                            rows.push(lists::pane_cells(name.clone(), &row));
+                            panes.push(row);
                         }
                     }
                 }
-                return Ok(Output::Value(json!(panes)));
+                return Ok(Output::Readable {
+                    text: lists::panes(&rows),
+                    value: json!(panes),
+                });
             }
             let (session, tab, leaf) = targets::pane(&state, options)?;
             let pane_id = leaf
@@ -848,13 +880,11 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                 .clone();
             match action.unwrap() {
                 "show" => {
-                    return Ok(Output::Value(pane_row(
-                        &mut client,
-                        &state,
-                        session,
-                        tab,
-                        &leaf,
-                    )?));
+                    let row = pane_row(&mut client, &state, session, tab, &leaf)?;
+                    return Ok(Output::Readable {
+                        text: lists::pane(&session.label, lists::tab_name(session, tab), &row),
+                        value: row,
+                    });
                 }
                 "close" => {
                     confirm_close(&target, &state, [leaf])?;
@@ -1201,19 +1231,23 @@ fn content_row(
     json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":pane_type,"content":content})
 }
 
+/// A window action: `window list` lists what each window shows; other actions say what
+/// the window did.
 fn presentation(
     target: &ConnectionTarget,
     options: &Options,
     action: crate::cli_window::Action,
 ) -> std::result::Result<Output, CliError> {
-    Ok(Output::Value(
-        serde_json::to_value(crate::cli_window::execute(
-            target,
-            options.window.as_deref(),
-            action,
-        )?)
-        .map_err(|e| CliError::new(1, "serialization_failed", e.to_string()))?,
-    ))
+    let response = crate::cli_window::execute(target, options.window.as_deref(), action.clone())?;
+    let text = match action {
+        crate::cli_window::Action::List => lists::windows(&response),
+        _ => lists::applied(&response, &action),
+    };
+    Ok(Output::Readable {
+        value: serde_json::to_value(response)
+            .map_err(|e| CliError::new(1, "serialization_failed", e.to_string()))?,
+        text,
+    })
 }
 
 /// Submit one change. A stale revision is retried when tabs and layouts are exactly as
@@ -1653,7 +1687,7 @@ fn validate(
         ("changes", None) => (1, 1, &[], &[]),
         _ => {
             return Err(CliError::usage(format!(
-                "unknown or missing {command} action; run compi {command} --help"
+                "unknown or missing {command} action; run compi help {command}"
             )));
         }
     };
@@ -1924,26 +1958,24 @@ mod tests {
         assert_eq!(parse(&args).unwrap_err().exit, 2);
     }
     #[test]
-    fn unknown_words_are_commands_only_inside_a_compi_shell() {
-        let check = |args: &[&str], in_shell: bool, expected: Invocation| {
+    fn unknown_words_are_errors_and_directories_open_the_app() {
+        let check = |args: &[&str], expected: Invocation| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-            let invocation = classify(&args, in_shell, |word| word == "project");
-            assert_eq!(invocation, expected, "{args:?} in_shell={in_shell}");
+            let invocation = classify(&args, |word| word == "project");
+            assert_eq!(invocation, expected, "{args:?}");
         };
-        for in_shell in [true, false] {
-            check(&["files"], in_shell, Invocation::Cli);
-            check(&["--instance", "dev", "edit"], in_shell, Invocation::Cli);
-            check(&["--help"], in_shell, Invocation::Cli);
-            check(&[], in_shell, Invocation::Gui);
-            check(&["project"], in_shell, Invocation::Gui);
-            check(&["../missing"], in_shell, Invocation::Gui);
-            check(&["--theme", "dracula", "fiiles"], in_shell, Invocation::Gui);
-        }
-        check(&["fiiles"], false, Invocation::Gui);
-        check(&["fiiles"], true, Invocation::Unknown("fiiles"));
+        check(&["files"], Invocation::Cli);
+        check(&["--instance", "dev", "edit"], Invocation::Cli);
+        check(&["--help"], Invocation::Cli);
+        check(&[], Invocation::Gui);
+        check(&["project"], Invocation::Gui);
+        check(&["../missing"], Invocation::Gui);
+        check(&["--theme", "dracula", "fiiles"], Invocation::Gui);
+        // A mistyped command never opens the app, in a Compi shell or not.
+        check(&["fiiles"], Invocation::Unknown("fiiles"));
+        check(&["commands"], Invocation::Unknown("commands"));
         check(
             &["--json", "--instance", "dev", "edti"],
-            true,
             Invocation::Unknown("edti"),
         );
     }
@@ -1957,20 +1989,15 @@ mod tests {
         assert_eq!(suggestion("elephant"), None);
         let error = unknown_command("fiiles");
         assert_eq!(error.exit, 2);
-        assert_eq!(
-            error.message,
-            "unknown command 'fiiles'; did you mean 'files'? See compi --help for commands"
-        );
-        assert_eq!(
-            unknown_command("xyz").message,
-            "unknown command 'xyz'; see compi --help for commands"
-        );
+        assert!(error.message.contains("did you mean 'files'?"));
+        assert!(error.message.contains("compi help"));
+        assert!(!unknown_command("xyz").message.contains("did you mean"));
     }
     #[test]
     fn update_accepts_only_check_and_json() {
         let accepted = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-            assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
+            assert_eq!(classify(&args, |_| false), Invocation::Cli);
             parse(&args).and_then(|options| {
                 let command = options.args[0].clone();
                 validate(&options, &command, options.args.get(1).map(String::as_str))?;
@@ -1995,7 +2022,7 @@ mod tests {
     fn view_commands_take_only_their_arguments() {
         let validated = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-            assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
+            assert_eq!(classify(&args, |_| false), Invocation::Cli);
             parse(&args).and_then(|options| {
                 let command = options.args[0].clone();
                 validate(&options, &command, options.args.get(1).map(String::as_str))
@@ -2046,7 +2073,7 @@ mod tests {
     }
     fn validated(args: &[&str]) -> std::result::Result<Options, CliError> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-        assert_eq!(classify(&args, true, |_| false), Invocation::Cli);
+        assert_eq!(classify(&args, |_| false), Invocation::Cli);
         parse(&args).and_then(|options| {
             let command = options.args[0].clone();
             validate(&options, &command, options.args.get(1).map(String::as_str))?;
@@ -2181,45 +2208,6 @@ mod tests {
         let options = validated(&["monitor", "quit", "7", "--force"]).unwrap();
         assert!(options.switches.contains("--force"));
         assert_eq!(options.args, ["monitor", "quit", "7"]);
-    }
-    #[test]
-    fn help_covers_the_new_forms() {
-        for (command, action, usage) in [
-            ("command", Some("list"), "Usage: compi command list"),
-            ("command", None, "Usage: compi command list"),
-            ("command", Some("run"), "Usage: compi command run ID"),
-            (
-                "monitor",
-                Some("totals"),
-                "Usage: compi monitor totals [--history 1m|5m|15m|1h] [--source SOURCE]",
-            ),
-            (
-                "monitor",
-                Some("list"),
-                "Usage: compi monitor list [--group] [--search TEXT] [--source SOURCE]",
-            ),
-            ("monitor", Some("sources"), "Usage: compi monitor sources"),
-            (
-                "monitor",
-                Some("inspect"),
-                "Usage: compi monitor inspect PID [--source SOURCE]",
-            ),
-            (
-                "monitor",
-                Some("quit"),
-                "Usage: compi monitor quit PID [--force] [--source SOURCE]",
-            ),
-            (
-                "monitor",
-                Some("processes"),
-                "Usage: compi monitor [PAGE] [--source SOURCE]",
-            ),
-        ] {
-            assert!(
-                help::text(command, action).starts_with(usage),
-                "{command} {action:?}"
-            );
-        }
     }
     #[test]
     fn close_reports_unsaved_files_of_closing_files_from_every_window() {

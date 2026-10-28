@@ -1,6 +1,7 @@
 //! `compi command list` and `compi command run ID`: the palette's commands, listed from
 //! the registry with no window needed, and run in the window that owns the selected pane
 //! as the palette would run them there.
+use super::human::{self, Fit};
 use super::{CliError, Options, Output, targets};
 use crate::cli_window::{self, Action, WindowInfo};
 use crate::commands::{self, CommandSpec, Platform, REGISTRY};
@@ -17,18 +18,24 @@ pub(super) fn list(overrides: &HashMap<String, String>) -> Output {
         .iter()
         .map(|spec| entry(spec, platform, overrides))
         .collect();
-    let rows: Vec<[&str; 3]> = commands
+    let rows: Vec<Vec<String>> = commands
         .iter()
         .map(|command| {
-            [
-                command["id"].as_str().unwrap_or_default(),
-                command["name"].as_str().unwrap_or_default(),
-                command["shortcut"].as_str().unwrap_or_default(),
-            ]
+            ["id", "name", "shortcut"]
+                .map(|key| command[key].as_str().unwrap_or_default().to_owned())
+                .to_vec()
         })
         .collect();
     Output::Report {
-        text: table(["ID", "NAME", "SHORTCUT"], &rows),
+        text: human::table(
+            &[
+                ("ID", Fit::Keep),
+                ("NAME", Fit::End),
+                ("SHORTCUT", Fit::Keep),
+            ],
+            &rows,
+            human::width(),
+        ),
         value: json!({"platform": platform_name(platform), "commands": commands}),
     }
 }
@@ -56,30 +63,6 @@ fn platform_name(platform: Platform) -> &'static str {
         Platform::Windows => "windows",
         Platform::Linux => "linux",
     }
-}
-
-/// Left-aligned columns two spaces apart, the last unpadded.
-fn table<const N: usize>(header: [&str; N], rows: &[[&str; N]]) -> String {
-    let mut widths = header.map(|title| title.chars().count());
-    for row in rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-    let mut text = String::new();
-    for row in std::iter::once(&header).chain(rows) {
-        let mut line = String::new();
-        for (index, cell) in row.iter().enumerate() {
-            if index + 1 == N {
-                line.push_str(cell);
-            } else {
-                line.push_str(&format!("{cell:<width$}  ", width = widths[index]));
-            }
-        }
-        text.push_str(line.trim_end());
-        text.push('\n');
-    }
-    text
 }
 
 /// Runs the command `validate` accepted in the window that shows the selected pane's
@@ -249,14 +232,6 @@ mod tests {
             &overrides,
         );
         assert_eq!(settings["shortcut"], "cmd-,");
-    }
-
-    #[test]
-    fn tables_align_columns() {
-        assert_eq!(
-            table(["ID", "NAME"], &[["a", "First"], ["longer", ""]]),
-            "ID      NAME\na       First\nlonger\n"
-        );
     }
 
     #[test]
