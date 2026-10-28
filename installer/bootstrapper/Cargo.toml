@@ -29,6 +29,10 @@ windows = { version = "0.62.2", features = [
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+[profile.dev]
+debug = 1
+incremental = false
+
 # No cross-crate LTO: Setup and maintenance are not performance-sensitive, and each
 # binary's thin-LTO link of the whole client graph cost about a minute locally.
 [profile.release]
