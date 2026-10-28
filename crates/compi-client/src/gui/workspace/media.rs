@@ -725,7 +725,13 @@ impl CompiApp {
         );
     }
 
-    pub(super) fn render_image_previews(&self, cx: &Context<Self>) -> AnyElement {
+    /// Pasted image cards of the focused terminal, at most `max_height` tall; placed at
+    /// the bottom right by `render_corner`.
+    pub(super) fn render_image_previews(
+        &self,
+        max_height: Pixels,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let colors = *self.colors();
         let focused = self.focused_view();
         let previews = self
@@ -811,11 +817,7 @@ impl CompiApp {
             });
         div()
             .id("image-preview-shelf")
-            .absolute()
-            .right(px(12.0))
-            .bottom(px(12.0))
-            .max_w(gpui::relative(0.9))
-            .max_h(gpui::relative(0.32))
+            .max_h(max_height)
             .overflow_y_scroll()
             .flex()
             .flex_col()

@@ -153,6 +153,8 @@ registry! {
     OpenThemeCatalog, "open_theme_catalog", "Browse theme catalog", None, None;
     OpenSettings, "open_settings", "Open Settings", Some("cmd-,"), Some("ctrl-,");
     OpenPromptSettings, "open_prompt_settings", "Prompt settings", None, None;
+    OpenNotificationSettings, "open_notification_settings", "Notification settings", None, None;
+    TestNotification, "test_notification", "Test notification", None, None;
     CheckForUpdates, "check_for_updates", "Check for Updates", None, None;
     OpenConfiguration, "open_configuration", "Open configuration file", None, None;
     ResetClientLayout, "reset_client_layout", "Reset window layout", None, None;
@@ -322,8 +324,15 @@ impl Command {
             OpenQuickAppearance | OpenSettings | OpenPromptSettings | OpenThemeCatalog => {
                 CommandCategory::Appearance
             }
-            OpenPalette | OpenConfiguration | CheckForUpdates | RestartDaemon | OpenDiagnostics
-            | OpenMonitor | Quit => CommandCategory::System,
+            OpenPalette
+            | OpenConfiguration
+            | CheckForUpdates
+            | RestartDaemon
+            | OpenDiagnostics
+            | OpenMonitor
+            | OpenNotificationSettings
+            | TestNotification
+            | Quit => CommandCategory::System,
         }
     }
 
@@ -417,6 +426,9 @@ impl Command {
                 "Shows the processes running where your terminals run, with their CPU and memory.",
             ),
             OpenBrowser => Some("Opens a web page in a pane beside the focused one."),
+            TestNotification => Some(
+                "Sends a notification the way your Notifications settings deliver one, with its sound.",
+            ),
             _ => None,
         }
     }
@@ -429,6 +441,8 @@ impl Command {
             OpenThemeCatalog => "themes catalog colors schemes light dark favorites",
             OpenSettings => "preferences configuration appearance terminal keyboard daemon",
             OpenPromptSettings => "shell prompt oh my posh starship ps1 theme bash zsh",
+            OpenNotificationSettings => "notify alert toast bell sound blocked done finished",
+            TestNotification => "notify alert toast bell sound try check",
             CheckForUpdates => "update upgrade release version download install",
             OpenConfiguration => "toml edit file",
             RestartDaemon => "server reboot",
@@ -500,6 +514,8 @@ impl Command {
                 | OpenThemeCatalog
                 | OpenSettings
                 | OpenPromptSettings
+                | OpenNotificationSettings
+                | TestNotification
                 | CheckForUpdates
                 | OpenConfiguration
                 | ResetClientLayout

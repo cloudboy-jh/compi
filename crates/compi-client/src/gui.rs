@@ -19,6 +19,7 @@ use compi_protocol::{
 mod brand;
 mod controls;
 mod lifecycle;
+mod os_notifications;
 use lifecycle::PaneError;
 mod workspace;
 use crate::typography::TerminalTypography;
@@ -146,6 +147,7 @@ fn run_application(
         let mut config = config;
         if !empty_measurement {
             gpui_component::init(cx);
+            workspace::notifications::init(&target, cx);
             if let Err(error) = crate::font_catalog::register_bundled(cx.text_system()) {
                 config.diagnostics.push(error);
             }
@@ -849,6 +851,7 @@ struct CompiApp {
     surface_names: HashMap<SurfaceId, (compi_protocol::ProcessLifetimeId, String, Option<String>)>,
     metadata: workspace::metadata::MetadataUi,
     program_status: workspace::program_status::ProgramStatusUi,
+    notifications: workspace::notifications::NotificationsUi,
     focused_view: Option<u64>,
     /// The `compi z` and branch pickers, over the terminal they serve.
     file_tree: Option<workspace::tree::FileTree>,

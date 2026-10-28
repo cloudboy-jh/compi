@@ -49,6 +49,11 @@ impl ProgramStatusUi {
             self.statuses.insert(status.surface_id.clone(), status);
         }
     }
+
+    /// What `surface_id` last reported, of whichever process.
+    pub(in crate::gui) fn status(&self, surface_id: &SurfaceId) -> Option<&SurfaceProgramStatus> {
+        self.statuses.get(surface_id)
+    }
 }
 
 #[derive(PartialEq, Eq)]

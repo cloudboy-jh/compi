@@ -30,6 +30,7 @@ use std::sync::mpsc;
 mod columns;
 mod icons;
 mod inspector;
+pub(in crate::gui::workspace) use inspector::surface_pane;
 mod overview;
 mod processes;
 mod resources;

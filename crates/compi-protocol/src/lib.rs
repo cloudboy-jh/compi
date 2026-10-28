@@ -65,7 +65,8 @@ use std::fmt;
 // Version 34 adds ranged file reads (`ReadContentRange`) and the kind of a content file the
 // editor cannot open (`FileKind` on `FileContent::TooLarge` and `Binary`); `GitImageFormat`
 // becomes `ImageFormat`.
-pub const PROTOCOL_VERSION: u32 = 34;
+// Version 35 adds the Notifications section of Settings (`SettingsSection::Notifications`).
+pub const PROTOCOL_VERSION: u32 = 35;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -1592,6 +1593,7 @@ pub enum SettingsSection {
     #[default]
     Appearance,
     Interface,
+    Notifications,
     Terminal,
     Keyboard,
     /// Monitor's Overview. Saved as "performance", the section's name before it
@@ -1603,9 +1605,10 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Appearance,
         Self::Interface,
+        Self::Notifications,
         Self::Terminal,
         Self::Keyboard,
         Self::Monitor,
@@ -1617,6 +1620,7 @@ impl SettingsSection {
         match self {
             Self::Appearance => "Appearance",
             Self::Interface => "Interface",
+            Self::Notifications => "Notifications",
             Self::Terminal => "Terminal",
             Self::Keyboard => "Keyboard",
             Self::Monitor => "Monitor",

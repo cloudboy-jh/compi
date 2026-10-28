@@ -55,7 +55,7 @@ pub(super) struct Inspection {
 }
 
 /// The pane holding terminal `surface`, with its workspace and tab.
-fn surface_pane(
+pub(in crate::gui::workspace) fn surface_pane(
     workspace: &WorkspaceSnapshot,
     surface: &SurfaceId,
 ) -> Option<(SessionId, TabId, PaneId)> {
@@ -255,8 +255,8 @@ impl CompiApp {
     }
 
     /// Open terminal: shows the pane of terminal `surface` (its tab, and its shell
-    /// where it shows a view) and focuses it.
-    pub(super) fn open_process_terminal(
+    /// where it shows a view) and focuses it. Notifications open their pane the same way.
+    pub(in crate::gui::workspace) fn open_process_terminal(
         &mut self,
         surface: &SurfaceId,
         window: &mut Window,

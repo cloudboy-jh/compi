@@ -99,6 +99,7 @@ gpui_kit_assets::icon_assets!(
         Gpu,
         Server,
         Clock,
+        Bell,
     ]
 );
 
@@ -1957,6 +1958,7 @@ mod tests {
             IconName::Gpu,
             IconName::Server,
             IconName::Clock,
+            IconName::Bell,
             IconName::Search,
             IconName::Folder,
             IconName::File,

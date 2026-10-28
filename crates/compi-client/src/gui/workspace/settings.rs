@@ -95,8 +95,8 @@ pub(super) enum SettingsAction {
     ToggleTransparency,
     ToggleBlur,
     FollowTheme,
-    /// Opens a font select's list.
-    FontSelect(Popup),
+    /// Opens a select's list (a font, notification delivery).
+    Select(Popup),
     /// The opacity slider; Enter raises it a step, Left and Right move it.
     Opacity,
     ResetWindowAppearance,
@@ -120,6 +120,11 @@ pub(super) enum SettingsAction {
     ToggleConfirmClose,
     FocusIndicator(crate::theme::FocusIndicator),
     ProgramStatus(usize),
+    NotificationAttention,
+    NotificationFinished,
+    PlayNotificationSound,
+    OpenNotificationSystemSettings,
+    TestNotification,
 }
 
 /// Where Settings controls are drawn: a Settings pane, or Quick Appearance.
@@ -525,7 +530,7 @@ static ROWS: &[Row] = &[
         "Interface font",
         "The font of menus, tabs and Settings.",
         "typeface family ui",
-        |_| vec![SettingsAction::FontSelect(Popup::UiFont)],
+        |_| vec![SettingsAction::Select(Popup::UiFont)],
         |app, row, cx| {
             app.settings_row(
                 row.title,
@@ -669,6 +674,119 @@ static ROWS: &[Row] = &[
         |_| vec![SettingsAction::ProgramStatus(2)],
         |app, row, cx| app.render_status_row(row, 2, cx),
     ),
+    // Notifications.
+    grouped(
+        "Delivery",
+        row(
+            "notification-delivery",
+            SettingsSection::Notifications,
+            "Delivery",
+            "Where notifications appear: in Compi, from the system, or both.",
+            "notify alert toast banner system in-app automatic both",
+            |_| vec![SettingsAction::Select(Popup::NotificationDelivery)],
+            |app, row, cx| app.render_notification_delivery_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Delivery",
+        row(
+            "notification-system",
+            SettingsSection::Notifications,
+            "System notifications",
+            "Whether the system shows Compi's notifications.",
+            "notify permission focus assist do not disturb windows macos",
+            |_| {
+                if crate::gui::os_notifications::SETTINGS_URL.is_some() {
+                    vec![SettingsAction::OpenNotificationSystemSettings]
+                } else {
+                    Vec::new()
+                }
+            },
+            |app, row, cx| app.render_notification_system_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Delivery",
+        row(
+            "notification-test",
+            SettingsSection::Notifications,
+            "Test notification",
+            "Sends one now with these settings.",
+            "notify try check preview",
+            |_| vec![SettingsAction::TestNotification],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    app.notifications
+                        .test_result()
+                        .unwrap_or(row_description("notification-test"))
+                        .to_owned(),
+                    "Send test",
+                    SettingsAction::TestNotification,
+                    false,
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Events",
+        row(
+            "notification-attention",
+            SettingsSection::Notifications,
+            "Needs attention",
+            "A program asks for permission, a question's answer or a sign-in.",
+            "notify blocked permission question sign in osc 7501",
+            |_| vec![SettingsAction::NotificationAttention],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.config.notifications.attention,
+                    SettingsAction::NotificationAttention,
+                    row_description("notification-attention"),
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Events",
+        row(
+            "notification-finished",
+            SettingsSection::Notifications,
+            "Finished",
+            "A program reports its work done.",
+            "notify done complete osc 7501",
+            |_| vec![SettingsAction::NotificationFinished],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.config.notifications.finished,
+                    SettingsAction::NotificationFinished,
+                    row_description("notification-finished"),
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Sound",
+        row(
+            "notification-sound",
+            SettingsSection::Notifications,
+            "Sound",
+            "The sound a notification plays, when the system's sound and quiet settings allow it.",
+            "notify audio chime bell play preview",
+            |app| {
+                let mut stops = vec![SettingsAction::Select(Popup::NotificationSound)];
+                if app.config.notifications.sound != crate::config::NotificationSound::Off {
+                    stops.push(SettingsAction::PlayNotificationSound);
+                }
+                stops
+            },
+            |app, row, cx| app.render_notification_sound_row(row, cx),
+        ),
+    ),
     // Terminal.
     row(
         "terminal-font",
@@ -676,7 +794,7 @@ static ROWS: &[Row] = &[
         "Terminal font",
         "The font terminals draw text in.",
         "typeface family monospace",
-        |_| vec![SettingsAction::FontSelect(Popup::TerminalFont)],
+        |_| vec![SettingsAction::Select(Popup::TerminalFont)],
         |app, row, cx| {
             app.settings_row(
                 row.title,
@@ -2304,6 +2422,23 @@ impl CompiApp {
                     self.global_error = Some(error);
                 }
             }
+            SettingsAction::NotificationAttention => {
+                let mut settings = self.config.notifications;
+                settings.attention = !settings.attention;
+                self.set_notification_settings(settings, cx);
+            }
+            SettingsAction::NotificationFinished => {
+                let mut settings = self.config.notifications;
+                settings.finished = !settings.finished;
+                self.set_notification_settings(settings, cx);
+            }
+            SettingsAction::PlayNotificationSound => self.play_notification_sound(cx),
+            SettingsAction::OpenNotificationSystemSettings => {
+                if let Some(url) = crate::gui::os_notifications::SETTINGS_URL {
+                    cx.open_url(url);
+                }
+            }
+            SettingsAction::TestNotification => self.test_notification(window, cx),
             SettingsAction::ProgramStatus(index) => {
                 let mut settings = self.config.program_status.clone();
                 match index {
@@ -2391,7 +2526,7 @@ impl CompiApp {
                 );
             }
             SettingsAction::FollowTheme => self.follow_theme_terminal_colors(window, cx),
-            SettingsAction::FontSelect(popup) => self.popup = Some(popup),
+            SettingsAction::Select(popup) => self.popup = Some(popup),
             SettingsAction::Opacity => self.adjust_opacity(0.05, window, cx),
             SettingsAction::ResetWindowAppearance => self.reset_window_appearance(window),
             SettingsAction::ResetSidebar => self.execute(Command::ResetSidebarWidth, window, cx),
@@ -3169,7 +3304,7 @@ impl CompiApp {
     /// its own font. A custom terminal family from the configuration file shows as the
     /// value with no preset checked.
     fn render_font_select(&self, row: &RowCx, popup: Popup, cx: &Context<Self>) -> AnyElement {
-        let action = SettingsAction::FontSelect(popup);
+        let action = SettingsAction::Select(popup);
         let focused = self.settings_focused(row, action);
         let (options, selected, value): (Vec<_>, _, SharedString) = match popup {
             Popup::UiFont => (
@@ -4320,6 +4455,7 @@ fn section_icon(section: SettingsSection) -> IconName {
         SettingsSection::Monitor => IconName::Gauge,
         SettingsSection::Updates => IconName::CircleArrowDown,
         SettingsSection::Advanced => IconName::SlidersHorizontal,
+        SettingsSection::Notifications => IconName::Bell,
     }
 }
 

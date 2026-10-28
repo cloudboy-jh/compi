@@ -69,6 +69,18 @@ panes = true    # dot on tiled panes, glyph and progress on floating title strip
 sidebar = true  # state at the start of the sidebar and palette status line
 ```
 
+## Notifications
+
+**Settings → Notifications** chooses when programs reporting through OSC 7501 notify you, and where. Changes made in Settings apply to every open window; edits to the file apply when Compi next opens.
+
+```toml
+[notifications]
+delivery = "automatic"  # "automatic" (in Compi while it is active, else from the system), "in_app", "os" or "both"
+attention = true        # a program is blocked on you: a permission, a question or a sign-in
+finished = false        # a program reports its work done
+sound = "off"           # or "default", "message", "mail", "reminder", "text_message": Windows' notification sounds, once per notification, unless Windows is quiet
+```
+
 ## Closing tabs and panes
 
 Closing a tab (its ×, **Close terminal tab**) or a pane (**Close pane**) ends its processes in one click. **Settings → Interface → Confirm before closing** asks first instead; Enter closes and Esc cancels. To keep a tab's processes running, hide it instead.

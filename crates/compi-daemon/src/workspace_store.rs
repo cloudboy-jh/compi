@@ -162,6 +162,7 @@ impl WorkspaceStore {
                     if value.get("format_version") == Some(&serde_json::Value::from(8)) {
                         restore_newer_kinds(&mut value);
                         restore_commit_diffs(&mut value);
+                        restore_newer_sections(&mut value);
                     }
                     serde_json::from_value::<Manifest>(value)
                 });
@@ -490,6 +491,62 @@ fn migrate_content_kinds(value: &mut serde_json::Value) {
 fn readable_by_older_formats(value: &mut serde_json::Value) {
     mark_newer_kinds(value);
     hide_commit_diffs(value);
+    hide_newer_sections(value);
+}
+
+/// Settings sections newer than format 8's daemons (protocol 34) know.
+const NEWER_SECTIONS: [&str; 1] = ["notifications"];
+
+/// A protocol-34 daemon refuses a Settings section it does not know, so a newer one is
+/// written as Appearance carrying the real one as `shown_section`, a key it ignores;
+/// `restore_newer_sections` puts it back. Every Settings content is walked: content
+/// leaves and terminal views, in every layout copy.
+fn hide_newer_sections(value: &mut serde_json::Value) {
+    walk_settings(value, &mut |settings| {
+        if let Some(section) = settings
+            .get("section")
+            .filter(|section| {
+                section
+                    .as_str()
+                    .is_some_and(|name| NEWER_SECTIONS.contains(&name))
+            })
+            .cloned()
+        {
+            settings.insert("section".into(), "appearance".into());
+            settings.insert("shown_section".into(), section);
+        }
+    });
+}
+
+/// Undoes `hide_newer_sections`.
+fn restore_newer_sections(value: &mut serde_json::Value) {
+    walk_settings(value, &mut |settings| {
+        if let Some(section) = settings.remove("shown_section") {
+            settings.insert("section".into(), section);
+        }
+    });
+}
+
+/// Every object holding Settings content (`kind: settings`, not a marked newer kind).
+fn walk_settings(
+    value: &mut serde_json::Value,
+    visit: &mut impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    use serde_json::Value;
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(|item| walk_settings(item, visit)),
+        Value::Object(object) => {
+            if object.get("kind").and_then(Value::as_str) == Some("settings")
+                && !object.contains_key("shows")
+            {
+                visit(object);
+            }
+            object
+                .values_mut()
+                .for_each(|child| walk_settings(child, visit));
+        }
+        _ => {}
+    }
 }
 
 /// Content kinds newer than Settings, written as marked Settings leaves.
@@ -1429,6 +1486,56 @@ mod tests {
             "http://localhost:3000/docs?page=2"
         );
         assert_eq!(panes["first"]["content"]["root"], "/");
+        let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.sessions, workspace.sessions);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_notifications_settings_pane_survives_reopen_and_reads_as_appearance_to_older_daemons() {
+        let path = test_path("notifications-section");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let (mut workspace, files) = content_workspace(SurfaceStatus::Lost);
+        let notifications = PaneContent::Settings(SettingsContent {
+            section: SettingsSection::Notifications,
+        });
+        // As a pane of its own, and as the view a terminal shows in place.
+        workspace.sessions[0].tabs[0].previous_layout = None;
+        workspace.sessions[0].tabs[0].layout = LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane {
+                pane_id: PaneId::new("pane-1"),
+                surface_id: SurfaceId::new("surface-1"),
+                view: Some(compi_protocol::PaneView {
+                    content: notifications.clone(),
+                    side: compi_protocol::PaneSide::View,
+                }),
+            }),
+            second: Box::new(LayoutNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(files),
+                second: Box::new(LayoutNode::Content {
+                    pane_id: PaneId::new("pane-3"),
+                    content: notifications,
+                }),
+            }),
+        };
+        store.commit(&workspace).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let layout = &saved["workspace"]["sessions"][0]["tabs"][0]["layout"];
+        for settings in [
+            &layout["first"]["view"]["content"],
+            &layout["second"]["second"]["content"],
+        ] {
+            assert_eq!(settings["section"], "appearance");
+            assert_eq!(settings["shown_section"], "notifications");
+            // What a protocol-34 daemon reads there.
+            let mut old = settings.clone();
+            old.as_object_mut().unwrap().remove("shown_section");
+            assert!(serde_json::from_value::<PaneContent>(old).is_ok());
+        }
         let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
         assert_eq!(reopened.sessions, workspace.sessions);
         let _ = fs::remove_file(path);

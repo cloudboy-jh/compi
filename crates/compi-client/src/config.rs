@@ -234,6 +234,121 @@ impl Default for ProgramStatusSettings {
     }
 }
 
+/// Where notifications appear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDelivery {
+    /// In Compi while it is the active app, from the system while it is not.
+    #[default]
+    Automatic,
+    InApp,
+    Os,
+    /// In Compi and from the system for the same event.
+    Both,
+}
+
+impl NotificationDelivery {
+    pub const ALL: [Self; 4] = [Self::Automatic, Self::InApp, Self::Os, Self::Both];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::InApp => "in_app",
+            Self::Os => "os",
+            Self::Both => "both",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic",
+            Self::InApp => "In-app only",
+            Self::Os => "System only",
+            Self::Both => "Both",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|delivery| delivery.id() == value)
+    }
+}
+
+/// The sound a notification plays: one of the system's own notification sounds, as the
+/// user's sound scheme sets it. A custom sound file would be another variant here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationSound {
+    #[default]
+    Off,
+    Default,
+    Message,
+    Mail,
+    Reminder,
+    TextMessage,
+}
+
+impl NotificationSound {
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Default,
+        Self::Message,
+        Self::Mail,
+        Self::Reminder,
+        Self::TextMessage,
+    ];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Default => "default",
+            Self::Message => "message",
+            Self::Mail => "mail",
+            Self::Reminder => "reminder",
+            Self::TextMessage => "text_message",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Default => "Default",
+            Self::Message => "Message",
+            Self::Mail => "Mail",
+            Self::Reminder => "Reminder",
+            Self::TextMessage => "Text message",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|sound| sound.id() == value)
+    }
+}
+
+/// When and how a terminal's program status (OSC 7501) notifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationSettings {
+    pub delivery: NotificationDelivery,
+    /// A program blocked on the user: a permission, a question or a sign-in.
+    pub attention: bool,
+    /// A program reporting its work done.
+    pub finished: bool,
+    pub sound: NotificationSound,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            delivery: NotificationDelivery::Automatic,
+            attention: true,
+            finished: false,
+            sound: NotificationSound::Off,
+        }
+    }
+}
+
 static CONFIG_WRITES: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -261,6 +376,8 @@ pub struct LoadedConfig {
     pub metadata: MetadataSettings,
     #[serde(default)]
     pub program_status: ProgramStatusSettings,
+    #[serde(default)]
+    pub notifications: NotificationSettings,
     /// Ask before closing a tab or pane ends its processes. Off: one click closes.
     #[serde(default)]
     pub confirm_close: bool,
@@ -294,6 +411,7 @@ impl Default for LoadedConfig {
             updates: UpdateSettings::default(),
             metadata: MetadataSettings::default(),
             program_status: ProgramStatusSettings::default(),
+            notifications: NotificationSettings::default(),
             confirm_close: false,
             focus_indicator: FocusIndicator::default(),
             provenance: ConfigProvenance::default(),
@@ -326,6 +444,20 @@ impl LoadedConfig {
             set_table_value(table, "sidebar", settings.sidebar.into());
         })?;
         self.program_status = settings;
+        Ok(())
+    }
+
+    pub fn save_notification_settings(
+        &mut self,
+        settings: NotificationSettings,
+    ) -> Result<(), String> {
+        update_table(&self.path, "notifications", |table| {
+            set_table_value(table, "delivery", settings.delivery.id().into());
+            set_table_value(table, "attention", settings.attention.into());
+            set_table_value(table, "finished", settings.finished.into());
+            set_table_value(table, "sound", settings.sound.id().into());
+        })?;
+        self.notifications = settings;
         Ok(())
     }
 
@@ -1378,6 +1510,45 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
             }
         }
     }
+    if let Some(notifications) = table(&document, "notifications", loaded) {
+        if let Some(value) = notifications.get("delivery") {
+            match value.as_str().and_then(NotificationDelivery::parse) {
+                Some(delivery) => loaded.notifications.delivery = delivery,
+                None => invalid(
+                    loaded,
+                    "notifications.delivery",
+                    "\"automatic\", \"in_app\", \"os\" or \"both\"",
+                    "configuration",
+                ),
+            }
+        }
+        for key in ["attention", "finished"] {
+            let Some(value) = notifications.get(key) else {
+                continue;
+            };
+            match value.as_bool() {
+                Some(enabled) if key == "attention" => loaded.notifications.attention = enabled,
+                Some(enabled) => loaded.notifications.finished = enabled,
+                None => invalid(
+                    loaded,
+                    &format!("notifications.{key}"),
+                    "true or false",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = notifications.get("sound") {
+            match value.as_str().and_then(NotificationSound::parse) {
+                Some(sound) => loaded.notifications.sound = sound,
+                None => invalid(
+                    loaded,
+                    "notifications.sound",
+                    "\"off\", \"default\", \"message\", \"mail\", \"reminder\" or \"text_message\"",
+                    "configuration",
+                ),
+            }
+        }
+    }
     if let Some(workspace) = table(&document, "workspace", loaded) {
         if let Some(value) = workspace.get("confirm_close") {
             match value.as_bool() {
@@ -2119,6 +2290,59 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("program_status.tabs"))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notifications_default_to_attention_only_round_trip_and_reject_unknown_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-notifications-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n# retain me\n").unwrap();
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        let defaults = loaded.notifications;
+        assert_eq!(defaults.delivery, NotificationDelivery::Automatic);
+        assert!(defaults.attention && !defaults.finished);
+        assert_eq!(defaults.sound, NotificationSound::Off);
+        let changed = NotificationSettings {
+            delivery: NotificationDelivery::Both,
+            attention: false,
+            finished: true,
+            sound: NotificationSound::Reminder,
+        };
+        loaded.save_notification_settings(changed).unwrap();
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).notifications,
+            changed
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("# retain me"));
+
+        let invalid = parse(
+            "version = 1\n[notifications]\ndelivery = 'loud'\nfinished = 'yes'\nsound = 'bell'\nattention = false",
+            FontOverrides::default(),
+        );
+        assert_eq!(
+            invalid.notifications.delivery,
+            NotificationDelivery::Automatic
+        );
+        assert!(!invalid.notifications.finished && !invalid.notifications.attention);
+        assert_eq!(invalid.notifications.sound, NotificationSound::Off);
+        for key in ["delivery", "finished", "sound"] {
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|message| message.contains(&format!("notifications.{key}"))),
+                "{key}"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

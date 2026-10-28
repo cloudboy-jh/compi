@@ -21,6 +21,7 @@ pub(in crate::gui) mod menus;
 pub(in crate::gui) mod metadata;
 pub(in crate::gui) mod monitor;
 pub(in crate::gui) mod motion;
+pub(in crate::gui) mod notifications;
 pub(in crate::gui) mod palette;
 pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
@@ -399,6 +400,10 @@ pub(super) enum Popup {
     UiFont,
     /// Settings → Terminal → Terminal font.
     TerminalFont,
+    /// Settings → Notifications → Delivery.
+    NotificationDelivery,
+    /// Settings → Notifications → Sound.
+    NotificationSound,
     /// The theme list's More menu.
     CatalogMenu,
     /// The Appearance controls under the sidebar's Appearance button.
@@ -835,6 +840,12 @@ impl CompiApp {
             update_quiesced.clone(),
             update_connection_guard.clone(),
         );
+        let notifications = notifications::NotificationsUi::new(
+            Window::window_handle(window).window_id(),
+            window.is_window_active(),
+            &target,
+            cx,
+        );
         let mut this = Self {
             started_at,
             target,
@@ -861,6 +872,7 @@ impl CompiApp {
             surface_names: HashMap::new(),
             metadata: metadata::MetadataUi::default(),
             program_status,
+            notifications,
             focused_view: None,
             file_tree: None,
             tree_scroll: ScrollHandle::new(),
@@ -997,6 +1009,7 @@ impl CompiApp {
             }));
         this.subscriptions
             .push(cx.observe_window_activation(window, |this, window, cx| {
+                this.notifications.window_active = window.is_window_active();
                 this.report_focus(window.is_window_active() && this.overlay.is_none());
                 cx.notify();
             }));
@@ -1018,6 +1031,7 @@ impl CompiApp {
                     .update(cx, |this, cx| {
                         this.poll_metadata(cx);
                         this.poll_browser_home(cx);
+                        this.expire_toasts(cx);
                         let now = Instant::now();
                         let mut scroll_expired = false;
                         for view in &mut this.surface_views {
@@ -2034,7 +2048,10 @@ impl CompiApp {
                 result,
             } => self.prompt_responded(job, request, result),
             UiEvent::ProgramStatusWatched(statuses) => self.program_status.replace_all(statuses),
-            UiEvent::ProgramStatusChanged(status) => self.program_status.update(status),
+            UiEvent::ProgramStatusChanged(status) => {
+                self.notice_program_status(&status, cx);
+                self.program_status.update(status);
+            }
             UiEvent::Monitor(event) => self.monitor_event(event),
             UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.connection_error = None;
@@ -4095,6 +4112,10 @@ impl CompiApp {
                 let stop = self.prompt_group_stop();
                 self.open_settings(Some(SettingsSection::Terminal), stop, window, cx);
             }
+            Command::OpenNotificationSettings => {
+                self.open_settings(Some(SettingsSection::Notifications), None, window, cx);
+            }
+            Command::TestNotification => self.test_notification(window, cx),
             Command::OpenThemeCatalog => {
                 self.open_theme_settings(catalog::CatalogTarget::Both, window, cx)
             }
@@ -5065,9 +5086,7 @@ impl CompiApp {
                         ),
                 )
             })
-            .when(self.overlay.is_none(), |root| {
-                root.child(self.render_image_previews(cx))
-            })
+            .child(self.render_corner(window, cx))
             .when(self.state.show_fps, |root| {
                 root.child(self.render_fps_overlay())
             })
