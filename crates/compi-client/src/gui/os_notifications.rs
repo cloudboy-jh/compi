@@ -33,7 +33,8 @@ pub(in crate::gui) struct OsNotice {
     pub tag: String,
     pub title: String,
     pub body: String,
-    /// What it plays; `Off` is silent.
+    /// What it plays; `Off` is silent. macOS notifications are silent for now.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub sound: NotificationSound,
 }
 
@@ -47,8 +48,11 @@ pub(in crate::gui) enum OsSubmit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::gui) enum OsStatus {
+    /// Only Windows reports the setting; macOS never answers On or Off.
+    #[cfg_attr(not(windows), allow(dead_code))]
     On,
     /// Turned off by the user or policy: why.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Off(String),
     /// The OS gives no answer (macOS): a note.
     Unknown(String),
