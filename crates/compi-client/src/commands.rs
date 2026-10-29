@@ -989,21 +989,17 @@ fn resolve_terminal_key(
             KeyRoute::Terminal
         };
     }
-    // GPUI may report the physical Ctrl+Shift+= either as Shift+equal or
-    // as Shift+plus. Check overrides first (above), including an unbound zoom.
+    // Ctrl+= zooms in like browsers and editors. GPUI may report the physical
+    // key, with or without Shift, as equal or plus. Check overrides first
+    // (above), including an unbound zoom.
     if platform == Platform::Windows
         && key.control
         && !key.alt
         && !key.command
         && !overrides.contains_key("zoom_in")
-        && ((key.shift
-            && ["equal", "=", "plus", "+"]
-                .iter()
-                .any(|candidate| key.key.eq_ignore_ascii_case(candidate)))
-            || (!key.shift
-                && ["plus", "+"]
-                    .iter()
-                    .any(|candidate| key.key.eq_ignore_ascii_case(candidate))))
+        && ["equal", "=", "plus", "+"]
+            .iter()
+            .any(|candidate| key.key.eq_ignore_ascii_case(candidate))
     {
         return route_command(Command::ZoomIn, context);
     }
@@ -1666,6 +1662,7 @@ mod tests {
 
         // GPUI folds Shift into printable punctuation on Windows.
         assert_eq!(route(ctrl("+")), KeyRoute::Command(Command::ZoomIn));
+        assert_eq!(route(ctrl("=")), KeyRoute::Command(Command::ZoomIn));
         assert_eq!(
             route(ShortcutKey {
                 shift: true,
