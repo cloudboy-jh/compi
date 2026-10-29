@@ -770,6 +770,18 @@ static ROWS: &[Row] = &[
         ),
     ),
     grouped(
+        "Events",
+        row(
+            "notification-focused-pane",
+            SettingsSection::Notifications,
+            "Focused pane",
+            "When the pane you're in notifies too: after you stop typing, clicking or scrolling for a while.",
+            "notify idle away active focused current pane typing inactive",
+            |_| vec![SettingsAction::Select(Popup::NotificationFocusedPane)],
+            |app, row, cx| app.render_notification_focused_pane_row(row, cx),
+        ),
+    ),
+    grouped(
         "Sound",
         row(
             "notification-sound",

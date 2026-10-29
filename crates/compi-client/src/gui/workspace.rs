@@ -402,6 +402,8 @@ pub(super) enum Popup {
     TerminalFont,
     /// Settings → Notifications → Delivery.
     NotificationDelivery,
+    /// Settings → Notifications → Focused pane.
+    NotificationFocusedPane,
     /// Settings → Notifications → Sound.
     NotificationSound,
     /// The theme list's More menu.
@@ -5003,6 +5005,9 @@ impl CompiApp {
             .text_size(px(UI_BODY_TEXT_SIZE))
             .font_weight(FontWeight::MEDIUM)
             .text_color(color(colors.foreground))
+            .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, _| {
+                this.notifications.input_seen();
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.handle_app_key(event, window, cx)
                     || (this.overlay.is_none() && this.handle_keystroke(&event.keystroke))
@@ -5014,6 +5019,7 @@ impl CompiApp {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_workspace_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_workspace_mouse_up))
             .child(gpui_base::TextSelectionLayer)
+            .child(self.render_input_watch(cx))
             .child(self.render_titlebar(window, cx))
             .child(
                 div()

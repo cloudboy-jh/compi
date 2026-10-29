@@ -326,6 +326,9 @@ impl NotificationSound {
     }
 }
 
+/// Longest `notifications.focused_pane_after` accepted, in seconds.
+pub const MAX_FOCUSED_PANE_AFTER: u32 = 3600;
+
 /// When and how a terminal's program status (OSC 7501) notifies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -336,6 +339,9 @@ pub struct NotificationSettings {
     /// A program reporting its work done.
     pub finished: bool,
     pub sound: NotificationSound,
+    /// Seconds without a key press, click or scroll in the active Compi window after
+    /// which its focused pane notifies too; 0: the focused pane never does.
+    pub focused_pane_after: u32,
 }
 
 impl Default for NotificationSettings {
@@ -345,6 +351,7 @@ impl Default for NotificationSettings {
             attention: true,
             finished: false,
             sound: NotificationSound::Off,
+            focused_pane_after: 30,
         }
     }
 }
@@ -456,6 +463,11 @@ impl LoadedConfig {
             set_table_value(table, "attention", settings.attention.into());
             set_table_value(table, "finished", settings.finished.into());
             set_table_value(table, "sound", settings.sound.id().into());
+            set_table_value(
+                table,
+                "focused_pane_after",
+                i64::from(settings.focused_pane_after).into(),
+            );
         })?;
         self.notifications = settings;
         Ok(())
@@ -1548,6 +1560,21 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                 ),
             }
         }
+        if let Some(value) = notifications.get("focused_pane_after") {
+            match value
+                .as_integer()
+                .and_then(|seconds| u32::try_from(seconds).ok())
+                .filter(|seconds| *seconds <= MAX_FOCUSED_PANE_AFTER)
+            {
+                Some(seconds) => loaded.notifications.focused_pane_after = seconds,
+                None => invalid(
+                    loaded,
+                    "notifications.focused_pane_after",
+                    "a whole number of seconds from 0 to 3600",
+                    "configuration",
+                ),
+            }
+        }
     }
     if let Some(workspace) = table(&document, "workspace", loaded) {
         if let Some(value) = workspace.get("confirm_close") {
@@ -2311,11 +2338,13 @@ mod tests {
         assert_eq!(defaults.delivery, NotificationDelivery::Automatic);
         assert!(defaults.attention && !defaults.finished);
         assert_eq!(defaults.sound, NotificationSound::Off);
+        assert_eq!(defaults.focused_pane_after, 30);
         let changed = NotificationSettings {
             delivery: NotificationDelivery::Both,
             attention: false,
             finished: true,
             sound: NotificationSound::Reminder,
+            focused_pane_after: 0,
         };
         loaded.save_notification_settings(changed).unwrap();
         assert_eq!(
@@ -2325,7 +2354,7 @@ mod tests {
         assert!(fs::read_to_string(&path).unwrap().contains("# retain me"));
 
         let invalid = parse(
-            "version = 1\n[notifications]\ndelivery = 'loud'\nfinished = 'yes'\nsound = 'bell'\nattention = false",
+            "version = 1\n[notifications]\ndelivery = 'loud'\nfinished = 'yes'\nsound = 'bell'\nattention = false\nfocused_pane_after = 3601",
             FontOverrides::default(),
         );
         assert_eq!(
@@ -2334,7 +2363,8 @@ mod tests {
         );
         assert!(!invalid.notifications.finished && !invalid.notifications.attention);
         assert_eq!(invalid.notifications.sound, NotificationSound::Off);
-        for key in ["delivery", "finished", "sound"] {
+        assert_eq!(invalid.notifications.focused_pane_after, 30);
+        for key in ["delivery", "finished", "sound", "focused_pane_after"] {
             assert!(
                 invalid
                     .diagnostics

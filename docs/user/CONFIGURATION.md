@@ -79,6 +79,7 @@ delivery = "automatic"  # "automatic" (in Compi while it is active, else from th
 attention = true        # a program is blocked on you: a permission, a question or a sign-in
 finished = false        # a program reports its work done
 sound = "off"           # or "default", "message", "mail", "reminder", "text_message": Windows' notification sounds, once per notification, unless Windows is quiet
+focused_pane_after = 30 # seconds without a key press, click or scroll in Compi before the pane you're in notifies too; 0 never, at most 3600
 ```
 
 ## Closing tabs and panes

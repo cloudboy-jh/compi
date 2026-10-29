@@ -10,8 +10,12 @@
 //! terminal, so one window per connection target, the oldest open, announces: the
 //! others stay silent. Nothing here acknowledges status; a toast's × only hides it.
 //!
-//! Sound travels only inside the system notification, so the system's sound settings,
-//! Focus Assist and Do Not Disturb decide whether it plays; toasts in Compi are silent.
+//! The pane the user is using stays silent: the focused pane of the active Compi
+//! window, until `focused_pane_after` seconds pass without a key press, click or
+//! scroll in that window (0: it stays silent while focused).
+//!
+//! A system notification carries its own sound; a toast shown only in Compi plays it
+//! through the same system quiet checks.
 
 use super::settings::{RowCx, SettingsAction};
 use super::*;
@@ -34,6 +38,8 @@ const MAX_TOASTS: usize = 3;
 const MAX_DETAIL_CHARS: usize = 140;
 /// How long the system's answer about notifications is reused.
 const OS_STATUS_TTL: Duration = Duration::from_secs(3);
+/// The waits Settings offers for Focused pane, in seconds; 0 is Never.
+const FOCUSED_PANE_CHOICES: [u32; 6] = [0, 15, 30, 60, 120, 300];
 /// What Settings and test results call the system that shows notifications.
 const SYSTEM_NAME: &str = if cfg!(windows) {
     "Windows"
@@ -83,6 +89,8 @@ pub(in crate::gui) struct NotificationsUi {
     /// What the last Play did, for Settings.
     sound_result: Option<String>,
     os_status: RefCell<Option<(Instant, OsStatus)>>,
+    /// The last key press, click or scroll in this window.
+    last_input: Instant,
 }
 
 /// Every Compi window by the target it connects to, oldest first: the first open one
@@ -121,7 +129,13 @@ impl NotificationsUi {
             test_result: None,
             sound_result: None,
             os_status: RefCell::new(None),
+            last_input: Instant::now(),
         }
+    }
+
+    /// The user pressed a key, clicked or scrolled in this window.
+    pub(in crate::gui) fn input_seen(&mut self) {
+        self.last_input = Instant::now();
     }
 
     pub(in crate::gui) fn test_result(&self) -> Option<&str> {
@@ -162,6 +176,30 @@ pub(in crate::gui) fn channels(delivery: NotificationDelivery, app_active: bool)
 /// in Compi, and no system notification carries it (so Both plays it once).
 fn sound_in_compi(wants_sound: bool, in_app: bool, system_sound: bool) -> bool {
     wants_sound && in_app && !system_sound
+}
+
+/// Whether the focused pane of the active window is in use: Never (0) keeps it in use
+/// while focused; otherwise input within the last `after` seconds does.
+fn focused_pane_in_use(since_input: Duration, after: u32) -> bool {
+    after == 0 || since_input < Duration::from_secs(u64::from(after))
+}
+
+/// What Focused pane's dropdown calls a wait.
+fn focused_pane_label(seconds: u32) -> String {
+    match seconds {
+        0 => "Never".into(),
+        seconds => format!("After {}", wait_text(seconds)),
+    }
+}
+
+/// A wait of `seconds`, in words: whole minutes as minutes.
+fn wait_text(seconds: u32) -> String {
+    match seconds {
+        1 => "1 second".into(),
+        60 => "1 minute".into(),
+        seconds if seconds % 60 == 0 => format!("{} minutes", seconds / 60),
+        seconds => format!("{seconds} seconds"),
+    }
 }
 
 /// What a delivery mode does, in a sentence.
@@ -402,27 +440,39 @@ impl CompiApp {
         self.deliver(notice, cx);
     }
 
-    /// The Compi window that is active, as `(window, focused pane)`; none while another
-    /// app is active.
-    fn active_compi(&self, cx: &App) -> Option<(WindowId, Option<PaneId>)> {
+    /// The Compi window that is active, as `(window, focused pane, time since its last
+    /// input)`; none while another app is active.
+    fn active_compi(&self, cx: &App) -> Option<(WindowId, Option<PaneId>, Duration)> {
         if self.notifications.window_active {
-            return Some((self.notifications.window_id, self.focused_pane().cloned()));
+            return Some((
+                self.notifications.window_id,
+                self.focused_pane().cloned(),
+                self.notifications.last_input.elapsed(),
+            ));
         }
         cx.windows().into_iter().find_map(|handle| {
             if handle.window_id() == self.notifications.window_id {
                 return None;
             }
             let app = handle.downcast::<CompiApp>()?.read(cx).ok()?;
-            app.notifications
-                .window_active
-                .then(|| (handle.window_id(), app.focused_pane().cloned()))
+            app.notifications.window_active.then(|| {
+                (
+                    handle.window_id(),
+                    app.focused_pane().cloned(),
+                    app.notifications.last_input.elapsed(),
+                )
+            })
         })
     }
 
-    /// Whether the user is using `pane_id`: it has the keyboard in Compi's active window.
+    /// Whether the user is using `pane_id`: it has the keyboard in Compi's active window
+    /// and Focused pane's wait has not passed since the last input there.
     fn in_use(&self, pane_id: &PaneId, cx: &App) -> bool {
+        let after = self.config.notifications.focused_pane_after;
         self.active_compi(cx)
-            .is_some_and(|(_, focused)| focused.as_ref() == Some(pane_id))
+            .is_some_and(|(_, focused, since_input)| {
+                focused.as_ref() == Some(pane_id) && focused_pane_in_use(since_input, after)
+            })
     }
 
     /// Sends `notice` where Notifications says, and says what happened.
@@ -531,6 +581,33 @@ impl CompiApp {
         cx.notify();
     }
 
+    /// Takes nothing on screen: records every click and scroll in the window, wherever
+    /// it lands and whatever handles it, for Focused pane. Keys are recorded by the
+    /// window's root.
+    pub(super) fn render_input_watch(&self, cx: &Context<Self>) -> AnyElement {
+        let app = cx.entity().downgrade();
+        gpui::canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let clicks = app.clone();
+                window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = clicks.update(cx, |app, _| app.notifications.input_seen());
+                    }
+                });
+                let scrolls = app.clone();
+                window.on_mouse_event(move |_: &ScrollWheelEvent, phase, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = scrolls.update(cx, |app, _| app.notifications.input_seen());
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+        .into_any_element()
+    }
+
     /// The bottom-right corner of the window: toasts, then the pasted image cards (not
     /// while a menu or dialog is open).
     pub(super) fn render_corner(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
@@ -631,6 +708,64 @@ impl CompiApp {
             .child(self.settings_focus_anchor(focused, cx))
             .into_any_element();
         self.settings_row(row.title, delivery_detail(current), control, row.compact)
+    }
+
+    /// Focused pane: a dropdown of how long the focused pane of the active window goes
+    /// without input before it notifies too. A value set in the file outside the choices
+    /// is listed with them.
+    pub(super) fn render_notification_focused_pane_row(
+        &self,
+        row: &RowCx,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let popup = Popup::NotificationFocusedPane;
+        let action = SettingsAction::Select(popup);
+        let current = self.config.notifications.focused_pane_after;
+        let mut choices = FOCUSED_PANE_CHOICES.to_vec();
+        if !choices.contains(&current) {
+            choices.push(current);
+            choices.sort_unstable();
+        }
+        let focused = self.settings_focused(row, action);
+        let open_row = row.clone();
+        let select = controls::select(
+            "notification-focused-pane-select",
+            choices
+                .iter()
+                .map(|seconds| controls::select_option(focused_pane_label(*seconds))),
+            choices.iter().position(|seconds| *seconds == current),
+            self.popup == Some(popup),
+        )
+        .placeholder(focused_pane_label(current))
+        .focused(focused)
+        .anchor(Anchor::TopRight)
+        .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+            this.focus_settings_control(&open_row, action);
+            this.set_popup(popup, *open);
+            cx.notify();
+        }))
+        .on_pick(cx.listener(move |this, index: &usize, _, cx| {
+            if let Some(seconds) = choices.get(*index) {
+                let mut settings = this.config.notifications;
+                settings.focused_pane_after = *seconds;
+                this.set_notification_settings(settings, cx);
+            }
+            cx.notify();
+        }));
+        let control = div()
+            .relative()
+            .flex_none()
+            .child(select)
+            .child(self.settings_focus_anchor(focused, cx))
+            .into_any_element();
+        let detail = match current {
+            0 => "The pane you're in stays quiet while Compi is the active app.".to_owned(),
+            seconds => format!(
+                "The pane you're in notifies too once you haven't typed, clicked or scrolled in its window for {}.",
+                wait_text(seconds)
+            ),
+        };
+        self.settings_row(row.title, detail, control, row.compact)
     }
 
     /// Sound: a dropdown (Off, or the system's notification sound) and Play, which plays
@@ -1033,6 +1168,18 @@ mod tests {
         assert!(!sound_in_compi(true, false, false));
         // Sound off.
         assert!(!sound_in_compi(false, true, false));
+    }
+
+    #[test]
+    fn the_focused_pane_notifies_only_after_its_wait_without_input() {
+        let secs = Duration::from_secs;
+        // Never: in use whenever focused, however long ago the last input was.
+        assert!(focused_pane_in_use(secs(3600), 0));
+        // Typing just now keeps it quiet; the wait passing lets it notify.
+        assert!(focused_pane_in_use(secs(0), 30));
+        assert!(focused_pane_in_use(secs(29), 30));
+        assert!(!focused_pane_in_use(secs(30), 30));
+        assert!(!focused_pane_in_use(secs(31), 30));
     }
 
     #[test]
