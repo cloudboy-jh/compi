@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # The development probe is deliberately external to the distributable bundle.
-# Requires the logged-in desktop session and Python 3 provided by macos-14.
+# Requires the logged-in desktop session and Python 3 provided by macos-15.
 # Usage: bash tools/smoke-macos-bundle.sh <artifact.dmg> <compi-probe> [<new.app.zip> <signed-metadata.json>]
 if (($# != 2 && $# != 4)); then
     printf 'Usage: bash tools/smoke-macos-bundle.sh <artifact.dmg> <compi-probe> [<new.app.zip> <signed-metadata.json>]\n' >&2

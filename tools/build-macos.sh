@@ -57,7 +57,7 @@ if [[ -n "$expected_tag" && "$expected_tag" != "v$version" ]]; then
     exit 1
 fi
 if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
-    printf 'Build on a native ARM64 macOS host (the release runner is macos-14).\n' >&2
+    printf 'Build on a native ARM64 macOS host (the release runner is macos-15).\n' >&2
     exit 1
 fi
 
@@ -93,8 +93,8 @@ PYTHON
 fi
 
 # GPUI 0.2.2 build.rs targets 10.15.7 for Metal, not the entire app.
-# The repository's native client build lane is macos-14; use that evidenced
-# baseline rather than claiming unqualified compatibility with macOS 11-13.
+# The client was first qualified on macOS 14 (the macos-14 lane, now macos-15);
+# keep that baseline rather than claiming unqualified compatibility with macOS 11-13.
 export MACOSX_DEPLOYMENT_TARGET=14.0
 target=aarch64-apple-darwin
 build_root="$project_root/target/macos-release"
