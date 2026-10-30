@@ -21,7 +21,7 @@ use super::settings::{RowCx, SettingsAction};
 use super::*;
 use crate::config::{NotificationDelivery, NotificationSound};
 use crate::gui::controls::IconName;
-use crate::gui::os_notifications::{self, OsNotice, OsStatus, OsSubmit};
+use crate::gui::os_notifications::{self, OsNotice, OsStatus, OsSubmit, SoundPlayed};
 use crate::program_status::{display_text, inherited_app};
 use compi_protocol::ProcessLifetimeId;
 use compi_protocol::program_status::{
@@ -47,6 +47,12 @@ const SYSTEM_NAME: &str = if cfg!(windows) {
     "macOS"
 } else {
     "The system"
+};
+/// The system whose sounds a shared configuration may name that this one can't play.
+const OTHER_SYSTEM_NAME: &str = if cfg!(target_os = "macos") {
+    "Windows"
+} else {
+    "macOS"
 };
 
 /// What a notification is about.
@@ -176,6 +182,18 @@ pub(in crate::gui) fn channels(delivery: NotificationDelivery, app_active: bool)
 /// in Compi, and no system notification carries it (so Both plays it once).
 fn sound_in_compi(wants_sound: bool, in_app: bool, system_sound: bool) -> bool {
     wants_sound && in_app && !system_sound
+}
+
+/// What a notification's sound or Play did, for Settings.
+fn sound_line(sound: NotificationSound, played: Result<SoundPlayed, String>) -> String {
+    let name = sound.on_this_system().label().to_lowercase();
+    match played {
+        Ok(SoundPlayed::Played) => format!("Played the {name} sound"),
+        Ok(SoundPlayed::Handed) => format!(
+            "Sent the {name} sound to {SYSTEM_NAME}; Focus or its notification sound setting can keep it quiet"
+        ),
+        Err(why) => format!("No sound: {why}"),
+    }
 }
 
 /// Whether the focused pane of the active window is in use: Never (0) keeps it in use
@@ -499,18 +517,15 @@ impl CompiApp {
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
-            let submitted = os_notifications::show(
-                cx,
-                OsNotice {
-                    tag,
-                    title: notice.title.clone(),
-                    body,
-                    sound: settings.sound,
-                },
-            );
+            let submitted = os_notifications::show(OsNotice {
+                tag,
+                title: notice.title.clone(),
+                body,
+                sound: settings.sound,
+            });
             outcome.push(match submitted {
                 OsSubmit::Submitted => {
-                    system_sound = wants_sound && os_notifications::sound_supported();
+                    system_sound = wants_sound;
                     format!("Sent to {}; it decides whether to show it", SYSTEM_NAME)
                 }
                 OsSubmit::Unavailable(why) => format!("Not sent to the system: {why}"),
@@ -532,10 +547,10 @@ impl CompiApp {
             outcome.push("Shown in Compi".to_owned());
         }
         if sound_in_compi(wants_sound, in_app, system_sound) {
-            outcome.push(match os_notifications::play_sound(settings.sound) {
-                Ok(()) => format!("Played the {} sound", settings.sound.label().to_lowercase()),
-                Err(why) => format!("No sound: {why}"),
-            });
+            outcome.push(sound_line(
+                settings.sound,
+                os_notifications::play_sound(settings.sound),
+            ));
         }
         outcome.join(". ")
     }
@@ -778,12 +793,14 @@ impl CompiApp {
         let popup = Popup::NotificationSound;
         let action = SettingsAction::Select(popup);
         let current = self.config.notifications.sound;
-        let sounds = NotificationSound::ALL;
+        let sounds = NotificationSound::choices();
         let focused = self.settings_focused(row, action);
         let open_row = row.clone();
         let select = controls::select(
             "notification-sound-select",
-            sounds.map(|sound| controls::select_option(sound.label())),
+            sounds
+                .iter()
+                .map(|sound| controls::select_option(sound.label())),
             sounds.iter().position(|sound| *sound == current),
             self.popup == Some(popup),
         )
@@ -820,9 +837,11 @@ impl CompiApp {
         let detail = match (&self.notifications.sound_result, current) {
             (Some(result), _) => result.clone(),
             (None, NotificationSound::Off) => "Notifications are silent.".into(),
-            (None, _) if !os_notifications::sound_supported() => {
-                "Compi can't play a sound for notifications on this system yet.".into()
-            }
+            (None, sound) if sound.on_this_system() != sound => format!(
+                "{} is a {OTHER_SYSTEM_NAME} sound, so {SYSTEM_NAME} plays its default sound.",
+                sound.label()
+            ),
+            (None, _) if cfg!(target_os = "macos") => "Plays once per notification, unless Focus is on or Compi's notification sounds are off in System Settings.".into(),
             (None, _) => format!(
                 "Plays once per notification, as your {SYSTEM_NAME} sound scheme sets it, unless {SYSTEM_NAME} is quiet (Do Not Disturb, presenting, a full-screen app) or its notification sounds are off."
             ),
@@ -833,10 +852,8 @@ impl CompiApp {
     /// Play: the notification sound now, through the same checks as a notification.
     pub(super) fn play_notification_sound(&mut self, cx: &mut Context<Self>) {
         let sound = self.config.notifications.sound;
-        self.notifications.sound_result = Some(match os_notifications::play_sound(sound) {
-            Ok(()) => format!("Played the {} sound.", sound.label().to_lowercase()),
-            Err(why) => format!("No sound: {why}."),
-        });
+        let played = os_notifications::play_sound(sound);
+        self.notifications.sound_result = Some(format!("{}.", sound_line(sound, played)));
         cx.notify();
     }
 
@@ -890,11 +907,6 @@ impl CompiApp {
             result.push_str(&format!(
                 ". Automatic shows it here while Compi is active, and sends it to {SYSTEM_NAME} while Compi is in the background"
             ));
-        }
-        if self.config.notifications.sound != NotificationSound::Off
-            && !os_notifications::sound_supported()
-        {
-            result.push_str(". This system's notifications play no sound from Compi yet");
         }
         result.push('.');
         self.notifications.test_result = Some(result);

@@ -275,29 +275,86 @@ impl NotificationDelivery {
     }
 }
 
-/// The sound a notification plays: one of the system's own notification sounds, as the
-/// user's sound scheme sets it. A custom sound file would be another variant here.
+/// The sound a notification plays: one of the system's own sounds. Windows offers its
+/// sound scheme's notification events, macOS its alert sounds (`/System/Library/Sounds`);
+/// a sound of the other system plays the default sound. A custom sound file would be
+/// another variant here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationSound {
     #[default]
     Off,
     Default,
+    // Windows.
     Message,
     Mail,
     Reminder,
     TextMessage,
+    // macOS.
+    Basso,
+    Blow,
+    Bottle,
+    Frog,
+    Funk,
+    Glass,
+    Hero,
+    Morse,
+    Ping,
+    Pop,
+    Purr,
+    Sosumi,
+    Submarine,
+    Tink,
 }
 
 impl NotificationSound {
-    pub const ALL: [Self; 6] = [
-        Self::Off,
-        Self::Default,
-        Self::Message,
-        Self::Mail,
-        Self::Reminder,
-        Self::TextMessage,
+    const WINDOWS: [Self; 4] = [Self::Message, Self::Mail, Self::Reminder, Self::TextMessage];
+    const MACOS: [Self; 14] = [
+        Self::Basso,
+        Self::Blow,
+        Self::Bottle,
+        Self::Frog,
+        Self::Funk,
+        Self::Glass,
+        Self::Hero,
+        Self::Morse,
+        Self::Ping,
+        Self::Pop,
+        Self::Purr,
+        Self::Sosumi,
+        Self::Submarine,
+        Self::Tink,
     ];
+
+    /// Every sound a configuration may name, on any system.
+    pub fn all() -> impl Iterator<Item = Self> {
+        [Self::Off, Self::Default]
+            .into_iter()
+            .chain(Self::WINDOWS)
+            .chain(Self::MACOS)
+    }
+
+    /// What Settings offers on this system: Off, Default and the system's own sounds.
+    pub fn choices() -> Vec<Self> {
+        let own: &[Self] = if cfg!(target_os = "macos") {
+            &Self::MACOS
+        } else {
+            &Self::WINDOWS
+        };
+        [Self::Off, Self::Default]
+            .into_iter()
+            .chain(own.iter().copied())
+            .collect()
+    }
+
+    /// The sound this system plays for `self`: another system's sound plays the default.
+    pub fn on_this_system(self) -> Self {
+        if Self::choices().contains(&self) {
+            self
+        } else {
+            Self::Default
+        }
+    }
 
     pub const fn id(self) -> &'static str {
         match self {
@@ -307,6 +364,20 @@ impl NotificationSound {
             Self::Mail => "mail",
             Self::Reminder => "reminder",
             Self::TextMessage => "text_message",
+            Self::Basso => "basso",
+            Self::Blow => "blow",
+            Self::Bottle => "bottle",
+            Self::Frog => "frog",
+            Self::Funk => "funk",
+            Self::Glass => "glass",
+            Self::Hero => "hero",
+            Self::Morse => "morse",
+            Self::Ping => "ping",
+            Self::Pop => "pop",
+            Self::Purr => "purr",
+            Self::Sosumi => "sosumi",
+            Self::Submarine => "submarine",
+            Self::Tink => "tink",
         }
     }
 
@@ -318,11 +389,25 @@ impl NotificationSound {
             Self::Mail => "Mail",
             Self::Reminder => "Reminder",
             Self::TextMessage => "Text message",
+            Self::Basso => "Basso",
+            Self::Blow => "Blow",
+            Self::Bottle => "Bottle",
+            Self::Frog => "Frog",
+            Self::Funk => "Funk",
+            Self::Glass => "Glass",
+            Self::Hero => "Hero",
+            Self::Morse => "Morse",
+            Self::Ping => "Ping",
+            Self::Pop => "Pop",
+            Self::Purr => "Purr",
+            Self::Sosumi => "Sosumi",
+            Self::Submarine => "Submarine",
+            Self::Tink => "Tink",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|sound| sound.id() == value)
+        Self::all().find(|sound| sound.id() == value)
     }
 }
 
@@ -1555,7 +1640,7 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                 None => invalid(
                     loaded,
                     "notifications.sound",
-                    "\"off\", \"default\", \"message\", \"mail\", \"reminder\" or \"text_message\"",
+                    "\"off\", \"default\" or a Windows or macOS sound name",
                     "configuration",
                 ),
             }
@@ -2374,6 +2459,33 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn another_systems_sound_is_kept_and_plays_the_default() {
+        let read = |sound: &str| {
+            parse(
+                &format!("version = 1\n[notifications]\nsound = '{sound}'"),
+                FontOverrides::default(),
+            )
+            .notifications
+            .sound
+        };
+        // A configuration shared between systems keeps either system's sound.
+        assert_eq!(read("mail"), NotificationSound::Mail);
+        assert_eq!(read("glass"), NotificationSound::Glass);
+        let (own, other) = if cfg!(target_os = "macos") {
+            (NotificationSound::Glass, NotificationSound::Mail)
+        } else {
+            (NotificationSound::Mail, NotificationSound::Glass)
+        };
+        assert_eq!(own.on_this_system(), own);
+        assert_eq!(other.on_this_system(), NotificationSound::Default);
+        assert_eq!(
+            NotificationSound::Off.on_this_system(),
+            NotificationSound::Off
+        );
+        assert!(!NotificationSound::choices().contains(&other));
     }
 
     #[test]

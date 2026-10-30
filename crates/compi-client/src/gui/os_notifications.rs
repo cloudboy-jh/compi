@@ -1,25 +1,25 @@
 //! Native OS notifications for terminal programs that need attention or finish.
 //!
-//! Windows posts toasts directly through `ToastNotificationManager` instead of
-//! GPUI's backend, for two reasons:
+//! Both platforms post directly instead of through GPUI's backend, which always
+//! posts silent notifications.
 //!
-//! - GPUI needs the process AppUserModelID set with
-//!   `SetCurrentProcessExplicitAppUserModelID`. The installed Start-menu
-//!   shortcut has no AppUserModelID, so an explicit process ID would split
-//!   Compi's taskbar button away from the pinned shortcut. Instead the
-//!   notifier is created for a per-user registered ID (`Compi.Compi`, or
-//!   `Compi.Compi.<instance>`) that only notifications use; the process and
-//!   its windows keep the shortcut's implicit ID.
-//! - GPUI always posts silent toasts. A notice with `sound` asks for the
-//!   default notification sound; without it the toast is silent.
+//! Windows posts toasts through `ToastNotificationManager`. GPUI would also need
+//! the process AppUserModelID set with `SetCurrentProcessExplicitAppUserModelID`;
+//! the installed Start-menu shortcut has no AppUserModelID, so an explicit process
+//! ID would split Compi's taskbar button away from the pinned shortcut. Instead the
+//! notifier is created for a per-user registered ID (`Compi.Compi`, or
+//! `Compi.Compi.<instance>`) that only notifications use; the process and its
+//! windows keep the shortcut's implicit ID.
 //!
-//! The sound only ever travels inside the OS notification, so Focus Assist /
-//! Do Not Disturb silence or hold it together with the banner; Compi never
-//! plays a sound of its own.
+//! macOS posts through `UNUserNotificationCenter`, which asks for permission on the
+//! first notification, cannot report that permission synchronously, and works only
+//! when Compi runs from its app bundle. Compi owns the center's delegate, so GPUI's
+//! system notification calls must stay unused.
 //!
-//! macOS goes through GPUI (`UNUserNotificationCenter`), which never sets a
-//! sound, asks for permission on the first notification, cannot report that
-//! permission, and works only when Compi runs from its app bundle.
+//! The notification sound travels inside the system notification, so Focus Assist,
+//! Do Not Disturb and Focus silence or hold it together with the banner. A toast shown
+//! only in Compi plays it through [`play_sound`], with the same quiet checks where the
+//! system allows them.
 //!
 //! On both platforms a successful [`show`] means the OS took the notification,
 //! not that it was presented: the user or a quiet mode may still hide it.
@@ -33,8 +33,7 @@ pub(in crate::gui) struct OsNotice {
     pub tag: String,
     pub title: String,
     pub body: String,
-    /// What it plays; `Off` is silent. macOS notifications are silent for now.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// What it plays; `Off` is silent.
     pub sound: NotificationSound,
 }
 
@@ -56,6 +55,16 @@ pub(in crate::gui) enum OsStatus {
     Off(String),
     /// The OS gives no answer (macOS): a note.
     Unknown(String),
+}
+
+/// What became of a sound [`play_sound`] did not refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::gui) enum SoundPlayed {
+    /// Compi played it.
+    Played,
+    /// Handed to the system, which plays it unless it is quiet.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Handed,
 }
 
 /// The OS page for notification settings, when there is one.
@@ -80,29 +89,22 @@ pub(in crate::gui) fn init(
     {
         // The bundle identifier, not an instance name, identifies the app here.
         let _ = instance;
-        cx.on_system_notification_response(move |response, cx| on_click(&response.tag, cx));
+        mac::init(cx, on_click);
     }
 }
 
-pub(in crate::gui) fn show(cx: &mut App, notice: OsNotice) -> OsSubmit {
+pub(in crate::gui) fn show(notice: OsNotice) -> OsSubmit {
+    let notice = OsNotice {
+        sound: notice.sound.on_this_system(),
+        ..notice
+    };
     #[cfg(windows)]
     {
-        let _ = cx;
         toast::show(notice)
     }
     #[cfg(target_os = "macos")]
     {
-        if !mac::in_app_bundle() {
-            return OsSubmit::Unavailable(mac::NOT_BUNDLED.to_owned());
-        }
-        // GPUI reports nothing back; a refusal is only logged.
-        cx.show_system_notification(gpui::SystemNotification {
-            tag: notice.tag.into(),
-            title: notice.title.into(),
-            body: notice.body.into(),
-            actions: Vec::new(),
-        });
-        OsSubmit::Submitted
+        mac::show(notice)
     }
 }
 
@@ -124,40 +126,295 @@ pub(in crate::gui) fn status() -> OsStatus {
     }
 }
 
-/// Whether this platform has a notification sound Compi can ask for.
-pub(in crate::gui) fn sound_supported() -> bool {
-    cfg!(windows)
-}
-
 /// Plays `sound` for a notification shown only in Compi (a system notification carries
 /// its own), unless the system wants quiet now: `Err` says why it did not play.
-pub(in crate::gui) fn play_sound(sound: NotificationSound) -> Result<(), String> {
+pub(in crate::gui) fn play_sound(sound: NotificationSound) -> Result<SoundPlayed, String> {
+    let sound = sound.on_this_system();
     #[cfg(windows)]
     {
-        toast::play_sound(sound)
+        toast::play_sound(sound).map(|()| SoundPlayed::Played)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = sound;
-        Err("Compi can't play notification sounds on macOS yet".into())
+        mac::play_sound(sound)
     }
 }
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
+    use super::{NotificationSound, OsNotice, OsSubmit, SoundPlayed};
+    use block2::RcBlock;
+    use gpui::App;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, Bool, ProtocolObject};
+    use objc2::{AnyThread, DefinedClass, class, define_class, msg_send};
+    use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSString, NSURL};
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
+        UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
+        UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    };
+    use std::cell::RefCell;
+    use std::ffi::c_void;
 
     pub(super) const NOT_BUNDLED: &str =
         "macOS shows notifications only when Compi runs from its app bundle";
 
-    /// GPUI leaves notifications off without a bundle identifier, as under
-    /// `cargo run`, because `UNUserNotificationCenter` aborts without one.
+    /// The request that carries the sound of a toast shown only in Compi. The delegate
+    /// presents it as sound alone, and each one replaces the last.
+    const SOUND_ONLY: &str = "compi-sound";
+
+    /// How long a sound-only notification stays delivered: macOS still keeps it in
+    /// Notification Center's history, so it goes once its sound has played.
+    const SOUND_ONLY_KEPT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// AudioToolbox's `kSystemSoundID_UserPreferredAlert`: the alert sound chosen in
+    /// System Settings.
+    const USER_PREFERRED_ALERT: u32 = 0x1000;
+
+    #[link(name = "AudioToolbox", kind = "framework")]
+    unsafe extern "C" {
+        fn AudioServicesCreateSystemSoundID(url: *const c_void, sound: *mut u32) -> i32;
+        fn AudioServicesPlayAlertSound(sound: u32);
+    }
+
+    struct State {
+        center: Retained<UNUserNotificationCenter>,
+        // The center holds its delegate weakly.
+        _delegate: Retained<Delegate>,
+        authorization_requested: bool,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+        /// Alert sounds loaded for AudioServices, which keeps them for the process.
+        static LOADED: RefCell<Vec<(NotificationSound, u32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// `UNUserNotificationCenter` aborts the process without a bundle identifier, as
+    /// under `cargo run`.
     pub(super) fn in_app_bundle() -> bool {
         unsafe {
             let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
             let identifier: *mut AnyObject = msg_send![bundle, bundleIdentifier];
             !identifier.is_null()
+        }
+    }
+
+    pub(super) fn init(cx: &mut App, on_click: impl Fn(&str, &mut App) + 'static) {
+        if !in_app_bundle() {
+            return;
+        }
+        let (clicks, receiver) = async_channel::unbounded::<String>();
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let delegate = Delegate::new(clicks);
+        center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        STATE.set(Some(State {
+            center,
+            _delegate: delegate,
+            authorization_requested: false,
+        }));
+        cx.spawn(async move |cx| {
+            while let Ok(tag) = receiver.recv().await {
+                cx.update(|cx| on_click(&tag, cx));
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn show(notice: OsNotice) -> OsSubmit {
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(&notice.title));
+        content.setBody(&NSString::from_str(&notice.body));
+        content.setSound(notification_sound(notice.sound).as_deref());
+        match post(&notice.tag, &content) {
+            Ok(()) => OsSubmit::Submitted,
+            Err(why) => OsSubmit::Unavailable(why),
+        }
+    }
+
+    /// While Compi is the active app the sound travels in a notification presented as
+    /// sound alone, so Focus and Compi's notification sound switch in System Settings
+    /// still silence it. A notification can't be sound alone while Compi is in the
+    /// background, so then Compi plays the alert sound itself.
+    pub(super) fn play_sound(sound: NotificationSound) -> Result<SoundPlayed, String> {
+        let Some(notification_sound) = notification_sound(sound) else {
+            return Ok(SoundPlayed::Played);
+        };
+        if app_active() && in_app_bundle() {
+            let content = UNMutableNotificationContent::new();
+            content.setTitle(&NSString::from_str("Compi"));
+            content.setSound(Some(&notification_sound));
+            post(SOUND_ONLY, &content)?;
+            // Presented or held back by Focus, it lands in Notification Center's history.
+            std::thread::spawn(|| {
+                std::thread::sleep(SOUND_ONLY_KEPT);
+                // The center is thread-safe.
+                UNUserNotificationCenter::currentNotificationCenter()
+                    .removeDeliveredNotificationsWithIdentifiers(&NSArray::from_retained_slice(&[
+                        NSString::from_str(SOUND_ONLY),
+                    ]));
+            });
+            return Ok(SoundPlayed::Handed);
+        }
+        let id = alert_sound(sound)?;
+        // SAFETY: `id` is a sound AudioServices created or a constant it defines.
+        unsafe { AudioServicesPlayAlertSound(id) };
+        Ok(SoundPlayed::Played)
+    }
+
+    /// The system's default notification sound, or an alert sound by its file name.
+    fn notification_sound(sound: NotificationSound) -> Option<Retained<UNNotificationSound>> {
+        match sound {
+            NotificationSound::Off => None,
+            NotificationSound::Default => Some(UNNotificationSound::defaultSound()),
+            named => Some(UNNotificationSound::soundNamed(&NSString::from_str(
+                named.label(),
+            ))),
+        }
+    }
+
+    /// `sound` loaded for AudioServices: the alert sound of System Settings for
+    /// Default, else its file in `/System/Library/Sounds`.
+    fn alert_sound(sound: NotificationSound) -> Result<u32, String> {
+        if sound == NotificationSound::Default {
+            return Ok(USER_PREFERRED_ALERT);
+        }
+        if let Some(id) = LOADED.with_borrow(|loaded| {
+            loaded
+                .iter()
+                .find(|(loaded, _)| *loaded == sound)
+                .map(|(_, id)| *id)
+        }) {
+            return Ok(id);
+        }
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&format!(
+            "/System/Library/Sounds/{}.aiff",
+            sound.label()
+        )));
+        let mut id = 0;
+        // SAFETY: `NSURL` is toll-free bridged to the `CFURLRef` it takes, and `url`
+        // outlives the call.
+        let status =
+            unsafe { AudioServicesCreateSystemSoundID(Retained::as_ptr(&url).cast(), &mut id) };
+        if status != 0 {
+            return Err(format!("macOS has no {} sound", sound.label()));
+        }
+        LOADED.with_borrow_mut(|loaded| loaded.push((sound, id)));
+        Ok(id)
+    }
+
+    fn app_active() -> bool {
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            msg_send![app, isActive]
+        }
+    }
+
+    /// Asks for permission once, then hands `content` to the center as `identifier`.
+    fn post(identifier: &str, content: &UNMutableNotificationContent) -> Result<(), String> {
+        STATE.with_borrow_mut(|state| {
+            let Some(state) = state.as_mut() else {
+                return Err(NOT_BUNDLED.to_owned());
+            };
+            if !state.authorization_requested {
+                state.authorization_requested = true;
+                let completion = RcBlock::new(|granted: Bool, error: *mut NSError| {
+                    // SAFETY: when non-null, `error` is valid for the callback.
+                    if let Some(error) = unsafe { error.as_ref() } {
+                        eprintln!(
+                            "Compi: macOS notification permission failed: {}",
+                            error.localizedDescription()
+                        );
+                    } else if !granted.as_bool() {
+                        eprintln!("Compi: macOS notification permission denied");
+                    }
+                });
+                state
+                    .center
+                    .requestAuthorizationWithOptions_completionHandler(
+                        UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+                        &completion,
+                    );
+            }
+            let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+                &NSString::from_str(identifier),
+                content,
+                None,
+            );
+            let completion = RcBlock::new(|error: *mut NSError| {
+                // SAFETY: when non-null, `error` is valid for the callback.
+                if let Some(error) = unsafe { error.as_ref() } {
+                    eprintln!(
+                        "Compi: macOS did not take a notification: {}",
+                        error.localizedDescription()
+                    );
+                }
+            });
+            state
+                .center
+                .addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+            Ok(())
+        })
+    }
+
+    struct DelegateIvars {
+        clicks: async_channel::Sender<String>,
+    }
+
+    define_class!(
+        // SAFETY: `NSObject` has no subclassing requirements and `Delegate` does not
+        // implement `Drop`.
+        #[unsafe(super(NSObject))]
+        #[name = "CompiNotificationDelegate"]
+        #[ivars = DelegateIvars]
+        struct Delegate;
+
+        unsafe impl NSObjectProtocol for Delegate {}
+
+        unsafe impl UNUserNotificationCenterDelegate for Delegate {
+            // The user clicked a notification, possibly on another thread.
+            #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+            fn did_receive_notification_response(
+                &self,
+                _center: &UNUserNotificationCenter,
+                response: &UNNotificationResponse,
+                completion_handler: &block2::DynBlock<dyn Fn()>,
+            ) {
+                let tag = response.notification().request().identifier().to_string();
+                if tag != SOUND_ONLY {
+                    // Unbounded: only fails once the receiving task is gone.
+                    let _ = self.ivars().clicks.try_send(tag);
+                }
+                completion_handler.call(());
+            }
+
+            // macOS asks only while Compi is the active app; without an answer it
+            // presents nothing. Whether to notify while active is Delivery's decision.
+            #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+            fn will_present_notification(
+                &self,
+                _center: &UNUserNotificationCenter,
+                notification: &UNNotification,
+                completion_handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
+            ) {
+                let options = if notification.request().identifier().to_string() == SOUND_ONLY {
+                    UNNotificationPresentationOptions::Sound
+                } else {
+                    UNNotificationPresentationOptions::Banner
+                        | UNNotificationPresentationOptions::List
+                        | UNNotificationPresentationOptions::Sound
+                };
+                completion_handler.call((options,));
+            }
+        }
+    );
+
+    impl Delegate {
+        fn new(clicks: async_channel::Sender<String>) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(DelegateIvars { clicks });
+            // SAFETY: `NSObject`'s `init` is its designated initializer.
+            unsafe { msg_send![super(this), init] }
         }
     }
 }
@@ -374,15 +631,16 @@ mod toast {
 
     /// The sound scheme event of `sound`: what Windows calls Notification, Instant
     /// Message Notification, New Mail Notification, Calendar Reminder and New Text
-    /// Message Notification.
+    /// Message Notification. macOS's sounds arrive here already turned into Default
+    /// (`on_this_system`).
     fn sound_event(sound: NotificationSound) -> Option<&'static str> {
         match sound {
             NotificationSound::Off => None,
-            NotificationSound::Default => Some("Notification.Default"),
             NotificationSound::Message => Some("Notification.IM"),
             NotificationSound::Mail => Some("Notification.Mail"),
             NotificationSound::Reminder => Some("Notification.Reminder"),
             NotificationSound::TextMessage => Some("Notification.SMS"),
+            _ => Some("Notification.Default"),
         }
     }
 

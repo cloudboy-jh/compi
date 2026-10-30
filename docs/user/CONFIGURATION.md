@@ -78,7 +78,7 @@ sidebar = true  # state at the start of the sidebar and palette status line
 delivery = "automatic"  # "automatic" (in Compi while it is active, else from the system), "in_app", "os" or "both"
 attention = true        # a program is blocked on you: a permission, a question or a sign-in
 finished = false        # a program reports its work done
-sound = "off"           # or "default", "message", "mail", "reminder", "text_message": Windows' notification sounds, once per notification, unless Windows is quiet
+sound = "off"           # or "default"; Windows: "message", "mail", "reminder", "text_message"; macOS: "basso", "blow", "bottle", "frog", "funk", "glass", "hero", "morse", "ping", "pop", "purr", "sosumi", "submarine", "tink". Once per notification, unless the system is quiet; the other system's sounds play the default
 focused_pane_after = 30 # seconds without a key press, click or scroll in Compi before the pane you're in notifies too; 0 never, at most 3600
 ```
 

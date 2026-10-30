@@ -1242,6 +1242,8 @@ dependencies = [
  "mermaid-rs-renderer",
  "mitex",
  "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
  "parking_lot",
  "pulldown-cmark",
  "raw-window-handle",
