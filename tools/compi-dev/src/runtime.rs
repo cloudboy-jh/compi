@@ -470,6 +470,8 @@ impl Effects for Dev {
             // Prepare while the old preview is still on screen.
             let built = self.client_build.as_ref().ok_or("no client build")?;
             install(built, &next)?;
+            #[cfg(target_os = "macos")]
+            sign(&next)?;
         }
         let swap = Instant::now();
         self.stop_preview();
@@ -517,6 +519,28 @@ fn install(from: &Path, to: &Path) -> Result<(), String> {
     retry(|| std::fs::copy(from, &staging).map(drop))
         .map_err(|error| format!("copy {} → {}: {error}", from.display(), staging.display()))?;
     replace(&staging, to)
+}
+
+/// The linker signs `executable` ad hoc under a hash-derived identifier, and macOS
+/// services such as notifications refuse a bundle whose code identifier differs from its
+/// bundle identifier; re-sign it under the bundle's.
+#[cfg(target_os = "macos")]
+fn sign(executable: &Path) -> Result<(), String> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--identifier"])
+        .arg(crate::layout::BUNDLE_IDENTIFIER)
+        .arg(executable)
+        .output()
+        .map_err(|error| format!("codesign {}: {error}", executable.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "codesign {}: {}",
+            executable.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 /// Rename with retries: antivirus and sync clients briefly hold new executables open.

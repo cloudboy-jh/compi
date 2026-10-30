@@ -168,8 +168,20 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// The preview's bundle identifier, for `INFO_PLIST` and its code signature.
 #[cfg(target_os = "macos")]
-const INFO_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+macro_rules! bundle_identifier {
+    () => {
+        "com.compi.dev-preview"
+    };
+}
+
+#[cfg(target_os = "macos")]
+pub const BUNDLE_IDENTIFIER: &str = bundle_identifier!();
+
+#[cfg(target_os = "macos")]
+const INFO_PLIST: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -177,7 +189,9 @@ const INFO_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>CFBundleDisplayName</key><string>Compi Dev</string>
     <key>CFBundleName</key><string>Compi Dev</string>
     <key>CFBundleExecutable</key><string>compi</string>
-    <key>CFBundleIdentifier</key><string>com.compi.dev-preview</string>
+    <key>CFBundleIdentifier</key><string>"#,
+    bundle_identifier!(),
+    r#"</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.0.0</string>
@@ -186,7 +200,8 @@ const INFO_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
 </plist>
-"#;
+"#
+);
 
 #[cfg(test)]
 mod tests {
