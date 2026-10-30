@@ -1,39 +1,29 @@
-# 0.5.0
+# 0.5.1
 
-- Notifications when a program needs you or finishes, in Compi or from Windows
-- A home page for blank browser panes: local servers running now and recent sites
-- `compi` commands print readable tables and lines in a terminal
-- `compi help` lists every command
+- macOS: notifications play a sound, with macOS's alert sounds to choose from
+- **Focused pane**: the pane you're in notifies too once you've stepped away
+- Tab tooltips state program status once
+- Windows: plain Ctrl+= zooms in
 - Updating ends running shells: the daemon restarts
 
 ## Notifications
 
-- When a program in a terminal you are not using asks for a permission, a question's answer or a sign-in, Compi tells you. Programs report this through program status (OSC 7501), as they already do for the tab glyphs.
-- **Settings → Notifications** (a new section, also `compi settings notifications`) picks the delivery: **Automatic** shows a card at the bottom right of the window while Compi is the active app and a system notification while it is in the background; **In-app only**, **System only** and **Both** do just that. **Send test** sends one with your settings.
-- **Needs attention** is on by default; **Finished** (a program reports its work done) is off.
-- Click a card or notification to go to that terminal. A card closes after 6 seconds; at most three show at once.
-- **Sound** is off by default. Pick one of Windows' notification sounds (Default, Message, Mail, Reminder or Text message) and hear it with **Play**. It plays once per notification, and not while Windows is quiet (Do Not Disturb, presenting, a full-screen app).
-- Each notification comes once, from one window, when the state changes; reopening Compi does not repeat old ones.
-- The settings are also in `config.toml` under `[notifications]`; see [Configuration](CONFIGURATION.md#notifications).
+- On macOS, **Sound** offers Default and macOS's alert sounds (Basso, Blow, Bottle, Frog, Funk, Glass, Hero, Morse, Ping, Pop, Purr, Sosumi, Submarine, Tink), with **Play** to hear one. The sound comes with the system notification, or with the card in Compi, once per notification. Focus and Compi's **Play sound for notifications** switch in System Settings silence it, except for a card's sound while Compi is in the background with **In-app only**.
+- A `config.toml` shared between Windows and macOS keeps either system's sound; the other system plays its default sound.
+- **Focused pane** (Settings → Notifications → Events, `notifications.focused_pane_after`): the pane you're in counts as in use only while you're active. After 30 seconds without a key press, click or scroll in its window (by default), it notifies too. **Never** keeps it quiet while focused.
 
-## Browser
+## Fixes
 
-- A Browser pane without an address shows a home page. **Running here** lists local servers your terminals printed addresses for (such as a dev server's `Local:` line) that answer now, this tab's first. **Recent** lists the window's last five sites. Back from the first page returns home.
-
-## Command line
-
-- In a terminal, list commands print tables, `show` commands print `name: value` lines, and window actions say what the window did. Long names and paths are shortened to fit; IDs always print whole.
-- Piped or redirected, commands print indented JSON as before. `--json` always prints the same single line, so scripts and agents should pass it.
-- `compi help` lists every command by what it works on, with options, output rules and exit codes; `compi help pane` or `compi pane` lists a command's actions. `compi --json help` returns them all.
-- An unknown command says so, suggests the closest one and exits 2 instead of opening the app.
+- Hovering a tab shows its title and its programs' records without repeating the state, and a tab with one pane no longer repeats the pane's name.
+- Windows: Ctrl+= zooms in like Ctrl+Shift+=, as in browsers and editors.
 
 ## Updating
 
-- **Running shells end.** The update restarts the local daemon after you consent: daemon protocol 35 (0.4.x used 34). Workspace format 8 is unchanged, so your workspace carries over. Save your work first. Remote daemons are not restarted by the local updater.
-- **Windows, from 0.3.0 or earlier:** run [Compi 0.5.0 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.5.0/Compi-0.5.0-Setup.exe) once; the older update helper cannot replace itself. From 0.3.1, update in the app.
+- **Running shells end.** The update restarts the local daemon after you consent. Daemon protocol 35 and workspace format 8 are unchanged, so your workspace carries over. Save your work first. Remote daemons are not restarted by the local updater.
+- **Windows, from 0.3.0 or earlier:** run [Compi 0.5.1 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.5.1/Compi-0.5.1-Setup.exe) once; the older update helper cannot replace itself. From 0.3.1, update in the app.
 
 ## Limitations
 
-- macOS: notifications have no sound yet, and notifications have not yet been checked on a Mac. The browser pane and the PDF, audio and video previews have not yet been checked on screen there either.
+- macOS: clicking a system notification has not yet been checked on a Mac. The browser pane and the PDF, audio and video previews have not yet been checked on screen there.
 - Animated GIF and WebP show their first frame only.
 - Windows packages are not publisher-signed. The macOS app is ad-hoc signed, not notarized. Operating-system trust warnings may appear; signed update metadata does not replace publisher signing.
