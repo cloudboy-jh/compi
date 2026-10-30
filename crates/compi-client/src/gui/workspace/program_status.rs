@@ -175,11 +175,15 @@ impl CompiApp {
         )
     }
 
-    /// Hover text for the tab's program status: every reporting pane by name, then its
-    /// records, so a program cannot pose as one in another terminal.
+    /// Hover text for the tab's program status. A tab of one pane has its name as the
+    /// tooltip title, so only its records; otherwise every reporting pane by name, then
+    /// its records, so a program cannot pose as one in another terminal.
     pub(super) fn tab_program_detail(&self, tab: &WorkspaceTab) -> String {
         let mut leaves = Vec::new();
         collect_leaves(&tab.layout, &mut leaves);
+        if let [(_, Some(surface))] = leaves.as_slice() {
+            return self.pane_program_detail(surface);
+        }
         let titles = self.tab_panes(tab);
         let mut lines = Vec::new();
         for (pane_id, surface) in &leaves {
@@ -259,7 +263,8 @@ impl CompiApp {
             )
     }
 
-    /// `program_status_glyph` with the tooltip `title` and `detail`.
+    /// `program_status_glyph` with the tooltip `title` and `detail`; the records in
+    /// `detail` say the state, so the title does not repeat it.
     pub(super) fn render_program_status(
         &self,
         id: impl Into<gpui::ElementId>,
@@ -271,30 +276,27 @@ impl CompiApp {
         self.program_status_glyph(headline, show_progress)
             .id(id)
             .tooltip(controls::tooltip(
-                format!("{title} · {}", status::headline_label(headline)),
+                title,
                 (!detail.is_empty()).then(|| detail.into()),
                 None,
             ))
             .into_any_element()
     }
 
-    /// Hover for a tab chip: its full `title`, and with the tab's `headline` the state
-    /// its panes most need the user for and every reporting pane's records.
+    /// Hover for a tab chip: its full `title`, and with `show_status` the records of
+    /// its panes (the chip's glyph shows the state they most need the user for).
     pub(super) fn tab_tooltip(
         &self,
         tab: &WorkspaceTab,
         title: &str,
-        headline: Option<Headline>,
+        show_status: bool,
     ) -> (String, Option<SharedString>) {
         let title = status::display_text(title);
-        let Some(headline) = headline else {
+        if !show_status {
             return (title, None);
-        };
+        }
         let detail = self.tab_program_detail(tab);
-        (
-            format!("{title} · {}", status::headline_label(headline)),
-            (!detail.is_empty()).then(|| detail.into()),
-        )
+        (title, (!detail.is_empty()).then(|| detail.into()))
     }
 
     /// The tiled pane's status: a dot in the top padding band, which never covers a
@@ -321,11 +323,7 @@ impl CompiApp {
                 .justify_center()
                 .child(div().size(px(6.0)).rounded_full().bg(tint))
                 .tooltip(controls::tooltip(
-                    format!(
-                        "{} · {}",
-                        status::display_text(&title),
-                        status::headline_label(headline)
-                    ),
+                    status::display_text(&title),
                     Some(self.pane_program_detail(surface_id).into()),
                     None,
                 ))

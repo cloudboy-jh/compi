@@ -5283,7 +5283,8 @@ impl CompiApp {
                 Some(secondary) => format!("{primary} · {secondary}"),
                 None => primary.clone(),
             };
-            let (tooltip_title, tooltip_detail) = self.tab_tooltip(tab, &full_title, headline);
+            let (tooltip_title, tooltip_detail) =
+                self.tab_tooltip(tab, &full_title, headline.is_some());
             // Not over its own menu or while the tab is dragged.
             let tooltip = self.tab_menu.is_none()
                 && self.context_menu.is_none()
