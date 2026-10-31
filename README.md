@@ -2,11 +2,11 @@
 
 # Compi
 
-**A native terminal workspace that any agent can drive.**
+**A workspace for your software factory.**
 
-You and your agent share the same workspace. It can arrange terminals, run work, inspect results and open changes for you to review, all in the workspace you're looking at. Close the window and your shells keep running.
+Compi is a native terminal workspace for Windows (WSL2) and macOS. Run your preferred agents, write instructions in Markdown, review diffs and inspect your app beside its running terminals.
 
-Native on Windows (WSL2) and macOS. [Download Compi](https://github.com/cloudboy-jh/compi/releases).
+Close the window and your shells keep running. [Download Compi](https://github.com/cloudboy-jh/compi/releases) or [work with agents](docs/user/AGENT_WORKFLOW.md).
 
 [![Core CI](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml/badge.svg?branch=main)](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml)
 
@@ -36,7 +36,7 @@ compi pane capture --scope scrollback --format text
 
 See when a program is working, waiting on you, done or failed, even in a background tab. Hover its status indicator for the message, progress and what it needs from you.
 
-Supporting programs report this through the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501). Compi displays their reports rather than guessing from terminal output, and exposes the same status through the CLI. [How program status works](docs/user/USAGE.md#program-status).
+Supporting programs report this through the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501). Compi displays their reports rather than guessing from terminal output, and exposes the same status through the CLI. Enable notifications to return to the terminal that needs your attention. [How program status works](docs/user/USAGE.md#program-status).
 
 ## Beyond the terminal
 
@@ -71,6 +71,7 @@ Shells in the preview survive client rebuilds. See the [development guide](docs/
 
 ## Documentation
 
+- [Work with agents](docs/user/AGENT_WORKFLOW.md)
 - [Usage and CLI reference](docs/user/USAGE.md)
 - [Configuration](docs/user/CONFIGURATION.md)
 - [Development](docs/dev/DEVELOPMENT.md) and [architecture](docs/dev/Spec.md)
