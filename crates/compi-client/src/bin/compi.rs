@@ -12,6 +12,8 @@ struct Arguments {
     instance: Option<String>,
     connect: Option<String>,
     working_directory: Option<String>,
+    /// A file or folder the system asks Compi to open (Explorer's Open with).
+    open: Option<String>,
     config: Option<PathBuf>,
     font: FontOverrides,
     theme: Option<String>,
@@ -29,6 +31,7 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
     let mut connect = None;
     let mut working_directory = None;
     let mut config = None;
+    let mut open = None;
     let mut family = None;
     let mut size = None;
     let mut line_height = None;
@@ -43,6 +46,7 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
             "--connect" => &mut connect,
             "--working-directory" => &mut working_directory,
             "--config" => &mut config,
+            "--open" => &mut open,
             "--font-family" => &mut family,
             "--font-size" => &mut size,
             "--line-height" => &mut line_height,
@@ -64,6 +68,12 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
             args.next()
                 .filter(|value| !value.is_empty() && !value.starts_with("--"))
                 .ok_or_else(|| format!("{argument} requires a value"))?,
+        );
+    }
+    if open.is_some() && (working_directory.is_some() || connect.is_some()) {
+        return Err(
+            "--open opens a file or folder on this computer; it takes no working directory or --connect"
+                .into(),
         );
     }
     if update_restore.is_some()
@@ -111,6 +121,7 @@ fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Arguments, 
         instance,
         connect,
         working_directory,
+        open,
         config: config.map(PathBuf::from),
         font,
         theme,
@@ -143,7 +154,7 @@ fn main() {
         Ok(args) => args,
         Err(error) => {
             eprintln!(
-                "{error}\nUsage: compi [--instance NAME] [--connect [USER@]HOST[:PORT]] [--working-directory PATH | PATH] [--config PATH] [--font-family FAMILY] [--font-size SIZE] [--line-height MULTIPLIER] [--theme NAME] [--sidebar-width WIDTH]"
+                "{error}\nUsage: compi [--instance NAME] [--connect [USER@]HOST[:PORT]] [--working-directory PATH | PATH | --open PATH] [--config PATH] [--font-family FAMILY] [--font-size SIZE] [--line-height MULTIPLIER] [--theme NAME] [--sidebar-width WIDTH]"
             );
             std::process::exit(2);
         }
@@ -206,14 +217,40 @@ fn main() {
     let mut config = compi_client::config::load(args.config.as_deref(), args.font);
     config.apply_presentation_overrides(args.theme.as_deref(), args.sidebar_width);
     config.diagnostics.extend(args.diagnostics);
-    let request = compi_client::window_host::LaunchRequest::new(args.working_directory, config);
+    let mut request = compi_client::window_host::LaunchRequest::new(args.working_directory, config);
+    if let Some(path) = &args.open {
+        // The host may run in another directory: send the path whole.
+        match std::path::absolute(path) {
+            Ok(path) => {
+                request.mode = compi_client::window_host::LaunchMode::Open {
+                    path: path.to_string_lossy().into_owned(),
+                }
+            }
+            Err(error) => {
+                eprintln!("Cannot open {path}: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+    // Explorer let this process come to the front; the running host shows the file.
+    #[cfg(windows)]
+    if args.open.is_some() {
+        use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+        // SAFETY: no pointers; failure only leaves the window behind.
+        let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+    }
     match compi_client::window_host::acquire(host_instance.as_deref(), request) {
         Ok(compi_client::window_host::HostAcquisition::Forwarded) => {}
         Ok(compi_client::window_host::HostAcquisition::Host(mut host, request)) => {
             let receiver = host.take_receiver();
+            let open = match request.mode {
+                compi_client::window_host::LaunchMode::Open { path } => Some(path),
+                _ => None,
+            };
             compi_client::gui::run(
                 target,
                 request.initial_working_directory,
+                open,
                 request.config,
                 Some(receiver),
             );
@@ -344,5 +381,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn open_names_one_local_path_and_no_working_directory() {
+        let args = parse_arguments(
+            ["--instance", "work", "--open", r"C:\Users\me\My Notes\a.md"].map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(args.open.as_deref(), Some(r"C:\Users\me\My Notes\a.md"));
+        assert_eq!(args.working_directory, None);
+        for conflicting in [
+            vec!["--open", "a.md", "/project"],
+            vec!["--open", "a.md", "--working-directory", "/project"],
+            vec!["--open", "a.md", "--connect", "host"],
+            vec!["--open", "a.md", "--open", "b.md"],
+            vec!["--open"],
+        ] {
+            assert!(parse_arguments(conflicting.into_iter().map(str::to_owned)).is_err());
+        }
     }
 }

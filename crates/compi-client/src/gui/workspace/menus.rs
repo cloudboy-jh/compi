@@ -234,7 +234,11 @@ impl CompiApp {
 
     /// The pane action set for `pane_id` as menu entries; shortcut hints show when
     /// the pane is the focused one, which is what a shortcut acts on.
-    fn pane_action_entries(&self, pane_id: &PaneId, cx: &Context<Self>) -> Vec<MenuEntry> {
+    pub(super) fn pane_action_entries(
+        &self,
+        pane_id: &PaneId,
+        cx: &Context<Self>,
+    ) -> Vec<MenuEntry> {
         let Some((_, facts)) = self.pane_facts(pane_id) else {
             return Vec::new();
         };

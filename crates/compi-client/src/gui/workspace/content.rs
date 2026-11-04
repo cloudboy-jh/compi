@@ -16,6 +16,7 @@ use super::tree_ui::tree_entry_icon;
 use super::unsaved::{self, Backup, Backups, SaveTicket};
 use super::*;
 use crate::gui::controls::{self, ChipTone, IconName, icon_button, text_button};
+use crate::gui::open_with;
 use compi_protocol::{
     ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileKind, FileState,
     FileVersion, FolderContent, GitChanges, GitScope, MAX_CONTENT_FILE_BYTES, PaneContent,
@@ -2901,6 +2902,7 @@ impl CompiApp {
             Some(changes::TreeMark::File { path, .. }) => Some(path.clone()),
             _ => None,
         };
+        let environment = ui.environment.clone();
         let (open_pane, diff_pane) = (pane_id.clone(), pane_id.clone());
         let mut entries = vec![
             controls::menu_item(
@@ -2929,6 +2931,11 @@ impl CompiApp {
             );
         }
         entries.push(controls::MenuEntry::Separator);
+        let native = self.open_with_entries(&environment, &path, folder, cx);
+        if !native.is_empty() {
+            entries.extend(native);
+            entries.push(controls::MenuEntry::Separator);
+        }
         entries.push(
             controls::menu_item("Copy path", move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
@@ -2943,6 +2950,160 @@ impl CompiApp {
         );
         entries.push(controls::MenuEntry::Separator);
         entries.push(self.pane_submenu(pane_id, cx));
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
+    /// **Open with** (the default app, the other apps the system suggests and its
+    /// chooser) for a file, and **Reveal in File Explorer / Finder** for a file or
+    /// folder `path` of `environment`. None in an SSH window, whose files are not on
+    /// this computer.
+    pub(super) fn open_with_entries(
+        &self,
+        environment: &ContentEnvironment,
+        path: &str,
+        folder: bool,
+        cx: &Context<Self>,
+    ) -> Vec<controls::MenuEntry> {
+        if self.target.is_remote() {
+            return Vec::new();
+        }
+        let Some(native) = open_with::native_path(environment, path) else {
+            return Vec::new();
+        };
+        let item = |label: String, action: open_with::Action| -> controls::MenuEntry {
+            let native = native.clone();
+            controls::menu_item(
+                label,
+                cx.listener(move |this, _, _, cx| {
+                    this.open_natively(native.clone(), action.clone(), cx);
+                }),
+            )
+            .into()
+        };
+        let mut entries = Vec::new();
+        if !folder {
+            let apps = open_with::apps(&native);
+            let mut choices = Vec::new();
+            if let Some(name) = apps.default {
+                choices.push(item(
+                    format!("{name} (default)"),
+                    open_with::Action::Default,
+                ));
+                if !apps.others.is_empty() {
+                    choices.push(controls::MenuEntry::Separator);
+                }
+            }
+            choices.extend(
+                apps.others
+                    .into_iter()
+                    .map(|app| item(app.name.clone(), open_with::Action::With(app))),
+            );
+            if !choices.is_empty() {
+                choices.push(controls::MenuEntry::Separator);
+            }
+            #[cfg(windows)]
+            choices.push(item(
+                "Choose another app…".into(),
+                open_with::Action::Choose,
+            ));
+            #[cfg(target_os = "macos")]
+            {
+                let chosen = native.clone();
+                choices.push(
+                    controls::menu_item(
+                        "Choose another app…",
+                        cx.listener(move |this, _, _, cx| {
+                            this.choose_app_for(chosen.clone(), cx);
+                        }),
+                    )
+                    .into(),
+                );
+            }
+            entries.push(controls::submenu("Open with", choices));
+        }
+        entries.push(item(
+            open_with::REVEAL_LABEL.to_owned(),
+            open_with::Action::Reveal,
+        ));
+        entries
+    }
+
+    /// Hands `path` to the system for `action`; a failure shows in the window.
+    fn open_natively(
+        &mut self,
+        path: std::path::PathBuf,
+        action: open_with::Action,
+        cx: &mut Context<Self>,
+    ) {
+        let done = open_with::run(path, action);
+        cx.spawn(async move |this, cx| {
+            let error = match done.recv().await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error,
+                Err(_) => "Could not start opening the file".to_owned(),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.global_error = Some(error);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// macOS has no app chooser of its own: pick an app, then open `path` with it.
+    #[cfg(target_os = "macos")]
+    fn choose_app_for(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(apps))) = picker.await else {
+                return;
+            };
+            let Some(app) = apps.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.open_natively(
+                    path,
+                    open_with::Action::With(open_with::App::chosen(&app)),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// Right-click in a content pane outside its rows (its file tabs, header, an
+    /// image or a placeholder): Open with and Reveal for the file it shows, then the
+    /// pane actions.
+    fn open_content_pane_menu(
+        &mut self,
+        pane_id: &PaneId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| find_content(workspace, pane_id))
+            .and_then(|content| {
+                let tab = content.active.as_ref()?;
+                // A past commit's file may not be in the work tree.
+                (!matches!(tab.diff_scope(), Some(GitScope::Commit(_))))
+                    .then(|| (content.environment.clone(), tab.path().to_owned()))
+            });
+        let mut entries = shown
+            .map(|(environment, path)| self.open_with_entries(&environment, &path, false, cx))
+            .unwrap_or_default();
+        if !entries.is_empty() {
+            entries.push(controls::MenuEntry::Separator);
+        }
+        entries.extend(self.pane_action_entries(pane_id, cx));
         self.open_menu(position, Anchor::TopLeft, entries, window, cx);
     }
 
@@ -3214,7 +3375,7 @@ impl CompiApp {
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.focus_pane(menu_id.clone());
-                    this.open_pane_menu(&menu_id, event.position, Anchor::TopLeft, window, cx);
+                    this.open_content_pane_menu(&menu_id, event.position, window, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),

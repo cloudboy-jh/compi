@@ -574,6 +574,28 @@ impl LoadedConfig {
         Ok(())
     }
 
+    /// Changes `[keybindings]`: each command ID gets a binding (`""` unbinds it) or,
+    /// with `None`, loses its entry and takes the platform default again.
+    pub fn save_keybindings(&mut self, changes: &[(&str, Option<String>)]) -> Result<(), String> {
+        update_table(&self.path, "keybindings", |table| {
+            for (id, binding) in changes {
+                match binding {
+                    Some(binding) => set_table_value(table, id, binding.as_str().into()),
+                    None => {
+                        table.remove(id);
+                    }
+                }
+            }
+        })?;
+        for (id, binding) in changes {
+            match binding {
+                Some(binding) => self.keybindings.insert((*id).to_owned(), binding.clone()),
+                None => self.keybindings.remove(*id),
+            };
+        }
+        Ok(())
+    }
+
     pub fn save_update_settings(&mut self, updates: UpdateSettings) -> Result<(), String> {
         update_table(&self.path, "updates", |table| {
             // The new key takes over the legacy line and its comments.

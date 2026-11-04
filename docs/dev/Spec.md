@@ -744,7 +744,7 @@ The palette (`gui/workspace/palette.rs`) is a drop-down under the chrome, at mos
 
 ## Configuration and appearance
 
-Use a versioned TOML configuration with documented defaults. An **Open configuration file** command, compact **Quick Appearance**, and a comprehensive in-window **Settings** panel are baseline. Settings edits appearance and bundled interface/terminal font choices directly, and shell prompt settings in the target environment (stored there under `~/.compi/prompt`, not in TOML); launch profiles, limits, custom font families, and advanced keybindings remain inspectable/editable through TOML.
+Use a versioned TOML configuration with documented defaults. An **Open configuration file** command, compact **Quick Appearance**, and a comprehensive in-window **Settings** panel are baseline. Settings edits appearance and bundled interface/terminal font choices directly, shell prompt settings in the target environment (stored there under `~/.compi/prompt`, not in TOML), and keybindings (Settings → Keyboard records a command's keys into `[keybindings]`, moving keys another command held and resetting to the platform default); launch profiles, limits and custom font families remain inspectable/editable through TOML.
 
 Settings uses a persistent section rail at normal widths and wrapped section controls in narrow windows. Overlay focus stays trapped; Settings and form dialogs use Tab/Shift-Tab for actionable controls, list dialogs use arrow navigation, Escape cancels or returns from nested theme browsing, and destructive confirmations default to Cancel, except the opt-in tab/pane close confirmation, which focuses its Close button. Modal text and focus treatments meet WCAG AA contrast against every bundled application surface.
 

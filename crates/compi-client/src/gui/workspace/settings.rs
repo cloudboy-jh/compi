@@ -53,6 +53,8 @@ pub(super) const RESOURCES_ROW: &str = "compi-resources";
 pub(super) const DIAGNOSTICS_ROW: &str = "performance-diagnostics";
 /// Rebuild renderer.
 pub(super) const REBUILD_ROW: &str = "rebuild-renderer";
+/// Settings → Keyboard: every command and its shortcut.
+const COMMANDS_ROW: &str = "commands";
 
 /// Focusable controls of Settings → Updates. Which ones exist depends on the update
 /// state; see `update_stops`.
@@ -104,7 +106,11 @@ pub(super) enum SettingsAction {
     ResetLayout,
     Zoom(Command),
     OpenConfiguration,
-    OpenPalette,
+    /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
+    /// the next keys pressed.
+    Shortcut(usize),
+    /// Gives a command its platform default shortcut again.
+    ResetShortcut(usize),
     OpenSettings,
     OpenMonitor,
     ToggleFps,
@@ -212,6 +218,13 @@ pub(in crate::gui) struct SettingsUi {
     pub(super) origin: Option<PaneId>,
     /// The shell prompt group was shown in the last frame.
     prompt_shown: bool,
+    /// The command (index in `commands::REGISTRY`) whose shortcut is being recorded,
+    /// and the Settings pane recording it. It records only while its shortcut keeps
+    /// the highlight; see `CompiApp::recording_shortcut`.
+    recording: Option<(PaneId, usize)>,
+    /// What the last shortcut change did, under that command: a key that was taken
+    /// from another command, or why a key was refused.
+    shortcut_notice: Option<(usize, String)>,
 }
 
 /// What a row's renderer needs: where it is drawn and how.
@@ -864,44 +877,15 @@ static ROWS: &[Row] = &[
         |app, row, cx| app.render_prompt_group(row, cx),
     ),
     // Keyboard.
-    row(
-        "commands",
+    page_row(
+        COMMANDS_ROW,
         SettingsSection::Keyboard,
         "Commands",
-        "Search every command and its shortcut.",
-        "palette shortcuts keys",
-        |_| vec![SettingsAction::OpenPalette],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                format!(
-                    "Search {} commands and their shortcuts.",
-                    commands::REGISTRY.len()
-                ),
-                "Open palette",
-                SettingsAction::OpenPalette,
-                false,
-                cx,
-            )
-        },
-    ),
-    row(
-        "keybindings",
-        SettingsSection::Keyboard,
-        "Keybindings",
-        "Custom shortcuts replace the platform defaults.",
-        "shortcuts keys bindings toml config",
-        |_| vec![SettingsAction::OpenConfiguration],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                row_description("keybindings").into(),
-                "Edit keybindings",
-                SettingsAction::OpenConfiguration,
-                false,
-                cx,
-            )
-        },
+        "Every command and its shortcut. Click a shortcut to change it.",
+        "palette shortcuts keys keybindings bindings record reset",
+        // The commands the pane's search leaves; see `CompiApp::command_stops`.
+        |_| Vec::new(),
+        |app, row, _, cx| app.render_commands_page(row, cx),
     ),
     // Monitor.
     in_header(row(
@@ -1226,15 +1210,60 @@ fn in_theme_grid(stop: Stop) -> bool {
 }
 
 /// The rows a pane shows for `section` and the lowercased `query`, before `shown`:
-/// with a query, every row it matches in any section; without, `section`'s rows.
+/// with a query, every row it matches in any section, and the command list when it
+/// matches a command; without, `section`'s rows.
 fn rows_for(section: SettingsSection, query: &str) -> impl Iterator<Item = &'static Row> {
     let searching = !query.trim().is_empty();
     ROWS.iter().filter(move |row| {
         if searching {
             row.matches(query)
+                || (row.id == COMMANDS_ROW && commands::search(query).next().is_some())
         } else {
             row.section == section
         }
+    })
+}
+
+/// The commands (indices in `commands::REGISTRY`) the command list shows for the
+/// lowercased `query`: those it matches, or all of them when it matches none (the
+/// list itself matched) or there is none.
+fn shown_commands(query: &str) -> Vec<usize> {
+    let all = || (0..commands::REGISTRY.len()).collect();
+    if query.trim().is_empty() {
+        return all();
+    }
+    let matched: Vec<usize> = commands::REGISTRY
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.matches_query(query))
+        .map(|(index, _)| index)
+        .collect();
+    if matched.is_empty() { all() } else { matched }
+}
+
+/// `shown_commands(query)` by category, in the palette's category order.
+fn command_groups(query: &str) -> Vec<(commands::CommandCategory, Vec<usize>)> {
+    let shown = shown_commands(query);
+    commands::CommandCategory::ALL
+        .into_iter()
+        .filter_map(|category| {
+            let group: Vec<usize> = shown
+                .iter()
+                .copied()
+                .filter(|&index| commands::REGISTRY[index].category() == category)
+                .collect();
+            (!group.is_empty()).then_some((category, group))
+        })
+        .collect()
+}
+
+/// The note under a command given `keys` that terminals read themselves.
+fn terminal_key_notice(keys: &str) -> Option<String> {
+    commands::terminal_reads(keys).then(|| {
+        format!(
+            "Terminals no longer receive {} while it runs this command.",
+            controls::key_label(keys)
+        )
     })
 }
 
@@ -1432,7 +1461,16 @@ impl CompiApp {
             focus_order(true, [(THEME_LIST_ROW, theme_list_stops())])
         } else {
             let rows = self.pane_rows(pane);
-            focus_order(true, rows.iter().map(|row| (row.id, (row.stops)(self))))
+            focus_order(
+                true,
+                rows.iter().map(|row| {
+                    if row.id == COMMANDS_ROW {
+                        (row.id, self.command_stops(&pane.query))
+                    } else {
+                        (row.id, (row.stops)(self))
+                    }
+                }),
+            )
         };
         if self.theme_bar_shown(pane_id) {
             order.extend(
@@ -2164,6 +2202,13 @@ impl CompiApp {
             return;
         }
         let key = &event.keystroke;
+        if let Some(command) = self.recording_shortcut(pane_id) {
+            // Every key goes to the recording, Compi's own shortcuts included.
+            self.record_shortcut(command, key, window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let host = SettingsHost::Pane(pane_id.clone());
         let plain = !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform;
         let handled = if key.key == "escape" && plain {
@@ -2396,6 +2441,8 @@ impl CompiApp {
             return;
         };
         pane.section = section;
+        self.settings.recording = None;
+        self.settings.shortcut_notice = None;
         pane.scroll.handle.set_offset(point(px(0.0), px(0.0)));
         if !pane.query.is_empty() {
             pane.query.clear();
@@ -2547,7 +2594,10 @@ impl CompiApp {
             SettingsAction::OpenConfiguration => {
                 self.execute(Command::OpenConfiguration, window, cx)
             }
-            SettingsAction::OpenPalette => self.execute(Command::OpenPalette, window, cx),
+            SettingsAction::Shortcut(command) => self.toggle_shortcut_recording(command),
+            SettingsAction::ResetShortcut(command) => {
+                self.change_shortcut(command, None, window, cx)
+            }
             SettingsAction::OpenMonitor => self.execute(Command::OpenMonitor, window, cx),
             SettingsAction::ToggleFps => {
                 self.state.show_fps = !self.state.show_fps;
@@ -4085,6 +4135,295 @@ impl CompiApp {
             .into_any_element()
     }
 
+    /// The command whose shortcut the Settings pane `pane_id` is recording, while that
+    /// shortcut keeps the highlight there.
+    fn recording_shortcut(&self, pane_id: &PaneId) -> Option<usize> {
+        let (pane, command) = self.settings.recording.as_ref()?;
+        let focus = self.settings.focus.as_ref()?;
+        (pane == pane_id
+            && focus.host == SettingsHost::Pane(pane_id.clone())
+            && focus.stop
+                == Stop::Control {
+                    row: COMMANDS_ROW,
+                    action: SettingsAction::Shortcut(*command),
+                })
+        .then_some(*command)
+    }
+
+    /// The command list's controls for `query`, in the order it draws them: each
+    /// command's shortcut, then its Reset when it has a binding of its own.
+    fn command_stops(&self, query: &str) -> Vec<SettingsAction> {
+        command_groups(query)
+            .into_iter()
+            .flat_map(|(_, group)| group)
+            .flat_map(|index| {
+                let custom = self
+                    .config
+                    .keybindings
+                    .contains_key(commands::REGISTRY[index].id);
+                [
+                    Some(SettingsAction::Shortcut(index)),
+                    custom.then_some(SettingsAction::ResetShortcut(index)),
+                ]
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Starts recording `command`'s shortcut in the highlighted Settings pane, or stops
+    /// when it already records it.
+    fn toggle_shortcut_recording(&mut self, command: usize) {
+        let Some(pane) = self.highlighted_pane() else {
+            return;
+        };
+        self.settings.shortcut_notice = None;
+        self.settings.recording = if self.settings.recording == Some((pane.clone(), command)) {
+            None
+        } else {
+            Some((pane, command))
+        };
+    }
+
+    /// A key pressed while `command`'s shortcut records: Escape stops, Backspace or
+    /// Delete removes the shortcut, and a key with Ctrl, Alt or Cmd (or a function
+    /// key) becomes it. A key that cannot be a shortcut says why and keeps recording.
+    fn record_shortcut(
+        &mut self,
+        command: usize,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = &key.modifiers;
+        let plain = !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift;
+        if matches!(
+            key.key.as_str(),
+            "shift" | "control" | "alt" | "platform" | "function" | "capslock"
+        ) {
+            return;
+        }
+        match key.key.as_str() {
+            "escape" if plain => {
+                self.settings.recording = None;
+                return;
+            }
+            "backspace" | "delete" if plain => {
+                self.settings.recording = None;
+                self.change_shortcut(command, Some(String::new()), window, cx);
+                return;
+            }
+            _ => {}
+        }
+        match commands::recorded_binding(commands::ShortcutKey {
+            key: &key.key,
+            control: modifiers.control,
+            shift: modifiers.shift,
+            alt: modifiers.alt,
+            command: modifiers.platform,
+        }) {
+            Ok(binding) => {
+                self.settings.recording = None;
+                self.change_shortcut(command, Some(binding), window, cx);
+            }
+            Err(reason) => {
+                self.settings.shortcut_notice = Some((command, format!("{reason}.")));
+            }
+        }
+    }
+
+    /// Gives `command` the shortcut `binding` (`""` for none), or with `None` its
+    /// platform default. Another command holding the same keys loses them, and the
+    /// notice under `command` says so; Reset gives that command its own back.
+    fn change_shortcut(
+        &mut self,
+        command: usize,
+        binding: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let platform = commands::Platform::current();
+        let spec = &commands::REGISTRY[command];
+        let reset = binding.is_none();
+        // A binding equal to the default is the default: no entry of its own. So is
+        // no shortcut for a command without a default.
+        let binding = binding.filter(|binding| match spec.shortcut(platform) {
+            Some(default) => !commands::same_shortcut(default, binding),
+            None => !binding.is_empty(),
+        });
+        let keys = match &binding {
+            Some(binding) if binding.is_empty() => None,
+            Some(binding) => Some(binding.clone()),
+            None => spec.shortcut(platform).map(str::to_owned),
+        };
+        let taken_from = keys.as_deref().and_then(|keys| {
+            commands::REGISTRY.iter().find(|other| {
+                other.id != spec.id
+                    && other
+                        .configured_shortcut(platform, &self.config.keybindings)
+                        .is_some_and(|theirs| commands::same_shortcut(theirs, keys))
+            })
+        });
+        let mut changes = vec![(spec.id, binding)];
+        let notice = match (taken_from, &keys) {
+            // Reset: the default stays with the command that took it, which wins.
+            (Some(other), Some(keys)) if reset => Some(format!(
+                "{} is also {}'s shortcut, which takes it.",
+                controls::key_label(keys),
+                other.label
+            )),
+            (Some(other), Some(keys)) => {
+                // The other command goes back to its own default, or, when the keys
+                // are its default, to none.
+                let default = other.shortcut(platform);
+                let own = default.filter(|default| !commands::same_shortcut(default, keys));
+                changes.push((
+                    other.id,
+                    (default.is_some() && own.is_none()).then(String::new),
+                ));
+                Some(match own {
+                    Some(own) => format!(
+                        "{} was {}'s shortcut; that command is back to {}.",
+                        controls::key_label(keys),
+                        other.label,
+                        controls::key_label(own)
+                    ),
+                    None => format!(
+                        "{} was {}'s shortcut; that command has none now.",
+                        controls::key_label(keys),
+                        other.label
+                    ),
+                })
+            }
+            _ => keys.as_deref().and_then(terminal_key_notice),
+        };
+        if let Err(error) = self.config.save_keybindings(&changes) {
+            self.global_error = Some(error);
+            return;
+        }
+        self.settings.shortcut_notice = notice.map(|notice| (command, notice));
+        self.share_keybindings(window, cx);
+    }
+
+    /// Gives this window's keybindings to Compi's other windows, which read the
+    /// configuration only when they open.
+    fn share_keybindings(&self, window: &Window, cx: &mut Context<Self>) {
+        let this = window.window_handle().window_id();
+        for handle in cx.windows() {
+            if handle.window_id() == this {
+                continue;
+            }
+            if let Some(app) = handle.downcast::<CompiApp>() {
+                let keybindings = self.config.keybindings.clone();
+                let _ = app.update(cx, move |app, _, cx| {
+                    app.config.keybindings = keybindings;
+                    cx.notify();
+                });
+            }
+        }
+    }
+
+    /// Settings → Keyboard: the commands the search leaves, in a card per category,
+    /// each with its shortcut as a button that records new keys.
+    fn render_commands_page(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let SettingsHost::Pane(pane_id) = &row.host else {
+            return div().into_any_element();
+        };
+        let query = self
+            .settings
+            .panes
+            .get(pane_id)
+            .map_or("", |pane| pane.query.as_str());
+        let recording = self.recording_shortcut(pane_id);
+        let platform = commands::Platform::current();
+        let hint = div()
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .line_height(px(UI_SMALL_LINE_HEIGHT))
+            .text_color(color(modal_text_color(colors.muted, &colors)))
+            .child(
+                "Click a shortcut, then press the new keys. Escape cancels; \
+                 Backspace leaves the command without one.",
+            );
+        let groups = command_groups(query).into_iter().map(|(category, group)| {
+            let lines = group.into_iter().enumerate().map(|(position, index)| {
+                let spec = &commands::REGISTRY[index];
+                let custom = self.config.keybindings.contains_key(spec.id);
+                let shortcut = spec.configured_shortcut(platform, &self.config.keybindings);
+                let label = if recording == Some(index) {
+                    "Press keys…".to_owned()
+                } else {
+                    shortcut.map_or_else(|| "Add shortcut".to_owned(), controls::key_label)
+                };
+                let mut button = controls::text_button(("shortcut", index), label)
+                    .header()
+                    .selected(recording == Some(index))
+                    .tab_stop(false);
+                if shortcut.is_none() && recording != Some(index) {
+                    button = button.ghost();
+                }
+                let reset = custom.then(|| {
+                    self.settings_control(
+                        row,
+                        SettingsAction::ResetShortcut(index),
+                        controls::text_button(("shortcut-reset", index), "Reset")
+                            .header()
+                            .ghost()
+                            .tab_stop(false)
+                            .detail(match spec.shortcut(platform) {
+                                Some(default) => {
+                                    format!("Back to {}", controls::key_label(default))
+                                }
+                                None => "Back to no shortcut".to_owned(),
+                            }),
+                        cx,
+                    )
+                });
+                let control = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(reset)
+                    .child(self.settings_control(row, SettingsAction::Shortcut(index), button, cx))
+                    .into_any_element();
+                let (detail, tint) = match &self.settings.shortcut_notice {
+                    Some((noticed, notice)) if *noticed == index => (notice.clone(), colors.accent),
+                    _ => (
+                        spec.command.description().unwrap_or_default().to_owned(),
+                        colors.muted,
+                    ),
+                };
+                div()
+                    .min_w_0()
+                    .px_4()
+                    .when(position > 0, |line| {
+                        line.border_t_1().border_color(color(colors.border))
+                    })
+                    .child(self.tinted_settings_row(
+                        spec.label.into(),
+                        detail,
+                        tint,
+                        control,
+                        row.compact,
+                    ))
+            });
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(settings_label_line(Some(category.label().into()), None))
+                .child(settings_card(&colors).children(lines))
+        });
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(hint)
+            .children(groups)
+            .into_any_element()
+    }
+
     /// `rows` in cards: consecutive rows of one section and group share a card, with
     /// hairlines between its rows; a page row draws in place of a card, `width` wide.
     /// A label above a card names its group when the section has more than one; in
@@ -4558,29 +4897,44 @@ mod tests {
         let keyboard: Vec<_> = rows_for(SettingsSection::Keyboard, "")
             .map(|row| row.id)
             .collect();
-        assert_eq!(keyboard, ["commands", "keybindings"]);
+        assert_eq!(keyboard, [COMMANDS_ROW]);
     }
 
     #[test]
     fn search_matches_titles_descriptions_and_keywords_across_sections() {
-        // Titles, in any section, ignoring case.
+        // Titles, in any section, ignoring case; command names find the command list.
         assert_eq!(
             ids("font"),
-            ["ui-font", "terminal-font", "custom-typography"]
+            [
+                "ui-font",
+                "terminal-font",
+                "custom-typography",
+                COMMANDS_ROW
+            ]
         );
         assert_eq!(ids("FONT"), ids("font"));
+        // The settings themselves, whether or not a command matches too.
+        let settings = |query: &str| -> Vec<&'static str> {
+            ids(query)
+                .into_iter()
+                .filter(|id| *id != COMMANDS_ROW)
+                .collect()
+        };
         // Keywords: the prompt group is one row however many controls it holds.
-        assert_eq!(ids("starship"), [PROMPT_ROW]);
-        assert_eq!(ids("opacity"), ["transparency", "opacity"]);
+        assert_eq!(settings("starship"), [PROMPT_ROW]);
+        assert_eq!(settings("opacity"), ["transparency", "opacity"]);
         // Descriptions.
-        assert_eq!(ids("foreground process"), ["metadata-process"]);
+        assert_eq!(settings("foreground process"), ["metadata-process"]);
         // Compi's performance tools are Advanced's; Monitor's words find its page.
-        assert_eq!(ids("rebuild"), [REBUILD_ROW]);
-        assert_eq!(ids("fps"), ["show-fps", RESOURCES_ROW, DIAGNOSTICS_ROW]);
+        assert_eq!(settings("rebuild"), [REBUILD_ROW]);
+        assert_eq!(
+            settings("fps"),
+            ["show-fps", RESOURCES_ROW, DIAGNOSTICS_ROW]
+        );
         assert!(ids("network").contains(&MONITOR_ROW));
         // A group name finds its rows.
         assert_eq!(
-            ids("tab metadata"),
+            settings("tab metadata"),
             [
                 "metadata-directory",
                 "metadata-process",
@@ -4601,6 +4955,36 @@ mod tests {
         }));
         assert!(contains_folded("Größe", "größe"));
         assert!(!contains_folded("ab", "abc"));
+    }
+
+    #[test]
+    fn the_command_list_shows_the_commands_a_search_names() {
+        let names = |query: &str| -> Vec<&str> {
+            shown_commands(query)
+                .into_iter()
+                .map(|index| commands::REGISTRY[index].id)
+                .collect()
+        };
+        assert_eq!(names("font size"), ["zoom_in", "zoom_out", "zoom_reset"]);
+        // Words of the list itself, matching no command, show every command.
+        assert_eq!(names("keybindings").len(), commands::REGISTRY.len());
+        assert_eq!(names("").len(), commands::REGISTRY.len());
+        assert!(ids("keybindings").contains(&COMMANDS_ROW));
+        assert!(!ids("zebra").contains(&COMMANDS_ROW));
+        // Grouped in the palette's category order, every shown command once.
+        let groups = command_groups("");
+        let mut seen: Vec<usize> = groups.iter().flat_map(|(_, group)| group.clone()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..commands::REGISTRY.len()).collect::<Vec<_>>());
+        let order: Vec<_> = groups.iter().map(|(category, _)| *category).collect();
+        assert!(order.windows(2).all(|pair| {
+            let at = |category| {
+                commands::CommandCategory::ALL
+                    .iter()
+                    .position(|c| *c == category)
+            };
+            at(pair[0]) < at(pair[1])
+        }));
     }
 
     #[test]

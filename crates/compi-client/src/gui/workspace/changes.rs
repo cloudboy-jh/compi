@@ -2630,6 +2630,11 @@ impl CompiApp {
         let environment = ui.environment.clone();
         let kind = change.kind;
         let file = work_tree_path(&repo, &change.path);
+        let native = if kind == GitChangeKind::Deleted {
+            Vec::new()
+        } else {
+            self.open_with_entries(&environment, &file, false, cx)
+        };
         let mut entries: Vec<controls::MenuEntry> = Vec::new();
         let (pane, path, scope) = (pane_id.clone(), change.path.clone(), change.scope.clone());
         entries.push(
@@ -2664,6 +2669,7 @@ impl CompiApp {
                 .into(),
             );
         }
+        entries.extend(native);
         entries.push(
             controls::menu_item("Copy path", move |_, _, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(file.clone()));

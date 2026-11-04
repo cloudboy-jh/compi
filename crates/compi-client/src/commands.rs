@@ -1070,6 +1070,71 @@ pub fn shortcut_matches(binding: &str, key: ShortcutKey<'_>) -> bool {
         && normalized_key(parsed.key).eq_ignore_ascii_case(normalized_key(key.key))
 }
 
+/// Whether `a` and `b` name the same keys, however each is written.
+pub fn same_shortcut(a: &str, b: &str) -> bool {
+    match (parse_shortcut(a), parse_shortcut(b)) {
+        (Ok(a), Ok(b)) => {
+            a.control == b.control
+                && a.shift == b.shift
+                && a.alt == b.alt
+                && a.command == b.command
+                && normalized_key(a.key).eq_ignore_ascii_case(normalized_key(b.key))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `binding` is Ctrl with a letter alone, a key shells and terminal programs
+/// read (Ctrl+R, Ctrl+D): bound, it no longer reaches them.
+pub fn terminal_reads(binding: &str) -> bool {
+    parse_shortcut(binding).is_ok_and(|key| {
+        key.control
+            && !key.alt
+            && !key.command
+            && !key.shift
+            && key.key.len() == 1
+            && key.key.as_bytes()[0].is_ascii_alphabetic()
+    })
+}
+
+/// The binding a recorded key press makes, in configuration syntax (`ctrl-shift-p`).
+/// It needs Ctrl, Alt or Cmd, or a function key, so typing still reaches terminals
+/// and editors.
+pub fn recorded_binding(key: ShortcutKey<'_>) -> Result<String, &'static str> {
+    let name = match key.key {
+        "-" => "minus".to_owned(),
+        "=" => "equal".to_owned(),
+        "+" => "plus".to_owned(),
+        " " => "space".to_owned(),
+        other => other.to_ascii_lowercase(),
+    };
+    let function_key = name
+        .strip_prefix('f')
+        .and_then(|number| number.parse::<u8>().ok())
+        .is_some_and(|number| (1..=24).contains(&number));
+    if !(key.control || key.alt || key.command || function_key) {
+        return Err(if cfg!(target_os = "macos") {
+            "Add Command, Control or Option, so typing still works"
+        } else {
+            "Add Ctrl or Alt, so typing still works"
+        });
+    }
+    let mut binding = String::new();
+    for (held, modifier) in [
+        (key.control, "ctrl-"),
+        (key.alt, "alt-"),
+        (key.shift, "shift-"),
+        (key.command, "cmd-"),
+    ] {
+        if held {
+            binding.push_str(modifier);
+        }
+    }
+    binding.push_str(&name);
+    parse_shortcut(&binding).map_err(|_| "That key cannot be a shortcut")?;
+    Ok(binding)
+}
+
 fn normalized_key(key: &str) -> &str {
     if key.eq_ignore_ascii_case("return") {
         return "enter";
@@ -1921,5 +1986,58 @@ mod tests {
         assert!(validate_shortcut("control-shfit-p").is_err());
         assert!(validate_shortcut("cmd-unknownkey").is_err());
         assert!(validate_shortcut("cmd-shift").is_err());
+    }
+
+    #[test]
+    fn a_recorded_key_saves_a_binding_that_matches_it_again() {
+        let pressed = [
+            ShortcutKey {
+                shift: true,
+                ..ctrl("P")
+            },
+            ctrl("-"),
+            ctrl("="),
+            ShortcutKey {
+                alt: true,
+                ..ctrl("+")
+            },
+            ShortcutKey {
+                key: "space",
+                command: true,
+                ..ShortcutKey::default()
+            },
+            ShortcutKey {
+                key: "f5",
+                ..ShortcutKey::default()
+            },
+        ];
+        for key in pressed {
+            let binding = recorded_binding(key).unwrap();
+            assert!(validate_shortcut(&binding).is_ok(), "{binding}");
+            assert!(shortcut_matches(&binding, key), "{binding}");
+        }
+        assert_eq!(
+            recorded_binding(ShortcutKey {
+                shift: true,
+                ..ctrl("-")
+            })
+            .as_deref(),
+            Ok("ctrl-shift-minus")
+        );
+        // Plain and Shift-only keys are typing, not shortcuts.
+        for key in ["a", "enter", "f25"] {
+            assert!(
+                recorded_binding(ShortcutKey {
+                    key,
+                    shift: true,
+                    ..ShortcutKey::default()
+                })
+                .is_err()
+            );
+        }
+        assert!(recorded_binding(ctrl("capslock")).is_err());
+        assert!(same_shortcut("Ctrl+Shift+Return", "shift-ctrl-enter"));
+        assert!(same_shortcut("cmd-equal", "cmd-="));
+        assert!(!same_shortcut("ctrl-t", "ctrl-shift-t"));
     }
 }

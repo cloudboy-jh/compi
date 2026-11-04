@@ -45,6 +45,116 @@
             <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="NoModify" Type="integer" Value="0" />
             <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="NoRepair" Type="integer" Value="0" />
             <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Compi" Name="WindowsInstaller" Type="integer" Value="0" />
+            <!-- Explorer: Compi in the Open with list of the file types it opens (a ProgID
+                 named by each type's OpenWithProgids), in Choose another app for any file,
+                 and Open in Compi on folders and folder backgrounds (Windows 11: Show more
+                 options). Explorer hands compi.exe the path to open. -->
+            <RegistryValue Root="HKCU" Key="Software\Classes\Applications\compi.exe" Name="FriendlyAppName" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Applications\compi.exe\DefaultIcon" Type="string" Value="[INSTALLFOLDER]compi.exe,0" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Applications\compi.exe\shell\open\command" Type="string" Value="&quot;[INSTALLFOLDER]compi.exe&quot; --open &quot;%1&quot;" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Compi.File" Type="string" Value="File" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Compi.File\DefaultIcon" Type="string" Value="[INSTALLFOLDER]compi.exe,0" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Compi.File\shell\open" Name="FriendlyAppName" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Compi.File\shell\open\command" Type="string" Value="&quot;[INSTALLFOLDER]compi.exe&quot; --open &quot;%1&quot;" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.text\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.log\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.md\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.markdown\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.mdx\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.rst\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.csv\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.tsv\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.json\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.jsonc\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.json5\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.toml\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.yaml\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.yml\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.xml\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.ini\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.cfg\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.conf\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.env\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.properties\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.lock\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.sh\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.bash\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.zsh\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.fish\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.ps1\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.psm1\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.bat\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.cmd\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.rs\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.go\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.py\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.rb\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.js\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.mjs\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.cjs\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.ts\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.mts\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.cts\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.tsx\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.jsx\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.c\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.h\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.cc\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.cpp\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.hpp\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.cs\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.java\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.kt\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.kts\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.swift\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.lua\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.php\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.html\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.htm\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.css\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.scss\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.sass\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.less\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.vue\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.svelte\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.zig\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.dart\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.sql\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.graphql\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.proto\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.tf\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.nix\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.ex\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.exs\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.erl\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.hs\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.ml\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.clj\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.r\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.jl\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.png\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.jpg\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.jpeg\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.gif\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.webp\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.bmp\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.ico\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.svg\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.pdf\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.mp3\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.wav\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.flac\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.ogg\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.m4a\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.mp4\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\.webm\OpenWithProgids" Name="Compi.File" Type="string" Value="Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\shell\Compi" Type="string" Value="Open in Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\shell\Compi" Name="Icon" Type="string" Value="[INSTALLFOLDER]compi.exe,0" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\shell\Compi\command" Type="string" Value="&quot;[INSTALLFOLDER]compi.exe&quot; --open &quot;%V&quot;" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\Background\shell\Compi" Type="string" Value="Open in Compi" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\Background\shell\Compi" Name="Icon" Type="string" Value="[INSTALLFOLDER]compi.exe,0" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\Background\shell\Compi\command" Type="string" Value="&quot;[INSTALLFOLDER]compi.exe&quot; --open &quot;%V&quot;" />
           </Component>
           <Directory Id="VersionsFolder" Name="versions">
             <Directory Id="PayloadFolder" Name="$(var.Version)">

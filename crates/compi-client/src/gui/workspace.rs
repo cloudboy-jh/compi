@@ -186,6 +186,29 @@ pub(super) fn abort_update(path: &std::path::Path, cx: &mut App) -> crate::Resul
     Ok(())
 }
 
+/// A file or folder the system asked Compi to open (Explorer's Open with, Finder's
+/// Open With): shown in the active local window, else the first one, which comes to
+/// the front. A file opens in a Files tab of its own, a folder as a terminal tab there.
+pub(super) fn open_from_system(path: String, cx: &mut App) -> crate::Result<()> {
+    let local = |handle: &gpui::AnyWindowHandle, cx: &App| {
+        handle
+            .downcast::<CompiApp>()
+            .filter(|typed| typed.read(cx).is_ok_and(|app| !app.target.is_remote()))
+    };
+    let target = cx
+        .active_window()
+        .and_then(|handle| local(&handle, cx))
+        .or_else(|| cx.windows().iter().find_map(|handle| local(handle, cx)))
+        .ok_or("No Compi window on this computer to open it in")?;
+    target.update(cx, |this, window, cx| {
+        this.pending_open = Some(path);
+        this.open_pending();
+        window.activate_window();
+        cx.notify();
+    })?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(super) struct TransferSeed {
     tab_id: TabId,
@@ -857,6 +880,7 @@ impl CompiApp {
             restore_session,
             restore_ready: false,
             initial_working_directory,
+            pending_open: None,
             first_snapshot_logged: false,
             ready_probe_marker: (!attach_only && perf::ready_probe_enabled())
                 .then(|| format!("COMPI_READY_{}", std::process::id())),
@@ -1819,6 +1843,74 @@ impl CompiApp {
         );
     }
 
+    /// Opens `pending_open` once the workspace is there and no change is in flight: a
+    /// folder as a terminal tab in it, a file in a Files tab of its own, rooted at its
+    /// folder. A path on a WSL share opens in that distribution.
+    fn open_pending(&mut self) {
+        if self.mutation_pending
+            || !self
+                .workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.initialized)
+        {
+            return;
+        }
+        let Some(path) = self.pending_open.take() else {
+            return;
+        };
+        let Some(session_id) = self
+            .state
+            .selected_session
+            .clone()
+            .or_else(|| Some(self.workspace.as_ref()?.sessions.first()?.id.clone()))
+        else {
+            self.global_error = Some(format!("Open a workspace first to show {path}"));
+            return;
+        };
+        let (environment, place) = super::open_with::system_content(&path);
+        // Windows cannot follow a WSL symlink to a folder (it is neither file nor folder
+        // through the share); a shell in that distribution can.
+        if !std::path::Path::new(&path).is_file() {
+            // A folder on a WSL share opens a shell in that distribution, at its Linux path.
+            let (working_directory, distribution) = match environment {
+                compi_protocol::ContentEnvironment::Wsl { distribution } => {
+                    (place, Some(distribution))
+                }
+                compi_protocol::ContentEnvironment::Host => (path, None),
+            };
+            self.mutate_in(
+                WorkspaceMutation::CreateTab {
+                    session_id,
+                    label: String::new(),
+                    cols: self.terminal_cols,
+                    rows: self.terminal_rows,
+                    working_directory: Some(working_directory),
+                },
+                true,
+                distribution,
+            );
+            return;
+        }
+        let root = std::path::Path::new(&place).parent().map_or_else(
+            || place.clone(),
+            |folder| folder.to_string_lossy().into_owned(),
+        );
+        let tab = compi_protocol::ContentTab::edit(place);
+        self.mutate(
+            WorkspaceMutation::CreateContentTab {
+                session_id,
+                label: String::new(),
+                content: compi_protocol::PaneContent::Files(compi_protocol::FolderContent {
+                    environment,
+                    root,
+                    tabs: vec![tab.clone()],
+                    active: Some(tab),
+                }),
+            },
+            true,
+        );
+    }
+
     fn accept_workspace(&mut self, workspace: WorkspaceSnapshot) {
         self.loading_surfaces = false;
         if self.workspace.as_ref().is_some_and(|old| {
@@ -2117,6 +2209,7 @@ impl CompiApp {
                         self.remote_split_finished(None);
                     }
                 }
+                self.open_pending();
             }
             UiEvent::TabConnected { tab_id, transport } => {
                 let status = self

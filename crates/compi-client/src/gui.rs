@@ -19,6 +19,7 @@ use compi_protocol::{
 mod brand;
 mod controls;
 mod lifecycle;
+mod open_with;
 mod os_notifications;
 use lifecycle::PaneError;
 mod workspace;
@@ -101,15 +102,18 @@ const TERMINAL_PADDING: f32 = 8.0;
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
 const UI_EVENT_YIELD: Duration = Duration::from_micros(8_333);
 
+/// `open`: a file or folder the system asked to open, shown in the first window.
 pub fn run(
     target: ConnectionTarget,
     initial_working_directory: Option<String>,
+    open: Option<String>,
     config: LoadedConfig,
     launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
 ) {
     run_application(
         target,
         initial_working_directory,
+        open,
         config,
         launch_requests,
         None,
@@ -126,6 +130,7 @@ pub fn run_restore(
     run_application(
         first.target.clone(),
         None,
+        None,
         first.config.clone(),
         launch_requests,
         Some(session),
@@ -135,6 +140,7 @@ pub fn run_restore(
 fn run_application(
     target: ConnectionTarget,
     initial_working_directory: Option<String>,
+    open: Option<String>,
     config: LoadedConfig,
     launch_requests: Option<std::sync::mpsc::Receiver<crate::window_host::LaunchRequest>>,
     restore: Option<Arc<crate::update_restore::RestoreSession>>,
@@ -143,6 +149,13 @@ fn run_application(
     crate::release_notes::initialize();
     let empty_measurement = perf::empty_window_enabled();
     let application = gpui_platform::application().with_assets(controls::Assets);
+    // Finder's Open With (and files dropped on the Dock icon) arrive as file URLs.
+    let (opened_tx, opened_rx) = async_channel::unbounded::<String>();
+    application.on_open_urls(move |urls| {
+        for path in urls.iter().filter_map(|url| open_with::file_url_path(url)) {
+            let _ = opened_tx.try_send(path);
+        }
+    });
     application.run(move |cx: &mut App| {
         let mut config = config;
         if !empty_measurement {
@@ -166,6 +179,23 @@ fn run_application(
             eprintln!("Could not open Compi: {error}");
             cx.quit();
             return;
+        }
+        if !empty_measurement {
+            if let Some(path) = open
+                && let Err(error) = workspace::open_from_system(path, cx)
+            {
+                eprintln!("Could not open the file: {error}");
+            }
+            cx.spawn(async move |cx| {
+                while let Ok(path) = opened_rx.recv().await {
+                    cx.update(|cx| {
+                        if let Err(error) = workspace::open_from_system(path, cx) {
+                            eprintln!("Could not open the file: {error}");
+                        }
+                    });
+                }
+            })
+            .detach();
         }
         if !empty_measurement && let Some(requests) = launch_requests {
             cx.spawn(async move |cx| {
@@ -201,6 +231,9 @@ fn run_application(
                                 crate::window_host::LaunchMode::InstallUpdate { version, consented, outcome } => {
                                     crate::updates::install_for_command(version, consented, outcome)
                                         .map_err(Into::into)
+                                }
+                                crate::window_host::LaunchMode::Open { path } => {
+                                    workspace::open_from_system(path, cx)
                                 }
                                 crate::window_host::LaunchMode::Control { request } => {
                                     if let Some(completion) = completion {
@@ -833,6 +866,9 @@ struct CompiApp {
     restore_session: Option<Arc<crate::update_restore::RestoreSession>>,
     restore_ready: bool,
     initial_working_directory: Option<String>,
+    /// A file or folder the system asked this window to open (Explorer's Open with,
+    /// Finder's Open With), waiting for the workspace and any change in flight.
+    pending_open: Option<String>,
     first_snapshot_logged: bool,
     ready_probe_marker: Option<String>,
     ready_probe_sent_at: Option<Instant>,

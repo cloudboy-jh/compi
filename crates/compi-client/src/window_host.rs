@@ -15,14 +15,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Version 12 adds `RevealNote`, selecting a Markdown file's rendered or source view.
+// Version 13 adds `LaunchMode::Open`, a file or folder the system asks Compi to open
+// (Explorer's Open with and Open in Compi). Version 12 adds `RevealNote`, selecting a
+// Markdown file's rendered or source view.
 // Version 11 lets `ShowChanges` carry a commit and `RevealDiff` a commit scope, which
 // `compi diff COMMIT` sends. Version 10 adds `RunCommand`, which `compi command run`
 // sends, and the response's `disabled_reason`. Version 9 adds `RevealDiff` and
 // `ShowChanges`, which `compi diff` sends. Version 8 reports each content pane's
 // `unsaved_files` in window listings, which `pane close`, `tab close` and
 // `workspace close` consult before closing.
-const VERSION: u32 = 12;
+const VERSION: u32 = 13;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_PENDING: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,6 +55,11 @@ pub enum LaunchMode {
         version: String,
         consented: Vec<compi_protocol::SurfaceId>,
         outcome: PathBuf,
+    },
+    /// Open a file (in a Files tab) or a folder (a terminal tab there) in this host's
+    /// window; the system's file manager sends these. An absolute path on this computer.
+    Open {
+        path: String,
     },
     Control {
         request: crate::cli_window::Request,
@@ -96,6 +103,14 @@ impl LaunchRequest {
     fn validate(&self) -> Result<()> {
         if let LaunchMode::Control { request } = &self.mode {
             request.validate()?;
+        }
+        if let LaunchMode::Open { path } = &self.mode
+            && (path.is_empty()
+                || path.len() > 32 * 1024
+                || path.contains('\0')
+                || !std::path::Path::new(path).is_absolute())
+        {
+            return Err("invalid path to open".into());
         }
         if !matches!(self.mode, LaunchMode::Ordinary) && self.initial_working_directory.is_some() {
             return Err("update handoff requests cannot replay a working directory".into());
@@ -302,7 +317,7 @@ fn serve(
                     }
                     if !matches!(
                         envelope.launch.mode,
-                        LaunchMode::Ordinary | LaunchMode::Control { .. }
+                        LaunchMode::Ordinary | LaunchMode::Open { .. } | LaunchMode::Control { .. }
                     ) && (envelope.expected_host_pid != Some(std::process::id())
                         || envelope.expected_installation.as_ref()
                             != Some(&registry_installation()?))
