@@ -66,7 +66,10 @@ use std::fmt;
 // editor cannot open (`FileKind` on `FileContent::TooLarge` and `Binary`); `GitImageFormat`
 // becomes `ImageFormat`.
 // Version 35 adds the Notifications section of Settings (`SettingsSection::Notifications`).
-pub const PROTOCOL_VERSION: u32 = 35;
+// Version 36 adds the Windows shell to launch profiles (`LaunchProfile::windows_shell`): WSL or
+// Windows PowerShell on the host. An older daemon would ignore it and start WSL. Prompt
+// settings take a `PromptPlace`, which can be Windows PowerShell, and know `PromptShell::PowerShell`.
+pub const PROTOCOL_VERSION: u32 = 36;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -396,10 +399,11 @@ pub enum ClientMessage {
     FinishImageUpload {
         upload_id: UploadId,
     },
-    /// Prompt settings in the target environment. `distribution` selects a WSL2
-    /// distribution on Windows and must be absent elsewhere.
+    /// Prompt settings where `place` says: the daemon's default shell environment, a
+    /// WSL2 distribution or Windows PowerShell; the last two only on Windows.
     Prompt {
-        distribution: Option<String>,
+        #[serde(default)]
+        place: prompt::PromptPlace,
         request: Box<prompt::PromptRequest>,
     },
     /// Sends each terminal's current program status as `ProgramStatusChanged`, answers
@@ -1105,6 +1109,42 @@ pub struct LaunchProfile {
     pub login: Option<bool>,
     pub working_directory: Option<String>,
     pub distribution: Option<String>,
+    /// The shell a Windows daemon starts. Other daemons ignore it.
+    #[serde(default, skip_serializing_if = "WindowsShell::is_wsl")]
+    pub windows_shell: WindowsShell,
+}
+
+/// What a Windows daemon launches: a WSL shell, or Windows PowerShell on the host.
+/// Profiles saved before this choice existed are WSL.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum WindowsShell {
+    #[default]
+    #[serde(rename = "wsl")]
+    Wsl,
+    #[serde(rename = "powershell")]
+    PowerShell,
+}
+
+impl WindowsShell {
+    pub fn is_wsl(&self) -> bool {
+        *self == Self::Wsl
+    }
+
+    /// The configuration value: `powershell` or `wsl`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::PowerShell => "powershell",
+            Self::Wsl => "wsl",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "powershell" => Some(Self::PowerShell),
+            "wsl" => Some(Self::Wsl),
+            _ => None,
+        }
+    }
 }
 
 /// Invocation-local launch context, retained only until the accepted launch effect runs.
@@ -1155,10 +1195,22 @@ pub struct SurfaceInfo {
 }
 
 impl SurfaceInfo {
+    /// The shell is Windows PowerShell on a Windows daemon's host, not WSL.
+    pub fn runs_powershell(&self) -> bool {
+        self.launch
+            .profile
+            .as_deref()
+            .is_some_and(|profile| profile.windows_shell == WindowsShell::PowerShell)
+    }
+
     /// The WSL2 distribution this terminal's shell runs in: the one the daemon launched
     /// it in, else the one its requested directory or profile names. `None` for a shell
     /// on the daemon host itself.
     pub fn wsl_distribution(&self) -> Option<&str> {
+        if self.runs_powershell() {
+            return None;
+        }
+        let profile = self.launch.profile.as_deref();
         self.distribution
             .as_deref()
             .or_else(|| {
@@ -1166,12 +1218,7 @@ impl SurfaceInfo {
                     .as_ref()
                     .map(|directory| directory.distribution.as_str())
             })
-            .or_else(|| {
-                self.launch
-                    .profile
-                    .as_ref()
-                    .and_then(|profile| profile.distribution.as_deref())
-            })
+            .or_else(|| profile.and_then(|profile| profile.distribution.as_deref()))
             .filter(|distribution| !distribution.is_empty())
     }
 }

@@ -159,6 +159,8 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Before any window claims (and so writes) its state slot, which marks an earlier user.
+    compi_client::config::settle_windows_shell(args.config.as_deref());
     if let Some(path) = &args.update_restore {
         let result = (|| -> compi_client::Result<()> {
             let session = compi_client::update_restore::RestoreSession::open(path)?;

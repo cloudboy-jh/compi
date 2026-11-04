@@ -7,7 +7,7 @@
     Scope="perUser"
     Compressed="yes">
 
-    <SummaryInformation Description="Compi persistent WSL terminal" />
+    <SummaryInformation Description="Compi persistent terminal" />
     <MajorUpgrade Schedule="afterInstallExecute" DowngradeErrorMessage="A newer version of Compi is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="CompiIcon" SourceFile="$(var.ProjectDir)\assets\Compi-desktopappicon-v4.ico" />
@@ -200,7 +200,7 @@
           <Shortcut
             Id="CompiStartMenuShortcut"
             Name="Compi"
-            Description="Persistent WSL terminal"
+            Description="Persistent terminal"
             Target="[INSTALLFOLDER]compi.exe"
             WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />

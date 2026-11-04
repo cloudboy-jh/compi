@@ -1,6 +1,7 @@
 //! Runs commands and file operations in the environment Compi launches shells
-//! in: the local Unix account, or a WSL2 distribution on Windows. An SSH
-//! target is a remote Unix daemon, so it is `Local` there.
+//! in: the local Unix account, a WSL2 distribution on Windows, or Windows itself
+//! for PowerShell. An SSH target is a remote Unix daemon, so it is `Local` there.
+use compi_protocol::prompt::{PromptPlace, PromptShell};
 use std::io::{Read, Write};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -18,35 +19,76 @@ pub(super) enum Target {
     Local,
     #[cfg(windows)]
     Wsl(String),
+    /// Windows PowerShell on this host. Paths use `/`, as in `C:/Users/me`.
+    #[cfg(windows)]
+    Windows,
 }
 
 impl Target {
-    pub(super) fn resolve(distribution: Option<&str>) -> Result<Self, String> {
+    pub(super) fn resolve(place: &PromptPlace) -> Result<Self, String> {
         #[cfg(unix)]
         {
-            if distribution.is_some() {
-                return Err("WSL distributions are only available on Windows".into());
+            match place {
+                PromptPlace::Default => Ok(Self::Local),
+                _ => Err("WSL and Windows PowerShell are only available on Windows".into()),
             }
-            Ok(Self::Local)
         }
         #[cfg(windows)]
         {
+            let distribution = match place {
+                PromptPlace::Windows => return Ok(Self::Windows),
+                PromptPlace::Default => None,
+                PromptPlace::Wsl { distribution } => Some(distribution.as_str()),
+            };
             compi_protocol::wsl::directory_distribution(distribution)
                 .map(Self::Wsl)
                 .map_err(|error| error.to_string())
         }
     }
 
-    pub(super) fn distribution(&self) -> Option<String> {
+    pub(super) fn place(&self) -> PromptPlace {
         match self {
             #[cfg(unix)]
-            Self::Local => None,
+            Self::Local => PromptPlace::Default,
             #[cfg(windows)]
-            Self::Wsl(name) => Some(name.clone()),
+            Self::Wsl(name) => PromptPlace::Wsl {
+                distribution: name.clone(),
+            },
+            #[cfg(windows)]
+            Self::Windows => PromptPlace::Windows,
         }
     }
 
-    fn command(&self, program: &str) -> Command {
+    pub(super) fn is_windows(&self) -> bool {
+        #[cfg(windows)]
+        return *self == Self::Windows;
+        #[cfg(unix)]
+        false
+    }
+
+    /// The shells whose prompts Compi manages here.
+    pub(super) fn shells(&self) -> &'static [PromptShell] {
+        if self.is_windows() {
+            &[PromptShell::PowerShell]
+        } else {
+            &PromptShell::POSIX
+        }
+    }
+
+    /// An absolute path of this target that is safe to pass around: one line, no tab.
+    pub(super) fn validate_path(&self, path: &str) -> Result<(), String> {
+        let absolute = if self.is_windows() {
+            super::config::windows_path(path)
+        } else {
+            path.starts_with('/')
+        };
+        if !absolute || path.contains(['\0', '\n', '\t']) || path.len() > 4096 {
+            return Err(format!("invalid prompt file path: {path:?}"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn command(&self, program: &str) -> Command {
         #[cfg(test)]
         let env = TEST_ENV.lock().clone();
         match self {
@@ -72,12 +114,40 @@ impl Target {
                 command.arg(program);
                 command
             }
+            #[cfg(windows)]
+            Self::Windows => {
+                use std::os::windows::process::CommandExt;
+                let mut command = Command::new(program);
+                command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+                #[cfg(test)]
+                command.envs(env);
+                command
+            }
         }
+    }
+
+    /// Run `program` of this target with `args`; it must succeed. Returns its output.
+    pub(super) fn exec_ok(
+        &self,
+        context: &str,
+        program: &str,
+        args: &[&str],
+    ) -> Result<Vec<u8>, String> {
+        let mut command = self.command(program);
+        command.args(args);
+        let output = run(command, &[], TIMEOUT)?;
+        if !output.status.success() {
+            return Err(format!("{context}: {}", error_text(&output)));
+        }
+        Ok(output.stdout)
     }
 
     /// Run a POSIX `sh` script with positional arguments. `wsl.exe` rejects an
     /// empty argument, so callers pass a placeholder instead.
     pub(super) fn sh(&self, script: &str, args: &[&str], stdin: &[u8]) -> Result<Output, String> {
+        if self.is_windows() {
+            return Err("Windows has no POSIX shell for prompt settings".into());
+        }
         if args.iter().any(|arg| arg.is_empty()) {
             return Err("prompt helper arguments must not be empty".into());
         }
@@ -106,12 +176,35 @@ impl Target {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
+        if self.is_windows() {
+            return paths
+                .iter()
+                .map(|path| match std::fs::read(path) {
+                    Ok(content) => Ok(Some(content)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(format!("could not read {path}: {error}")),
+                })
+                .collect();
+        }
         let args: Vec<&str> = paths.iter().map(String::as_str).collect();
         let output = self.sh_ok("could not read prompt files", READ_FILES, &args, &[])?;
         parse_files(&output, paths.len())
     }
 
     pub(super) fn apply(&self, operations: &[FileOperation]) -> Result<(), String> {
+        for operation in operations {
+            let (FileOperation::Write { path, .. }
+            | FileOperation::WriteUser { path, .. }
+            | FileOperation::Delete { path }
+            | FileOperation::RemoveBackup { path }) = operation;
+            self.validate_path(path)?;
+        }
+        if self.is_windows() {
+            return operations
+                .iter()
+                .try_for_each(apply_on_windows)
+                .map_err(|error| format!("could not write prompt files: {error}"));
+        }
         let mut input = Vec::new();
         for operation in operations {
             let (code, path, content) = match operation {
@@ -120,12 +213,50 @@ impl Target {
                 FileOperation::Delete { path } => ('d', path, &[][..]),
                 FileOperation::RemoveBackup { path } => ('r', path, &[][..]),
             };
-            validate_path(path)?;
             writeln!(input, "{code}\t{}\t{path}", content.len()).map_err(|e| e.to_string())?;
             input.extend_from_slice(content);
         }
         self.sh_ok("could not write prompt files", APPLY_FILES, &[], &input)
             .map(|_| ())
+    }
+}
+
+/// `APPLY_FILES` for Windows: Compi's files are replaced whole, a user's in place.
+fn apply_on_windows(operation: &FileOperation) -> std::io::Result<()> {
+    use std::path::Path;
+    match operation {
+        FileOperation::Write { path, content } => {
+            let path = Path::new(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = path.with_extension(format!("compi-{}.tmp", std::process::id()));
+            std::fs::write(&temporary, content)?;
+            std::fs::rename(&temporary, path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&temporary);
+            })
+        }
+        FileOperation::WriteUser { path, content } => {
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, content)
+        }
+        FileOperation::Delete { path } => match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        },
+        FileOperation::RemoveBackup { path } => {
+            if !path.contains("/.compi/prompt/backups/") || path.ends_with("/backups/") {
+                return Err(std::io::Error::other(
+                    "refusing to remove a path outside prompt backups",
+                ));
+            }
+            match std::fs::remove_dir_all(path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            }
+        }
     }
 }
 
@@ -147,13 +278,6 @@ pub(super) enum FileOperation {
     RemoveBackup {
         path: String,
     },
-}
-
-pub(super) fn validate_path(path: &str) -> Result<(), String> {
-    if !path.starts_with('/') || path.contains(['\0', '\n', '\t']) || path.len() > 4096 {
-        return Err(format!("invalid prompt file path: {path:?}"));
-    }
-    Ok(())
 }
 
 /// The helper's error, or `wsl.exe`'s own message, which it writes to stdout.
@@ -181,7 +305,7 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn run(mut command: Command, stdin: &[u8], timeout: Duration) -> Result<Output, String> {
+pub(super) fn run(mut command: Command, stdin: &[u8], timeout: Duration) -> Result<Output, String> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -326,9 +450,20 @@ mod tests {
 
     #[test]
     fn paths_must_be_absolute_single_line_and_tab_free() {
-        assert!(validate_path("/home/me/.zshrc").is_ok());
-        for path in ["relative", "/a\nb", "/a\tb", "/a\0b"] {
-            assert!(validate_path(path).is_err(), "{path:?}");
+        #[cfg(unix)]
+        let posix = Target::Local;
+        #[cfg(windows)]
+        let posix = Target::Wsl("Ubuntu".into());
+        assert!(posix.validate_path("/home/me/.zshrc").is_ok());
+        for path in ["relative", "/a\nb", "/a\tb", "/a\0b", "C:/Users/me"] {
+            assert!(posix.validate_path(path).is_err(), "{path:?}");
+        }
+        #[cfg(windows)]
+        {
+            assert!(Target::Windows.validate_path("C:/Users/me/x.ps1").is_ok());
+            for path in ["/home/me", "Users/me", "C:x", "C:/a\nb"] {
+                assert!(Target::Windows.validate_path(path).is_err(), "{path:?}");
+            }
         }
     }
 }

@@ -369,11 +369,16 @@ impl CompiApp {
         } else {
             #[cfg(windows)]
             {
-                let distribution = workspace
-                    .surface(&view.surface_id)
-                    .and_then(|surface| surface.wsl_distribution())
-                    .map(str::to_owned);
-                ImageTarget::Wsl { distribution }
+                let surface = workspace.surface(&view.surface_id);
+                if surface.is_some_and(|surface| surface.runs_powershell()) {
+                    ImageTarget::PowerShell
+                } else {
+                    ImageTarget::Wsl {
+                        distribution: surface
+                            .and_then(|surface| surface.wsl_distribution())
+                            .map(str::to_owned),
+                    }
+                }
             }
             #[cfg(target_os = "macos")]
             {

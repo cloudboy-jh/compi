@@ -211,7 +211,7 @@ fn read(path: &Path) -> Option<Seen> {
 }
 
 /// Any saved window slot (`primary.json` or `aux-*.json`) under the client state root.
-fn prior_window_state(data: &Path) -> bool {
+pub(crate) fn prior_window_state(data: &Path) -> bool {
     let mut pending = vec![data.join("client-state-v1")];
     while let Some(directory) = pending.pop() {
         let Ok(entries) = fs::read_dir(&directory) else {

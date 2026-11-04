@@ -547,29 +547,21 @@ impl Surface {
         instance: Option<&str>,
         startup_started: Option<Instant>,
     ) -> Result<Arc<Self>> {
-        #[cfg(unix)]
-        let shell_executable = launch.executable.to_str().map(str::to_owned);
-        #[cfg(windows)]
-        let shell_executable = Some(
-            info.launch
-                .profile
-                .as_ref()
-                .and_then(|profile| profile.executable.as_deref())
-                .unwrap_or("/bin/bash")
-                .to_owned(),
-        );
-        #[cfg(unix)]
-        let distribution = None;
-        #[cfg(windows)]
-        let distribution = Some(
-            launch
-                .argv
-                .windows(2)
-                .find(|args| args[0] == "--distribution")
-                .and_then(|args| args[1].to_str())
-                .ok_or("WSL launch has no resolved distribution")?
-                .to_owned(),
-        );
+        let distribution = launch.distribution.clone();
+        // A WSL shell's executable is `wsl.exe`; name the Linux shell it runs instead.
+        let shell_executable = match &distribution {
+            None => launch.executable.to_str().map(str::to_owned),
+            Some(_) => Some(
+                info.launch
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.executable.as_deref())
+                    .unwrap_or("/bin/bash")
+                    .to_owned(),
+            ),
+        };
+        // A WSL shell runs the Windows CLI through the bridge; a host shell runs it directly.
+        let wsl = distribution.is_some();
         let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) {
             "compi.exe"
         } else {
@@ -579,7 +571,7 @@ impl Surface {
             ("COMPI_SURFACE_ID", info.id.as_str().to_owned()),
             ("COMPI_INSTANCE", instance.unwrap_or("").to_owned()),
             (
-                if cfg!(windows) {
+                if wsl {
                     "COMPI_CLI_WINDOWS"
                 } else {
                     "COMPI_CLI"
@@ -587,7 +579,7 @@ impl Surface {
                 cli.to_string_lossy().into_owned(),
             ),
             (
-                if cfg!(windows) {
+                if wsl {
                     "COMPI_CLI_DATA_DIR_WINDOWS"
                 } else {
                     "COMPI_DATA_DIR"
@@ -597,14 +589,7 @@ impl Surface {
                     .into_owned(),
             ),
         ];
-        #[cfg(unix)]
-        launch.env.extend(
-            environment
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
-        #[cfg(windows)]
-        {
+        if wsl {
             let exec = launch
                 .argv
                 .iter()
@@ -618,6 +603,12 @@ impl Surface {
                     .map(|(key, value)| format!("{key}={value}").into()),
             );
             launch.argv.splice(exec..exec, prefix);
+        } else {
+            launch.env.extend(
+                environment
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into())),
+            );
         }
         if let Some(started) = startup_started {
             compi_protocol::perf::log_surface_startup_stage(
@@ -1318,8 +1309,10 @@ impl Surface {
                 shell_executable: self.shell_executable.clone(),
                 foreground_pgid,
                 environment: EnvironmentIdentity {
-                    kind: if cfg!(windows) {
+                    kind: if self.distribution.is_some() {
                         EnvironmentKind::Wsl
+                    } else if cfg!(windows) {
+                        EnvironmentKind::Windows
                     } else {
                         EnvironmentKind::Unix
                     },

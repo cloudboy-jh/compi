@@ -3,18 +3,20 @@
 //! every change is planned, backed up and applied only with the plan's token.
 mod config;
 pub(crate) mod target;
+#[cfg(windows)]
+mod windows;
 
 use compi_protocol::ErrorCode;
 use compi_protocol::prompt::{
     MAX_PREVIEW_STYLES, PromptApplied, PromptBackup, PromptConfig, PromptEnvironment,
-    PromptFileAction, PromptFileChange, PromptOperation, PromptPlan, PromptPreview, PromptProvider,
-    PromptProviderInfo, PromptRender, PromptRequest, PromptResponse, PromptScope, PromptShell,
-    PromptShellInfo, PromptStartupLine, PromptState, PromptStyle, PromptStyleEntry,
+    PromptFileAction, PromptFileChange, PromptOperation, PromptPlace, PromptPlan, PromptPreview,
+    PromptProvider, PromptProviderInfo, PromptRender, PromptRequest, PromptResponse, PromptScope,
+    PromptShell, PromptShellInfo, PromptStartupLine, PromptState, PromptStyle, PromptStyleEntry,
     PromptStyleRender,
 };
 use config::{
     block, config_extension, existing_omp_config, find_block, init_script, line_diff, live_script,
-    scope_name, style_label, with_block, without_block,
+    scope_name, script_extension, style_label, with_block, without_block,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -36,10 +38,10 @@ fn internal(message: impl Into<String>) -> Failure {
 }
 
 pub(crate) fn handle(
-    distribution: Option<String>,
+    place: PromptPlace,
     request: PromptRequest,
 ) -> Result<PromptResponse, Failure> {
-    let target = Target::resolve(distribution.as_deref()).map_err(invalid)?;
+    let target = Target::resolve(&place).map_err(invalid)?;
     match request {
         PromptRequest::Detect => {
             let facts = probe(&target)?;
@@ -108,6 +110,9 @@ struct Facts {
     starship_config: Option<String>,
     startup: Vec<(String, u32, String)>,
     profile_sources_bashrc: Option<bool>,
+    /// Windows PowerShell's profile, which runs outside Compi.
+    profile: Option<String>,
+    execution_policy: Option<String>,
     state: PromptState,
     state_error: Option<String>,
     backups: Vec<Manifest>,
@@ -125,10 +130,12 @@ impl Facts {
         format!("{}/.compi/prompt", self.home)
     }
 
-    fn startup_file(&self, shell: PromptShell) -> String {
+    /// The startup file a shell outside Compi runs; `None` when it is unknown.
+    fn startup_file(&self, shell: PromptShell) -> Option<String> {
         match shell {
-            PromptShell::Bash => format!("{}/.bashrc", self.home),
-            PromptShell::Zsh => format!("{}/.zshrc", self.home),
+            PromptShell::Bash => Some(format!("{}/.bashrc", self.home)),
+            PromptShell::Zsh => Some(format!("{}/.zshrc", self.home)),
+            PromptShell::PowerShell => self.profile.clone(),
         }
     }
 }
@@ -258,6 +265,8 @@ fn parse_probe(output: &str) -> Facts {
                 }
             }
             "profile_sources_bashrc" => facts.profile_sources_bashrc = Some(rest == "yes"),
+            "profile" => facts.profile = Some(rest.to_owned()),
+            "execution_policy" => facts.execution_policy = Some(rest.to_owned()),
             "state" => match serde_json::from_str(rest) {
                 Ok(state) => facts.state = state,
                 Err(error) => facts.state_error = Some(error.to_string()),
@@ -295,11 +304,22 @@ fn valid_backup_id(id: &str) -> bool {
 }
 
 fn probe(target: &Target) -> Result<Facts, Failure> {
+    #[cfg(windows)]
+    let output = if target.is_windows() {
+        windows::probe_output(target)
+            .map_err(|error| internal(format!("could not inspect Windows PowerShell: {error}")))?
+            .into_bytes()
+    } else {
+        target
+            .sh_ok("could not inspect the shell environment", PROBE, &[], &[])
+            .map_err(internal)?
+    };
+    #[cfg(unix)]
     let output = target
         .sh_ok("could not inspect the shell environment", PROBE, &[], &[])
         .map_err(internal)?;
     let facts = parse_probe(&String::from_utf8_lossy(&output));
-    if !facts.home.starts_with('/') {
+    if target.validate_path(&facts.home).is_err() {
         return Err(internal("the shell environment has no absolute HOME"));
     }
     *FACTS.lock() = Some((target.clone(), Instant::now(), facts.clone()));
@@ -316,13 +336,19 @@ fn cached_facts(target: &Target) -> Result<Facts, Failure> {
     probe(target)
 }
 
-fn compi_shell() -> String {
+/// The shell Compi starts in `target`.
+fn compi_shell(target: &Target) -> String {
     #[cfg(windows)]
     {
-        "/bin/bash".into()
+        if target.is_windows() {
+            windows::powershell()
+        } else {
+            "/bin/bash".into()
+        }
     }
     #[cfg(unix)]
     {
+        let _ = target;
         crate::launch::default_shell()
     }
 }
@@ -388,11 +414,12 @@ fn style_name(style: &PromptStyle) -> String {
 }
 
 fn environment(target: &Target, facts: &Facts) -> PromptEnvironment {
-    let label = match target.distribution() {
-        Some(name) => format!("WSL {name}"),
-        None => facts.host.clone(),
+    let label = match target.place() {
+        PromptPlace::Wsl { distribution } => format!("WSL {distribution}"),
+        PromptPlace::Windows => "Windows".to_owned(),
+        PromptPlace::Default => facts.host.clone(),
     };
-    let compi_shell = compi_shell();
+    let compi_shell = compi_shell(target);
     let compi = PromptShellInfo {
         shell: PromptShell::from_path(&compi_shell),
         path: compi_shell,
@@ -441,9 +468,9 @@ fn environment(target: &Target, facts: &Facts) -> PromptEnvironment {
     #[cfg(unix)]
     let distributions = Vec::new();
     PromptEnvironment {
-        notes: notes(&label, facts, &compi, &login),
+        notes: notes(&label, target, facts, &compi, &login),
         target: label,
-        distribution: target.distribution(),
+        place: target.place(),
         distributions,
         home: facts.home.clone(),
         compi_shell: compi,
@@ -470,11 +497,29 @@ fn environment(target: &Target, facts: &Facts) -> PromptEnvironment {
 
 fn notes(
     label: &str,
+    target: &Target,
     facts: &Facts,
     compi: &PromptShellInfo,
     login: &PromptShellInfo,
 ) -> Vec<String> {
     let mut notes = Vec::new();
+    if target.is_windows() {
+        if let Some(policy) = facts
+            .execution_policy
+            .as_deref()
+            .filter(|policy| ["Restricted", "AllSigned"].contains(policy))
+        {
+            notes.push(format!(
+                "PowerShell's execution policy is {policy}, so your profile and Oh My Posh's own scripts do not run. Allow local scripts with Set-ExecutionPolicy -Scope CurrentUser RemoteSigned, then refresh."
+            ));
+        }
+        if facts.profile.is_none() {
+            notes.push(
+                "Compi could not find your PowerShell profile, so prompts outside Compi are unavailable."
+                    .into(),
+            );
+        }
+    }
     if facts.providers.is_empty() {
         notes.push(format!(
             "Neither Oh My Posh nor Starship is installed in {label}. Install one there yourself (https://ohmyposh.dev or https://starship.rs), then refresh. Compi does not install prompt providers."
@@ -541,11 +586,11 @@ fn notes(
     notes
 }
 
-fn validate_style(config: &PromptConfig) -> Result<(), Failure> {
+fn validate_style(target: &Target, config: &PromptConfig) -> Result<(), Failure> {
     match (&config.provider, &config.style) {
         (_, PromptStyle::Default) => Ok(()),
         (PromptProvider::OhMyPosh, PromptStyle::Theme { path })
-        | (_, PromptStyle::Existing { path }) => target::validate_path(path).map_err(invalid),
+        | (_, PromptStyle::Existing { path }) => target.validate_path(path).map_err(invalid),
         (PromptProvider::Starship, PromptStyle::Preset { name })
             if !name.is_empty()
                 && name.len() <= 64
@@ -564,32 +609,38 @@ fn validate_style(config: &PromptConfig) -> Result<(), Failure> {
 
 /// The chosen style's configuration, which Compi copies unchanged.
 fn style_config(target: &Target, binary: &str, config: &PromptConfig) -> Result<Vec<u8>, Failure> {
-    validate_style(config)?;
+    validate_style(target, config)?;
     let context = "could not read the prompt style";
+    let exists = |path: &String| -> Result<(), Failure> {
+        match target
+            .read_files(std::slice::from_ref(path))
+            .map_err(internal)?
+            .pop()
+        {
+            Some(Some(_)) => Ok(()),
+            _ => Err(invalid(format!("{path} does not exist"))),
+        }
+    };
     match (&config.provider, &config.style) {
         (PromptProvider::OhMyPosh, PromptStyle::Default) => target
-            .sh_ok(
-                context,
-                r#"exec "$1" config export --format json"#,
-                &[binary],
-                &[],
-            )
+            .exec_ok(context, binary, &["config", "export", "--format", "json"])
             .map_err(internal),
         (
             PromptProvider::OhMyPosh,
             PromptStyle::Theme { path } | PromptStyle::Existing { path },
-        ) => target
-            .sh_ok(
-                context,
-                r#"if [ ! -f "$2" ]; then echo "$2 does not exist" >&2; exit 1; fi
-exec "$1" config export --config "$2" --format json"#,
-                &[binary, path],
-                &[],
-            )
-            .map_err(internal),
+        ) => {
+            exists(path)?;
+            target
+                .exec_ok(
+                    context,
+                    binary,
+                    &["config", "export", "--config", path, "--format", "json"],
+                )
+                .map_err(internal)
+        }
         (PromptProvider::Starship, PromptStyle::Default) => Ok(Vec::new()),
         (PromptProvider::Starship, PromptStyle::Preset { name }) => target
-            .sh_ok(context, r#"exec "$1" preset "$2""#, &[binary, name], &[])
+            .exec_ok(context, binary, &["preset", name])
             .map_err(internal),
         (PromptProvider::Starship, PromptStyle::Existing { path }) => target
             .read_files(std::slice::from_ref(path))
@@ -654,11 +705,18 @@ for spec in "$@"; do
     printf 'O'; render primary 0 120; printf '\037'; render right 0 120; printf '\036'
 done"#;
 
-fn style_spec(provider: PromptProvider, style: &PromptStyle) -> Result<String, Failure> {
-    validate_style(&PromptConfig {
-        provider,
-        style: style.clone(),
-    })?;
+fn style_spec(
+    target: &Target,
+    provider: PromptProvider,
+    style: &PromptStyle,
+) -> Result<String, Failure> {
+    validate_style(
+        target,
+        &PromptConfig {
+            provider,
+            style: style.clone(),
+        },
+    )?;
     Ok(match style {
         PromptStyle::Default => "default:-".into(),
         PromptStyle::Theme { path } => format!("theme:{path}"),
@@ -681,15 +739,35 @@ fn preview(
     }
     let specs = styles
         .iter()
-        .map(|style| style_spec(provider, style))
+        .map(|style| style_spec(target, provider, style))
         .collect::<Result<Vec<_>, _>>()?;
     let facts = cached_facts(target)?;
     let binary = provider_binary(&facts, provider)?;
-    let cwd = cwd
-        .filter(|cwd| target::validate_path(cwd).is_ok())
-        .unwrap_or("-");
     let width = width.clamp(20, 400).to_string();
-    let shell = PromptShell::from_path(&compi_shell()).unwrap_or(PromptShell::Bash);
+    #[cfg(windows)]
+    if target.is_windows() {
+        // PowerShell reports its folder through OSC 7 as `/C:/…`.
+        let cwd = cwd
+            .map(|cwd| {
+                cwd.strip_prefix('/')
+                    .filter(|rest| config::windows_path(rest))
+                    .unwrap_or(cwd)
+            })
+            .filter(|cwd| target.validate_path(cwd).is_ok())
+            .unwrap_or("-");
+        let output =
+            windows::preview_output(target, provider, binary, cwd, &width, &facts.home, &specs)
+                .map_err(|error| {
+                    internal(format!("{} preview failed: {error}", provider.label()))
+                })?;
+        return Ok(PromptPreview {
+            renders: parse_preview(&output, styles.len()),
+        });
+    }
+    let cwd = cwd
+        .filter(|cwd| target.validate_path(cwd).is_ok())
+        .unwrap_or("-");
+    let shell = PromptShell::from_path(&compi_shell(target)).unwrap_or(PromptShell::Bash);
     let mut args = vec![provider.executable(), binary, cwd, &width, shell.name()];
     args.extend(specs.iter().map(String::as_str));
     let output = target.sh(PREVIEW, &args, &[]).map_err(internal)?;
@@ -798,11 +876,12 @@ impl Desired {
         self.files.push((path, content, user));
     }
 
-    /// Compi's config and init files for one scope; `None` removes them all.
+    /// Compi's config and init files for one scope in `shells`; `None` removes them all.
     fn scope(
         &mut self,
         base: &str,
         scope: PromptScope,
+        shells: &[PromptShell],
         applied: Option<(&PromptConfig, &str, &[u8], &[PromptShell])>,
     ) {
         let name = scope_name(scope);
@@ -816,14 +895,18 @@ impl Desired {
                 false,
             );
         }
-        for shell in PromptShell::ALL {
+        for &shell in shells {
             let script = applied.filter(|(.., shells)| shells.contains(&shell)).map(
                 |(config, binary, ..)| {
                     let path = format!("{base}/{name}.{}", config_extension(config.provider));
                     init_script(config.provider, binary, shell, &path).into_bytes()
                 },
             );
-            self.set(format!("{base}/{name}.{}", shell.name()), script, false);
+            self.set(
+                format!("{base}/{name}.{}", script_extension(shell)),
+                script,
+                false,
+            );
         }
     }
 }
@@ -845,10 +928,11 @@ fn prepare(
     operation: &PromptOperation,
 ) -> Result<Prepared, Failure> {
     let base = facts.base();
-    let login = PromptShell::from_path(&facts.login_shell);
-    let mut startup_files: Vec<String> = PromptShell::ALL
-        .into_iter()
-        .map(|shell| facts.startup_file(shell))
+    let shells = target.shells();
+    let login = PromptShell::from_path(&facts.login_shell).filter(|shell| shells.contains(shell));
+    let mut startup_files: Vec<String> = shells
+        .iter()
+        .filter_map(|shell| facts.startup_file(*shell))
         .collect();
     if let Some(path) = facts
         .state
@@ -857,18 +941,22 @@ fn prepare(
         .and_then(|applied| applied.startup_file.clone())
         && !startup_files.contains(&path)
     {
-        target::validate_path(&path).map_err(internal)?;
+        target.validate_path(&path).map_err(internal)?;
         startup_files.push(path);
     }
     let mut universe: Vec<String> = Vec::new();
     for scope in ["compi", "normal"] {
-        for suffix in ["omp.json", "starship.toml", "bash", "zsh"] {
+        let suffixes = ["omp.json", "starship.toml"]
+            .into_iter()
+            .chain(shells.iter().map(|shell| script_extension(*shell)));
+        for suffix in suffixes {
             universe.push(format!("{base}/{scope}.{suffix}"));
         }
     }
-    for name in ["live.bash", "live.zsh", "state.json"] {
-        universe.push(format!("{base}/{name}"));
+    for shell in shells {
+        universe.push(format!("{base}/live.{}", script_extension(*shell)));
     }
+    universe.push(format!("{base}/state.json"));
     universe.extend(startup_files.iter().cloned());
     if let PromptOperation::Restore { backup } = operation
         && let Some(manifest) = facts.backups.iter().find(|manifest| manifest.id == *backup)
@@ -880,7 +968,7 @@ fn prepare(
         }
     }
     for path in &universe {
-        target::validate_path(path).map_err(internal)?;
+        target.validate_path(path).map_err(internal)?;
     }
     let contents = target.read_files(&universe).map_err(internal)?;
     let snapshot: Vec<(String, Option<Vec<u8>>)> = universe.into_iter().zip(contents).collect();
@@ -901,7 +989,7 @@ fn prepare(
     let mut notes = Vec::new();
     // Removes the login-shell prompt: its files and Compi's block in any startup file.
     let remove_outside = |desired: &mut Desired| -> bool {
-        desired.scope(&base, PromptScope::Normal, None);
+        desired.scope(&base, PromptScope::Normal, shells, None);
         let mut found = false;
         for path in &startup_files {
             let content = startup_content(path);
@@ -924,7 +1012,8 @@ fn prepare(
             desired.scope(
                 &base,
                 PromptScope::Compi,
-                Some((config, binary, &content, &PromptShell::ALL)),
+                shells,
+                Some((config, binary, &content, shells)),
             );
             let mut compi = PromptApplied {
                 config: config.clone(),
@@ -945,9 +1034,12 @@ fn prepare(
                 desired.scope(
                     &base,
                     PromptScope::Normal,
+                    shells,
                     Some((config, binary, &content, &[shell])),
                 );
-                let startup = facts.startup_file(shell);
+                let startup = facts
+                    .startup_file(shell)
+                    .ok_or_else(|| invalid("Compi could not find your PowerShell profile"))?;
                 for path in &startup_files {
                     if *path != startup {
                         let content = startup_content(path);
@@ -999,7 +1091,7 @@ fn prepare(
             );
         }
         PromptOperation::Disable => {
-            desired.scope(&base, PromptScope::Compi, None);
+            desired.scope(&base, PromptScope::Compi, shells, None);
             let found = remove_outside(&mut desired);
             if !found && state == PromptState::default() {
                 return Err(invalid("no prompt is applied"));
@@ -1021,13 +1113,13 @@ fn prepare(
                 .map(|file| format!("{directory}/{file}"))
                 .collect();
             for file in &files {
-                target::validate_path(file).map_err(internal)?;
+                target.validate_path(file).map_err(internal)?;
             }
             let saved = target.read_files(&files).map_err(internal)?;
             let mut saved = saved.into_iter();
             let mut restored_state = None;
             for entry in &manifest.entries {
-                target::validate_path(&entry.path).map_err(internal)?;
+                target.validate_path(&entry.path).map_err(internal)?;
                 let content = match &entry.file {
                     Some(_) => Some(
                         saved
@@ -1069,10 +1161,10 @@ fn prepare(
         .then(|| serde_json::to_vec(&state).map_err(|error| internal(error.to_string())))
         .transpose()?;
     desired.set(state_path.clone(), state_content, false);
-    for shell in PromptShell::ALL {
+    for shell in shells {
         desired.set(
-            format!("{base}/live.{}", shell.name()),
-            live_script(shell, &state, &base).map(String::into_bytes),
+            format!("{base}/live.{}", script_extension(*shell)),
+            live_script(*shell, &state, &base).map(String::into_bytes),
             false,
         );
     }
@@ -1082,6 +1174,17 @@ fn prepare(
             .ok_or_else(|| internal(format!("{path} is not a prompt file Compi manages")))?;
         // An empty user file that never existed does not need creating.
         let unchanged = old == new || (user && old.is_none() && new.as_deref() == Some(b""));
+        // Compi edits a user's file as text; one that is not UTF-8 would be mangled.
+        if !unchanged
+            && user
+            && old
+                .as_deref()
+                .is_some_and(|old| std::str::from_utf8(old).is_err())
+        {
+            return Err(invalid(format!(
+                "{path} is not UTF-8 text, so Compi does not edit it"
+            )));
+        }
         if !unchanged {
             changes.push(Change {
                 path,
@@ -1239,7 +1342,7 @@ for rc in .bashrc .zshrc; do
 done"#;
 
     fn request(request: PromptRequest) -> Result<PromptResponse, Failure> {
-        handle(None, request)
+        handle(PromptPlace::Default, request)
     }
 
     fn detect() -> PromptEnvironment {
@@ -1292,7 +1395,7 @@ done"#;
     }
 
     fn read(path: &str) -> Option<String> {
-        Target::resolve(None)
+        Target::resolve(&PromptPlace::Default)
             .unwrap()
             .read_files(&[path.to_owned()])
             .unwrap()
@@ -1484,7 +1587,7 @@ done"#;
 
             // Restoring keeps later edits to the rest of the file.
             let edited = format!("{original}alias later=1\n");
-            Target::resolve(None)
+            Target::resolve(&PromptPlace::Default)
                 .unwrap()
                 .apply(&[FileOperation::WriteUser {
                     path: startup.clone(),
@@ -1522,7 +1625,7 @@ done"#;
 
     #[test]
     fn detect_preview_apply_turn_off_and_restore_in_a_temporary_home() {
-        let target = Target::resolve(None).unwrap();
+        let target = Target::resolve(&PromptPlace::Default).unwrap();
         let home = target.sh_ok("mktemp", "mktemp -d", &[], &[]).unwrap();
         let home = String::from_utf8(home).unwrap().trim().to_owned();
         target.sh_ok("setup", SETUP, &[&home], &[]).unwrap();
@@ -1582,6 +1685,13 @@ done"#;
         assert_eq!(facts.backups.len(), 1);
         let notes = notes(
             "WSL Ubuntu",
+            &{
+                #[cfg(unix)]
+                let posix = Target::Local;
+                #[cfg(windows)]
+                let posix = Target::Wsl("Ubuntu".into());
+                posix
+            },
             &facts,
             &PromptShellInfo {
                 path: "/bin/bash".into(),

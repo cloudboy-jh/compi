@@ -20,8 +20,42 @@ pub(super) const fn scope_name(scope: PromptScope) -> &'static str {
     }
 }
 
+/// The file extension of Compi's init and live scripts for `shell`.
+pub(super) const fn script_extension(shell: PromptShell) -> &'static str {
+    match shell {
+        PromptShell::Bash => "bash",
+        PromptShell::Zsh => "zsh",
+        PromptShell::PowerShell => "ps1",
+    }
+}
+
 pub(super) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// A PowerShell single-quoted string; it also reads `‘ ’ ‚ ‛` as quotes.
+fn powershell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        if matches!(
+            character,
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}'
+        ) {
+            quoted.push(character);
+        }
+        quoted.push(character);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// PowerShell loads a script's text as a script block, which the script execution
+/// policy does not stop the way it stops a `.ps1` file.
+fn powershell_load(path: &str) -> String {
+    format!(
+        "if (Test-Path -LiteralPath {path}) {{ . ([ScriptBlock]::Create([IO.File]::ReadAllText({path}))) }}",
+        path = powershell_quote(path)
+    )
 }
 
 /// The init script Compi sources for one scope and shell.
@@ -37,6 +71,20 @@ pub(super) fn init_script(
         }
         PromptShell::Zsh => {
             "if (( ${+functions[_compi_prompt_snapshot]} )); then _compi_prompt_snapshot; fi"
+        }
+        // Compi's PowerShell integration keeps the profile's prompt itself.
+        PromptShell::PowerShell => {
+            let binary = powershell_quote(binary);
+            let config = powershell_quote(config);
+            let init = match provider {
+                PromptProvider::OhMyPosh => {
+                    format!("    & {binary} init pwsh --config {config} | Invoke-Expression")
+                }
+                PromptProvider::Starship => format!(
+                    "    $env:STARSHIP_CONFIG = {config}\n    Invoke-Expression (& {binary} init powershell --print-full-init | Out-String)"
+                ),
+            };
+            return format!("{GENERATED}\nif (Test-Path -LiteralPath {binary}) {{\n{init}\n}}\n");
         }
     };
     let binary = shell_quote(binary);
@@ -56,26 +104,41 @@ pub(super) fn init_script(
 /// The script running Compi shells source after a live reload; `None` when no
 /// managed prompt remains, so they return to their own prompt.
 pub(super) fn live_script(shell: PromptShell, state: &PromptState, base: &str) -> Option<String> {
+    let load = |scope: &str| {
+        let path = format!("{base}/{scope}.{}", script_extension(shell));
+        match shell {
+            PromptShell::PowerShell => format!("{}\n", powershell_load(&path)),
+            _ => {
+                let path = shell_quote(&path);
+                format!("[ ! -f {path} ] || . {path}\n")
+            }
+        }
+    };
     let mut script = String::new();
     if state
         .normal
         .as_ref()
         .is_some_and(|applied| applied.shell == Some(shell))
     {
-        let path = shell_quote(&format!("{base}/normal.{}", shell.name()));
-        script.push_str(&format!("[ ! -f {path} ] || . {path}\n"));
+        script.push_str(&load("normal"));
     }
     if state.compi.is_some() {
-        let path = shell_quote(&format!("{base}/compi.{}", shell.name()));
-        script.push_str(&format!("[ ! -f {path} ] || . {path}\n"));
+        script.push_str(&load("compi"));
     }
     (!script.is_empty()).then(|| format!("{GENERATED}\n{script}"))
 }
 
 pub(super) fn block(shell: PromptShell) -> String {
-    let path = format!("$HOME/.compi/prompt/normal.{}", shell.name());
+    let path = format!("$HOME/.compi/prompt/normal.{}", script_extension(shell));
+    let load = match shell {
+        // `$HOME` is the user profile folder in PowerShell, as `home` is in Compi.
+        PromptShell::PowerShell => format!(
+            "if (Test-Path -LiteralPath \"{path}\") {{ . ([ScriptBlock]::Create([IO.File]::ReadAllText(\"{path}\"))) }}"
+        ),
+        _ => format!("if [ -f \"{path}\" ]; then . \"{path}\"; fi"),
+    };
     format!(
-        "{BLOCK_BEGIN}\n# Managed by Compi prompt settings. Turn it off there, or delete this block.\nif [ -f \"{path}\" ]; then . \"{path}\"; fi\n{BLOCK_END}\n"
+        "{BLOCK_BEGIN}\n# Managed by Compi prompt settings. Turn it off there, or delete this block.\n{load}\n{BLOCK_END}\n"
     )
 }
 
@@ -169,7 +232,8 @@ pub(super) fn line_diff(old: &str, new: &str) -> String {
     diff
 }
 
-/// The configuration file an `oh-my-posh init` line passes with `--config`.
+/// The configuration file an `oh-my-posh init` line passes with `--config`. A Windows
+/// home (`C:/Users/me`) also reads PowerShell's `$env:USERPROFILE\…` and `\` paths.
 pub(super) fn existing_omp_config(line: &str, home: &str) -> Option<String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let init = tokens.iter().position(|token| *token == "init")?;
@@ -184,17 +248,31 @@ pub(super) fn existing_omp_config(line: &str, home: &str) -> Option<String> {
     let value = value?
         .trim_end_matches([')', '"', '\'', ';', '`'])
         .trim_start_matches(['"', '\'']);
-    let path = if let Some(rest) = value.strip_prefix("~/") {
-        format!("{home}/{rest}")
-    } else if let Some(rest) = value
-        .strip_prefix("$HOME/")
-        .or_else(|| value.strip_prefix("${HOME}/"))
-    {
-        format!("{home}/{rest}")
+    let windows = windows_path(home);
+    let value = if windows {
+        value.replace('\\', "/")
     } else {
         value.to_owned()
     };
-    (path.starts_with('/') && !path.contains('$')).then_some(path)
+    let relative = ["~/", "$HOME/", "${HOME}/"]
+        .into_iter()
+        .chain(
+            windows
+                .then_some(["$env:USERPROFILE/", "$env:HOME/"])
+                .into_iter()
+                .flatten(),
+        )
+        .find_map(|prefix| value.strip_prefix(prefix));
+    let path = match relative {
+        Some(rest) => format!("{home}/{rest}"),
+        None => value.clone(),
+    };
+    ((path.starts_with('/') || windows_path(&path)) && !path.contains('$')).then_some(path)
+}
+
+/// An absolute drive path such as `C:/x` or `C:\x`.
+pub(super) fn windows_path(path: &str) -> bool {
+    matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
 }
 
 /// A readable name for a theme file, such as `capr4n` for `capr4n.omp.json`.
@@ -281,6 +359,65 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn existing_omp_config_reads_powershell_profile_lines_with_a_windows_home() {
+        let home = "C:/Users/me";
+        for (line, expected) in [
+            (
+                r#"oh-my-posh init pwsh --config "$env:USERPROFILE\.config\t\capr4n.omp.json" | Invoke-Expression"#,
+                Some("C:/Users/me/.config/t/capr4n.omp.json"),
+            ),
+            (
+                r"oh-my-posh init pwsh --config 'D:\themes\t.omp.json' | Invoke-Expression",
+                Some("D:/themes/t.omp.json"),
+            ),
+            (
+                r#"oh-my-posh init pwsh --config "$env:POSH_THEMES_PATH\t.omp.json" | iex"#,
+                None,
+            ),
+        ] {
+            assert_eq!(
+                existing_omp_config(line, home).as_deref(),
+                expected,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_scripts_quote_paths_and_load_without_the_execution_policy() {
+        let script = init_script(
+            PromptProvider::OhMyPosh,
+            "C:/Users/it's/oh-my-posh.exe",
+            PromptShell::PowerShell,
+            "C:/Users/it's/.compi/prompt/compi.omp.json",
+        );
+        assert!(script.contains("if (Test-Path -LiteralPath 'C:/Users/it''s/oh-my-posh.exe') {"));
+        assert!(script.contains(
+            "& 'C:/Users/it''s/oh-my-posh.exe' init pwsh --config 'C:/Users/it''s/.compi/prompt/compi.omp.json' | Invoke-Expression"
+        ));
+        let state = PromptState {
+            compi: Some(PromptApplied {
+                config: PromptConfig {
+                    provider: PromptProvider::OhMyPosh,
+                    style: PromptStyle::Default,
+                },
+                shell: None,
+                startup_file: None,
+                applied_at_ms: 1,
+            }),
+            normal: None,
+        };
+        let live = live_script(PromptShell::PowerShell, &state, "C:/Users/me/.compi/prompt");
+        assert!(live.unwrap().contains(
+            "[ScriptBlock]::Create([IO.File]::ReadAllText('C:/Users/me/.compi/prompt/compi.ps1'))"
+        ));
+        let profile = "Set-Alias ll ls\r\n";
+        let added = with_block(profile, &block(PromptShell::PowerShell));
+        assert!(added.starts_with(profile) && added.contains("normal.ps1"));
+        assert_eq!(without_block(&added), profile);
     }
 
     #[test]

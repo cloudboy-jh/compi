@@ -1026,14 +1026,14 @@ impl DaemonClient {
         }
     }
 
-    /// Detect, preview or apply prompt settings in the daemon's shell environment.
+    /// Detect, preview or apply prompt settings in one of the daemon's shell environments.
     pub fn prompt(
         &mut self,
-        distribution: Option<String>,
+        place: crate::prompt::PromptPlace,
         request: crate::prompt::PromptRequest,
     ) -> Result<crate::prompt::PromptResponse> {
         match self.request(ClientMessage::Prompt {
-            distribution,
+            place,
             request: Box::new(request),
         })? {
             ServerMessage::Prompt { response } => Ok(*response),

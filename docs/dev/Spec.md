@@ -12,7 +12,7 @@ The [README](../../README.md) distinguishes the current implementation from this
 
 Compi is a native, cross-platform terminal workspace backed by a persistent server.
 
-Open it on a Mac and work in a native shell. Open it on Windows and work in WSL. Organize work into sessions, tabs, and split panes. Close the window and leave the work running. Reopen it and return to the same workspace.
+Open it on a Mac and work in a native shell. Open it on Windows and work in PowerShell or WSL. Organize work into sessions, tabs, and split panes. Close the window and leave the work running. Reopen it and return to the same workspace.
 
 Persistence and multiplexing must feel like ordinary terminal behavior. No prefix key, terminal mode, embedded tmux interface, or mandatory management ceremony.
 
@@ -51,7 +51,7 @@ The baseline includes:
 - Native macOS and Windows GPUI clients.
 - A platform-neutral server that runs without a window system.
 - Native Unix process hosting on macOS and Linux.
-- WSL2 shell hosting for the Windows product.
+- Windows PowerShell and optional WSL2 shell hosting for the Windows product.
 - `portable-pty` for native Unix hosting; retain Windows' tested ConPTY ownership adapter until an equivalent library path is proved.
 - A platform-independent terminal engine.
 - A workspace actor and stable workspace identities.
@@ -327,10 +327,10 @@ Keep PTY, terminal, transport, configuration, and platform concerns as focused m
 | Environment | Baseline arrangement |
 |---|---|
 | macOS | Native GPUI client, native local server, Unix PTY, user's native shell. |
-| Windows | Native GPUI client, native local server, pinned ConPTY runtime with the tested process-ownership adapter, WSL2 shell launch adapter. |
+| Windows | Native GPUI client, native local server, pinned ConPTY runtime with the tested process-ownership adapter, Windows PowerShell and WSL2 shell launch adapters. |
 | Linux | Headless native server and native Unix PTYs, exercised in CI. Desktop client qualification follows. |
 
-The current Windows product uses a native server and WSL2 shell adapter. This is a deployment choice, not a domain constraint; moving the server into WSL would be a separate decision, not a prerequisite for Mac support.
+The current Windows product uses a native server that starts Windows PowerShell on the host or, when chosen, a WSL2 shell. WSL is optional. This is a deployment choice, not a domain constraint; moving the server into WSL would be a separate decision, not a prerequisite for Mac support.
 
 ### PTY integration
 
@@ -358,7 +358,7 @@ Profiles resolve into host-specific executable, argv, cwd, and environment data 
 ### Shell and environment fidelity
 
 - macOS defaults to the user's configured native shell with platform-appropriate interactive/login behavior; it must not assume Bash.
-- Windows defaults to the chosen WSL2 distribution and configured shell, preserving the existing Bash default until changed by configuration.
+- Windows starts the shell chosen in Settings → Terminal → Shell (`[shell] windows`): Windows PowerShell for new installations, WSL for installations that used Compi before it had the choice. WSL uses the chosen WSL2 distribution and configured shell, Bash by default. Open shells keep theirs when the choice changes.
 - Linux defaults to the user's configured shell.
 - Explicit profiles can choose a shell or directly launch a process without changing workspace semantics.
 - Preserve shell startup files, job control, SSH agent access, credential helpers, locale, and normal environment behavior. The only startup-file edit Compi makes is the reviewed login-shell prompt block described under [shell prompt settings](#shell-prompt-settings).
@@ -460,12 +460,13 @@ The diff body (`gui/workspace/diff_view.rs`) is its own GPUI view per file shown
 
 ### Shell prompt settings
 
-The **Shell prompt** group at the bottom of Settings → Terminal configures the user's own prompt provider, Oh My Posh or Starship, for Bash and Zsh. Compi has no prompt of its own, never installs a provider, and uses each style exactly as the provider defines it. All work runs in the daemon's shell environment: the local Unix account, the selected WSL2 distribution, or the remote account behind SSH.
+The **Shell prompt** group at the bottom of Settings → Terminal configures the user's own prompt provider, Oh My Posh or Starship, for Bash, Zsh and Windows PowerShell. Compi has no prompt of its own, never installs a provider, and uses each style exactly as the provider defines it. All work runs in one of the daemon's shell environments: the local Unix account, the selected WSL2 distribution, Windows PowerShell on a Windows host, or the remote account behind SSH.
 
-- **Detection** happens in the background; the main view shows only the controls, progress, and errors. Details list the target, the login shell, provider paths, startup-file lines that initialize a provider, install hints, and warnings, including a Windows-only Oh My Posh that WSL shells cannot use. Styles are the user's current configuration, the built-in default, Oh My Posh themes (from its cache, `POSH_THEMES_PATH`, and Homebrew theme folders, one entry per theme name with the first folder winning), and Starship presets. Fish, PowerShell, and custom launch profiles are unsupported.
+- **Detection** happens in the background; the main view shows only the controls, progress, and errors. Details list the target, the login shell, provider paths, startup-file lines that initialize a provider, install hints, and warnings, including a Windows-only Oh My Posh that WSL shells cannot use and a PowerShell execution policy that stops profile scripts. Styles are the user's current configuration, the built-in default, Oh My Posh themes (from its cache, `POSH_THEMES_PATH`, and Homebrew theme folders, or on Windows its install's `themes` folder, one entry per theme name with the first folder winning), and Starship presets. Fish, PowerShell 7, and custom launch profiles are unsupported.
 - **Picker** lists every style with its real rendered prompt after a quick success. The daemon renders up to 32 styles per request and the client fetches the list in batches. Previewing changes nothing; prompt, terminal theme, and layout stay independent.
 - **Scope.** Applying always covers *Compi shells*: `~/.compi/prompt/compi.{bash,zsh}`, which the bundled bridge loads after the user's startup files; user files are untouched. *Also use outside Compi* additionally writes `~/.compi/prompt/normal.<shell>` and a marked `# >>> compi prompt >>>` block at the end of the login shell's `~/.bashrc` or `~/.zshrc`, rewritten in place so links and permissions survive; applying without it removes that block. Unrelated lines are never changed. Turn off removes every managed prompt.
 - **Application.** New Compi shells load the applied prompt, and running Compi shells reload at their next prompt through a token file read by the bridge's prompt hook; Compi never types into a terminal. Shells outside Compi need a new shell.
+- **Windows PowerShell.** The daemon runs the providers and writes `~/.compi/prompt/{compi,normal}.ps1` itself, without a POSIX shell. The scripts and the profile block load as script blocks, which the execution policy does not stop. Compi's PowerShell bridge loads `compi.ps1` after the profile and, while PowerShell waits for input, reloads `live.ps1` when the token changes, restoring the profile's prompt and its `POSH_*`/`STARSHIP_*` variables first. *Also use outside Compi* writes the block into the current user's Windows PowerShell profile. A profile that is not UTF-8 is refused rather than rewritten.
 - **Plan, confirm, back up.** Every apply, turn-off, and restore is planned first, in the background, when its dropdown opens under the clicked style, **Turn off**, or the history row; the dropdown holds the confirm and Cancel, and the confirm waits for the plan. One dropdown is open at a time; Escape or Cancel closes it and writes nothing. Re-applying the current style and scope opens none. Only a change to the user's own startup file is shown, as a line diff. The plan carries a token over the files' current contents; execution with a stale token is rejected. Before writing, Compi backs up every managed file to `~/.compi/prompt/backups/<id>/` (newest 20 kept). Restoring returns Compi's files to that moment; in a user's startup file only Compi's block is restored, so later unrelated edits survive.
 - **Live reload safety.** The bridge snapshots the prompt the user's startup files produced (PS1/PS0/PS2/RPS1, `PROMPT_COMMAND` or precmd/preexec hooks, the DEBUG trap, provider session variables, and ble.sh prompt options and hooks) before loading a managed prompt, restores that snapshot before each reload, and keeps its own hook last so providers read the real exit status. Under ble.sh the prompt loads from ble.sh's attach and pre-command hooks because ble.sh owns PS1 and `PROMPT_COMMAND` once attached.
 

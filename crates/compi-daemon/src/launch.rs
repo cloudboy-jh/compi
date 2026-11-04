@@ -12,6 +12,8 @@ pub struct LaunchDescription {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(OsString, OsString)>,
     pub metadata: Option<WorkingDirectory>,
+    /// The WSL2 distribution a Windows daemon starts the shell in; `None` on the host.
+    pub distribution: Option<String>,
 }
 
 impl LaunchDescription {
@@ -41,34 +43,8 @@ impl LaunchDescription {
     }
 }
 
-#[cfg(windows)]
-pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
-    let launch = compi_protocol::wsl::resolve_launch(working_directory, None)?;
-    let mut argv = Vec::new();
-    shell_integration::prepare_wsl(Some(&launch.distribution), None, None, false, &mut argv)?;
-    let mut prefix = vec![OsString::from("--distribution"), launch.distribution.into()];
-    prefix.extend(["--cd".into(), launch.directory.into(), "--exec".into()]);
-    prefix.append(&mut argv);
-    prefix.push("-i".into());
-    Ok(LaunchDescription {
-        executable: r"C:\Windows\System32\wsl.exe".into(),
-        argv: prefix,
-        cwd: None,
-        env: Vec::new(),
-        metadata: launch.metadata,
-    })
-}
-
 #[cfg(unix)]
-pub fn resolve_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
-    resolve_unix_launch(working_directory, true)
-}
-
-#[cfg(unix)]
-fn resolve_unix_launch(
-    working_directory: Option<&str>,
-    install_bridge: bool,
-) -> Result<LaunchDescription> {
+fn resolve_unix_launch(working_directory: Option<&str>) -> Result<LaunchDescription> {
     let (account_shell, account_home) = user_defaults()?;
     let executable = std::env::var_os("SHELL")
         .filter(|shell| !shell.is_empty())
@@ -96,20 +72,13 @@ fn resolve_unix_launch(
         argv.push("-l".into());
     }
     argv.push("-i".into());
-    let mut env = vec![("SHELL".into(), executable.clone())];
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| account_home);
-    if install_bridge {
-        shell_integration::prepare_unix(&executable, &home, &mut env, &mut argv, login)?;
-    }
     Ok(LaunchDescription {
-        executable,
+        executable: executable.clone(),
         argv,
         cwd: Some(cwd),
-        env,
+        env: vec![("SHELL".into(), executable)],
         metadata: None,
+        distribution: None,
     })
 }
 
@@ -262,10 +231,14 @@ pub fn resolve_profile(
             cwd: Some(std::fs::canonicalize(cwd)?),
             env,
             metadata: None,
+            distribution: None,
         })
     }
     #[cfg(windows)]
     {
+        if profile.windows_shell == compi_protocol::WindowsShell::PowerShell {
+            return resolve_powershell(profile, directory, context);
+        }
         let resolved =
             compi_protocol::wsl::resolve_launch(directory, profile.distribution.as_deref())?;
         let executable = profile.executable.as_deref().unwrap_or("/bin/bash");
@@ -306,15 +279,99 @@ pub fn resolve_profile(
             cwd: None,
             env: Vec::new(),
             metadata: resolved.metadata,
+            distribution: Some(distribution.to_owned()),
         })
     }
 }
 
+/// Windows PowerShell on the host, in the requested folder or the user's profile folder.
+#[cfg(windows)]
+fn resolve_powershell(
+    profile: &compi_protocol::LaunchProfile,
+    directory: Option<&str>,
+    context: Option<&compi_protocol::LaunchContext>,
+) -> Result<LaunchDescription> {
+    let executable = match &profile.executable {
+        Some(executable) => PathBuf::from(executable),
+        None => PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot is not set")?)
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    };
+    if !executable.is_absolute() || !executable.is_file() {
+        return Err(format!(
+            "configured shell is not an absolute Windows path: {}",
+            executable.display()
+        )
+        .into());
+    }
+    // The default shell gets Compi's integration; a configured one runs as configured.
+    let argv = if profile.executable.is_none() && profile.args.is_empty() {
+        shell_integration::powershell_argv()
+    } else {
+        profile.args.iter().map(OsString::from).collect()
+    };
+    // A Linux-only folder, say one inherited from a WSL pane, starts at home instead.
+    let cwd = match directory.and_then(windows_directory) {
+        Some(cwd) => PathBuf::from(cwd),
+        None => PathBuf::from(
+            std::env::var_os("USERPROFILE")
+                .filter(|home| !home.is_empty())
+                .ok_or("USERPROFILE is not set")?,
+        ),
+    };
+    let env = context
+        .map(|context| {
+            context
+                .env
+                .iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(LaunchDescription {
+        executable: executable.into(),
+        argv,
+        cwd: Some(cwd),
+        env,
+        metadata: None,
+        distribution: None,
+    })
+}
+
+/// The Windows folder a requested path names: a Windows path as it is, and a WSL drive
+/// mount (`/mnt/c/x`) or a `file://` drive path (`/C:/x`) as `C:\x`. `None` for a path
+/// only Linux has.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_directory(path: &str) -> Option<String> {
+    let drive = |letter: u8, rest: &str| {
+        letter.is_ascii_alphabetic().then(|| {
+            format!(
+                "{}:\\{}",
+                letter.to_ascii_uppercase() as char,
+                rest.replace('/', "\\")
+            )
+        })
+    };
+    match path.as_bytes() {
+        [letter, b':', b'\\' | b'/', ..] if letter.is_ascii_alphabetic() => {
+            Some(path.replace('/', "\\"))
+        }
+        [b'\\', b'\\', ..] => Some(path.to_owned()),
+        [b'/', letter, b':'] => drive(*letter, ""),
+        [b'/', letter, b':', b'/', ..] => drive(*letter, &path[4..]),
+        _ => {
+            let rest = path.strip_prefix("/mnt/")?;
+            let (mount, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            match mount.as_bytes() {
+                [letter] => drive(*letter, tail),
+                _ => None,
+            }
+        }
+    }
+}
+
 pub fn check_system() -> Result<()> {
-    #[cfg(windows)]
-    compi_protocol::wsl::ensure_default_wsl2()?;
     #[cfg(unix)]
-    let _ = resolve_unix_launch(None, false)?;
+    let _ = resolve_unix_launch(None)?;
     #[cfg(unix)]
     validate_executable(std::ffi::OsStr::new("/bin/ps"))?;
     // Validate PTY availability too, without starting a shell or interpreting
@@ -326,6 +383,27 @@ pub fn check_system() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_starts_in_the_windows_folder_a_path_names() {
+        for (path, folder) in [
+            (r"C:\Users\me\proj", Some(r"C:\Users\me\proj")),
+            ("d:/work", Some(r"d:\work")),
+            (
+                r"\\wsl.localhost\Ubuntu\home",
+                Some(r"\\wsl.localhost\Ubuntu\home"),
+            ),
+            ("/mnt/c/Users/me", Some(r"C:\Users\me")),
+            ("/mnt/d", Some(r"D:\")),
+            ("/C:/Users/me", Some(r"C:\Users\me")),
+            ("/c:", Some(r"C:\")),
+            ("/home/me", None),
+            ("/mnt/wsl/x", None),
+            ("~", None),
+        ] {
+            assert_eq!(windows_directory(path).as_deref(), folder, "{path}");
+        }
+    }
 
     #[test]
     fn explicit_non_shell_program_ignores_shell_integration() {

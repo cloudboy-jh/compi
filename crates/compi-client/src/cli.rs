@@ -561,6 +561,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
     if command == "changes" {
         return Ok(changes::run());
     }
+    config::settle_windows_shell(options.config.as_deref());
     let config = config::load(options.config.as_deref(), config::FontOverrides::default());
     if command == "layout" && action == Some("list") {
         let builtins = arrangement::Builtin::ALL.map(|preset| preset.id());

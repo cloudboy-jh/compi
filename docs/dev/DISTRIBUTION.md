@@ -6,7 +6,7 @@ The **Release** workflow builds Windows x64 and Apple Silicon macOS 14+ artifact
 
 - `Compi-<version>-Setup.exe`: per-user Windows installer, including repair and uninstall.
 - `Compi-Setup.exe`: the same Setup under a stable name, so `releases/latest/download/Compi-Setup.exe` always gets the newest one. In-app **Repair Compi** downloads it.
-- `Compi-<version>-Windows-x64.zip`: portable Windows launcher, versioned client/daemon payload, updater, and bundled ConPTY runtime/license. Extract the entire archive together; do not copy individual executables. WSL2 is required for either Windows package.
+- `Compi-<version>-Windows-x64.zip`: portable Windows launcher, versioned client/daemon payload, updater, and bundled ConPTY runtime/license. Extract the entire archive together; do not copy individual executables. WSL2 is optional for either Windows package: without it, Compi runs Windows PowerShell.
 - `Compi-<version>-macOS-arm64.dmg`: open the disk image and drag `Compi.app` into Applications.
 - `Compi-<version>-macOS-arm64.app.zip`: alternative Mac app archive. Move the entire extracted bundle, not just its executable.
 - `Compi-<version>-Windows-x64-update.zip`: complete Windows payload consumed by the updater, not a standalone installer.

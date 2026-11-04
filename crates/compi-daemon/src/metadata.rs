@@ -82,10 +82,10 @@ pub(crate) fn unavailable(surface: &compi_protocol::SurfaceInfo) -> PaneMetadata
         shell_executable: None,
         foreground_pgid: None,
         environment: EnvironmentIdentity {
-            kind: if cfg!(windows) {
-                EnvironmentKind::Wsl
-            } else {
-                EnvironmentKind::Unix
+            kind: match surface.wsl_distribution() {
+                Some(_) => EnvironmentKind::Wsl,
+                None if cfg!(windows) => EnvironmentKind::Windows,
+                None => EnvironmentKind::Unix,
             },
             hostname: MetadataField::unavailable("terminal runtime unavailable"),
             distribution: surface.wsl_distribution().map(str::to_owned),
@@ -162,11 +162,26 @@ fn collect(input: &MetadataInput, value: &mut PaneMetadata, previous: Option<&Pa
             };
         }
     } else {
-        // ConPTY has no Unix-style foreground process group. Never label its launcher as active.
-        value.process =
-            MetadataField::unavailable("native ConPTY does not expose a foreground process group");
+        value.process = windows_foreground(input).map_or_else(
+            || {
+                MetadataField::unavailable(
+                    "native ConPTY does not expose a foreground process group",
+                )
+            },
+            MetadataField::available,
+        );
     }
-    if let Some(cwd) = input.current_directory.as_deref() {
+    if let Some(reported) = input.current_directory.as_deref() {
+        // OSC 7 reports a Windows folder as `/C:/…`; Windows Git wants `C:/…`.
+        let cwd = match reported.as_bytes() {
+            [b'/', drive, b':', ..]
+                if input.environment.kind == EnvironmentKind::Windows
+                    && drive.is_ascii_alphabetic() =>
+            {
+                &reported[1..]
+            }
+            _ => reported,
+        };
         value.git = match run(
             input,
             "git",
@@ -194,7 +209,7 @@ fn collect(input: &MetadataInput, value: &mut PaneMetadata, previous: Option<&Pa
             }
             Err(reason) => stale_or_unavailable(
                 previous
-                    .filter(|value| value.directory.value.as_deref() == Some(cwd))
+                    .filter(|value| value.directory.value.as_deref() == Some(reported))
                     .map(|value| &value.git),
                 &reason,
             ),
@@ -361,6 +376,54 @@ fn run(
             .collect());
     }
     String::from_utf8(stdout).map_err(|_| "metadata output was not UTF-8".into())
+}
+
+/// ConPTY has no foreground process group. A shell that reported its process id runs in
+/// front of its newest child, or waits at its prompt without one. Never the launcher.
+#[cfg(windows)]
+fn windows_foreground(input: &MetadataInput) -> Option<ActiveProcess> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let shell = input.shell_pid?;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let name = |entry: &PROCESSENTRY32W| {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        String::from_utf16_lossy(&entry.szExeFile[..end])
+    };
+    let (mut own, mut child) = (None, None);
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while more {
+        if entry.th32ProcessID == shell {
+            own = Some(name(&entry));
+        } else if entry.th32ParentProcessID == shell {
+            // Later entries are the newer processes.
+            child = Some((entry.th32ProcessID, name(&entry)));
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    let (pid, name) = child.or_else(|| Some((shell, own?)))?;
+    Some(ActiveProcess {
+        pid,
+        process_group: pid,
+        name,
+    })
+}
+
+#[cfg(not(windows))]
+fn windows_foreground(_: &MetadataInput) -> Option<ActiveProcess> {
+    None
 }
 
 #[cfg(test)]

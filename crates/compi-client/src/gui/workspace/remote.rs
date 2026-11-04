@@ -4,9 +4,10 @@
 //! A terminal of the editor's tab that sits idle at a prompt in the repository folder gets
 //! the command. Otherwise a new terminal opens beside the editor pane, in the repository
 //! folder and its environment: the WSL distribution of a WSL folder, and the daemon's
-//! default shell for a host folder (on Windows, WSL's view of the drive). The command is
-//! then typed into it with Enter. Push never forces; a branch without an upstream pushes
-//! with `-u origin <branch>`. The ahead and behind counts follow with the next read of the
+//! default shell for a host folder (on Windows, WSL's view of the drive or PowerShell,
+//! as Settings chose). The command is then typed into it with Enter, quoted for that
+//! shell. Push never forces; a branch without an upstream pushes with
+//! `-u origin <branch>`. The ahead and behind counts follow with the next read of the
 //! repository.
 use super::content::same_folder;
 use super::*;
@@ -44,14 +45,20 @@ impl RemoteCommand {
         }
     }
 
-    /// The command line typed for the repository of `listing`.
-    pub(super) fn line(self, listing: &GitChanges) -> String {
+    /// The command line typed for the repository of `listing`, into PowerShell or a
+    /// POSIX shell.
+    pub(super) fn line(self, listing: &GitChanges, powershell: bool) -> String {
         match (self, &listing.branch, &listing.upstream) {
             (Self::Fetch, ..) => "git fetch".to_owned(),
             (Self::Pull, ..) => "git pull".to_owned(),
-            (Self::Push, Some(branch), None) => {
-                format!("git push -u origin {}", shell_word(branch))
-            }
+            (Self::Push, Some(branch), None) => format!(
+                "git push -u origin {}",
+                if powershell {
+                    crate::shell_quote::powershell(branch)
+                } else {
+                    shell_word(branch)
+                }
+            ),
             (Self::Push, ..) => "git push".to_owned(),
         }
     }
@@ -99,11 +106,22 @@ fn mounted_path(path: &str) -> Option<String> {
     ))
 }
 
-/// Whether a shell whose current directory is `cwd` (in `distribution`, or on the host) is
-/// in the repository `repo` of `environment`.
+/// A Windows folder however a shell or Git writes it: `/C:/a/b/` (OSC 7), `C:/a/b` or
+/// `C:\a\b`, as `C:\a\b`.
+fn windows_folder(path: &str) -> String {
+    let path = match path.as_bytes() {
+        [b'/', _, b':', ..] => &path[1..],
+        _ => path,
+    };
+    path.replace('/', "\\").trim_end_matches('\\').to_owned()
+}
+
+/// Whether a shell whose current directory is `cwd` (in `distribution`, on the host, or
+/// in PowerShell on Windows) is in the repository `repo` of `environment`.
 fn in_repo(
     cwd: &str,
     distribution: Option<&str>,
+    powershell: bool,
     environment: &ContentEnvironment,
     repo: &str,
 ) -> bool {
@@ -112,11 +130,14 @@ fn in_repo(
             distribution == Some(own.as_str()) && same_folder(cwd, repo)
         }
         ContentEnvironment::Host => match mounted_path(repo) {
-            // A Windows folder: the shells beside it run in WSL.
+            Some(_) if powershell => {
+                windows_folder(cwd).eq_ignore_ascii_case(&windows_folder(repo))
+            }
+            // A Windows folder from a WSL shell beside it.
             Some(mounted) => {
                 distribution.is_some() && cwd.trim_end_matches('/').eq_ignore_ascii_case(&mounted)
             }
-            None => distribution.is_none() && same_folder(cwd, repo),
+            None => !powershell && distribution.is_none() && same_folder(cwd, repo),
         },
     }
 }
@@ -124,7 +145,10 @@ fn in_repo(
 /// Whether the process in the foreground of a terminal is its shell: it waits at a prompt.
 fn at_prompt(shell: &str, foreground: &str) -> bool {
     let shell = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
-    shell.trim_start_matches('-') == foreground.trim_start_matches('-')
+    // Windows reports `powershell.exe` and `PowerShell.exe` alike.
+    shell
+        .trim_start_matches('-')
+        .eq_ignore_ascii_case(foreground.trim_start_matches('-'))
 }
 
 /// The terminal panes of `node` showing their shell, with their surfaces. One showing
@@ -202,9 +226,14 @@ impl CompiApp {
             self.global_error = Some(reason.into());
             return;
         }
-        let mut data = command.line(&listing).into_bytes();
+        let (terminal, powershell) =
+            match self.idle_repo_terminal(pane_id, &environment, &listing.repo) {
+                Some((terminal, powershell)) => (Some(terminal), powershell),
+                None => (None, self.new_shell_is_powershell(&environment)),
+            };
+        let mut data = command.line(&listing, powershell).into_bytes();
         data.push(b'\r');
-        if let Some(terminal) = self.idle_repo_terminal(pane_id, &environment, &listing.repo) {
+        if let Some(terminal) = terminal {
             if let Some(view) = self
                 .surface_views
                 .iter_mut()
@@ -226,15 +255,26 @@ impl CompiApp {
         self.open_remote_terminal(pane_id, environment, listing.repo, data, window);
     }
 
+    /// Whether a terminal opened for a folder of `environment` runs PowerShell: a host
+    /// folder of a local Windows daemon, with PowerShell chosen in Settings.
+    fn new_shell_is_powershell(&self, environment: &ContentEnvironment) -> bool {
+        cfg!(windows)
+            && !self.target.is_remote()
+            && *environment == ContentEnvironment::Host
+            && self.config.launch.as_ref().is_ok_and(|launch| {
+                launch.profile.windows_shell == compi_protocol::WindowsShell::PowerShell
+            })
+    }
+
     /// A terminal of `pane_id`'s tab that is attached, idle at a prompt, and in the
-    /// repository `repo`. Unknown idleness counts as busy: nothing is typed into a
-    /// program that may be running.
+    /// repository `repo`, and whether it runs PowerShell. Unknown idleness counts as busy:
+    /// nothing is typed into a program that may be running.
     fn idle_repo_terminal(
         &self,
         pane_id: &PaneId,
         environment: &ContentEnvironment,
         repo: &str,
-    ) -> Option<PaneId> {
+    ) -> Option<(PaneId, bool)> {
         let workspace = self.workspace.as_ref()?;
         let tab = workspace
             .sessions
@@ -271,8 +311,14 @@ impl CompiApp {
                 && view.transport.is_some()
                 && !snapshot.is_some_and(|snapshot| snapshot.modes.alternate_screen)
                 && at_prompt(shell, &foreground.name)
-                && in_repo(&cwd, surface.wsl_distribution(), environment, repo))
-            .then(|| terminal.clone())
+                && in_repo(
+                    &cwd,
+                    surface.wsl_distribution(),
+                    surface.runs_powershell(),
+                    environment,
+                    repo,
+                ))
+            .then(|| (terminal.clone(), surface.runs_powershell()))
         })
     }
 
@@ -404,7 +450,7 @@ impl CompiApp {
             let pane = pane_id.clone();
             let (reason, detail) = match listing {
                 Ok(listing) => {
-                    let line = command.line(listing);
+                    let line = command.line(listing, false);
                     let detail = if command == RemoteCommand::Push && listing.upstream.is_none()
                     {
                         format!("Runs {line} in a terminal beside the editor: the branch has no upstream yet")
@@ -482,18 +528,22 @@ mod tests {
     #[test]
     fn push_sets_an_upstream_only_when_there_is_none() {
         let tracked = listing(Some("main"), Some("abc1234"), Some("origin/main"));
-        assert_eq!(RemoteCommand::Push.line(&tracked), "git push");
-        assert_eq!(RemoteCommand::Pull.line(&tracked), "git pull");
-        assert_eq!(RemoteCommand::Fetch.line(&tracked), "git fetch");
+        assert_eq!(RemoteCommand::Push.line(&tracked, false), "git push");
+        assert_eq!(RemoteCommand::Pull.line(&tracked, false), "git pull");
+        assert_eq!(RemoteCommand::Fetch.line(&tracked, false), "git fetch");
         let new = listing(Some("feature/a-1"), Some("abc1234"), None);
         assert_eq!(
-            RemoteCommand::Push.line(&new),
+            RemoteCommand::Push.line(&new, false),
             "git push -u origin feature/a-1"
         );
         let odd = listing(Some("it's$x"), Some("abc1234"), None);
         assert_eq!(
-            RemoteCommand::Push.line(&odd),
+            RemoteCommand::Push.line(&odd, false),
             r"git push -u origin 'it'\''s$x'"
+        );
+        assert_eq!(
+            RemoteCommand::Push.line(&odd, true),
+            "git push -u origin 'it''s$x'"
         );
     }
 
@@ -515,30 +565,75 @@ mod tests {
         let wsl = ContentEnvironment::Wsl {
             distribution: "Ubuntu".into(),
         };
-        assert!(in_repo("/home/u/r/", Some("Ubuntu"), &wsl, "/home/u/r"));
-        assert!(!in_repo("/home/u/r", Some("Debian"), &wsl, "/home/u/r"));
-        assert!(!in_repo("/home/u/r/src", Some("Ubuntu"), &wsl, "/home/u/r"));
+        assert!(in_repo(
+            "/home/u/r/",
+            Some("Ubuntu"),
+            false,
+            &wsl,
+            "/home/u/r"
+        ));
+        assert!(!in_repo(
+            "/home/u/r",
+            Some("Debian"),
+            false,
+            &wsl,
+            "/home/u/r"
+        ));
+        assert!(!in_repo(
+            "/home/u/r/src",
+            Some("Ubuntu"),
+            false,
+            &wsl,
+            "/home/u/r"
+        ));
         let host = ContentEnvironment::Host;
+        let windows_repo = r"C:\Users\u\r";
         assert!(in_repo(
             "/mnt/c/Users/u/R",
             Some("Ubuntu"),
+            false,
             &host,
-            r"C:\Users\u\r"
+            windows_repo
         ));
         assert!(in_repo(
             "/mnt/c/users/u/r",
             Some("Ubuntu"),
+            false,
             &host,
             "C:/Users/u/r/"
         ));
         assert!(!in_repo(
             "/mnt/d/Users/u/r",
             Some("Ubuntu"),
+            false,
             &host,
-            r"C:\Users\u\r"
+            windows_repo
         ));
-        assert!(in_repo("/Users/u/r", None, &host, "/Users/u/r"));
-        assert!(!in_repo("/Users/u/r", Some("Ubuntu"), &host, "/Users/u/r"));
+        // PowerShell reports its folder through OSC 7 as `/C:/…`.
+        assert!(in_repo("/C:/Users/U/R/", None, true, &host, windows_repo));
+        assert!(in_repo("/C:/Users/u/r", None, true, &host, "C:/Users/u/r/"));
+        assert!(!in_repo(
+            "/C:/Users/u/r/src",
+            None,
+            true,
+            &host,
+            windows_repo
+        ));
+        assert!(!in_repo(
+            "/mnt/c/Users/u/r",
+            None,
+            true,
+            &host,
+            windows_repo
+        ));
+        assert!(in_repo("/Users/u/r", None, false, &host, "/Users/u/r"));
+        assert!(!in_repo(
+            "/Users/u/r",
+            Some("Ubuntu"),
+            false,
+            &host,
+            "/Users/u/r"
+        ));
     }
 
     #[test]
@@ -546,5 +641,9 @@ mod tests {
         assert!(at_prompt("/bin/bash", "bash"));
         assert!(at_prompt("/usr/bin/zsh", "-zsh"));
         assert!(!at_prompt("/bin/bash", "git"));
+        assert!(at_prompt(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "PowerShell.exe"
+        ));
     }
 }

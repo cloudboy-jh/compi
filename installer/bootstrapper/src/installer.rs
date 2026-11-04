@@ -1437,7 +1437,7 @@ fn preview_configuration(
                         selected: env!("CARGO_PKG_VERSION").into(),
                     },
                     Finding::Leftovers,
-                    Finding::Wsl(doctor::WslFact::NotWsl2 {
+                    Finding::Wsl(doctor::WslProblem::NotWsl2 {
                         name: "Ubuntu".into(),
                     }),
                 ]

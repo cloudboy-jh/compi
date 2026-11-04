@@ -7,8 +7,8 @@ use super::settings::{RowCx, SettingsAction};
 use super::*;
 use compi_protocol::prompt::{
     MAX_PREVIEW_STYLES, PromptConfig, PromptEnvironment, PromptFileChange, PromptOperation,
-    PromptPlan, PromptProvider, PromptRender, PromptRequest, PromptResponse, PromptStyle,
-    PromptStyleRender,
+    PromptPlace, PromptPlan, PromptProvider, PromptRender, PromptRequest, PromptResponse,
+    PromptStyle, PromptStyleRender,
 };
 use gpui::{AnyElement, HighlightStyle, ListAlignment, ListState, StyledText, list};
 
@@ -60,8 +60,8 @@ fn prompt_control_id(action: PromptAction) -> usize {
     }
 }
 
-/// Distribution the render came from, provider, and style.
-type RenderKey = (Option<String>, PromptProvider, PromptStyle);
+/// Place the render came from, provider, and style.
+type RenderKey = (PromptPlace, PromptProvider, PromptStyle);
 
 /// Provider output, parsed once when it arrives.
 struct ParsedRender {
@@ -105,7 +105,7 @@ impl StyleRender {
 struct PendingRenders {
     request: u64,
     generation: u64,
-    distribution: Option<String>,
+    place: PromptPlace,
     provider: PromptProvider,
     styles: Vec<PromptStyle>,
 }
@@ -129,9 +129,10 @@ struct PromptDropdown {
 }
 
 pub(in crate::gui) struct PromptSettingsState {
-    /// WSL2 distribution to configure; `None` is the default distribution.
-    distribution: Option<String>,
-    /// Distributions from the last successful detection, kept while another loads.
+    /// Where to configure on Windows; `None` until chosen, which is where Compi starts
+    /// shells by default.
+    place: Option<PromptPlace>,
+    /// WSL distributions from the last successful detection, kept while another loads.
     distributions: Vec<String>,
     environment: Option<Result<PromptEnvironment, String>>,
     loading: bool,
@@ -152,8 +153,8 @@ pub(in crate::gui) struct PromptSettingsState {
     executing: bool,
     /// The open popover's plan or execute request; other replies are stale.
     action_request: u64,
-    /// Focused pane's distribution and directory when the section opened.
-    cwd: Option<(Option<String>, String)>,
+    /// Focused pane's place and directory when the section opened.
+    cwd: Option<(PromptPlace, String)>,
     error: Option<String>,
     /// Style rows of the selected provider, in list order.
     rows: Vec<StyleRow>,
@@ -164,7 +165,7 @@ pub(in crate::gui) struct PromptSettingsState {
 impl Default for PromptSettingsState {
     fn default() -> Self {
         Self {
-            distribution: None,
+            place: None,
             distributions: Vec::new(),
             environment: None,
             loading: false,
@@ -666,12 +667,12 @@ impl CompiApp {
     /// Detects the prompt environment the first time the shell prompt group shows
     /// for a distribution; Refresh detects again.
     pub(super) fn enter_prompt_settings(&mut self) {
-        let (distribution, cwd) = self.focused_prompt_location();
+        let (place, cwd) = self.focused_prompt_location();
         let state = &mut self.prompt_settings;
-        if state.environment.is_none() && !state.loading && state.distribution.is_none() {
-            state.distribution = distribution.clone();
+        if state.environment.is_none() && !state.loading && state.place.is_none() {
+            state.place = place.clone();
         }
-        state.cwd = cwd.map(|path| (distribution, path));
+        state.cwd = cwd.map(|path| (place.unwrap_or_default(), path));
         if state.environment.is_none() && !state.loading {
             self.request_prompt_detect();
         }
@@ -688,15 +689,23 @@ impl CompiApp {
     }
 
     /// The terminal whose prompt the group configures: the focused one, else the one
-    /// Settings was opened from.
-    fn focused_prompt_location(&self) -> (Option<String>, Option<String>) {
+    /// Settings was opened from. On Windows without one, the shell Settings chose.
+    fn focused_prompt_location(&self) -> (Option<PromptPlace>, Option<String>) {
+        let windows = cfg!(windows) && !self.target.is_remote();
+        let chosen = || {
+            (windows
+                && self.config.launch.as_ref().is_ok_and(|launch| {
+                    launch.profile.windows_shell == compi_protocol::WindowsShell::PowerShell
+                }))
+            .then_some(PromptPlace::Windows)
+        };
         let Some(view) = self.focused_view().or_else(|| {
             let origin = self.settings.origin.as_ref()?;
             self.surface_views
                 .iter()
                 .find(|view| &view.pane_id == origin)
         }) else {
-            return (None, None);
+            return (chosen(), None);
         };
         let surface = self
             .workspace
@@ -712,27 +721,52 @@ impl CompiApp {
                     .map(|cwd| cwd.resolved_wsl_path.clone())
             })
             .filter(|path| path.starts_with('/'));
-        #[cfg(windows)]
-        let distribution = surface
-            .and_then(|surface| surface.wsl_distribution())
-            .map(str::to_owned)
-            .filter(|_| !self.target.is_remote());
-        #[cfg(not(windows))]
-        let distribution = None;
-        (distribution, cwd)
+        let place = match surface {
+            _ if !windows => None,
+            Some(surface) if surface.runs_powershell() => Some(PromptPlace::Windows),
+            Some(surface) => surface
+                .wsl_distribution()
+                .map(|distribution| PromptPlace::Wsl {
+                    distribution: distribution.to_owned(),
+                }),
+            None => chosen(),
+        };
+        (place, cwd)
     }
 
-    /// WSL2 distribution for requests; always `None` outside local Windows.
-    fn prompt_request_distribution(&self) -> Option<String> {
+    /// Where requests go; always `Default` outside local Windows.
+    fn prompt_request_place(&self) -> PromptPlace {
         if !cfg!(windows) || self.target.is_remote() {
-            return None;
+            return PromptPlace::Default;
         }
         let state = &self.prompt_settings;
-        state.distribution.clone().or_else(|| {
-            state
-                .environment()
-                .and_then(|environment| environment.distribution.clone())
-        })
+        state
+            .place
+            .clone()
+            .or_else(|| {
+                state
+                    .environment()
+                    .map(|environment| environment.place.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The places to choose between on local Windows: PowerShell, then each WSL
+    /// distribution; none elsewhere.
+    fn prompt_places(&self) -> Vec<(PromptPlace, String)> {
+        if !cfg!(windows) || self.target.is_remote() {
+            return Vec::new();
+        }
+        std::iter::once((PromptPlace::Windows, "PowerShell".to_owned()))
+            .chain(self.prompt_settings.distributions.iter().map(|name| {
+                (
+                    PromptPlace::Wsl {
+                        distribution: name.clone(),
+                    },
+                    name.clone(),
+                )
+            }))
+            .collect()
     }
 
     fn prompt_preview_width(&self) -> u16 {
@@ -747,7 +781,7 @@ impl CompiApp {
         state
             .cwd
             .as_ref()
-            .filter(|(distribution, _)| any_namespace || *distribution == environment.distribution)
+            .filter(|(place, _)| any_namespace || *place == environment.place)
             .map(|(_, path)| path.clone())
     }
 
@@ -755,15 +789,14 @@ impl CompiApp {
         &self,
         job: PromptJob,
         request: u64,
-        distribution: Option<String>,
+        place: PromptPlace,
         prompt: PromptRequest,
     ) {
         let target = self.target.clone();
         let sender = self.event_tx.clone();
         thread::spawn(move || {
-            let result =
-                (|| -> crate::Result<_> { target.connect()?.prompt(distribution, prompt) })()
-                    .map_err(|error| error.to_string());
+            let result = (|| -> crate::Result<_> { target.connect()?.prompt(place, prompt) })()
+                .map_err(|error| error.to_string());
             sender.send(UiEvent::PromptResponded {
                 job,
                 request,
@@ -774,16 +807,11 @@ impl CompiApp {
 
     fn request_prompt_detect(&mut self) {
         let request = NEXT_PROMPT_REQUEST.fetch_add(1, Ordering::Relaxed);
-        let distribution = self.prompt_request_distribution();
+        let place = self.prompt_request_place();
         let state = &mut self.prompt_settings;
         state.detect_request = request;
         state.loading = true;
-        self.send_prompt_request(
-            PromptJob::Detect,
-            request,
-            distribution,
-            PromptRequest::Detect,
-        );
+        self.send_prompt_request(PromptJob::Detect, request, place, PromptRequest::Detect);
     }
 
     /// Requests the next batch of renders for the selected provider; one batch
@@ -792,7 +820,7 @@ impl CompiApp {
         if self.prompt_settings.pending_renders.is_some() {
             return;
         }
-        let distribution = self.prompt_request_distribution();
+        let place = self.prompt_request_place();
         let width = self.prompt_preview_width();
         let cwd = self.prompt_preview_cwd();
         let state = &mut self.prompt_settings;
@@ -811,7 +839,7 @@ impl CompiApp {
             .filter(|style| {
                 !state
                     .renders
-                    .contains_key(&(distribution.clone(), provider, style.clone()))
+                    .contains_key(&(place.clone(), provider, style.clone()))
             })
             .take(MAX_PREVIEW_STYLES)
             .collect();
@@ -822,14 +850,14 @@ impl CompiApp {
         state.pending_renders = Some(PendingRenders {
             request,
             generation: state.render_generation,
-            distribution: distribution.clone(),
+            place: place.clone(),
             provider,
             styles: styles.clone(),
         });
         self.send_prompt_request(
             PromptJob::Renders,
             request,
-            distribution,
+            place,
             PromptRequest::Preview {
                 provider,
                 styles,
@@ -843,7 +871,7 @@ impl CompiApp {
     /// any other, and plans it in the background.
     fn open_prompt_dropdown(&mut self, operation: PromptOperation) {
         let request = NEXT_PROMPT_REQUEST.fetch_add(1, Ordering::Relaxed);
-        let distribution = self.prompt_request_distribution();
+        let place = self.prompt_request_place();
         let state = &mut self.prompt_settings;
         state.action_request = request;
         state.popover_focus = 0;
@@ -855,7 +883,7 @@ impl CompiApp {
         self.send_prompt_request(
             PromptJob::Plan,
             request,
-            distribution,
+            place,
             PromptRequest::Plan { operation },
         );
     }
@@ -912,7 +940,7 @@ impl CompiApp {
     }
 
     fn execute_prompt_plan(&mut self) {
-        let distribution = self.prompt_request_distribution();
+        let place = self.prompt_request_place();
         let state = &mut self.prompt_settings;
         let Some(PromptDropdown {
             operation,
@@ -932,7 +960,7 @@ impl CompiApp {
         if let Some(dropdown) = state.dropdown.as_mut() {
             dropdown.error = None;
         }
-        self.send_prompt_request(PromptJob::Execute, request, distribution, prompt);
+        self.send_prompt_request(PromptJob::Execute, request, place, prompt);
     }
 
     /// Closes the popover; nothing is written. False when none is open or its change
@@ -1025,9 +1053,9 @@ impl CompiApp {
                 state.loading = false;
                 match result {
                     Ok(PromptResponse::Detected { environment }) => {
-                        let keep_selection = state.environment().is_some_and(|previous| {
-                            previous.distribution == environment.distribution
-                        });
+                        let keep_selection = state
+                            .environment()
+                            .is_some_and(|previous| previous.place == environment.place);
                         self.adopt_prompt_environment(environment, keep_selection);
                     }
                     other => {
@@ -1067,10 +1095,9 @@ impl CompiApp {
                                 "The daemon returned no preview for this style.".into(),
                             )
                         });
-                        state.renders.insert(
-                            (pending.distribution.clone(), pending.provider, style),
-                            render,
-                        );
+                        state
+                            .renders
+                            .insert((pending.place.clone(), pending.provider, style), render);
                     }
                 }
                 self.fetch_prompt_renders();
@@ -1132,8 +1159,9 @@ impl CompiApp {
             actions.push(PromptAction::Details);
         }
         actions.push(PromptAction::Refresh);
-        if state.distributions.len() > 1 {
-            actions.extend((0..state.distributions.len()).map(PromptAction::Distribution));
+        let places = self.prompt_places().len();
+        if places > 1 {
+            actions.extend((0..places).map(PromptAction::Distribution));
         }
         let Some(environment) = environment else {
             return actions;
@@ -1218,15 +1246,15 @@ impl CompiApp {
     }
 
     fn select_prompt_distribution(&mut self, index: usize) {
-        let active = self.prompt_request_distribution();
-        let state = &mut self.prompt_settings;
-        let Some(name) = state.distributions.get(index).cloned() else {
+        let active = self.prompt_request_place();
+        let Some((place, _)) = self.prompt_places().into_iter().nth(index) else {
             return;
         };
-        if active.as_ref() == Some(&name) {
+        if active == place {
             return;
         }
-        state.distribution = Some(name);
+        let state = &mut self.prompt_settings;
+        state.place = Some(place);
         state.environment = None;
         state.selected = None;
         state.dropdown = None;
@@ -1476,7 +1504,7 @@ impl CompiApp {
         {
             column = column.child(self.render_prompt_details(environment));
         }
-        if state.distributions.len() > 1 {
+        if self.prompt_places().len() > 1 {
             column = column.child(self.render_prompt_distributions(group, compact, cx));
         }
         if let Some(environment) = environment {
@@ -1493,25 +1521,24 @@ impl CompiApp {
         compact: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let active = self.prompt_request_distribution();
-        let controls =
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .children(self.prompt_settings.distributions.iter().enumerate().map(
-                    |(index, name)| {
-                        self.prompt_segment(
-                            group,
-                            PromptAction::Distribution(index),
-                            name.clone(),
-                            active.as_ref() == Some(name),
-                            cx,
-                        )
-                    },
-                ))
-                .into_any_element();
-        self.settings_row("WSL distribution", String::new(), controls, compact)
+        let active = self.prompt_request_place();
+        let controls = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children(self.prompt_places().into_iter().enumerate().map(
+                |(index, (place, label))| {
+                    self.prompt_segment(
+                        group,
+                        PromptAction::Distribution(index),
+                        label,
+                        active == place,
+                        cx,
+                    )
+                },
+            ))
+            .into_any_element();
+        self.settings_row("Shell", String::new(), controls, compact)
     }
 
     fn render_prompt_details(&self, environment: &PromptEnvironment) -> AnyElement {
@@ -1519,7 +1546,7 @@ impl CompiApp {
         let shell = |role: &str, info: &compi_protocol::prompt::PromptShellInfo| match info.shell {
             Some(_) => format!("{role}: {}", info.path),
             None => format!(
-                "{role}: {} · not supported; Compi manages bash and zsh prompts",
+                "{role}: {} · not supported; Compi manages bash, zsh and Windows PowerShell prompts",
                 info.path
             ),
         };
@@ -1740,7 +1767,7 @@ impl CompiApp {
         };
         let palette = *self.terminal_theme.terminal();
         let key = (
-            self.prompt_request_distribution(),
+            self.prompt_request_place(),
             selected.provider,
             row.style.clone(),
         );
@@ -2175,7 +2202,7 @@ mod tests {
         };
         PromptEnvironment {
             target: "WSL Ubuntu".into(),
-            distribution: None,
+            place: PromptPlace::Default,
             distributions: Vec::new(),
             home: "/home/user".into(),
             compi_shell: shell.clone(),

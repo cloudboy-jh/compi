@@ -75,13 +75,11 @@ pub(crate) struct RunningDaemon {
     pub shells: Vec<String>,
 }
 
+/// WSL that is installed but can't run WSL panes. No WSL at all is not a problem.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum WslFact {
-    Ready,
-    NoDistribution,
+pub(crate) enum WslProblem {
     NotWsl2 { name: String },
     NotStarting,
-    Unavailable,
 }
 
 #[derive(Clone, Debug)]
@@ -100,7 +98,7 @@ pub(crate) struct Facts {
     pub unfinished: bool,
     /// Finished Setup runs and dead lock receipts left on disk.
     pub leftovers: bool,
-    pub wsl: WslFact,
+    pub wsl: Option<WslProblem>,
 }
 
 impl Facts {
@@ -190,7 +188,7 @@ pub(crate) enum Finding {
         shells: Vec<String>,
     },
     DaemonUninspectable,
-    Wsl(WslFact),
+    Wsl(WslProblem),
 }
 
 impl Finding {
@@ -216,10 +214,8 @@ impl Finding {
             } => format!("Instance \u{201c}{name}\u{201d} is out of date"),
             Self::DaemonUnsupervised { .. } => "Background service isn't watched".into(),
             Self::DaemonUninspectable => "Can't check the background service".into(),
-            Self::Wsl(WslFact::NoDistribution | WslFact::Unavailable) => "WSL isn't set up".into(),
-            Self::Wsl(WslFact::NotWsl2 { .. }) => "Your Linux uses WSL 1".into(),
-            Self::Wsl(WslFact::NotStarting) => "Linux doesn't start".into(),
-            Self::Wsl(WslFact::Ready) => "WSL is ready".into(),
+            Self::Wsl(WslProblem::NotWsl2 { .. }) => "Your Linux uses WSL 1".into(),
+            Self::Wsl(WslProblem::NotStarting) => "Linux doesn't start".into(),
         }
     }
 
@@ -253,25 +249,20 @@ impl Finding {
             }
             Self::DaemonUnsupervised { .. } => "If it stops, it won't restart on its own.".into(),
             Self::DaemonUninspectable => "Close Compi, wait a moment, then check again.".into(),
-            Self::Wsl(WslFact::NoDistribution | WslFact::Unavailable) => {
-                "Run this in PowerShell, then restart Windows:".into()
+            Self::Wsl(WslProblem::NotWsl2 { .. }) => {
+                "WSL panes need WSL 2. Run this in PowerShell:".into()
             }
-            Self::Wsl(WslFact::NotWsl2 { .. }) => {
-                "Compi needs WSL 2. Run this in PowerShell:".into()
+            Self::Wsl(WslProblem::NotStarting) => {
+                "Run this in PowerShell to finish its setup:".into()
             }
-            Self::Wsl(WslFact::NotStarting) => "Run this in PowerShell to finish its setup:".into(),
-            Self::Wsl(WslFact::Ready) => String::new(),
         }
     }
 
     /// The exact command to run by hand, for problems Setup must not change itself.
     pub(crate) fn command(&self) -> Option<String> {
         match self {
-            Self::Wsl(WslFact::NoDistribution | WslFact::Unavailable) => {
-                Some("wsl --install".into())
-            }
-            Self::Wsl(WslFact::NotWsl2 { name }) => Some(format!("wsl --set-version {name} 2")),
-            Self::Wsl(WslFact::NotStarting) => Some("wsl".into()),
+            Self::Wsl(WslProblem::NotWsl2 { name }) => Some(format!("wsl --set-version {name} 2")),
+            Self::Wsl(WslProblem::NotStarting) => Some("wsl".into()),
             _ => None,
         }
     }
@@ -450,8 +441,8 @@ pub(crate) fn findings(facts: &Facts) -> Vec<Finding> {
 }
 
 fn push_wsl(facts: &Facts, found: &mut Vec<Finding>) {
-    if facts.wsl != WslFact::Ready {
-        found.push(Finding::Wsl(facts.wsl.clone()));
+    if let Some(problem) = &facts.wsl {
+        found.push(Finding::Wsl(problem.clone()));
     }
 }
 
@@ -527,18 +518,13 @@ pub(crate) fn reinstall_plan(daemons: &[RunningDaemon]) -> UpgradePlan {
     }
 }
 
-/// Classifies `compi_protocol::wsl::ensure_default_wsl2`'s error.
-pub(crate) fn wsl_problem(message: &str) -> WslFact {
-    if message.contains("no default WSL distribution") {
-        WslFact::NoDistribution
-    } else if let Some((name, _)) = message
+/// Classifies `compi_protocol::wsl::ensure_default_wsl2`'s error. Missing WSL or no
+/// distribution is `None`: Compi runs without WSL.
+pub(crate) fn wsl_problem(message: &str) -> Option<WslProblem> {
+    message
         .strip_prefix("the default WSL distribution ")
         .and_then(|rest| rest.split_once(" uses WSL"))
-    {
-        WslFact::NotWsl2 { name: name.into() }
-    } else {
-        WslFact::Unavailable
-    }
+        .map(|(name, _)| WslProblem::NotWsl2 { name: name.into() })
 }
 
 /// Daemon protocols of published releases that predate `compi-daemon --protocol-version`.
@@ -661,7 +647,7 @@ mod tests {
             protocols: vec![("0.1.3".into(), 14)],
             unfinished: false,
             leftovers: false,
-            wsl: WslFact::Ready,
+            wsl: None,
         }
     }
 
@@ -979,18 +965,19 @@ mod tests {
     #[test]
     fn wsl_problems_show_the_exact_command_and_never_auto_fix() {
         let cases = [
-            (WslFact::NoDistribution, "wsl --install"),
-            (WslFact::Unavailable, "wsl --install"),
             (
-                WslFact::NotWsl2 {
+                WslProblem::NotWsl2 {
                     name: "Ubuntu".into(),
                 },
                 "wsl --set-version Ubuntu 2",
             ),
-            (WslFact::NotStarting, "wsl"),
+            (WslProblem::NotStarting, "wsl"),
         ];
-        for (wsl, command) in cases {
-            let found = findings(&Facts { wsl, ..healthy() });
+        for (problem, command) in cases {
+            let found = findings(&Facts {
+                wsl: Some(problem),
+                ..healthy()
+            });
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].command().as_deref(), Some(command));
             assert_eq!(found[0].fix(), None);
@@ -998,21 +985,22 @@ mod tests {
     }
 
     #[test]
-    fn wsl_errors_are_classified_for_their_command() {
+    fn only_a_broken_wsl_is_a_problem_not_a_missing_one() {
         assert_eq!(
-            wsl_problem("the default WSL distribution Ubuntu-24.04 uses WSL1; Compi requires WSL2"),
-            WslFact::NotWsl2 {
+            wsl_problem(
+                "the default WSL distribution Ubuntu-24.04 uses WSL1; WSL panes need WSL 2. \
+                 Run `wsl --set-version Ubuntu-24.04 2` in PowerShell."
+            ),
+            Some(WslProblem::NotWsl2 {
                 name: "Ubuntu-24.04".into()
-            }
+            })
         );
-        assert_eq!(
-            wsl_problem("no default WSL distribution was found; Compi requires WSL2"),
-            WslFact::NoDistribution
-        );
-        assert_eq!(
-            wsl_problem("could not inspect WSL distributions: not installed"),
-            WslFact::Unavailable
-        );
+        for missing in [
+            "WSL has no default Linux distribution. To use WSL panes, run `wsl --install` in PowerShell.",
+            "WSL isn't installed. To use WSL panes, run `wsl --install` in PowerShell.",
+        ] {
+            assert_eq!(wsl_problem(missing), None);
+        }
     }
 
     #[test]
@@ -1022,7 +1010,7 @@ mod tests {
             task: TaskFact::Missing,
             daemons: Ok(vec![daemon(None, 14, "0.1.3")]),
             leftovers: true,
-            wsl: WslFact::NotStarting,
+            wsl: Some(WslProblem::NotStarting),
             ..healthy()
         };
         assert_eq!(
@@ -1033,7 +1021,7 @@ mod tests {
                     shells: Vec::new()
                 },
                 Finding::Leftovers,
-                Finding::Wsl(WslFact::NotStarting),
+                Finding::Wsl(WslProblem::NotStarting),
             ]
         );
     }

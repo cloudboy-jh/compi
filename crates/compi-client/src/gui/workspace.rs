@@ -423,6 +423,8 @@ pub(super) enum Popup {
     UiFont,
     /// Settings → Terminal → Terminal font.
     TerminalFont,
+    /// Settings → Terminal → Shell (Windows).
+    Shell,
     /// Settings → Notifications → Delivery.
     NotificationDelivery,
     /// Settings → Notifications → Focused pane.

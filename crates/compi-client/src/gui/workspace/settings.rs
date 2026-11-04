@@ -18,7 +18,7 @@
 use super::catalog::{CatalogTarget, GridStep};
 use super::*;
 use crate::gui::controls::IconName;
-use compi_protocol::{PaneContent, SettingsContent, SettingsSection};
+use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
 use gpui::Entity;
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -111,6 +111,10 @@ pub(super) enum SettingsAction {
     Shortcut(usize),
     /// Gives a command its platform default shortcut again.
     ResetShortcut(usize),
+    /// Starting folder: pick a folder for new tabs.
+    ChooseStartingFolder,
+    /// Starting folder: back to the shell's home.
+    StartAtHome,
     OpenSettings,
     OpenMonitor,
     ToggleFps,
@@ -813,6 +817,33 @@ static ROWS: &[Row] = &[
         ),
     ),
     // Terminal.
+    shown_when(
+        |_| cfg!(windows),
+        row(
+            "shell",
+            SettingsSection::Terminal,
+            "Shell",
+            "What new tabs and splits start: Windows PowerShell or WSL.",
+            "powershell wsl linux bash windows default distribution",
+            |_| vec![SettingsAction::Select(Popup::Shell)],
+            |app, row, cx| app.render_shell_row(row, cx),
+        ),
+    ),
+    row(
+        "starting-folder",
+        SettingsSection::Terminal,
+        "Starting folder",
+        "Where a new tab starts when it doesn't open from another pane's folder.",
+        "working directory cwd home project default folder",
+        |app| {
+            let mut stops = vec![SettingsAction::ChooseStartingFolder];
+            if app.starting_folder().is_some() {
+                stops.push(SettingsAction::StartAtHome);
+            }
+            stops
+        },
+        |app, row, cx| app.render_starting_folder_row(row, cx),
+    ),
     row(
         "terminal-font",
         SettingsSection::Terminal,
@@ -2610,6 +2641,8 @@ impl CompiApp {
             SettingsAction::RestartDaemon => self.execute(Command::RestartDaemon, window, cx),
             SettingsAction::Prompt(action) => self.activate_prompt_action(action),
             SettingsAction::Density(density) => self.apply_density(density, window, cx),
+            SettingsAction::ChooseStartingFolder => self.choose_starting_folder(cx),
+            SettingsAction::StartAtHome => self.set_starting_folder(None, cx),
             SettingsAction::OpenSettings => {
                 self.open_settings(Some(SettingsSection::Appearance), None, window, cx)
             }
@@ -3435,6 +3468,152 @@ impl CompiApp {
             .child(select)
             .child(self.settings_focus_anchor(focused, cx))
             .into_any_element()
+    }
+
+    /// Shell (Windows): what new tabs and splits start, Windows PowerShell or WSL. Saved
+    /// to the configuration and given to every window; running shells keep theirs.
+    fn render_shell_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        const SHELLS: [(WindowsShell, &str, &str); 2] = [
+            (
+                WindowsShell::PowerShell,
+                "PowerShell",
+                "Windows PowerShell, on Windows",
+            ),
+            (WindowsShell::Wsl, "WSL", "Your default Linux distribution"),
+        ];
+        let popup = Popup::Shell;
+        let action = SettingsAction::Select(popup);
+        let focused = self.settings_focused(row, action);
+        let current = self
+            .config
+            .launch
+            .as_ref()
+            .ok()
+            .map(|launch| launch.profile.windows_shell);
+        let selected = SHELLS
+            .iter()
+            .position(|(shell, ..)| Some(*shell) == current);
+        let open_row = row.clone();
+        let select = controls::select(
+            "shell-select",
+            SHELLS
+                .iter()
+                .map(|(_, label, detail)| controls::select_option(*label).detail(*detail)),
+            selected,
+            self.popup == Some(popup),
+        )
+        .placeholder(selected.map_or("Choose", |index| SHELLS[index].1))
+        .focused(focused)
+        .anchor(Anchor::TopRight)
+        .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+            this.focus_settings_control(&open_row, action);
+            this.set_popup(popup, *open);
+            cx.notify();
+        }))
+        .on_pick(cx.listener(|this, index: &usize, _, cx| {
+            if let Some((shell, ..)) = SHELLS.get(*index) {
+                this.set_windows_shell(*shell, cx);
+            }
+            cx.notify();
+        }));
+        let control = div()
+            .relative()
+            .flex_none()
+            .child(select)
+            .child(self.settings_focus_anchor(focused, cx))
+            .into_any_element();
+        let detail = match current {
+            Some(WindowsShell::PowerShell) => {
+                "New tabs and splits start Windows PowerShell. Open tabs keep their shell."
+            }
+            Some(WindowsShell::Wsl) => {
+                "New tabs and splits start your default WSL distribution. Open tabs keep their shell."
+            }
+            None => "Fix the configuration file to choose a shell.",
+        };
+        self.settings_row(row.title, detail.into(), control, row.compact)
+    }
+
+    /// Saves the shell and gives it to every window.
+    fn set_windows_shell(&mut self, shell: WindowsShell, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_windows_shell(shell) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_launch_change(cx, move |launch| launch.profile.windows_shell = shell);
+    }
+
+    /// The folder new tabs start in when they open from no other pane; `None` is home.
+    fn starting_folder(&self) -> Option<&str> {
+        self.config
+            .launch
+            .as_ref()
+            .ok()?
+            .profile
+            .working_directory
+            .as_deref()
+    }
+
+    /// Starting folder: the folder, with Choose… and, once one is set, Home.
+    fn render_starting_folder_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let folder = self.starting_folder();
+        let buttons = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.settings_button(
+                row,
+                0,
+                "Choose…",
+                SettingsAction::ChooseStartingFolder,
+                cx,
+            ))
+            .when(folder.is_some(), |buttons| {
+                buttons.child(self.settings_button(row, 1, "Home", SettingsAction::StartAtHome, cx))
+            })
+            .into_any_element();
+        let detail = match folder {
+            Some(folder) => folder.to_owned(),
+            None if self.config.launch.is_err() => {
+                "Fix the configuration file to choose a folder.".into()
+            }
+            None => "Your home folder.".into(),
+        };
+        self.settings_row(row.title, detail, buttons, row.compact)
+    }
+
+    /// Asks for a folder on this computer. A WSL shell starts in a Windows folder's WSL path.
+    fn choose_starting_folder(&mut self, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(folders))) = picker.await else {
+                return;
+            };
+            let Some(folder) = folders.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.set_starting_folder(Some(folder.to_string_lossy().into_owned()), cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Saves the starting folder and gives it to every window.
+    fn set_starting_folder(&mut self, folder: Option<String>, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_working_directory(folder.clone()) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_launch_change(cx, move |launch| {
+            launch.profile.working_directory = folder.clone();
+        });
     }
 
     /// One drawn choice of a setting: `preview` above its `label`, an accent edge when
@@ -4851,6 +5030,26 @@ fn open_update_log() -> Result<(), String> {
         .arg(&path)
         .spawn();
     result.map(|_| ()).map_err(|error| error.to_string())
+}
+
+/// Gives every window a launch setting this one saved, since each launches from its own
+/// copy of the configuration.
+fn share_launch_change(
+    cx: &mut Context<CompiApp>,
+    change: impl Fn(&mut compi_protocol::LaunchContext) + 'static,
+) {
+    cx.defer(move |cx| {
+        for handle in cx.windows() {
+            if let Some(typed) = handle.downcast::<CompiApp>() {
+                let _ = typed.update(cx, |app, _, cx| {
+                    if let Ok(launch) = &mut app.config.launch {
+                        change(launch);
+                    }
+                    cx.notify();
+                });
+            }
+        }
+    });
 }
 
 #[cfg(test)]

@@ -224,10 +224,7 @@ fn selected_wsl2_distribution(name: &str) -> Result<DefaultDistribution> {
     {
         return Ok(distribution);
     }
-    let output = run_wsl(["--list", "--verbose"])?;
-    if !output.status.success() {
-        return Err("could not inspect WSL distributions".into());
-    }
+    let output = list_distributions()?;
     let listing = decode_wsl_output(&output.stdout);
     for line in listing.lines() {
         let fields: Vec<_> = line
@@ -250,20 +247,12 @@ fn selected_wsl2_distribution(name: &str) -> Result<DefaultDistribution> {
 }
 
 fn default_wsl2_distribution() -> Result<DefaultDistribution> {
-    let output = run_wsl(["--list", "--verbose"])?;
-    if !output.status.success() {
-        let error = decode_wsl_output(&output.stderr);
-        return Err(format!("could not inspect WSL distributions: {}", error.trim()).into());
-    }
+    let output = list_distributions()?;
 
     match parse_default_distribution(&output.stdout) {
         Some(distribution) if distribution.version == 2 => Ok(distribution),
-        Some(distribution) => Err(format!(
-            "the default WSL distribution {} uses WSL{}; Compi requires WSL2",
-            distribution.name, distribution.version
-        )
-        .into()),
-        None => Err("no default WSL distribution was found; Compi requires WSL2".into()),
+        Some(distribution) => Err(wsl1_error(&distribution.name, distribution.version).into()),
+        None => Err(format!("WSL has no default Linux distribution. {INSTALL_HINT}").into()),
     }
 }
 /// Resolve only the WSL2 distribution, without starting Linux to validate a path.
@@ -279,11 +268,7 @@ pub fn directory_distribution(requested_distribution: Option<&str>) -> Result<St
 /// Installed WSL2 distributions that can host shells, in `wsl --list` order.
 /// Docker Desktop's internal distributions are not user shells.
 pub fn wsl2_distributions() -> Result<Vec<String>> {
-    let output = run_wsl(["--list", "--verbose"])?;
-    if !output.status.success() {
-        let error = decode_wsl_output(&output.stderr);
-        return Err(format!("could not inspect WSL distributions: {}", error.trim()).into());
-    }
+    let output = list_distributions()?;
     Ok(parse_wsl2_distributions(&decode_wsl_output(&output.stdout)))
 }
 
@@ -395,12 +380,41 @@ fn native_default_distribution() -> Option<Result<DefaultDistribution>> {
         return None;
     }
     if version != 2 {
-        return Some(Err(format!(
-            "the default WSL distribution {name} uses WSL{version}; Compi requires WSL2"
-        )
-        .into()));
+        return Some(Err(wsl1_error(&name, version).into()));
     }
     Some(Ok(DefaultDistribution { name, version }))
+}
+
+const INSTALL_HINT: &str = "To use WSL panes, run `wsl --install` in PowerShell.";
+
+/// Setup's doctor reads the distribution name back from this text's start.
+fn wsl1_error(name: &str, version: u32) -> String {
+    format!(
+        "the default WSL distribution {name} uses WSL{version}; WSL panes need WSL 2. \
+         Run `wsl --set-version {name} 2` in PowerShell."
+    )
+}
+
+/// `wsl --list --verbose`, with errors that say what to do when WSL is missing.
+fn list_distributions() -> Result<Output> {
+    let output = run_wsl(["--list", "--verbose"]).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("WSL isn't installed. {INSTALL_HINT}")
+        } else {
+            format!("could not run wsl.exe: {error}")
+        }
+    })?;
+    if !output.status.success() {
+        // With no distribution, wsl.exe explains on stdout.
+        let stderr = decode_wsl_output(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            decode_wsl_output(&output.stdout)
+        } else {
+            stderr
+        };
+        return Err(format!("WSL isn't ready: {}. {INSTALL_HINT}", detail.trim()).into());
+    }
+    Ok(output)
 }
 
 fn run_wsl<'a>(args: impl IntoIterator<Item = &'a str>) -> std::io::Result<Output> {

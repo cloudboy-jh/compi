@@ -92,10 +92,33 @@ pub fn search_files(
     distribution: Option<&str>,
     query: &str,
 ) -> Result<Vec<SearchEntry>> {
+    search_root(resolve_root(root, distribution)?, query)
+}
+
+/// `list_directory` for a folder on the Windows host itself, such as `C:\folder`.
+#[cfg(windows)]
+pub fn list_host_directory(path: &str) -> Result<Vec<DirectoryEntry>> {
+    list_root(resolve_host_root(path)?)
+}
+
+/// `search_files` under a folder on the Windows host itself; results are Windows paths.
+#[cfg(windows)]
+pub fn search_host_files(root: &str, query: &str) -> Result<Vec<SearchEntry>> {
+    search_root(resolve_host_root(root)?, query)
+}
+
+fn search_root(root: Root, query: &str) -> Result<Vec<SearchEntry>> {
     if query.is_empty() || query.len() > MAX_QUERY_BYTES || query.contains('\0') {
         return Err("search query must contain 1–256 bytes and no NUL".into());
     }
-    let root = resolve_root(root, distribution)?;
+    #[cfg(windows)]
+    let separator = if root.distribution.is_none() {
+        '\\'
+    } else {
+        '/'
+    };
+    #[cfg(not(windows))]
+    let separator = '/';
     let needle = query.to_lowercase();
     let started = Instant::now();
     let mut count = 0;
@@ -133,10 +156,10 @@ pub fn search_files(
             if !found && !(entry.is_directory && depth < MAX_SEARCH_DEPTH) {
                 continue;
             }
-            let shell_path = if shell == "/" {
-                format!("/{name}", name = entry.name)
+            let shell_path = if shell.ends_with(separator) {
+                format!("{shell}{name}", name = entry.name)
             } else {
-                format!("{shell}/{name}", name = entry.name)
+                format!("{shell}{separator}{name}", name = entry.name)
             };
             if shell_path.len() > MAX_PATH_BYTES {
                 continue;

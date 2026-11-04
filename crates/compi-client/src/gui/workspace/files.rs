@@ -7,8 +7,7 @@ use crate::viewport::FileLocation;
 use compi_protocol::{ContentEnvironment, PaneContent, SurfaceInfo};
 
 const UNKNOWN_DIRECTORY: &str = "The shell has not reported its current directory. Enable OSC 7 shell integration to open files from this pane.";
-const WINDOWS_SEARCH: &str =
-    "Open file… searches WSL and Unix folders; use Files to browse this Windows folder";
+const WINDOWS_SEARCH: &str = "Open file… searches a Windows folder through a PowerShell terminal; open one, or use Files to browse it";
 const NO_SEARCH_TERMINAL: &str =
     "Open file… searches through a terminal of this folder's environment; open one first";
 
@@ -75,29 +74,42 @@ impl CompiApp {
         link_target(&reported, None, windows).ok()
     }
 
-    /// A surface the daemon can list and search `folder` of `environment` through.
+    /// A surface the daemon can list and search `folder` of `environment` through: a
+    /// PowerShell shell on this PC for a Windows folder, else a shell with `/` paths.
     fn search_surface(
         &self,
         environment: &ContentEnvironment,
         folder: &str,
         own: Option<&SurfaceId>,
     ) -> Result<SurfaceId, &'static str> {
-        if self.windows_paths(environment) || !folder.starts_with('/') {
+        let windows = self.windows_paths(environment);
+        if !windows && !folder.starts_with('/') {
             return Err(WINDOWS_SEARCH);
         }
+        let searches = |surface: &SurfaceInfo| {
+            ContentEnvironment::of_surface(surface) == *environment
+                && (!windows || surface.runs_powershell())
+        };
+        let workspace = self.workspace.as_ref();
         if let Some(own) = own {
-            return Ok(own.clone());
+            let fits = !windows
+                || workspace
+                    .and_then(|workspace| workspace.surface(own))
+                    .is_some_and(searches);
+            return if fits {
+                Ok(own.clone())
+            } else {
+                Err(WINDOWS_SEARCH)
+            };
         }
-        self.workspace
-            .as_ref()
-            .and_then(|workspace| {
-                workspace
-                    .surfaces
-                    .iter()
-                    .find(|surface| ContentEnvironment::of_surface(surface) == *environment)
-            })
+        workspace
+            .and_then(|workspace| workspace.surfaces.iter().find(|surface| searches(surface)))
             .map(|surface| surface.id.clone())
-            .ok_or(NO_SEARCH_TERMINAL)
+            .ok_or(if windows {
+                WINDOWS_SEARCH
+            } else {
+                NO_SEARCH_TERMINAL
+            })
     }
 
     /// The environment and folder of terminal pane `pane_id`'s shell, as Files would

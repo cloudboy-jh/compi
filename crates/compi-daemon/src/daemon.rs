@@ -972,34 +972,32 @@ fn handle_connection(
                     Err(error) => send_actor_error(&sink, request_id, &error),
                 },
                 ClientMessage::ListDirectory { surface_id, path } => {
-                    match directory_distribution(&manager, &surface_id, target.as_ref()).and_then(
-                        |distribution| {
-                            validate_directory_path(&path)?;
-                            Ok(distribution)
+                    match directory_place(&manager, &surface_id, target.as_ref()).and_then(
+                        |place| {
+                            place.validate(&path)?;
+                            Ok(place)
                         },
                     ) {
-                        Ok(distribution) => {
-                            match file_tree::list_directory(&path, distribution.as_deref()) {
-                                Ok(entries) => sink.send_control(&ServerControl {
-                                    request_id: Some(request_id),
-                                    message: ServerMessage::DirectoryListed {
-                                        entries: entries
-                                            .into_iter()
-                                            .map(|entry| DirectoryEntry {
-                                                name: entry.name,
-                                                is_directory: entry.is_directory,
-                                            })
-                                            .collect(),
-                                    },
-                                })?,
-                                Err(error) => send_error(
-                                    &sink,
-                                    Some(request_id),
-                                    ErrorCode::Internal,
-                                    &format!("could not list directory: {error}"),
-                                ),
-                            }
-                        }
+                        Ok(place) => match place.list(&path) {
+                            Ok(entries) => sink.send_control(&ServerControl {
+                                request_id: Some(request_id),
+                                message: ServerMessage::DirectoryListed {
+                                    entries: entries
+                                        .into_iter()
+                                        .map(|entry| DirectoryEntry {
+                                            name: entry.name,
+                                            is_directory: entry.is_directory,
+                                        })
+                                        .collect(),
+                                },
+                            })?,
+                            Err(error) => send_error(
+                                &sink,
+                                Some(request_id),
+                                ErrorCode::Internal,
+                                &format!("could not list directory: {error}"),
+                            ),
+                        },
                         Err((code, message)) => send_error(&sink, Some(request_id), code, message),
                     }
                 }
@@ -1008,9 +1006,9 @@ fn handle_connection(
                     root,
                     query,
                 } => {
-                    match directory_distribution(&manager, &surface_id, target.as_ref()).and_then(
-                        |distribution| {
-                            validate_directory_path(&root)?;
+                    match directory_place(&manager, &surface_id, target.as_ref()).and_then(
+                        |place| {
+                            place.validate(&root)?;
                             if query.is_empty()
                                 || query.len() > MAX_DIRECTORY_QUERY_BYTES
                                 || query.contains('\0')
@@ -1020,31 +1018,29 @@ fn handle_connection(
                                     "search query must contain 1 through 256 bytes and no NUL",
                                 ));
                             }
-                            Ok(distribution)
+                            Ok(place)
                         },
                     ) {
-                        Ok(distribution) => {
-                            match file_tree::search_files(&root, distribution.as_deref(), &query) {
-                                Ok(entries) => sink.send_control(&ServerControl {
-                                    request_id: Some(request_id),
-                                    message: ServerMessage::DirectorySearched {
-                                        entries: entries
-                                            .into_iter()
-                                            .map(|entry| SearchEntry {
-                                                path: entry.path,
-                                                is_directory: entry.is_directory,
-                                            })
-                                            .collect(),
-                                    },
-                                })?,
-                                Err(error) => send_error(
-                                    &sink,
-                                    Some(request_id),
-                                    ErrorCode::Internal,
-                                    &format!("could not search directory: {error}"),
-                                ),
-                            }
-                        }
+                        Ok(place) => match place.search(&root, &query) {
+                            Ok(entries) => sink.send_control(&ServerControl {
+                                request_id: Some(request_id),
+                                message: ServerMessage::DirectorySearched {
+                                    entries: entries
+                                        .into_iter()
+                                        .map(|entry| SearchEntry {
+                                            path: entry.path,
+                                            is_directory: entry.is_directory,
+                                        })
+                                        .collect(),
+                                },
+                            })?,
+                            Err(error) => send_error(
+                                &sink,
+                                Some(request_id),
+                                ErrorCode::Internal,
+                                &format!("could not search directory: {error}"),
+                            ),
+                        },
                         Err((code, message)) => send_error(&sink, Some(request_id), code, message),
                     }
                 }
@@ -1185,17 +1181,14 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
                     }
                 }
-                ClientMessage::Prompt {
-                    distribution,
-                    request,
-                } => {
+                ClientMessage::Prompt { place, request } => {
                     let result = if target.is_some() {
                         Err((
                             ErrorCode::InvalidRequest,
                             "prompt settings do not accept an attachment target".to_owned(),
                         ))
                     } else {
-                        crate::prompt::handle(distribution, *request)
+                        crate::prompt::handle(place, *request)
                     };
                     match result {
                         Ok(response) => sink.send_control(&ServerControl {
@@ -1491,11 +1484,48 @@ fn process_lifecycle(
     Ok(true)
 }
 
-fn directory_distribution(
+/// Where a terminal's paths live: a Unix host or a WSL distribution (`None`, the default
+/// one, on Windows), both with `/` paths, or for PowerShell the Windows host itself.
+enum DirectoryPlace {
+    Shell(Option<String>),
+    #[cfg(windows)]
+    WindowsHost,
+}
+
+impl DirectoryPlace {
+    fn validate(&self, path: &str) -> std::result::Result<(), (ErrorCode, &'static str)> {
+        match self {
+            Self::Shell(_) => validate_directory_path(path),
+            // `resolve_host_root` checks a Windows path itself.
+            #[cfg(windows)]
+            Self::WindowsHost => Ok(()),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<file_tree::DirectoryEntry>> {
+        match self {
+            Self::Shell(distribution) => file_tree::list_directory(path, distribution.as_deref()),
+            #[cfg(windows)]
+            Self::WindowsHost => file_tree::list_host_directory(path),
+        }
+    }
+
+    fn search(&self, root: &str, query: &str) -> Result<Vec<file_tree::SearchEntry>> {
+        match self {
+            Self::Shell(distribution) => {
+                file_tree::search_files(root, distribution.as_deref(), query)
+            }
+            #[cfg(windows)]
+            Self::WindowsHost => file_tree::search_host_files(root, query),
+        }
+    }
+}
+
+fn directory_place(
     manager: &SurfaceManager,
     surface_id: &SurfaceId,
     target: Option<&TerminalTarget>,
-) -> std::result::Result<Option<String>, (ErrorCode, &'static str)> {
+) -> std::result::Result<DirectoryPlace, (ErrorCode, &'static str)> {
     if target.is_some() {
         return Err((
             ErrorCode::InvalidRequest,
@@ -1507,12 +1537,17 @@ fn directory_distribution(
         .ok_or((ErrorCode::SurfaceNotFound, "surface was not found"))?;
     #[cfg(windows)]
     {
-        Ok(surface.wsl_distribution().map(str::to_owned))
+        if surface.runs_powershell() {
+            return Ok(DirectoryPlace::WindowsHost);
+        }
+        Ok(DirectoryPlace::Shell(
+            surface.wsl_distribution().map(str::to_owned),
+        ))
     }
     #[cfg(unix)]
     {
         let _ = surface;
-        Ok(None)
+        Ok(DirectoryPlace::Shell(None))
     }
 }
 

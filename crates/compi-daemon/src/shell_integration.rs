@@ -23,6 +23,24 @@ const BASH_FUNCTIONS: [&str; 17] = [
 ];
 const EXPORT_FUNCTIONS: &str = r#"if [[ $1 == compi-installed ]]; then set -- "$HOME/.compi/shell/compi-shell.sh"; fi; . "$1" || exit; names='compi _compi_cli_init _compi_windows_cli _compi_choose_directory _compi_report_cwd _compi_prompt_cwd _compi_prompt_ble_hook _compi_prompt_ble_precmd _compi_prompt_native_dispatch _compi_prompt_command_restore _compi_prompt_sync _compi_prompt_startup _compi_prompt_snapshot _compi_prompt_restore _compi_prompt_status _compi_prompt_rerun _compi_install_prompt_hook'; export -f $names || exit; for name in $names; do printenv "BASH_FUNC_${name}%%" || exit; printf '\0'; done"#;
 
+/// Windows PowerShell's arguments with Compi's integration: it runs after the user's
+/// profile (`-NoExit`), as an encoded command, which the script execution policy does not
+/// block the way it blocks a script file.
+#[cfg(windows)]
+pub(crate) fn powershell_argv() -> Vec<OsString> {
+    static ENCODED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use base64::Engine;
+        let script: Vec<u8> = include_str!("../../../assets/compi-shell.ps1")
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(script)
+    });
+    ["-NoLogo", "-NoExit", "-EncodedCommand", ENCODED.as_str()]
+        .map(OsString::from)
+        .into()
+}
+
 #[cfg(unix)]
 pub(crate) fn shell_name(executable: &str) -> Option<&'static str> {
     match executable.rsplit('/').next()? {

@@ -50,7 +50,7 @@ Supporting programs report this through the [Program Status Protocol](https://ww
 
 Get Compi from [GitHub Releases](https://github.com/cloudboy-jh/compi/releases).
 
-- **Windows:** x64, WSL2 required. Installer or portable archive.
+- **Windows:** x64. Installer or portable archive. Uses Windows PowerShell; WSL2 is optional, for Linux shells.
 - **macOS:** Apple Silicon, macOS 14+. Move the app into Applications.
 
 Windows builds are unsigned and macOS builds are ad-hoc signed, so your OS may warn on first launch. Linux runs the headless server; its window is not yet supported.

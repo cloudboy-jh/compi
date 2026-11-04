@@ -27,6 +27,7 @@ pub mod project_history;
 pub mod release_notes;
 mod replica;
 pub mod selection;
+pub mod shell_quote;
 pub mod theme;
 pub mod theme_file;
 mod theme_migration;

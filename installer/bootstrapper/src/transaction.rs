@@ -302,17 +302,6 @@ pub(crate) fn preflight(operation: InstallerOperation) -> Result<Readiness> {
         )
         .into());
     }
-    let wsl = machine::wsl_fact();
-    if wsl != doctor::WslFact::Ready {
-        let finding = doctor::Finding::Wsl(wsl);
-        return Err(format!(
-            "{}. {} {}",
-            finding.title(),
-            finding.explanation(),
-            finding.command().unwrap_or_default()
-        )
-        .into());
-    }
     Ok(readiness)
 }
 

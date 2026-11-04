@@ -24,14 +24,13 @@ struct ProjectVisit {
 }
 
 impl ProjectHistory {
-    /// Record a shell-reported cwd transition. Relative, native Windows, and
-    /// control-character paths are ignored; no filesystem access is performed.
+    /// Record a shell-reported cwd transition. Relative and control-character paths are
+    /// ignored; no filesystem access is performed.
     pub fn record(&mut self, path: &str) -> bool {
-        if !valid_path(path) {
+        let Some(path) = folder(path) else {
             return false;
-        }
-        let trimmed = path.trim_end_matches('/');
-        let path = if trimmed.is_empty() { "/" } else { trimmed };
+        };
+        let path = path.as_str();
         if self.tick >= MAX_TICK {
             self.compact_ticks();
         }
@@ -94,13 +93,13 @@ impl ProjectHistory {
     /// Correct file-derived values before they become live client state.
     pub(crate) fn sanitize(&mut self) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|entry| valid_path(&entry.path));
+        self.entries.retain(|entry| folder(&entry.path).is_some());
         let mut changed = self.entries.len() != before;
         for entry in &mut self.entries {
-            let trimmed = entry.path.trim_end_matches('/');
-            let len = if trimmed.is_empty() { 1 } else { trimmed.len() };
-            changed |= entry.path.len() != len;
-            entry.path.truncate(len);
+            if let Some(folder) = folder(&entry.path).filter(|folder| *folder != entry.path) {
+                entry.path = folder;
+                changed = true;
+            }
             let visits = entry.visits.clamp(1, MAX_VISITS);
             let last_visit = entry.last_visit.max(1);
             changed |= entry.visits != visits || entry.last_visit != last_visit;
@@ -158,8 +157,35 @@ impl ProjectHistory {
     }
 }
 
-fn valid_path(path: &str) -> bool {
-    path.starts_with('/') && path.len() <= MAX_PATH_BYTES && !path.chars().any(char::is_control)
+/// The folder a shell reported, as the palette shows and reopens it: a Unix path, or a
+/// Windows folder as `C:\a` (PowerShell reports `/C:/a` through OSC 7). Either works as
+/// the starting folder of a WSL or a PowerShell tab.
+fn folder(path: &str) -> Option<String> {
+    if path.len() > MAX_PATH_BYTES || path.chars().any(char::is_control) {
+        return None;
+    }
+    let windows = match path.as_bytes() {
+        [b'/', drive, b':'] | [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => {
+            Some(&path[1..])
+        }
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic() => Some(path),
+        _ => None,
+    };
+    if let Some(windows) = windows {
+        let windows = windows.replace('/', "\\");
+        let trimmed = windows.trim_end_matches('\\');
+        // A drive's root keeps its separator: `C:` alone is a drive's current folder.
+        return Some(if trimmed.len() == 2 {
+            format!("{trimmed}\\")
+        } else {
+            trimmed.to_owned()
+        });
+    }
+    if !path.starts_with('/') {
+        return None;
+    }
+    let trimmed = path.trim_end_matches('/');
+    Some(if trimmed.is_empty() { "/" } else { trimmed }.to_owned())
 }
 
 /// How well `query` (not empty) matches `path` as an ordered subsequence, ignoring ASCII
@@ -233,9 +259,31 @@ mod tests {
     }
 
     #[test]
+    fn windows_folders_are_kept_as_powershell_reports_them_once() {
+        let mut history = ProjectHistory::default();
+        // PowerShell's OSC 7, a typed Windows path and a drive root.
+        assert!(history.record("/C:/Users/me/code/"));
+        assert!(history.record(r"C:\Users\me\code\"));
+        assert!(history.record("/D:"));
+        let mut found = history.search("");
+        found.sort_unstable();
+        assert_eq!(found, [r"C:\Users\me\code", r"D:\"]);
+        // A root folder named like a drive is still a Unix folder.
+        assert!(history.record("/a:b"));
+        assert!(history.search("").contains(&"/a:b"));
+
+        let mut stored: ProjectHistory = serde_json::from_str(
+            r#"{"entries":[{"path":"/C:/x/","visits":2,"last_visit":1}],"tick":1}"#,
+        )
+        .unwrap();
+        assert!(stored.sanitize());
+        assert_eq!(stored.search(""), [r"C:\x"]);
+    }
+
+    #[test]
     fn bounded_paths_counters_and_invalid_shell_paths() {
         let mut history = ProjectHistory::default();
-        for path in ["relative", "C:\\Windows", "", "/bad\nname"] {
+        for path in ["relative", "C:Windows", "", "/bad\nname"] {
             assert!(!history.record(path));
         }
         assert!(history.record("/mnt/c/code/"));

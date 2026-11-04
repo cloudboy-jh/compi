@@ -2,7 +2,7 @@
 
 use crate::doctor::{
     self, Facts, Finding, Fix, PAYLOAD_FILES, PayloadFact, ROOT_FILES, RunningDaemon,
-    SelectionFact, TaskFact, TaskTarget, WslFact,
+    SelectionFact, TaskFact, TaskTarget, WslProblem,
 };
 use crate::{Result, plain, transaction};
 use compi_protocol::{DaemonClient, LifecycleConsent, LifecycleStatus};
@@ -285,14 +285,14 @@ fn task_fact(root: &Path) -> TaskFact {
     }
 }
 
-pub(crate) fn wsl_fact() -> WslFact {
+pub(crate) fn wsl_fact() -> Option<WslProblem> {
     if let Err(error) = compi_protocol::wsl::ensure_default_wsl2() {
         transaction::log(&format!("WSL check failed: {error}"));
         return doctor::wsl_problem(&error.to_string());
     }
     match transaction::wsl_guest_starts() {
-        Ok(true) => WslFact::Ready,
-        _ => WslFact::NotStarting,
+        Ok(true) => None,
+        _ => Some(WslProblem::NotStarting),
     }
 }
 
@@ -437,7 +437,10 @@ fn check_lines(facts: &Facts) -> Vec<String> {
         "Leftover setup files: {}",
         if facts.leftovers { "yes" } else { "no" }
     ));
-    lines.push(format!("WSL: {:?}", facts.wsl));
+    lines.push(match &facts.wsl {
+        Some(problem) => format!("WSL: {problem:?}"),
+        None => "WSL: ready or not installed".into(),
+    });
     lines
 }
 

@@ -294,11 +294,12 @@ fn words_match(haystack: &str, query: &str) -> bool {
         .all(|word| haystack.contains(&word.to_lowercase()))
 }
 
-/// `path` relative to `folder` when inside it.
+/// `path` relative to `folder` when inside it, with `/` or Windows `\` separators.
 fn relative_path(path: &str, folder: &str) -> String {
-    path.strip_prefix(folder.trim_end_matches('/'))
-        .filter(|rest| rest.starts_with('/'))
-        .map_or(path, |rest| rest.trim_start_matches('/'))
+    const SEPARATORS: [char; 2] = ['/', '\\'];
+    path.strip_prefix(folder.trim_end_matches(SEPARATORS))
+        .filter(|rest| rest.starts_with(SEPARATORS))
+        .map_or(path, |rest| rest.trim_start_matches(SEPARATORS))
         .to_owned()
 }
 

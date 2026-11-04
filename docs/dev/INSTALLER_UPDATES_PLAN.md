@@ -6,7 +6,7 @@ Implement only the **Installer** and **In-app updates** sections of `C:\Users\jo
 
 Preserve existing GPUI settings/commands, daemon-owned workspaces, client-owned presentation, TOML configuration, custom theme library, per-user Windows installation, and macOS app bundles. No terminal-engine replacement, general CLI expansion, remote deployment, or broader capability-negotiation project.
 
-Target the currently distributed platforms: Windows x64 with WSL2 and Apple Silicon macOS 14+. Do not imply Windows ARM64, Intel Mac, or Linux desktop support. Native runtime evidence is required on both platforms.
+Target the currently distributed platforms: Windows x64 (WSL2 optional) and Apple Silicon macOS 14+. Do not imply Windows ARM64, Intel Mac, or Linux desktop support. Native runtime evidence is required on both platforms.
 
 ## Implementation status
 
@@ -70,7 +70,7 @@ Evidence owners: `installer/bootstrapper/src/installer.rs` (131–231, 627–736
 
 ### 3. Finish installer UX and branding
 
-- Windows preflight: supported OS/architecture, install registration/version, disk/access, missing WSL, no default distribution, WSL1 default, and failing guest startup. Reuse WSL checks and present specific fix instructions plus Recheck. Do not silently install/convert/select a distribution. Repair/removal should not be blocked merely because shell prerequisites are missing.
+- Windows preflight: supported OS/architecture, install registration/version, disk/access. WSL is optional: Setup never requires it, and repair reports only an installed-but-broken WSL (WSL1 default, failing guest startup) with its fix command. Do not silently install/convert/select a distribution. Repair/removal should not be blocked merely because shell prerequisites are missing.
 - Keep the macOS drag-to-Applications experience; make supported OS/architecture, location/access, quarantine/Gatekeeper, replacement, and next-launch guidance explicit. Use actual platform copy progress; do not add a redundant Mac wizard merely for parity.
 - Use structured per-attempt events: checking prerequisites, extracting/downloading, verifying, staging, applying, rolling back, complete/error. Display bytes/percentage when measurable and an honest indeterminate stage otherwise. Embedded offline MSI has no network download to pretend to measure.
 - Integrate real MSI progress and supported cancellation, not a killed `msiexec` process. Permit cancel before commit and during supported rollback-safe stages; explain any non-cancellable commit. Wait for rollback before saying cancellation is complete.
@@ -115,7 +115,7 @@ Produce update-capable release **B**, then genuinely newer release **C**. Test *
 
 Extend `tools/smoke-windows-distribution.ps1` and `tools/smoke-macos-bundle.sh`; retain existing same-process reconnect assertions. Exercise actual setup/maintenance, not only raw MSI; exercise copied installed app bundles, not only bare executables. Use disposable profiles/machines and attributable artifacts, never uninstall the developer's live installation.
 
-| Scenario | Required proof on native Windows/WSL2 and macOS |
+| Scenario | Required proof on native Windows (with and without WSL2) and macOS |
 |---|---|
 | Fresh install and launch | Standard-user install, prerequisites/actionable failures, correct branding, shell ready, correct payload/registration/location |
 | Upgrade and repair/reinstall | A→B and B→C, same-version repair/reinstall, older-version rejection, settings/workspace/theme retention |
@@ -127,7 +127,7 @@ Extend `tools/smoke-windows-distribution.ps1` and `tools/smoke-macos-bundle.sh`;
 | Relaunch failures | Old GUI-host/attachment lock, missing new executable, immediate exit, incompatible connection; success requires observed new build/attachment |
 | Uninstall | Default keep-data→reinstall; explicit managed-data deletion; external projects/config/theme sources untouched; no residual owned task/process/install registration |
 
-Windows-specific: default scheduled task and named instances, running supervisor/backoff, two-user task ownership, missing MSI source, task registration rollback, MSI restart-required outcomes, portable ZIP, logon/reboot selection. Test supported Windows 10 baseline and Windows 11 with WSL2.
+Windows-specific: default scheduled task and named instances, running supervisor/backoff, two-user task ownership, missing MSI source, task registration rollback, MSI restart-required outcomes, portable ZIP, logon/reboot selection. Test supported Windows 10 baseline and Windows 11, each with and without WSL2.
 
 macOS-specific: advertised minimum and current supported OS, DMG and ZIP, actual downloaded quarantine/Gatekeeper/signing, writable and denied Applications destinations, mounted-DMG launch guidance, live-bundle replacement, rollback and removal with a daemon still running.
 

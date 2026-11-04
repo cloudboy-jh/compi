@@ -11,7 +11,7 @@ use windows::Win32::Foundation::{
     FreeLibrary, HANDLE, HMODULE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
-use windows::Win32::System::Console::{COORD, HPCON};
+use windows::Win32::System::Console::{COORD, HPCON, SetConsoleCtrlHandler};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -176,6 +176,10 @@ impl ConptySession {
                 raw_handle(&pty_output),
             )?;
 
+            // A daemon started in its own process group ignores Ctrl+C, and its children
+            // inherit that, so Ctrl+C in a native shell would reach nothing. Restore normal
+            // handling first; the daemon has no console of its own to receive it.
+            let _ = SetConsoleCtrlHandler(None, false);
             let process_result = create_process(hpc.handle, launch);
             drop(pty_input);
             drop(pty_output);
@@ -478,6 +482,7 @@ mod tests {
             cwd: None,
             env: Vec::new(),
             metadata: None,
+            distribution: None,
         };
         let mut pty = ConptySession::spawn(&launch, 80, 24).unwrap();
         let (input, mut output) = pty.take_io().unwrap();

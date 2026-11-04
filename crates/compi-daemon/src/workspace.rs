@@ -702,6 +702,10 @@ fn prepare_mutation(
         if let WorkspaceEffect::Launch(info, context) = effect {
             *context = request.launch.clone();
             if let Some(context) = context {
+                // A restarted shell keeps its kind; only new shells follow the current setting.
+                if let Some(previous) = &info.launch.profile {
+                    context.profile.windows_shell = previous.windows_shell;
+                }
                 info.launch.profile = Some(Box::new(context.profile.clone()));
             }
             if let Some(surface) = candidate
@@ -1469,11 +1473,16 @@ fn apply_mutation(
 }
 
 /// Whether a shell's last reported directory still exists where it ran. A WSL shell's
-/// path is checked through its distribution's share; without a recorded distribution it
-/// cannot be checked, and the launch itself reports a missing directory.
+/// path is checked through its distribution's share and a PowerShell shell's on Windows;
+/// a WSL shell without a recorded distribution cannot be checked, and the launch itself
+/// reports a missing directory.
 fn resume_directory_exists(surface: &SurfaceInfo, directory: &str) -> bool {
     #[cfg(windows)]
     {
+        if surface.runs_powershell() {
+            return crate::launch::windows_directory(directory)
+                .is_some_and(|folder| std::path::Path::new(&folder).is_dir());
+        }
         let Some(distribution) = surface.wsl_distribution() else {
             return true;
         };
@@ -4333,6 +4342,85 @@ mod tests {
             effects.recv().unwrap(),
             WorkspaceEffect::End { .. }
         ));
+    }
+
+    #[test]
+    fn a_restarted_shell_keeps_its_kind_and_new_shells_follow_the_setting() {
+        use compi_protocol::WindowsShell;
+        let (actor, effects) = WorkspaceActor::memory();
+        let launch = |shell| {
+            let mut context = compi_protocol::LaunchContext::default();
+            context.profile.windows_shell = shell;
+            Some(Box::new(context))
+        };
+        let mut initialize = request(
+            &actor,
+            "initialize",
+            0,
+            WorkspaceMutation::Initialize {
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+            },
+        );
+        initialize.launch = launch(WindowsShell::Wsl);
+        actor.mutate(initialize).unwrap();
+        let WorkspaceEffect::Launch(surface, _) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        actor.observe(RuntimeObservation::Failed {
+            surface_id: surface.id.clone(),
+            process_lifetime_id: surface.process_lifetime_id.clone(),
+            error: "launch failed".into(),
+        });
+        let failed = wait_revision(&actor, actor.snapshot().unwrap().revision + 1);
+
+        // The setting changed to PowerShell before the WSL shell restarts.
+        let mut restart = request(
+            &actor,
+            "restart",
+            failed.revision,
+            WorkspaceMutation::RestartSurface {
+                surface_id: surface.id.clone(),
+                expected_lifetime: surface.process_lifetime_id.clone(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        restart.launch = launch(WindowsShell::PowerShell);
+        actor.mutate(restart).unwrap();
+        let WorkspaceEffect::Launch(restarted, Some(context)) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(context.profile.windows_shell, WindowsShell::Wsl);
+        assert_eq!(
+            restarted.launch.profile.unwrap().windows_shell,
+            WindowsShell::Wsl
+        );
+
+        let snapshot = actor.snapshot().unwrap();
+        let mut tab = request(
+            &actor,
+            "new-tab",
+            snapshot.revision,
+            WorkspaceMutation::CreateTab {
+                session_id: snapshot.sessions[0].id.clone(),
+                label: String::new(),
+                cols: 80,
+                rows: 24,
+                working_directory: None,
+            },
+        );
+        tab.launch = launch(WindowsShell::PowerShell);
+        actor.mutate(tab).unwrap();
+        let WorkspaceEffect::Launch(created, Some(context)) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(context.profile.windows_shell, WindowsShell::PowerShell);
+        assert_eq!(
+            created.launch.profile.unwrap().windows_shell,
+            WindowsShell::PowerShell
+        );
     }
 
     fn leaf_node(tree: &LayoutNode, pane: &PaneId) -> LayoutNode {

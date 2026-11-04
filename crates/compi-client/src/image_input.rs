@@ -25,11 +25,13 @@ pub enum ImageInput {
 }
 
 pub enum ImageTarget {
-    /// A local POSIX shell (macOS). Windows sessions use `Wsl`.
+    /// A local POSIX shell (macOS). Windows sessions use `Wsl` or `PowerShell`.
     Native,
     Wsl {
         distribution: Option<String>,
     },
+    /// Windows PowerShell on this PC: the native path, quoted for PowerShell.
+    PowerShell,
     Remote,
 }
 
@@ -38,7 +40,7 @@ pub struct PreparedImage {
     pub path: PathBuf,
     /// The path in the shell's environment after local path mapping or remote upload.
     pub shell_path: Option<String>,
-    /// `shell_path` as one quoted POSIX shell argument.
+    /// `shell_path` as one quoted argument of the target shell.
     pub quoted_path: Option<String>,
     pub name: String,
     pub width: u32,
@@ -85,7 +87,13 @@ pub fn prepare(input: ImageInput, target: ImageTarget) -> Result<PreparedImage, 
         ImageTarget::Remote => None,
         _ => Some(target_path(&path, &target)?),
     };
-    let quoted_path = shell_path.as_deref().map(quote_posix).transpose()?;
+    let quoted_path = shell_path
+        .as_deref()
+        .map(|path| match target {
+            ImageTarget::PowerShell => quote_powershell(path),
+            _ => quote_posix(path),
+        })
+        .transpose()?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -394,11 +402,18 @@ fn quote_posix(path: &str) -> Result<String, String> {
     Ok(format!("'{}'", path.replace('\'', "'\\''")))
 }
 
+fn quote_powershell(path: &str) -> Result<String, String> {
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return Err("Image paths cannot be empty or contain control characters".into());
+    }
+    Ok(crate::shell_quote::powershell(path).into_owned())
+}
+
 fn validate_target(target: &ImageTarget) -> Result<(), String> {
     match target {
         ImageTarget::Native => {
             #[cfg(windows)]
-            return Err("Windows image insertion requires a WSL session".into());
+            return Err("Windows image insertion targets a WSL or PowerShell terminal".into());
         }
         ImageTarget::Wsl { distribution } => {
             if distribution
@@ -411,6 +426,10 @@ fn validate_target(target: &ImageTarget) -> Result<(), String> {
             }
             #[cfg(not(windows))]
             return Err("WSL image targets are only available on Windows".into());
+        }
+        ImageTarget::PowerShell => {
+            #[cfg(not(windows))]
+            return Err("PowerShell image targets are only available on Windows".into());
         }
         ImageTarget::Remote => {}
     }
@@ -444,19 +463,24 @@ fn native_source_path(path: PathBuf, target: &ImageTarget) -> Result<PathBuf, St
     }
 }
 
+/// A Windows path without Win32's extended-length drive/UNC prefix, which shells and
+/// `wslpath` do not understand.
+fn without_verbatim_prefix(text: &str) -> String {
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
+    }
+}
+
 fn target_path(path: &Path, target: &ImageTarget) -> Result<String, String> {
     match target {
         ImageTarget::Native => Ok(path_text(path)?.to_owned()),
+        ImageTarget::PowerShell => Ok(without_verbatim_prefix(path_text(path)?)),
         ImageTarget::Wsl { distribution } => {
             #[cfg(windows)]
             {
-                let text = path_text(path)?;
-                // wslpath does not understand Win32's extended-length drive/UNC prefixes.
-                let normalized = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-                    format!(r"\\{unc}")
-                } else {
-                    text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
-                };
+                let normalized = without_verbatim_prefix(path_text(path)?);
                 let resolved = run_wsl(
                     distribution.as_deref(),
                     &["wslpath", "-a", "-u", &normalized],

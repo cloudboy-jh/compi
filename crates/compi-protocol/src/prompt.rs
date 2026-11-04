@@ -1,6 +1,7 @@
 //! Shell prompt settings. The daemon detects, previews and applies prompt
-//! providers inside the terminal environment it launches shells in: the local
-//! Unix account, a WSL2 distribution, or the remote account behind SSH.
+//! providers inside a terminal environment it launches shells in: the local
+//! Unix account, a WSL2 distribution, Windows PowerShell, or the remote account
+//! behind SSH.
 //!
 //! Compi never installs a provider. Every change is planned first, backed up
 //! under `~/.compi/prompt/backups`, and applied only with the token of a plan
@@ -37,26 +38,47 @@ impl PromptProvider {
 pub enum PromptShell {
     Bash,
     Zsh,
+    /// Windows PowerShell on a Windows daemon's host.
+    PowerShell,
 }
 
 impl PromptShell {
-    pub const ALL: [Self; 2] = [Self::Bash, Self::Zsh];
+    /// The shells of a Unix account or WSL distribution.
+    pub const POSIX: [Self; 2] = [Self::Bash, Self::Zsh];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Bash => "bash",
             Self::Zsh => "zsh",
+            Self::PowerShell => "powershell",
         }
     }
 
-    /// Recognize a supported shell from an executable path such as `/usr/bin/zsh`.
+    /// Recognize a supported shell from an executable path such as `/usr/bin/zsh` or
+    /// `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`.
     pub fn from_path(path: &str) -> Option<Self> {
-        match path.rsplit('/').next()? {
+        let name = path.rsplit(['/', '\\']).next()?;
+        match name {
             "bash" => Some(Self::Bash),
             "zsh" => Some(Self::Zsh),
+            _ if name.eq_ignore_ascii_case("powershell.exe") => Some(Self::PowerShell),
             _ => None,
         }
     }
+}
+
+/// Where prompt settings apply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptPlace {
+    /// Where the daemon starts shells by default: its Unix account, or on Windows the
+    /// default WSL2 distribution.
+    #[default]
+    Default,
+    /// A WSL2 distribution of a Windows daemon.
+    Wsl { distribution: String },
+    /// Windows PowerShell on a Windows daemon's host.
+    Windows,
 }
 
 /// Which shells a prompt applies to.
@@ -165,9 +187,10 @@ pub struct PromptBackup {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptEnvironment {
-    /// Human-readable target, such as `WSL Ubuntu` or a host name.
+    /// Human-readable target, such as `WSL Ubuntu`, `Windows` or a host name.
     pub target: String,
-    pub distribution: Option<String>,
+    /// The place this describes, resolved: never `Default` on Windows.
+    pub place: PromptPlace,
     /// Installed WSL2 distributions on Windows; empty elsewhere.
     pub distributions: Vec<String>,
     pub home: String,

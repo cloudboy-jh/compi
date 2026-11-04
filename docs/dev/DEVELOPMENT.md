@@ -1,6 +1,6 @@
 # Development
 
-Requires Rust and the platform build tools. Windows also requires WSL2; macOS requires Xcode with the Metal compiler available through `xcrun`. Newer Xcode versions ship the Metal toolchain as a separate download: if the build reports `missing Metal Toolchain`, run `xcodebuild -downloadComponent MetalToolchain` once.
+Requires Rust and the platform build tools. On Windows, the WSL integration and prompt tests also need WSL2; building and running Compi do not. macOS requires Xcode with the Metal compiler available through `xcrun`. Newer Xcode versions ship the Metal toolchain as a separate download: if the build reports `missing Metal Toolchain`, run `xcodebuild -downloadComponent MetalToolchain` once.
 
 On Windows, prepare the pinned Microsoft runtime **before building or testing** (requires PowerShell 7 and HTTPS access to NuGet for the first download):
 

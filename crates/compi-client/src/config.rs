@@ -16,7 +16,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES, SplitAxis};
+use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES, SplitAxis, WindowsShell};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -563,6 +563,30 @@ impl LoadedConfig {
             set_table_value(table, "confirm_close", confirm.into());
         })?;
         self.confirm_close = confirm;
+        Ok(())
+    }
+
+    /// Saves the shell new tabs and splits start on Windows. Running shells keep theirs.
+    pub fn save_windows_shell(&mut self, shell: WindowsShell) -> Result<(), String> {
+        save_windows_shell(&self.path, shell)?;
+        if let Ok(launch) = &mut self.launch {
+            launch.profile.windows_shell = shell;
+        }
+        Ok(())
+    }
+
+    /// Saves the folder new tabs start in when they open from no other pane; `None` is
+    /// the shell's home. WSL launches translate a Windows folder themselves.
+    pub fn save_working_directory(&mut self, folder: Option<String>) -> Result<(), String> {
+        update_table(&self.path, "shell", |table| match &folder {
+            Some(folder) => set_table_value(table, "working_directory", folder.as_str().into()),
+            None => {
+                table.remove("working_directory");
+            }
+        })?;
+        if let Ok(launch) = &mut self.launch {
+            launch.profile.working_directory = folder;
+        }
         Ok(())
     }
 
@@ -1260,6 +1284,14 @@ fn apply_launch(document: &toml::Table, loaded: &mut LoadedConfig) {
             None => errors.push("shell.login must be true or false".to_owned()),
         }
     }
+    // Absent only where `settle_windows_shell` could not write it: a fresh install's choice.
+    launch.profile.windows_shell = WindowsShell::PowerShell;
+    if let Some(value) = shell.get("windows") {
+        match value.as_str().and_then(WindowsShell::from_id) {
+            Some(windows_shell) => launch.profile.windows_shell = windows_shell,
+            None => errors.push(r#"shell.windows must be "powershell" or "wsl""#.to_owned()),
+        }
+    }
     for (key, value) in environment {
         if key.is_empty() || key.contains(['=', '\0']) {
             invalid(
@@ -1315,6 +1347,74 @@ fn apply_launch(document: &toml::Table, loaded: &mut LoadedConfig) {
         loaded.diagnostics.push(message.clone());
         loaded.launch = Err(message);
     }
+}
+
+/// Whether the configuration names the Windows shell, in `[shell]` or the default profile.
+fn names_windows_shell(document: &toml::Table) -> bool {
+    let in_table = |table: Option<&toml::Value>| {
+        table
+            .and_then(toml::Value::as_table)
+            .is_some_and(|table| table.contains_key("windows"))
+    };
+    in_table(document.get("shell"))
+        || document
+            .get("default_profile")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|name| {
+                in_table(
+                    document
+                        .get("profiles")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|profiles| profiles.get(name)),
+                )
+            })
+}
+
+/// Run by the app and the CLI before they load the configuration. The first time a version
+/// with the Windows shell setting runs, writes the shell new tabs start: WSL for someone
+/// who used Compi before, when every shell was WSL; else PowerShell.
+pub fn settle_windows_shell(explicit: Option<&Path>) {
+    if !cfg!(windows) {
+        return;
+    }
+    let selected =
+        explicit.is_some() || std::env::var_os("COMPI_CONFIG_FILE").is_some_and(|v| !v.is_empty());
+    let Ok(path) = config_path(explicit, std::env::consts::OS, |key| std::env::var_os(key)) else {
+        return;
+    };
+    // A selected file that is missing is reported where it is loaded, not created here.
+    if selected && !path.exists() {
+        return;
+    }
+    if let Ok(data) = compi_protocol::paths::data_dir() {
+        settle_windows_shell_in(&path, crate::release_notes::prior_window_state(&data));
+    }
+}
+
+fn settle_windows_shell_in(path: &Path, used_before: bool) {
+    let named = match fs::read_to_string(path) {
+        Ok(source) => match source.parse::<toml::Table>() {
+            Ok(document) => names_windows_shell(&document),
+            // Its error is reported where the file is loaded.
+            Err(_) => return,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return,
+    };
+    if !named {
+        let shell = if used_before {
+            WindowsShell::Wsl
+        } else {
+            WindowsShell::PowerShell
+        };
+        let _ = save_windows_shell(path, shell);
+    }
+}
+
+fn save_windows_shell(path: &Path, shell: WindowsShell) -> Result<(), String> {
+    update_table(path, "shell", |table| {
+        set_table_value(table, "windows", shell.id().into());
+    })
 }
 
 /// Explicit path > COMPI_CONFIG_FILE > native path; CLI font values > file > defaults.
@@ -2347,6 +2447,103 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("appearance.density"))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn starting_folder_saves_and_clears_back_to_home() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-starting-folder-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n# retain me\n[shell]\nlogin = true\n").unwrap();
+        let folder = |path: &Path| {
+            load(Some(path), FontOverrides::default())
+                .launch
+                .unwrap()
+                .profile
+                .working_directory
+        };
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        loaded
+            .save_working_directory(Some(r"C:\Users\me\My Projects".into()))
+            .unwrap();
+        assert_eq!(folder(&path).as_deref(), Some(r"C:\Users\me\My Projects"));
+        loaded.save_working_directory(None).unwrap();
+        assert_eq!(folder(&path), None);
+        let source = fs::read_to_string(&path).unwrap();
+        assert!(!source.contains("working_directory"));
+        assert!(source.contains("# retain me") && source.contains("login = true"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_shell_is_settled_once_for_earlier_users_and_fresh_installs() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-windows-shell-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let shell = |path: &Path| {
+            load(Some(path), FontOverrides::default())
+                .launch
+                .unwrap()
+                .profile
+                .windows_shell
+        };
+
+        // Someone who used Compi before, when every shell was WSL, keeps WSL.
+        let earlier = root.join("earlier.toml");
+        fs::write(
+            &earlier,
+            "version = 1\n# retain me\n[shell]\nlogin = true\n",
+        )
+        .unwrap();
+        settle_windows_shell_in(&earlier, true);
+        assert_eq!(shell(&earlier), WindowsShell::Wsl);
+        assert!(
+            fs::read_to_string(&earlier)
+                .unwrap()
+                .contains("# retain me")
+        );
+
+        // A fresh install, with no configuration file yet, gets PowerShell.
+        let fresh = root.join("fresh.toml");
+        settle_windows_shell_in(&fresh, false);
+        assert_eq!(shell(&fresh), WindowsShell::PowerShell);
+
+        // Once named, it stays, even after the fresh install has saved windows.
+        settle_windows_shell_in(&fresh, true);
+        assert_eq!(shell(&fresh), WindowsShell::PowerShell);
+        let mut loaded = load(Some(&fresh), FontOverrides::default());
+        loaded.save_windows_shell(WindowsShell::Wsl).unwrap();
+        settle_windows_shell_in(&fresh, false);
+        assert_eq!(shell(&fresh), WindowsShell::Wsl);
+
+        // Named in the selected profile counts too.
+        let profile = root.join("profile.toml");
+        let source = "version = 1\ndefault_profile = 'dev'\n[profiles.dev]\nwindows = 'wsl'\n";
+        fs::write(&profile, source).unwrap();
+        settle_windows_shell_in(&profile, false);
+        assert_eq!(fs::read_to_string(&profile).unwrap(), source);
+        assert_eq!(shell(&profile), WindowsShell::Wsl);
+
+        let invalid = parse(
+            "version = 1\n[shell]\nwindows = 'cmd'",
+            FontOverrides::default(),
+        );
+        assert!(invalid.launch.unwrap_err().contains("shell.windows"));
         fs::remove_dir_all(root).unwrap();
     }
 
