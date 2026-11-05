@@ -33,7 +33,10 @@ pub fn classify(path: &str) -> &'static [Component] {
         // Dependency changes rebuild both binaries; they do not hold the client the
         // way a wire-contract change does.
         "Cargo.toml" | "Cargo.lock" => return &[Client, Daemon],
-        "assets/compi-shell.sh" => return &[Daemon],
+        // Scripts the daemon embeds.
+        "assets/compi-shell.sh" | "assets/compi-shell.ps1" | "assets/compi-monitor.sh" => {
+            return &[Daemon];
+        }
         "assets/Compi-desktopappicon-v4.ico" => return &[Client, Daemon],
         _ => {}
     }
@@ -97,7 +100,13 @@ mod tests {
     #[test]
     fn daemon_protocol_and_shared_inputs_are_distinguished() {
         assert_eq!(classify("crates/compi-daemon/src/daemon.rs"), &[Daemon]);
-        assert_eq!(classify("assets/compi-shell.sh"), &[Daemon]);
+        for script in [
+            "assets/compi-shell.sh",
+            "assets/compi-shell.ps1",
+            "assets/compi-monitor.sh",
+        ] {
+            assert_eq!(classify(script), &[Daemon], "{script}");
+        }
         assert_eq!(classify("crates/compi-protocol/src/lib.rs"), &[Protocol]);
         assert_eq!(classify("Cargo.lock"), &[Client, Daemon]);
         assert_eq!(
