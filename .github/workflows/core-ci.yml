@@ -63,7 +63,8 @@ jobs:
       - name: Lint all workspace targets
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Run workspace unit and binary tests
-        run: cargo test --locked --workspace --lib --bins
+        # Setup's tests run on their own, one at a time; see docs/dev/testcmds.md.
+        run: cargo test --locked --workspace --exclude compi-setup --lib --bins
       - name: Verify daemon stdio relay
         run: cargo test --locked -p compi-daemon --test stdio_relay
       - name: Verify engine-to-wire conversion and replica recovery
@@ -96,6 +97,31 @@ jobs:
           name: terminal-traces-${{ matrix.os }}
           path: ${{ runner.temp }}/compi-terminal-traces
           if-no-files-found: ignore
+
+  # Builds what the release's Windows job builds, with its cache key, so a tag starts warm:
+  # caches a tag saves are invisible to later tags, so only main's count.
+  windows-release-cache:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+          workspaces: |
+            . -> target/installer/product
+            . -> target/installer/diagnostics
+      - name: Prepare pinned Microsoft ConPTY runtime
+        shell: pwsh
+        run: .\tools\prepare-conpty.ps1
+      - name: Build the release binaries and Setup
+        run: cargo build --locked --release -p compi-client -p compi-daemon -p compi-update -p compi-setup --bins --target-dir target/installer/product
+      - name: Build package smoke diagnostics
+        run: cargo build --locked -p compi-client -p compi-daemon -p compi-update --bins --examples --target-dir target/installer/diagnostics
 
   mac-client:
     runs-on: macos-15

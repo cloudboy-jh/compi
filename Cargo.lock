@@ -1317,6 +1317,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "compi-setup"
+version = "0.6.1"
+dependencies = [
+ "async-channel",
+ "compi-client",
+ "compi-protocol",
+ "compi-update",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "semver",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "windows 0.62.2",
+ "winresource",
+]
+
+[[package]]
 name = "compi-update"
 version = "0.6.1"
 dependencies = [

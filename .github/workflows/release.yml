@@ -39,12 +39,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          # Core CI's `windows-release-cache` job writes this cache on main; tags read it.
+          # Only main saves: a tag's cache is invisible to the next tag, and a cancelled
+          # or failed run would otherwise leave a partial cache under the shared key.
+          shared-key: windows-release
           # `diagnostics` holds the debug smoke diagnostics and the installed-update fixture.
           workspaces: |
             . -> target/installer/product
             . -> target/installer/diagnostics
-            installer/bootstrapper -> ../../target/installer/bootstrapper-target
-          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'

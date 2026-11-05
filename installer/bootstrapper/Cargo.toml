@@ -4,8 +4,6 @@ version = "0.6.1"
 edition = "2024"
 publish = false
 
-[workspace]
-
 [target.'cfg(windows)'.dependencies]
 compi-client = { path = "../../crates/compi-client" }
 compi-protocol = { path = "../../crates/compi-protocol" }
@@ -28,12 +26,3 @@ windows = { version = "0.62.2", features = [
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
-
-[profile.dev]
-debug = 1
-incremental = false
-
-# No cross-crate LTO: Setup and maintenance are not performance-sensitive, and each
-# binary's thin-LTO link of the whole client graph cost about a minute locally.
-[profile.release]
-strip = "symbols"

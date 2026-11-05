@@ -1,7 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
-static COMPI_MSI: &[u8] = include_bytes!("../payload/Compi.msi");
+static COMPI_MSI: &[u8] = include_bytes!(env!("COMPI_SETUP_PAYLOAD"));
 
 #[cfg(windows)]
 fn main() {

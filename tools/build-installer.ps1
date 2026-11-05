@@ -92,11 +92,13 @@ $productBin = Join-Path $productTarget 'release'
 $msiPath = Join-Path $installerRoot 'Compi.msi'
 $payloadDirectory = Join-Path $projectRoot 'installer\bootstrapper\payload'
 $payloadPath = Join-Path $payloadDirectory 'Compi.msi'
-# Maintenance and Setup are two binaries of one package: one target directory compiles
-# the shared code once, and Setup relinks after the MSI it embeds exists.
-$bootstrapperTarget = Join-Path $installerRoot 'bootstrapper-target'
-$maintenanceSource = Join-Path $bootstrapperTarget 'release\compi-maintenance.exe'
-$setupSource = Join-Path $bootstrapperTarget 'release\compi-setup.exe'
+# The product, maintenance and Setup build together in one target directory with the same
+# packages each time, so the dependencies they share compile once; Setup relinks after the
+# MSI it embeds exists.
+$buildArguments = @('build', '--locked', '--release', '-p', 'compi-client', '-p', 'compi-daemon',
+    '-p', 'compi-update', '-p', 'compi-setup', '--bins', '--target-dir', $productTarget)
+$maintenanceSource = Join-Path $productBin 'compi-maintenance.exe'
+$setupSource = Join-Path $productBin 'compi-setup.exe'
 $setupName = "Compi-$version-Setup.exe"
 $setupDestination = Join-Path $OutputDirectory $setupName
 $portableName = "Compi-$version-Windows-x64.zip"
@@ -126,7 +128,7 @@ try {
 
     & (Join-Path $PSScriptRoot 'prepare-conpty.ps1') -Architecture x64
 
-    & cargo build --locked --release -p compi-client -p compi-daemon -p compi-update --bins --target-dir $productTarget
+    & cargo @buildArguments
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build Compi product binaries' }
     Assert-FileVersion (Join-Path $productBin 'compi.exe')
     Assert-FileVersion (Join-Path $productBin 'compi-daemon.exe')
@@ -141,8 +143,6 @@ try {
     Invoke-SignArtifact (Join-Path $productBin 'compi-daemon.exe')
     Invoke-SignArtifact $launcherSource
     Invoke-SignArtifact $helperSource
-    & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-maintenance --target-dir $bootstrapperTarget
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to build the installed Compi maintenance surface' }
     Assert-FileVersion $maintenanceSource
     Invoke-SignArtifact $maintenanceSource
 
@@ -169,9 +169,12 @@ try {
     Invoke-SignArtifact $msiPath
 
     Copy-Item -Force $msiPath $payloadPath
-    & cargo build --locked --manifest-path installer\bootstrapper\Cargo.toml --release --bin compi-setup --target-dir $bootstrapperTarget
+    & cargo @buildArguments
     if ($LASTEXITCODE -ne 0) { throw 'Failed to build the Compi Setup bootstrapper' }
     Assert-FileVersion $setupSource
+    if ((Get-Item -LiteralPath $setupSource).Length -le (Get-Item -LiteralPath $msiPath).Length) {
+        throw 'Compi Setup does not embed the package it was just built with'
+    }
     Invoke-SignArtifact $setupSource
 
     Copy-Item -Force $setupSource $setupDestination

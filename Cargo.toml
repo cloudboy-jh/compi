@@ -5,6 +5,7 @@ members = [
     "crates/compi-daemon",
     "crates/compi-client",
     "crates/compi-update",
+    "installer/bootstrapper",
     "tools/compi-dev",
 ]
 default-members = [
@@ -12,7 +13,7 @@ default-members = [
     "crates/compi-daemon",
     "crates/compi-client",
 ]
-exclude = ["installer/bootstrapper", "vendor/gpui-pre-windows"]
+exclude = ["vendor/gpui-pre-windows"]
 
 [workspace.package]
 version = "0.6.1"
@@ -38,8 +39,10 @@ sha2 = "0.10"
 debug = 1
 incremental = false
 
+# No cross-crate LTO: with it, every binary relinks the whole GPUI graph (about a minute
+# each) for about 1% smaller files. Setup and maintenance share this profile, and so the
+# release build of everything they share with the product.
 [profile.release]
-lto = "thin"
 strip = "symbols"
 
 # GPUI's Windows platform with one change: its composition target is not topmost, so a
