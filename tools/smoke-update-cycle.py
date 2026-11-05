@@ -113,8 +113,10 @@ if ($default.Count) { throw 'Installed cycle requires no running default daemon;
     sentinels = {}
     for filename in ('config.toml', 'external-project.txt'):
         path = (data if filename != 'external-project.txt' else profile) / filename
+        # The cycle's shell command is POSIX: on Windows, start WSL as updating users keep it.
         content = ('# smoke data retention ' + uuid.uuid4().hex
-                   + '\nversion = 1\n[updates]\ncheck_for_updates = false\n') if filename == 'config.toml' else uuid.uuid4().hex
+                   + '\nversion = 1\n[updates]\ncheck_for_updates = false\n'
+                   + ('[shell]\nwindows = "wsl"\n' if windows else '')) if filename == 'config.toml' else uuid.uuid4().hex
         path.write_text(content)
         sentinels[path] = path.read_bytes()
     driver = payload / ('compi-update-smoke.exe' if windows else 'compi-update-smoke')
