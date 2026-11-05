@@ -4368,12 +4368,13 @@ mod tests {
         let WorkspaceEffect::Launch(surface, _) = effects.recv().unwrap() else {
             unreachable!()
         };
+        let launched = actor.snapshot().unwrap().revision;
         actor.observe(RuntimeObservation::Failed {
             surface_id: surface.id.clone(),
             process_lifetime_id: surface.process_lifetime_id.clone(),
             error: "launch failed".into(),
         });
-        let failed = wait_revision(&actor, actor.snapshot().unwrap().revision + 1);
+        let failed = wait_revision(&actor, launched + 1);
 
         // The setting changed to PowerShell before the WSL shell restarts.
         let mut restart = request(
