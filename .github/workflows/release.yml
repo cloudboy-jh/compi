@@ -162,7 +162,10 @@ jobs:
           python-version: '3.x'
       - uses: Swatinem/rust-cache@v2
         with:
+          # Written on main by Core CI's `macos-release-cache` job; see the Windows job.
+          shared-key: macos-release
           workspaces: . -> target/macos-release/product
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Developer ID and notarization
         env:
           CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE_BASE64 }}
@@ -212,7 +215,9 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release --target aarch64-apple-darwin --target-dir target/macos-release/product -p compi-client --example compi-probe
+          # The distribution's packages too, so the dependencies they share are not rebuilt
+          # with other features: only the probe links.
+          MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release --target aarch64-apple-darwin --target-dir target/macos-release/product -p compi-client -p compi-daemon -p compi-update --bins --example compi-probe
           mkdir -p target/distribution-smoke
           bash tools/smoke-macos-bundle.sh target/distribution/Compi-*-macOS-arm64.dmg target/macos-release/product/aarch64-apple-darwin/release/examples/compi-probe 2>&1 | tee target/distribution-smoke/macos-bundle.log
       - name: Remove signing keychain

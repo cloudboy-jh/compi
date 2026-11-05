@@ -123,6 +123,23 @@ jobs:
       - name: Build package smoke diagnostics
         run: cargo build --locked -p compi-client -p compi-daemon -p compi-update --bins --examples --target-dir target/installer/diagnostics
 
+  # The macOS release job's build, with its cache key; see windows-release-cache.
+  macos-release-cache:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-release
+          workspaces: . -> target/macos-release/product
+      - name: Build the release binaries and the bundle check's probe
+        run: cargo build --locked --release --target aarch64-apple-darwin --target-dir target/macos-release/product -p compi-client -p compi-daemon -p compi-update --bins --example compi-probe
+
   mac-client:
     runs-on: macos-15
     timeout-minutes: 30
