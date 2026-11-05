@@ -1,29 +1,40 @@
-# 0.5.1
+# 0.6.0
 
-- macOS: notifications play a sound, with macOS's alert sounds to choose from
-- **Focused pane**: the pane you're in notifies too once you've stepped away
-- Tab tooltips state program status once
-- Windows: plain Ctrl+= zooms in
+- Windows: Compi no longer needs WSL. New tabs start Windows PowerShell or WSL, your choice
+- **Font size**: one size for every window, in Settings → Terminal
+- **Open with** and **Reveal** for files, and **Open in Compi** from File Explorer and Finder
+- **Settings → Keyboard** lists every command; click a shortcut to change it
 - Updating ends running shells: the daemon restarts
 
-## Notifications
+## Windows without WSL
 
-- On macOS, **Sound** offers Default and macOS's alert sounds (Basso, Blow, Bottle, Frog, Funk, Glass, Hero, Morse, Ping, Pop, Purr, Sosumi, Submarine, Tink), with **Play** to hear one. The sound comes with the system notification, or with the card in Compi, once per notification. Focus and Compi's **Play sound for notifications** switch in System Settings silence it, except for a card's sound while Compi is in the background with **In-app only**.
-- A `config.toml` shared between Windows and macOS keeps either system's sound; the other system plays its default sound.
-- **Focused pane** (Settings → Notifications → Events, `notifications.focused_pane_after`): the pane you're in counts as in use only while you're active. After 30 seconds without a key press, click or scroll in its window (by default), it notifies too. **Never** keeps it quiet while focused.
+- Setup and Compi start without WSL. WSL is checked only when a WSL tab opens, and its errors say what to run (`wsl --install`, `wsl --set-version NAME 2`).
+- **Settings → Terminal → Shell** picks what new tabs and splits start: Windows PowerShell or WSL. If you used Compi before, you keep WSL; new installs start PowerShell. Open tabs keep their shell, also after a restart.
+- PowerShell tabs report their folder and program status, keep `$?` and `$LASTEXITCODE`, put `compi` on `PATH` and leave your profile alone. Ctrl+C interrupts.
+- Files, search, project history, Git (Changes, Fetch, Pull, Push) and pasted image paths work in PowerShell tabs.
+- **Settings → Terminal → Starting folder**: **Choose…** a folder, or **Home**. WSL tabs open the same Windows folder.
+- **Shell prompt** offers Oh My Posh and Starship styles for PowerShell, with previews. Compi's block sits outside your profile and can be turned off.
 
-## Fixes
+## Font size
 
-- Hovering a tab shows its title and its programs' records without repeating the state, and a tab with one pane no longer repeats the pane's name.
-- Windows: Ctrl+= zooms in like Ctrl+Shift+=, as in browsers and editors.
+- **Settings → Terminal → Font size** shows the terminal and editor size with −, + and **Reset**. Ctrl+= and Ctrl+- (Cmd on macOS) step it by one and Ctrl/Cmd+0 resets it. It is saved as `font.size`, every window follows it, and editing the file applies at once.
+- It replaces the per-window zoom: a window you had zoomed shows the saved size.
+
+## Open with and Settings → Keyboard
+
+- A file in Files or Changes, and a file tab's menu, offer **Open with ▸** (the default app, the apps your system suggests, **Choose another app…**) and **Reveal in File Explorer** / **Reveal in Finder**.
+- Setup adds Compi to File Explorer's **Open with** for text, code, Markdown, image, PDF and media files, and **Open in Compi** on folders. On macOS, Finder can open files and folders with Compi.
+- **Settings → Keyboard** lists every command by category with its shortcut. Click a shortcut to record new keys, Backspace to unbind, **Reset** to restore it.
 
 ## Updating
 
-- **Running shells end.** The update restarts the local daemon after you consent. Daemon protocol 35 and workspace format 8 are unchanged, so your workspace carries over. Save your work first. Remote daemons are not restarted by the local updater.
-- **Windows, from 0.3.0 or earlier:** run [Compi 0.5.1 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.5.1/Compi-0.5.1-Setup.exe) once; the older update helper cannot replace itself. From 0.3.1, update in the app.
+- **Running shells end.** The update restarts the local daemon after you consent: daemon protocol 36 (was 35). Workspace format 8 is unchanged, so your workspace carries over. Save your work first. Remote daemons are not restarted by the local updater.
+- **Windows, from 0.3.0 or earlier:** run [Compi 0.6.0 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.6.0/Compi-0.6.0-Setup.exe) once; the older update helper cannot replace itself. From 0.3.1, update in the app.
 
 ## Limitations
 
-- macOS: clicking a system notification has not yet been checked on a Mac. The browser pane and the PDF, audio and video previews have not yet been checked on screen there.
+- Windows without WSL has not yet been tried on a PC that never had WSL installed.
+- Windows PowerShell 5.1 is the only native shell; PowerShell 7 and cmd are not offered yet. A PowerShell command that starts no other program shows as idle.
+- macOS: Open with, Finder integration, clicking a system notification, the browser pane and the PDF, audio and video previews have not yet been checked on screen on a Mac.
 - Animated GIF and WebP show their first frame only.
 - Windows packages are not publisher-signed. The macOS app is ad-hoc signed, not notarized. Operating-system trust warnings may appear; signed update metadata does not replace publisher signing.
