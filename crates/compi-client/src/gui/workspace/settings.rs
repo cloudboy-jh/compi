@@ -104,7 +104,7 @@ pub(super) enum SettingsAction {
     ResetWindowAppearance,
     ResetSidebar,
     ResetLayout,
-    Zoom(Command),
+    FontSize(Command),
     OpenConfiguration,
     /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
     /// the next keys pressed.
@@ -861,25 +861,25 @@ static ROWS: &[Row] = &[
         },
     ),
     row(
-        "zoom",
+        "font-size",
         SettingsSection::Terminal,
-        "Zoom",
-        "Make terminal text larger or smaller.",
-        "size scale bigger smaller line height",
+        "Font size",
+        "Terminal and editor text, in every window.",
+        "zoom scale bigger smaller larger text line height",
         |_| {
             vec![
-                SettingsAction::Zoom(Command::ZoomOut),
-                SettingsAction::Zoom(Command::ZoomReset),
-                SettingsAction::Zoom(Command::ZoomIn),
+                SettingsAction::FontSize(Command::ZoomOut),
+                SettingsAction::FontSize(Command::ZoomIn),
+                SettingsAction::FontSize(Command::ZoomReset),
             ]
         },
-        |app, row, cx| app.render_zoom_row(row, cx),
+        |app, row, cx| app.render_font_size_row(row, cx),
     ),
     row(
         "custom-typography",
         SettingsSection::Terminal,
         "Custom typography",
-        "Set a custom font, size, or line height in the configuration file.",
+        "Set a custom font, line height or fallback fonts in the configuration file.",
         "toml config",
         |_| vec![SettingsAction::OpenConfiguration],
         |app, row, cx| {
@@ -2621,7 +2621,7 @@ impl CompiApp {
             SettingsAction::ResetWindowAppearance => self.reset_window_appearance(window),
             SettingsAction::ResetSidebar => self.execute(Command::ResetSidebarWidth, window, cx),
             SettingsAction::ResetLayout => self.execute(Command::ResetClientLayout, window, cx),
-            SettingsAction::Zoom(command) => self.execute(command, window, cx),
+            SettingsAction::FontSize(command) => self.execute(command, window, cx),
             SettingsAction::OpenConfiguration => {
                 self.execute(Command::OpenConfiguration, window, cx)
             }
@@ -2733,6 +2733,33 @@ impl CompiApp {
             return;
         }
         if let Err(error) = self.config.save_terminal_font(preset) {
+            self.global_error = Some(error);
+            return;
+        }
+        self.font_settings = self.config.font.clone();
+        self.typography_scale = 0.0;
+        if self.refresh_typography(window) {
+            self.rebuild_layout(window, true);
+        }
+        self.broadcast_global_appearance(window, cx);
+        cx.notify();
+    }
+
+    /// Save the terminal font size (`None` restores the default) for every window.
+    pub(super) fn apply_font_size(
+        &mut self,
+        size: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = match size {
+            Some(size) => size == self.config.font.size,
+            None => self.config.provenance.font_size == crate::config::ValueSource::Default,
+        };
+        if unchanged {
+            return;
+        }
+        if let Err(error) = self.config.save_font_size(size) {
             self.global_error = Some(error);
             return;
         }
@@ -3854,40 +3881,42 @@ impl CompiApp {
         )
     }
 
-    fn render_zoom_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let zoom = div()
+    fn render_font_size_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let size = self.font_settings.size;
+        let shown = if size.fract() == 0.0 {
+            format!("{size:.0}")
+        } else {
+            format!("{size}")
+        };
+        let control = div()
             .flex()
             .items_center()
             .gap_1()
             .child(self.settings_control(
                 row,
-                SettingsAction::Zoom(Command::ZoomOut),
-                controls::icon_button((row.row, 0_usize), IconName::Minus, "Zoom out").header(),
+                SettingsAction::FontSize(Command::ZoomOut),
+                controls::icon_button((row.row, 0_usize), IconName::Minus, "Smaller").header(),
+                cx,
+            ))
+            .child(div().min_w(px(32.0)).text_center().child(shown))
+            .child(self.settings_control(
+                row,
+                SettingsAction::FontSize(Command::ZoomIn),
+                controls::icon_button((row.row, 2_usize), IconName::Plus, "Larger").header(),
                 cx,
             ))
             .child(self.settings_button(
                 row,
                 1,
                 "Reset",
-                SettingsAction::Zoom(Command::ZoomReset),
-                cx,
-            ))
-            .child(self.settings_control(
-                row,
-                SettingsAction::Zoom(Command::ZoomIn),
-                controls::icon_button((row.row, 2_usize), IconName::Plus, "Zoom in").header(),
+                SettingsAction::FontSize(Command::ZoomReset),
                 cx,
             ))
             .into_any_element();
         self.settings_row(
             row.title,
-            format!(
-                "{:.0}% · {:.1}px · {:.2} line height",
-                self.zoom * 100.0,
-                self.font_settings.size,
-                self.font_settings.line_height
-            ),
-            zoom,
+            row_description("font-size").into(),
+            control,
             row.compact,
         )
     }
@@ -5107,6 +5136,7 @@ mod tests {
             [
                 "ui-font",
                 "terminal-font",
+                "font-size",
                 "custom-typography",
                 COMMANDS_ROW
             ]
@@ -5190,9 +5220,9 @@ mod tests {
     fn keyboard_order_is_search_sections_then_each_rows_controls() {
         let toggle = SettingsAction::ToggleConfirmClose;
         let zoom = [
-            SettingsAction::Zoom(Command::ZoomOut),
-            SettingsAction::Zoom(Command::ZoomReset),
-            SettingsAction::Zoom(Command::ZoomIn),
+            SettingsAction::FontSize(Command::ZoomOut),
+            SettingsAction::FontSize(Command::ZoomReset),
+            SettingsAction::FontSize(Command::ZoomIn),
         ];
         let order = focus_order(
             true,

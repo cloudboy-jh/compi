@@ -20,7 +20,7 @@ const PLATFORM_FALLBACKS: &[&str] = &["Apple Symbols", "Arial Unicode MS", "Appl
 #[cfg(windows)]
 const PLATFORM_FALLBACKS: &[&str] = &["Segoe UI Symbol", "Segoe UI Emoji"];
 
-/// Resolved once per font, zoom, or display-scale change, never per terminal cell.
+/// Resolved once per font or display-scale change, never per terminal cell.
 #[derive(Clone, Debug)]
 pub struct TerminalTypography {
     pub font: Font,
@@ -38,17 +38,11 @@ pub struct TerminalTypography {
 }
 
 impl TerminalTypography {
-    pub fn resolve(settings: &FontSettings, zoom: f32, window: &Window) -> Self {
+    pub fn resolve(settings: &FontSettings, window: &Window) -> Self {
         let text_system = window.text_system();
         let available = text_system.all_font_names();
         let mut diagnostics = Vec::new();
-        let zoom = if zoom.is_finite() && zoom > 0.0 {
-            zoom
-        } else {
-            diagnostics.push("Invalid font zoom; using 100%.".into());
-            1.0
-        };
-        let font_size = settings.size * zoom;
+        let font_size = settings.size;
         let features = FontFeatures(Arc::new(vec![
             ("calt".into(), 0),
             ("liga".into(), 0),

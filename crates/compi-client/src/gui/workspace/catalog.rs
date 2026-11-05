@@ -563,15 +563,18 @@ impl CompiApp {
         favorites: Vec<ThemeId>,
         ui_font: UiFontPreset,
         density: crate::theme::WorkspaceDensity,
-        terminal_font_family: String,
+        terminal_font: crate::config::FontSettings,
         window: &mut Window,
     ) {
-        let terminal_font_changed = self.config.configured_font.family != terminal_font_family;
+        // The family and size follow live; line height and fallbacks do not.
+        let terminal_font_changed = self.config.configured_font.family != terminal_font.family;
+        let font_size_changed = self.config.configured_font.size != terminal_font.size;
         if self.config.configured_appearance == appearance
             && self.config.theme_favorites == favorites
             && self.config.ui_font == ui_font
             && self.config.density == density
             && !terminal_font_changed
+            && !font_size_changed
         {
             return;
         }
@@ -584,13 +587,21 @@ impl CompiApp {
             self.rebuild_layout(window, true);
         }
         if terminal_font_changed {
-            self.config.configured_font.family = terminal_font_family.clone();
+            self.config.configured_font.family = terminal_font.family.clone();
             if self.config.provenance.font_family != crate::config::ValueSource::CommandLine {
-                self.config.font.family = terminal_font_family;
+                self.config.font.family = terminal_font.family;
                 self.config.provenance.font_family = crate::config::ValueSource::Configuration;
                 self.font_settings = self.config.font.clone();
                 self.typography_scale = 0.0;
             }
+        }
+        // A size saved anywhere applies here too, even over `--font-size`, as when saved here.
+        if font_size_changed {
+            self.config.configured_font.size = terminal_font.size;
+            self.config.font.size = terminal_font.size;
+            self.config.provenance.font_size = crate::config::ValueSource::Configuration;
+            self.font_settings = self.config.font.clone();
+            self.typography_scale = 0.0;
         }
         let cli = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
         if !cli {
@@ -643,7 +654,7 @@ impl CompiApp {
                         self.config.theme_favorites.clone(),
                         self.config.ui_font,
                         self.config.density,
-                        self.config.configured_font.family.clone(),
+                        self.config.configured_font.clone(),
                         target_window,
                     );
                     target_cx.notify();

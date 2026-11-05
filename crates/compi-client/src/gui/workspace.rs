@@ -215,7 +215,6 @@ pub(super) struct TransferSeed {
     source_state: ClientState,
     display_appearance: AppearanceSettings,
     display_sidebar_width: f32,
-    display_zoom: f32,
     activate: bool,
 }
 
@@ -834,10 +833,7 @@ impl CompiApp {
             });
         let slot_id = slot.id().to_owned();
         let slot_diagnostics = slot.diagnostics.clone();
-        let zoom = transferred_seed
-            .as_ref()
-            .map_or(state.font_zoom, |seed| seed.display_zoom);
-        let typography = Arc::new(TerminalTypography::resolve(&config.font, zoom, window));
+        let typography = Arc::new(TerminalTypography::resolve(&config.font, window));
         let mut appearance_diagnostics = config.diagnostics.clone();
         appearance_diagnostics.extend(library_diagnostics);
         for id in [
@@ -952,7 +948,6 @@ impl CompiApp {
             background_effect,
             settings_scope: SettingsScope::Global,
             daemon_restarting: false,
-            zoom,
             overlay: None,
             overlay_index: 0,
             overlay_scroll: ScrollHandle::new(),
@@ -1224,7 +1219,7 @@ impl CompiApp {
                                 favorites: loaded.theme_favorites,
                                 ui_font: loaded.ui_font,
                                 density: loaded.density,
-                                terminal_font_family: loaded.configured_font.family,
+                                terminal_font: loaded.configured_font,
                                 diagnostics: loaded.diagnostics,
                             });
                         }
@@ -2059,16 +2054,11 @@ impl CompiApp {
                 favorites,
                 ui_font,
                 density,
-                terminal_font_family,
+                terminal_font,
                 diagnostics,
             } => {
-                self.pending_appearance_reload = Some((
-                    appearance,
-                    favorites,
-                    ui_font,
-                    density,
-                    terminal_font_family,
-                ));
+                self.pending_appearance_reload =
+                    Some((appearance, favorites, ui_font, density, terminal_font));
                 self.config_diagnostics = diagnostics;
                 self.global_warning =
                     diagnostic_warning(&self.config_diagnostics, &self.typography.diagnostics);
@@ -4172,22 +4162,17 @@ impl CompiApp {
                 }
             }
             Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => {
-                self.zoom = if command == Command::ZoomReset {
-                    1.0
-                } else {
-                    (self.zoom
-                        + if command == Command::ZoomIn {
-                            0.1
-                        } else {
-                            -0.1
-                        })
-                    .clamp(0.5, 3.0)
+                let current = self.config.font.size;
+                let size = match command {
+                    Command::ZoomIn => {
+                        Some((current.floor() + 1.0).min(crate::config::MAX_FONT_SIZE))
+                    }
+                    Command::ZoomOut => {
+                        Some((current.ceil() - 1.0).max(crate::config::MIN_FONT_SIZE))
+                    }
+                    _ => None,
                 };
-                self.state.font_zoom = self.zoom;
-                self.font_settings = self.config.configured_font.clone();
-                self.typography_scale = 0.0;
-                self.refresh_typography(window);
-                self.save_state();
+                self.apply_font_size(size, window, cx);
             }
             Command::OpenQuickAppearance => self.open_quick_appearance(),
             Command::OpenSettings => self.open_settings(None, None, window, cx),
@@ -4236,7 +4221,6 @@ impl CompiApp {
                     view.selection = None;
                 }
                 self.sidebar_width = self.state.sidebar_width;
-                self.zoom = self.state.font_zoom;
                 let effective = inherited_appearance(&self.config, &self.state.appearance);
                 self.set_theme(self.resolve_theme(&effective.theme));
                 self.set_terminal_theme(self.resolve_theme(effective.effective_terminal_theme()));
@@ -4937,7 +4921,7 @@ impl CompiApp {
                 window.on_next_frame(move |_, cx| cx.notify(view_id));
             }
         }
-        if let Some((appearance, favorites, ui_font, density, terminal_font_family)) =
+        if let Some((appearance, favorites, ui_font, density, terminal_font)) =
             self.pending_appearance_reload.take()
         {
             self.sync_global_appearance(
@@ -4945,7 +4929,7 @@ impl CompiApp {
                 favorites,
                 ui_font,
                 density,
-                terminal_font_family,
+                terminal_font,
                 window,
             );
         }
@@ -7499,7 +7483,6 @@ impl CompiApp {
                 source_state: self.state.clone(),
                 display_appearance,
                 display_sidebar_width: self.sidebar_width,
-                display_zoom: self.zoom,
                 activate: activate_destination,
             };
             match open_compi_window(self.target.clone(), None, config, Some(seed), cx) {

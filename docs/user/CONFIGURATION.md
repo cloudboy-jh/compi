@@ -31,9 +31,12 @@ terminal_opacity = 0.7 # remembered background opacity, not text opacity
 
 [font]
 family = "JetBrains Mono"
+size = 14 # 6 through 72
 ```
 
 Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono. Custom installed families remain supported through `font.family`. Bundled font notices and SIL Open Font License 1.1 text are in [`crates/compi-client/fonts/ATTRIBUTION.txt`](../../crates/compi-client/fonts/ATTRIBUTION.txt).
+
+**Settings → Terminal → Font size** shows the terminal and editor text size with −, + and **Reset**; Ctrl+= and Ctrl+- (Cmd on macOS) step it by one, and Ctrl/Cmd+0 resets it. The size is saved as `font.size` and every window follows it, including after editing the file by hand. Reset removes the key, returning to the default of 14.
 
 ## Pane density
 

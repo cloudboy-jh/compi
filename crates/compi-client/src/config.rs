@@ -160,6 +160,10 @@ pub struct FontOverrides {
     pub line_height: Option<f32>,
 }
 
+/// The terminal font sizes `[font] size` accepts, in logical pixels.
+pub const MIN_FONT_SIZE: f32 = 6.0;
+pub const MAX_FONT_SIZE: f32 = 72.0;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdateSettings {
@@ -751,6 +755,36 @@ impl LoadedConfig {
             self.font.family = family.to_owned();
             self.provenance.font_family = ValueSource::Configuration;
         }
+        Ok(())
+    }
+
+    /// Persist the terminal font size, or remove it (`None`) to use the default. Unlike the
+    /// family, a saved size also replaces this window's `--font-size`: the user just chose it.
+    pub fn save_font_size(&mut self, size: Option<f32>) -> Result<(), String> {
+        if size.is_some_and(|size| {
+            !valid_number(f64::from(size), MIN_FONT_SIZE.into(), MAX_FONT_SIZE.into())
+        }) {
+            return Err(format!(
+                "Font size must be from {MIN_FONT_SIZE} through {MAX_FONT_SIZE}"
+            ));
+        }
+        update_table(&self.path, "font", |table| match size {
+            Some(size) if size.fract() == 0.0 => {
+                set_table_value(table, "size", i64::from(size as i32).into());
+            }
+            Some(size) => set_table_value(table, "size", f64::from(size).into()),
+            None => {
+                table.remove("size");
+            }
+        })?;
+        let applied = size.unwrap_or(FontSettings::default().size);
+        self.configured_font.size = applied;
+        self.font.size = applied;
+        self.provenance.font_size = if size.is_some() {
+            ValueSource::Configuration
+        } else {
+            ValueSource::Default
+        };
         Ok(())
     }
 
@@ -2407,6 +2441,51 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("appearance.ui_font"))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn font_size_saves_over_a_command_line_size_and_resets_to_the_default() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-font-size-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\n[font]\nfamily = 'Terminal Face'\n# retain me\n",
+        )
+        .unwrap();
+        let overrides = FontOverrides {
+            size: Some(24.0),
+            ..Default::default()
+        };
+
+        let mut loaded = load(Some(&path), overrides);
+        loaded.save_font_size(Some(17.0)).unwrap();
+        assert_eq!(loaded.font.size, 17.0);
+        assert_eq!(loaded.provenance.font_size, ValueSource::Configuration);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("size = 17\n"), "{text}");
+        assert!(text.contains("# retain me"));
+        assert_eq!(load(Some(&path), FontOverrides::default()).font.size, 17.0);
+
+        assert!(loaded.save_font_size(Some(MAX_FONT_SIZE + 1.0)).is_err());
+        assert_eq!(load(Some(&path), FontOverrides::default()).font.size, 17.0);
+
+        loaded.save_font_size(None).unwrap();
+        let default = FontSettings::default().size;
+        assert_eq!(loaded.font.size, default);
+        assert_eq!(loaded.provenance.font_size, ValueSource::Default);
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.font.size, default);
+        assert_eq!(reloaded.font.family, "Terminal Face");
+        assert!(!fs::read_to_string(&path).unwrap().contains("size"));
         fs::remove_dir_all(root).unwrap();
     }
 

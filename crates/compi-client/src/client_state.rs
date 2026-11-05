@@ -175,6 +175,8 @@ pub struct ClientState {
     pub version: u32,
     pub geometry: Option<WindowGeometry>,
     pub sidebar_width: f32,
+    /// Unused: the font size is global (`[font] size`). Kept because older clients
+    /// require the field and quarantine state without it.
     pub font_zoom: f32,
     #[serde(default, skip_serializing_if = "WindowAppearanceOverrides::is_default")]
     pub appearance: WindowAppearanceOverrides,

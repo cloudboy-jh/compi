@@ -581,7 +581,7 @@ enum UiEvent {
         favorites: Vec<ThemeId>,
         ui_font: UiFontPreset,
         density: crate::theme::WorkspaceDensity,
-        terminal_font_family: String,
+        terminal_font: FontSettings,
         diagnostics: Vec<String>,
     },
     ImagePrepared {
@@ -937,7 +937,7 @@ struct CompiApp {
         Vec<ThemeId>,
         UiFontPreset,
         crate::theme::WorkspaceDensity,
-        String,
+        FontSettings,
     )>,
     pending_image_inputs: HashSet<u64>,
     image_previews: VecDeque<workspace::media::ImagePreview>,
@@ -951,7 +951,6 @@ struct CompiApp {
     glass: bool,
     settings_scope: SettingsScope,
     daemon_restarting: bool,
-    zoom: f32,
     overlay: Option<Overlay>,
     overlay_index: usize,
     overlay_scroll: ScrollHandle,
@@ -1057,11 +1056,7 @@ impl CompiApp {
         if (scale - self.typography_scale).abs() <= f32::EPSILON {
             return false;
         }
-        let typography = Arc::new(TerminalTypography::resolve(
-            &self.font_settings,
-            self.zoom,
-            window,
-        ));
+        let typography = Arc::new(TerminalTypography::resolve(&self.font_settings, window));
         self.global_warning = diagnostic_warning(&self.config_diagnostics, &typography.diagnostics);
         self.typography = typography;
         self.typography_scale = scale;
