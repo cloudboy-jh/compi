@@ -10,6 +10,11 @@
 //! their own above those (`show_commit_changes`) and open as read-only diff tabs. A commit
 //! is read once, when the section or a tab first needs it, as it never changes.
 //!
+//! Unstaged files that differ from the index only in line endings (CRLF against LF, as
+//! when Windows and WSL tools share a checkout) leave Unstaged for a Line endings only
+//! group right after it, without line counts; its Restore discards them like Discard does,
+//! asking first.
+//!
 //! Writes are explicit actions only (`git_write`): stage, unstage and discard on list rows,
 //! section headers and diff tab headers, a hunk's button in a diff tab, and the commit box
 //! above the list. Discarding asks first, naming the files. A write's controls show a
@@ -55,6 +60,9 @@ const MICRO_GLYPH_WIDTH: f32 = UI_MICRO_TEXT_SIZE * 0.56;
 const SMALL_GLYPH_WIDTH: f32 = UI_SMALL_TEXT_SIZE * 0.56;
 /// How long a commit's or a refused hunk's line stays under the commit box.
 const NOTICE_DURATION: Duration = Duration::from_secs(8);
+/// What the Line endings only group's header says on hover.
+const LINE_ENDINGS_HINT: &str =
+    "Only CRLF/LF differ, often from Windows and WSL tools sharing this folder";
 
 /// How every Changes list and diff tab of a window shows changes. Not saved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,7 +85,8 @@ pub(super) struct RepoStatus {
     /// The folder read: the pane's root.
     root: String,
     listing: Listing,
-    /// Files and lines across the listing: distinct paths, added, removed.
+    /// Files and lines across the listing: distinct paths, added, removed; lines of changes
+    /// of line endings alone left out.
     totals: (usize, u64, u64),
     /// A listing request is out, since then.
     reading: Option<Instant>,
@@ -276,6 +285,8 @@ struct Folds {
     sections: HashSet<GitScope>,
     /// Folded folders by section and folder path.
     folders: HashSet<(GitScope, String)>,
+    /// The Line endings only group is folded.
+    line_endings: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,6 +306,9 @@ enum ListRow {
     },
     /// A change, by index through `Listed`.
     File { change: usize, depth: usize },
+    /// The group of unstaged changes that only change line endings, after Unstaged. Its
+    /// files list flat, by path, in tree mode too.
+    LineEndings { count: usize, collapsed: bool },
 }
 
 /// A list row by what it shows rather than where, so a new listing or a fold keeps it.
@@ -303,6 +317,7 @@ enum RowKey {
     Section(GitScope),
     Folder(GitScope, String),
     File(GitScope, String),
+    LineEndings,
 }
 
 /// The changes the list shows: the shown commit's, then the working tree's. A list row
@@ -555,17 +570,18 @@ impl RepoStatus {
             .collect();
         paths.sort_unstable();
         paths.dedup();
-        self.totals =
-            listing
-                .changes
-                .iter()
-                .fold((paths.len(), 0, 0), |(files, added, removed), change| {
-                    (
-                        files,
-                        added + u64::from(change.added.unwrap_or(0)),
-                        removed + u64::from(change.removed.unwrap_or(0)),
-                    )
-                });
+        // Line endings alone change no line, so their counts stay out of the totals.
+        self.totals = listing
+            .changes
+            .iter()
+            .filter(|change| !change.line_endings_only)
+            .fold((paths.len(), 0, 0), |(files, added, removed), change| {
+                (
+                    files,
+                    added + u64::from(change.added.unwrap_or(0)),
+                    removed + u64::from(change.removed.unwrap_or(0)),
+                )
+            });
         self.marks = tree_marks(&self.root, &listing);
         self.listing = Listing::Ready(listing);
         self.rebuild(tree);
@@ -586,15 +602,20 @@ impl RepoStatus {
     /// Unfolds what hides the change of `path` in `scope`, selects it and scrolls the list
     /// to it.
     fn reveal(&mut self, path: &str, scope: &GitScope, tree: bool) {
-        let mut unfolded = self.folds.sections.remove(scope);
-        self.folds.folders.retain(|(folded, folder)| {
-            let hides = folded == scope
-                && path
-                    .strip_prefix(folder.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'));
-            unfolded |= hides;
-            !hides
-        });
+        let unfolded = if line_endings_only(self.listed(), scope, path) {
+            std::mem::take(&mut self.folds.line_endings)
+        } else {
+            let mut unfolded = self.folds.sections.remove(scope);
+            self.folds.folders.retain(|(folded, folder)| {
+                let hides = folded == scope
+                    && path
+                        .strip_prefix(folder.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'));
+                unfolded |= hides;
+                !hides
+            });
+            unfolded
+        };
         if unfolded {
             self.rebuild(tree);
         }
@@ -773,8 +794,9 @@ impl<'a> TreeFolder<'a> {
 
 /// The list of `changes`: the section of the shown `commit` (by full id; shown while it is
 /// read, too), then a section per working scope that has changes, Unstaged first, each
-/// holding its changes in path order or, as a tree, in folders. Also every change in that
-/// order, folded or not.
+/// holding its changes in path order or, as a tree, in folders. Unstaged changes of line
+/// endings alone leave Unstaged for a group of their own right after it. Also every change
+/// in that order, folded or not.
 fn list_rows(
     changes: Listed<'_>,
     commit: Option<&str>,
@@ -788,37 +810,55 @@ fn list_rows(
         .into_iter()
         .chain([GitScope::Unstaged, GitScope::Staged]);
     for scope in sections {
-        let count = changes
-            .iter()
-            .filter(|change| change.scope == scope)
-            .count();
-        if count == 0 && !matches!(scope, GitScope::Commit(_)) {
-            continue;
-        }
-        let collapsed = folds.sections.contains(&scope);
-        rows.push(ListRow::Section {
-            scope: scope.clone(),
-            count,
-            collapsed,
-        });
-        let members = changes
-            .iter()
-            .enumerate()
-            .filter(|(_, change)| change.scope == scope);
-        if tree {
-            let mut root = TreeFolder::default();
-            for (index, change) in members {
-                root.insert(&change.path, index);
+        let in_section = |change: &GitChange| change.scope == scope && !change.line_endings_only;
+        let count = changes.iter().filter(|change| in_section(change)).count();
+        if count > 0 || matches!(scope, GitScope::Commit(_)) {
+            let collapsed = folds.sections.contains(&scope);
+            rows.push(ListRow::Section {
+                scope: scope.clone(),
+                count,
+                collapsed,
+            });
+            let members = changes
+                .iter()
+                .enumerate()
+                .filter(|(_, change)| in_section(change));
+            if tree {
+                let mut root = TreeFolder::default();
+                for (index, change) in members {
+                    root.insert(&change.path, index);
+                }
+                root.emit(&scope, "", 0, collapsed, folds, &mut rows, &mut order);
+            } else {
+                for (index, _) in members {
+                    order.push(index);
+                    if !collapsed {
+                        rows.push(ListRow::File {
+                            change: index,
+                            depth: 0,
+                        });
+                    }
+                }
             }
-            root.emit(&scope, "", 0, collapsed, folds, &mut rows, &mut order);
-        } else {
-            for (index, _) in members {
-                order.push(index);
-                if !collapsed {
-                    rows.push(ListRow::File {
-                        change: index,
-                        depth: 0,
-                    });
+        }
+        if scope == GitScope::Unstaged {
+            let members: Vec<usize> = changes
+                .iter()
+                .enumerate()
+                .filter(|(_, change)| change.line_endings_only)
+                .map(|(index, _)| index)
+                .collect();
+            if !members.is_empty() {
+                let collapsed = folds.line_endings;
+                rows.push(ListRow::LineEndings {
+                    count: members.len(),
+                    collapsed,
+                });
+                for change in members {
+                    order.push(change);
+                    if !collapsed {
+                        rows.push(ListRow::File { change, depth: 0 });
+                    }
                 }
             }
         }
@@ -862,6 +902,7 @@ fn row_key(row: &ListRow, changes: Listed<'_>) -> RowKey {
             let change = &changes[*change];
             RowKey::File(change.scope.clone(), change.path.clone())
         }
+        ListRow::LineEndings { .. } => RowKey::LineEndings,
     }
 }
 
@@ -875,24 +916,30 @@ fn row_is(row: &ListRow, changes: Listed<'_>, key: &RowKey) -> bool {
         (ListRow::File { change, .. }, RowKey::File(wanted, path)) => {
             changes[*change].scope == *wanted && changes[*change].path == *path
         }
+        (ListRow::LineEndings { .. }, RowKey::LineEndings) => true,
         _ => false,
     }
 }
 
 /// Where the selection of `key`, last at row `was`, goes in `rows`: its row; else the
-/// folded section or folder hiding it; else the row now at its place (the next one, when
-/// its change left), or the last.
+/// folded section, group or folder hiding it; else the row now at its place (the next one,
+/// when its change left), or the last.
 fn reselect(rows: &[ListRow], changes: Listed<'_>, key: &RowKey, was: usize) -> Option<usize> {
     if let Some(at) = rows.iter().position(|row| row_is(row, changes, key)) {
         return Some(at);
     }
+    let line_endings =
+        matches!(key, RowKey::File(scope, path) if line_endings_only(changes, scope, path));
     if let RowKey::Folder(scope, path) | RowKey::File(scope, path) = key
         && let Some(at) = rows.iter().rposition(|row| match row {
             ListRow::Section {
                 scope: folded,
                 collapsed: true,
                 ..
-            } => folded == scope,
+            } => folded == scope && !line_endings,
+            ListRow::LineEndings {
+                collapsed: true, ..
+            } => line_endings,
             ListRow::Folder {
                 scope: folded,
                 path: folder,
@@ -928,7 +975,7 @@ fn step_row(len: usize, at: Option<usize>, forward: bool) -> Option<usize> {
 /// How deep `row` sits: sections at 0, what they hold below.
 fn row_level(row: &ListRow) -> usize {
     match row {
-        ListRow::Section { .. } => 0,
+        ListRow::Section { .. } | ListRow::LineEndings { .. } => 0,
         ListRow::Folder { depth, .. } | ListRow::File { depth, .. } => depth + 1,
     }
 }
@@ -940,7 +987,9 @@ fn sideways(rows: &[ListRow], at: usize, open: bool) -> Sideways {
         return Sideways::Stay;
     };
     let folded = match row {
-        ListRow::Section { collapsed, .. } | ListRow::Folder { collapsed, .. } => Some(*collapsed),
+        ListRow::Section { collapsed, .. }
+        | ListRow::Folder { collapsed, .. }
+        | ListRow::LineEndings { collapsed, .. } => Some(*collapsed),
         ListRow::File { .. } => None,
     };
     if folded == Some(open) {
@@ -960,12 +1009,14 @@ fn sideways(rows: &[ListRow], at: usize, open: bool) -> Sideways {
 }
 
 /// The paths staging or unstaging the changes of `scope` names, only those inside
-/// `folder` when given; sorted, once each.
+/// `folder` when given; sorted, once each. Changes of line endings alone are left to their
+/// own group (`line_endings_paths`).
 fn scope_paths(changes: &[GitChange], scope: &GitScope, folder: Option<&str>) -> Vec<String> {
     let mut paths: Vec<String> = changes
         .iter()
         .filter(|change| {
             change.scope == *scope
+                && !change.line_endings_only
                 && folder.is_none_or(|folder| {
                     change
                         .path
@@ -980,12 +1031,32 @@ fn scope_paths(changes: &[GitChange], scope: &GitScope, folder: Option<&str>) ->
     paths
 }
 
+/// The paths of the changes of line endings alone, in list order.
+fn line_endings_paths(changes: &[GitChange]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|change| change.line_endings_only)
+        .map(|change| change.path.clone())
+        .collect()
+}
+
+/// Whether the working tree's change of `path` in `scope` changes line endings alone.
+fn line_endings_only(changes: Listed<'_>, scope: &GitScope, path: &str) -> bool {
+    changes
+        .working
+        .iter()
+        .any(|change| change.line_endings_only && change.scope == *scope && change.path == path)
+}
+
 /// What `s` (`Unstaged`) or `u` (`Staged`) moves on `row`: its file, or every file of its
-/// folder or section, when the row is in that section.
+/// folder, section or group, when the row is in that section.
 fn row_paths(row: &ListRow, changes: Listed<'_>, scope: &GitScope) -> Vec<String> {
     match row {
         ListRow::Section { scope: at, .. } if at == scope => {
             scope_paths(changes.working, scope, None)
+        }
+        ListRow::LineEndings { .. } if *scope == GitScope::Unstaged => {
+            line_endings_paths(changes.working)
         }
         ListRow::Folder {
             scope: at, path, ..
@@ -2570,6 +2641,23 @@ impl CompiApp {
             .unwrap_or_default()
     }
 
+    /// Restore on the Line endings only group: asks, as any discard does, before putting
+    /// those files back as the index has them.
+    fn confirm_restore_line_endings(&mut self, pane_id: &PaneId) {
+        let changes: Vec<GitChange> = self
+            .repo_changes(pane_id)
+            .map(|listing| {
+                listing
+                    .changes
+                    .iter()
+                    .filter(|change| change.line_endings_only)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.confirm_discard(pane_id, &changes);
+    }
+
     /// Asks before discarding the work-tree changes of `changes` (unstaged ones), naming
     /// them; untracked files are deleted.
     fn confirm_discard(&mut self, pane_id: &PaneId, changes: &[GitChange]) {
@@ -2870,8 +2958,9 @@ impl CompiApp {
     /// list: Up and Down select a row; Enter opens the selected file's diff or folds the
     /// selected section or folder; Left and Right fold and unfold it, or move out of or
     /// into it; `s` stages and `u` unstages the selected file, folder or section; Delete
-    /// discards the selected unstaged file, asking first. Without a selection, only Up
-    /// and Down are taken, so a diff tab keeps the rest. Whether the key was taken.
+    /// discards the selected unstaged file, or restores the Line endings only group on its
+    /// header, asking first. Without a selection, only Up and Down are taken, so a diff tab
+    /// keeps the rest. Whether the key was taken.
     pub(super) fn changes_list_key(
         &mut self,
         pane_id: &PaneId,
@@ -2943,13 +3032,17 @@ impl CompiApp {
                 let Some(at) = at else {
                     return false;
                 };
-                if let ListRow::File { change, .. } = status.rows[at] {
-                    let change = status.listed()[change].clone();
-                    if change.scope == GitScope::Unstaged
-                        && change.kind != GitChangeKind::Conflicted
-                    {
-                        self.confirm_discard(pane_id, std::slice::from_ref(&change));
+                match status.rows[at] {
+                    ListRow::File { change, .. } => {
+                        let change = status.listed()[change].clone();
+                        if change.scope == GitScope::Unstaged
+                            && change.kind != GitChangeKind::Conflicted
+                        {
+                            self.confirm_discard(pane_id, std::slice::from_ref(&change));
+                        }
                     }
+                    ListRow::LineEndings { .. } => self.confirm_restore_line_endings(pane_id),
+                    _ => {}
                 }
                 true
             }
@@ -2958,7 +3051,7 @@ impl CompiApp {
     }
 
     /// What clicking row `at` of the Changes list does: a file opens its diff beside the
-    /// list, a section or folder folds or unfolds.
+    /// list, a section, group or folder folds or unfolds.
     fn activate_change_row(
         &mut self,
         pane_id: &PaneId,
@@ -2983,6 +3076,11 @@ impl CompiApp {
             RowKey::File(scope, path) => {
                 ui.sidebar = true;
                 self.open_diff(pane_id, path, Some(scope), None, window, cx);
+            }
+            RowKey::LineEndings => {
+                let tree = self.content.changes.tree;
+                ui.repo.folds.line_endings = !ui.repo.folds.line_endings;
+                ui.repo.rebuild(tree);
             }
         }
     }
@@ -3738,6 +3836,51 @@ impl CompiApp {
                             .child(row_controls(chosen || moving, &colors, [move_all]))
                             .into_any_element()
                     }
+                    ListRow::LineEndings { count, collapsed } => {
+                        let restoring = listed.working.iter().any(|change| {
+                            change.line_endings_only && repo.discarding(&change.path)
+                        });
+                        let restorer = pane_id.clone();
+                        let restore = controls::text_button(
+                            ("changes-line-endings-restore", index),
+                            "Restore",
+                        )
+                        .ghost()
+                        .tooltip("Restore these files…")
+                        .detail("Discards their working-tree changes, so they match the index")
+                        .key("delete")
+                        .tab_stop(false)
+                        .loading(restoring)
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.confirm_restore_line_endings(&restorer);
+                                cx.notify();
+                            },
+                        ));
+                        base.pl(px(TREE_INSET))
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(color(colors.muted))
+                            .hover(move |style| style.text_color(color(colors.foreground)))
+                            .tooltip(controls::tooltip(
+                                "Line endings only",
+                                Some(LINE_ENDINGS_HINT.into()),
+                                None,
+                            ))
+                            .child(
+                                item.child(fold_chevron(*collapsed, color(colors.muted)))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Line endings only"),
+                                    )
+                                    .child(div().ml_2().child(count.to_string())),
+                            )
+                            .child(div().flex_none().child(restore))
+                            .into_any_element()
+                    }
                     ListRow::Folder {
                         label,
                         depth,
@@ -3771,9 +3914,12 @@ impl CompiApp {
                         let (folder, name) = split_path(&change.path);
                         let level = if tree { *depth } else { 0 };
                         let inset = TREE_INSET + level as f32 * TREE_INDENT;
+                        // Line endings alone change no line's text; counts would read as
+                        // real edits.
                         let counts = change
                             .added
                             .zip(change.removed)
+                            .filter(|_| !change.line_endings_only)
                             .map(|(added, removed)| (u64::from(added), u64::from(removed)));
                         let counts_chars = counts.map_or(0, |(added, removed)| {
                             let digits = |value: u64| value.to_string().len();
@@ -3788,7 +3934,9 @@ impl CompiApp {
                             - 14.0
                             - name.chars().count() as f32 * SMALL_GLYPH_WIDTH
                             - counts_chars as f32 * MICRO_GLYPH_WIDTH;
-                        let folder = (!tree && !folder.is_empty())
+                        // The Line endings only group lists flat in tree mode too.
+                        let flat = !tree || change.line_endings_only;
+                        let folder = (flat && !folder.is_empty())
                             .then(|| truncate_middle(folder, (room / MICRO_GLYPH_WIDTH) as usize))
                             .filter(|folder| folder.chars().count() >= 4);
                         let scope = &change.scope;
@@ -4483,6 +4631,7 @@ mod tests {
             added: Some(1),
             removed: Some(0),
             stamp: "s".into(),
+            line_endings_only: false,
         }
     }
 
@@ -4622,6 +4771,7 @@ mod tests {
                 ListRow::Section { count, .. } => format!("section {count}"),
                 ListRow::Folder { label, depth, .. } => format!("{depth} {label}/"),
                 ListRow::File { change, depth } => format!("{depth} {}", changes[*change].path),
+                ListRow::LineEndings { count, .. } => format!("line endings {count}"),
             })
             .collect();
         assert_eq!(
@@ -4706,6 +4856,98 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn line_endings_alone_list_in_their_own_group_after_unstaged() {
+        use GitChangeKind::Modified;
+        use GitScope::{Staged, Unstaged};
+        let crlf = |path| GitChange {
+            line_endings_only: true,
+            ..change(Unstaged, Modified, path)
+        };
+        // As the daemon sorts them: unstaged, then staged, each by path.
+        let changes = [
+            crlf("a.txt"),
+            change(Unstaged, Modified, "src/b.rs"),
+            crlf("src/c.rs"),
+            change(Staged, Modified, "src/c.rs"),
+        ];
+        let listed = working(&changes);
+        for tree in [false, true] {
+            let (rows, order) = working_rows(&changes, tree, &Folds::default());
+            assert_eq!(order, [1, 0, 2, 3]);
+            assert!(matches!(
+                rows[0],
+                ListRow::Section {
+                    scope: Unstaged,
+                    count: 1,
+                    ..
+                }
+            ));
+            let group = rows
+                .iter()
+                .position(|row| matches!(row, ListRow::LineEndings { count: 2, .. }))
+                .unwrap();
+            // Flat by path, in tree mode too.
+            assert_eq!(
+                &rows[group + 1..group + 3],
+                [
+                    ListRow::File {
+                        change: 0,
+                        depth: 0
+                    },
+                    ListRow::File {
+                        change: 2,
+                        depth: 0
+                    },
+                ]
+            );
+            assert_eq!(sideways(&rows, group, true), Sideways::Select(group + 1));
+            // `]` goes from the real edits into the group, then on to Staged.
+            let next = adjacent_diff(&listed, &order, Some("src/b.rs"), &Unstaged, true).unwrap();
+            assert_eq!(next.path, "a.txt");
+            let next = adjacent_diff(&listed, &order, Some("src/c.rs"), &Unstaged, true).unwrap();
+            assert_eq!((&next.scope, next.path.as_str()), (&Staged, "src/c.rs"));
+            // Stage all on Unstaged leaves the group alone; `s` on the group takes its own.
+            assert_eq!(row_paths(&rows[0], listed, &Unstaged), ["src/b.rs"]);
+            assert_eq!(
+                row_paths(&rows[group], listed, &Unstaged),
+                ["a.txt", "src/c.rs"]
+            );
+            assert!(row_paths(&rows[group], listed, &Staged).is_empty());
+        }
+
+        // Folded, the group keeps the selection of a file it hides; Unstaged keeps its own.
+        let mut folds = Folds {
+            line_endings: true,
+            ..Folds::default()
+        };
+        folds.sections.insert(Unstaged);
+        let (rows, order) = working_rows(&changes, false, &folds);
+        assert_eq!(order, [1, 0, 2, 3]);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(row_key(&rows[1], listed), RowKey::LineEndings);
+        let a = RowKey::File(Unstaged, "a.txt".into());
+        assert_eq!(reselect(&rows, listed, &a, 9), Some(1));
+        let b = RowKey::File(Unstaged, "src/b.rs".into());
+        assert_eq!(reselect(&rows, listed, &b, 9), Some(0));
+
+        // Nothing but line endings: the group shows without an Unstaged section.
+        let (rows, _) = working_rows(&changes[..1], false, &Folds::default());
+        assert_eq!(
+            rows,
+            [
+                ListRow::LineEndings {
+                    count: 1,
+                    collapsed: false
+                },
+                ListRow::File {
+                    change: 0,
+                    depth: 0
+                },
+            ]
+        );
     }
 
     #[test]

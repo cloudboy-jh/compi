@@ -379,6 +379,7 @@ mod tests {
             added: Some(1),
             removed: Some(1),
             stamp: String::new(),
+            line_endings_only: false,
         };
         GitChanges {
             repo: "/home/me/proj".into(),

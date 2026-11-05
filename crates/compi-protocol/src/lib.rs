@@ -647,6 +647,10 @@ pub enum SurfaceStatus {
 pub struct DirectoryEntry {
     pub name: String,
     pub is_directory: bool,
+    /// A cloud file provider (OneDrive) keeps only a placeholder here: reading it
+    /// downloads it. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub online_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -833,6 +837,10 @@ pub struct GitChange {
     /// (index/HEAD blob ids, plus the work-tree file's length and modification time for
     /// Unstaged).
     pub stamp: String,
+    /// An unstaged modification that only changes line endings (CRLF against LF), as when
+    /// Windows and WSL tools share a checkout. Never set for other scopes and kinds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub line_endings_only: bool,
 }
 
 /// A repository's uncommitted changes.
@@ -2166,6 +2174,7 @@ mod tests {
                 entries: vec![DirectoryEntry {
                     name: "src".into(),
                     is_directory: true,
+                    online_only: true,
                 }],
             },
             ServerMessage::DirectorySearched {

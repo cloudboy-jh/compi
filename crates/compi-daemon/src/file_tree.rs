@@ -18,6 +18,7 @@ const MAX_REPLY_BYTES: usize = 256 * 1024;
 pub struct DirectoryEntry {
     pub name: String,
     pub is_directory: bool,
+    pub online_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,7 @@ pub(crate) struct Root {
 struct ScannedEntry {
     name: String,
     is_directory: bool,
+    online_only: bool,
 }
 
 /// List immediate children of an absolute path in the terminal's path namespace.
@@ -80,6 +82,7 @@ pub(crate) fn list_root(root: Root) -> Result<Vec<DirectoryEntry>> {
         result.push(DirectoryEntry {
             name: entry.name,
             is_directory: entry.is_directory,
+            online_only: entry.online_only,
         });
     }
     Ok(result)
@@ -241,7 +244,11 @@ fn scan_directory(
             .file_type()
             .map_err(|error| format!("cannot inspect {shell:?}/{name}: {error}"))?
             .is_dir();
-        entries.push(ScannedEntry { name, is_directory });
+        entries.push(ScannedEntry {
+            online_only: online_only(&item),
+            name,
+            is_directory,
+        });
     }
     entries.sort_unstable_by(|a, b| {
         b.is_directory
@@ -256,6 +263,26 @@ fn check_time(started: Instant) -> Result<()> {
         return Err("directory scan exceeded its time limit".into());
     }
     Ok(())
+}
+
+/// Whether a cloud file provider (OneDrive's Files On-Demand) holds only a placeholder
+/// for `item`, so reading it downloads it. Windows reads the attributes with the listing.
+#[cfg(windows)]
+fn online_only(item: &fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    };
+    item.metadata().is_ok_and(|metadata| {
+        metadata.file_attributes()
+            & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0 | FILE_ATTRIBUTE_RECALL_ON_OPEN.0)
+            != 0
+    })
+}
+
+#[cfg(not(windows))]
+fn online_only(_item: &fs::DirEntry) -> bool {
+    false
 }
 
 /// Whether a failed access through the WSL share may succeed on the path WSL resolves.
@@ -475,19 +502,23 @@ mod tests {
             vec![
                 DirectoryEntry {
                     name: ".git".into(),
-                    is_directory: true
+                    is_directory: true,
+                    online_only: false,
                 },
                 DirectoryEntry {
                     name: "π folder".into(),
-                    is_directory: true
+                    is_directory: true,
+                    online_only: false,
                 },
                 DirectoryEntry {
                     name: ".hidden".into(),
-                    is_directory: false
+                    is_directory: false,
+                    online_only: false,
                 },
                 DirectoryEntry {
                     name: "a file".into(),
-                    is_directory: false
+                    is_directory: false,
+                    online_only: false,
                 },
             ]
         );

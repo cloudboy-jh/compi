@@ -16,7 +16,7 @@ use compi_protocol::{
     MAX_GIT_CHANGES, MAX_GIT_IMAGE_BYTES, is_commit_id, is_repo_path,
 };
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
@@ -62,6 +62,18 @@ const UNSTAGED_NUMSTAT: &[&str] = &[
     "--no-ext-diff",
     "--no-textconv",
     "-M",
+];
+/// `UNSTAGED_NUMSTAT` blind to a carriage return at a line's end: a file that differs from
+/// the index only in CRLF against LF is left out. `--name-only` would not do: it lists a
+/// file without comparing its lines, so whitespace options do not drop it.
+const CR_BLIND_NUMSTAT: &[&str] = &[
+    "diff",
+    "--numstat",
+    "-z",
+    "--no-ext-diff",
+    "--no-textconv",
+    "-M",
+    "--ignore-cr-at-eol",
 ];
 const STAGED_NUMSTAT: &[&str] = &[
     "diff",
@@ -128,6 +140,26 @@ pub fn read_changes(
     });
     let truncated = status.cut || entries.len() > MAX_GIT_CHANGES;
     entries.truncate(MAX_GIT_CHANGES);
+    let candidates: Vec<&str> = entries
+        .iter()
+        .filter(|entry| may_be_line_endings(entry, unstaged.get(&entry.path)))
+        .map(|entry| entry.path.as_str())
+        .collect();
+    // Asked only when some file may differ in line endings alone. A failed or cut run only
+    // loses the grouping: a file missing from cut output would pass for line endings.
+    let line_endings = if candidates.is_empty() {
+        HashSet::new()
+    } else {
+        match git(
+            git_environment,
+            git_folder,
+            CR_BLIND_NUMSTAT,
+            MAX_LISTING_BYTES,
+        ) {
+            Ok(run) if run.success && !run.cut => line_endings_only(&candidates, &run.stdout),
+            _ => HashSet::new(),
+        }
+    };
     let changes = entries
         .into_iter()
         .map(|entry| {
@@ -147,6 +179,8 @@ pub fn read_changes(
             } else {
                 entry.stamp
             };
+            let line_endings_only =
+                entry.scope == GitScope::Unstaged && line_endings.contains(&entry.path);
             GitChange {
                 scope: entry.scope,
                 kind: entry.kind,
@@ -155,6 +189,7 @@ pub fn read_changes(
                 added,
                 removed,
                 stamp,
+                line_endings_only,
             }
         })
         .collect();
@@ -680,6 +715,26 @@ fn change_kind(code: char) -> Option<GitChangeKind> {
     })
 }
 
+/// Whether an unstaged change may be line endings alone, given its `UNSTAGED_NUMSTAT`
+/// counts: every line whose ending changed counts once removed and once added, so such a
+/// file removes exactly as many lines as it adds.
+fn may_be_line_endings(entry: &Entry, counts: Option<&(Option<u32>, Option<u32>)>) -> bool {
+    entry.scope == GitScope::Unstaged
+        && entry.kind == GitChangeKind::Modified
+        && matches!(counts, Some(&(Some(added), Some(removed))) if added > 0 && added == removed)
+}
+
+/// The `candidates` absent from complete `CR_BLIND_NUMSTAT` output: ignoring carriage
+/// returns at line ends, nothing of them differs from the index.
+fn line_endings_only(candidates: &[&str], cr_blind: &[u8]) -> HashSet<String> {
+    let differing = parse_numstat(cr_blind);
+    candidates
+        .iter()
+        .filter(|path| !differing.contains_key(**path))
+        .map(|path| (*path).to_owned())
+        .collect()
+}
+
 /// Lines added and removed per path from `git diff --numstat -z`; binary files count `-`.
 fn parse_numstat(output: &[u8]) -> HashMap<String, (Option<u32>, Option<u32>)> {
     let mut counts = HashMap::new();
@@ -962,7 +1017,7 @@ fn git_command(environment: &ContentEnvironment, reading: bool) -> Result<Comman
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::{GitCommit, GitCommitLookup};
+    use compi_protocol::{GitAction, GitCommit, GitCommitLookup};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1299,6 +1354,104 @@ mod tests {
         let second = repo.changes();
         assert_ne!(first.changes[0].stamp, second.changes[0].stamp);
         assert_eq!(first.changes[1].stamp, second.changes[1].stamp);
+    }
+
+    #[test]
+    fn line_endings_alone_are_told_from_real_edits() {
+        let entry = |scope, kind| Entry {
+            scope,
+            kind,
+            path: "a.txt".into(),
+            old_path: None,
+            stamp: String::new(),
+            in_work_tree: true,
+        };
+        let modified = entry(GitScope::Unstaged, GitChangeKind::Modified);
+        assert!(may_be_line_endings(&modified, Some(&(Some(3), Some(3)))));
+        // Uneven counts, a mode change alone, a binary file or no counts at all.
+        for counts in [
+            Some(&(Some(3), Some(2))),
+            Some(&(Some(0), Some(0))),
+            Some(&(None, None)),
+            None,
+        ] {
+            assert!(!may_be_line_endings(&modified, counts), "{counts:?}");
+        }
+        let even = Some(&(Some(3), Some(3)));
+        let staged = entry(GitScope::Staged, GitChangeKind::Modified);
+        let type_changed = entry(GitScope::Unstaged, GitChangeKind::TypeChanged);
+        assert!(!may_be_line_endings(&staged, even));
+        assert!(!may_be_line_endings(&type_changed, even));
+
+        // NUL-separated records with spaces in names, a binary file and a rename.
+        let cr_blind = b"1\t1\tedit.txt\0-\t-\tbin.dat\0\
+            0\t0\t\0old name.txt\0new name.txt\0";
+        let candidates = ["crlf only.txt", "edit.txt", "bin.dat", "new name.txt"];
+        assert_eq!(
+            line_endings_only(&candidates, cr_blind),
+            HashSet::from(["crlf only.txt".to_owned()])
+        );
+        assert_eq!(
+            line_endings_only(&candidates, b""),
+            candidates
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn crlf_noise_is_marked_and_restoring_cleans_it() {
+        let Some(repo) = Repo::new() else {
+            return;
+        };
+        repo.write("crlf only.txt", "one\ntwo\n");
+        repo.write("edited.txt", "one\ntwo\n");
+        repo.write("mixed.txt", "one\r\ntwo\n");
+        repo.write("staged.txt", "one\n");
+        repo.git(&["add", "."]).unwrap();
+        repo.git(&["commit", "-qm", "first"]).unwrap();
+        repo.write("crlf only.txt", "one\r\ntwo\r\n");
+        // As many lines added as removed, but one of them really changed.
+        repo.write("edited.txt", "one\r\nthree\r\n");
+        repo.write("mixed.txt", "one\ntwo\r\n");
+        repo.write("staged.txt", "one\r\n");
+        repo.git(&["add", "staged.txt"]).unwrap();
+
+        let changes = repo.changes();
+        let marked: Vec<_> = changes
+            .changes
+            .iter()
+            .map(|change| {
+                (
+                    &change.scope,
+                    change.path.as_str(),
+                    change.line_endings_only,
+                )
+            })
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                (&GitScope::Unstaged, "crlf only.txt", true),
+                (&GitScope::Unstaged, "edited.txt", false),
+                (&GitScope::Unstaged, "mixed.txt", true),
+                (&GitScope::Staged, "staged.txt", false),
+            ]
+        );
+
+        let restore = GitAction::Discard {
+            paths: vec!["crlf only.txt".into(), "mixed.txt".into()],
+            untracked: Vec::new(),
+        };
+        write(&ContentEnvironment::Host, &repo.root(), restore).unwrap();
+        let left: Vec<_> = repo
+            .changes()
+            .changes
+            .into_iter()
+            .map(|change| change.path)
+            .collect();
+        assert_eq!(left, ["edited.txt", "staged.txt"]);
     }
 
     #[test]

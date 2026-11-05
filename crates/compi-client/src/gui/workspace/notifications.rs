@@ -61,6 +61,9 @@ pub(in crate::gui) enum NoticeKind {
     Attention,
     Finished,
     Test,
+    /// A note from Compi itself, such as the OneDrive one: shown only in Compi, until
+    /// closed.
+    Note,
 }
 
 /// One notification: what it says and the terminal it opens.
@@ -312,6 +315,7 @@ fn notice_text(
         (NoticeKind::Attention, None) => format!("{who} needs you"),
         (NoticeKind::Finished, _) => format!("{who} finished"),
         (NoticeKind::Test, _) => "Compi notification test".into(),
+        (NoticeKind::Note, _) => who,
     };
     let message = record.message.as_deref().map(bounded).unwrap_or_default();
     (title, message)
@@ -884,9 +888,10 @@ impl CompiApp {
     /// Toasts past their time go; runs on the window's timer.
     pub(super) fn expire_toasts(&mut self, cx: &mut Context<Self>) {
         let before = self.notifications.toasts.len();
-        self.notifications
-            .toasts
-            .retain(|toast| toast.shown.elapsed() < TOAST_LIFETIME);
+        // A note is shown once ever, so it stays until it is closed.
+        self.notifications.toasts.retain(|toast| {
+            toast.notice.kind == NoticeKind::Note || toast.shown.elapsed() < TOAST_LIFETIME
+        });
         if self.notifications.toasts.len() != before {
             cx.notify();
         }
@@ -911,6 +916,22 @@ impl CompiApp {
         result.push('.');
         self.notifications.test_result = Some(result);
         cx.notify();
+    }
+
+    /// The one-time note that the folder `reported` by a pane syncs with OneDrive, in
+    /// this window's corner: never from the system, and it takes no focus.
+    pub(super) fn note_onedrive_folder(&mut self, reported: &str, cx: &mut Context<Self>) {
+        if self.target.is_remote() || !crate::onedrive::claim(reported) {
+            return;
+        }
+        let notice = Notice {
+            kind: NoticeKind::Note,
+            target: None,
+            title: crate::onedrive::TITLE.into(),
+            message: crate::onedrive::MESSAGE.into(),
+            place: String::new(),
+        };
+        self.push_toast(notice, cx);
     }
 
     /// Opens the terminal `surface_id` from a notification and brings its window
@@ -943,6 +964,7 @@ impl CompiApp {
                 NoticeKind::Attention => (IconName::CircleAlert, colors.modified),
                 NoticeKind::Finished => (IconName::CircleCheck, colors.added),
                 NoticeKind::Test => (IconName::Bell, colors.accent),
+                NoticeKind::Note => (IconName::Info, colors.accent),
             };
             let target = notice.target.clone();
             div()

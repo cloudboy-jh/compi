@@ -987,6 +987,7 @@ fn handle_connection(
                                         .map(|entry| DirectoryEntry {
                                             name: entry.name,
                                             is_directory: entry.is_directory,
+                                            online_only: entry.online_only,
                                         })
                                         .collect(),
                                 },

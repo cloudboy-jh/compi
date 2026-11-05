@@ -8,7 +8,7 @@ Download Compi from [GitHub Releases](https://github.com/cloudboy-jh/compi/relea
 
 Windows x64 is required. Compi uses Windows PowerShell; WSL2 is optional, for Linux shells (`wsl --install`). Choose either:
 
-- **Installer:** run `Compi-<version>-Setup.exe` for a per-user installation with repair and uninstall. `Compi-Setup.exe` is the same installer under a stable name for the latest release. Setup also lists Compi in File Explorer's **Open with** and adds **Open in Compi** to folders; uninstalling removes both. Windows may ask once which app opens a file type after a new app registers for it.
+- **Installer:** run `Compi-<version>-Setup.exe` for a per-user installation with repair and uninstall. `Compi-Setup.exe` is the same installer under a stable name for the latest release. Setup also lists Compi in File Explorer's **Open with** and adds **Open in Compi** to folders, and an installed Compi adds them back when it starts after an update in the app; uninstalling removes both. Windows may ask once which app opens a file type after a new app registers for it.
 - **Portable:** extract the entire `Compi-<version>-Windows-x64.zip` archive together. Do not copy individual executables; the bundled terminal runtime and license must stay with the daemon. The portable copy does not register with File Explorer.
 
 ### macOS

@@ -4,6 +4,8 @@ use compi_protocol::PaneId;
 pub(in crate::gui) struct Entry {
     pub name: String,
     pub directory: bool,
+    /// Only a OneDrive placeholder is here; reading it downloads it.
+    pub online_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -12,6 +14,7 @@ pub(in crate::gui) struct Row {
     pub name: String,
     pub depth: usize,
     pub directory: bool,
+    pub online_only: bool,
     pub expanded: bool,
     pub loading: bool,
 }
@@ -44,6 +47,7 @@ impl FileTree {
                 path,
                 depth: 0,
                 directory: true,
+                online_only: false,
                 expanded: true,
                 loading: true,
             }],
@@ -78,6 +82,7 @@ impl FileTree {
                     name,
                     depth: 0,
                     directory,
+                    online_only: false,
                     expanded: false,
                     loading: false,
                 }
@@ -107,6 +112,7 @@ impl FileTree {
             name: entry.name,
             depth: depth + 1,
             directory: entry.directory,
+            online_only: entry.online_only,
             expanded: false,
             loading: false,
         });
@@ -219,10 +225,12 @@ mod tests {
                 Entry {
                     name: "src".into(),
                     directory: true,
+                    online_only: false,
                 },
                 Entry {
                     name: "README.md".into(),
                     directory: false,
+                    online_only: false,
                 },
             ],
         );
@@ -232,6 +240,7 @@ mod tests {
             vec![Entry {
                 name: "main.rs".into(),
                 directory: false,
+                online_only: false,
             }],
         );
         assert_eq!(
@@ -260,6 +269,7 @@ mod tests {
             vec![Entry {
                 name: "main.rs".into(),
                 directory: false,
+                online_only: false,
             }],
         );
         assert_eq!(tree.rows[1].path, r"C:\work\main.rs");
@@ -272,6 +282,7 @@ mod tests {
         let entry = |name: &str, directory| Entry {
             name: name.into(),
             directory,
+            online_only: false,
         };
         let mut tree = FileTree::new(PaneId::new("pane"), "/work".into());
         tree.replace_children(

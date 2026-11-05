@@ -2571,6 +2571,7 @@ impl CompiApp {
                         .map(|entry| Entry {
                             name: entry.name,
                             directory: entry.is_directory,
+                            online_only: entry.online_only,
                         })
                         .collect(),
                 );
@@ -3719,6 +3720,21 @@ impl CompiApp {
                                 .child(row.name.clone()),
                         )
                         .child(div().flex_1())
+                        // A OneDrive placeholder: opening it downloads it.
+                        .when(row.online_only, |item| {
+                            item.child(
+                                div()
+                                    .id(("content-tree-online", index))
+                                    .flex_none()
+                                    .ml_1()
+                                    .child(controls::glyph(IconName::Cloud, color(colors.muted)))
+                                    .tooltip(controls::tooltip(
+                                        "Online only",
+                                        Some("Opening it downloads it from OneDrive".into()),
+                                        None,
+                                    )),
+                            )
+                        })
                         .when_some(mark, |item, mark| {
                             let mark = self
                                 .render_tree_mark(pane_id, index, mark, row_height, selected, cx);
@@ -4365,7 +4381,18 @@ impl CompiApp {
                 .p_3()
                 .text_size(px(UI_SMALL_TEXT_SIZE))
                 .text_color(color(colors.muted))
-                .child(format!("Opening {}…", file_name(path)))
+                .child(
+                    if ui
+                        .tree
+                        .rows
+                        .iter()
+                        .any(|row| row.path == path && row.online_only)
+                    {
+                        format!("Downloading {} from OneDrive…", file_name(path))
+                    } else {
+                        format!("Opening {}…", file_name(path))
+                    },
+                )
                 .into_any_element(),
         };
         if crate::notes::is_markdown(path) && ui.editor(path).is_some() {

@@ -11,6 +11,7 @@ pub mod connection;
 pub mod console;
 pub mod content_path;
 pub mod diff;
+pub mod explorer;
 pub mod font_catalog;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod gui;
@@ -21,6 +22,7 @@ pub mod layout;
 pub mod metadata;
 pub mod monitor;
 pub mod notes;
+pub mod onedrive;
 pub mod probe;
 pub mod program_status;
 pub mod project_history;

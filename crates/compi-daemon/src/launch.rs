@@ -249,18 +249,24 @@ pub fn resolve_profile(
         let distribution = resolved.distribution.as_str();
         argv.extend(["--distribution".into(), distribution.into()]);
         argv.extend(["--cd".into(), resolved.directory.into(), "--exec".into()]);
-        if let Some(context) = context
-            && !context.env.is_empty()
-        {
-            argv.push("/usr/bin/env".into());
-            argv.extend(
+        let mut env: Vec<OsString> = context
+            .map(|context| {
                 context
                     .env
                     .iter()
-                    .map(|(key, value)| OsString::from(format!("{key}={value}"))),
-            );
+                    .map(|(key, value)| OsString::from(format!("{key}={value}")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let integrated = profile.executable.is_none() && profile.args.is_empty();
+        if integrated && let Some(folders) = shell_integration::windows_folders() {
+            env.push(format!("COMPI_WINDOWS_FOLDERS={folders}").into());
         }
-        if profile.executable.is_none() && profile.args.is_empty() {
+        if !env.is_empty() {
+            argv.push("/usr/bin/env".into());
+            argv.extend(env);
+        }
+        if integrated {
             let login = args.iter().any(|arg| arg == "-l");
             shell_integration::prepare_wsl(
                 Some(distribution),
@@ -309,8 +315,9 @@ fn resolve_powershell(
     } else {
         profile.args.iter().map(OsString::from).collect()
     };
-    // A Linux-only folder, say one inherited from a WSL pane, starts at home instead.
-    let cwd = match directory.and_then(windows_directory) {
+    // A Linux folder, say a WSL pane's, opens as its Windows folder; one WSL lacks, at home.
+    let cwd = match directory.and_then(|path| windows_directory(path).or_else(|| wsl_folder(path)))
+    {
         Some(cwd) => PathBuf::from(cwd),
         None => PathBuf::from(
             std::env::var_os("USERPROFILE")
@@ -335,6 +342,21 @@ fn resolve_powershell(
         metadata: None,
         distribution: None,
     })
+}
+
+/// The Windows folder of the default WSL distribution's Linux folder `/x`, through
+/// `wslpath`, which follows Linux links into Windows drives: `C:\…` or
+/// `\\wsl.localhost\<distribution>\x`. `None` without WSL or that folder.
+#[cfg(windows)]
+fn wsl_folder(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let distribution = compi_protocol::wsl::directory_distribution(None).ok()?;
+    let folder = compi_protocol::wsl::windows_path_for_wsl(path, &distribution).ok()?;
+    folder
+        .is_dir()
+        .then(|| folder.to_string_lossy().into_owned())
 }
 
 /// The Windows folder a requested path names: a Windows path as it is, and a WSL drive

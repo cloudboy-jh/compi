@@ -1,5 +1,6 @@
 # Source in interactive Bash or Zsh: . /path/to/compi/assets/compi-shell.sh
 # Only tree/z/jump are intercepted; other compi commands retain their normal CLI behavior.
+# Inside WSL, cd also takes a Windows path.
 
 # Initialize after user startup files, including login Bash's imported functions.
 _compi_cli_init() {
@@ -406,14 +407,124 @@ _compi_choose_directory() {
     if (( padding > 2 || digits % 4 == 1 ||
           (digits % 4 == 2 && padding != 2) ||
           (digits % 4 == 3 && padding != 1) ||
-          (digits % 4 == 0 && padding != 0) || value != 0 )) ||
-       [[ $directory != /* || ! -d $directory ]]; then
+          (digits % 4 == 0 && padding != 0) || value != 0 )); then
+        printf 'compi: invalid directory selection\n' > /dev/tty
+        return 1
+    fi
+    # A folder a PowerShell pane visited is a Windows path.
+    if [[ ! -d $directory ]]; then
+        encoded=$(_compi_cd_target "$directory") && [[ -d $encoded ]] && directory=$encoded
+    fi
+    if [[ $directory != /* || ! -d $directory ]]; then
         printf 'compi: invalid directory selection\n' > /dev/tty
         return 1
     fi
     builtin cd -- "$directory" || return 1
     _compi_report_cwd
 }
+
+# The Windows folders OneDrive (or a policy) can move out of the Windows home, as Compi
+# passes them to the WSL shells it starts, `|`-separated: Home=C:\Users\me, then
+# Desktop=C:\Users\me\OneDrive\Desktop and the same for Documents, Pictures, Music, Videos.
+_compi_windows_folder() {
+    local list=${COMPI_WINDOWS_FOLDERS-} entry
+    while [[ -n $list ]]; do
+        entry=${list%%|*}
+        if [[ $list == *'|'* ]]; then list=${list#*|}; else list=''; fi
+        if [[ ${entry%%=*} == "$1" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Where a path into one of those folders really is: ~/Desktop/x, Desktop/x typed at
+# home, or /mnt/c/Users/me/Desktop/x.
+_compi_moved_folder() {
+    local target=$1 relative name folder home
+    if [[ $target == "$HOME"/* ]]; then
+        relative=${target#"$HOME"/}
+    elif [[ $target != /* && $PWD == "$HOME" ]]; then
+        relative=$target
+    elif home=$(_compi_windows_folder Home) && home=$(command wslpath -u "$home" 2> /dev/null) &&
+         [[ $target == "$home"/* ]]; then
+        relative=${target#"$home"/}
+    else
+        return 1
+    fi
+    name=${relative%%/*}
+    [[ $name != Home ]] && folder=$(_compi_windows_folder "$name") &&
+        folder=$(command wslpath -u "$folder" 2> /dev/null) || return 1
+    folder+=${relative#"$name"}
+    [[ $folder != "$target" && -d $folder ]] || return 1
+    printf '%s\n' "$folder"
+}
+
+# Inside WSL, where a Windows path is: C:\x, C:/x, or the /C:/x a PowerShell pane
+# reports, at the drive mount wslpath names; \\wsl.localhost\<this distribution>\x
+# (or \\wsl$\…) at /x; and a moved Windows folder where it went. Fails for any other
+# path, and outside WSL.
+_compi_cd_target() {
+    local target=$1 name
+    [[ -n ${WSL_DISTRO_NAME-} ]] || return 1
+    case $target in
+        /[A-Za-z]:|/[A-Za-z]:/*) target=${target#/} ;;
+    esac
+    case $target in
+        [A-Za-z]:) target=$(command wslpath -u "$target\\" 2> /dev/null) || return 1 ;;
+        [A-Za-z]:[\\/]*) target=$(command wslpath -u "$target" 2> /dev/null) || return 1 ;;
+        [\\/][\\/]wsl.localhost[\\/]*|[\\/][\\/]wsl\$[\\/]*)
+            target=${target#??}
+            target=${target#*[\\/]}
+            name=${target%%[\\/]*}
+            [[ $name == "$WSL_DISTRO_NAME" ]] || return 1
+            target=${target#"$name"}
+            target=${target//\\//}
+            printf '%s\n' "${target:-/}"
+            return 0
+            ;;
+    esac
+    if [[ $target != "$1" ]]; then
+        _compi_moved_folder "$target" && return 0
+        [[ -d $target ]] || return 1
+        printf '%s\n' "$target"
+        return 0
+    fi
+    _compi_moved_folder "$target"
+}
+
+if [[ -n ${WSL_DISTRO_NAME-} ]]; then
+    # Only a path Bash or Zsh cannot find changes, except a moved Windows folder, which
+    # wins over the empty one OneDrive leaves at the old place; a cd your startup files
+    # define wins over this one.
+    cd() {
+        local target
+        if (( $# == 1 )) && [[ $1 != -* ]]; then
+            case $1 in
+                /mnt/*/Desktop | /mnt/*/Desktop/* | /mnt/*/Documents | /mnt/*/Documents/* | \
+                /mnt/*/Pictures | /mnt/*/Pictures/* | /mnt/*/Music | /mnt/*/Music/* | \
+                /mnt/*/Videos | /mnt/*/Videos/*)
+                    if target=$(_compi_moved_folder "$1"); then
+                        builtin cd -- "$target"
+                        return
+                    fi
+                    ;;
+            esac
+            if [[ ! -d $1 ]] && target=$(_compi_cd_target "$1") && [[ -d $target ]]; then
+                builtin cd -- "$target"
+                return
+            fi
+        fi
+        case ${1-} in
+            [A-Za-z]:[!\\/]*)
+                [[ -d $1 ]] ||
+                    printf 'compi: quote a Windows path or use / (the shell drops unquoted backslashes)\n' >&2
+                ;;
+        esac
+        builtin cd "$@"
+    }
+fi
 
 # From a WSL terminal, Windows starts the GUI-subsystem CLI without any console of its
 # own: its output would lose carriage returns and it could never read an answer. Run it

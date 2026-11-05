@@ -870,6 +870,9 @@ pub(crate) fn perform(
             ));
         }
         let _ = fs::remove_dir(&root);
+        // Entries an installed Compi wrote after an update in the app, which the
+        // package that is now removed did not own.
+        compi_client::explorer::unregister();
     }
     if operation == InstallerOperation::Remove && remove_data {
         // The managed directory is exact. Never traverse directory junctions/symlinks.

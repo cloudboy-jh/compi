@@ -123,6 +123,7 @@ pub fn read_commit(
                 added,
                 removed,
                 stamp: id.clone(),
+                line_endings_only: false,
             }
         })
         .collect();

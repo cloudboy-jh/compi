@@ -2506,6 +2506,9 @@ impl CompiApp {
                 if let Some(view) = self.surface_views.iter().find(|view| view.id == tab_id) {
                     cache_surface_name(&mut self.surface_names, view);
                 }
+                if let Some(path) = observed_directory.as_deref() {
+                    self.note_onedrive_folder(path, cx);
+                }
                 if let Some(path) = observed_directory
                     && self.state.project_history.record(&path)
                 {

@@ -881,6 +881,7 @@ mod tests {
             added: None,
             removed: None,
             stamp: stamp.into(),
+            line_endings_only: false,
         };
         let mut changes = GitChanges {
             repo: "/repo".into(),

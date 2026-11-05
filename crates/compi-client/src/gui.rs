@@ -147,6 +147,16 @@ fn run_application(
 ) {
     // Before any window claims (and so writes) its state slot.
     crate::release_notes::initialize();
+    // An update in the app skips Setup's package, which writes Compi's Explorer entries.
+    #[cfg(windows)]
+    std::thread::spawn(|| {
+        if let Ok(install) = compi_update::InstallTarget::detect()
+            && install.kind == compi_update::InstallationKind::InstalledWindows
+            && let Err(error) = crate::explorer::ensure_registered(&install.root)
+        {
+            eprintln!("compi: Explorer entries: {error}");
+        }
+    });
     let empty_measurement = perf::empty_window_enabled();
     let application = gpui_platform::application().with_assets(controls::Assets);
     // Finder's Open With (and files dropped on the Dock icon) arrive as file URLs.

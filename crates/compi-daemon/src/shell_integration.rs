@@ -2,11 +2,14 @@ use crate::Result;
 use std::ffi::OsString;
 
 const BRIDGE: &str = include_str!("../../../assets/compi-shell.sh");
-const BASH_FUNCTIONS: [&str; 17] = [
+const BASH_FUNCTIONS: [&str; 20] = [
     "compi",
     "_compi_cli_init",
     "_compi_windows_cli",
     "_compi_choose_directory",
+    "_compi_cd_target",
+    "_compi_windows_folder",
+    "_compi_moved_folder",
     "_compi_report_cwd",
     "_compi_prompt_cwd",
     "_compi_prompt_ble_hook",
@@ -21,7 +24,44 @@ const BASH_FUNCTIONS: [&str; 17] = [
     "_compi_prompt_rerun",
     "_compi_install_prompt_hook",
 ];
-const EXPORT_FUNCTIONS: &str = r#"if [[ $1 == compi-installed ]]; then set -- "$HOME/.compi/shell/compi-shell.sh"; fi; . "$1" || exit; names='compi _compi_cli_init _compi_windows_cli _compi_choose_directory _compi_report_cwd _compi_prompt_cwd _compi_prompt_ble_hook _compi_prompt_ble_precmd _compi_prompt_native_dispatch _compi_prompt_command_restore _compi_prompt_sync _compi_prompt_startup _compi_prompt_snapshot _compi_prompt_restore _compi_prompt_status _compi_prompt_rerun _compi_install_prompt_hook'; export -f $names || exit; for name in $names; do printenv "BASH_FUNC_${name}%%" || exit; printf '\0'; done"#;
+const EXPORT_FUNCTIONS: &str = r#"if [[ $1 == compi-installed ]]; then set -- "$HOME/.compi/shell/compi-shell.sh"; fi; . "$1" || exit; names='compi _compi_cli_init _compi_windows_cli _compi_choose_directory _compi_cd_target _compi_windows_folder _compi_moved_folder _compi_report_cwd _compi_prompt_cwd _compi_prompt_ble_hook _compi_prompt_ble_precmd _compi_prompt_native_dispatch _compi_prompt_command_restore _compi_prompt_sync _compi_prompt_startup _compi_prompt_snapshot _compi_prompt_restore _compi_prompt_status _compi_prompt_rerun _compi_install_prompt_hook'; export -f $names || exit; for name in $names; do printenv "BASH_FUNC_${name}%%" || exit; printf '\0'; done"#;
+
+/// `Home=C:\Users\me|Desktop=…|Documents=…|Pictures=…|Music=…|Videos=…`: the Windows
+/// home and the folders OneDrive (or a policy) can move out of it, for WSL shells, whose
+/// `cd` finds a moved one (`~/Desktop`) through `_compi_moved_folder`.
+#[cfg(windows)]
+pub(crate) fn windows_folders() -> Option<String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Profile,
+        FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    };
+    let folders = [
+        ("Home", FOLDERID_Profile),
+        ("Desktop", FOLDERID_Desktop),
+        ("Documents", FOLDERID_Documents),
+        ("Pictures", FOLDERID_Pictures),
+        ("Music", FOLDERID_Music),
+        ("Videos", FOLDERID_Videos),
+    ];
+    let mut list = Vec::new();
+    for (name, id) in folders {
+        // SAFETY: the returned string is read once, then freed as the API requires.
+        let Ok(path) = (unsafe { SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, None) }) else {
+            continue;
+        };
+        let value = unsafe { path.to_string() };
+        unsafe { CoTaskMemFree(Some(path.0.cast())) };
+        if let Ok(value) = value
+            && !value.contains('|')
+        {
+            list.push(format!("{name}={value}"));
+        }
+    }
+    list.iter()
+        .any(|entry| entry.starts_with("Home="))
+        .then(|| list.join("|"))
+}
 
 /// Windows PowerShell's arguments with Compi's integration: it runs after the user's
 /// profile (`-NoExit`), as an encoded command, which the script execution policy does not

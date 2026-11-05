@@ -86,7 +86,19 @@ pub fn resolve_launch(
         Some(name) => selected_wsl2_distribution(name)?,
         None => native_default_distribution().unwrap_or_else(default_wsl2_distribution)?,
     };
-    let Some(requested) = working_directory else {
+    // A PowerShell pane reports `C:\x` as `/C:/x`.
+    let requested = working_directory.map(|path| match path.as_bytes() {
+        [b'/', letter, b':', rest @ ..]
+            if letter.is_ascii_alphabetic() && matches!(rest.first(), None | Some(b'/')) =>
+        {
+            &path[1..]
+        }
+        _ => path,
+    });
+    // Your Windows home, as a starting folder or inherited from PowerShell, is your
+    // Linux home here.
+    let home = env::var("USERPROFILE").unwrap_or_default();
+    let Some(requested) = requested.filter(|path| !is_windows_home(path, &home)) else {
         return Ok(WslLaunch {
             distribution: distribution.name,
             directory: "~".to_owned(),
@@ -503,6 +515,16 @@ fn normalize_windows_path(path: &Path) -> String {
         .trim_end_matches('\\')
         .to_lowercase()
 }
+
+/// Whether `path` is the Windows folder `home` (`C:\Users\me`), written with either
+/// separator, a trailing one or another case. A drive mount such as `/mnt/c/Users/me`
+/// is a folder chosen in WSL, not a home.
+fn is_windows_home(path: &str, home: &str) -> bool {
+    let drive = |path: &str| path.as_bytes().get(1) == Some(&b':');
+    drive(path)
+        && drive(home)
+        && normalize_windows_path(Path::new(path)) == normalize_windows_path(Path::new(home))
+}
 fn is_mounted_windows_path(path: &str) -> bool {
     let Some(remainder) = path.strip_prefix("/mnt/") else {
         return false;
@@ -524,6 +546,24 @@ fn decode_wsl_output(output: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_windows_home_itself_opens_the_linux_home() {
+        let home = r"C:\Users\me";
+        for path in [r"C:\Users\me", "c:/users/me/", r"C:\Users\ME\"] {
+            assert!(is_windows_home(path, home), "{path}");
+        }
+        for path in [
+            r"C:\Users\me\proj",
+            r"C:\Users",
+            "/mnt/c/Users/me",
+            "/home/me",
+            r"D:\Users\me",
+        ] {
+            assert!(!is_windows_home(path, home), "{path}");
+        }
+        assert!(!is_windows_home(r"C:\Users\me", ""));
+    }
 
     #[test]
     fn launch_path_keeps_windows_commands_and_first_entry_precedence() {

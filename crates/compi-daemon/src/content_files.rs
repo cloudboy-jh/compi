@@ -35,6 +35,7 @@ pub fn list_directory(
         .map(|entry| DirectoryEntry {
             name: entry.name,
             is_directory: entry.is_directory,
+            online_only: entry.online_only,
         })
         .collect())
 }
@@ -1026,10 +1027,12 @@ mod tests {
                 DirectoryEntry {
                     name: "src".into(),
                     is_directory: true,
+                    online_only: false,
                 },
                 DirectoryEntry {
                     name: "Cargo.toml".into(),
                     is_directory: false,
+                    online_only: false,
                 },
             ]
         );
