@@ -4,7 +4,7 @@
 use super::human::{self, Fit};
 use crate::arrangement;
 use crate::cli_window::{Action, Response};
-use compi_protocol::{WorkspaceSession, WorkspaceSnapshot, WorkspaceTab};
+use compi_protocol::{TabGroup, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab};
 use serde_json::Value;
 
 /// A tab as lists name it: its position in its workspace, then its name if it has one.
@@ -55,9 +55,22 @@ pub(super) fn workspace(session: &WorkspaceSession) -> String {
     )
 }
 
+/// A group as lists name it: its name, else its colour.
+pub(super) fn group_name(group: &TabGroup) -> String {
+    if group.name.is_empty() {
+        group.color.id().to_owned()
+    } else {
+        group.name.clone()
+    }
+}
+
 pub(super) fn tabs<'a>(sessions: impl Iterator<Item = &'a WorkspaceSession>) -> String {
     let sessions: Vec<&WorkspaceSession> = sessions.collect();
     let several = sessions.len() > 1;
+    let grouped = sessions
+        .iter()
+        .flat_map(|session| &session.tabs)
+        .any(|tab| tab.group.is_some());
     let rows: Vec<Vec<String>> = sessions
         .iter()
         .flat_map(|session| {
@@ -67,6 +80,10 @@ pub(super) fn tabs<'a>(sessions: impl Iterator<Item = &'a WorkspaceSession>) -> 
                     arrangement::leaves(&tab.layout).len().to_string(),
                     tab.id.to_string(),
                 ];
+                if grouped {
+                    let group = tab.group.as_ref().and_then(|id| session.group(id));
+                    row.insert(1, group.map(group_name).unwrap_or_default());
+                }
                 if several {
                     row.insert(0, session.label.clone());
                 }
@@ -75,6 +92,49 @@ pub(super) fn tabs<'a>(sessions: impl Iterator<Item = &'a WorkspaceSession>) -> 
         })
         .collect();
     let mut columns = vec![("TAB", Fit::End), ("PANES", Fit::Keep), ("ID", Fit::Keep)];
+    if grouped {
+        columns.insert(1, ("GROUP", Fit::End));
+    }
+    if several {
+        columns.insert(0, ("WORKSPACE", Fit::End));
+    }
+    human::table(&columns, &rows, human::width())
+}
+
+/// `group list`: each group's name, colour, tab count and folding.
+pub(super) fn groups<'a>(sessions: impl Iterator<Item = &'a WorkspaceSession>) -> String {
+    let sessions: Vec<&WorkspaceSession> = sessions.collect();
+    let several = sessions.len() > 1;
+    let rows: Vec<Vec<String>> = sessions
+        .iter()
+        .flat_map(|session| {
+            session.groups.iter().map(move |group| {
+                let tabs = session
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.group.as_ref() == Some(&group.id))
+                    .count();
+                let mut row = vec![
+                    group_name(group),
+                    group.color.id().to_owned(),
+                    tabs.to_string(),
+                    if group.folded { "yes" } else { "no" }.to_owned(),
+                    group.id.to_string(),
+                ];
+                if several {
+                    row.insert(0, session.label.clone());
+                }
+                row
+            })
+        })
+        .collect();
+    let mut columns = vec![
+        ("GROUP", Fit::End),
+        ("COLOR", Fit::Keep),
+        ("TABS", Fit::Keep),
+        ("FOLDED", Fit::Keep),
+        ("ID", Fit::Keep),
+    ];
     if several {
         columns.insert(0, ("WORKSPACE", Fit::End));
     }

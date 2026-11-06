@@ -6,7 +6,7 @@ use crate::{DaemonClient, MirrorApply, ScreenMirror, ServerEvent};
 use compi_protocol::{
     ClientMessage, ContentEnvironment, FolderContent, LayoutNode, PaneContent, PaneId, PaneSide,
     ScreenMessage, ServerMessage, SessionId, SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus,
-    TabId, WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
+    TabId, TabPlacement, WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -203,6 +203,7 @@ fn tab_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
             index: args[3]
                 .parse()
                 .map_err(|_| "tab index must be a non-negative integer")?,
+            group: TabPlacement::Infer,
         },
         Some("remove") if args.len() == 2 => WorkspaceMutation::RemoveTab {
             tab_id: TabId::new(args[1].clone()),

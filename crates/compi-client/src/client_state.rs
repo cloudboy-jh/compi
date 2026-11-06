@@ -288,6 +288,15 @@ impl ClientState {
             .filter(|tab| !self.hidden_tabs.contains(&tab.id))
     }
 
+    /// The visible tabs the tab strip shows: those outside folded groups.
+    pub fn shown_tabs<'a>(
+        &'a self,
+        session: &'a WorkspaceSession,
+    ) -> impl Iterator<Item = &'a WorkspaceTab> {
+        self.visible_tabs(session)
+            .filter(|tab| !folded(session, tab))
+    }
+
     pub fn selected_tab<'a>(&self, workspace: &'a WorkspaceSnapshot) -> Option<&'a WorkspaceTab> {
         let session = self.selected_session(workspace)?;
         self.tab_in_session(session)
@@ -475,9 +484,9 @@ impl ClientState {
                     .iter()
                     .any(|tab| &tab.id == id && !self.hidden_tabs.contains(id))
             });
+            let old_session =
+                previous.and_then(|old| old.sessions.iter().find(|old| old.id == session.id));
             if !valid {
-                let old_session =
-                    previous.and_then(|old| old.sessions.iter().find(|old| old.id == session.id));
                 let replacement = selected
                     .and_then(|id| self.neighbor_tab(session, old_session, id))
                     .or_else(|| {
@@ -492,6 +501,31 @@ impl ClientState {
                 } else {
                     self.selected_tabs.remove(session.id.as_str());
                 }
+            }
+            // A selected tab folding away gives way to the nearest shown tab; one
+            // selected while folded (unfolding is on its way) keeps its place.
+            let replacement = self
+                .selected_tabs
+                .get(session.id.as_str())
+                .and_then(|id| {
+                    let index = session.tabs.iter().position(|tab| &tab.id == id)?;
+                    let tab = &session.tabs[index];
+                    let was_folded = old_session.is_some_and(|old| {
+                        old.tabs
+                            .iter()
+                            .find(|old_tab| old_tab.id == tab.id)
+                            .is_some_and(|old_tab| folded(old, old_tab))
+                    });
+                    (folded(session, tab) && (!valid || !was_folded)).then_some(index)
+                })
+                .and_then(|index| {
+                    nearest_shown(&session.tabs, index, |tab| {
+                        !self.hidden_tabs.contains(&tab.id) && !folded(session, tab)
+                    })
+                });
+            if let Some(tab) = replacement {
+                self.selected_tabs
+                    .insert(session.id.to_string(), tab.id.clone());
             }
             for tab in &session.tabs {
                 if self
@@ -518,15 +552,21 @@ impl ClientState {
             previous?
         };
         let index = order.tabs.iter().position(|tab| &tab.id == id)?;
-        order.tabs[index + 1..]
-            .iter()
-            .chain(order.tabs[..index].iter().rev())
-            .find_map(|candidate| {
-                session
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.id == candidate.id && !self.hidden_tabs.contains(&tab.id))
-            })
+        let candidates = || {
+            order.tabs[index + 1..]
+                .iter()
+                .chain(order.tabs[..index].iter().rev())
+                .filter_map(|candidate| {
+                    session
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == candidate.id && !self.hidden_tabs.contains(&tab.id))
+                })
+        };
+        // Prefer a tab the strip shows over one in a folded group.
+        candidates()
+            .find(|tab| !folded(session, tab))
+            .or_else(|| candidates().next())
     }
 
     pub fn select_session(&mut self, workspace: &WorkspaceSnapshot, id: &SessionId) -> bool {
@@ -625,15 +665,20 @@ impl ClientState {
     /// Initialize only a newly allocated tear-off destination, before attachment.
     /// Pass the source's durable state, not its CLI overrides or theme preview.
     /// Existing destinations use `restore_tab` instead and keep their presentation.
+    /// The destination shows exactly `ids`, selecting the one the source selected.
     pub fn initialize_transfer(
         &mut self,
         workspace: &WorkspaceSnapshot,
-        id: &TabId,
+        ids: &[TabId],
         source: &ClientState,
     ) -> bool {
-        let Some((_, tab)) = locate_tab(workspace, id) else {
+        let tabs: Vec<_> = ids
+            .iter()
+            .filter_map(|id| locate_tab(workspace, id).map(|(_, tab)| tab))
+            .collect();
+        if tabs.is_empty() || tabs.len() != ids.len() {
             return false;
-        };
+        }
         self.geometry = None;
         self.appearance = source.appearance.clone();
         self.font_zoom = source.font_zoom;
@@ -648,18 +693,29 @@ impl ClientState {
         self.viewports.clear();
         self.floating.clear();
         self.floating_focused = false;
-        copy_viewports(&tab.layout, &source.viewports, &mut self.viewports);
-        if let Some(pane) = source.focused_panes.get(id.as_str()) {
-            self.focused_panes.insert(id.to_string(), pane.clone());
+        for tab in &tabs {
+            copy_viewports(&tab.layout, &source.viewports, &mut self.viewports);
+            if let Some(pane) = source.focused_panes.get(tab.id.as_str()) {
+                self.focused_panes.insert(tab.id.to_string(), pane.clone());
+            }
         }
         self.hidden_tabs = workspace
             .sessions
             .iter()
             .flat_map(|session| &session.tabs)
-            .filter(|tab| &tab.id != id)
+            .filter(|tab| !ids.contains(&tab.id))
             .map(|tab| tab.id.clone())
             .collect();
-        self.select_tab(workspace, id)
+        let selected = ids
+            .iter()
+            .find(|id| {
+                source
+                    .selected_tabs
+                    .values()
+                    .any(|selected| selected == *id)
+            })
+            .unwrap_or(&ids[0]);
+        self.select_tab(workspace, selected)
     }
 
     /// Bound file-derived presentation without consulting or creating server work.
@@ -797,6 +853,23 @@ fn locate_tab<'a>(
             .find(|tab| &tab.id == id)
             .map(|tab| (session, tab))
     })
+}
+
+/// Whether `tab` is in a folded group of `session`.
+pub fn folded(session: &WorkspaceSession, tab: &WorkspaceTab) -> bool {
+    tab.group
+        .as_ref()
+        .and_then(|group| session.group(group))
+        .is_some_and(|group| group.folded)
+}
+
+/// The nearest of `tabs` around `index` that is `shown`: the first to the right,
+/// else the first to the left.
+fn nearest_shown<T>(tabs: &[T], index: usize, shown: impl Fn(&T) -> bool) -> Option<&T> {
+    tabs.get(index + 1..)?
+        .iter()
+        .chain(tabs[..index].iter().rev())
+        .find(|tab| shown(tab))
 }
 
 fn copy_viewports(
@@ -1355,12 +1428,84 @@ mod tests {
                                 ),
                                 previous_layout: None,
                                 merge: None,
+                                group: None,
                             }
                         })
                         .collect(),
+                    groups: Vec::new(),
                 })
                 .collect(),
         }
+    }
+
+    /// Puts `tabs` of session one in group `g`, folded or not.
+    fn group_tabs(workspace: &mut WorkspaceSnapshot, tabs: &[&str], folded: bool) {
+        let session = &mut workspace.sessions[0];
+        session.groups = vec![compi_protocol::TabGroup {
+            id: compi_protocol::TabGroupId::from("g"),
+            name: "Group".into(),
+            color: compi_protocol::TabGroupColor::Blue,
+            folded,
+        }];
+        for tab in &mut session.tabs {
+            tab.group = tabs
+                .contains(&tab.id.as_str())
+                .then(|| compi_protocol::TabGroupId::from("g"));
+        }
+    }
+
+    #[test]
+    fn a_selected_tab_folding_away_selects_the_nearest_shown_tab_right_then_left() {
+        let selected = |state: &ClientState, workspace: &WorkspaceSnapshot| {
+            state.selected_tab(workspace).unwrap().id.to_string()
+        };
+        let fold = |tabs: &[&str], select: &str| {
+            let mut previous = workspace();
+            group_tabs(&mut previous, tabs, false);
+            let mut state = ClientState::default();
+            state.reconcile(None, &previous);
+            assert!(state.select_tab(&previous, &TabId::from(select)));
+            let mut folded = previous.clone();
+            folded.sessions[0].groups[0].folded = true;
+            state.reconcile(Some(&previous), &folded);
+            selected(&state, &folded)
+        };
+        assert_eq!(fold(&["one-b"], "one-b"), "one-c");
+        assert_eq!(fold(&["one-b", "one-c"], "one-c"), "one-a");
+        // Nothing left to show: the selection stays.
+        assert_eq!(fold(&["one-a", "one-b", "one-c"], "one-b"), "one-b");
+        // A hidden tab is not shown either.
+        let mut previous = workspace();
+        group_tabs(&mut previous, &["one-a"], false);
+        let mut state = ClientState::default();
+        state.reconcile(None, &previous);
+        assert!(state.hide_tab(&previous, &TabId::from("one-b")));
+        assert!(state.select_tab(&previous, &TabId::from("one-a")));
+        let mut folded = previous.clone();
+        folded.sessions[0].groups[0].folded = true;
+        state.reconcile(Some(&previous), &folded);
+        assert_eq!(selected(&state, &folded), "one-c");
+    }
+
+    #[test]
+    fn a_tab_selected_inside_a_folded_group_keeps_its_selection_while_it_unfolds() {
+        let mut workspace = workspace();
+        group_tabs(&mut workspace, &["one-b"], true);
+        let mut state = ClientState::default();
+        state.reconcile(None, &workspace);
+        assert!(state.select_tab(&workspace, &TabId::from("one-b")));
+        // A snapshot from elsewhere arrives before the unfolding one.
+        let previous = workspace.clone();
+        workspace.revision += 1;
+        state.reconcile(Some(&previous), &workspace);
+        assert_eq!(state.selected_tab(&workspace).unwrap().id.as_str(), "one-b");
+        assert_eq!(
+            state
+                .shown_tabs(&workspace.sessions[0])
+                .map(|tab| tab.id.as_str())
+                .collect::<Vec<_>>(),
+            ["one-a", "one-c"]
+        );
     }
 
     #[test]
@@ -1711,7 +1856,7 @@ mod tests {
             .viewports
             .insert("two-a-surface".to_owned(), unrelated);
         let mut destination = ClientState::default();
-        destination.initialize_transfer(&workspace, &TabId::from("one-a"), &source);
+        destination.initialize_transfer(&workspace, &[TabId::from("one-a")], &source);
         assert!(destination.viewports.contains_key("one-a-surface"));
         assert!(!destination.viewports.contains_key("two-a-surface"));
         let previous = workspace.clone();
@@ -1772,7 +1917,7 @@ mod tests {
         source.select_tab(&workspace, &TabId::from("one-a"));
         assert!(source.focus_pane(&workspace, &PaneId::from("second-pane")));
         let mut destination = ClientState::default();
-        assert!(destination.initialize_transfer(&workspace, &TabId::from("one-a"), &source));
+        assert!(destination.initialize_transfer(&workspace, &[TabId::from("one-a")], &source));
         assert_eq!(
             destination.focused_pane(&workspace).unwrap().as_str(),
             "second-pane"
@@ -1843,6 +1988,7 @@ mod tests {
             layout: LayoutNode::terminal(agent.clone(), SurfaceId::from("agent-surface")),
             previous_layout: None,
             merge: None,
+            group: None,
         });
         state.reconcile(Some(&previous), &workspace);
         assert_eq!(state.focused_pane(&workspace), Some(&agent));
@@ -1941,7 +2087,7 @@ mod tests {
         let workspace = workspace();
         let tab = workspace.sessions[0].tabs[0].id.clone();
         let mut torn = ClientState::default();
-        assert!(torn.initialize_transfer(&workspace, &tab, &slot.state));
+        assert!(torn.initialize_transfer(&workspace, std::slice::from_ref(&tab), &slot.state));
         assert_eq!(torn.monitor_columns, expected.monitor_columns);
     }
 

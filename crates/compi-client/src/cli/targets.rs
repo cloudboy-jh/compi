@@ -1,7 +1,7 @@
 use super::{CliError, Options};
 use crate::arrangement;
 use compi_protocol::{
-    LayoutNode, PaneId, SurfaceId, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
+    LayoutNode, PaneId, SurfaceId, TabGroup, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 
 fn unique<T>(mut matches: Vec<T>, kind: &str, selector: Option<&str>) -> Result<T, CliError> {
@@ -68,6 +68,61 @@ pub fn tab<'a>(
         "tab",
         None,
     )
+}
+
+/// The tab `selector` names, as `--tab` resolves it, within `--workspace` if given.
+pub fn named_tab<'a>(
+    state: &'a WorkspaceSnapshot,
+    options: &Options,
+    selector: &str,
+) -> Result<(&'a WorkspaceSession, &'a WorkspaceTab), CliError> {
+    let selected_workspace = options
+        .workspace
+        .as_deref()
+        .map(|selector| find_workspace(state, selector))
+        .transpose()?;
+    find_tab(state, selector, selected_workspace)
+}
+
+/// The tab group `selector` names by ID, else by name in any case, within
+/// `--workspace` if given.
+pub fn group<'a>(
+    state: &'a WorkspaceSnapshot,
+    options: &Options,
+    selector: &str,
+) -> Result<(&'a WorkspaceSession, &'a TabGroup), CliError> {
+    let selected_workspace = options
+        .workspace
+        .as_deref()
+        .map(|selector| find_workspace(state, selector))
+        .transpose()?;
+    let candidates = state
+        .sessions
+        .iter()
+        .filter(|session| selected_workspace.is_none_or(|selected| selected.id == session.id))
+        .flat_map(|session| session.groups.iter().map(move |group| (session, group)));
+    if let Some(found) = candidates
+        .clone()
+        .find(|(_, group)| group.id.as_str() == selector)
+    {
+        return Ok(found);
+    }
+    let name = selector.to_lowercase();
+    let mut matches: Vec<_> = candidates
+        .filter(|(_, group)| group.name.to_lowercase() == name)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => Err(CliError::target(format!("group {selector} was not found"))),
+        _ => Err(CliError::target(format!(
+            "ambiguous group {selector}; use one of its IDs: {}",
+            matches
+                .iter()
+                .map(|(_, group)| group.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 /// The selected pane as its leaf node: a terminal or a content pane.
@@ -287,7 +342,7 @@ mod tests {
     use super::*;
     use compi_protocol::{
         ContentEnvironment, FolderContent, PaneContent, ServerGeneration, ServerId, SessionId,
-        TabId,
+        TabGroupColor, TabGroupId, TabId,
     };
 
     fn state() -> WorkspaceSnapshot {
@@ -301,6 +356,13 @@ mod tests {
                     layout: LayoutNode::terminal(PaneId::new(pane), SurfaceId::new(surface)),
                     previous_layout: None,
                     merge: None,
+                    group: Some(TabGroupId::new(format!("group-{id}"))),
+                }],
+                groups: vec![TabGroup {
+                    id: TabGroupId::new(format!("group-{id}")),
+                    name: "Agents".into(),
+                    color: TabGroupColor::Blue,
+                    folded: false,
                 }],
             };
         WorkspaceSnapshot {
@@ -375,6 +437,36 @@ mod tests {
             ..options
         };
         assert_eq!(validate_context(&state, &contradicted).unwrap_err().exit, 3);
+    }
+
+    #[test]
+    fn groups_resolve_by_id_or_name_in_any_case_and_ambiguous_names_list_ids() {
+        let state = state();
+        let anywhere = Options::default();
+        let error = group(&state, &anywhere, "agents").unwrap_err();
+        assert_eq!(error.exit, 3);
+        assert!(
+            error.message.ends_with("group-session-a, group-session-b"),
+            "{}",
+            error.message
+        );
+        let (session, found) = group(&state, &anywhere, "group-session-b").unwrap();
+        assert_eq!(
+            (session.id.as_str(), found.id.as_str()),
+            ("session-b", "group-session-b")
+        );
+        let scoped = Options {
+            workspace: Some("alpha".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            group(&state, &scoped, "AGENTS").unwrap().1.id.as_str(),
+            "group-session-a"
+        );
+        assert_eq!(
+            group(&state, &scoped, "group-session-b").unwrap_err().exit,
+            3
+        );
     }
 
     #[test]

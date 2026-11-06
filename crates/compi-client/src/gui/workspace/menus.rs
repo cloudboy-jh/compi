@@ -8,11 +8,11 @@
 //! own pane (a terminal's view), Float or Dock pane, End process… (terminals; it always
 //! asks first), Close Files / Settings / Monitor (a terminal's view) and Close pane.
 //!
-//! The tab menu lists the tab's actions, then a Panes group: one row per pane that
-//! focuses it, a × that closes it in one click while the menu stays open, and a ›
-//! submenu of its pane actions. Kit's popup menu cannot keep itself open or tell
-//! which row the keyboard is on, so this one menu is drawn with Compi rows in the
-//! menu's look (`controls::menu_surface`).
+//! The tab menu lists the tab's actions, its group's (Add to group › and Remove from
+//! group), then a Panes group: one row per pane that focuses it, a × that closes it
+//! in one click while the menu stays open, and a › submenu of its pane actions.
+//! Kit's popup menu cannot keep itself open or tell which row the keyboard is on, so
+//! this one menu is drawn with Compi rows in the menu's look (`controls::menu_surface`).
 use super::*;
 use crate::gui::controls::{IconName, MenuEntry, menu_item};
 use gpui::{Anchor, Hsla, Keystroke, anchored, deferred};
@@ -164,15 +164,32 @@ pub(in crate::gui) struct TabMenu {
     previous_focus: Option<FocusHandle>,
     /// The row the keyboard is on, lit like a hovered row.
     highlight: Option<TabMenuRow>,
-    /// The pane whose › submenu is open, and the submenu row the keyboard is on.
-    submenu: Option<(PaneId, Option<PaneAction>)>,
+    /// The open › submenu and the row the keyboard is on in it.
+    submenu: Option<TabSubmenu>,
 }
 
 /// A row of the tab menu that can be picked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TabMenuRow {
     Command(Command),
+    /// Add to group ›.
+    AddToGroup,
     Pane(PaneId),
+}
+
+/// A › submenu of the tab menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TabSubmenu {
+    /// A pane row's pane actions.
+    Pane(PaneId, Option<PaneAction>),
+    /// Add to group's: New group…, then the workspace's other groups.
+    Groups(Option<GroupPick>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GroupPick {
+    New,
+    Join(compi_protocol::TabGroupId),
 }
 
 impl CompiApp {
@@ -568,17 +585,18 @@ impl CompiApp {
         }
     }
 
-    /// The tab menu's command rows with why each is unavailable. The reasons hold for
-    /// the selected tab; a command for another tab is checked once that tab is
-    /// selected.
-    fn tab_menu_commands(
+    /// The tab menu's rows above its panes, in groups, with why each is unavailable:
+    /// its commands, then Add to group › and, for a grouped tab, Remove from group.
+    /// Command reasons hold for the selected tab; a command for another tab is checked
+    /// once that tab is selected. The group rows act on the menu's tab itself.
+    fn tab_menu_sections(
         &self,
         tab_id: &TabId,
         cx: &App,
-    ) -> Vec<Vec<(Command, &'static str, Option<&'static str>)>> {
+    ) -> Vec<Vec<(TabMenuRow, &'static str, Option<&'static str>)>> {
         let selected = self.selected_tab().is_some_and(|tab| &tab.id == tab_id);
         let context = self.command_context(cx);
-        TAB_COMMANDS
+        let mut sections: Vec<Vec<_>> = TAB_COMMANDS
             .iter()
             .map(|group| {
                 group
@@ -587,21 +605,41 @@ impl CompiApp {
                         let reason = selected
                             .then(|| command.disabled_reason(&context))
                             .flatten();
-                        (command, label, reason)
+                        (TabMenuRow::Command(command), label, reason)
                     })
                     .collect()
             })
-            .collect()
+            .collect();
+        let grouped = self.tab_group(tab_id).is_some();
+        let group_context = commands::CommandContext {
+            has_tab: true,
+            tab_grouped: grouped,
+            ..context
+        };
+        let mut group_rows = vec![(
+            TabMenuRow::AddToGroup,
+            "Add to group",
+            Command::GroupTab.disabled_reason(&group_context),
+        )];
+        if grouped {
+            group_rows.push((
+                TabMenuRow::Command(Command::RemoveTabFromGroup),
+                "Remove from group",
+                Command::RemoveTabFromGroup.disabled_reason(&group_context),
+            ));
+        }
+        sections.insert(1, group_rows);
+        sections
     }
 
     /// The rows the keyboard moves through, in order.
     fn tab_menu_rows(&self, tab_id: &TabId, cx: &App) -> Vec<TabMenuRow> {
         let mut rows: Vec<_> = self
-            .tab_menu_commands(tab_id, cx)
+            .tab_menu_sections(tab_id, cx)
             .into_iter()
             .flatten()
             .filter(|(_, _, reason)| reason.is_none())
-            .map(|(command, _, _)| TabMenuRow::Command(command))
+            .map(|(row, _, _)| row)
             .collect();
         if let Some(tab) = self.tab_by_id(tab_id) {
             rows.extend(
@@ -624,6 +662,30 @@ impl CompiApp {
             .collect()
     }
 
+    /// Add to group's rows: New group…, then the groups `tab_id` can join.
+    fn tab_menu_group_picks(&self, tab_id: &TabId) -> Vec<GroupPick> {
+        std::iter::once(GroupPick::New)
+            .chain(
+                self.joinable_groups(tab_id)
+                    .map(|group| GroupPick::Join(group.id.clone())),
+            )
+            .collect()
+    }
+
+    /// The submenu a row opens, with its first row lit.
+    fn tab_menu_submenu(&self, tab_id: &TabId, row: &TabMenuRow) -> Option<TabSubmenu> {
+        match row {
+            TabMenuRow::Pane(pane_id) => Some(TabSubmenu::Pane(
+                pane_id.clone(),
+                self.tab_menu_actions(pane_id).first().copied(),
+            )),
+            TabMenuRow::AddToGroup => Some(TabSubmenu::Groups(
+                self.tab_menu_group_picks(tab_id).first().cloned(),
+            )),
+            TabMenuRow::Command(_) => None,
+        }
+    }
+
     /// ↑↓ move, Enter picks, Delete closes the highlighted pane, → opens its
     /// submenu, ← and Escape go back; Escape on the menu closes it.
     fn tab_menu_key(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
@@ -631,22 +693,30 @@ impl CompiApp {
             return;
         };
         let (tab_id, highlight) = (menu.tab_id.clone(), menu.highlight.clone());
-        if let Some((pane_id, sub_highlight)) = menu.submenu.clone() {
-            let actions = self.tab_menu_actions(&pane_id);
-            match key.key.as_str() {
-                "up" | "down" => {
+        if let Some(submenu) = menu.submenu.clone() {
+            match (key.key.as_str(), submenu) {
+                ("up" | "down", TabSubmenu::Pane(pane_id, sub_highlight)) => {
+                    let actions = self.tab_menu_actions(&pane_id);
                     let next = step(&actions, sub_highlight.as_ref(), key.key == "down");
                     if let Some(menu) = &mut self.tab_menu {
-                        menu.submenu = Some((pane_id, next));
+                        menu.submenu = Some(TabSubmenu::Pane(pane_id, next));
                     }
                 }
-                "enter" | "space" => {
-                    if let Some(action) = sub_highlight {
-                        self.close_tab_menu(window, cx);
-                        self.run_pane_action(&pane_id, action, window, cx);
+                ("up" | "down", TabSubmenu::Groups(sub_highlight)) => {
+                    let picks = self.tab_menu_group_picks(&tab_id);
+                    let next = step(&picks, sub_highlight.as_ref(), key.key == "down");
+                    if let Some(menu) = &mut self.tab_menu {
+                        menu.submenu = Some(TabSubmenu::Groups(next));
                     }
                 }
-                "left" | "escape" => {
+                ("enter" | "space", TabSubmenu::Pane(pane_id, Some(action))) => {
+                    self.close_tab_menu(window, cx);
+                    self.run_pane_action(&pane_id, action, window, cx);
+                }
+                ("enter" | "space", TabSubmenu::Groups(Some(pick))) => {
+                    self.pick_tab_menu_group(&tab_id, pick, window, cx);
+                }
+                ("left" | "escape", _) => {
                     if let Some(menu) = &mut self.tab_menu {
                         menu.submenu = None;
                     }
@@ -675,11 +745,13 @@ impl CompiApp {
                 }
             }
             "right" => {
-                if let Some(TabMenuRow::Pane(pane_id)) = highlight {
-                    let first = self.tab_menu_actions(&pane_id).first().copied();
-                    if let Some(menu) = &mut self.tab_menu {
-                        menu.submenu = Some((pane_id, first));
-                    }
+                let submenu = highlight
+                    .as_ref()
+                    .and_then(|row| self.tab_menu_submenu(&tab_id, row));
+                if let Some(menu) = &mut self.tab_menu
+                    && submenu.is_some()
+                {
+                    menu.submenu = submenu;
                 }
             }
             "escape" => self.close_tab_menu(window, cx),
@@ -688,7 +760,8 @@ impl CompiApp {
         cx.notify();
     }
 
-    /// Runs a tab menu row: a command on the menu's tab, or focusing a pane there.
+    /// Runs a tab menu row: a command on the menu's tab, focusing a pane there, or
+    /// opening Add to group ›.
     fn pick_tab_menu_row(
         &mut self,
         tab_id: &TabId,
@@ -696,6 +769,15 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if row == TabMenuRow::AddToGroup {
+            let submenu = self.tab_menu_submenu(tab_id, &row);
+            if let Some(menu) = &mut self.tab_menu {
+                menu.highlight = Some(row);
+                menu.submenu = submenu;
+            }
+            cx.notify();
+            return;
+        }
         self.close_tab_menu(window, cx);
         match row {
             TabMenuRow::Command(command) => {
@@ -709,6 +791,24 @@ impl CompiApp {
             TabMenuRow::Pane(pane_id) => {
                 self.run_pane_action(&pane_id, PaneAction::Focus, window, cx)
             }
+            TabMenuRow::AddToGroup => {}
+        }
+        cx.notify();
+    }
+
+    /// An Add to group row: name a new group holding the menu's tab, or move it into
+    /// a group.
+    fn pick_tab_menu_group(
+        &mut self,
+        tab_id: &TabId,
+        pick: GroupPick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_tab_menu(window, cx);
+        match pick {
+            GroupPick::New => self.name_new_group(tab_id.clone()),
+            GroupPick::Join(group_id) => self.join_group(tab_id.clone(), Some(group_id)),
         }
         cx.notify();
     }
@@ -766,47 +866,81 @@ impl CompiApp {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (group, commands) in self
-            .tab_menu_commands(&menu.tab_id, cx)
+        for (section, entries) in self
+            .tab_menu_sections(&menu.tab_id, cx)
             .into_iter()
             .enumerate()
         {
-            if group > 0 {
+            if section > 0 {
                 rows.push(controls::menu_separator_row(cx).into_any_element());
             }
-            for (command, label, reason) in commands {
-                let row = TabMenuRow::Command(command);
+            for (row, label, reason) in entries {
                 let highlighted = menu.highlight.as_ref() == Some(&row);
+                let groups_open = match &menu.submenu {
+                    Some(TabSubmenu::Groups(highlight)) if row == TabMenuRow::AddToGroup => {
+                        Some(highlight.clone())
+                    }
+                    _ => None,
+                };
+                let lit = highlighted || groups_open.is_some();
+                let (id, key) = match &row {
+                    TabMenuRow::Command(command) => (
+                        format!("tab-menu-{}", command.spec().id),
+                        self.configured_shortcut(*command),
+                    ),
+                    _ => ("tab-menu-add-to-group".to_owned(), None),
+                };
+                let opens = row == TabMenuRow::AddToGroup;
+                let chevron = if reason.is_some() {
+                    muted
+                } else if lit {
+                    theme.accent_foreground
+                } else {
+                    theme.popover_foreground
+                };
                 let tab_id = menu.tab_id.clone();
                 rows.push(
-                    controls::menu_row(
-                        SharedString::from(format!("tab-menu-{}", command.spec().id)),
-                        highlighted,
-                        reason.is_some(),
-                        cx,
-                    )
-                    .when(reason.is_none(), |item| {
-                        let hovered_row = row.clone();
-                        item.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            if *hovered && let Some(menu) = &mut this.tab_menu {
-                                menu.highlight = Some(hovered_row.clone());
-                                menu.submenu = None;
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.pick_tab_menu_row(&tab_id, row.clone(), window, cx);
-                            },
+                    controls::menu_row(SharedString::from(id), lit, reason.is_some(), cx)
+                        .relative()
+                        .when(reason.is_none(), |item| {
+                            let hovered_row = row.clone();
+                            item.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if *hovered && let Some(menu) = &mut this.tab_menu {
+                                    menu.highlight = Some(hovered_row.clone());
+                                    if hovered_row != TabMenuRow::AddToGroup {
+                                        menu.submenu = None;
+                                    } else if !matches!(menu.submenu, Some(TabSubmenu::Groups(_))) {
+                                        menu.submenu = Some(TabSubmenu::Groups(None));
+                                    }
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.pick_tab_menu_row(&tab_id, row.clone(), window, cx);
+                                },
+                            ))
+                        })
+                        .child(controls::menu_item_body(
+                            label.into(),
+                            key,
+                            reason.map(Into::into),
+                            cx,
                         ))
-                    })
-                    .child(controls::menu_item_body(
-                        label.into(),
-                        self.configured_shortcut(command),
-                        reason.map(Into::into),
-                        cx,
-                    ))
-                    .into_any_element(),
+                        .when(opens, |item| {
+                            item.child(controls::glyph(IconName::ChevronRight, chevron))
+                        })
+                        .when_some(groups_open, |item, highlight| {
+                            item.child(
+                                div().absolute().top(px(-4.0)).right(px(-4.0)).child(
+                                    deferred(anchored().snap_to_window_with_margin(px(8.0)).child(
+                                        self.render_tab_menu_groups(&menu.tab_id, highlight, cx),
+                                    ))
+                                    .with_priority(gpui_base::POPUP_PRIORITY + 1),
+                                ),
+                            )
+                        })
+                        .into_any_element(),
                 );
             }
         }
@@ -869,9 +1003,8 @@ impl CompiApp {
         let row = TabMenuRow::Pane(pane.pane_id.clone());
         let highlighted = menu.highlight.as_ref() == Some(&row);
         let open = menu
-            .submenu
-            .as_ref()
-            .filter(|(pane_id, _)| pane_id == &pane.pane_id);
+            .pane_submenu()
+            .filter(|(pane_id, _)| *pane_id == &pane.pane_id);
         let lit = highlighted || open.is_some();
         let text = if lit {
             theme.accent_foreground
@@ -900,11 +1033,10 @@ impl CompiApp {
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 if *hovered && let Some(menu) = &mut this.tab_menu {
                     menu.highlight = Some(hover_row.clone());
-                    if menu
-                        .submenu
-                        .as_ref()
-                        .is_some_and(|(pane_id, _)| TabMenuRow::Pane(pane_id.clone()) != hover_row)
-                    {
+                    if menu.submenu.as_ref().is_some_and(|submenu| {
+                        !matches!(submenu, TabSubmenu::Pane(pane_id, _)
+                            if TabMenuRow::Pane(pane_id.clone()) == hover_row)
+                    }) {
                         menu.submenu = None;
                     }
                     cx.notify();
@@ -986,11 +1118,10 @@ impl CompiApp {
                         move |this, hovered: &bool, _, cx| {
                             if *hovered && let Some(menu) = &mut this.tab_menu {
                                 if menu
-                                    .submenu
-                                    .as_ref()
+                                    .pane_submenu()
                                     .is_none_or(|(pane_id, _)| pane_id != &sub_id)
                                 {
-                                    menu.submenu = Some((sub_id.clone(), None));
+                                    menu.submenu = Some(TabSubmenu::Pane(sub_id.clone(), None));
                                 }
                                 cx.notify();
                             }
@@ -1000,11 +1131,10 @@ impl CompiApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(menu) = &mut this.tab_menu {
                             if menu
-                                .submenu
-                                .as_ref()
+                                .pane_submenu()
                                 .is_none_or(|(pane_id, _)| pane_id != &sub_id)
                             {
-                                menu.submenu = Some((sub_id.clone(), None));
+                                menu.submenu = Some(TabSubmenu::Pane(sub_id.clone(), None));
                             }
                             menu.highlight = Some(TabMenuRow::Pane(sub_id.clone()));
                         }
@@ -1050,7 +1180,7 @@ impl CompiApp {
             .when(reason.is_none(), |row| {
                 row.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered && let Some(menu) = &mut this.tab_menu {
-                        menu.submenu = Some((hover_id.clone(), Some(action)));
+                        menu.submenu = Some(TabSubmenu::Pane(hover_id.clone(), Some(action)));
                         cx.notify();
                     }
                 }))
@@ -1075,6 +1205,69 @@ impl CompiApp {
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .children(rows)
             .into_any_element()
+    }
+
+    /// Add to group's › submenu: New group…, then the groups the tab can join, each
+    /// with its colour.
+    fn render_tab_menu_groups(
+        &self,
+        tab_id: &TabId,
+        highlight: Option<GroupPick>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let rows = self
+            .tab_menu_group_picks(tab_id)
+            .into_iter()
+            .enumerate()
+            .map(|(index, pick)| {
+                let (label, tint) = match &pick {
+                    GroupPick::New => ("New group…".to_owned(), None),
+                    GroupPick::Join(id) => self.group_by_id(id).map_or_else(
+                        || (String::new(), None),
+                        |(_, group)| {
+                            (
+                                super::tab_groups::group_title(group),
+                                Some(color(self.group_color(group.color))),
+                            )
+                        },
+                    ),
+                };
+                let (hover_pick, run_pick, tab_id) = (pick.clone(), pick.clone(), tab_id.clone());
+                controls::menu_row(
+                    ("tab-menu-group", index),
+                    highlight.as_ref() == Some(&pick),
+                    false,
+                    cx,
+                )
+                .gap_2()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered && let Some(menu) = &mut this.tab_menu {
+                        menu.submenu = Some(TabSubmenu::Groups(Some(hover_pick.clone())));
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.pick_tab_menu_group(&tab_id, run_pick.clone(), window, cx);
+                }))
+                .children(tint.map(|tint| div().flex_none().size(px(8.0)).rounded_full().bg(tint)))
+                .child(controls::menu_item_body(label.into(), None, None, cx))
+            });
+        controls::menu_surface(cx)
+            .id("tab-menu-groups")
+            .occlude()
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+            .children(rows)
+            .into_any_element()
+    }
+}
+
+impl TabMenu {
+    /// The open pane submenu: its pane and the action the keyboard is on.
+    fn pane_submenu(&self) -> Option<(&PaneId, &Option<PaneAction>)> {
+        match &self.submenu {
+            Some(TabSubmenu::Pane(pane_id, action)) => Some((pane_id, action)),
+            _ => None,
+        }
     }
 }
 

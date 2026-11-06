@@ -30,8 +30,9 @@ use windows::core::PCWSTR;
 /// lets a terminal leaf carry a content `view`; older daemons ignore the key and reach
 /// their format check. Format 7 (protocol 31) adds commit diff tabs, also stored so older
 /// daemons can refuse the file. Format 8 (protocol 33) adds the Browser kind, stored the
-/// way Monitor is.
-const FORMAT_VERSION: u32 = 8;
+/// way Monitor is. Format 9 (protocol 37) adds tab groups (`groups` on a session, `group`
+/// on a tab and a merge record); older daemons ignore the keys and reach their format check.
+const FORMAT_VERSION: u32 = 9;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -160,6 +161,9 @@ impl WorkspaceStore {
                         value["format_version"] = 8.into();
                     }
                     if value.get("format_version") == Some(&serde_json::Value::from(8)) {
+                        value["format_version"] = 9.into();
+                    }
+                    if value.get("format_version") == Some(&serde_json::Value::from(9)) {
                         restore_newer_kinds(&mut value);
                         restore_commit_diffs(&mut value);
                         restore_newer_sections(&mut value);
@@ -311,6 +315,7 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
             ),
             previous_layout: None,
             merge: None,
+            group: None,
         });
         surfaces.push(SurfaceInfo {
             id: surface_id,
@@ -347,6 +352,7 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
                 id: SessionId::new("session-imported"),
                 label: "Imported work".into(),
                 tabs,
+                groups: Vec::new(),
             })
             .into_iter()
             .collect(),
@@ -713,9 +719,32 @@ pub(crate) fn validate(workspace: &StoredWorkspace) -> Result<()> {
     let mut tab_ids = HashSet::new();
     let mut pane_ids = HashSet::new();
     let mut merged_ids = HashSet::new();
+    let mut group_ids = HashSet::new();
     for session in &workspace.sessions {
         if !session_ids.insert(session.id.clone()) {
             return Err("workspace contains duplicate session IDs".into());
+        }
+        for group in &session.groups {
+            if !group_ids.insert(&group.id) {
+                return Err("workspace contains duplicate tab group IDs".into());
+            }
+            if !session
+                .tabs
+                .iter()
+                .any(|tab| tab.group.as_ref() == Some(&group.id))
+            {
+                return Err(format!("tab group {} holds no tabs", group.id).into());
+            }
+        }
+        if let Some(tab) = session.tabs.iter().find(|tab| {
+            tab.group
+                .as_ref()
+                .is_some_and(|group| session.group(group).is_none())
+        }) {
+            return Err(format!("tab {} is in a group outside its workspace", tab.id).into());
+        }
+        if !groups_contiguous(&session.tabs) {
+            return Err(format!("a tab group in workspace {} is split", session.id).into());
         }
         for tab in &session.tabs {
             if !tab_ids.insert(tab.id.clone()) {
@@ -753,6 +782,25 @@ pub(crate) fn validate(workspace: &StoredWorkspace) -> Result<()> {
         return Err("a merged tab record reuses a live tab ID".into());
     }
     Ok(())
+}
+
+/// Whether each tab group's tabs sit next to each other.
+pub(crate) fn groups_contiguous(tabs: &[WorkspaceTab]) -> bool {
+    let mut seen = Vec::new();
+    let mut previous = None;
+    for tab in tabs {
+        let group = tab.group.as_ref();
+        if group != previous {
+            if let Some(group) = group {
+                if seen.contains(&group) {
+                    return false;
+                }
+                seen.push(group);
+            }
+            previous = group;
+        }
+    }
+    true
 }
 
 fn validate_layout(
@@ -949,6 +997,7 @@ mod tests {
     use compi_protocol::{
         BrowserContent, ContentEnvironment, ContentTab, FolderContent, GitScope, MonitorContent,
         MonitorPage, PaneContent, PaneSide, PaneView, SettingsContent, SettingsSection, SplitAxis,
+        TabGroup, TabGroupColor, TabGroupId,
     };
 
     fn test_path(name: &str) -> PathBuf {
@@ -1001,7 +1050,9 @@ mod tests {
                 layout: LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1")),
                 previous_layout: None,
                 merge: None,
+                group: None,
             }],
+            groups: Vec::new(),
         });
         store.commit(&workspace).unwrap();
         let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
@@ -1135,7 +1186,9 @@ mod tests {
                 },
                 previous_layout: None,
                 merge: None,
+                group: None,
             }],
+            groups: Vec::new(),
         });
         assert!(validate(&workspace).is_err());
     }
@@ -1189,7 +1242,9 @@ mod tests {
                 layout: split(&terminal, &content),
                 previous_layout: Some(Box::new(split(&content, &terminal))),
                 merge: None,
+                group: None,
             }],
+            groups: Vec::new(),
         });
         (workspace, content)
     }
@@ -1787,11 +1842,11 @@ mod tests {
     }
 
     #[test]
-    fn format_5_to_7_files_load_as_format_8() {
+    fn format_5_to_8_files_load_as_format_9() {
         let expected = content_kinds_workspace();
-        for format in [5, 6, 7] {
+        for format in [5, 6, 7, 8] {
             let path = test_path(&format!("format-{format}"));
-            // As a format-5 to format-7 daemon wrote it: newer kinds marked for older
+            // As a format-5 to format-8 daemon wrote it: newer kinds marked for older
             // daemons.
             let mut manifest = serde_json::to_value(Manifest {
                 format_version: format,
@@ -1805,9 +1860,154 @@ mod tests {
             assert_eq!(workspace.sessions, expected.sessions);
             let saved: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved["format_version"], 8);
+            assert_eq!(saved["format_version"], 9);
             let _ = fs::remove_file(path);
         }
+    }
+
+    /// `content_kinds_workspace` with its tab in a named, folded group.
+    fn grouped_workspace() -> StoredWorkspace {
+        let mut workspace = content_kinds_workspace();
+        let session = &mut workspace.sessions[0];
+        let group = TabGroupId::new("group-1");
+        session.tabs[0].group = Some(group.clone());
+        session.groups.push(TabGroup {
+            id: group,
+            name: "Build".into(),
+            color: TabGroupColor::Magenta,
+            folded: true,
+        });
+        validate(&workspace).unwrap();
+        workspace
+    }
+
+    #[test]
+    fn tab_groups_survive_reopen() {
+        let path = test_path("groups");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        let workspace = grouped_workspace();
+        store.commit(&workspace).unwrap();
+        let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        assert_eq!(reopened.sessions, workspace.sessions);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_format_8_daemon_reaches_its_version_check_on_tab_groups() {
+        // Protocol 36's sessions and tabs, which have no groups.
+        #[derive(Deserialize)]
+        struct OldManifest {
+            format_version: u32,
+            workspace: OldWorkspace,
+        }
+        #[derive(Deserialize)]
+        struct OldWorkspace {
+            sessions: Vec<OldSession>,
+        }
+        #[derive(Deserialize)]
+        struct OldSession {
+            #[allow(dead_code)]
+            id: SessionId,
+            #[allow(dead_code)]
+            label: String,
+            tabs: Vec<OldTab>,
+        }
+        #[derive(Deserialize)]
+        struct OldTab {
+            #[allow(dead_code)]
+            id: TabId,
+            #[allow(dead_code)]
+            label: String,
+            #[allow(dead_code)]
+            layout: LayoutNode,
+            #[allow(dead_code)]
+            previous_layout: Option<LayoutNode>,
+        }
+
+        let path = test_path("groups-downgrade");
+        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
+        store.commit(&grouped_workspace()).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["workspace"]["sessions"][0]["groups"][0]["id"],
+            "group-1"
+        );
+        assert_eq!(
+            saved["workspace"]["sessions"][0]["tabs"][0]["group"],
+            "group-1"
+        );
+        let old: OldManifest = serde_json::from_value(saved).unwrap();
+        assert_eq!(old.format_version, FORMAT_VERSION);
+        assert_eq!(old.workspace.sessions[0].tabs.len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tab_groups_must_exist_hold_tabs_and_stay_together() {
+        let workspace = grouped_workspace();
+        let mut second = workspace.sessions[0].clone();
+        second.id = SessionId::new("session-2");
+        second.tabs.clear();
+        second.groups.clear();
+
+        let mut empty = workspace.clone();
+        empty.sessions[0].groups.push(TabGroup {
+            id: TabGroupId::new("group-2"),
+            name: String::new(),
+            color: TabGroupColor::Grey,
+            folded: false,
+        });
+        assert!(validate(&empty).is_err());
+
+        let mut foreign = workspace.clone();
+        let mut other = second.clone();
+        other.groups = foreign.sessions[0].groups.clone();
+        foreign.sessions[0].groups.clear();
+        foreign.sessions.push(other);
+        assert!(validate(&foreign).is_err());
+
+        let mut duplicate = workspace.clone();
+        let mut other = second;
+        other.tabs.push(duplicate.sessions[0].tabs[0].clone());
+        other.tabs[0].id = TabId::new("tab-2");
+        other.tabs[0].layout = LayoutNode::Content {
+            pane_id: PaneId::new("pane-9"),
+            content: PaneContent::Settings(SettingsContent {
+                section: SettingsSection::Appearance,
+            }),
+        };
+        other.tabs[0].previous_layout = None;
+        other.groups = duplicate.sessions[0].groups.clone();
+        duplicate.sessions.push(other);
+        assert!(validate(&duplicate).is_err());
+
+        let mut split = workspace;
+        let mut middle = split.sessions[0].tabs[0].clone();
+        middle.id = TabId::new("tab-2");
+        middle.layout = LayoutNode::Content {
+            pane_id: PaneId::new("pane-9"),
+            content: PaneContent::Settings(SettingsContent {
+                section: SettingsSection::Appearance,
+            }),
+        };
+        middle.previous_layout = None;
+        middle.group = None;
+        let mut last = middle.clone();
+        last.id = TabId::new("tab-3");
+        last.layout = LayoutNode::Content {
+            pane_id: PaneId::new("pane-10"),
+            content: PaneContent::Settings(SettingsContent {
+                section: SettingsSection::Appearance,
+            }),
+        };
+        last.group = split.sessions[0].tabs[0].group.clone();
+        split.sessions[0]
+            .tabs
+            .extend([middle.clone(), last.clone()]);
+        assert!(validate(&split).is_err());
+        // Together, the same tabs are valid.
+        split.sessions[0].tabs.swap(1, 2);
+        validate(&split).unwrap();
     }
 
     #[test]

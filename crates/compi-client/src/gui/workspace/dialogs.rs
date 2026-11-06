@@ -584,11 +584,11 @@ impl CompiApp {
 
     fn render_text_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let title = match &self.overlay {
-            Some(Overlay::Text { title, .. }) => *title,
-            _ => "Edit name",
+        let (title, allows_empty) = match &self.overlay {
+            Some(Overlay::Text { title, purpose }) => (*title, purpose.allows_empty()),
+            _ => ("Edit name", false),
         };
-        let valid = !self.ime_text.trim().is_empty();
+        let valid = allows_empty || !self.ime_text.trim().is_empty();
         self.render_centered_scrim(
             div()
                 .w_full()
@@ -621,6 +621,14 @@ impl CompiApp {
                                     .text_size(px(UI_SMALL_TEXT_SIZE))
                                     .text_color(color(modal_text_color(colors.error, &colors)))
                                     .child("Enter a non-empty name."),
+                            )
+                        })
+                        .when(allows_empty && self.ime_text.trim().is_empty(), |body| {
+                            body.child(
+                                div()
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.muted, &colors)))
+                                    .child("Without a name, the group shows only its colour."),
                             )
                         }),
                 )
@@ -911,6 +919,9 @@ impl CompiApp {
             }
             Some(Overlay::Tabs { .. }) => ("Search tabs", Some(("Switch tab", false))),
             Some(Overlay::Windows) => ("Search windows", Some(("Move tab to window", false))),
+            Some(Overlay::TabGroups { .. }) => {
+                ("Search tab groups", Some(("Add tab to group", false)))
+            }
             Some(Overlay::Recover { .. }) => (
                 "Search backed-up files",
                 Some(("Recover unsaved edits", false)),
@@ -1080,7 +1091,15 @@ impl CompiApp {
                     };
                 }
                 "enter" if self.overlay_focus == 1 => self.dismiss_overlay(),
-                "enter" if !self.ime_text.trim().is_empty() => self.activate_overlay(window, cx),
+                "enter"
+                    if !self.ime_text.trim().is_empty()
+                        || matches!(
+                            &self.overlay,
+                            Some(Overlay::Text { purpose, .. }) if purpose.allows_empty()
+                        ) =>
+                {
+                    self.activate_overlay(window, cx)
+                }
                 _ => return false,
             }
             cx.notify();

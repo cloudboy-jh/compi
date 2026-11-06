@@ -952,6 +952,7 @@ mod tests {
             layout,
             previous_layout: None,
             merge: None,
+            group: None,
         };
         let workspace = WorkspaceSnapshot {
             server_id: ServerId::new("server"),
@@ -966,6 +967,7 @@ mod tests {
                         "a",
                         LayoutNode::terminal(PaneId::new("pane-a"), SurfaceId::new("surface-a")),
                     )],
+                    groups: Vec::new(),
                 },
                 WorkspaceSession {
                     id: SessionId::new("two"),
@@ -985,6 +987,7 @@ mod tests {
                             )),
                         },
                     )],
+                    groups: Vec::new(),
                 },
             ],
             surfaces: vec![],

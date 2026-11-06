@@ -442,7 +442,7 @@ impl CompiApp {
                     .map(|handle| handle.window_id())
                     .collect();
                 let previous_error = self.global_error.take();
-                self.transfer_tab_mode(tab_id.clone(), None, false, window, cx);
+                self.transfer_tab_mode(vec![tab_id.clone()], None, false, window, cx);
                 if !self.state.hidden_tabs.contains(tab_id) {
                     return Err(self
                         .global_error

@@ -1458,6 +1458,8 @@ pub(super) struct MenuItem {
     disabled: bool,
     /// A check mark before the label: the option is on.
     checked: bool,
+    /// A colour dot before the label.
+    swatch: Option<gpui::Hsla>,
     on_select: ClickHandler,
 }
 
@@ -1472,6 +1474,7 @@ pub(super) fn menu_item(
         reason: None,
         disabled: false,
         checked: false,
+        swatch: None,
         on_select: Rc::new(on_select),
     }
 }
@@ -1485,6 +1488,12 @@ impl MenuItem {
     /// Marks the item as the option that is on.
     pub(super) fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+
+    /// Shows `swatch` as a dot before the label.
+    pub(super) fn swatch(mut self, swatch: gpui::Hsla) -> Self {
+        self.swatch = Some(swatch);
         self
     }
 
@@ -1529,15 +1538,30 @@ pub(super) fn submenu(
     MenuEntry::Submenu(label.into(), entries.into_iter().collect())
 }
 
-/// Kit's menu row for `item`: a plain label, or the label with its shortcut and
-/// disabled reason.
+/// Kit's menu row for `item`: a plain label, or the label with its colour dot,
+/// shortcut and disabled reason.
 fn popup_menu_item(item: &MenuItem) -> PopupMenuItem {
-    let row = if item.key.is_none() && item.reason.is_none() {
+    let row = if item.key.is_none() && item.reason.is_none() && item.swatch.is_none() {
         PopupMenuItem::new(item.label.clone())
     } else {
-        let (label, key, reason) = (item.label.clone(), item.key.clone(), item.reason.clone());
+        let (label, key, reason, swatch) = (
+            item.label.clone(),
+            item.key.clone(),
+            item.reason.clone(),
+            item.swatch,
+        );
         PopupMenuItem::element(move |_, cx| {
-            menu_item_body(label.clone(), key.as_deref(), reason.clone(), cx)
+            let body = menu_item_body(label.clone(), key.as_deref(), reason.clone(), cx);
+            match swatch {
+                Some(swatch) => div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(swatch))
+                    .child(body),
+                None => body,
+            }
         })
     };
     let on_select = item.on_select.clone();

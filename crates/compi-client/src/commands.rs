@@ -94,6 +94,13 @@ registry! {
     RemoveTab, "remove_tab", "Close terminal tab", None, None;
     DetachTab, "detach_tab", "Hide terminal tab", Some("cmd-w"), Some("ctrl-w");
     RestoreHiddenTab, "restore_hidden_tab", "Restore hidden terminal tab", Some("cmd-shift-t"), Some("ctrl-shift-t");
+    GroupTab, "group_tab", "Add tab to group…", Some("cmd-shift-g"), Some("ctrl-shift-g");
+    RemoveTabFromGroup, "remove_tab_from_group", "Remove tab from group", None, None;
+    RenameTabGroup, "rename_tab_group", "Rename tab group…", None, None;
+    ToggleTabGroupFold, "toggle_tab_group_fold", "Fold tab group", None, None;
+    UngroupTabGroup, "ungroup_tab_group", "Ungroup tabs", None, None;
+    CloseTabGroup, "close_tab_group", "Close tab group…", None, None;
+    MoveTabGroupToNewWindow, "move_tab_group_to_new_window", "Move tab group to new window", None, None;
     NewWindow, "new_window", "New window", Some("cmd-n"), Some("ctrl-shift-n");
     MoveTabToNewWindow, "move_tab_to_new_window", "Move terminal tab to new window", None, None;
     MoveTabToWindow, "move_tab_to_window", "Move terminal tab to another window", None, None;
@@ -269,6 +276,11 @@ pub struct CommandContext {
     pub pull_reason: Option<&'static str>,
     pub push_reason: Option<&'static str>,
     pub tab_index: usize,
+    /// Tabs Previous and Next tab reach: the strip's, outside folded groups, and the
+    /// selected one.
+    pub shown_tab_count: usize,
+    /// The selected tab is in a group.
+    pub tab_grouped: bool,
     pub has_selection: bool,
     pub terminal_available: bool,
     pub can_paste: bool,
@@ -302,8 +314,23 @@ impl Command {
     pub const fn category(self) -> CommandCategory {
         use Command::*;
         match self {
-            NewTab | SwitchTab | PreviousTab | NextTab | RenameTab | MoveTabLeft | MoveTabRight
-            | RemoveTab | DetachTab | RestoreHiddenTab => CommandCategory::Tabs,
+            NewTab
+            | SwitchTab
+            | PreviousTab
+            | NextTab
+            | RenameTab
+            | MoveTabLeft
+            | MoveTabRight
+            | RemoveTab
+            | DetachTab
+            | RestoreHiddenTab
+            | GroupTab
+            | RemoveTabFromGroup
+            | RenameTabGroup
+            | ToggleTabGroupFold
+            | UngroupTabGroup
+            | CloseTabGroup
+            | MoveTabGroupToNewWindow => CommandCategory::Tabs,
             SplitRight | SplitDown | TogglePaneZoom | DetachPane | TogglePaneFloat
             | ToggleFloatingFocus | NextFloatingPane | FocusLeft | FocusRight | FocusUp
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
@@ -345,6 +372,18 @@ impl Command {
             NewWindow => Some("Opens another window without duplicating your terminals."),
             MoveTabToNewWindow | MoveTabToWindow => {
                 Some("Moves this tab and its splits without stopping terminals.")
+            }
+            GroupTab => Some(
+                "Puts this tab in a new or existing group: a named, coloured label in the tab strip.",
+            ),
+            RemoveTabFromGroup => Some("Takes this tab out of its group, next to it."),
+            ToggleTabGroupFold => Some(
+                "Shows only the group's label in the tab strip, or its tabs again; terminals keep running.",
+            ),
+            UngroupTabGroup => Some("Removes this tab's group; its tabs stay where they are."),
+            CloseTabGroup => Some("Stops every terminal in this tab's group and removes its tabs."),
+            MoveTabGroupToNewWindow => {
+                Some("Moves this tab's group and its tabs without stopping terminals.")
             }
             TogglePaneZoom => Some("Switches between one pane and the full split layout."),
             DetachPane => Some("Moves this pane to its own tab without stopping its terminal."),
@@ -449,6 +488,13 @@ impl Command {
             Reconnect => "server attach retry",
             DetachTab => "hide close keep running",
             RestoreHiddenTab => "reopen unhide",
+            GroupTab => "group tabs label colour color organize",
+            RemoveTabFromGroup => "group ungroup leave out",
+            RenameTabGroup => "group label name",
+            ToggleTabGroupFold => "group fold unfold collapse expand hide show",
+            UngroupTabGroup => "group remove dissolve",
+            CloseTabGroup => "group close remove end",
+            MoveTabGroupToNewWindow => "group detach tear off window",
             DetachPane => "detach split pane tab",
             TogglePaneFloat => "floating overlay popup dock undock",
             ToggleFloatingFocus | NextFloatingPane => "floating keyboard cycle",
@@ -551,6 +597,12 @@ impl Command {
                 | MoveTabLeft
                 | MoveTabRight
                 | RemoveTab
+                | GroupTab
+                | RemoveTabFromGroup
+                | RenameTabGroup
+                | ToggleTabGroupFold
+                | UngroupTabGroup
+                | CloseTabGroup
                 | SplitRight
                 | SplitDown
                 | DetachPane
@@ -578,6 +630,7 @@ impl Command {
                     Paste
                         | ClearScrollback
                         | MoveTabToNewWindow
+                        | MoveTabGroupToNewWindow
                         | MoveTabToWindow
                         | ShowFiles
                         | ShowChanges
@@ -612,10 +665,22 @@ impl Command {
                 (!c.has_workspace || c.tab_count == 0).then_some("No terminal tabs are available")
             }
             PreviousTab | NextTab => {
-                (!c.has_tab || c.tab_count < 2).then_some("There is no other terminal tab")
+                (!c.has_tab || c.shown_tab_count < 2).then_some("There is no other terminal tab")
             }
-            RenameTab | RemoveTab | DetachTab | MoveTabToNewWindow => {
+            RenameTab | RemoveTab | DetachTab | MoveTabToNewWindow | GroupTab => {
                 (!c.has_tab).then_some("Select a terminal tab first")
+            }
+            RemoveTabFromGroup
+            | RenameTabGroup
+            | ToggleTabGroupFold
+            | UngroupTabGroup
+            | CloseTabGroup
+            | MoveTabGroupToNewWindow => {
+                if !c.has_tab {
+                    Some("Select a terminal tab first")
+                } else {
+                    (!c.tab_grouped).then_some("This tab is in no group")
+                }
             }
             MoveTabToWindow => {
                 if !c.has_tab {
@@ -1271,6 +1336,7 @@ mod tests {
             has_pane: true,
             workspace_count: 1,
             tab_count: 2,
+            shown_tab_count: 2,
             hidden_tab_count: 1,
             pane_count: 2,
             tab_pane_count: 2,

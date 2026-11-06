@@ -3,8 +3,8 @@ use compi_protocol::{
     ContentEnvironment, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES,
     MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId, PaneSide,
     PaneView, PlannedLayoutNode, ProcessLifetimeId, ServerGeneration, SessionId, SplitAxis,
-    SurfaceId, SurfaceInfo, SurfaceStatus, TabId, TabMerge, WorkspaceMutation, WorkspaceSession,
-    WorkspaceSnapshot, WorkspaceTab,
+    SurfaceId, SurfaceInfo, SurfaceStatus, TabGroup, TabGroupId, TabId, TabMerge, TabPlacement,
+    WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -698,6 +698,9 @@ fn prepare_mutation(
         &mut affected_surfaces,
         &mut effects,
     )?;
+    for session in &mut candidate.sessions {
+        settle_groups(session);
+    }
     for effect in &mut effects {
         if let WorkspaceEffect::Launch(info, context) = effect {
             *context = request.launch.clone();
@@ -787,7 +790,9 @@ fn apply_mutation(
                     layout: LayoutNode::terminal(pane_id.clone(), surface.id.clone()),
                     previous_layout: None,
                     merge: None,
+                    group: None,
                 }],
+                groups: Vec::new(),
             });
             workspace.initialized = true;
             affected_sessions.push(session_id);
@@ -805,6 +810,7 @@ fn apply_mutation(
                 id: id.clone(),
                 label: label.clone(),
                 tabs: Vec::new(),
+                groups: Vec::new(),
             });
             workspace.initialized = true;
             affected_sessions.push(id);
@@ -844,6 +850,7 @@ fn apply_mutation(
                 layout: LayoutNode::terminal(pane_id.clone(), surface.id.clone()),
                 previous_layout: None,
                 merge: None,
+                group: None,
             });
             affected_sessions.push(session_id.clone());
             affected_tabs.push(tab_id);
@@ -876,6 +883,7 @@ fn apply_mutation(
                 },
                 previous_layout: None,
                 merge: None,
+                group: None,
             });
             affected_sessions.push(session_id.clone());
             affected_tabs.push(tab_id);
@@ -894,6 +902,7 @@ fn apply_mutation(
             session_id,
             tab_id,
             index,
+            group,
         } => {
             let session = workspace
                 .sessions
@@ -905,12 +914,217 @@ fn apply_mutation(
                 .iter()
                 .position(|tab| &tab.id == tab_id)
                 .ok_or_else(|| invalid(format!("tab {tab_id} was not found in session")))?;
+            if let TabPlacement::Join { group_id } = group
+                && session.group(group_id).is_none()
+            {
+                return Err(invalid(format!(
+                    "group {group_id} is not in the tab's workspace"
+                )));
+            }
+            let before = group_order(session);
             let tab = session.tabs.remove(old);
             let index = (*index).min(session.tabs.len());
             session.tabs.insert(index, tab);
+            let group_of = |index: Option<usize>| {
+                index
+                    .and_then(|index| session.tabs.get(index))
+                    .and_then(|tab| tab.group.clone())
+            };
+            let (left, right) = (group_of(index.checked_sub(1)), group_of(Some(index + 1)));
+            let own = session.tabs[index].group.clone();
+            session.tabs[index].group = match group {
+                TabPlacement::Infer if left.is_some() && left == right => left,
+                TabPlacement::Infer if own.is_some() && (left == own || right == own) => own,
+                TabPlacement::Infer | TabPlacement::Leave => None,
+                TabPlacement::Join { group_id } => Some(group_id.clone()),
+            };
+            settle_groups(session);
             affected_sessions.push(session_id.clone());
             affected_tabs.push(tab_id.clone());
+            regrouped(&before, session, affected_tabs);
             Ok("committed".into())
+        }
+        WorkspaceMutation::CreateTabGroup {
+            tab_ids,
+            name,
+            color,
+        } => {
+            validate_label(name, false).map_err(invalid)?;
+            let mut unique = HashSet::new();
+            let Some(first) = tab_ids.first() else {
+                return Err(invalid("a tab group needs at least one tab".into()));
+            };
+            if tab_ids.iter().any(|tab_id| !unique.insert(tab_id)) {
+                return Err(invalid("a tab group lists a tab twice".into()));
+            }
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.tabs.iter().any(|tab| &tab.id == first))
+                .ok_or_else(|| invalid(format!("tab {first} was not found")))?;
+            if let Some(missing) = tab_ids
+                .iter()
+                .find(|tab_id| !session.tabs.iter().any(|tab| &tab.id == *tab_id))
+            {
+                return Err(invalid(format!(
+                    "tab {missing} is not in the workspace of tab {first}"
+                )));
+            }
+            let group_id = TabGroupId::new(allocate("group", ordinal));
+            let before = group_order(session);
+            for tab in &mut session.tabs {
+                if unique.contains(&tab.id) {
+                    tab.group = Some(group_id.clone());
+                }
+            }
+            session.groups.push(TabGroup {
+                id: group_id,
+                name: name.clone(),
+                color: *color,
+                folded: false,
+            });
+            // Gathers the new group at its earliest tab and closes the gaps it left.
+            settle_groups(session);
+            affected_sessions.push(session.id.clone());
+            regrouped(&before, session, affected_tabs);
+            Ok("committed".into())
+        }
+        WorkspaceMutation::SetTabGroup { tab_id, group_id } => {
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.tabs.iter().any(|tab| &tab.id == tab_id))
+                .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
+            if let Some(group_id) = group_id
+                && session.group(group_id).is_none()
+            {
+                return Err(invalid(format!(
+                    "group {group_id} is not in the tab's workspace"
+                )));
+            }
+            let old = session
+                .tabs
+                .iter()
+                .position(|tab| &tab.id == tab_id)
+                .expect("the session contains the tab");
+            let current = session.tabs[old].group.clone();
+            if &current == group_id {
+                affected_tabs.push(tab_id.clone());
+                return Ok("unchanged".into());
+            }
+            let before = group_order(session);
+            let mut tab = session.tabs.remove(old);
+            // Joining lands after the group's last tab; leaving, just past its old group.
+            let anchor = group_id.as_ref().or(current.as_ref());
+            let index = session
+                .tabs
+                .iter()
+                .rposition(|tab| tab.group.as_ref() == anchor)
+                .map_or(old, |last| last + 1);
+            tab.group = group_id.clone();
+            session.tabs.insert(index, tab);
+            settle_groups(session);
+            affected_sessions.push(session.id.clone());
+            affected_tabs.push(tab_id.clone());
+            regrouped(&before, session, affected_tabs);
+            Ok("committed".into())
+        }
+        WorkspaceMutation::UpdateTabGroup {
+            group_id,
+            name,
+            color,
+            folded,
+        } => {
+            if name.is_none() && color.is_none() && folded.is_none() {
+                return Err(invalid(
+                    "a group update needs a name, colour or folding".into(),
+                ));
+            }
+            if let Some(name) = name {
+                validate_label(name, false).map_err(invalid)?;
+            }
+            let (session, index) = find_group_mut(&mut workspace.sessions, group_id)
+                .ok_or_else(|| invalid(format!("group {group_id} was not found")))?;
+            let group = &mut session.groups[index];
+            if let Some(name) = name {
+                group.name = name.clone();
+            }
+            if let Some(color) = color {
+                group.color = *color;
+            }
+            if let Some(folded) = folded {
+                group.folded = *folded;
+            }
+            affected_sessions.push(session.id.clone());
+            Ok("committed".into())
+        }
+        WorkspaceMutation::MoveTabGroup { group_id, index } => {
+            let (session, _) = find_group_mut(&mut workspace.sessions, group_id)
+                .ok_or_else(|| invalid(format!("group {group_id} was not found")))?;
+            let before = group_order(session);
+            let (members, mut rest): (Vec<_>, Vec<_>) = std::mem::take(&mut session.tabs)
+                .into_iter()
+                .partition(|tab| tab.group.as_ref() == Some(group_id));
+            let mut index = (*index).min(rest.len());
+            // Inside another group's run, land after that group.
+            if let (Some(left), Some(right)) = (
+                index
+                    .checked_sub(1)
+                    .and_then(|left| rest[left].group.as_ref()),
+                rest.get(index).and_then(|tab| tab.group.as_ref()),
+            ) && left == right
+            {
+                let inside = left.clone();
+                index = rest
+                    .iter()
+                    .rposition(|tab| tab.group.as_ref() == Some(&inside))
+                    .map_or(index, |last| last + 1);
+            }
+            rest.splice(index..index, members);
+            session.tabs = rest;
+            affected_sessions.push(session.id.clone());
+            regrouped(&before, session, affected_tabs);
+            Ok("committed".into())
+        }
+        WorkspaceMutation::Ungroup { group_id } => {
+            let (session, index) = find_group_mut(&mut workspace.sessions, group_id)
+                .ok_or_else(|| invalid(format!("group {group_id} was not found")))?;
+            session.groups.remove(index);
+            for tab in &mut session.tabs {
+                if tab.group.as_ref() == Some(group_id) {
+                    tab.group = None;
+                    affected_tabs.push(tab.id.clone());
+                }
+            }
+            affected_sessions.push(session.id.clone());
+            Ok("committed".into())
+        }
+        WorkspaceMutation::RemoveTabGroup { group_id } => {
+            let (session, _) = find_group_mut(&mut workspace.sessions, group_id)
+                .ok_or_else(|| invalid(format!("group {group_id} was not found")))?;
+            let tabs: Vec<TabId> = session
+                .tabs
+                .iter()
+                .filter(|tab| tab.group.as_ref() == Some(group_id))
+                .map(|tab| tab.id.clone())
+                .collect();
+            affected_sessions.push(session.id.clone());
+            let mut state = "removed";
+            for tab_id in &tabs {
+                let removal = prepare_removal(
+                    workspace,
+                    RemovalTarget::Tab {
+                        tab_id: tab_id.clone(),
+                    },
+                    affected_surfaces,
+                    effects,
+                )?;
+                if removal != "removed" {
+                    state = "ending";
+                }
+            }
+            affected_tabs.extend(tabs);
+            Ok(state.into())
         }
         WorkspaceMutation::SplitPane {
             pane_id,
@@ -1157,6 +1371,7 @@ fn apply_mutation(
                 forget_pane_history(tab, pane_id);
                 let surface_id = detached.surface_id().cloned();
                 let old_tab_id = tab.id.clone();
+                let group = tab.group.clone();
                 let new_tab_id = TabId::new(allocate("tab", ordinal));
                 session.tabs.insert(
                     index + 1,
@@ -1166,6 +1381,7 @@ fn apply_mutation(
                         layout: detached,
                         previous_layout: None,
                         merge: None,
+                        group,
                     },
                 );
                 affected_sessions.push(session.id.clone());
@@ -1288,6 +1504,7 @@ fn apply_mutation(
                         label: source.label.clone(),
                         layout: own,
                         index,
+                        group: source.group.clone(),
                     });
                 }
                 if let Some(nested) = source.merge.as_deref() {
@@ -1354,6 +1571,7 @@ fn apply_mutation(
             affected_tabs.push(tab_id.clone());
             for record in tabs {
                 let index = record.index.min(session.tabs.len());
+                let group = record.group.filter(|group| session.group(group).is_some());
                 affected_tabs.push(record.id.clone());
                 session.tabs.insert(
                     index,
@@ -1363,6 +1581,7 @@ fn apply_mutation(
                         layout: record.layout,
                         previous_layout: None,
                         merge: None,
+                        group,
                     },
                 );
             }
@@ -1704,6 +1923,80 @@ fn new_surface(
         },
         working_directory: None,
         distribution: None,
+    }
+}
+
+fn find_group_mut<'a>(
+    sessions: &'a mut [WorkspaceSession],
+    group_id: &TabGroupId,
+) -> Option<(&'a mut WorkspaceSession, usize)> {
+    sessions.iter_mut().find_map(|session| {
+        let index = session
+            .groups
+            .iter()
+            .position(|group| &group.id == group_id)?;
+        Some((session, index))
+    })
+}
+
+/// Restores the group invariants after tabs moved, closed or changed group: a tab's
+/// group exists, no group is empty, and a group's tabs sit together, gathered at its
+/// first tab in their order.
+fn settle_groups(session: &mut WorkspaceSession) {
+    let WorkspaceSession { tabs, groups, .. } = session;
+    for tab in tabs.iter_mut() {
+        if tab
+            .group
+            .as_ref()
+            .is_some_and(|id| !groups.iter().any(|group| &group.id == id))
+        {
+            tab.group = None;
+        }
+    }
+    groups.retain(|group| tabs.iter().any(|tab| tab.group.as_ref() == Some(&group.id)));
+    if crate::workspace_store::groups_contiguous(tabs) {
+        return;
+    }
+    let mut pending = VecDeque::from(std::mem::take(tabs));
+    while let Some(tab) = pending.pop_front() {
+        let group = tab.group.clone();
+        tabs.push(tab);
+        let Some(group) = group else {
+            continue;
+        };
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].group.as_ref() == Some(&group) {
+                tabs.extend(pending.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+/// Each tab of `session` in order with its group, to compare after a change.
+fn group_order(session: &WorkspaceSession) -> Vec<(TabId, Option<TabGroupId>)> {
+    session
+        .tabs
+        .iter()
+        .map(|tab| (tab.id.clone(), tab.group.clone()))
+        .collect()
+}
+
+/// Adds to `affected` each tab whose position or group differs from `before`.
+fn regrouped(
+    before: &[(TabId, Option<TabGroupId>)],
+    session: &WorkspaceSession,
+    affected: &mut Vec<TabId>,
+) {
+    for (index, tab) in session.tabs.iter().enumerate() {
+        let unchanged = before
+            .get(index)
+            .is_some_and(|(id, group)| id == &tab.id && group == &tab.group);
+        if !unchanged && !affected.contains(&tab.id) {
+            affected.push(tab.id.clone());
+        }
     }
 }
 
@@ -2258,6 +2551,10 @@ fn apply_removal(workspace: &mut StoredWorkspace, target: &RemovalTarget) {
         }
     }
     prune_unreferenced_surfaces(workspace);
+    // Pending tab removals finish later, so their groups settle here too.
+    for session in &mut workspace.sessions {
+        settle_groups(session);
+    }
 }
 
 fn remove_pane(node: LayoutNode, target: &PaneId) -> Option<LayoutNode> {
@@ -5710,5 +6007,526 @@ mod tests {
             SurfaceStatus::Running
         );
         assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A running terminal's tab followed by `count` content tabs, and every tab's ID in
+    /// order.
+    fn tabs_fixture(
+        count: usize,
+    ) -> (
+        WorkspaceActor,
+        Receiver<WorkspaceEffect>,
+        SurfaceInfo,
+        Vec<TabId>,
+    ) {
+        let (actor, effects, surface, _) = running_terminal();
+        let session_id = actor.snapshot().unwrap().sessions[0].id.clone();
+        for index in 1..=count {
+            mutate_current(
+                &actor,
+                &format!("content-tab-{index}"),
+                WorkspaceMutation::CreateContentTab {
+                    session_id: session_id.clone(),
+                    label: format!("t{index}"),
+                    content: settings_content(SettingsSection::Interface),
+                },
+            )
+            .unwrap();
+        }
+        let tabs = actor.snapshot().unwrap().sessions[0]
+            .tabs
+            .iter()
+            .map(|tab| tab.id.clone())
+            .collect();
+        (actor, effects, surface, tabs)
+    }
+
+    /// The first workspace's tabs in order, each as its fixture index followed by its
+    /// group's name: `["0", "1A", "2A"]`.
+    fn shape(actor: &WorkspaceActor, tabs: &[TabId]) -> Vec<String> {
+        let snapshot = actor.snapshot().unwrap();
+        let session = &snapshot.sessions[0];
+        session
+            .tabs
+            .iter()
+            .map(|tab| {
+                let index = tabs.iter().position(|id| id == &tab.id).unwrap();
+                let group = tab.group.as_ref().map_or("", |id| {
+                    session.group(id).map(|group| group.name.as_str()).unwrap()
+                });
+                format!("{index}{group}")
+            })
+            .collect()
+    }
+
+    fn create_group(actor: &WorkspaceActor, tabs: &[&TabId], name: &str) -> TabGroupId {
+        mutate_current(
+            actor,
+            &format!("group-{name}"),
+            WorkspaceMutation::CreateTabGroup {
+                tab_ids: tabs.iter().map(|tab| (*tab).clone()).collect(),
+                name: name.into(),
+                color: compi_protocol::TabGroupColor::Blue,
+            },
+        )
+        .unwrap();
+        actor
+            .snapshot()
+            .unwrap()
+            .sessions
+            .iter()
+            .flat_map(|session| &session.groups)
+            .find(|group| group.name == name)
+            .unwrap()
+            .id
+            .clone()
+    }
+
+    fn set_group(actor: &WorkspaceActor, tab: &TabId, group: Option<&TabGroupId>) -> String {
+        mutate_current(
+            actor,
+            &format!(
+                "set-group-{tab}-{group:?}-{}",
+                actor.snapshot().unwrap().revision
+            ),
+            WorkspaceMutation::SetTabGroup {
+                tab_id: tab.clone(),
+                group_id: group.cloned(),
+            },
+        )
+        .unwrap()
+        .operation_state
+    }
+
+    fn move_tab(actor: &WorkspaceActor, tab: &TabId, index: usize, group: TabPlacement) {
+        let snapshot = actor.snapshot().unwrap();
+        mutate_current(
+            actor,
+            &format!("move-{tab}-{}", snapshot.revision),
+            WorkspaceMutation::MoveTab {
+                session_id: snapshot.sessions[0].id.clone(),
+                tab_id: tab.clone(),
+                index,
+                group,
+            },
+        )
+        .unwrap();
+    }
+
+    fn move_group(actor: &WorkspaceActor, group: &TabGroupId, index: usize) {
+        mutate_current(
+            actor,
+            &format!("move-{group}-{}", actor.snapshot().unwrap().revision),
+            WorkspaceMutation::MoveTabGroup {
+                group_id: group.clone(),
+                index,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn new_groups_gather_their_tabs_and_take_them_from_older_groups() {
+        let (actor, _effects, _, tabs) = tabs_fixture(4);
+        let session_id = actor.snapshot().unwrap().sessions[0].id.clone();
+        let receipt = mutate_current(
+            &actor,
+            "group-a",
+            WorkspaceMutation::CreateTabGroup {
+                tab_ids: vec![tabs[3].clone(), tabs[1].clone()],
+                name: "A".into(),
+                color: compi_protocol::TabGroupColor::Green,
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(receipt.affected_sessions, vec![session_id.clone()]);
+        // Grouped tabs and the tab they moved past; the tabs before stay put.
+        assert_eq!(
+            receipt.affected_tabs,
+            vec![tabs[1].clone(), tabs[3].clone(), tabs[2].clone()]
+        );
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "3A", "2", "4"]);
+        let group = &actor.snapshot().unwrap().sessions[0].groups[0];
+        assert_eq!(
+            (group.color, group.folded),
+            (compi_protocol::TabGroupColor::Green, false)
+        );
+
+        create_group(&actor, &[&tabs[3], &tabs[4]], "B");
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "3B", "4B", "2"]);
+        // Taking a group's last tab ends it.
+        create_group(&actor, &[&tabs[1]], "C");
+        assert_eq!(shape(&actor, &tabs), ["0", "1C", "3B", "4B", "2"]);
+        let names: Vec<String> = actor.snapshot().unwrap().sessions[0]
+            .groups
+            .iter()
+            .map(|group| group.name.clone())
+            .collect();
+        assert_eq!(names, ["B", "C"]);
+
+        mutate_current(
+            &actor,
+            "other-session",
+            WorkspaceMutation::CreateSession {
+                label: "Other".into(),
+            },
+        )
+        .unwrap();
+        let other_session = actor.snapshot().unwrap().sessions[1].id.clone();
+        let foreign = mutate_current(
+            &actor,
+            "other-tab",
+            WorkspaceMutation::CreateContentTab {
+                session_id: other_session,
+                label: String::new(),
+                content: settings_content(SettingsSection::Interface),
+            },
+        )
+        .unwrap()
+        .affected_tabs[0]
+            .clone();
+        let ready = actor.snapshot().unwrap();
+        for (id, tab_ids, name) in [
+            ("group-none", vec![], String::new()),
+            (
+                "group-twice",
+                vec![tabs[0].clone(), tabs[0].clone()],
+                String::new(),
+            ),
+            (
+                "group-foreign",
+                vec![tabs[0].clone(), foreign],
+                String::new(),
+            ),
+            (
+                "group-missing",
+                vec![TabId::new("tab-missing")],
+                String::new(),
+            ),
+            ("group-long", vec![tabs[0].clone()], "x".repeat(257)),
+        ] {
+            let error = mutate_current(
+                &actor,
+                id,
+                WorkspaceMutation::CreateTabGroup {
+                    tab_ids,
+                    name,
+                    color: compi_protocol::TabGroupColor::Grey,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{id}");
+            assert_eq!(actor.snapshot().unwrap(), ready, "{id}");
+        }
+    }
+
+    #[test]
+    fn tabs_join_after_a_groups_last_tab_and_leave_just_past_it() {
+        let (actor, _effects, _, tabs) = tabs_fixture(4);
+        let a = create_group(&actor, &[&tabs[1], &tabs[2]], "A");
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "2A", "3", "4"]);
+        assert_eq!(set_group(&actor, &tabs[4], Some(&a)), "committed");
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "2A", "4A", "3"]);
+        assert_eq!(set_group(&actor, &tabs[1], None), "committed");
+        assert_eq!(shape(&actor, &tabs), ["0", "2A", "4A", "1", "3"]);
+        assert_eq!(set_group(&actor, &tabs[1], None), "unchanged");
+        assert_eq!(set_group(&actor, &tabs[2], Some(&a)), "unchanged");
+        assert_eq!(set_group(&actor, &tabs[0], Some(&a)), "committed");
+        assert_eq!(shape(&actor, &tabs), ["2A", "4A", "0A", "1", "3"]);
+
+        // A group's only tab leaving ends the group where the tab is.
+        let b = create_group(&actor, &[&tabs[3]], "B");
+        set_group(&actor, &tabs[3], None);
+        assert_eq!(shape(&actor, &tabs), ["2A", "4A", "0A", "1", "3"]);
+        let after = actor.snapshot().unwrap();
+        assert!(after.sessions[0].group(&b).is_none());
+
+        // A group of another workspace cannot be joined.
+        mutate_current(
+            &actor,
+            "other-session",
+            WorkspaceMutation::CreateSession {
+                label: "Other".into(),
+            },
+        )
+        .unwrap();
+        let other_session = actor.snapshot().unwrap().sessions[1].id.clone();
+        let foreign = mutate_current(
+            &actor,
+            "other-tab",
+            WorkspaceMutation::CreateContentTab {
+                session_id: other_session,
+                label: String::new(),
+                content: settings_content(SettingsSection::Interface),
+            },
+        )
+        .unwrap()
+        .affected_tabs[0]
+            .clone();
+        let error = mutate_current(
+            &actor,
+            "join-foreign",
+            WorkspaceMutation::SetTabGroup {
+                tab_id: foreign,
+                group_id: Some(a),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn moved_tabs_join_the_group_they_land_inside_and_keep_their_own_at_its_edge() {
+        let (actor, _effects, _, tabs) = tabs_fixture(5);
+        create_group(&actor, &[&tabs[1], &tabs[2]], "A");
+        let b = create_group(&actor, &[&tabs[4], &tabs[5]], "B");
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "2A", "3", "4B", "5B"]);
+        // Inside A.
+        move_tab(&actor, &tabs[3], 2, TabPlacement::Infer);
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "3A", "2A", "4B", "5B"]);
+        // Past B, away from A: it leaves A.
+        move_tab(&actor, &tabs[3], 5, TabPlacement::Infer);
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "2A", "4B", "5B", "3"]);
+        // Between two groups is in neither.
+        move_tab(&actor, &tabs[0], 2, TabPlacement::Infer);
+        assert_eq!(shape(&actor, &tabs), ["1A", "2A", "0", "4B", "5B", "3"]);
+        // At its own group's edge, a tab stays in it.
+        move_tab(&actor, &tabs[2], 0, TabPlacement::Infer);
+        assert_eq!(shape(&actor, &tabs), ["2A", "1A", "0", "4B", "5B", "3"]);
+        // Inside another group, a tab joins it.
+        move_tab(&actor, &tabs[1], 3, TabPlacement::Infer);
+        assert_eq!(shape(&actor, &tabs), ["2A", "0", "4B", "1B", "5B", "3"]);
+        // Leaving inside a group puts the tab after it, keeping the group whole.
+        move_tab(&actor, &tabs[3], 3, TabPlacement::Leave);
+        assert_eq!(shape(&actor, &tabs), ["2A", "0", "4B", "1B", "5B", "3"]);
+        move_tab(&actor, &tabs[1], 1, TabPlacement::Leave);
+        assert_eq!(shape(&actor, &tabs), ["2A", "1", "0", "4B", "5B", "3"]);
+        // Joining away from a group gathers the group at the tab.
+        move_tab(
+            &actor,
+            &tabs[3],
+            0,
+            TabPlacement::Join {
+                group_id: b.clone(),
+            },
+        );
+        assert_eq!(shape(&actor, &tabs), ["3B", "4B", "5B", "2A", "1", "0"]);
+
+        let session_id = actor.snapshot().unwrap().sessions[0].id.clone();
+        let error = mutate_current(
+            &actor,
+            "join-missing",
+            WorkspaceMutation::MoveTab {
+                session_id,
+                tab_id: tabs[0].clone(),
+                index: 0,
+                group: TabPlacement::Join {
+                    group_id: TabGroupId::new("group-missing"),
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn moved_groups_keep_their_tabs_together_and_skip_past_other_groups() {
+        let (actor, _effects, _, tabs) = tabs_fixture(5);
+        let a = create_group(&actor, &[&tabs[1], &tabs[2]], "A");
+        let b = create_group(&actor, &[&tabs[4], &tabs[5]], "B");
+        move_group(&actor, &a, 0);
+        assert_eq!(shape(&actor, &tabs), ["1A", "2A", "0", "3", "4B", "5B"]);
+        // Index 3 among [0, 3, 4B, 5B] is inside B.
+        move_group(&actor, &a, 3);
+        assert_eq!(shape(&actor, &tabs), ["0", "3", "4B", "5B", "1A", "2A"]);
+        move_group(&actor, &b, 1);
+        assert_eq!(shape(&actor, &tabs), ["0", "4B", "5B", "3", "1A", "2A"]);
+        move_group(&actor, &b, 99);
+        assert_eq!(shape(&actor, &tabs), ["0", "3", "1A", "2A", "4B", "5B"]);
+        let error = mutate_current(
+            &actor,
+            "move-missing",
+            WorkspaceMutation::MoveTabGroup {
+                group_id: TabGroupId::new("group-missing"),
+                index: 0,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn groups_update_what_is_given_and_ungroup_in_place() {
+        let (actor, _effects, _, tabs) = tabs_fixture(3);
+        let a = create_group(&actor, &[&tabs[1], &tabs[2]], "A");
+        mutate_current(
+            &actor,
+            "update-all",
+            WorkspaceMutation::UpdateTabGroup {
+                group_id: a.clone(),
+                name: Some("Build".into()),
+                color: Some(compi_protocol::TabGroupColor::Red),
+                folded: Some(true),
+            },
+        )
+        .unwrap();
+        mutate_current(
+            &actor,
+            "update-color",
+            WorkspaceMutation::UpdateTabGroup {
+                group_id: a.clone(),
+                name: None,
+                color: Some(compi_protocol::TabGroupColor::Cyan),
+                folded: None,
+            },
+        )
+        .unwrap();
+        let group = actor.snapshot().unwrap().sessions[0].groups[0].clone();
+        assert_eq!(
+            group,
+            TabGroup {
+                id: a.clone(),
+                name: "Build".into(),
+                color: compi_protocol::TabGroupColor::Cyan,
+                folded: true,
+            }
+        );
+        for (id, name) in [
+            ("update-nothing", None),
+            ("update-long", Some("x".repeat(257))),
+        ] {
+            let error = mutate_current(
+                &actor,
+                id,
+                WorkspaceMutation::UpdateTabGroup {
+                    group_id: a.clone(),
+                    name,
+                    color: None,
+                    folded: None,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{id}");
+        }
+
+        let receipt = mutate_current(
+            &actor,
+            "ungroup",
+            WorkspaceMutation::Ungroup {
+                group_id: a.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.affected_tabs,
+            vec![tabs[1].clone(), tabs[2].clone()]
+        );
+        assert_eq!(shape(&actor, &tabs), ["0", "1", "2", "3"]);
+        assert!(actor.snapshot().unwrap().sessions[0].groups.is_empty());
+    }
+
+    #[test]
+    fn closing_a_group_ends_its_shells_and_drops_it_once_they_exit() {
+        let (actor, effects, surface, tabs) = tabs_fixture(3);
+        // Without a process to end, the group's tabs close at once.
+        let b = create_group(&actor, &[&tabs[3]], "B");
+        let receipt = mutate_current(
+            &actor,
+            "close-b",
+            WorkspaceMutation::RemoveTabGroup { group_id: b },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "removed");
+        assert_eq!(shape(&actor, &tabs), ["0", "1", "2"]);
+        assert!(actor.snapshot().unwrap().sessions[0].groups.is_empty());
+
+        // The running shell holds its tab, and the group, until it exits.
+        let a = create_group(&actor, &[&tabs[0], &tabs[2]], "A");
+        let receipt = mutate_current(
+            &actor,
+            "close-a",
+            WorkspaceMutation::RemoveTabGroup { group_id: a },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "ending");
+        assert_eq!(receipt.affected_surfaces, vec![surface.id.clone()]);
+        assert!(matches!(
+            effects.recv().unwrap(),
+            WorkspaceEffect::End { .. }
+        ));
+        let ending = actor.snapshot().unwrap();
+        assert_eq!(shape(&actor, &tabs), ["0A", "1"]);
+        actor.observe(RuntimeObservation::Exited {
+            surface_id: surface.id.clone(),
+            process_lifetime_id: surface.process_lifetime_id.clone(),
+            exit_code: 0,
+        });
+        let removed = wait_revision(&actor, ending.revision + 1);
+        assert_eq!(shape(&actor, &tabs), ["1"]);
+        assert!(removed.sessions[0].groups.is_empty());
+    }
+
+    #[test]
+    fn merged_and_detached_tabs_keep_their_groups() {
+        let (actor, _effects, _, tabs) = tabs_fixture(3);
+        create_group(&actor, &[&tabs[1], &tabs[2]], "A");
+        let b = create_group(&actor, &[&tabs[3]], "B");
+        let before = actor.snapshot().unwrap();
+        let layout = |index: usize| before.sessions[0].tabs[index].layout.clone();
+        let split = |first: LayoutNode, second: LayoutNode| LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        // Merging A's second tab and B's only one into the ungrouped tab ends B.
+        mutate_current(
+            &actor,
+            "merge",
+            WorkspaceMutation::MergeTabs {
+                tab_id: tabs[0].clone(),
+                sources: vec![tabs[2].clone(), tabs[3].clone()],
+                layout: split(layout(0), split(layout(2), layout(3))),
+            },
+        )
+        .unwrap();
+        assert_eq!(shape(&actor, &tabs), ["0", "1A"]);
+        assert!(actor.snapshot().unwrap().sessions[0].group(&b).is_none());
+        // Splitting rejoins A, which still exists, but not the ended B.
+        mutate_current(
+            &actor,
+            "unmerge",
+            WorkspaceMutation::SplitMergedTabs {
+                tab_id: tabs[0].clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "2A", "3"]);
+
+        // A pane detached from a grouped tab opens beside it in the group.
+        let grouped = actor.snapshot().unwrap();
+        mutate_current(
+            &actor,
+            "merge-into-group",
+            WorkspaceMutation::MergeTabs {
+                tab_id: tabs[1].clone(),
+                sources: vec![tabs[3].clone()],
+                layout: split(
+                    grouped.sessions[0].tabs[1].layout.clone(),
+                    grouped.sessions[0].tabs[3].layout.clone(),
+                ),
+            },
+        )
+        .unwrap();
+        let pane_id = pane_ids(&grouped.sessions[0].tabs[3].layout)[0].clone();
+        let receipt =
+            mutate_current(&actor, "detach", WorkspaceMutation::DetachPane { pane_id }).unwrap();
+        let after = actor.snapshot().unwrap();
+        let detached = &after.sessions[0].tabs[2];
+        assert_eq!(detached.id, receipt.affected_tabs[0]);
+        assert_eq!(detached.group, after.sessions[0].tabs[1].group);
+        assert!(detached.group.is_some());
+        assert_eq!(after.sessions[0].tabs[3].id, tabs[2]);
     }
 }

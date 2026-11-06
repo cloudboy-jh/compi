@@ -380,6 +380,18 @@ pub(super) fn removed_panes(
             }
             panes
         }
+        WorkspaceMutation::RemoveTabGroup { group_id } => {
+            let mut panes = Vec::new();
+            for tab in workspace
+                .sessions
+                .iter()
+                .flat_map(|session| &session.tabs)
+                .filter(|tab| tab.group.as_ref() == Some(group_id))
+            {
+                layout_panes(&tab.layout, &mut panes);
+            }
+            panes
+        }
         _ => Vec::new(),
     }
 }
@@ -393,7 +405,7 @@ pub(in crate::gui) enum AfterUnsaved {
     },
     Mutate(WorkspaceMutation),
     Transfer {
-        tab_id: TabId,
+        tab_ids: Vec<TabId>,
         destination: Option<AnyWindowHandle>,
     },
     CloseWindow,
@@ -604,9 +616,9 @@ impl CompiApp {
             AfterUnsaved::CloseFile { pane_id, path } => self.drop_content_tab(&pane_id, &path),
             AfterUnsaved::Mutate(operation) => self.mutate(operation, false),
             AfterUnsaved::Transfer {
-                tab_id,
+                tab_ids,
                 destination,
-            } => self.transfer_tab_mode(tab_id, destination, true, window, cx),
+            } => self.transfer_tab_mode(tab_ids, destination, true, window, cx),
             AfterUnsaved::CloseWindow => {
                 self.flush_state();
                 window.remove_window();
@@ -928,6 +940,7 @@ mod tests {
             layout,
             previous_layout: None,
             merge: None,
+            group: None,
         };
         let workspace = WorkspaceSnapshot {
             server_id: ServerId::new("server"),
@@ -953,11 +966,13 @@ mod tests {
                         ),
                         tab("single", pane("right")),
                     ],
+                    groups: Vec::new(),
                 },
                 WorkspaceSession {
                     id: SessionId::new("two"),
                     label: "two".into(),
                     tabs: vec![tab("other", pane("elsewhere"))],
+                    groups: Vec::new(),
                 },
             ],
             surfaces: Vec::new(),

@@ -16,6 +16,7 @@
 //! already is one), then merges that tab in; no process starts or ends, and a
 //! failure between the steps leaves the pane in its own tab. Escape cancels, and
 //! no PTY is resized until a move commits and its landing (`motion`) ends.
+use super::tab_groups::TabBarHit;
 use super::*;
 use crate::arrangement::{self, DropZone};
 use gpui::{Animation, AnimationExt as _, ease_out_quint};
@@ -331,7 +332,7 @@ impl CompiApp {
         if !drag.moving && !drag_threshold_crossed(drag.origin, position) {
             return;
         }
-        let hovered = self.tab_bar_target(position, window);
+        let hovered = self.tab_bar_hit(position, window);
         // Over the same pane and zone the target stands; nothing is recomputed.
         let hit = if hovered.is_none() {
             let across = self.selected_tab().is_some_and(|tab| tab.id != drag.tab_id);
@@ -346,15 +347,17 @@ impl CompiApp {
             None
         } else {
             match &hovered {
-                Some(Some(tab_id)) if tab_id == &drag.tab_id => None,
-                Some(Some(tab_id)) => Some(DropTarget::Tab(tab_id.clone())),
-                Some(None) => self.can_detach(drag).then_some(DropTarget::NewTab),
+                Some(TabBarHit::Tab(tab_id)) if tab_id == &drag.tab_id => None,
+                Some(TabBarHit::Tab(tab_id)) => Some(DropTarget::Tab(tab_id.clone())),
+                // A group label takes no pane.
+                Some(TabBarHit::Label) => None,
+                Some(TabBarHit::Space) => self.can_detach(drag).then_some(DropTarget::NewTab),
                 None => hit.and_then(|hit| self.pane_drop_target(drag, hit)),
             }
         };
         let selected = self.selected_tab().map(|tab| tab.id.clone());
         let spring = match hovered {
-            Some(Some(tab_id)) if Some(&tab_id) != selected.as_ref() => Some(tab_id),
+            Some(TabBarHit::Tab(tab_id)) if Some(&tab_id) != selected.as_ref() => Some(tab_id),
             _ => None,
         };
         let Some(drag) = &mut self.pane_drag else {
@@ -392,36 +395,6 @@ impl CompiApp {
             drag.spring = None;
         }
         cx.notify();
-    }
-
-    /// `Some(Some(tab))` over a visible tab, `Some(None)` over empty tab-bar space,
-    /// `None` outside the tab bar.
-    fn tab_bar_target(&self, position: Point<Pixels>, window: &Window) -> Option<Option<TabId>> {
-        let (x, y) = (f32::from(position.x), f32::from(position.y));
-        let (viewport_width, _) = logical_viewport_dimensions(window);
-        let leading_width = titlebar_leading_width(window);
-        let header = header_metrics(viewport_width, leading_width);
-        let tab_region_right = viewport_width
-            - WINDOW_CONTROLS_WIDTH
-            - HEADER_BUTTON_SLOT_WIDTH
-            - header.pane_actions_width;
-        if !(0.0..=CHROME_HEIGHT).contains(&y) || x < leading_width || x >= tab_region_right {
-            return None;
-        }
-        let offset = x - leading_width - f32::from(self.tab_scroll_handle.offset().x);
-        let index = (offset / header.tab_width).floor().max(0.0) as usize;
-        let workspace = self.workspace.as_ref()?;
-        let session_id = self.state.selected_session.as_ref()?;
-        let session = workspace
-            .sessions
-            .iter()
-            .find(|session| &session.id == session_id)?;
-        Some(
-            self.state
-                .visible_tabs(session)
-                .nth(index)
-                .map(|tab| tab.id.clone()),
-        )
     }
 
     /// A pane can become its own tab only if its tab has other panes.

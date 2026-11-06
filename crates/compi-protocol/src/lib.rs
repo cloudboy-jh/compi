@@ -69,7 +69,9 @@ use std::fmt;
 // Version 36 adds the Windows shell to launch profiles (`LaunchProfile::windows_shell`): WSL or
 // Windows PowerShell on the host. An older daemon would ignore it and start WSL. Prompt
 // settings take a `PromptPlace`, which can be Windows PowerShell, and know `PromptShell::PowerShell`.
-pub const PROTOCOL_VERSION: u32 = 36;
+// Version 37 adds tab groups: `WorkspaceSession::groups`, `WorkspaceTab::group`, where a tab
+// moved by `MoveTab` lands (`TabPlacement`) and the group mutations.
+pub const PROTOCOL_VERSION: u32 = 37;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -149,6 +151,7 @@ opaque_id!(ServerId);
 opaque_id!(ServerGeneration);
 opaque_id!(SessionId);
 opaque_id!(TabId);
+opaque_id!(TabGroupId);
 opaque_id!(PaneId);
 opaque_id!(SurfaceId);
 opaque_id!(ProcessLifetimeId);
@@ -1862,6 +1865,104 @@ pub struct WorkspaceTab {
     /// How to split this tab back into the tabs merged into it, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge: Option<Box<TabMerge>>,
+    /// The session's tab group holding this tab. A group's tabs are always next to
+    /// each other in the session's order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<TabGroupId>,
+}
+
+/// A named, coloured run of tabs in a session. A group always holds at least one tab;
+/// the daemon drops a group whose last tab leaves or closes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TabGroup {
+    pub id: TabGroupId,
+    /// May be empty: the group shows only its colour.
+    pub name: String,
+    pub color: TabGroupColor,
+    /// Folded groups show only their label; their tabs keep running.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folded: bool,
+}
+
+/// Group colours, drawn from the theme's terminal palette (grey from its muted text).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TabGroupColor {
+    Grey,
+    Blue,
+    Green,
+    Yellow,
+    Red,
+    Magenta,
+    Cyan,
+}
+
+impl TabGroupColor {
+    pub const ALL: [Self; 7] = [
+        Self::Grey,
+        Self::Blue,
+        Self::Green,
+        Self::Yellow,
+        Self::Red,
+        Self::Magenta,
+        Self::Cyan,
+    ];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Grey => "grey",
+            Self::Blue => "blue",
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Red => "red",
+            Self::Magenta => "magenta",
+            Self::Cyan => "cyan",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Grey => "Grey",
+            Self::Blue => "Blue",
+            Self::Green => "Green",
+            Self::Yellow => "Yellow",
+            Self::Red => "Red",
+            Self::Magenta => "Magenta",
+            Self::Cyan => "Cyan",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|color| color.id().eq_ignore_ascii_case(value))
+            .or_else(|| value.eq_ignore_ascii_case("gray").then_some(Self::Grey))
+    }
+
+    /// The first colour no group in `groups` uses, else the one used least; grey last.
+    pub fn next_free(groups: &[TabGroup]) -> Self {
+        Self::ALL[1..]
+            .iter()
+            .copied()
+            .chain([Self::Grey])
+            .min_by_key(|color| groups.iter().filter(|group| group.color == *color).count())
+            .unwrap_or(Self::Grey)
+    }
+}
+
+/// Which group a tab moved by `MoveTab` ends up in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TabPlacement {
+    /// Join the group the tab lands inside; keep its own group when it lands next to
+    /// it; otherwise leave it.
+    #[default]
+    Infer,
+    Join {
+        group_id: TabGroupId,
+    },
+    Leave,
 }
 
 /// The pre-merge shape of a merged tab, holding only panes still in that tab.
@@ -1881,6 +1982,9 @@ pub struct MergedTab {
     pub layout: LayoutNode,
     /// Session position before the merge; splitting reinserts at this index.
     pub index: usize,
+    /// The tab's group before the merge; splitting rejoins it if it still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<TabGroupId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1888,6 +1992,14 @@ pub struct WorkspaceSession {
     pub id: SessionId,
     pub label: String,
     pub tabs: Vec<WorkspaceTab>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<TabGroup>,
+}
+
+impl WorkspaceSession {
+    pub fn group(&self, id: &TabGroupId) -> Option<&TabGroup> {
+        self.groups.iter().find(|group| &group.id == id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1985,9 +2097,48 @@ pub enum WorkspaceMutation {
         session_id: SessionId,
         tab_id: TabId,
         index: usize,
+        #[serde(default)]
+        group: TabPlacement,
     },
     RemoveTab {
         tab_id: TabId,
+    },
+    /// Put `tab_ids` (one session, at least one) in a new group, gathered where the
+    /// first of them is.
+    CreateTabGroup {
+        tab_ids: Vec<TabId>,
+        name: String,
+        color: TabGroupColor,
+    },
+    /// Move `tab_id` into `group_id`, after its last tab, or out of its group
+    /// (`None`), just after the group.
+    SetTabGroup {
+        tab_id: TabId,
+        group_id: Option<TabGroupId>,
+    },
+    /// Change what is given of a group's name, colour and folding.
+    UpdateTabGroup {
+        group_id: TabGroupId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<TabGroupColor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folded: Option<bool>,
+    },
+    /// Move a group's tabs together to `index` in the session's tabs without them;
+    /// an index inside another group lands after that group.
+    MoveTabGroup {
+        group_id: TabGroupId,
+        index: usize,
+    },
+    /// Drop the group; its tabs stay where they are.
+    Ungroup {
+        group_id: TabGroupId,
+    },
+    /// Close every tab of the group, ending their processes, like `RemoveTab` on each.
+    RemoveTabGroup {
+        group_id: TabGroupId,
     },
     SplitPane {
         pane_id: PaneId,
@@ -2361,7 +2512,9 @@ mod tests {
                     layout: LayoutNode::terminal(PaneId::new("pane-1"), surface.id.clone()),
                     previous_layout: None,
                     merge: None,
+                    group: None,
                 }],
+                groups: Vec::new(),
             }],
             surfaces: vec![surface.clone()],
             recovery_message: None,

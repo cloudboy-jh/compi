@@ -30,6 +30,7 @@ pub(in crate::gui) mod program_status;
 pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod remote;
 pub(in crate::gui) mod settings;
+pub(in crate::gui) mod tab_groups;
 pub(super) mod tree;
 mod tree_ui;
 pub(in crate::gui) mod unsaved;
@@ -211,7 +212,8 @@ pub(super) fn open_from_system(path: String, cx: &mut App) -> crate::Result<()> 
 
 #[derive(Clone)]
 pub(super) struct TransferSeed {
-    tab_id: TabId,
+    /// The tabs the new window shows.
+    tab_ids: Vec<TabId>,
     source_state: ClientState,
     display_appearance: AppearanceSettings,
     display_sidebar_width: f32,
@@ -343,6 +345,16 @@ pub(super) enum TextPurpose {
     RenameWorkspace(SessionId),
     RenameTab(TabId),
     SaveArrangement(TabId),
+    /// A new group holding the tab; the name may be empty.
+    NewTabGroup(TabId),
+    RenameTabGroup(compi_protocol::TabGroupId),
+}
+
+impl TextPurpose {
+    /// Group names may be empty: the group shows only its colour.
+    pub(super) fn allows_empty(&self) -> bool {
+        matches!(self, Self::NewTabGroup(_) | Self::RenameTabGroup(_))
+    }
 }
 
 #[derive(Clone)]
@@ -390,6 +402,10 @@ pub(super) enum Overlay {
         hidden_only: bool,
     },
     Windows,
+    /// Add tab to group…: a new group or one to join.
+    TabGroups {
+        tab_id: TabId,
+    },
     Diagnostics,
     /// Save / Don't save / Cancel before `then` drops these dirty editors; `saving`
     /// while Save waits for every save.
@@ -674,7 +690,7 @@ fn open_window_mode(
     if let Some(seed) = &transferred_seed
         && !slot
             .state
-            .initialize_transfer(&snapshot, &seed.tab_id, &seed.source_state)
+            .initialize_transfer(&snapshot, &seed.tab_ids, &seed.source_state)
     {
         return Err("The transferred terminal tab no longer exists".into());
     }
@@ -919,7 +935,9 @@ impl CompiApp {
             expanded_workspaces: HashSet::new(),
             tab_drag_origin: None,
             dragging_tab: None,
+            dragging_group: None,
             drag_position: None,
+            tab_strip: Default::default(),
             titlebar_drag: false,
             workspace: Some(snapshot),
             state_slot: Some(Arc::new(Mutex::new(slot))),
@@ -2877,17 +2895,11 @@ impl CompiApp {
                 self.state.select_tab(workspace, &id);
             }
         }
+        self.unfold_for(&id);
         self.workspace_scroll.set_offset(point(px(0.0), px(0.0)));
         self.sync_visible_views();
         self.save_state();
-        if let Some(workspace) = &self.workspace
-            && let Some(session) = self.state.selected_session(workspace)
-        {
-            let index = self
-                .state
-                .visible_tabs(session)
-                .position(|tab| tab.id == id)
-                .unwrap_or(0);
+        if let Some(index) = self.strip_index(&id) {
             self.tab_scroll_handle.scroll_to_item(index);
         }
     }
@@ -3439,6 +3451,11 @@ impl CompiApp {
             tab_index: tab
                 .and_then(|tab| visible.iter().position(|item| item.id == tab.id))
                 .unwrap_or(0),
+            shown_tab_count: session.map_or(0, |session| {
+                self.state.shown_tabs(session).count()
+                    + usize::from(tab.is_some_and(|tab| crate::client_state::folded(session, tab)))
+            }),
+            tab_grouped: tab.is_some_and(|tab| self.tab_group(&tab.id).is_some()),
             has_selection: self
                 .focused_view()
                 .filter(|_| !self.focused_shell_hidden())
@@ -3568,8 +3585,9 @@ impl CompiApp {
             cx.notify();
             return true;
         }
-        if key.key == "escape" && self.dragging_tab.is_some() {
+        if key.key == "escape" && (self.dragging_tab.is_some() || self.dragging_group.is_some()) {
             self.dragging_tab = None;
+            self.dragging_group = None;
             self.tab_drag_origin = None;
             self.drag_position = None;
             cx.notify();
@@ -3824,9 +3842,14 @@ impl CompiApp {
                     .as_ref()
                     .and_then(|workspace| self.state.selected_session(workspace))
                 {
+                    // Folded groups' tabs are skipped; the selected one stays reachable.
                     let tabs: Vec<_> = self
                         .state
                         .visible_tabs(session)
+                        .filter(|tab| {
+                            !crate::client_state::folded(session, tab)
+                                || Some(&tab.id) == tab_id.as_ref()
+                        })
                         .map(|tab| tab.id.clone())
                         .collect();
                     if !tabs.is_empty() {
@@ -3857,32 +3880,56 @@ impl CompiApp {
                 }
             }
             Command::MoveTabLeft | Command::MoveTabRight => {
-                if let (Some(tab_id), Some(session_id)) =
-                    (tab_id, self.state.selected_session.clone())
-                {
-                    let index = self
-                        .workspace
-                        .as_ref()
-                        .and_then(|workspace| {
-                            workspace
-                                .sessions
-                                .iter()
-                                .find(|session| session.id == session_id)
-                        })
-                        .and_then(|session| session.tabs.iter().position(|tab| tab.id == tab_id))
-                        .unwrap_or(0);
+                let chips = self.tab_strip_chips();
+                let step = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| self.state.selected_session(workspace))
+                    .zip(tab_id.as_ref())
+                    .and_then(|(session, tab_id)| {
+                        let (index, group) = tab_groups::keyboard_move(
+                            session,
+                            &chips,
+                            tab_id,
+                            command == Command::MoveTabLeft,
+                        )?;
+                        Some((session.id.clone(), index, group))
+                    });
+                if let (Some(tab_id), Some((session_id, index, group))) = (tab_id, step) {
                     self.mutate(
                         WorkspaceMutation::MoveTab {
                             session_id,
                             tab_id,
-                            index: if command == Command::MoveTabLeft {
-                                index.saturating_sub(1)
-                            } else {
-                                index + 1
-                            },
+                            index,
+                            group,
                         },
                         false,
                     );
+                }
+            }
+            Command::GroupTab => {
+                if let Some(tab_id) = tab_id {
+                    self.choose_tab_group(tab_id);
+                }
+            }
+            Command::RemoveTabFromGroup => {
+                if let Some(tab_id) = tab_id {
+                    self.join_group(tab_id, None);
+                }
+            }
+            Command::RenameTabGroup
+            | Command::ToggleTabGroupFold
+            | Command::UngroupTabGroup
+            | Command::CloseTabGroup
+            | Command::MoveTabGroupToNewWindow => {
+                if let Some(group) = self.selected_group().map(|group| group.id.clone()) {
+                    match command {
+                        Command::RenameTabGroup => self.rename_group(&group),
+                        Command::ToggleTabGroupFold => self.toggle_group_fold(&group),
+                        Command::UngroupTabGroup => self.ungroup(&group),
+                        Command::CloseTabGroup => self.close_group(&group, window, cx),
+                        _ => self.move_group_to_new_window(&group, window, cx),
+                    }
                 }
             }
             Command::DetachTab => {
@@ -3910,7 +3957,7 @@ impl CompiApp {
             }
             Command::MoveTabToNewWindow => {
                 if let Some(tab_id) = tab_id {
-                    self.transfer_tab(tab_id, None, window, cx);
+                    self.transfer_tabs(vec![tab_id], None, window, cx);
                 }
             }
             Command::MoveTabToWindow => self.open_overlay(Overlay::Windows, ""),
@@ -4337,7 +4384,7 @@ impl CompiApp {
             Overlay::ImageInspector => self.dismiss_overlay(),
             Overlay::Text { purpose, .. } => {
                 let label = self.ime_text.trim().to_owned();
-                if label.is_empty() {
+                if label.is_empty() && !purpose.allows_empty() {
                     self.global_error = Some("Enter a non-empty name".into());
                     return;
                 }
@@ -4356,6 +4403,18 @@ impl CompiApp {
                         cx.notify();
                         return;
                     }
+                    TextPurpose::NewTabGroup(tab_id) => {
+                        self.create_group(tab_id, label);
+                        window.focus(&self.focus_handle, cx);
+                        cx.notify();
+                        return;
+                    }
+                    TextPurpose::RenameTabGroup(group_id) => WorkspaceMutation::UpdateTabGroup {
+                        group_id,
+                        name: Some(label),
+                        color: None,
+                        folded: None,
+                    },
                 };
                 self.mutate(operation, true);
             }
@@ -4452,8 +4511,12 @@ impl CompiApp {
                         ChoiceAction::File(path) => self.open_palette_file(path, window, cx),
                         ChoiceAction::Window(handle) => {
                             if let Some(tab) = self.selected_tab().map(|tab| tab.id.clone()) {
-                                self.transfer_tab(tab, Some(handle), window, cx);
+                                self.transfer_tabs(vec![tab], Some(handle), window, cx);
                             }
+                        }
+                        ChoiceAction::NewTabGroup(tab_id) => self.name_new_group(tab_id),
+                        ChoiceAction::JoinTabGroup(tab_id, group_id) => {
+                            self.join_group(tab_id, Some(group_id));
                         }
                         ChoiceAction::Recover(index) => {
                             if let Overlay::Recover { backups } = &other
@@ -4504,6 +4567,10 @@ enum ChoiceAction {
     ArrangementTab(TabId),
     /// A backup in `Overlay::Recover`, by index.
     Recover(usize),
+    /// Name a new group holding the tab.
+    NewTabGroup(TabId),
+    /// Move the tab into the group.
+    JoinTabGroup(TabId, compi_protocol::TabGroupId),
 }
 #[derive(Clone)]
 struct Choice {
@@ -4808,6 +4875,10 @@ impl CompiApp {
                 .is_some_and(|pane| self.state.is_floating(pane))
         {
             "Dock pane"
+        } else if command == Command::ToggleTabGroupFold
+            && self.selected_group().is_some_and(|group| group.folded)
+        {
+            "Unfold tab group"
         } else {
             command.spec().label
         }
@@ -4848,7 +4919,15 @@ impl CompiApp {
                 if let Some(workspace) = &self.workspace {
                     for session in &workspace.sessions {
                         for tab in &session.tabs {
-                            let title = format!("{} / {}", session.label, self.tab_label(tab));
+                            let title = match tab.group.as_ref().and_then(|id| session.group(id)) {
+                                Some(group) => format!(
+                                    "{} / {} / {}",
+                                    session.label,
+                                    tab_groups::group_title(group),
+                                    self.tab_label(tab)
+                                ),
+                                None => format!("{} / {}", session.label, self.tab_label(tab)),
+                            };
                             if (!hidden_only || self.state.hidden_tabs.contains(&tab.id))
                                 && title.to_lowercase().contains(&query)
                             {
@@ -4863,6 +4942,9 @@ impl CompiApp {
                         }
                     }
                 }
+            }
+            Some(Overlay::TabGroups { tab_id }) => {
+                choices = self.tab_group_choices(tab_id, &query);
             }
             Some(Overlay::Windows) => {
                 for handle in cx.windows() {
@@ -4941,6 +5023,7 @@ impl CompiApp {
         }
         self.restart_visible_lost_shell();
         self.prune_tab_menu(window, cx);
+        self.refresh_tab_strip(window);
         if self.rebuild_layout(window, false) {
             let view_id = cx.entity_id();
             window.on_next_frame(move |_, cx| cx.notify(view_id));
@@ -5181,10 +5264,10 @@ impl CompiApp {
             .when(self.overlay.is_some(), |root| {
                 root.child(self.render_overlay(window, cx))
             })
-            .when(
-                self.dragging_tab.is_some() && self.drag_position.is_some(),
-                |root| {
-                    let position = self.drag_position.unwrap();
+            .when_some(
+                self.drag_position
+                    .filter(|_| self.dragging_tab.is_some() || self.dragging_group.is_some()),
+                |root, position| {
                     root.child(
                         div()
                             .absolute()
@@ -5195,7 +5278,11 @@ impl CompiApp {
                             .bg(color(colors.surface))
                             .border_1()
                             .border_color(color(colors.accent))
-                            .child("Move terminal tab"),
+                            .child(if self.dragging_group.is_some() {
+                                "Move tab group"
+                            } else {
+                                "Move terminal tab"
+                            }),
                     )
                 },
             )
@@ -5335,16 +5422,20 @@ impl CompiApp {
         let trailing_width =
             WINDOW_CONTROLS_WIDTH + HEADER_BUTTON_SLOT_WIDTH + metrics.pane_actions_width;
         let tab_region_right = (window_width - trailing_width).max(leading_width);
-        let visible: Vec<_> = self
+        let session = self
             .workspace
             .as_ref()
-            .and_then(|workspace| self.state.selected_session(workspace))
-            .map(|session| self.state.visible_tabs(session).collect())
-            .unwrap_or_default();
+            .and_then(|workspace| self.state.selected_session(workspace));
         // A pane dragged over the tab bar: the tab it would join, or new-tab space.
         let pane_drop = self.pane_drag_tab_target();
         let new_tab_drop = matches!(pane_drop, Some(None));
-        let tabs = visible.into_iter().enumerate().map(|(index, tab)| {
+        let drop_mark = self.strip_drop_mark(window);
+        let chips = &self.tab_strip.chips;
+        // `line`: the tab's group colour, and whether it is the group's last chip.
+        let render_tab = |index: usize,
+                          tab: &WorkspaceTab,
+                          width: f32,
+                          line: Option<(u32, bool)>| {
             let id = tab.id.clone();
             let context_id = id.clone();
             let close_id = id.clone();
@@ -5367,10 +5458,18 @@ impl CompiApp {
             };
             let (tooltip_title, tooltip_detail) =
                 self.tab_tooltip(tab, &full_title, headline.is_some());
+            let tooltip_detail = match self.tab_group(&tab.id).map(tab_groups::group_title) {
+                Some(group) => Some(match tooltip_detail {
+                    Some(detail) => format!("In {group}\n{detail}").into(),
+                    None => format!("In {group}").into(),
+                }),
+                None => tooltip_detail,
+            };
             // Not over its own menu or while the tab is dragged.
             let tooltip = self.tab_menu.is_none()
                 && self.context_menu.is_none()
-                && self.dragging_tab.is_none();
+                && self.dragging_tab.is_none()
+                && self.dragging_group.is_none();
             let program_status =
                 headline.map(|headline| self.program_status_glyph(headline, false));
             div()
@@ -5378,7 +5477,7 @@ impl CompiApp {
                 .group("terminal-tab")
                 .relative()
                 .h_full()
-                .w(px(metrics.tab_width))
+                .w(px(width))
                 .flex_none()
                 .px_3()
                 .flex()
@@ -5510,6 +5609,54 @@ impl CompiApp {
                         ))
                         .child(chrome_icon(ChromeIcon::Close, color(colors.muted))),
                 )
+                .when_some(line, |chip, (tint, last)| {
+                    chip.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right(px(if last { 4.0 } else { 0.0 }))
+                            .bottom_0()
+                            .h(px(2.0))
+                            .bg(color(tint)),
+                    )
+                })
+                .into_any_element()
+        };
+        let tabs = chips.iter().enumerate().filter_map(|(index, placed)| {
+            let session = session?;
+            let width = placed.end - placed.start;
+            let group_of = |id: &TabId| {
+                session
+                    .tabs
+                    .iter()
+                    .find(|tab| &tab.id == id)
+                    .and_then(|tab| tab.group.as_ref())
+            };
+            match &placed.chip {
+                tab_groups::Chip::Tab(id) => {
+                    let tab = session.tabs.iter().find(|tab| &tab.id == id)?;
+                    let line = tab.group.as_ref().and_then(|group| session.group(group)).map(
+                        |group| {
+                            let last = !matches!(
+                                chips.get(index + 1).map(|next| &next.chip),
+                                Some(tab_groups::Chip::Tab(next)) if group_of(next) == Some(&group.id)
+                            );
+                            (self.group_color(group.color), last)
+                        },
+                    );
+                    Some(render_tab(index, tab, width, line))
+                }
+                tab_groups::Chip::Label(id) => {
+                    let group = session.group(id)?;
+                    let count = session
+                        .tabs
+                        .iter()
+                        .filter(|tab| tab.group.as_ref() == Some(id))
+                        .count();
+                    let lit = matches!(&drop_mark, Some(tab_groups::DropMark::Label(lit)) if lit == id);
+                    Some(self.render_group_label(index, group, count, width, lit, cx))
+                }
+            }
         });
         div()
             .h(px(CHROME_HEIGHT))
@@ -5603,15 +5750,15 @@ impl CompiApp {
                         )
                     }),
             )
-            .when(
-                self.drag_position
-                    .is_some_and(|position| f32::from(position.y) <= CHROME_HEIGHT),
-                |bar| {
-                    let x = f32::from(self.drag_position.unwrap().x);
-                    let insertion = (((x - leading_width) / metrics.tab_width).round()
-                        * metrics.tab_width
-                        + leading_width)
-                        .clamp(leading_width, tab_region_right);
+            .when_some(
+                match &drop_mark {
+                    Some(tab_groups::DropMark::Bar(x)) => Some(*x),
+                    _ => None,
+                },
+                |bar, x| {
+                    let insertion =
+                        (leading_width + f32::from(self.tab_scroll_handle.offset().x) + x - 1.0)
+                            .clamp(leading_width, tab_region_right);
                     bar.child(
                         div()
                             .absolute()
@@ -7241,7 +7388,7 @@ impl CompiApp {
                 self.tab_drag_origin = None;
                 self.titlebar_drag = false;
                 start_native_window_move(window);
-            } else if self.dragging_tab.is_some() {
+            } else if self.dragging_tab.is_some() || self.dragging_group.is_some() {
                 self.drag_position = Some(event.position);
             }
             cx.stop_propagation();
@@ -7334,92 +7481,15 @@ impl CompiApp {
         let moved = self.drag_position.take().is_some();
         self.tab_drag_origin = None;
         self.titlebar_drag = false;
-        if let Some(tab_id) = self.dragging_tab.take()
-            && moved
-        {
-            let (viewport_width, viewport_height) = logical_viewport_dimensions(window);
-            let pointer_x = f32::from(event.position.x);
-            let pointer_y = f32::from(event.position.y);
-            let inside = pointer_x >= 0.0
-                && pointer_y >= 0.0
-                && pointer_x < viewport_width
-                && pointer_y < viewport_height;
-            if inside {
-                let leading_width = titlebar_leading_width(window);
-                let header = header_metrics(viewport_width, leading_width);
-                let tab_region_right = viewport_width
-                    - WINDOW_CONTROLS_WIDTH
-                    - HEADER_BUTTON_SLOT_WIDTH
-                    - header.pane_actions_width;
-                if pointer_y <= CHROME_HEIGHT
-                    && pointer_x >= leading_width
-                    && pointer_x < tab_region_right
-                    && let Some(session_id) = self.state.selected_session.clone()
-                {
-                    let x =
-                        pointer_x - leading_width - f32::from(self.tab_scroll_handle.offset().x);
-                    let visible_index = (x / header.tab_width).floor().max(0.0) as usize;
-                    let session = self.workspace.as_ref().and_then(|workspace| {
-                        workspace
-                            .sessions
-                            .iter()
-                            .find(|session| session.id == session_id)
-                    });
-                    let target = session.and_then(|session| {
-                        self.state
-                            .visible_tabs(session)
-                            .nth(visible_index)
-                            .map(|tab| &tab.id)
-                    });
-                    let index = session
-                        .map(|session| {
-                            target
-                                .and_then(|target| {
-                                    session.tabs.iter().position(|tab| &tab.id == target)
-                                })
-                                .unwrap_or(session.tabs.len().saturating_sub(1))
-                        })
-                        .unwrap_or(0);
-                    self.mutate(
-                        WorkspaceMutation::MoveTab {
-                            session_id,
-                            tab_id,
-                            index,
-                        },
-                        false,
-                    );
-                }
-            } else {
-                let global = window.bounds().origin + event.position;
-                let source = Window::window_handle(window);
-                let mut destination = None;
-                for handle in cx.windows() {
-                    if handle == source {
-                        continue;
-                    }
-                    if let Some(typed) = handle.downcast::<CompiApp>() {
-                        let matches = typed
-                            .update(cx, |other, target, _| {
-                                other.target == self.target && target.bounds().contains(&global)
-                            })
-                            .unwrap_or(false);
-                        if matches {
-                            destination = Some(handle);
-                            break;
-                        }
-                    }
-                }
-                self.transfer_tab(tab_id, destination, window, cx);
-            }
-        }
+        self.finish_strip_drag(event.position, moved, window, cx);
         cx.notify();
     }
 
-    /// Moves a tab to another window, once unsaved edits in its content panes (whose
+    /// Moves tabs to another window, once unsaved edits in their content panes (whose
     /// editors live in this window) are saved or dropped.
-    fn transfer_tab(
+    fn transfer_tabs(
         &mut self,
-        tab_id: TabId,
+        tab_ids: Vec<TabId>,
         destination: Option<AnyWindowHandle>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7427,12 +7497,17 @@ impl CompiApp {
         let panes = self
             .workspace
             .as_ref()
-            .map(|workspace| unsaved::tab_panes(workspace, &tab_id))
+            .map(|workspace| {
+                tab_ids
+                    .iter()
+                    .flat_map(|tab_id| unsaved::tab_panes(workspace, tab_id))
+                    .collect()
+            })
             .unwrap_or_default();
         self.guard_unsaved(
             unsaved::CloseScope::Panes(panes),
             unsaved::AfterUnsaved::Transfer {
-                tab_id,
+                tab_ids,
                 destination,
             },
             window,
@@ -7440,9 +7515,11 @@ impl CompiApp {
         );
     }
 
+    /// Moves `tab_ids`, of one workspace, with their live views to `destination` or
+    /// a new window showing only them.
     fn transfer_tab_mode(
         &mut self,
-        tab_id: TabId,
+        tab_ids: Vec<TabId>,
         destination: Option<AnyWindowHandle>,
         activate_destination: bool,
         window: &mut Window,
@@ -7457,17 +7534,24 @@ impl CompiApp {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
-        let Some(tab) = workspace
-            .sessions
+        let tabs: Vec<_> = tab_ids
             .iter()
-            .flat_map(|session| &session.tabs)
-            .find(|tab| tab.id == tab_id)
-        else {
+            .filter_map(|id| {
+                workspace
+                    .sessions
+                    .iter()
+                    .flat_map(|session| &session.tabs)
+                    .find(|tab| &tab.id == id)
+            })
+            .collect();
+        if tabs.is_empty() || tabs.len() != tab_ids.len() {
             self.global_error = Some("The terminal tab no longer exists".into());
             return;
-        };
+        }
         let mut leaves = Vec::new();
-        collect_leaves(&tab.layout, &mut leaves);
+        for tab in &tabs {
+            collect_leaves(&tab.layout, &mut leaves);
+        }
         let surfaces: HashSet<_> = leaves.iter().filter_map(|(_, id)| id.clone()).collect();
         // Resolve creation and all fallible preconditions before releasing a source view.
         let is_new = destination.is_none();
@@ -7482,7 +7566,7 @@ impl CompiApp {
             config.font = self.font_settings.clone();
             let display_appearance = self.accepted_appearance();
             let seed = TransferSeed {
-                tab_id: tab_id.clone(),
+                tab_ids: tab_ids.clone(),
                 source_state: self.state.clone(),
                 display_appearance,
                 display_sidebar_width: self.sidebar_width,
@@ -7517,21 +7601,30 @@ impl CompiApp {
             }
             return;
         }
-        // A shell of this tab waiting in `compi tree` is answered here: the destination
-        // does not know it waits.
-        self.cancel_shell_reply_in(&tab.layout);
+        // A shell of these tabs waiting in `compi tree` is answered here: the
+        // destination does not know it waits.
+        for tab in &tabs {
+            self.cancel_shell_reply_in(&tab.layout);
+        }
         self.report_focus(false);
         let mut transferred = Some(
             self.surface_views
                 .extract_if(.., |view| surfaces.contains(&view.surface_id))
                 .collect::<Vec<_>>(),
         );
-        // Content panes have no view; they move with the tab's layout.
-        let expected_count = surfaces.len();
-        if transferred
-            .as_ref()
-            .is_none_or(|views| views.len() != expected_count)
-        {
+        // Content panes have no view; they move with the tab's layout. Only the tab shown
+        // here has attached views; the other tabs' panes attach in the destination when
+        // it shows them.
+        let mut shown = Vec::new();
+        if let Some(tab) = self.selected_tab().filter(|tab| tab_ids.contains(&tab.id)) {
+            collect_leaves(&tab.layout, &mut shown);
+        }
+        let shown: HashSet<_> = shown.into_iter().filter_map(|(_, id)| id).collect();
+        if transferred.as_ref().is_none_or(|views| {
+            shown
+                .iter()
+                .any(|surface| !views.iter().any(|view| &view.surface_id == surface))
+        }) {
             self.surface_views
                 .extend(transferred.take().unwrap_or_default());
             self.global_error =
@@ -7541,7 +7634,13 @@ impl CompiApp {
             }
             return;
         }
-        let focus = self.state.focused_panes.get(tab_id.as_str()).cloned();
+        // The destination selects the tab selected here, else the first.
+        let selected = self
+            .selected_tab()
+            .map(|tab| tab.id.clone())
+            .filter(|id| tab_ids.contains(id))
+            .unwrap_or_else(|| tab_ids[0].clone());
+        let focus = self.state.focused_panes.get(selected.as_str()).cloned();
         let result = target.update(cx, |other, target_window, target_cx| {
             // Moving existing workers transfers their single controller; no attach, restart,
             // resize or input can interleave across this synchronous UI-thread boundary.
@@ -7572,8 +7671,11 @@ impl CompiApp {
             }
             other.surface_views.extend(views);
             other.workspace = Some(workspace.clone());
-            other.state.restore_tab(&workspace, &tab_id);
-            other.pane_zoom.clear(&tab_id);
+            for tab_id in &tab_ids {
+                other.state.restore_tab(&workspace, tab_id);
+                other.pane_zoom.clear(tab_id);
+            }
+            other.state.select_tab(&workspace, &selected);
             other.zoom_layout = None;
             if let Some(focus) = &focus {
                 other.state.focus_pane(&workspace, focus);
@@ -7610,11 +7712,13 @@ impl CompiApp {
                 let _ = target.update(cx, |_, window, _| window.remove_window());
             }
         } else {
-            self.pane_zoom.clear(&tab_id);
             self.zoom_layout = None;
-            self.state.hide_tab(&workspace, &tab_id);
-            // The destination builds its own editors, restoring any edits from backups.
-            self.release_content_panes(&unsaved::tab_panes(&workspace, &tab_id), cx);
+            for tab_id in &tab_ids {
+                self.pane_zoom.clear(tab_id);
+                self.state.hide_tab(&workspace, tab_id);
+                // The destination builds its own editors, restoring any edits from backups.
+                self.release_content_panes(&unsaved::tab_panes(&workspace, tab_id), cx);
+            }
             self.sync_visible_views();
             self.save_state();
             self.rebuild_layout(window, true);

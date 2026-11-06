@@ -19,8 +19,8 @@ mod view;
 use crate::{DaemonClient, Result, arrangement, config, connection::ConnectionTarget};
 use compi_protocol::{
     LayoutNode, MutationId, MutationRequest, PaneId, ScreenSnapshot, SplitAxis, SurfaceId,
-    SurfaceInfo, SurfaceStatus, WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot,
-    WorkspaceTab,
+    SurfaceInfo, SurfaceStatus, TabGroupColor, TabPlacement, WorkspaceMutation, WorkspaceSession,
+    WorkspaceSnapshot, WorkspaceTab,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const COMMANDS: &[&str] = &[
     "workspace",
     "tab",
+    "group",
     "pane",
     "window",
     "split",
@@ -237,6 +238,8 @@ fn wants_json(raw: &[String]) -> bool {
                 | "--search"
                 | "--source"
                 | "--with"
+                | "--color"
+                | "--into"
         ) {
             args.next();
         }
@@ -450,7 +453,7 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
             }
             "--cwd" | "--name" | "--panes" | "--layout" | "--index" | "--cols" | "--rows"
             | "--text" | "--key" | "--scope" | "--format" | "--history" | "--search"
-            | "--source" => {
+            | "--source" | "--color" | "--into" => {
                 let value = iterator
                     .next()
                     .ok_or_else(|| CliError::usage(format!("{arg} requires a value")))?
@@ -702,22 +705,10 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         },
         "tab" => match action.unwrap() {
             "list" => {
-                let selected = if options.workspace.is_some()
-                    || options.tab.is_some()
-                    || options.pane.is_some()
-                    || options.surface.is_some()
-                {
-                    Some(targets::workspace(&state, options)?.id.clone())
-                } else {
-                    None
-                };
-                let sessions = state
-                    .sessions
-                    .iter()
-                    .filter(|session| selected.as_ref().is_none_or(|id| id == &session.id));
+                let sessions = listed_sessions(&state, options)?;
                 return Ok(Output::Readable {
-                    text: lists::tabs(sessions.clone()),
-                    value: json!(sessions.flat_map(|session| session.tabs.iter().map(move |tab| json!({"workspace_id":session.id,"workspace":session.label,"tab":tab}))).collect::<Vec<_>>()),
+                    text: lists::tabs(sessions.iter().copied()),
+                    value: json!(sessions.iter().flat_map(|session| session.tabs.iter().map(move |tab| json!({"workspace_id":session.id,"workspace":session.label,"tab":tab}))).collect::<Vec<_>>()),
                 });
             }
             "open" => WorkspaceMutation::CreateTab {
@@ -756,6 +747,44 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
                     session_id,
                     tab_id: source_tab.id.clone(),
                     index: number(options, "--index", 0, usize::MAX)?,
+                    group: TabPlacement::Infer,
+                }
+            }
+            "group" => {
+                // Named tabs, else the selected one.
+                let tabs = if options.args.len() > 2 {
+                    options.args[2..]
+                        .iter()
+                        .map(|selector| targets::named_tab(&state, options, selector))
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                } else {
+                    vec![targets::tab(&state, options)?]
+                };
+                let (session, first) = tabs[0];
+                if let Some(selector) = options.values.get("--into") {
+                    WorkspaceMutation::SetTabGroup {
+                        tab_id: first.id.clone(),
+                        group_id: Some(targets::group(&state, options, selector)?.1.id.clone()),
+                    }
+                } else {
+                    WorkspaceMutation::CreateTabGroup {
+                        tab_ids: tabs.iter().map(|(_, tab)| tab.id.clone()).collect(),
+                        name: options.values.get("--name").cloned().unwrap_or_default(),
+                        color: match options.values.get("--color") {
+                            Some(color) => group_color(color)?,
+                            None => TabGroupColor::next_free(&session.groups),
+                        },
+                    }
+                }
+            }
+            "ungroup" => {
+                let tab = match options.args.get(2) {
+                    Some(selector) => targets::named_tab(&state, options, selector)?.1,
+                    None => targets::tab(&state, options)?.1,
+                };
+                WorkspaceMutation::SetTabGroup {
+                    tab_id: tab.id.clone(),
+                    group_id: None,
                 }
             }
             "close" => {
@@ -815,6 +844,50 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
             },
             _ => unreachable!(),
         },
+        "group" => {
+            if action == Some("list") {
+                let sessions = listed_sessions(&state, options)?;
+                return Ok(Output::Readable {
+                    text: lists::groups(sessions.iter().copied()),
+                    value: json!(sessions.iter().flat_map(|session| session.groups.iter().map(move |group| json!({"workspace_id":session.id,"workspace":session.label,"group":group,"tabs":session.tabs.iter().filter(|tab| tab.group.as_ref() == Some(&group.id)).map(|tab| &tab.id).collect::<Vec<_>>()})))
+                        .collect::<Vec<_>>()),
+                });
+            }
+            let (session, group) = targets::group(&state, options, &options.args[2])?;
+            let group_id = group.id.clone();
+            let update = |name: Option<String>, color: Option<TabGroupColor>, folded| {
+                WorkspaceMutation::UpdateTabGroup {
+                    group_id: group_id.clone(),
+                    name,
+                    color,
+                    folded,
+                }
+            };
+            match action.unwrap() {
+                "rename" => update(Some(options.args[3].clone()), None, None),
+                "color" => update(None, Some(group_color(&options.args[3])?), None),
+                "fold" => update(None, None, Some(true)),
+                "unfold" => update(None, None, Some(false)),
+                "move" => WorkspaceMutation::MoveTabGroup {
+                    group_id,
+                    index: number(options, "--index", 0, usize::MAX)?,
+                },
+                "ungroup" => WorkspaceMutation::Ungroup { group_id },
+                "close" => {
+                    confirm_close(
+                        &target,
+                        &state,
+                        session
+                            .tabs
+                            .iter()
+                            .filter(|tab| tab.group.as_ref() == Some(&group_id))
+                            .flat_map(|tab| arrangement::leaves(&tab.layout)),
+                    )?;
+                    WorkspaceMutation::RemoveTabGroup { group_id }
+                }
+                _ => unreachable!(),
+            }
+        }
         "pane" => {
             if matches!(action, Some("list" | "show")) {
                 // Pane rows carry each terminal's current program status.
@@ -1162,6 +1235,21 @@ fn changed(
             [pane] => format!("New pane {pane}"),
             panes => format!("{} new panes: {}", panes.len(), panes.join(", ")),
         },
+        ("tab", "group") if !options.values.contains_key("--into") => {
+            match after
+                .sessions
+                .iter()
+                .flat_map(|session| &session.groups)
+                .find(|group| {
+                    before
+                        .sessions
+                        .iter()
+                        .all(|session| session.group(&group.id).is_none())
+                }) {
+                Some(group) => format!("New group {}", group.id),
+                None => "Done.".to_owned(),
+            }
+        }
         ("tab", "open") => match created.first() {
             Some(pane) => format!("New tab · pane {pane}"),
             None => "New tab.".to_owned(),
@@ -1514,6 +1602,32 @@ fn preset<'a>(
     Ok(arrangement::Preset::Named(shape))
 }
 
+/// The sessions a list covers: the selected workspace when any target is given,
+/// else every workspace.
+fn listed_sessions<'a>(
+    state: &'a WorkspaceSnapshot,
+    options: &Options,
+) -> std::result::Result<Vec<&'a WorkspaceSession>, CliError> {
+    if options.workspace.is_some()
+        || options.tab.is_some()
+        || options.pane.is_some()
+        || options.surface.is_some()
+    {
+        Ok(vec![targets::workspace(state, options)?])
+    } else {
+        Ok(state.sessions.iter().collect())
+    }
+}
+
+fn group_color(value: &str) -> std::result::Result<TabGroupColor, CliError> {
+    TabGroupColor::parse(value).ok_or_else(|| {
+        CliError::usage(format!(
+            "unknown colour {value}; use one of {}",
+            TabGroupColor::ALL.map(TabGroupColor::id).join(", ")
+        ))
+    })
+}
+
 fn required<'a>(options: &'a Options, name: &str) -> std::result::Result<&'a str, CliError> {
     options
         .values
@@ -1644,6 +1758,12 @@ fn validate(
         ("workspace", Some("list" | "show" | "close")) => (2, 2, &[], &[]),
         ("workspace", Some("create" | "rename")) => (3, 3, &[], &[]),
         ("tab", Some("list" | "focus" | "detach" | "close" | "unmerge")) => (2, 2, &[], &[]),
+        ("tab", Some("group")) => (2, usize::MAX, &["--name", "--color", "--into"], &[]),
+        ("tab", Some("ungroup")) => (2, 3, &[], &[]),
+        ("group", Some("list")) => (2, 2, &[], &[]),
+        ("group", Some("rename" | "color")) => (4, 4, &[], &[]),
+        ("group", Some("fold" | "unfold" | "ungroup" | "close")) => (3, 3, &[], &[]),
+        ("group", Some("move")) => (3, 3, &["--index"], &[]),
         ("tab", Some("open")) => (2, 2, &["--cwd", "--name"], &[]),
         ("tab", Some("rename")) => (3, 3, &[], &[]),
         ("tab", Some("move")) => (2, 2, &["--index"], &[]),
@@ -1788,8 +1908,24 @@ fn validate(
             "changes reports this computer's Compi; --connect is not supported",
         ));
     }
-    if command == "tab" && action == Some("move") {
+    if matches!((command, action), ("tab" | "group", Some("move"))) {
         number(options, "--index", 0, usize::MAX)?;
+    }
+    if command == "tab" && action == Some("group") && options.values.contains_key("--into") {
+        if options.args.len() > 3 {
+            return Err(CliError::usage("tab group --into moves one tab"));
+        }
+        if options.values.contains_key("--name") || options.values.contains_key("--color") {
+            return Err(CliError::usage(
+                "--name and --color are for a new group, not with --into",
+            ));
+        }
+    }
+    if let Some(color) = options.values.get("--color") {
+        group_color(color)?;
+    }
+    if command == "group" && action == Some("color") {
+        group_color(&options.args[3])?;
     }
     if command == "pane" && action == Some("resize") {
         if !options.values.contains_key("--cols") && !options.values.contains_key("--rows") {
@@ -2072,6 +2208,65 @@ mod tests {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }
     }
+    #[test]
+    fn tab_groups_take_only_their_arguments() {
+        for accepted in [
+            &["tab", "group"][..],
+            &[
+                "tab", "group", "build", "tests", "--name", "CI", "--color", "Blue",
+            ],
+            &[
+                "--workspace",
+                "work",
+                "tab",
+                "group",
+                "build",
+                "--color",
+                "gray",
+            ],
+            &["tab", "group", "build", "--into", "CI"],
+            &["--tab", "work/build", "tab", "group", "--into", "group-1"],
+            &["tab", "ungroup"],
+            &["tab", "ungroup", "build"],
+            &["group", "list"],
+            &["--json", "group", "list"],
+            &["group", "rename", "CI", "Checks"],
+            &["group", "rename", "CI", ""],
+            &["group", "color", "CI", "magenta"],
+            &["group", "fold", "CI"],
+            &["group", "unfold", "group-1"],
+            &["group", "move", "CI", "--index", "0"],
+            &["group", "ungroup", "CI"],
+            &["group", "close", "CI"],
+        ] {
+            assert!(validated(accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            &["group"][..],
+            &["group", "show", "CI"],
+            &["group", "list", "CI"],
+            &["group", "rename", "CI"],
+            &["group", "color", "CI", "purple"],
+            &["group", "fold"],
+            &["group", "fold", "CI", "--index", "1"],
+            &["group", "move", "CI"],
+            &["group", "move", "CI", "--index", "-1"],
+            &["group", "close", "CI", "extra"],
+            &["tab", "group", "--color", "orange"],
+            &["tab", "group", "a", "b", "--into", "CI"],
+            &["tab", "group", "--into", "CI", "--name", "x"],
+            &["tab", "group", "--into", "CI", "--color", "red"],
+            &["tab", "group", "--index", "1"],
+            &["tab", "ungroup", "a", "b"],
+            &["tab", "ungroup", "--name", "x"],
+            &["tab", "move", "--index", "1", "--color", "red"],
+        ] {
+            assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
+        }
+        // --color and --into take values, so neither is the output mode.
+        let args = ["tab", "group", "--into", "--json"].map(str::to_owned);
+        assert!(!wants_json(&args));
+    }
     fn validated(args: &[&str]) -> std::result::Result<Options, CliError> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
         assert_eq!(classify(&args, |_| false), Invocation::Cli);
@@ -2325,11 +2520,13 @@ mod tests {
             },
             previous_layout: None,
             merge: None,
+            group: None,
         };
         let session = WorkspaceSession {
             id: SessionId::new("session-1"),
             label: "Default".into(),
             tabs: vec![tab.clone()],
+            groups: Vec::new(),
         };
 
         let row = content_row(&session, &tab, &PaneId::new("files"), &files);

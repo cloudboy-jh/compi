@@ -524,7 +524,18 @@ impl CompiApp {
                 let panes = self.tab_panes(tab);
                 let label = self.tab_label(tab);
                 let hidden = self.state.hidden_tabs.contains(&tab.id);
-                let mut haystack = format!("{} {label}", session.label);
+                // The workspace, and the tab's group, give the tab its context.
+                let context = match tab.group.as_ref().and_then(|id| session.group(id)) {
+                    Some(group) => {
+                        format!(
+                            "{} · {}",
+                            session.label,
+                            super::tab_groups::group_title(group)
+                        )
+                    }
+                    None => session.label.clone(),
+                };
+                let mut haystack = format!("{context} {label}");
                 for pane in &panes {
                     haystack.push(' ');
                     haystack.push_str(&pane.title);
@@ -539,9 +550,9 @@ impl CompiApp {
                     pane_id: None,
                     title: label.clone(),
                     detail: if status.is_empty() {
-                        session.label.clone()
+                        context
                     } else {
-                        format!("{} · {status}", session.label)
+                        format!("{context} · {status}")
                     },
                     haystack,
                     hidden,

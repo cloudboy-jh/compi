@@ -925,7 +925,11 @@ struct CompiApp {
     expanded_workspaces: HashSet<SessionId>,
     tab_drag_origin: Option<Point<Pixels>>,
     dragging_tab: Option<TabId>,
+    /// A group label picked up in the tab strip; let go without dragging, it folds.
+    dragging_group: Option<compi_protocol::TabGroupId>,
     drag_position: Option<Point<Pixels>>,
+    /// The tab strip's chips as this frame lays them out; see `workspace::tab_groups`.
+    tab_strip: workspace::tab_groups::TabStrip,
     titlebar_drag: bool,
     workspace: Option<WorkspaceSnapshot>,
     state_slot: Option<Arc<Mutex<StateSlot>>>,
