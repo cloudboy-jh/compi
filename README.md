@@ -2,7 +2,7 @@
 
 # Compi
 
-**A workspace for your software factory.**
+**A workspace for you and your agents.**
 
 Compi is a native terminal workspace for Windows (WSL2) and macOS. Run your preferred agents, write instructions in Markdown, review diffs and inspect your app beside its running terminals.
 
