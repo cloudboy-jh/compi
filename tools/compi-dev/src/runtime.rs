@@ -31,8 +31,14 @@ pub struct Options {
 }
 
 pub fn run(options: Options) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        return run_on_windows(&options);
+    }
     if !cfg!(any(windows, target_os = "macos")) {
-        return Err("`cargo dev` runs the native client, which exists on Windows and macOS".into());
+        return Err(
+            "the preview is the native client, which runs on Windows and macOS only".into(),
+        );
     }
     let layout = Layout::discover()?;
     layout.prepare()?;
@@ -111,6 +117,45 @@ pub fn run(options: Options) -> Result<(), String> {
         Err(_) => println!("Preview closed."),
     }
     process::shutdown_done();
+    Ok(())
+}
+
+/// Inside WSL the preview is the Windows client, so `cargo dev` runs as Windows' own
+/// `cargo dev` on the same checkout, which WSL starts in the matching Windows folder.
+#[cfg(target_os = "linux")]
+fn run_on_windows(options: &Options) -> Result<(), String> {
+    let here = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut parts = here.components().skip(1);
+    let on_windows_drive = parts.next().is_some_and(|part| part.as_os_str() == "mnt")
+        && parts.next().is_some_and(|part| {
+            let drive = part.as_os_str().as_encoded_bytes();
+            drive.len() == 1 && drive[0].is_ascii_alphabetic()
+        });
+    if !on_windows_drive {
+        return Err(format!(
+            "{} is in WSL's own file system; the preview is a Windows program, so run \
+             `cargo dev` from a checkout on a Windows drive (/mnt/c/…)",
+            here.display()
+        ));
+    }
+    let mut command = Command::new("cargo.exe");
+    command.arg("dev");
+    if options.stop {
+        command.arg("--stop");
+    }
+    let status = command.status().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "cargo.exe is not on PATH; install Rust on Windows, or run `cargo dev` in \
+             PowerShell"
+                .to_owned()
+        } else {
+            format!("could not start Windows' cargo.exe: {error}")
+        }
+    })?;
+    // Windows' runner has already said what went wrong.
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
     Ok(())
 }
 
