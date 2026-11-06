@@ -38,9 +38,56 @@ pub enum BuildOutcome {
     Interrupted,
 }
 
+/// What the runner reports; the runtime decides how it reads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Note {
+    /// The runner's own sources changed; it runs its old build until restarted.
+    RunnerChanged,
+    PreviewAlreadyOpen,
+    /// Reopen asked for with no dev daemon running.
+    NoDaemon,
+    /// Reopen asked for, but no client build speaks the running daemon's protocol.
+    NoCompatibleClient,
+    /// A restart refused because this build fails.
+    RestartBlocked(Target),
+    Restarting,
+    DaemonStopped {
+        shells: usize,
+    },
+    DaemonStopFailed(String),
+    DaemonStartFailed(String),
+    /// No daemon runs and none has built yet.
+    DaemonWaitsForBuild,
+    Building(Target),
+    Built {
+        target: Target,
+        elapsed: Duration,
+        warnings: usize,
+    },
+    BuildFailed {
+        target: Target,
+        diagnostics: String,
+    },
+    StageFailed(String),
+    PreviewStarting {
+        refresh: bool,
+    },
+    PreviewReady {
+        refresh: bool,
+        elapsed: Duration,
+    },
+    PreviewFailed(String),
+    /// Daemon sources changed while the running daemon speaks the same protocol.
+    DaemonStale,
+    /// The new client speaks another protocol than the running daemon.
+    ProtocolHold {
+        preview_open: bool,
+    },
+}
+
 /// Side effects, separated so the decision logic is testable without processes.
 pub trait Effects {
-    fn say(&mut self, line: &str);
+    fn note(&mut self, note: Note);
     fn build(&mut self, target: Target) -> BuildOutcome;
     /// Copy the fresh daemon build aside. Never touches the running daemon.
     fn stage_daemon(&mut self) -> Result<(), String>;
@@ -113,7 +160,7 @@ impl Controller {
     pub fn sync(&mut self, current: &Fingerprints, effects: &mut impl Effects) -> Sync {
         if current.runner != self.runner_at_start && !self.runner_notice {
             self.runner_notice = true;
-            effects.say("Runner sources changed — restart `cargo dev` to use them");
+            effects.note(Note::RunnerChanged);
         }
         let client_ready = self.ensure_client(current, effects);
         if self.daemon.installed.map(|stamp| stamp.daemon) != Some(current.daemon) {
@@ -137,16 +184,16 @@ impl Controller {
     /// Reopen the preview after it was closed, without rebuilding.
     pub fn reopen(&mut self, effects: &mut impl Effects) {
         if effects.preview_running() {
-            effects.say("Preview is already open");
+            effects.note(Note::PreviewAlreadyOpen);
             return;
         }
         if !effects.daemon_running() {
-            effects.say("Dev daemon is not running; save a file or press r⏎ to start it");
+            effects.note(Note::NoDaemon);
             return;
         }
         let install = self.compatible_build() && self.fresh_build();
         if !install && self.client.live.is_none() {
-            effects.say("No client build compatible with the running dev daemon yet");
+            effects.note(Note::NoCompatibleClient);
             return;
         }
         self.launch(install, effects);
@@ -166,25 +213,22 @@ impl Controller {
         } else if self.daemon.staged == Some(current.daemon) {
             Some(fresh)
         } else {
-            effects.say("Daemon build is failing — fix it before restarting the dev daemon");
+            effects.note(Note::RestartBlocked(Target::Daemon));
             return;
         };
         let protocol_changes =
             self.daemon.installed.map(|stamp| stamp.protocol) != Some(current.protocol);
         if protocol_changes && !self.ensure_client(current, effects) {
-            effects.say("Client build is failing — fix it before restarting the dev daemon");
+            effects.note(Note::RestartBlocked(Target::Client));
             return;
         }
-        effects.say("Restarting dev daemon…");
+        effects.note(Note::Restarting);
         effects.stop_preview();
         if effects.daemon_running() {
             match effects.stop_daemon() {
-                Ok(shells) => effects.say(&format!(
-                    "Dev daemon stopped ({} ended)",
-                    count(shells, "dev shell")
-                )),
+                Ok(shells) => effects.note(Note::DaemonStopped { shells }),
                 Err(error) => {
-                    effects.say(&format!("Could not stop dev daemon: {error}"));
+                    effects.note(Note::DaemonStopFailed(error));
                     self.client.live = None;
                     self.relaunch_compatible(effects);
                     return;
@@ -192,7 +236,7 @@ impl Controller {
             }
         }
         if let Err(error) = effects.start_daemon(install) {
-            effects.say(&format!("Could not start dev daemon: {error}"));
+            effects.note(Note::DaemonStartFailed(error));
             return;
         }
         if let Some(stamp) = install {
@@ -215,18 +259,14 @@ impl Controller {
     }
 
     fn launch(&mut self, install: bool, effects: &mut impl Effects) -> Sync {
-        let action = if effects.preview_running() {
-            "Refreshing preview…"
-        } else {
-            "Launching preview…"
-        };
-        effects.say(action);
+        let refresh = effects.preview_running();
+        effects.note(Note::PreviewStarting { refresh });
         match effects.launch_preview(install) {
             Ok(elapsed) => {
                 if install {
                     self.client.live = self.built_client();
                 }
-                effects.say(&format!("Preview ready in {}", seconds(elapsed)));
+                effects.note(Note::PreviewReady { refresh, elapsed });
                 Sync {
                     preview_replaced: true,
                 }
@@ -235,7 +275,7 @@ impl Controller {
                 if install {
                     self.client.rejected = self.built_client();
                 }
-                effects.say(&format!("Preview failed to start: {error}"));
+                effects.note(Note::PreviewFailed(error));
                 Sync::default()
             }
         }
@@ -261,7 +301,7 @@ impl Controller {
         match self.build(Target::Daemon, effects) {
             Some(true) => match effects.stage_daemon() {
                 Ok(()) => self.daemon.staged = Some(current.daemon),
-                Err(error) => effects.say(&format!("Could not stage daemon build: {error}")),
+                Err(error) => effects.note(Note::StageFailed(error)),
             },
             Some(false) => {}
             None => return,
@@ -271,29 +311,21 @@ impl Controller {
 
     /// `None` when the build was interrupted, so the same inputs are attempted again.
     fn build(&mut self, target: Target, effects: &mut impl Effects) -> Option<bool> {
-        effects.say(&format!("Building {}…", target.label()));
+        effects.note(Note::Building(target));
         match effects.build(target) {
             BuildOutcome::Built { elapsed, warnings } => {
-                let warnings = match warnings {
-                    0 => String::new(),
-                    1 => " (1 warning)".to_owned(),
-                    count => format!(" ({count} warnings)"),
-                };
-                effects.say(&format!(
-                    "Built {} in {}{warnings}",
-                    target.label(),
-                    seconds(elapsed)
-                ));
+                effects.note(Note::Built {
+                    target,
+                    elapsed,
+                    warnings,
+                });
                 Some(true)
             }
             BuildOutcome::Failed(diagnostics) => {
-                effects.say(&match target {
-                    Target::Client => "Build failed — keeping previous preview running".to_owned(),
-                    Target::Daemon => {
-                        "Daemon build failed — dev daemon keeps running unchanged".to_owned()
-                    }
+                effects.note(Note::BuildFailed {
+                    target,
+                    diagnostics,
                 });
-                effects.say(diagnostics.trim_end());
                 Some(false)
             }
             BuildOutcome::Interrupted => None,
@@ -315,7 +347,7 @@ impl Controller {
         } else if self.daemon.installed.is_some() {
             None
         } else {
-            effects.say("Dev daemon cannot start until its build succeeds");
+            effects.note(Note::DaemonWaitsForBuild);
             return false;
         };
         match effects.start_daemon(install) {
@@ -326,7 +358,7 @@ impl Controller {
                 true
             }
             Err(error) => {
-                effects.say(&format!("Could not start dev daemon: {error}"));
+                effects.note(Note::DaemonStartFailed(error));
                 false
             }
         }
@@ -344,10 +376,7 @@ impl Controller {
             return;
         }
         self.stale_notice = Some(current.daemon);
-        effects.say(
-            "Daemon sources changed — the running dev daemon is stale; shells keep running. \
-             Press r⏎ to restart it (ends dev shells).",
-        );
+        effects.note(Note::DaemonStale);
     }
 
     fn notify_hold(&mut self, current: &Fingerprints, effects: &mut impl Effects) {
@@ -356,15 +385,8 @@ impl Controller {
             return;
         }
         self.hold_notice = Some(key);
-        let preview = if effects.preview_running() {
-            "keeping the current preview"
-        } else {
-            "not opening a preview"
-        };
-        effects.say(&format!(
-            "Protocol changed — {preview} because the new client cannot talk to the running dev \
-             daemon. Press r⏎ to restart the dev daemon (ends dev shells)."
-        ));
+        let preview_open = effects.preview_running();
+        effects.note(Note::ProtocolHold { preview_open });
     }
 
     fn built_client(&self) -> Option<Digest> {
@@ -403,7 +425,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         log: Vec<String>,
-        said: Vec<String>,
+        said: Vec<Note>,
         failures: VecDeque<Target>,
         daemon_running: bool,
         preview_running: bool,
@@ -419,14 +441,14 @@ mod tests {
         fn take(&mut self) -> Vec<String> {
             std::mem::take(&mut self.log)
         }
-        fn heard(&self, text: &str) -> bool {
-            self.said.iter().any(|line| line.contains(text))
+        fn heard(&self, wanted: impl Fn(&Note) -> bool) -> bool {
+            self.said.iter().any(wanted)
         }
     }
 
     impl Effects for Fake {
-        fn say(&mut self, line: &str) {
-            self.said.push(line.to_owned());
+        fn note(&mut self, note: Note) {
+            self.said.push(note);
         }
         fn build(&mut self, target: Target) -> BuildOutcome {
             self.log.push(format!("build {}", target.label()));
@@ -555,8 +577,11 @@ mod tests {
         assert!(!sync.preview_replaced);
         assert_eq!(fake.take(), ["build client"]);
         assert!(fake.preview_running);
-        assert!(fake.heard("Build failed — keeping previous preview running"));
-        assert!(fake.heard("mismatched types"));
+        assert!(fake.heard(|note| matches!(
+            note,
+            Note::BuildFailed { target: Target::Client, diagnostics }
+                if diagnostics.contains("mismatched types")
+        )));
 
         // An unrelated poll with the same broken sources does not rebuild.
         controller.sync(&sources(2, 1, 1), &mut fake);
@@ -584,13 +609,13 @@ mod tests {
         controller.sync(&sources(1, 2, 1), &mut fake);
         assert_eq!(fake.take(), ["build daemon", "stage daemon"]);
         assert!(fake.daemon_running && fake.preview_running);
-        assert!(fake.heard("dev daemon is stale"));
+        assert!(fake.heard(|note| *note == Note::DaemonStale));
 
         // Further client work continues against the stale daemon; warning is not repeated.
         fake.said.clear();
         controller.sync(&sources(2, 2, 1), &mut fake);
         assert_eq!(fake.take(), ["build client", "launch preview install=true"]);
-        assert!(!fake.heard("stale"));
+        assert!(!fake.heard(|note| *note == Note::DaemonStale));
     }
 
     #[test]
@@ -605,7 +630,7 @@ mod tests {
             ["build client", "build daemon", "stage daemon"]
         );
         assert!(fake.preview_running && fake.daemon_running);
-        assert!(fake.heard("Protocol changed — keeping the current preview"));
+        assert!(fake.heard(|note| *note == Note::ProtocolHold { preview_open: true }));
 
         controller.restart_daemon(&changed, &mut fake);
         assert_eq!(
@@ -617,7 +642,7 @@ mod tests {
                 "launch preview install=true",
             ]
         );
-        assert!(fake.heard("2 dev shells ended"));
+        assert!(fake.heard(|note| *note == Note::DaemonStopped { shells: 2 }));
 
         // Now in step: ordinary client edits swap again.
         controller.sync(&sources(2, 1, 2), &mut fake);
@@ -646,7 +671,7 @@ mod tests {
         controller.restart_daemon(&sources(1, 2, 1), &mut fake);
         assert!(fake.take().is_empty(), "no stop without a good replacement");
         assert!(fake.daemon_running && fake.preview_running);
-        assert!(fake.heard("Daemon build is failing"));
+        assert!(fake.heard(|note| *note == Note::RestartBlocked(Target::Daemon)));
     }
 
     #[test]
@@ -673,7 +698,9 @@ mod tests {
         let sync = controller.sync(&sources(2, 1, 1), &mut fake);
         assert!(!sync.preview_replaced);
         assert_eq!(fake.take(), ["build client", "launch preview install=true"]);
-        assert!(fake.heard("previous preview restored"));
+        assert!(fake.heard(
+            |note| matches!(note, Note::PreviewFailed(error) if error.contains("previous preview restored"))
+        ));
 
         // An unrelated daemon edit must not retry the crashing build.
         controller.sync(&sources(2, 2, 1), &mut fake);
@@ -693,15 +720,15 @@ mod tests {
 
         controller.reopen(&mut fake);
         assert!(fake.take().is_empty());
-        assert!(fake.heard("already open"));
+        assert!(fake.heard(|note| *note == Note::PreviewAlreadyOpen));
     }
 
     #[test]
     fn interrupted_build_is_silent_and_retried_on_next_change() {
         struct Interrupting(Fake);
         impl Effects for Interrupting {
-            fn say(&mut self, line: &str) {
-                self.0.say(line)
+            fn note(&mut self, note: Note) {
+                self.0.note(note)
             }
             fn build(&mut self, target: Target) -> BuildOutcome {
                 self.0.log.push(format!("build {}", target.label()));
@@ -734,7 +761,11 @@ mod tests {
         let mut interrupting = Interrupting(fake);
         controller.sync(&sources(2, 1, 1), &mut interrupting);
         assert_eq!(interrupting.0.take(), ["build client"]);
-        assert!(!interrupting.0.heard("failed"));
+        assert!(
+            !interrupting
+                .0
+                .heard(|note| matches!(note, Note::BuildFailed { .. }))
+        );
         controller.sync(&sources(2, 1, 1), &mut interrupting);
         assert_eq!(interrupting.0.take(), ["build client"]);
     }

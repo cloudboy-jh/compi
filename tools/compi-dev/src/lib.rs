@@ -5,6 +5,7 @@ mod cargo;
 pub mod classify;
 pub mod controller;
 pub mod layout;
+mod log;
 mod process;
 mod runtime;
 pub mod watch;

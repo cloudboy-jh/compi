@@ -2,17 +2,20 @@
 
 use crate::cargo;
 use crate::classify::Component;
-use crate::controller::{BuildOutcome, Controller, DaemonStamp, Effects, Target, count, seconds};
+use crate::controller::{
+    BuildOutcome, Controller, DaemonStamp, Effects, Note, Target, count, seconds,
+};
 use crate::layout::{INSTANCE, Layout, executable, is_within, same_file};
+use crate::log::{self, Tag, Tone};
 use crate::process;
-use crate::watch::{Debouncer, Tree, earliest};
+use crate::watch::{Debouncer, Tree};
 use compi_protocol::{ConnectionFailure, ConnectionFailureKind, DaemonClient, LocalDaemonProcess};
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(150);
 const QUIET: Duration = Duration::from_millis(250);
@@ -53,11 +56,8 @@ pub fn run(options: Options) -> Result<(), String> {
         return stop(layout, shared_data);
     }
     process::install_interrupt_handler();
-
-    println!(
-        "Compi dev · instance {INSTANCE} · runtime {}",
-        relative(&layout.root, &layout.workspace)
-    );
+    log::init();
+    log::header(INSTANCE, &relative(&layout.root, &layout.workspace));
     let mut dev = Dev::new(layout, shared_data);
     dev.stop_strays();
     dev.close_stale_previews();
@@ -66,55 +66,56 @@ pub fn run(options: Options) -> Result<(), String> {
     let mut controller = Controller::new(&tree.fingerprints(), installed);
     controller.sync(&tree.fingerprints(), &mut dev);
     if !process::interrupted() {
-        println!("Watching sources · ⏎ reopen preview · r⏎ restart dev daemon · q⏎ quit");
+        log::line(Tag::Dev, Tone::Quiet, "watching sources");
     }
 
     let commands = spawn_command_reader();
     let mut debouncer = Debouncer::new(QUIET, BURST_LIMIT);
     let mut batch = Vec::new();
-    let mut saved_at: Option<SystemTime> = None;
     while !process::interrupted() {
         match commands.recv_timeout(POLL) {
             Ok(Request::Quit) => break,
             Ok(Request::Restart) => controller.restart_daemon(&tree.fingerprints(), &mut dev),
             Ok(Request::Reopen) => controller.reopen(&mut dev),
-            Ok(Request::Unknown(text)) => {
-                println!(
-                    "Unknown command {text:?} · ⏎ reopen preview · r⏎ restart dev daemon · q⏎ quit"
-                )
-            }
+            Ok(Request::Unknown(text)) => log::line(
+                Tag::Dev,
+                Tone::Warn,
+                &format!(
+                    "unknown command {text:?} · ⏎ reopen preview · r⏎ restart dev daemon · q⏎ quit"
+                ),
+            ),
             Err(_) => {}
         }
         let changes = tree.refresh();
         if !changes.paths.is_empty() {
             debouncer.record(Instant::now());
-            saved_at = earliest(saved_at, changes.saved_at);
+            log::saved(changes.saved_at);
             batch.extend(changes.paths);
         }
         if debouncer.due(Instant::now()) {
             debouncer.reset();
             if let Some(summary) = describe(&batch) {
-                println!("{summary}");
+                log::line(Tag::Change, Tone::Plain, &summary);
             }
             batch.clear();
-            let sync = controller.sync(&tree.fingerprints(), &mut dev);
-            if sync.preview_replaced
-                && let Some(elapsed) = saved_at.and_then(|saved| saved.elapsed().ok())
-            {
-                println!("Save → visible preview: {}", seconds(elapsed));
-            }
-            saved_at = None;
+            controller.sync(&tree.fingerprints(), &mut dev);
+            log::forget_save();
         }
         dev.notice_closed_preview();
     }
 
     controller.shutdown(&mut dev);
-    match DaemonClient::lifecycle_status(Some(INSTANCE)) {
-        Ok(status) => println!(
-            "Preview closed. Dev daemon keeps running with {} — `cargo dev --stop` ends it.",
-            count(status.live_surfaces.len(), "shell")
-        ),
-        Err(_) => println!("Preview closed."),
+    log::finish();
+    log::line(Tag::Preview, Tone::Plain, "closed");
+    if let Ok(status) = DaemonClient::lifecycle_status(Some(INSTANCE)) {
+        log::line(
+            Tag::Daemon,
+            Tone::Plain,
+            &format!(
+                "keeps running · {} · `cargo dev --stop` ends it",
+                count(status.live_surfaces.len(), "shell")
+            ),
+        );
     }
     process::shutdown_done();
     Ok(())
@@ -162,15 +163,17 @@ fn run_on_windows(options: &Options) -> Result<(), String> {
 /// `cargo dev --stop`: close dev previews and stray checkout instances, then deliberately
 /// end the dev daemon.
 fn stop(layout: Layout, shared_data: Option<PathBuf>) -> Result<(), String> {
+    log::init();
     let mut dev = Dev::new(layout, shared_data);
     dev.stop_strays();
     dev.close_stale_previews();
     if !dev.daemon_running() {
-        println!("Dev daemon is not running.");
+        log::line(Tag::Daemon, Tone::Plain, "not running");
         return Ok(());
     }
-    let shells = dev.stop_daemon()?;
-    println!("Dev daemon stopped ({} ended).", count(shells, "dev shell"));
+    log::progress(Tag::Daemon, "stopping…");
+    let shells = dev.stop_daemon().inspect_err(|_| log::finish())?;
+    render(Note::DaemonStopped { shells });
     Ok(())
 }
 
@@ -212,7 +215,11 @@ impl Dev {
                     .as_deref()
                     .is_some_and(|path| is_stray(path, &target, &own_client))
                 {
-                    self.say(&format!("Closing stray preview (pid {pid})"));
+                    log::line(
+                        Tag::Dev,
+                        Tone::Plain,
+                        &format!("closing stray preview · pid {pid}"),
+                    );
                     process::close_pid(pid, CLOSE_GRACE);
                 }
             }
@@ -220,7 +227,11 @@ impl Dev {
         let daemons = match compi_protocol::local_daemon_processes() {
             Ok(daemons) => daemons,
             Err(error) => {
-                self.say(&format!("Could not check for stray Compi daemons: {error}"));
+                log::line(
+                    Tag::Dev,
+                    Tone::Warn,
+                    &format!("could not check for stray daemons · {error}"),
+                );
                 return;
             }
         };
@@ -233,10 +244,14 @@ impl Dev {
                 Some(shells) => count(shells, "shell"),
                 None => "its shells".into(),
             };
-            self.say(&format!(
-                "Stopped stray dev instance `{name}` (pid {}, ended {ended})",
-                daemon.pid
-            ));
+            log::line(
+                Tag::Dev,
+                Tone::Plain,
+                &format!(
+                    "stopped stray instance `{name}` · pid {} · ended {ended}",
+                    daemon.pid
+                ),
+            );
         }
     }
 
@@ -258,11 +273,15 @@ impl Dev {
                         status.daemon_executable
                     ));
                 }
-                self.say(&format!(
-                    "Reattached to dev daemon (pid {}, {})",
-                    status.daemon_pid,
-                    count(status.live_surfaces.len(), "shell")
-                ));
+                log::line(
+                    Tag::Daemon,
+                    Tone::Plain,
+                    &format!(
+                        "reattached · pid {} · {}",
+                        status.daemon_pid,
+                        count(status.live_surfaces.len(), "shell")
+                    ),
+                );
                 Ok(stamp)
             }
             Err(error)
@@ -281,7 +300,11 @@ impl Dev {
         let own = self.preview.as_ref().map(|preview| preview.child.id());
         for (pid, _) in live_hosts(&self.layout.data.join("update-gui-hosts-v1")) {
             if Some(pid) != own {
-                self.say(&format!("Closing previous dev preview (pid {pid})"));
+                log::line(
+                    Tag::Dev,
+                    Tone::Plain,
+                    &format!("closing previous preview · pid {pid}"),
+                );
                 process::close_pid(pid, CLOSE_GRACE);
             }
         }
@@ -292,7 +315,11 @@ impl Dev {
             && preview.child.try_wait().ok().flatten().is_some()
         {
             self.preview = None;
-            self.say("Preview closed — dev daemon and shells keep running. Press ⏎ to reopen.");
+            log::line(
+                Tag::Preview,
+                Tone::Plain,
+                "closed · dev daemon and shells keep running · ⏎ reopens it",
+            );
         }
     }
 
@@ -312,7 +339,7 @@ impl Dev {
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    eprintln!("  client │ {line}");
+                    log::output(Tag::Client, &line);
                 }
             });
         }
@@ -399,8 +426,8 @@ impl ReadySignal {
 }
 
 impl Effects for Dev {
-    fn say(&mut self, line: &str) {
-        println!("{line}");
+    fn note(&mut self, note: Note) {
+        render(note);
     }
 
     fn build(&mut self, target: Target) -> BuildOutcome {
@@ -462,7 +489,11 @@ impl Effects for Dev {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if self.daemon_running() {
-                self.say(&format!("Dev daemon started (pid {})", daemon.id()));
+                log::line(
+                    Tag::Daemon,
+                    Tone::Plain,
+                    &format!("started · pid {}", daemon.id()),
+                );
                 daemon.release();
                 return Ok(());
             }
@@ -715,7 +746,7 @@ fn parse_request(line: &str) -> Request {
     }
 }
 
-/// One line naming what changed, e.g. `UI change: workspace.rs (+1 more)`. Runner-only
+/// What changed, e.g. `workspace.rs +1 · ui`, naming the most disruptive kind. Runner-only
 /// edits get none: the controller's one-time restart notice covers them.
 fn describe(paths: &[String]) -> Option<String> {
     let unique: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
@@ -724,13 +755,13 @@ fn describe(paths: &[String]) -> Option<String> {
         .flat_map(|path| crate::classify::classify(path).iter().copied())
         .collect();
     let kind = if components.contains(&Component::Protocol) {
-        "Protocol change"
+        "protocol"
     } else if components.contains(&Component::Daemon) && components.contains(&Component::Client) {
-        "Client + daemon change"
+        "client + daemon"
     } else if components.contains(&Component::Daemon) {
-        "Daemon change"
+        "daemon"
     } else if components.contains(&Component::Client) {
-        "UI change"
+        "ui"
     } else {
         return None;
     };
@@ -740,9 +771,141 @@ fn describe(paths: &[String]) -> Option<String> {
         .map(|path| path.rsplit('/').next().unwrap_or(path))
         .unwrap_or_default();
     Some(match unique.len() {
-        0 | 1 => format!("{kind}: {first}"),
-        count => format!("{kind}: {first} (+{} more)", count - 1),
+        0 | 1 => format!("{first} · {kind}"),
+        count => format!("{first} +{} · {kind}", count - 1),
     })
+}
+
+fn render(note: Note) {
+    let restart = "r⏎ restarts the dev daemon (ends dev shells)";
+    let (tag, tone, text) = match note {
+        Note::RunnerChanged => (
+            Tag::Dev,
+            Tone::Warn,
+            "runner sources changed · restart `cargo dev` to use them".to_owned(),
+        ),
+        Note::PreviewAlreadyOpen => (Tag::Preview, Tone::Plain, "already open".to_owned()),
+        Note::NoDaemon => (
+            Tag::Daemon,
+            Tone::Warn,
+            "not running · save a file or press r⏎ to start it".to_owned(),
+        ),
+        Note::NoCompatibleClient => (
+            Tag::Preview,
+            Tone::Warn,
+            "no client build speaks the running daemon's protocol yet".to_owned(),
+        ),
+        Note::RestartBlocked(target) => (
+            target_tag(target),
+            Tone::Error,
+            "build failing · fix it before restarting the dev daemon".to_owned(),
+        ),
+        Note::Restarting => return log::progress(Tag::Daemon, "restarting…"),
+        Note::DaemonStopped { shells } => (
+            Tag::Daemon,
+            Tone::Plain,
+            format!("stopped · ended {}", count(shells, "dev shell")),
+        ),
+        Note::DaemonStopFailed(error) => (
+            Tag::Daemon,
+            Tone::Error,
+            format!("could not stop · {error}"),
+        ),
+        Note::DaemonStartFailed(error) => (
+            Tag::Daemon,
+            Tone::Error,
+            format!("could not start · {error}"),
+        ),
+        Note::DaemonWaitsForBuild => (
+            Tag::Daemon,
+            Tone::Warn,
+            "cannot start until its build succeeds".to_owned(),
+        ),
+        Note::Building(target) => return log::progress(target_tag(target), "building…"),
+        Note::Built {
+            target,
+            elapsed,
+            warnings,
+        } => {
+            let mut text = format!("built · {}", seconds(elapsed));
+            if warnings > 0 {
+                text.push_str(&format!(" · {}", count(warnings, "warning")));
+            }
+            let tone = if warnings > 0 {
+                Tone::Warn
+            } else {
+                Tone::Plain
+            };
+            (target_tag(target), tone, text)
+        }
+        Note::BuildFailed {
+            target,
+            diagnostics,
+        } => {
+            let kept = match target {
+                Target::Client => "preview unchanged",
+                Target::Daemon => "dev daemon unchanged",
+            };
+            log::line(
+                target_tag(target),
+                Tone::Error,
+                &format!("build failed · {kept}"),
+            );
+            return log::detail(diagnostics.trim_end());
+        }
+        Note::StageFailed(error) => (
+            Tag::Daemon,
+            Tone::Error,
+            format!("could not stage build · {error}"),
+        ),
+        Note::PreviewStarting { refresh } => {
+            return log::progress(
+                Tag::Preview,
+                if refresh {
+                    "refreshing…"
+                } else {
+                    "opening…"
+                },
+            );
+        }
+        Note::PreviewReady { refresh, elapsed } => {
+            let mut text = format!(
+                "{} · {}",
+                if refresh { "refreshed" } else { "open" },
+                seconds(elapsed)
+            );
+            if let Some(latency) = log::take_save_latency() {
+                text.push_str(&format!(" · {} from save", seconds(latency)));
+            }
+            (Tag::Preview, Tone::Plain, text)
+        }
+        Note::PreviewFailed(error) => (
+            Tag::Preview,
+            Tone::Error,
+            format!("failed to start · {error}"),
+        ),
+        Note::DaemonStale => (
+            Tag::Daemon,
+            Tone::Warn,
+            format!("stale · its sources changed, shells keep running · {restart}"),
+        ),
+        Note::ProtocolHold { preview_open } => (
+            Tag::Preview,
+            Tone::Warn,
+            format!(
+                "{} · protocol changed · {restart}",
+                if preview_open { "kept" } else { "not opened" }
+            ),
+        ),
+    };
+    log::line(tag, tone, &text);
+}
+
+fn target_tag(target: Target) -> Tag {
+    match target {
+        Target::Client => Tag::Client,
+        Target::Daemon => Tag::Daemon,
+    }
 }
 
 fn relative(path: &Path, base: &Path) -> String {
@@ -809,7 +972,7 @@ mod tests {
         };
         assert_eq!(
             describe(&paths(&["crates/compi-client/src/gui/workspace.rs"])).unwrap(),
-            "UI change: workspace.rs"
+            "workspace.rs · ui"
         );
         assert_eq!(
             describe(&paths(&[
@@ -818,11 +981,11 @@ mod tests {
                 "crates/compi-client/src/gui.rs",
             ]))
             .unwrap(),
-            "Protocol change: gui.rs (+1 more)"
+            "gui.rs +1 · protocol"
         );
         assert_eq!(
             describe(&paths(&["crates/compi-daemon/src/daemon.rs"])).unwrap(),
-            "Daemon change: daemon.rs"
+            "daemon.rs · daemon"
         );
         assert_eq!(describe(&paths(&["tools/compi-dev/src/runtime.rs"])), None);
     }
