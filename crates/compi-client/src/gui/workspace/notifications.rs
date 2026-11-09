@@ -601,8 +601,8 @@ impl CompiApp {
     }
 
     /// Takes nothing on screen: records every click and scroll in the window, wherever
-    /// it lands and whatever handles it, for Focused pane. Keys are recorded by the
-    /// window's root.
+    /// it lands and whatever handles it, for Focused pane and for tooltips waiting to show
+    /// (`controls::note_pointer_press`). Keys are recorded by the window's root.
     pub(super) fn render_input_watch(&self, cx: &Context<Self>) -> AnyElement {
         let app = cx.entity().downgrade();
         gpui::canvas(
@@ -611,12 +611,14 @@ impl CompiApp {
                 let clicks = app.clone();
                 window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
                     if phase == gpui::DispatchPhase::Capture {
+                        controls::note_pointer_press();
                         let _ = clicks.update(cx, |app, _| app.notifications.input_seen());
                     }
                 });
                 let scrolls = app.clone();
                 window.on_mouse_event(move |_: &ScrollWheelEvent, phase, _, cx| {
                     if phase == gpui::DispatchPhase::Capture {
+                        controls::note_pointer_press();
                         let _ = scrolls.update(cx, |app, _| app.notifications.input_seen());
                     }
                 });

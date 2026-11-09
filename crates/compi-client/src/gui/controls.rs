@@ -68,6 +68,7 @@ use gpui_component::{
 };
 pub(super) use gpui_kit_assets::IconName;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -839,7 +840,7 @@ pub(super) fn tooltip(
     key: Option<&'static str>,
 ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     let title = title.into();
-    move |window, cx| {
+    tooltip_until_press(move |window, cx| {
         let (title, detail) = (title.clone(), detail.clone());
         Tooltip::element(move |window, cx| {
             tooltip_text(title.clone(), detail.clone(), key, window, cx)
@@ -847,6 +848,35 @@ pub(super) fn tooltip(
         .text_size(px(UI_SMALL_TEXT_SIZE))
         .rounded(px(CONTROL_RADIUS))
         .build(window, cx)
+    })
+}
+
+thread_local! {
+    /// Mouse presses and wheel scrolls so far, in any window.
+    static POINTER_PRESSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Counts a mouse press or wheel scroll; every window's root calls it before the
+/// element under the pointer sees the event.
+pub(super) fn note_pointer_press() {
+    POINTER_PRESSES.set(POINTER_PRESSES.get() + 1);
+}
+
+/// `build`, unless the pointer was pressed or scrolled since the frame that made it.
+/// GPUI shows a tooltip half a second after the hover began, built with that frame's
+/// builder and kept while the pointer stays inside that frame's bounds. A click or scroll
+/// in between would bring up a tooltip for what it may have moved or changed, and leave
+/// it there; such a tooltip is empty instead, and the next hover shows a current one.
+pub(super) fn tooltip_until_press(
+    build: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let presses = POINTER_PRESSES.get();
+    move |window, cx| {
+        if POINTER_PRESSES.get() == presses {
+            build(window, cx)
+        } else {
+            cx.new(|_| gpui::EmptyView).into()
+        }
     }
 }
 

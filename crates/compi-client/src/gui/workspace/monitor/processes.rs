@@ -1104,10 +1104,10 @@ impl CompiApp {
                 };
                 let name = listing::display_line(&details.name);
                 cell.child(cell_text(name).ml_1())
-                    .tooltip(move |window, cx| {
+                    .tooltip(controls::tooltip_until_press(move |window, cx| {
                         let (title, detail) = name_tooltip(&details);
                         controls::tooltip(title, detail, None)(window, cx)
-                    })
+                    }))
             }
         }
     }
