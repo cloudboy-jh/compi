@@ -311,10 +311,10 @@ impl Chat {
                 .spawn(move || keep_tail(errors, &stderr));
         }
         {
-            let chat = self.clone();
+            let (chat, tail) = (self.clone(), stderr.clone());
             let _ = thread::Builder::new()
                 .name("compi-chat".into())
-                .spawn(move || chat.read(output, generation));
+                .spawn(move || chat.read(output, generation, tail));
         }
         inner.agent = Some(Agent {
             child,
@@ -351,7 +351,9 @@ impl Chat {
     }
 
     /// Reads the harness's messages until its output ends, then reports why it stopped.
-    fn read(self: Arc<Self>, output: impl Read, generation: u64) {
+    /// Lines that are not messages (a launcher's own error, `wsl.exe`'s included) go to
+    /// `tail` with its standard error, to explain an exit.
+    fn read(self: Arc<Self>, output: impl Read, generation: u64, tail: Arc<Mutex<String>>) {
         for line in BufReader::new(output).lines() {
             let Ok(line) = line else { break };
             let line = line.trim();
@@ -359,6 +361,7 @@ impl Chat {
                 continue;
             }
             let Ok(message) = serde_json::from_str::<Value>(line) else {
+                push_tail(&tail, line);
                 continue;
             };
             let mut inner = self.lock();
@@ -1600,16 +1603,25 @@ fn keep_tail(errors: impl Read, tail: &Mutex<String>) {
     let mut reader = BufReader::new(errors);
     let mut line = String::new();
     while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
-        let mut tail = lock(tail);
-        tail.push_str(&line);
-        if tail.len() > STDERR_TAIL_BYTES {
-            let mut cut = tail.len() - STDERR_TAIL_BYTES;
-            while !tail.is_char_boundary(cut) {
-                cut += 1;
-            }
-            tail.drain(..cut);
-        }
+        push_tail(tail, &line);
         line.clear();
+    }
+}
+
+/// Adds `text` to the end of `tail`, keeping its last `STDERR_TAIL_BYTES`. NULs go:
+/// `wsl.exe` reports its own failures in UTF-16.
+fn push_tail(tail: &Mutex<String>, text: &str) {
+    let mut tail = lock(tail);
+    tail.extend(text.chars().filter(|c| *c != '\0'));
+    if !tail.ends_with('\n') {
+        tail.push('\n');
+    }
+    if tail.len() > STDERR_TAIL_BYTES {
+        let mut cut = tail.len() - STDERR_TAIL_BYTES;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail.drain(..cut);
     }
 }
 
