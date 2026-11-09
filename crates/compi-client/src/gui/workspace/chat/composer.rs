@@ -3,7 +3,7 @@
 //! composer with its attachments and its `/` command and `@` file lists, and a row of the
 //! harness's settings, context use and Send or Stop.
 use super::*;
-use compi_protocol::chat::{ChatCommand, ChatOption};
+use compi_protocol::chat::{ChatCommand, ChatOption, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES};
 use controls::MenuEntry;
 
 /// Typing pauses this long before a file search.
@@ -12,6 +12,10 @@ const FILE_SEARCH_DELAY: Duration = Duration::from_millis(150);
 const MAX_COMPLETIONS: usize = 50;
 /// The settings the composer row shows as pickers, in order; the rest go under More.
 const PICKED_SETTINGS: [&str; 3] = ["model", "thought_level", "mode"];
+/// The composer card's corner radius.
+const CARD_RADIUS: f32 = 10.0;
+/// The harness's mark in the empty draft.
+const MARK_SIZE: f32 = 14.0;
 /// A setting with more choices than this opens a searched list instead of a menu.
 const SEARCHED_CHOICES: usize = 16;
 const PICKER_WIDTH: f32 = 420.0;
@@ -55,6 +59,64 @@ impl OptionPicker {
             .map(|(index, _)| index)
             .collect()
     }
+}
+
+/// What the system picker returned, sorted: files by the path the chat's environment
+/// knows them by, images read, and why any were left out.
+struct PickedAttachments {
+    files: Vec<String>,
+    images: Vec<ChatImage>,
+    refused: Option<String>,
+}
+
+/// Reads `picked` for a chat in `environment`: images by their bytes, other files by
+/// path, which a remote chat cannot reach.
+fn read_attachments(
+    environment: &ContentEnvironment,
+    remote: bool,
+    picked: Vec<std::path::PathBuf>,
+) -> PickedAttachments {
+    use base64::Engine as _;
+    let mut read = PickedAttachments {
+        files: Vec::new(),
+        images: Vec::new(),
+        refused: None,
+    };
+    let mut left_out = Vec::new();
+    for path in picked {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        if let Some(mime) = ChatImage::mime_for(&name) {
+            match std::fs::read(&path) {
+                Ok(bytes) if bytes.len() <= MAX_CHAT_IMAGE_BYTES => read.images.push(ChatImage {
+                    name,
+                    mime: mime.to_owned(),
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                }),
+                Ok(_) => left_out.push(format!(
+                    "{name} (over {:.1} MB)",
+                    MAX_CHAT_IMAGE_BYTES as f64 / (1024.0 * 1024.0)
+                )),
+                Err(error) => left_out.push(format!("{name} ({error})")),
+            }
+            continue;
+        }
+        let picked = path.to_string_lossy();
+        match crate::gui::open_with::picked_path(environment, &picked).filter(|_| !remote) {
+            Some(file) => read.files.push(file),
+            None => left_out.push(name),
+        }
+    }
+    if !left_out.is_empty() {
+        read.refused = Some(format!(
+            "Not attached: {}. Files must be where the chat can read them; type @ to \
+             attach from its folder.",
+            left_out.join(", ")
+        ));
+    }
+    read
 }
 
 /// The list open over the composer.
@@ -651,8 +713,8 @@ impl CompiApp {
                         )),
                 )
             })
-            .child(self.render_chat_composer(chat, model, &frame, cx))
-            .child(self.render_chat_controls(chat, model, cx))
+            .child(self.render_chat_card(chat, model, &frame, cx))
+            .child(self.render_chat_context(chat, model))
             .into_any_element()
     }
 
@@ -760,38 +822,64 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The draft: its attachments, the editor, and the completion list over it.
-    fn render_chat_composer(
+    /// The composer: one card holding the attached files, the draft (with the harness's
+    /// mark and hints while it is empty), and a row of attach, the harness's settings,
+    /// usage and Send or Stop; the completion list opens over it. A click anywhere on the
+    /// card puts the keyboard in the draft.
+    fn render_chat_card(
         &self,
         chat: &ChatContent,
         model: &ChatModel,
         frame: &RowFrame,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let attachments = model.attachments.iter().enumerate().map(|(index, file)| {
+        let colors = frame.colors;
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let empty = model.composer.read(cx).value().is_empty();
+        let composer = model.composer.clone();
+        let remove = |index: usize, image: bool| {
             let id = chat.id.clone();
+            icon_button(
+                ("chat-attachment", index * 2 + usize::from(image)),
+                IconName::Close,
+                "Remove",
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if let Some(model) = this.chat.chats.get_mut(&id) {
+                    if image && index < model.images.len() {
+                        model.images.remove(index);
+                    } else if !image && index < model.attachments.len() {
+                        model.attachments.remove(index);
+                    }
+                }
+                cx.notify();
+            }))
+        };
+        let files = model.attachments.iter().enumerate().map(|(index, file)| {
             rows::file_chip(rows::relative_to(file, &model.folder).into(), &frame.colors)
                 .pr_0()
-                .child(
-                    icon_button(("chat-attachment", index), IconName::Close, "Remove").on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            if let Some(model) = this.chat.chats.get_mut(&id)
-                                && index < model.attachments.len()
-                            {
-                                model.attachments.remove(index);
-                            }
-                            cx.notify();
-                        }),
-                    ),
-                )
+                .child(remove(index, false))
+        });
+        let images = model.images.iter().enumerate().map(|(index, image)| {
+            rows::image_chip(image.name.clone().into(), &frame.colors)
+                .pr_0()
+                .child(remove(index, true))
         });
         div()
             .relative()
             .flex()
             .flex_col()
-            .gap_1()
-            .when_some(model.completion.as_ref(), |composer, completion| {
-                composer.child(
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(color(colors.border))
+            .in_focus(move |style| style.border_color(color(colors.accent)))
+            .bg(color(colors.surface))
+            .track_focus(&model.card)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                window.focus(&composer.focus_handle(cx), cx);
+            })
+            .when_some(model.completion.as_ref(), |card, completion| {
+                card.child(
                     div()
                         .absolute()
                         .left_0()
@@ -800,10 +888,116 @@ impl CompiApp {
                         .child(self.render_chat_completion(chat, model, completion, cx)),
                 )
             })
-            .when(!model.attachments.is_empty(), |composer| {
-                composer.child(div().flex().flex_wrap().gap_1().children(attachments))
+            .when(
+                !model.attachments.is_empty() || !model.images.is_empty(),
+                |card| {
+                    card.child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .children(files)
+                            .children(images),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .relative()
+                    .px_0p5()
+                    .pt_1()
+                    // The field pads its text 10 px across and 8 px down; the hint sits
+                    // where typing starts, 12 px in from the card and 12 px down.
+                    .child(Textarea::new(&model.composer).appearance(false))
+                    .when(empty, |draft| {
+                        draft.child(
+                            div()
+                                .absolute()
+                                .top(px(12.0))
+                                .left(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_color(muted)
+                                .child(
+                                    img(harness_mark(chat.harness))
+                                        .flex_none()
+                                        .size(px(MARK_SIZE)),
+                                )
+                                .child(format!(
+                                    "Ask {} anything  ·  / commands  ·  @ files",
+                                    chat.harness.name()
+                                )),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .px_1p5()
+                    .pb_1p5()
+                    .pt_1()
+                    .child(self.render_chat_controls(chat, model, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Under the composer, quietly: the folder, where it lives, and its Git branch.
+    fn render_chat_context(&self, chat: &ChatContent, model: &ChatModel) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let place: SharedString = match &chat.environment {
+            ContentEnvironment::Host if cfg!(windows) => "Windows".into(),
+            ContentEnvironment::Host => "Local".into(),
+            ContentEnvironment::Wsl { distribution } => format!("WSL: {distribution}").into(),
+        };
+        let branch = match &model.repo {
+            Repo::At {
+                branch: Some(branch),
+                ..
+            } => Some(branch.clone()),
+            _ => None,
+        };
+        div()
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .text_size(px(UI_MICRO_TEXT_SIZE))
+            .text_color(muted)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(controls::glyph(IconName::Folder, muted))
+                    .child(model.folder_label.clone()),
+            )
+            .child("/")
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(controls::glyph(IconName::Terminal, muted))
+                    .child(place),
+            )
+            .when_some(branch, |line, branch| {
+                line.child(
+                    div()
+                        .ml_2()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(controls::glyph(IconName::GitBranch, muted))
+                        .child(div().truncate().child(branch)),
+                )
             })
-            .child(Textarea::new(&model.composer).appearance(true))
             .into_any_element()
     }
 
@@ -933,8 +1127,8 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Under the composer: the harness's settings (model, thinking, mode, More), context
-    /// use and cost, and Send or Stop.
+    /// The card's bottom row: attach, the harness's settings (model, thinking, mode,
+    /// More), context use and cost, and Send or Stop.
     fn render_chat_controls(
         &self,
         chat: &ChatContent,
@@ -982,8 +1176,8 @@ impl CompiApp {
         let working = state.is_some_and(ChatState::working);
         let id = chat.id.clone();
         let action = if working {
-            text_button("chat-stop", "Stop")
-                .icon(IconName::Square)
+            icon_button("chat-stop", IconName::Square, "Stop")
+                .primary()
                 .header()
                 .disabled_because((model.requests > 0).then_some("Wait for the last request"))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -991,8 +1185,7 @@ impl CompiApp {
                     cx.notify();
                 }))
         } else {
-            text_button("chat-send", "Send")
-                .icon(IconName::ArrowUp)
+            icon_button("chat-send", IconName::ArrowUp, "Send")
                 .primary()
                 .header()
                 .key("enter")
@@ -1003,19 +1196,75 @@ impl CompiApp {
                     cx.notify();
                 }))
         };
+        let attach_id = chat.id.clone();
+        let attach = icon_button("chat-attach", IconName::Plus, "Attach files or images").on_click(
+            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.pick_chat_attachments(&attach_id, cx);
+                cx.notify();
+            }),
+        );
         div()
             .flex()
             .items_center()
-            .gap_1()
+            .gap_0p5()
             .min_w_0()
+            .child(attach)
             .children(pickers)
             .when(!others.is_empty(), |row| {
                 row.child(self.render_chat_more(chat, model, &others, cx))
             })
             .child(div().flex_1())
             .children(usage)
-            .child(div().flex_none().ml_1().child(action))
+            .child(div().flex_none().ml_2().child(action))
             .into_any_element()
+    }
+
+    /// The card's +: the system's file picker. Images (PNG, JPEG, GIF, WebP) are read here
+    /// and sent with the prompt; other files are attached by the path the chat's
+    /// environment knows them by. A file it cannot reach, or an image too large, is
+    /// named under the card instead.
+    fn pick_chat_attachments(&mut self, chat: &str, cx: &mut Context<Self>) {
+        let Some((_, content)) = self.chat_pane(chat) else {
+            return;
+        };
+        let remote = self.target.is_remote();
+        let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        let chat = chat.to_owned();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(picked))) = picker.await else {
+                return;
+            };
+            let read = cx
+                .background_executor()
+                .spawn(async move { read_attachments(&content.environment, remote, picked) })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(model) = this.chat.chats.get_mut(&chat) else {
+                    return;
+                };
+                for file in read.files {
+                    if !model.attachments.contains(&file) {
+                        model.attachments.push(file);
+                    }
+                }
+                for image in read.images {
+                    if model.images.len() < MAX_CHAT_IMAGES
+                        && !model.images.iter().any(|kept| kept.data == image.data)
+                    {
+                        model.images.push(image);
+                    }
+                }
+                model.error = read.refused;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A picker of one harness setting: its current choice, opening the choices.

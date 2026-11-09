@@ -850,10 +850,15 @@ fn handle_connection(
                         send_error(&sink, Some(request_id), ErrorCode::InvalidRequest, &message)
                     }
                 },
-                ClientMessage::SendChat { chat, text, files } => answer_chat(
+                ClientMessage::SendChat {
+                    chat,
+                    text,
+                    files,
+                    images,
+                } => answer_chat(
                     &sink,
                     request_id,
-                    crate::chat::hub().send(&chat, text, files),
+                    crate::chat::hub().send(&chat, text, files, images),
                 )?,
                 ClientMessage::CancelChat { chat } => {
                     answer_chat(&sink, request_id, crate::chat::hub().cancel(&chat))?

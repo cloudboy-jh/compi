@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 172" width="180" height="172">
+  <!-- OMP's π mark, after the hero image of github.com/can1357/oh-my-pi (MIT). -->
+  <defs>
+    <linearGradient id="omp" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f45bd1"/>
+      <stop offset="0.55" stop-color="#a35ef2"/>
+      <stop offset="1" stop-color="#6fb0ea"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#omp)" d="M0 0H180V36H138V172H100V36H62V128H26V36H0Z"/>
+</svg>

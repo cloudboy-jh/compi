@@ -108,15 +108,24 @@ gpui_kit_assets::icon_assets!(
         Paperclip,
         Terminal,
         Wrench,
+        Image,
     ]
 );
 
-/// The application's assets: GPUI Kit's default icons and the extra Lucide icons Compi
-/// uses (`ExtraIcons`).
+/// Harnesses' own marks, drawn in their colours with `img`.
+pub(super) const OMP_MARK: &str = "brands/omp.svg";
+
+/// The application's assets: GPUI Kit's default icons, the extra Lucide icons Compi
+/// uses (`ExtraIcons`) and harness marks.
 pub(super) struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        if path == OMP_MARK {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../../assets/brands/omp.svg"
+            ))));
+        }
         if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));
         }

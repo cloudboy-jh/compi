@@ -467,12 +467,14 @@ pub enum ClientMessage {
         chat: chat::ChatContent,
     },
     /// Sends `text` as the next prompt of a running chat, with `files` (absolute paths in
-    /// the chat's environment) attached; refused while a turn runs.
+    /// the chat's environment) and `images` attached; refused while a turn runs.
     SendChat {
         chat: String,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<chat::ChatImage>,
     },
     /// Stops the chat's running turn.
     CancelChat {

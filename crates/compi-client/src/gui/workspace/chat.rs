@@ -20,12 +20,13 @@ use super::monitor::watch::{self, LINGER, SlotChange, WatchEnd, WatchLink, Watch
 use super::*;
 use crate::gui::controls::{self, IconName, icon_button, text_button};
 use compi_protocol::chat::{
-    ChatAnswer, ChatAnswers, ChatContent, ChatEntry, ChatEvent, ChatPermission, ChatQuestion,
-    ChatSessionInfo, ChatState, ChatStatus,
+    ChatAnswer, ChatAnswers, ChatContent, ChatEntry, ChatEvent, ChatHarness, ChatImage,
+    ChatPermission, ChatQuestion, ChatSessionInfo, ChatState, ChatStatus,
 };
 use compi_protocol::{ContentEnvironment, ContentTab, FolderContent, GitScope, PaneContent};
 use gpui::{
-    Entity, ScrollStrategy, StyleRefinement, UniformListScrollHandle, WeakEntity, uniform_list,
+    Entity, MouseButton, ScrollStrategy, StyleRefinement, UniformListScrollHandle, WeakEntity, img,
+    uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::message_scroller::{MessageScroller, MessageScrollerState};
@@ -93,8 +94,11 @@ enum Sessions {
 /// Whether the chat's folder is in a Git repository, read once: Open in diff needs one.
 enum Repo {
     Reading,
-    /// Its top level.
-    At(String),
+    /// Its top level, and the branch checked out (`None` when detached or unborn).
+    At {
+        top: String,
+        branch: Option<String>,
+    },
     None,
 }
 
@@ -113,11 +117,15 @@ struct ChatModel {
     _composer_events: Subscription,
     /// Keyboard focus of the pane; the composer and the transcript's text sit inside it.
     focus: FocusHandle,
+    /// The composer card's: its accent ring follows the draft's focus.
+    card: FocusHandle,
     /// The folder, as tool cards name paths relative to it and as the header shows it.
     folder: String,
     folder_label: SharedString,
     /// Files to attach to the next prompt: absolute paths in the chat's environment.
     attachments: Vec<String>,
+    /// Images to send with the next prompt, read where they were picked.
+    images: Vec<ChatImage>,
     /// The `/` command or `@` file list over the composer.
     completion: Option<Completion>,
     /// The draft Escape closed the completion on: it stays closed until the draft changes.
@@ -161,6 +169,13 @@ fn chat_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<(&'a PaneId, &'a ChatC
                 output.push((pane_id, chat));
             }
         }
+    }
+}
+
+/// The harness's own mark, in its colours.
+fn harness_mark(harness: ChatHarness) -> &'static str {
+    match harness {
+        ChatHarness::Omp => controls::OMP_MARK,
     }
 }
 
@@ -261,7 +276,7 @@ impl ChatModel {
             .iter()
             .rev()
             .find_map(|entry| match entry {
-                ChatEntry::User { text, files } => Some((text.as_str(), files.as_slice())),
+                ChatEntry::User { text, files, .. } => Some((text.as_str(), files.as_slice())),
                 _ => None,
             })
     }
@@ -367,6 +382,7 @@ impl ChatModel {
             composer.set_value(String::new(), window, cx);
         });
         self.attachments.clear();
+        self.images.clear();
         self.completion = None;
     }
 }
@@ -624,11 +640,8 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> ChatModel {
         let composer = cx.new(|cx| {
+            // The card draws the harness's mark and hints over the empty draft.
             TextareaState::new(window, cx)
-                .placeholder(format!(
-                    "Message {}  ·  / for commands, @ for files",
-                    chat.harness.name()
-                ))
                 .auto_grow(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
                 .submit_on_enter(true)
         });
@@ -663,9 +676,11 @@ impl CompiApp {
             composer,
             _composer_events: events,
             focus: cx.focus_handle(),
+            card: cx.focus_handle(),
             folder: chat.folder.clone(),
             folder_label: folder_label(&chat.folder),
             attachments: Vec::new(),
+            images: Vec::new(),
             completion: None,
             dismissed: None,
             file_request: 0,
@@ -680,7 +695,8 @@ impl CompiApp {
         }
     }
 
-    /// Reads whether `chat`'s folder is in a Git repository, for Open in diff.
+    /// Reads whether `chat`'s folder is in a Git repository, for Open in diff, and its
+    /// branch, for the line under the composer.
     fn read_chat_repo(&self, chat: &ChatContent, cx: &mut Context<Self>) {
         let target = self.target.clone();
         let (id, environment, folder) = (
@@ -700,7 +716,10 @@ impl CompiApp {
             this.update(cx, |this, cx| {
                 if let Some(model) = this.chat.chats.get_mut(&id) {
                     model.repo = match listing {
-                        Ok(Some(listing)) => Repo::At(listing.repo),
+                        Ok(Some(listing)) => Repo::At {
+                            top: listing.repo,
+                            branch: listing.branch,
+                        },
                         Ok(None) | Err(_) => Repo::None,
                     };
                     cx.notify();
@@ -809,13 +828,14 @@ impl CompiApp {
         }
         let draft = model.composer.read(cx).value();
         let text = draft.trim();
-        if text.is_empty() {
+        if text.is_empty() && model.attachments.is_empty() && model.images.is_empty() {
             return;
         }
         let message = ClientMessage::SendChat {
             chat: chat.to_owned(),
             text: text.to_owned(),
             files: model.attachments.clone(),
+            images: model.images.clone(),
         };
         self.chat_request(chat, message, Some(draft), window, cx);
     }
@@ -835,6 +855,7 @@ impl CompiApp {
             chat: chat.to_owned(),
             text: text.to_owned(),
             files: files.to_vec(),
+            images: Vec::new(),
         };
         self.chat_action(chat, message, window, cx);
     }
@@ -1004,7 +1025,8 @@ impl CompiApp {
         let Some((pane_id, content)) = self.chat_pane(chat) else {
             return;
         };
-        let Some(Repo::At(repo)) = self.chat.chats.get(chat).map(|model| &model.repo) else {
+        let Some(Repo::At { top: repo, .. }) = self.chat.chats.get(chat).map(|model| &model.repo)
+        else {
             return;
         };
         let repo = repo.clone();
@@ -1264,7 +1286,7 @@ impl CompiApp {
             .gap_2()
             .border_b_1()
             .border_color(color(colors.border))
-            .child(controls::glyph(IconName::Bot, color(colors.foreground)))
+            .child(img(harness_mark(chat.harness)).flex_none().size(px(14.0)))
             .child(
                 div()
                     .flex_none()
@@ -1403,7 +1425,7 @@ impl CompiApp {
             // Retry resends the last prompt after a turn that failed.
             retry: model.send_refusal().is_none(),
             diff_refusal: match &model.repo {
-                Repo::At(_) => None,
+                Repo::At { .. } => None,
                 Repo::Reading => Some("Checking for a Git repository"),
                 Repo::None => Some("The chat's folder is not in a Git repository"),
             },

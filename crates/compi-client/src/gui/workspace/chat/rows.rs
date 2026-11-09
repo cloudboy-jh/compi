@@ -22,6 +22,7 @@ pub(super) enum ChatRow {
     User {
         text: Entity<TextViewState>,
         files: Rc<[SharedString]>,
+        images: Rc<[SharedString]>,
     },
     Agent(Entity<TextViewState>),
     Thought {
@@ -247,11 +248,19 @@ fn markdown(text: &str, cx: &mut App) -> Entity<TextViewState> {
 
 pub(super) fn chat_row(entry: &ChatEntry, folder: &str, cx: &mut App) -> ChatRow {
     match entry {
-        ChatEntry::User { text, files } => ChatRow::User {
+        ChatEntry::User {
+            text,
+            files,
+            images,
+        } => ChatRow::User {
             text: markdown(text, cx),
             files: files
                 .iter()
                 .map(|file| SharedString::from(relative_to(file, folder)))
+                .collect(),
+            images: images
+                .iter()
+                .map(|name| SharedString::from(name.clone()))
                 .collect(),
         },
         ChatEntry::Agent { text } => ChatRow::Agent(markdown(text, cx)),
@@ -309,10 +318,21 @@ pub(super) fn update_row(
             *started_ms = *started;
             *ended_ms = *ended;
         }
-        (ChatRow::User { files, .. }, ChatEntry::User { files: now, .. }) => {
+        (
+            ChatRow::User { files, images, .. },
+            ChatEntry::User {
+                files: now,
+                images: now_images,
+                ..
+            },
+        ) => {
             *files = now
                 .iter()
                 .map(|file| SharedString::from(relative_to(file, folder)))
+                .collect();
+            *images = now_images
+                .iter()
+                .map(|name| SharedString::from(name.clone()))
                 .collect();
         }
         (ChatRow::Agent(_), ChatEntry::Agent { .. }) => {}
@@ -378,7 +398,11 @@ pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> An
         && matches!(rows.get(index + 1), Some(ChatRow::Tool { .. }));
     let last = index + 1 == rows.len();
     let body = match row {
-        ChatRow::User { text, files } => render_user(text, files, frame),
+        ChatRow::User {
+            text,
+            files,
+            images,
+        } => render_user(text, files, images, frame),
         ChatRow::Agent(text) => chat_text(text, frame.colors.foreground, frame),
         ChatRow::Thought {
             text,
@@ -421,6 +445,15 @@ fn chat_text(view: &Entity<TextViewState>, tint: u32, frame: &RowFrame) -> AnyEl
 
 /// A file attached to a prompt, or about to be.
 pub(super) fn file_chip(label: SharedString, frame_colors: &ThemeColors) -> Div {
+    chip(IconName::Paperclip, label, frame_colors)
+}
+
+/// An image sent with a prompt, or about to be.
+pub(super) fn image_chip(label: SharedString, frame_colors: &ThemeColors) -> Div {
+    chip(IconName::Image, label, frame_colors)
+}
+
+fn chip(icon: IconName, label: SharedString, frame_colors: &ThemeColors) -> Div {
     div()
         .flex_none()
         .max_w(px(260.0))
@@ -433,7 +466,7 @@ pub(super) fn file_chip(label: SharedString, frame_colors: &ThemeColors) -> Div 
         .bg(color(frame_colors.surface_hover))
         .text_size(px(UI_MICRO_TEXT_SIZE))
         .child(controls::glyph(
-            IconName::Paperclip,
+            icon,
             color(modal_text_color(frame_colors.muted, frame_colors)),
         ))
         .child(
@@ -449,6 +482,7 @@ pub(super) fn file_chip(label: SharedString, frame_colors: &ThemeColors) -> Div 
 fn render_user(
     text: &Entity<TextViewState>,
     files: &[SharedString],
+    images: &[SharedString],
     frame: &RowFrame,
 ) -> AnyElement {
     div()
@@ -461,13 +495,22 @@ fn render_user(
         .rounded(px(6.0))
         .bg(color(frame.colors.surface))
         .child(chat_text(text, frame.colors.foreground, frame))
-        .when(!files.is_empty(), |message| {
+        .when(!files.is_empty() || !images.is_empty(), |message| {
             message.child(
-                div().flex().flex_wrap().gap_1().children(
-                    files
-                        .iter()
-                        .map(|file| file_chip(file.clone(), &frame.colors)),
-                ),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(
+                        files
+                            .iter()
+                            .map(|file| file_chip(file.clone(), &frame.colors)),
+                    )
+                    .children(
+                        images
+                            .iter()
+                            .map(|name| image_chip(name.clone(), &frame.colors)),
+                    ),
             )
         })
         .into_any_element()
@@ -931,7 +974,8 @@ mod tests {
             &agent("Hi"),
             &ChatEntry::User {
                 text: "Hi".into(),
-                files: Vec::new()
+                files: Vec::new(),
+                images: Vec::new(),
             }
         ));
         assert!(continues(&call("1"), &call("1")));

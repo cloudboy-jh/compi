@@ -8,10 +8,10 @@
 //! resumes it (`session/load`) when it starts again, after a restart of the daemon too.
 use compi_protocol::chat::{
     ChatAnswer, ChatAnswers, ChatChoice, ChatCommand, ChatContent, ChatDiff, ChatEntry, ChatEvent,
-    ChatField, ChatOption, ChatPermission, ChatPermissionOption, ChatQuestion, ChatSessionInfo,
-    ChatState, ChatStatus, ChatTool, ChatToolStatus, ChatUsage, MAX_CHAT_ATTACHMENTS,
-    MAX_CHAT_DIFF_BYTES, MAX_CHAT_PROMPT_BYTES, MAX_CHAT_TOOL_INPUT_BYTES,
-    MAX_CHAT_TOOL_OUTPUT_BYTES,
+    ChatField, ChatImage, ChatOption, ChatPermission, ChatPermissionOption, ChatQuestion,
+    ChatSessionInfo, ChatState, ChatStatus, ChatTool, ChatToolStatus, ChatUsage,
+    MAX_CHAT_ATTACHMENTS, MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES,
+    MAX_CHAT_PROMPT_BYTES, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
 };
 use compi_protocol::{ContentEnvironment, LayoutNode, WorkspaceSnapshot};
 use serde_json::{Map, Value, json};
@@ -68,8 +68,14 @@ impl ChatHub {
         (fit(inner.state.clone(), WATCH_STATE_BYTES), receiver)
     }
 
-    pub fn send(&self, id: &str, text: String, files: Vec<String>) -> Result<(), String> {
-        self.get(id)?.send(text, files)
+    pub fn send(
+        &self,
+        id: &str,
+        text: String,
+        files: Vec<String>,
+        images: Vec<ChatImage>,
+    ) -> Result<(), String> {
+        self.get(id)?.send(text, files, images)
     }
 
     pub fn cancel(&self, id: &str) -> Result<(), String> {
@@ -534,8 +540,8 @@ impl Chat {
             .ok_or_else(|| format!("{harness} has no session yet"))
     }
 
-    fn send(&self, text: String, files: Vec<String>) -> Result<(), String> {
-        if text.trim().is_empty() && files.is_empty() {
+    fn send(&self, text: String, files: Vec<String>, images: Vec<ChatImage>) -> Result<(), String> {
+        if text.trim().is_empty() && files.is_empty() && images.is_empty() {
             return Err("nothing to send".into());
         }
         if text.len() > MAX_CHAT_PROMPT_BYTES {
@@ -548,6 +554,16 @@ impl Chat {
                 "a prompt attaches at most {MAX_CHAT_ATTACHMENTS} files"
             ));
         }
+        if images.len() > MAX_CHAT_IMAGES {
+            return Err(format!("a prompt carries at most {MAX_CHAT_IMAGES} images"));
+        }
+        // Base64 is four bytes for three.
+        if let Some(image) = images
+            .iter()
+            .find(|image| image.data.len() > MAX_CHAT_IMAGE_BYTES.div_ceil(3) * 4)
+        {
+            return Err(format!("{} is too large to send", image.name));
+        }
         let mut inner = self.lock();
         let session = self.ready_session(&inner)?;
         let mut prompt = vec![json!({ "type": "text", "text": text })];
@@ -558,8 +574,18 @@ impl Chat {
                 "name": file_name(path),
             })
         }));
+        prompt.extend(
+            images.iter().map(
+                |image| json!({ "type": "image", "mimeType": image.mime, "data": image.data }),
+            ),
+        );
+        let images = images.into_iter().map(|image| image.name).collect();
         inner.emit(ChatEvent::Entry {
-            entry: ChatEntry::User { text, files },
+            entry: ChatEntry::User {
+                text,
+                files,
+                images,
+            },
         });
         let since_ms = now_ms();
         inner.activity_ms = since_ms;
@@ -1065,6 +1091,7 @@ impl Inner {
                         |text| ChatEntry::User {
                             text,
                             files: Vec::new(),
+                            images: Vec::new(),
                         },
                         |entry| matches!(entry, ChatEntry::User { .. }),
                     );
@@ -1076,26 +1103,47 @@ impl Inner {
                     .or_else(|| content["resource"]["uri"].as_str())
                     .unwrap_or_default();
                 let path = path_of_uri(uri);
-                let index = self.state.entries.len().checked_sub(1);
-                match index.and_then(|index| self.state.entries.get(index).map(|e| (index, e))) {
-                    Some((index, ChatEntry::User { text, files })) => {
-                        let mut files = files.clone();
-                        files.push(path);
-                        let entry = ChatEntry::User {
-                            text: text.clone(),
-                            files,
-                        };
-                        self.emit(ChatEvent::Replace { index, entry });
-                    }
-                    _ => self.emit(ChatEvent::Entry {
-                        entry: ChatEntry::User {
-                            text: String::new(),
-                            files: vec![path],
-                        },
-                    }),
-                }
+                self.attach_replayed(|files, _| files.push(path));
             }
+            // A replayed image has no name; it is counted, not shown.
+            Some("image") => self.attach_replayed(|_, images| images.push("image".into())),
             _ => {}
+        }
+    }
+
+    /// Adds a replayed attachment to the prompt it belongs to: the last entry when it is
+    /// a prompt, else a prompt of its own.
+    fn attach_replayed(&mut self, add: impl FnOnce(&mut Vec<String>, &mut Vec<String>)) {
+        let last = self.state.entries.len().checked_sub(1);
+        match last.and_then(|index| self.state.entries.get(index).map(|entry| (index, entry))) {
+            Some((
+                index,
+                ChatEntry::User {
+                    text,
+                    files,
+                    images,
+                },
+            )) => {
+                let (mut files, mut images) = (files.clone(), images.clone());
+                add(&mut files, &mut images);
+                let entry = ChatEntry::User {
+                    text: text.clone(),
+                    files,
+                    images,
+                };
+                self.emit(ChatEvent::Replace { index, entry });
+            }
+            _ => {
+                let (mut files, mut images) = (Vec::new(), Vec::new());
+                add(&mut files, &mut images);
+                self.emit(ChatEvent::Entry {
+                    entry: ChatEntry::User {
+                        text: String::new(),
+                        files,
+                        images,
+                    },
+                });
+            }
         }
     }
 

@@ -14,6 +14,10 @@ pub const MAX_CHAT_SESSION_BYTES: usize = 256;
 pub const MAX_CHAT_PROMPT_BYTES: usize = 256 * 1024;
 /// Files one prompt may attach.
 pub const MAX_CHAT_ATTACHMENTS: usize = 64;
+/// Images one prompt may carry, each at most `MAX_CHAT_IMAGE_BYTES` before encoding, so
+/// a prompt stays well inside one control frame.
+pub const MAX_CHAT_IMAGES: usize = 4;
+pub const MAX_CHAT_IMAGE_BYTES: usize = 1536 * 1024;
 /// The most of a tool call's input kept for display.
 pub const MAX_CHAT_TOOL_INPUT_BYTES: usize = 16 * 1024;
 /// The most of a tool call's output kept for display: its end.
@@ -182,11 +186,14 @@ pub enum ChatStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEntry {
-    /// What was sent, as Markdown, with the files it attached.
+    /// What was sent, as Markdown, with the files it attached and the names of the
+    /// images it carried.
     User {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     /// The harness's reply, as Markdown.
     Agent { text: String },
@@ -377,6 +384,32 @@ pub enum ChatAnswer {
 
 /// Answers by field key.
 pub type ChatAnswers = BTreeMap<String, ChatAnswer>;
+
+/// An image sent with a prompt, its bytes carried along: the window reads it where it
+/// was picked, so it needs no path the harness can reach.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatImage {
+    /// Its file name, as the transcript shows it.
+    pub name: String,
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    /// Standard padded base64.
+    pub data: String,
+}
+
+impl ChatImage {
+    /// The MIME type of an image file the harnesses take, by its extension.
+    pub fn mime_for(name: &str) -> Option<&'static str> {
+        let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
+        Some(match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => return None,
+        })
+    }
+}
 
 /// A session of the harness in the chat's folder, for resuming.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

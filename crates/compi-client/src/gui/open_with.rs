@@ -113,6 +113,32 @@ pub(super) fn system_content(path: &str) -> (ContentEnvironment, String) {
     (ContentEnvironment::Host, path.to_owned())
 }
 
+/// A file the system's picker returned, as a program in `environment` names it: a
+/// Windows drive path is `/mnt/<drive>/…` in WSL, and a WSL share path is that
+/// distribution's Linux path there; the host reads any of its own paths, shares
+/// included. `None` when `environment` cannot reach it (another distribution's share, a
+/// network path from WSL).
+pub(super) fn picked_path(environment: &ContentEnvironment, picked: &str) -> Option<String> {
+    let (place, path) = system_content(picked);
+    match environment {
+        ContentEnvironment::Host => Some(picked.to_owned()),
+        wsl if place == *wsl => Some(path),
+        ContentEnvironment::Wsl { .. } => {
+            let bytes = picked.as_bytes();
+            let drive = *bytes.first()?;
+            (drive.is_ascii_alphabetic() && bytes.get(1) == Some(&b':')).then(|| {
+                format!(
+                    "/mnt/{}/{}",
+                    drive.to_ascii_lowercase() as char,
+                    picked[2..]
+                        .trim_start_matches(['\\', '/'])
+                        .replace('\\', "/")
+                )
+            })
+        }
+    }
+}
+
 /// The path of a `file://` URL (Finder's Open With sends these), percent-decoded and
 /// without a trailing slash; None for any other URL.
 pub(super) fn file_url_path(url: &str) -> Option<String> {
@@ -496,6 +522,28 @@ mod mac_apps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picked_files_are_named_as_the_chats_environment_reaches_them() {
+        let ubuntu = ContentEnvironment::Wsl {
+            distribution: "Ubuntu".into(),
+        };
+        assert_eq!(
+            picked_path(&ubuntu, r"C:\Users\me\My Notes\a.md").as_deref(),
+            Some("/mnt/c/Users/me/My Notes/a.md")
+        );
+        assert_eq!(
+            picked_path(&ubuntu, r"\\wsl.localhost\Ubuntu\home\me\a.rs").as_deref(),
+            Some("/home/me/a.rs")
+        );
+        // Another distribution's files and network shares are out of WSL's reach.
+        assert_eq!(picked_path(&ubuntu, r"\\wsl$\Debian\home\me\a.rs"), None);
+        assert_eq!(picked_path(&ubuntu, r"\\server\share\a.md"), None);
+        assert_eq!(
+            picked_path(&ContentEnvironment::Host, r"\\wsl.localhost\Ubuntu\home\a").as_deref(),
+            Some(r"\\wsl.localhost\Ubuntu\home\a")
+        );
+    }
 
     #[test]
     fn wsl_paths_open_through_their_drive_or_the_distribution_share() {
