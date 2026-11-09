@@ -163,7 +163,7 @@ impl CompiApp {
         let note = |text: String| {
             div()
                 .px_2()
-                .min_h(px(26.0))
+                .min_h(ui_rems(26.0))
                 .flex()
                 .items_center()
                 .text_color(muted)
@@ -203,7 +203,7 @@ impl CompiApp {
                     let (id, session_id) = (chat.id.clone(), session.id.clone());
                     controls::menu_row(("chat-session", index), false, here, cx)
                         .gap_x_2()
-                        .child(div().flex_none().w(px(12.0)).when(here, |mark| {
+                        .child(div().flex_none().w(ui_rems(12.0)).when(here, |mark| {
                             mark.child(controls::glyph(IconName::Check, muted))
                         }))
                         .child(
@@ -218,7 +218,7 @@ impl CompiApp {
                         .child(
                             div()
                                 .flex_none()
-                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                                 .text_color(muted)
                                 .child(detail),
                         )
@@ -234,9 +234,9 @@ impl CompiApp {
         };
         controls::menu_surface(cx)
             .id("chat-session-list")
-            .w(px(380.0))
-            .max_w(px(380.0))
-            .max_h(px(360.0))
+            .w(ui_rems(380.0))
+            .max_w(ui_rems(380.0))
+            .max_h(ui_rems(360.0))
             .overflow_y_scroll()
             .child(controls::menu_label_row("Resume a session", cx))
             .children(rows)

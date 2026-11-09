@@ -674,7 +674,7 @@ impl CompiApp {
             .when_some(model.error.clone(), |footer, error| {
                 footer.child(
                     div()
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(color(colors.error))
                         .child(error),
                 )
@@ -682,7 +682,7 @@ impl CompiApp {
             .when(starting, |footer| {
                 footer.child(
                     div()
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(muted)
                         .child(format!("Starting {harness}…")),
                 )
@@ -693,7 +693,7 @@ impl CompiApp {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                         .child(
                             div()
                                 .flex_1()
@@ -721,7 +721,7 @@ impl CompiApp {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(muted)
                         .child(Spinner::new().with_size(Size::XSmall).color(muted))
                         .child(format!(
@@ -785,7 +785,7 @@ impl CompiApp {
                             |column| {
                                 column.child(
                                     div()
-                                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                                         .text_color(muted)
                                         .child(field.title.clone()),
                                 )
@@ -804,11 +804,11 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_2()
-            .rounded(px(6.0))
+            .rounded(ui_rems(6.0))
             .bg(color(colors.surface))
             .child(
                 div()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                     .child(question.message.clone()),
             )
             .children(fields)
@@ -886,7 +886,7 @@ impl CompiApp {
             .relative()
             .flex()
             .flex_col()
-            .rounded(px(CARD_RADIUS))
+            .rounded(ui_rems(CARD_RADIUS))
             .border_1()
             .border_color(color(colors.border))
             .in_focus(move |style| style.border_color(color(colors.accent)))
@@ -933,8 +933,8 @@ impl CompiApp {
                         draft.child(
                             div()
                                 .absolute()
-                                .top(px(12.0))
-                                .left(px(12.0))
+                                .top(ui_rems(12.0))
+                                .left(ui_rems(12.0))
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
@@ -942,7 +942,7 @@ impl CompiApp {
                                 .child(
                                     img(harness_mark(chat.harness))
                                         .flex_none()
-                                        .size(px(MARK_SIZE)),
+                                        .size(ui_rems(MARK_SIZE)),
                                 )
                                 .child(format!(
                                     "Ask {} anything  ·  / commands  ·  @ files",
@@ -983,7 +983,7 @@ impl CompiApp {
             .items_center()
             .gap_2()
             .min_w_0()
-            .text_size(px(UI_MICRO_TEXT_SIZE))
+            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
             .text_color(muted)
             .child(
                 div()
@@ -1032,7 +1032,7 @@ impl CompiApp {
         let note = |text: String| {
             div()
                 .px_2()
-                .min_h(px(26.0))
+                .min_h(ui_rems(26.0))
                 .flex()
                 .items_center()
                 .text_color(muted)
@@ -1102,7 +1102,7 @@ impl CompiApp {
                                     .when(!command.description.is_empty(), |column| {
                                         column.child(
                                             line()
-                                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                                                 .opacity(0.7)
                                                 .child(command.description.clone()),
                                         )
@@ -1152,8 +1152,8 @@ impl CompiApp {
         controls::menu_surface(cx)
             .id("chat-completion")
             .w_full()
-            .max_w(px(COMPLETION_MAX_WIDTH))
-            .max_h(px(260.0))
+            .max_w(ui_rems(COMPLETION_MAX_WIDTH))
+            .max_h(ui_rems(260.0))
             .overflow_y_scroll()
             .track_scroll(&completion.scroll)
             .children(rows)
@@ -1195,7 +1195,7 @@ impl CompiApp {
             div()
                 .id("chat-usage")
                 .flex_none()
-                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                 .text_color(muted)
                 .child(label)
                 .tooltip(controls::tooltip(
@@ -1403,12 +1403,12 @@ impl CompiApp {
                                 choice.value == current,
                                 cx,
                             )
-                            .h(px(PICKER_ROW_HEIGHT))
+                            .h(ui_rems(PICKER_ROW_HEIGHT))
                             .gap_x_2()
                             .child(
                                 div()
                                     .flex_none()
-                                    .w(px(12.0))
+                                    .w(ui_rems(12.0))
                                     .when(choice.value == current, |mark| {
                                         mark.child(controls::glyph(IconName::Check, muted))
                                     }),
@@ -1419,7 +1419,7 @@ impl CompiApp {
                                     div()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                                         .text_color(muted)
                                         .child(detail),
                                 )
@@ -1445,11 +1445,13 @@ impl CompiApp {
                         .collect::<Vec<_>>()
                 }),
             )
-            .h(px(PICKER_ROW_HEIGHT * count.clamp(1, PICKER_ROWS) as f32))
+            .h(ui_rems(
+                PICKER_ROW_HEIGHT * count.clamp(1, PICKER_ROWS) as f32,
+            ))
             .track_scroll(&picker.scroll)
         };
         controls::menu_surface(cx)
-            .w(px(PICKER_WIDTH))
+            .w(ui_rems(PICKER_WIDTH))
             .flex()
             .flex_col()
             .gap_1()
@@ -1458,7 +1460,7 @@ impl CompiApp {
                 panel.child(
                     div()
                         .px_2()
-                        .h(px(PICKER_ROW_HEIGHT))
+                        .h(ui_rems(PICKER_ROW_HEIGHT))
                         .flex()
                         .items_center()
                         .text_color(muted)

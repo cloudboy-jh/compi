@@ -1240,6 +1240,7 @@ impl CompiApp {
                                 ui_font: loaded.ui_font,
                                 density: loaded.density,
                                 terminal_font: loaded.configured_font,
+                                chat_text_size: loaded.chat_text_size,
                                 diagnostics: loaded.diagnostics,
                             });
                         }
@@ -2075,10 +2076,17 @@ impl CompiApp {
                 ui_font,
                 density,
                 terminal_font,
+                chat_text_size,
                 diagnostics,
             } => {
-                self.pending_appearance_reload =
-                    Some((appearance, favorites, ui_font, density, terminal_font));
+                self.pending_appearance_reload = Some((
+                    appearance,
+                    favorites,
+                    ui_font,
+                    density,
+                    terminal_font,
+                    chat_text_size,
+                ));
                 self.config_diagnostics = diagnostics;
                 self.global_warning =
                     diagnostic_warning(&self.config_diagnostics, &self.typography.diagnostics);
@@ -4216,17 +4224,17 @@ impl CompiApp {
                 }
             }
             Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => {
-                let current = self.config.font.size;
-                let size = match command {
-                    Command::ZoomIn => {
-                        Some((current.floor() + 1.0).min(crate::config::MAX_FONT_SIZE))
-                    }
-                    Command::ZoomOut => {
-                        Some((current.ceil() - 1.0).max(crate::config::MIN_FONT_SIZE))
-                    }
-                    _ => None,
-                };
-                self.apply_font_size(size, window, cx);
+                if self.focused_pane_shows_chat() {
+                    self.step_chat_text_size(command, window, cx);
+                } else {
+                    let size = zoom_size(
+                        command,
+                        self.config.font.size,
+                        crate::config::MIN_FONT_SIZE,
+                        crate::config::MAX_FONT_SIZE,
+                    );
+                    self.apply_font_size(size, window, cx);
+                }
             }
             Command::OpenQuickAppearance => self.open_quick_appearance(),
             Command::OpenSettings => self.open_settings(None, None, window, cx),
@@ -5014,7 +5022,7 @@ impl CompiApp {
                 window.on_next_frame(move |_, cx| cx.notify(view_id));
             }
         }
-        if let Some((appearance, favorites, ui_font, density, terminal_font)) =
+        if let Some((appearance, favorites, ui_font, density, terminal_font, chat_text_size)) =
             self.pending_appearance_reload.take()
         {
             self.sync_global_appearance(
@@ -5023,7 +5031,9 @@ impl CompiApp {
                 ui_font,
                 density,
                 terminal_font,
+                chat_text_size,
                 window,
+                cx,
             );
         }
         if self.refresh_typography(window) {
@@ -8188,6 +8198,16 @@ fn structure_key(workspace: &WorkspaceSnapshot) -> u64 {
         surface.process_lifetime_id.as_str().hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// The size `command` (Zoom in, out or reset) makes of `current`: 1 px steps on whole
+/// sizes within `min`–`max`, or `None` for the default.
+fn zoom_size(command: Command, current: f32, min: f32, max: f32) -> Option<f32> {
+    match command {
+        Command::ZoomIn => Some((current.floor() + 1.0).min(max)),
+        Command::ZoomOut => Some((current.ceil() - 1.0).max(min)),
+        _ => None,
+    }
 }
 
 fn positive_scale(scale: f32) -> f32 {

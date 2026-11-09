@@ -105,6 +105,8 @@ pub(super) enum SettingsAction {
     ResetSidebar,
     ResetLayout,
     FontSize(Command),
+    /// Zoom in, out or reset of the chat text size.
+    ChatTextSize(Command),
     OpenConfiguration,
     /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
     /// the next keys pressed.
@@ -558,6 +560,28 @@ static ROWS: &[Row] = &[
         },
     ),
     row(
+        "chat-text-size",
+        SettingsSection::Interface,
+        "Chat text size",
+        "Agent chats, with their cards and composer, in every window.",
+        "zoom scale bigger smaller larger font agent omp",
+        |_| {
+            vec![
+                SettingsAction::ChatTextSize(Command::ZoomOut),
+                SettingsAction::ChatTextSize(Command::ZoomIn),
+                SettingsAction::ChatTextSize(Command::ZoomReset),
+            ]
+        },
+        |app, row, cx| {
+            app.render_size_row(
+                row,
+                app.config.chat_text_size,
+                SettingsAction::ChatTextSize,
+                cx,
+            )
+        },
+    ),
+    row(
         "density",
         SettingsSection::Interface,
         "Pane density",
@@ -873,7 +897,9 @@ static ROWS: &[Row] = &[
                 SettingsAction::FontSize(Command::ZoomReset),
             ]
         },
-        |app, row, cx| app.render_font_size_row(row, cx),
+        |app, row, cx| {
+            app.render_size_row(row, app.font_settings.size, SettingsAction::FontSize, cx)
+        },
     ),
     row(
         "custom-typography",
@@ -2622,6 +2648,7 @@ impl CompiApp {
             SettingsAction::ResetSidebar => self.execute(Command::ResetSidebarWidth, window, cx),
             SettingsAction::ResetLayout => self.execute(Command::ResetClientLayout, window, cx),
             SettingsAction::FontSize(command) => self.execute(command, window, cx),
+            SettingsAction::ChatTextSize(command) => self.step_chat_text_size(command, window, cx),
             SettingsAction::OpenConfiguration => {
                 self.execute(Command::OpenConfiguration, window, cx)
             }
@@ -3881,8 +3908,14 @@ impl CompiApp {
         )
     }
 
-    fn render_font_size_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let size = self.font_settings.size;
+    /// A size with −, + and Reset, which send `action` with Zoom out, in and reset.
+    fn render_size_row(
+        &self,
+        row: &RowCx,
+        size: f32,
+        action: fn(Command) -> SettingsAction,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let shown = if size.fract() == 0.0 {
             format!("{size:.0}")
         } else {
@@ -3894,28 +3927,22 @@ impl CompiApp {
             .gap_1()
             .child(self.settings_control(
                 row,
-                SettingsAction::FontSize(Command::ZoomOut),
+                action(Command::ZoomOut),
                 controls::icon_button((row.row, 0_usize), IconName::Minus, "Smaller").header(),
                 cx,
             ))
             .child(div().min_w(px(32.0)).text_center().child(shown))
             .child(self.settings_control(
                 row,
-                SettingsAction::FontSize(Command::ZoomIn),
+                action(Command::ZoomIn),
                 controls::icon_button((row.row, 2_usize), IconName::Plus, "Larger").header(),
                 cx,
             ))
-            .child(self.settings_button(
-                row,
-                1,
-                "Reset",
-                SettingsAction::FontSize(Command::ZoomReset),
-                cx,
-            ))
+            .child(self.settings_button(row, 1, "Reset", action(Command::ZoomReset), cx))
             .into_any_element();
         self.settings_row(
             row.title,
-            row_description("font-size").into(),
+            row_description(row.row).into(),
             control,
             row.compact,
         )
@@ -5135,6 +5162,7 @@ mod tests {
             ids("font"),
             [
                 "ui-font",
+                "chat-text-size",
                 "terminal-font",
                 "font-size",
                 "custom-typography",

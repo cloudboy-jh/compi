@@ -25,7 +25,8 @@ use compi_protocol::chat::{
 };
 use compi_protocol::{ContentEnvironment, ContentTab, FolderContent, GitScope, PaneContent};
 use gpui::{
-    Entity, MouseButton, ScrollStrategy, StyleRefinement, UniformListScrollHandle, WeakEntity, img,
+    AnyElement, Bounds, Element, ElementId, Entity, GlobalElementId, InspectorElementId, LayoutId,
+    MouseButton, Pixels, ScrollStrategy, StyleRefinement, UniformListScrollHandle, WeakEntity, img,
     uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -47,6 +48,76 @@ const HEADER_HEIGHT: f32 = 34.0;
 /// The composer grows with its text between these many lines.
 const COMPOSER_MIN_ROWS: usize = 1;
 const COMPOSER_MAX_ROWS: usize = 8;
+
+/// `child` laid out and drawn with a rem of `rem`. A chat sizes everything in rems
+/// ([`ui_rems`]), as GPUI Kit's components do, so the whole chat scales with its text size.
+struct WithRemSize {
+    rem: Pixels,
+    child: AnyElement,
+}
+
+impl IntoElement for WithRemSize {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for WithRemSize {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let child = &mut self.child;
+        let layout =
+            window.with_rem_size(Some(self.rem), |window| child.request_layout(window, cx));
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        window.with_rem_size(Some(self.rem), |window| {
+            child.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        window.with_rem_size(Some(self.rem), |window| child.paint(window, cx));
+    }
+}
 
 /// What a chat watcher reports, tagged with its chat and generation.
 pub(in crate::gui) struct ChatUpdate {
@@ -489,6 +560,54 @@ impl CompiApp {
 
     fn focused_chat(&self) -> Option<&ChatModel> {
         self.pane_chat(self.focused_pane()?)
+    }
+
+    /// Whether the focused pane shows a chat, as a content pane or a terminal's view: Zoom
+    /// in, out and reset then size chat text.
+    pub(super) fn focused_pane_shows_chat(&self) -> bool {
+        let (Some(workspace), Some(pane)) = (self.workspace.as_ref(), self.focused_pane()) else {
+            return false;
+        };
+        self.pane_chat_content(pane).is_some()
+            && (self.shows_view(pane)
+                || matches!(
+                    content::find_leaf(workspace, pane),
+                    Some(LayoutNode::Content { .. })
+                ))
+    }
+
+    /// Zoom in, out or reset (`command`) of the chat text size, in every window.
+    pub(super) fn step_chat_text_size(
+        &mut self,
+        command: Command,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let size = zoom_size(
+            command,
+            self.config.chat_text_size,
+            crate::config::MIN_CHAT_TEXT_SIZE,
+            crate::config::MAX_CHAT_TEXT_SIZE,
+        );
+        if size.unwrap_or(crate::config::DEFAULT_CHAT_TEXT_SIZE) == self.config.chat_text_size {
+            return;
+        }
+        if let Err(error) = self.config.save_chat_text_size(size) {
+            self.global_error = Some(error);
+            return;
+        }
+        self.remeasure_chats(cx);
+        self.broadcast_global_appearance(window, cx);
+        cx.notify();
+    }
+
+    /// Lays every chat's transcript out again, after its text size changed.
+    pub(super) fn remeasure_chats(&self, cx: &mut App) {
+        for model in self.chat.chats.values() {
+            model
+                .scroller
+                .update(cx, |scroller, cx| scroller.remeasure(cx));
+        }
     }
 
     /// The pane holding chat `chat`, and the chat.
@@ -1244,7 +1363,7 @@ impl CompiApp {
         };
         let colors = *self.colors();
         let key_pane = pane_id.clone();
-        div()
+        let pane = div()
             .flex_1()
             .min_h_0()
             .min_w_0()
@@ -1252,14 +1371,21 @@ impl CompiApp {
             .flex()
             .flex_col()
             .track_focus(&model.focus)
+            .text_size(ui_rems(UI_BODY_TEXT_SIZE))
             .text_color(color(modal_text_color(colors.foreground, &colors)))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 this.chat_key_down(&key_pane, event, window, cx);
             }))
             .child(self.render_chat_header(chat, model, cx))
             .child(self.render_chat_transcript(chat, model, cx))
-            .child(self.render_chat_footer(chat, model, cx))
-            .into_any_element()
+            .child(self.render_chat_footer(chat, model, cx));
+        WithRemSize {
+            rem: px(
+                DEFAULT_REM * self.config.chat_text_size / crate::config::DEFAULT_CHAT_TEXT_SIZE
+            ),
+            child: pane.into_any_element(),
+        }
+        .into_any_element()
     }
 
     /// The harness, the chat's title and folder, whether it is reachable, and its menu.
@@ -1278,7 +1404,7 @@ impl CompiApp {
         };
         div()
             .flex_none()
-            .h(px(HEADER_HEIGHT))
+            .h(ui_rems(HEADER_HEIGHT))
             .pl_3()
             .pr_1()
             .flex()
@@ -1286,11 +1412,15 @@ impl CompiApp {
             .gap_2()
             .border_b_1()
             .border_color(color(colors.border))
-            .child(img(harness_mark(chat.harness)).flex_none().size(px(14.0)))
+            .child(
+                img(harness_mark(chat.harness))
+                    .flex_none()
+                    .size(ui_rems(14.0)),
+            )
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                     .font_weight(FontWeight::MEDIUM)
                     .child(chat.harness.name()),
             )
@@ -1301,7 +1431,7 @@ impl CompiApp {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_size(px(UI_SMALL_TEXT_SIZE))
+                        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                         .child(title),
                 )
             })
@@ -1309,11 +1439,11 @@ impl CompiApp {
                 div()
                     .id("chat-folder")
                     .flex_none()
-                    .max_w(px(200.0))
+                    .max_w(ui_rems(200.0))
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                     .text_color(muted)
                     .child(model.folder_label.clone())
                     .tooltip(controls::tooltip(chat.folder.clone(), None, None)),
@@ -1324,7 +1454,7 @@ impl CompiApp {
                     div()
                         .id("chat-reconnecting")
                         .flex_none()
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(muted)
                         .child("Reconnecting…")
                         .tooltip(controls::tooltip(error, None, None)),
@@ -1352,13 +1482,13 @@ impl CompiApp {
             .justify_center()
             .gap_1()
             .text_color(color(modal_text_color(colors.muted, &colors)))
-            .child(div().text_size(px(UI_BODY_TEXT_SIZE)).child(title))
+            .child(div().text_size(ui_rems(UI_BODY_TEXT_SIZE)).child(title))
             .when_some(detail, |message, detail| {
                 message.child(
                     div()
-                        .max_w(px(480.0))
+                        .max_w(ui_rems(480.0))
                         .text_center()
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .child(detail),
                 )
             })
@@ -1440,7 +1570,7 @@ impl CompiApp {
                     model.scroller.clone(),
                     move |index, _, _| rows::render_row(&rows, index, &frame),
                 )
-                .with_row_style(StyleRefinement::default().pb(px(0.0)))
+                .with_row_style(StyleRefinement::default().pb(ui_rems(0.0)))
                 .with_jump_button_label("Latest")
                 .with_jump_button_renderer(|button| button.icon(IconName::ArrowDown))
                 .size_full(),

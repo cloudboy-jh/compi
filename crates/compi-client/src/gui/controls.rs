@@ -42,8 +42,8 @@
 //! [`sync_theme`] completes the Kit theme from Compi's colors before a window draws;
 //! popups take the surface color, its text and the theme's border.
 use super::{
-    UI_MICRO_TEXT_SIZE, UI_SMALL_TEXT_SIZE, blend_rgb, color, composite_rgb, ui_text_color,
-    ui_text_color_for,
+    UI_MICRO_TEXT_SIZE, UI_SMALL_TEXT_SIZE, blend_rgb, color, composite_rgb, ui_rems,
+    ui_text_color, ui_text_color_for,
 };
 use crate::theme::ThemeColors;
 use gpui::{
@@ -525,7 +525,7 @@ impl RenderOnce for Control {
                         .min_w_0()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .text_size(px(size.text_size()))
+                        .text_size(ui_rems(size.text_size()))
                         .when(self.variant == Variant::Primary, |label| {
                             label.font_weight(FontWeight::MEDIUM)
                         })
@@ -1645,7 +1645,7 @@ pub(super) fn menu_item_body(
         .children(reason.map(|reason| {
             div()
                 .pb_0p5()
-                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                 .text_color(cx.theme().muted_foreground)
                 .child(reason)
         }))
@@ -1857,9 +1857,9 @@ pub(super) fn menu_surface(cx: &App) -> Div {
         .flex()
         .flex_col()
         .gap_y_0p5()
-        .min_w(px(128.0))
-        .max_w(px(POPUP_MAX_WIDTH))
-        .text_size(px(UI_SMALL_TEXT_SIZE))
+        .min_w(ui_rems(128.0))
+        .max_w(ui_rems(POPUP_MAX_WIDTH))
+        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
 }
 
 /// A menu row as Kit draws one: 26 px, lit while `highlighted` or hovered, muted and
@@ -1874,7 +1874,7 @@ pub(super) fn menu_row(
     let (accent, accent_text) = (theme.tokens.accent, theme.accent_foreground);
     div()
         .id(id)
-        .min_h(px(26.0))
+        .min_h(ui_rems(26.0))
         .px_2()
         .flex()
         .items_center()
@@ -1903,7 +1903,7 @@ pub(super) fn menu_separator_row(cx: &App) -> Div {
 /// A group's heading in a menu, as Kit draws a label row.
 pub(super) fn menu_label_row(label: impl Into<SharedString>, cx: &App) -> Div {
     div()
-        .min_h(px(26.0))
+        .min_h(ui_rems(26.0))
         .px_2()
         .flex()
         .items_center()

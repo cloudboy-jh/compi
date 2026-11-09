@@ -4,6 +4,7 @@
 use super::*;
 use crate::diff::{self, FileDiff, LineKind, Whitespace};
 use compi_protocol::chat::{ChatTool, ChatToolStatus};
+use gpui_component::text::TextViewStyle;
 
 /// An edit is unfolded at first while it changes at most this many lines.
 const SMALL_EDIT_LINES: u32 = 30;
@@ -14,6 +15,8 @@ const TOOL_TEXT_MAX_HEIGHT: f32 = 240.0;
 /// Gap under a row, and under a tool card followed by another.
 const ROW_GAP: f32 = 12.0;
 const PACKED_GAP: f32 = 2.0;
+/// How long a code block's Copy button shows its check after a copy.
+const COPIED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One transcript entry as drawn: cheap to clone into the transcript's row renderer,
 /// with what the reader unfolded.
@@ -70,6 +73,9 @@ pub(super) struct ToolRow {
     /// Lines its edits add and remove.
     added: u32,
     removed: u32,
+    /// Its input (unless it shows edits) and output as selectable code blocks.
+    input: Option<Entity<TextViewState>>,
+    output: Option<Entity<TextViewState>>,
 }
 
 /// One file an edit changed, as the card draws it.
@@ -94,7 +100,7 @@ enum DiffText {
 }
 
 impl ToolRow {
-    fn new(tool: &ChatTool, folder: &str, before: Option<&ToolRow>) -> Self {
+    fn new(tool: &ChatTool, folder: &str, before: Option<&ToolRow>, cx: &mut App) -> Self {
         let (verb, icon) = tool_kind(tool);
         // An update with the same edits keeps the diffs already built.
         let diffs = match before.filter(|before| before.tool.diffs == tool.diffs) {
@@ -107,8 +113,20 @@ impl ToolRow {
         };
         let added = diffs.iter().map(|block| block.added).sum();
         let removed = diffs.iter().map(|block| block.removed).sum();
+        // A card with edits shows them in place of its input.
+        let input = tool.input.as_ref().filter(|_| diffs.is_empty());
         Self {
             target: tool_target(tool, folder),
+            input: tool_view(
+                input,
+                before.map(|before| (before.tool.input.as_ref(), before.input.as_ref())),
+                cx,
+            ),
+            output: tool_view(
+                tool.output.as_ref(),
+                before.map(|before| (before.tool.output.as_ref(), before.output.as_ref())),
+                cx,
+            ),
             tool: tool.clone(),
             verb,
             icon,
@@ -226,6 +244,164 @@ fn tool_target(tool: &ChatTool, folder: &str) -> Option<SharedString> {
     .map(|value| relative_to(value, folder).into())
 }
 
+/// The view of a tool's input or output `text`: `before`'s view when it showed the same
+/// text, or that view given the new text, else a new one.
+fn tool_view(
+    text: Option<&String>,
+    before: Option<(Option<&String>, Option<&Entity<TextViewState>>)>,
+    cx: &mut App,
+) -> Option<Entity<TextViewState>> {
+    let text = text?;
+    match before {
+        Some((shown, Some(view))) if shown == Some(text) => Some(view.clone()),
+        Some((_, Some(view))) => {
+            let source = tool_markdown(text);
+            view.update(cx, |view, cx| view.set_text(&source, cx));
+            Some(view.clone())
+        }
+        _ => Some(markdown(&tool_markdown(text), cx)),
+    }
+}
+
+/// A tool's input or output as one fenced code block: YAML-like when it is a JSON object
+/// or list, else the text as it came.
+fn tool_markdown(text: &str) -> String {
+    let (language, body) = match json_text(text) {
+        Some(body) => ("yaml", body),
+        None => ("", text.trim_end().to_owned()),
+    };
+    let longest = body
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}{language}\n{body}\n{fence}")
+}
+
+/// A JSON object or list as `key: value` lines: values unquoted and aligned, lists of
+/// plain values joined with commas, nested objects and list items (`- `) indented under
+/// their key, text of several lines as a `|` block.
+fn json_text(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if !(value.is_object() || value.is_array()) {
+        return None;
+    }
+    let mut out = String::new();
+    write_nested(&value, 0, &mut out);
+    Some(out.trim_end().to_owned())
+}
+
+/// An object's fields, or a list's items, at `indent`.
+fn write_nested(value: &serde_json::Value, indent: usize, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => write_fields(map, indent, false, out),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                match item {
+                    serde_json::Value::Object(map) if !map.is_empty() => {
+                        write_fields(map, indent, true, out)
+                    }
+                    item => {
+                        out.push_str(&" ".repeat(indent));
+                        out.push('-');
+                        write_value(item, indent + 2, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An object's `key: value` lines at `indent`; as a list `item`, the first starts `- `.
+fn write_fields(
+    map: &serde_json::Map<String, serde_json::Value>,
+    indent: usize,
+    item: bool,
+    out: &mut String,
+) {
+    let width = map
+        .iter()
+        .filter(|(_, value)| inline_value(value).is_some_and(|text| !text.contains('\n')))
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let body = indent + if item { 2 } else { 0 };
+    for (index, (key, value)) in map.iter().enumerate() {
+        out.push_str(&" ".repeat(indent));
+        if item {
+            out.push_str(if index == 0 { "- " } else { "  " });
+        }
+        out.push_str(key);
+        out.push(':');
+        if inline_value(value).is_some_and(|text| !text.contains('\n')) {
+            out.push_str(&" ".repeat(width - key.chars().count()));
+        }
+        write_value(value, body + 2, out);
+    }
+}
+
+/// What follows a key or a list's `-`: an inline value on the line, a `|` block, or the
+/// nested fields on the lines under it, at `indent`.
+fn write_value(value: &serde_json::Value, indent: usize, out: &mut String) {
+    match inline_value(value) {
+        Some(text) if text.contains('\n') => {
+            out.push_str(" |\n");
+            for line in text.lines() {
+                out.push_str(&" ".repeat(indent));
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        Some(text) => {
+            out.push(' ');
+            out.push_str(&text);
+            out.push('\n');
+        }
+        None => {
+            out.push('\n');
+            write_nested(value, indent, out);
+        }
+    }
+}
+
+/// A value that fits on its key's line: text without quotes, a number, true or false,
+/// none, or a list of those (or of one-field objects, by that field) joined with commas.
+fn inline_value(value: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    let scalar = |value: &Value| match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
+        Value::Null => Some("none".to_owned()),
+        Value::Array(_) | Value::Object(_) => None,
+    };
+    match value {
+        Value::Array(items) if items.is_empty() => Some("none".to_owned()),
+        Value::Object(map) if map.is_empty() => Some("none".to_owned()),
+        Value::Array(items) => {
+            // `[{ "label": "Red" }, { "label": "Blue" }]` reads as `Red, Blue`.
+            let field = items.first()?.as_object().and_then(|first| {
+                (first.len() == 1)
+                    .then(|| first.keys().next().cloned())
+                    .flatten()
+            });
+            items
+                .iter()
+                .map(|item| match (&field, item) {
+                    (Some(key), Value::Object(map)) if map.len() == 1 => {
+                        map.get(key).and_then(scalar)
+                    }
+                    _ => scalar(item),
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|items| items.iter().all(|item| !item.contains('\n')))
+                .map(|items| items.join(", "))
+        }
+        _ => scalar(value),
+    }
+}
+
 /// Whether `now` is `was` as it went on: the same kind, with more text, or the same tool
 /// call reported further.
 pub(super) fn continues(was: &ChatEntry, now: &ChatEntry) -> bool {
@@ -275,7 +451,7 @@ pub(super) fn chat_row(entry: &ChatEntry, folder: &str, cx: &mut App) -> ChatRow
             open: false,
         },
         ChatEntry::Tool(tool) => ChatRow::Tool {
-            tool: Rc::new(ToolRow::new(tool, folder, None)),
+            tool: Rc::new(ToolRow::new(tool, folder, None, cx)),
             open: None,
         },
         ChatEntry::Error { message } => ChatRow::Error(message.clone().into()),
@@ -301,7 +477,7 @@ pub(super) fn update_row(
     let same_kind = std::mem::discriminant(was) == std::mem::discriminant(now);
     match (&mut *row, now) {
         (ChatRow::Tool { tool, .. }, ChatEntry::Tool(now)) if tool.tool.id == now.id => {
-            *tool = Rc::new(ToolRow::new(now, folder, Some(tool)));
+            *tool = Rc::new(ToolRow::new(now, folder, Some(tool), cx));
         }
         (
             ChatRow::Thought {
@@ -415,14 +591,14 @@ pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> An
         }
         ChatRow::Error(message) => render_error(message, last && frame.retry, frame),
         ChatRow::Cancelled => div()
-            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
             .text_color(frame.muted())
             .child("Stopped")
             .into_any_element(),
     };
     div()
         .w_full()
-        .pb(px(if packed { PACKED_GAP } else { ROW_GAP }))
+        .pb(ui_rems(if packed { PACKED_GAP } else { ROW_GAP }))
         .child(body)
         .into_any_element()
 }
@@ -432,15 +608,44 @@ pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> An
 fn chat_text(view: &Entity<TextViewState>, tint: u32, frame: &RowFrame) -> AnyElement {
     TextView::new(view)
         .selectable(true)
-        .code_block_actions(|block, _, _| {
-            let code = block.code();
-            icon_button("copy-code", IconName::Copy, "Copy").on_click(move |_, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
-            })
-        })
-        .text_size(px(UI_BODY_TEXT_SIZE))
+        .code_block_actions(copy_code_button)
+        .text_size(ui_rems(UI_BODY_TEXT_SIZE))
         .text_color(color(modal_text_color(tint, &frame.colors)))
         .into_any_element()
+}
+
+/// The Copy button in a code block's corner; a check for [`COPIED_FOR`] after a copy.
+fn copy_code_button(
+    block: &gpui_base::text::CodeBlock,
+    window: &mut Window,
+    cx: &mut App,
+) -> controls::Control {
+    use std::hash::{Hash as _, Hasher as _};
+    let code = block.code();
+    // Keyed by the code, so two blocks of one message keep their own state.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    code.hash(&mut hasher);
+    let id = ElementId::NamedInteger("copy-code".into(), hasher.finish());
+    let copied = window.use_keyed_state(id.clone(), cx, |_, _| false);
+    if *copied.read(cx) {
+        return icon_button(id, IconName::Check, "Copied");
+    }
+    icon_button(id, IconName::Copy, "Copy").on_click(move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+        copied.update(cx, |copied, cx| {
+            *copied = true;
+            cx.notify();
+        });
+        let copied = copied.clone();
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            copied.update(cx, |copied, cx| {
+                *copied = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    })
 }
 
 /// A file attached to a prompt, or about to be.
@@ -456,15 +661,15 @@ pub(super) fn image_chip(label: SharedString, frame_colors: &ThemeColors) -> Div
 fn chip(icon: IconName, label: SharedString, frame_colors: &ThemeColors) -> Div {
     div()
         .flex_none()
-        .max_w(px(260.0))
-        .h(px(20.0))
+        .max_w(ui_rems(260.0))
+        .h(ui_rems(20.0))
         .px_1p5()
         .flex()
         .items_center()
         .gap_1()
-        .rounded(px(4.0))
+        .rounded(ui_rems(4.0))
         .bg(color(frame_colors.surface_hover))
-        .text_size(px(UI_MICRO_TEXT_SIZE))
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
         .child(controls::glyph(
             icon,
             color(modal_text_color(frame_colors.muted, frame_colors)),
@@ -492,7 +697,7 @@ fn render_user(
         .flex()
         .flex_col()
         .gap_1p5()
-        .rounded(px(6.0))
+        .rounded(ui_rems(6.0))
         .bg(color(frame.colors.surface))
         .child(chat_text(text, frame.colors.foreground, frame))
         .when(!files.is_empty() || !images.is_empty(), |message| {
@@ -544,7 +749,7 @@ fn render_thought(
                 .items_center()
                 .gap_1p5()
                 .cursor_pointer()
-                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                 .text_color(frame.muted())
                 .child(controls::glyph(
                     if open {
@@ -574,7 +779,7 @@ fn render_error(message: &SharedString, retry: bool, frame: &RowFrame) -> AnyEle
         .flex()
         .items_center()
         .gap_2()
-        .text_size(px(UI_SMALL_TEXT_SIZE))
+        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
         .child(
             div()
                 .flex_1()
@@ -614,7 +819,7 @@ fn change_counts(added: u32, removed: u32, frame: &RowFrame) -> Div {
         .flex_none()
         .flex()
         .gap_1()
-        .text_size(px(UI_MICRO_TEXT_SIZE))
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
         .font_family(frame.mono.clone())
         .child(
             div()
@@ -648,15 +853,15 @@ fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> Any
     };
     let head = div()
         .id(("chat-tool", index))
-        .h(px(24.0))
+        .h(ui_rems(24.0))
         .px_1()
         .flex()
         .items_center()
         .gap_2()
-        .rounded(px(4.0))
+        .rounded(ui_rems(4.0))
         .cursor_pointer()
         .hover(|style| style.bg(color(frame.colors.surface_hover)))
-        .text_size(px(UI_SMALL_TEXT_SIZE))
+        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
         .child(controls::glyph(
             row.icon,
             if failed {
@@ -683,7 +888,7 @@ fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> Any
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .font_family(frame.mono.clone())
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                     .text_color(muted)
                     .child(target),
             )
@@ -696,7 +901,7 @@ fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> Any
             head.child(
                 div()
                     .flex_none()
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                     .text_color(muted)
                     .child(duration),
             )
@@ -752,11 +957,11 @@ pub(super) fn render_permission_block(
         .flex()
         .flex_col()
         .gap_2()
-        .rounded(px(6.0))
+        .rounded(ui_rems(6.0))
         .bg(color(frame.colors.surface))
         .child(
             div()
-                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                 .child(permission.title.clone()),
         )
         // The subject is the command or path in full; one the title already shows is dropped.
@@ -766,7 +971,7 @@ pub(super) fn render_permission_block(
                 block.child(
                     div()
                         .font_family(frame.mono.clone())
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .child(subject),
                 )
             },
@@ -788,22 +993,12 @@ fn render_tool_body(index: usize, row: &ToolRow, frame: &RowFrame) -> AnyElement
                 .enumerate()
                 .map(|(block, diff)| render_diff(index, block, diff, frame)),
         )
-        .when_some(
-            tool.input.clone().filter(|_| row.diffs.is_empty()),
-            |body, input| {
-                body.child(tool_text(
-                    "Input",
-                    ("chat-tool-input", index),
-                    input,
-                    false,
-                    frame,
-                ))
-            },
-        )
-        .when_some(tool.output.clone(), |body, output| {
+        .when_some(row.input.as_ref(), |body, input| {
+            body.child(tool_text("Input", input, false, frame))
+        })
+        .when_some(row.output.as_ref(), |body, output| {
             body.child(tool_text(
                 "Output",
-                ("chat-tool-output", index),
                 output,
                 tool.status == ChatToolStatus::Failed,
                 frame,
@@ -812,36 +1007,33 @@ fn render_tool_body(index: usize, row: &ToolRow, frame: &RowFrame) -> AnyElement
         .into_any_element()
 }
 
-/// A tool's input or output: a labelled block of monospaced text that scrolls once tall.
+/// A tool's input or output: a label over its code block, selectable with Copy, which
+/// scrolls once tall.
 fn tool_text(
     label: &'static str,
-    id: (&'static str, usize),
-    text: String,
+    view: &Entity<TextViewState>,
     error: bool,
     frame: &RowFrame,
 ) -> AnyElement {
+    let mut code_block = StyleRefinement::default().max_h(ui_rems(TOOL_TEXT_MAX_HEIGHT));
+    code_block.overflow.y = Some(gpui::Overflow::Scroll);
     div()
         .flex()
         .flex_col()
         .gap_0p5()
         .child(
             div()
-                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                 .text_color(frame.muted())
                 .child(label),
         )
         .child(
-            div()
-                .id(id)
-                .max_h(px(TOOL_TEXT_MAX_HEIGHT))
-                .overflow_y_scroll()
-                .p_2()
-                .rounded(px(4.0))
-                .bg(color(frame.colors.surface))
-                .font_family(frame.mono.clone())
-                .text_size(px(UI_MICRO_TEXT_SIZE))
-                .when(error, |block| block.text_color(color(frame.colors.error)))
-                .child(text),
+            TextView::new(view)
+                .selectable(true)
+                .code_block_actions(copy_code_button)
+                .style(TextViewStyle::default().code_block(code_block))
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                .when(error, |text| text.text_color(color(frame.colors.error))),
         )
         .into_any_element()
 }
@@ -872,7 +1064,7 @@ fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -
                     .child(
                         div()
                             .flex_none()
-                            .w(px(14.0))
+                            .w(ui_rems(14.0))
                             .text_color(frame.muted())
                             .child(marker),
                     )
@@ -889,13 +1081,13 @@ fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -
     div()
         .flex()
         .flex_col()
-        .rounded(px(4.0))
+        .rounded(ui_rems(4.0))
         .border_1()
         .border_color(color(frame.colors.border))
         .overflow_hidden()
         .child(
             div()
-                .h(px(28.0))
+                .h(ui_rems(28.0))
                 .pl_2()
                 .pr_1()
                 .flex()
@@ -909,7 +1101,7 @@ fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -
                         .text_ellipsis()
                         .whitespace_nowrap()
                         .font_family(frame.mono.clone())
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .child(diff.label.clone()),
                 )
                 .child(change_counts(diff.added, diff.removed, frame))
@@ -922,7 +1114,7 @@ fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -
                 .flex()
                 .flex_col()
                 .font_family(frame.mono.clone())
-                .text_size(px(UI_MICRO_TEXT_SIZE))
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                 .map(|body| match lines {
                     Some(lines) => body.children(lines),
                     None => body.child(
@@ -994,5 +1186,48 @@ mod tests {
         assert_eq!(tool_target(&tool("3", "other", None), "/work"), None);
         assert_eq!(relative_to(r"C:\work\a.rs", r"C:\work\"), "a.rs");
         assert_eq!(relative_to("/elsewhere/a.rs", "/work"), "/elsewhere/a.rs");
+    }
+
+    #[test]
+    fn json_tool_text_reads_as_aligned_fields() {
+        let text = json_text(
+            r#"{
+                "i": "Asking color preference",
+                "questions": [{
+                    "id": "color",
+                    "question": "Red or blue?",
+                    "options": [{ "label": "Red" }, { "label": "Blue" }],
+                    "multi": false
+                }],
+                "command": "ls -la\npwd",
+                "env": { "CI": true, "skip": null },
+                "tags": []
+            }"#,
+        );
+        // In the harness's order.
+        assert_eq!(
+            text.as_deref(),
+            Some(
+                "i:    Asking color preference\n\
+                 questions:\n  \
+                   - id:       color\n    \
+                     question: Red or blue?\n    \
+                     options:  Red, Blue\n    \
+                     multi:    false\n\
+                 command: |\n  \
+                   ls -la\n  \
+                   pwd\n\
+                 env:\n  \
+                   CI:   true\n  \
+                   skip: none\n\
+                 tags: none"
+            )
+        );
+        // Plain text, a lone JSON number and cut-off JSON stay as they are.
+        assert_eq!(json_text("total 8"), None);
+        assert_eq!(json_text("42"), None);
+        assert_eq!(json_text(r#"{"command": "ls"#), None);
+        // A fence outlasts any backticks in the text.
+        assert_eq!(tool_markdown("a ``` b"), "````\na ``` b\n````");
     }
 }

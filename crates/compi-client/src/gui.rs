@@ -102,6 +102,15 @@ const TERMINAL_PADDING: f32 = 8.0;
 const UI_EVENT_BUDGET: Duration = Duration::from_millis(1);
 const UI_EVENT_YIELD: Duration = Duration::from_micros(8_333);
 
+/// GPUI's rem in logical pixels; Compi never changes the window's.
+const DEFAULT_REM: f32 = 16.0;
+
+/// `size` logical pixels as rems: the same size, except inside an element that scales the
+/// rem, as a chat does by its text size.
+fn ui_rems(size: f32) -> gpui::Rems {
+    gpui::rems(size / DEFAULT_REM)
+}
+
 /// `open`: a file or folder the system asked to open, shown in the first window.
 pub fn run(
     target: ConnectionTarget,
@@ -592,6 +601,7 @@ enum UiEvent {
         ui_font: UiFontPreset,
         density: crate::theme::WorkspaceDensity,
         terminal_font: FontSettings,
+        chat_text_size: f32,
         diagnostics: Vec<String>,
     },
     ImagePrepared {
@@ -954,6 +964,7 @@ struct CompiApp {
         UiFontPreset,
         crate::theme::WorkspaceDensity,
         FontSettings,
+        f32,
     )>,
     pending_image_inputs: HashSet<u64>,
     image_previews: VecDeque<workspace::media::ImagePreview>,

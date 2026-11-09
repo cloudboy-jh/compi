@@ -164,6 +164,16 @@ pub struct FontOverrides {
 pub const MIN_FONT_SIZE: f32 = 6.0;
 pub const MAX_FONT_SIZE: f32 = 72.0;
 
+/// Chat text size, `[chat] text_size`, in logical pixels: the size of message text. The
+/// rest of a chat (headers, cards, the composer, its spacing) scales with it.
+pub const DEFAULT_CHAT_TEXT_SIZE: f32 = 14.0;
+pub const MIN_CHAT_TEXT_SIZE: f32 = 10.0;
+pub const MAX_CHAT_TEXT_SIZE: f32 = 32.0;
+
+fn default_chat_text_size() -> f32 {
+    DEFAULT_CHAT_TEXT_SIZE
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdateSettings {
@@ -480,6 +490,9 @@ pub struct LoadedConfig {
     /// How the focused pane is marked when several are visible.
     #[serde(default)]
     pub focus_indicator: FocusIndicator,
+    /// Message text size of every chat; see [`DEFAULT_CHAT_TEXT_SIZE`].
+    #[serde(default = "default_chat_text_size")]
+    pub chat_text_size: f32,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Named pane arrangements, shape only, keyed by preset name.
@@ -510,6 +523,7 @@ impl Default for LoadedConfig {
             notifications: NotificationSettings::default(),
             confirm_close: false,
             focus_indicator: FocusIndicator::default(),
+            chat_text_size: DEFAULT_CHAT_TEXT_SIZE,
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -785,6 +799,32 @@ impl LoadedConfig {
         } else {
             ValueSource::Default
         };
+        Ok(())
+    }
+
+    /// Persist the chat text size, or remove it (`None`) to use the default.
+    pub fn save_chat_text_size(&mut self, size: Option<f32>) -> Result<(), String> {
+        if size.is_some_and(|size| {
+            !valid_number(
+                f64::from(size),
+                MIN_CHAT_TEXT_SIZE.into(),
+                MAX_CHAT_TEXT_SIZE.into(),
+            )
+        }) {
+            return Err(format!(
+                "Chat text size must be from {MIN_CHAT_TEXT_SIZE} through {MAX_CHAT_TEXT_SIZE}"
+            ));
+        }
+        update_table(&self.path, "chat", |table| match size {
+            Some(size) if size.fract() == 0.0 => {
+                set_table_value(table, "text_size", i64::from(size as i32).into());
+            }
+            Some(size) => set_table_value(table, "text_size", f64::from(size).into()),
+            None => {
+                table.remove("text_size");
+            }
+        })?;
+        self.chat_text_size = size.unwrap_or(DEFAULT_CHAT_TEXT_SIZE);
         Ok(())
     }
 
@@ -1761,6 +1801,21 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                     "configuration",
                 ),
             }
+        }
+    }
+    if let Some(chat) = table(&document, "chat", loaded)
+        && let Some(value) = chat.get("text_size")
+    {
+        match number(value).filter(|value| {
+            valid_number(*value, MIN_CHAT_TEXT_SIZE.into(), MAX_CHAT_TEXT_SIZE.into())
+        }) {
+            Some(size) => loaded.chat_text_size = size as f32,
+            None => invalid(
+                loaded,
+                "chat.text_size",
+                "a finite number from 10 through 32",
+                "configuration",
+            ),
         }
     }
     if let Some(notifications) = table(&document, "notifications", loaded) {

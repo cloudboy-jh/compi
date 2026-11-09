@@ -38,6 +38,13 @@ Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, an
 
 **Settings → Terminal → Font size** shows the terminal and editor text size with −, + and **Reset**; Ctrl+= and Ctrl+- (Cmd on macOS) step it by one, and Ctrl/Cmd+0 resets it. The size is saved as `font.size` and every window follows it, including after editing the file by hand. Reset removes the key, returning to the default of 14.
 
+**Settings → Interface → Chat text size** sizes agent chats with −, + and **Reset**. The messages and everything around them (header, tool cards, menus, the message box) grow together; the rest of the window keeps its size. With a chat focused, Ctrl+=, Ctrl+- and Ctrl+0 (Cmd on macOS) change the chat text size instead of the terminal font. It is saved in its own table, and every window follows it, including after editing the file by hand. Reset removes the key, returning to the default of 14.
+
+```toml
+[chat]
+text_size = 14 # 10 through 32
+```
+
 ## Pane density
 
 **Settings → Interface → Pane density** chooses how terminal panes sit in every window, independent of themes, prompts and transparency:

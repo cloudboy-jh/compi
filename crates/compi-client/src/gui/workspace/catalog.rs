@@ -557,6 +557,7 @@ impl CompiApp {
         cx.notify();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn sync_global_appearance(
         &mut self,
         appearance: AppearanceSettings,
@@ -564,19 +565,27 @@ impl CompiApp {
         ui_font: UiFontPreset,
         density: crate::theme::WorkspaceDensity,
         terminal_font: crate::config::FontSettings,
+        chat_text_size: f32,
         window: &mut Window,
+        cx: &mut App,
     ) {
         // The family and size follow live; line height and fallbacks do not.
         let terminal_font_changed = self.config.configured_font.family != terminal_font.family;
         let font_size_changed = self.config.configured_font.size != terminal_font.size;
+        let chat_text_size_changed = self.config.chat_text_size != chat_text_size;
         if self.config.configured_appearance == appearance
             && self.config.theme_favorites == favorites
             && self.config.ui_font == ui_font
             && self.config.density == density
             && !terminal_font_changed
             && !font_size_changed
+            && !chat_text_size_changed
         {
             return;
+        }
+        if chat_text_size_changed {
+            self.config.chat_text_size = chat_text_size;
+            self.remeasure_chats(cx);
         }
         self.config.configured_appearance = appearance.clone();
         self.config.theme_favorites = favorites;
@@ -655,7 +664,9 @@ impl CompiApp {
                         self.config.ui_font,
                         self.config.density,
                         self.config.configured_font.clone(),
+                        self.config.chat_text_size,
                         target_window,
+                        target_cx,
                     );
                     target_cx.notify();
                 }
