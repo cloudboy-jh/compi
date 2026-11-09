@@ -124,7 +124,12 @@ pub(super) struct Completion {
     kind: CompletionKind,
     /// The highlighted item.
     highlight: usize,
+    /// The list's scroll, kept on the highlighted item.
+    scroll: ScrollHandle,
 }
+
+/// The widest the `/` and `@` lists get; narrower composers make them narrower.
+const COMPLETION_MAX_WIDTH: f32 = 560.0;
 
 enum CompletionKind {
     /// `/` at the start: the harness's commands starting with `query`.
@@ -264,18 +269,26 @@ impl CompiApp {
         let mut search = None;
         model.completion = match wanted(&value, cursor) {
             None => None,
-            Some(Wanted::Command(query)) => Some(Completion {
-                highlight: match &model.completion {
+            Some(Wanted::Command(query)) => {
+                let same = matches!(
+                    &model.completion,
                     Some(Completion {
                         kind: CompletionKind::Commands { query: shown },
-                        highlight,
-                    }) if shown == query => *highlight,
-                    _ => 0,
-                },
-                kind: CompletionKind::Commands {
-                    query: query.to_owned(),
-                },
-            }),
+                        ..
+                    }) if shown == query
+                );
+                if same {
+                    model.completion.take()
+                } else {
+                    Some(Completion {
+                        highlight: 0,
+                        scroll: ScrollHandle::new(),
+                        kind: CompletionKind::Commands {
+                            query: query.to_owned(),
+                        },
+                    })
+                }
+            }
             Some(Wanted::File { at, query }) => {
                 let same = matches!(
                     &model.completion,
@@ -292,6 +305,7 @@ impl CompiApp {
                     }
                     Some(Completion {
                         highlight: 0,
+                        scroll: ScrollHandle::new(),
                         kind: CompletionKind::Files {
                             at,
                             query: query.to_owned(),
@@ -370,9 +384,11 @@ impl CompiApp {
                 if let Some(Completion {
                     kind: CompletionKind::Files { found, .. },
                     highlight,
+                    scroll,
                 }) = &mut model.completion
                 {
                     *highlight = 0;
+                    scroll.scroll_to_item(0);
                     *found = match result {
                         Ok(entries) => Found::Listed(
                             entries
@@ -420,6 +436,7 @@ impl CompiApp {
                 } else {
                     (completion.highlight + 1) % count
                 };
+                completion.scroll.scroll_to_item(completion.highlight);
                 true
             }
             "tab" | "enter" => self.accept_chat_completion(chat, window, cx),
@@ -883,6 +900,7 @@ impl CompiApp {
                     div()
                         .absolute()
                         .left_0()
+                        .right_0()
                         .bottom_full()
                         .mb_1()
                         .child(self.render_chat_completion(chat, model, completion, cx)),
@@ -1050,31 +1068,42 @@ impl CompiApp {
                         .enumerate()
                         .map(|(index, command)| {
                             let name = command.name.trim_start_matches('/');
+                            let line = || {
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                            };
                             controls::menu_row(
                                 ("chat-command", index),
                                 index == completion.highlight,
                                 false,
                                 cx,
                             )
+                            .flex_none()
                             .child(
                                 div()
+                                    .flex_1()
                                     .min_w_0()
                                     .flex()
                                     .flex_col()
                                     .py_0p5()
                                     .child(
-                                        div().flex().gap_2().child(format!("/{name}")).when_some(
-                                            command.hint.clone(),
-                                            |line, hint| {
-                                                line.child(div().text_color(muted).child(hint))
-                                            },
-                                        ),
+                                        div()
+                                            .min_w_0()
+                                            .flex()
+                                            .gap_2()
+                                            .child(div().flex_none().child(format!("/{name}")))
+                                            .when_some(command.hint.clone(), |row, hint| {
+                                                row.child(line().opacity(0.7).child(hint))
+                                            }),
                                     )
                                     .when(!command.description.is_empty(), |column| {
                                         column.child(
-                                            div()
+                                            line()
                                                 .text_size(px(UI_MICRO_TEXT_SIZE))
-                                                .text_color(muted)
+                                                .opacity(0.7)
                                                 .child(command.description.clone()),
                                         )
                                     }),
@@ -1105,6 +1134,7 @@ impl CompiApp {
                             false,
                             cx,
                         )
+                        .flex_none()
                         .child(
                             div()
                                 .min_w_0()
@@ -1121,8 +1151,11 @@ impl CompiApp {
         };
         controls::menu_surface(cx)
             .id("chat-completion")
+            .w_full()
+            .max_w(px(COMPLETION_MAX_WIDTH))
             .max_h(px(260.0))
             .overflow_y_scroll()
+            .track_scroll(&completion.scroll)
             .children(rows)
             .into_any_element()
     }
