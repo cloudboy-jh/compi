@@ -1,3 +1,4 @@
+mod chat;
 #[cfg(windows)]
 pub mod conpty;
 mod content_files;

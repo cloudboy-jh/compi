@@ -1,6 +1,7 @@
 //! Client-side daemon transport, terminal replicas, and interaction logic.
 
 pub mod arrangement;
+pub mod chat;
 pub mod cli;
 pub mod cli_window;
 pub mod client_state;

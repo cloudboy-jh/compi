@@ -32,7 +32,8 @@ use windows::core::PCWSTR;
 /// daemons can refuse the file. Format 8 (protocol 33) adds the Browser kind, stored the
 /// way Monitor is. Format 9 (protocol 37) adds tab groups (`groups` on a session, `group`
 /// on a tab and a merge record); older daemons ignore the keys and reach their format check.
-const FORMAT_VERSION: u32 = 9;
+/// Format 10 (protocol 38) adds the Chat kind, stored the way Monitor is.
+const FORMAT_VERSION: u32 = 10;
 
 #[derive(Clone)]
 pub struct WorkspaceStore {
@@ -164,6 +165,9 @@ impl WorkspaceStore {
                         value["format_version"] = 9.into();
                     }
                     if value.get("format_version") == Some(&serde_json::Value::from(9)) {
+                        value["format_version"] = 10.into();
+                    }
+                    if value.get("format_version") == Some(&serde_json::Value::from(10)) {
                         restore_newer_kinds(&mut value);
                         restore_commit_diffs(&mut value);
                         restore_newer_sections(&mut value);
@@ -556,7 +560,7 @@ fn walk_settings(
 }
 
 /// Content kinds newer than Settings, written as marked Settings leaves.
-const NEWER_KINDS: [&str; 2] = ["monitor", "browser"];
+const NEWER_KINDS: [&str; 3] = ["monitor", "browser", "chat"];
 
 /// A format-3 daemon (protocol 26) reads every content leaf as a folder: it needs an
 /// `environment` and a `root` and ignores other keys. A format-4 daemon (protocol 27) knows
@@ -597,7 +601,7 @@ fn mark_newer_kinds(value: &mut serde_json::Value) {
 }
 
 /// Undoes `mark_newer_kinds`, keeping a leaf's own fields (Monitor's page, Browser's
-/// URL). Every layout copy is walked.
+/// URL, a chat's environment). Every layout copy is walked.
 fn restore_newer_kinds(value: &mut serde_json::Value) {
     use serde_json::Value;
     match value {
@@ -612,8 +616,11 @@ fn restore_newer_kinds(value: &mut serde_json::Value) {
                     .filter(|kind| NEWER_KINDS.contains(kind))
                     .map(str::to_owned)
                 {
-                    for placeholder in ["shows", "section", "environment", "root"] {
-                        content.remove(placeholder);
+                    content.remove("shows");
+                    content.remove("section");
+                    content.remove("root");
+                    if kind != "chat" {
+                        content.remove("environment");
                     }
                     content.insert("kind".into(), Value::from(kind));
                 }
@@ -1475,8 +1482,9 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// `content_workspace` with Settings, Monitor and Browser panes beside the files pane,
-    /// in both arrangements; the Monitor watches a WSL distribution.
+    /// `content_workspace` with Settings, Monitor, Browser and Chat panes beside the files
+    /// pane, in both arrangements; the Monitor watches and the chat runs in a WSL
+    /// distribution.
     fn content_kinds_workspace() -> StoredWorkspace {
         let (mut workspace, files) = content_workspace(SurfaceStatus::Lost);
         let settings = LayoutNode::Content {
@@ -1500,6 +1508,18 @@ mod tests {
                 url: "http://localhost:3000/docs?page=2".into(),
             }),
         };
+        let chat = LayoutNode::Content {
+            pane_id: PaneId::new("pane-6"),
+            content: PaneContent::Chat(compi_protocol::chat::ChatContent {
+                id: "chat-1".into(),
+                harness: compi_protocol::chat::ChatHarness::Omp,
+                environment: ContentEnvironment::Wsl {
+                    distribution: "Ubuntu".into(),
+                },
+                folder: "/home/me/project".into(),
+                session: Some("01a1bc23-56d5".into()),
+            }),
+        };
         let terminal = LayoutNode::terminal(PaneId::new("pane-1"), SurfaceId::new("surface-1"));
         let split = |first: &LayoutNode, second: &LayoutNode| LayoutNode::Split {
             axis: SplitAxis::Horizontal,
@@ -1510,17 +1530,23 @@ mod tests {
         let tab = &mut workspace.sessions[0].tabs[0];
         tab.layout = split(
             &terminal,
-            &split(&files, &split(&settings, &split(&monitor, &browser))),
+            &split(
+                &files,
+                &split(&settings, &split(&monitor, &split(&browser, &chat))),
+            ),
         );
         tab.previous_layout = Some(Box::new(split(
-            &split(&browser, &split(&monitor, &split(&settings, &files))),
+            &split(
+                &split(&chat, &browser),
+                &split(&monitor, &split(&settings, &files)),
+            ),
             &terminal,
         )));
         workspace
     }
 
     #[test]
-    fn settings_monitor_and_browser_panes_survive_reopen() {
+    fn settings_monitor_browser_and_chat_panes_survive_reopen() {
         let path = test_path("content-kinds");
         let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
         let workspace = content_kinds_workspace();
@@ -1529,9 +1555,13 @@ mod tests {
         let panes = &saved["workspace"]["sessions"][0]["tabs"][0]["layout"]["second"]["second"];
         assert_eq!(panes["first"]["content"]["kind"], "settings");
         assert_eq!(panes["first"]["content"]["section"], "terminal");
-        // Monitor and Browser are stored as marked Settings leaves for older daemons, and
-        // the placeholders written for them are ignored when loading.
-        let (monitor, browser) = (&panes["second"]["first"], &panes["second"]["second"]);
+        // Monitor, Browser and Chat are stored as marked Settings leaves for older daemons,
+        // and the placeholders written for them are ignored when loading.
+        let monitor = &panes["second"]["first"];
+        let (browser, chat) = (
+            &panes["second"]["second"]["first"],
+            &panes["second"]["second"]["second"],
+        );
         assert_eq!(monitor["content"]["kind"], "settings");
         assert_eq!(monitor["content"]["shows"], "monitor");
         assert_eq!(browser["content"]["kind"], "settings");
@@ -1540,6 +1570,7 @@ mod tests {
             browser["content"]["url"],
             "http://localhost:3000/docs?page=2"
         );
+        assert_eq!(chat["content"]["shows"], "chat");
         assert_eq!(panes["first"]["content"]["root"], "/");
         let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
         assert_eq!(reopened.sessions, workspace.sessions);
@@ -1768,10 +1799,13 @@ mod tests {
         let old: OldManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(old.format_version, FORMAT_VERSION);
         let tab = &old.workspace.sessions[0].tabs[0];
-        assert_eq!(roots(&tab.layout), ["/home/user/project", "/", "/", "/"]);
+        assert_eq!(
+            roots(&tab.layout),
+            ["/home/user/project", "/", "/", "/", "/"]
+        );
         assert_eq!(
             roots(tab.previous_layout.as_ref().unwrap()),
-            ["/", "/", "/", "/home/user/project"]
+            ["/", "/", "/", "/", "/home/user/project"]
         );
         let _ = fs::remove_file(path);
     }
@@ -1842,11 +1876,11 @@ mod tests {
     }
 
     #[test]
-    fn format_5_to_8_files_load_as_format_9() {
+    fn format_5_to_9_files_load_as_format_10() {
         let expected = content_kinds_workspace();
-        for format in [5, 6, 7, 8] {
+        for format in [5, 6, 7, 8, 9] {
             let path = test_path(&format!("format-{format}"));
-            // As a format-5 to format-8 daemon wrote it: newer kinds marked for older
+            // As a format-5 to format-9 daemon wrote it: newer kinds marked for older
             // daemons.
             let mut manifest = serde_json::to_value(Manifest {
                 format_version: format,
@@ -1860,7 +1894,7 @@ mod tests {
             assert_eq!(workspace.sessions, expected.sessions);
             let saved: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved["format_version"], 9);
+            assert_eq!(saved["format_version"], 10);
             let _ = fs::remove_file(path);
         }
     }

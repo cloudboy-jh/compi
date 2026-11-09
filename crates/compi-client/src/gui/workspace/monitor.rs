@@ -34,7 +34,7 @@ pub(in crate::gui::workspace) use inspector::surface_pane;
 mod overview;
 mod processes;
 mod resources;
-mod watch;
+pub(in crate::gui::workspace) mod watch;
 
 use crate::monitor::apps::RowKey;
 use crate::monitor::layout::{self, CardMove, OverviewCard, OverviewRows};
@@ -43,7 +43,8 @@ use icons::{ICON_QUEUE, IconCache, IconsEvent};
 use overview::{Metric, TotalsFeed};
 use processes::{ProcessFeed, ProcessList};
 use watch::{
-    LINGER, ProcessesEvent, ProcessesSample, SlotChange, TotalsEvent, WatchContext, WatchSlot,
+    LINGER, ProcessesEvent, ProcessesSample, SlotChange, TotalsEvent, WatchContext, WatchLink,
+    WatchSlot,
 };
 
 const UNAVAILABLE: &str = "—";
@@ -423,11 +424,8 @@ impl CompiApp {
             }
         }
         let host = WatchContext {
-            target: self.target.clone(),
+            link: self.watch_link(),
             source: MonitorSource::Host,
-            sender: self.event_tx.clone(),
-            quiesced: self.update_quiesced.clone(),
-            connection_guard: self.update_connection_guard.clone(),
         };
         for (source, processes, generation, stop) in started {
             let context = WatchContext {
@@ -595,6 +593,16 @@ impl CompiApp {
         let feed = &sources.get(&source).unwrap_or(unread).processes;
         pane.list.show_source(feed, *flat);
         pane.source = source;
+    }
+
+    /// This window's link for watching connections: its daemon and update pause.
+    pub(in crate::gui::workspace) fn watch_link(&self) -> WatchLink {
+        WatchLink {
+            target: self.target.clone(),
+            sender: self.event_tx.clone(),
+            quiesced: self.update_quiesced.clone(),
+            connection_guard: self.update_connection_guard.clone(),
+        }
     }
 
     /// Stops each watcher no pane has wanted for [`LINGER`]; whether one stopped. A

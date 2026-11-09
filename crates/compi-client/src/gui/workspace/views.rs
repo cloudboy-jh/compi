@@ -1,4 +1,4 @@
-//! Views in place. A terminal pane can carry a view (Files, Settings or Monitor) shown
+//! Views in place. A terminal pane can carry a view (Files, Settings, Monitor or a chat) shown
 //! in place of its shell, which keeps running underneath at its size: the layout still
 //! sizes the pane in cells, so its PTY never shrinks for the view. The view shares the
 //! terminal's `PaneId`, so its content's client state (`ContentUi`, `SettingsUi`,
@@ -71,6 +71,7 @@ pub(super) const fn view_label(content: &PaneContent) -> &'static str {
         PaneContent::Settings(_) => "Settings",
         PaneContent::Monitor(_) => "Monitor",
         PaneContent::Browser(_) => "Browser",
+        PaneContent::Chat(_) => "Chat",
     }
 }
 

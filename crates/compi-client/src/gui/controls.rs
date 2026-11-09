@@ -101,6 +101,13 @@ gpui_kit_assets::icon_assets!(
         Clock,
         Bell,
         Cloud,
+        Brain,
+        FilePen,
+        FileSearch,
+        MoveRight,
+        Paperclip,
+        Terminal,
+        Wrench,
     ]
 );
 

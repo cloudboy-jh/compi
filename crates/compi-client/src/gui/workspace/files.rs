@@ -41,7 +41,7 @@ fn link_target(path: &str, folder: Option<&str>, windows: bool) -> Result<String
 
 impl CompiApp {
     /// Paths of `environment` use Windows syntax: the host of a local Windows daemon.
-    fn windows_paths(&self, environment: &ContentEnvironment) -> bool {
+    pub(super) fn windows_paths(&self, environment: &ContentEnvironment) -> bool {
         *environment == ContentEnvironment::Host && cfg!(windows) && !self.target.is_remote()
     }
 
@@ -76,7 +76,7 @@ impl CompiApp {
 
     /// A surface the daemon can list and search `folder` of `environment` through: a
     /// PowerShell shell on this PC for a Windows folder, else a shell with `/` paths.
-    fn search_surface(
+    pub(super) fn search_surface(
         &self,
         environment: &ContentEnvironment,
         folder: &str,
@@ -147,6 +147,16 @@ impl CompiApp {
             });
         }
         if let Some(content) = self.focused_pane_content() {
+            if let PaneContent::Chat(chat) = content {
+                // Files open beside a chat, in its folder; the chat stays.
+                return Ok(FileScope {
+                    search: self.search_surface(&chat.environment, &chat.folder, None),
+                    pane_id,
+                    environment: chat.environment.clone(),
+                    folder: chat.folder.clone(),
+                    content: false,
+                });
+            }
             return Err(match content {
                 PaneContent::Monitor(_) => {
                     "Monitor has no folder; select a terminal or a files pane"
@@ -154,7 +164,7 @@ impl CompiApp {
                 PaneContent::Browser(_) => {
                     "Browser has no folder; select a terminal or a files pane"
                 }
-                PaneContent::Settings(_) | PaneContent::Files(_) => {
+                PaneContent::Settings(_) | PaneContent::Files(_) | PaneContent::Chat(_) => {
                     "Settings has no folder; select a terminal or a files pane"
                 }
             });

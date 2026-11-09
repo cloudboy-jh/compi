@@ -2294,15 +2294,24 @@ fn validate_split_geometry(
 }
 
 /// Content paths must be absolute where they live: on this host, or inside a WSL
-/// distribution, which only a Windows host can reach. Settings and Monitor carry
+/// distribution, which only a Windows host can reach. Settings, Monitor and Browser carry
 /// no paths.
 fn validate_content(content: &PaneContent) -> Result<(), String> {
     content.validate()?;
-    let PaneContent::Files(folder) = content else {
-        return Ok(());
+    let (environment, mut paths): (_, Box<dyn Iterator<Item = &str>>) = match content {
+        PaneContent::Files(folder) => (
+            &folder.environment,
+            Box::new(std::iter::once(folder.root.as_str()).chain(folder.files())),
+        ),
+        PaneContent::Chat(chat) => (
+            &chat.environment,
+            Box::new(std::iter::once(chat.folder.as_str())),
+        ),
+        PaneContent::Settings(_) | PaneContent::Monitor(_) | PaneContent::Browser(_) => {
+            return Ok(());
+        }
     };
-    let mut paths = std::iter::once(folder.root.as_str()).chain(folder.files());
-    match &folder.environment {
+    match environment {
         ContentEnvironment::Host => {
             if let Some(path) = paths.find(|path| !std::path::Path::new(path).is_absolute()) {
                 return Err(format!("content path {path} is not absolute on this host"));
@@ -2327,6 +2336,7 @@ fn content_kind(content: &PaneContent) -> &'static str {
         PaneContent::Settings(_) => "settings",
         PaneContent::Monitor(_) => "monitor",
         PaneContent::Browser(_) => "browser",
+        PaneContent::Chat(_) => "chat",
     }
 }
 

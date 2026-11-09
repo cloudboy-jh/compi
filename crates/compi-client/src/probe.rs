@@ -266,6 +266,10 @@ fn pane_command(target: &ConnectionTarget, args: &[String]) -> Result<()> {
                     content: PaneContent::Files(folder),
                     ..
                 } => folder.environment,
+                LayoutNode::Content {
+                    content: PaneContent::Chat(chat),
+                    ..
+                } => chat.environment,
                 // Settings, Monitor and Browser have no folder; files beside them are
                 // the daemon host's.
                 LayoutNode::Content {

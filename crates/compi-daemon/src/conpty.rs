@@ -349,7 +349,9 @@ unsafe fn create_process(
     ))
 }
 
-unsafe fn create_kill_on_close_job(process: &OwnedHandle) -> Result<OwnedHandle> {
+/// A job that ends `process` (and what it starts afterwards) once the job's handle is
+/// closed, so the process cannot outlive its owner, the daemon included.
+pub(crate) unsafe fn create_kill_on_close_job(process: &impl AsRawHandle) -> Result<OwnedHandle> {
     let job = unsafe { CreateJobObjectW(None, PCWSTR::null())? };
     let job = unsafe { OwnedHandle::from_raw_handle(job.0) };
 

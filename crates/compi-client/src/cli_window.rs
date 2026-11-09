@@ -136,7 +136,7 @@ impl Request {
 }
 
 /// What a pane holds; reported as
-/// `"type": "terminal" | "content" | "settings" | "monitor" | "browser"`.
+/// `"type": "terminal" | "content" | "settings" | "monitor" | "browser" | "chat"`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneType {
@@ -149,6 +149,8 @@ pub enum PaneType {
     Monitor,
     /// A content pane showing a web page.
     Browser,
+    /// A content pane showing a chat with an agent harness.
+    Chat,
 }
 
 impl PaneType {
@@ -159,6 +161,7 @@ impl PaneType {
             PaneContent::Settings(_) => Self::Settings,
             PaneContent::Monitor(_) => Self::Monitor,
             PaneContent::Browser(_) => Self::Browser,
+            PaneContent::Chat(_) => Self::Chat,
         }
     }
 }

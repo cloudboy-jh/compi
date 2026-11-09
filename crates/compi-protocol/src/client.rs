@@ -806,6 +806,39 @@ impl DaemonClient {
         }
     }
 
+    /// Starts watching `chat` on this connection, starting its harness if needed, and
+    /// returns its whole state; each change then arrives as `ChatChanged`. Use a connection
+    /// of its own: replies to other requests on it skip those events.
+    pub fn watch_chat(&mut self, chat: crate::chat::ChatContent) -> Result<crate::chat::ChatState> {
+        match self.request_bounded(ClientMessage::WatchChat { chat }, Duration::from_secs(10))? {
+            ServerMessage::ChatWatching { state } => Ok(state),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Sends a chat request answered by `ChatAccepted`: `SendChat`, `CancelChat`,
+    /// `AnswerChatPermission`, `AnswerChatQuestion`, `SetChatOption`, `ResumeChat` or
+    /// `RestartChat`.
+    pub fn chat_request(&mut self, message: ClientMessage) -> Result<()> {
+        match self.request_bounded(message, Duration::from_secs(10))? {
+            ServerMessage::ChatAccepted => Ok(()),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// The harness's sessions in the chat's folder, newest first as the harness lists them.
+    pub fn chat_sessions(&mut self, chat: &str) -> Result<Vec<crate::chat::ChatSessionInfo>> {
+        match self.request_bounded(
+            ClientMessage::ListChatSessions {
+                chat: chat.to_owned(),
+            },
+            Duration::from_secs(15),
+        )? {
+            ServerMessage::ChatSessions { sessions } => Ok(sessions),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     pub fn attach_console_surface(
         &mut self,
         surface: &SurfaceInfo,

@@ -10,6 +10,7 @@ pub(in crate::gui) mod branches;
 pub(in crate::gui) mod browser;
 pub(super) mod catalog;
 mod changes;
+pub(in crate::gui) mod chat;
 pub(in crate::gui) mod content;
 pub(in crate::gui) mod dialogs;
 mod diff_view;
@@ -976,6 +977,7 @@ impl CompiApp {
             settings: settings::SettingsUi::default(),
             monitor: monitor::MonitorUi::default(),
             browser: browser::BrowserUi::default(),
+            chat: chat::ChatUi::default(),
             popup: None,
             context_menu: None,
             tab_menu: None,
@@ -2157,6 +2159,7 @@ impl CompiApp {
                 self.program_status.update(status);
             }
             UiEvent::Monitor(event) => self.monitor_event(event),
+            UiEvent::Chat(update) => self.chat_event(update, cx),
             UiEvent::SurfacesLoaded(Ok(workspace)) => {
                 self.connection_error = None;
                 self.accept_workspace(workspace);
@@ -3441,6 +3444,7 @@ impl CompiApp {
                 .and_then(|content| content.active.as_ref())
                 .is_some_and(|tab| content::notes::readable(tab.path())),
             files_reason: file_scope.as_ref().err().copied(),
+            chat_reason: self.chat_scope().err(),
             file_search_reason: file_scope
                 .as_ref()
                 .ok()
@@ -4228,6 +4232,7 @@ impl CompiApp {
             Command::OpenSettings => self.open_settings(None, None, window, cx),
             Command::OpenMonitor => self.open_monitor(window, cx),
             Command::OpenBrowser => self.open_browser(compi_protocol::BrowserContent::BLANK.into()),
+            Command::OpenChat => self.open_chat(window, cx),
             Command::BrowserBack => self.browser_navigate(browser::Navigation::Back),
             Command::BrowserForward => self.browser_navigate(browser::Navigation::Forward),
             Command::BrowserReload => self.browser_navigate(browser::Navigation::Reload),
@@ -4714,6 +4719,9 @@ impl CompiApp {
                         compi_protocol::PaneContent::Browser(browser) => {
                             (self.browser_title(&pane_id, &browser.url), None)
                         }
+                        compi_protocol::PaneContent::Chat(chat) => {
+                            (chat.harness.name().to_owned(), Some(chat.folder))
+                        }
                     };
                     Some(TabPane {
                         floating: self.state.is_floating(&pane_id),
@@ -5034,6 +5042,7 @@ impl CompiApp {
         self.prepare_settings(window, cx);
         self.prepare_monitor(window, cx);
         self.prepare_browsers(window, cx);
+        self.prepare_chats(window, cx);
         self.reconcile_keyboard_focus(window, cx);
         for view in &mut self.surface_views {
             if !view.stop.load(Ordering::Acquire) {

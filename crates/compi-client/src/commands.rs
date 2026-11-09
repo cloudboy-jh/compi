@@ -170,6 +170,7 @@ registry! {
     OpenDiagnostics, "open_diagnostics", "Open diagnostics", None, None;
     OpenMonitor, "open_monitor", "Monitor", None, None;
     OpenBrowser, "open_browser", "Open browser", None, None;
+    OpenChat, "open_chat", "OMP chat", None, None;
     BrowserBack, "browser_back", "Back", None, None;
     BrowserForward, "browser_forward", "Forward", None, None;
     BrowserReload, "browser_reload", "Reload page", None, None;
@@ -267,6 +268,9 @@ pub struct CommandContext {
     /// Why the focused pane's folder cannot open in a content pane: a terminal that
     /// has not reported its directory.
     pub files_reason: Option<&'static str>,
+    /// Why a chat cannot start from the focused pane: it has no folder, or its terminal
+    /// has not reported its directory.
+    pub chat_reason: Option<&'static str>,
     /// Why the focused pane's folder cannot be searched for a file to open.
     pub file_search_reason: Option<&'static str>,
     /// Why Git commands cannot run from the focused pane: it is not a content pane whose
@@ -336,7 +340,7 @@ impl Command {
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
-            | SwapPaneDown | RemovePane | OpenBrowser | BrowserBack | BrowserForward
+            | SwapPaneDown | RemovePane | OpenBrowser | OpenChat | BrowserBack | BrowserForward
             | BrowserReload | FocusAddressBar => CommandCategory::Panes,
             ShowFiles | ShowChanges | DiffThisFile | ToggleMarkdownRead | NextChange
             | PreviousChange | GitFetch | GitPull | GitPush | SwitchBranch | CreateBranch
@@ -465,6 +469,9 @@ impl Command {
                 "Shows the processes running where your terminals run, with their CPU and memory.",
             ),
             OpenBrowser => Some("Opens a web page in a pane beside the focused one."),
+            OpenChat => Some(
+                "Starts a chat with OMP in the focused terminal's folder, in place of its shell; from another pane, beside it.",
+            ),
             TestNotification => Some(
                 "Sends a notification the way your Notifications settings deliver one, with its sound.",
             ),
@@ -526,6 +533,7 @@ impl Command {
                 "task manager processes activity monitor resources top htop cpu memory threads pid kill end usage"
             }
             OpenBrowser => "web page url localhost preview site dev server http",
+            OpenChat => "agent ai assistant omp chat prompt llm acp",
             BrowserBack | BrowserForward => "browser web page history navigate",
             BrowserReload => "browser web page refresh stop",
             FocusAddressBar => "browser web page url location navigate go",
@@ -622,6 +630,7 @@ impl Command {
                 | NewEditor
                 | EndSurface
                 | RestartSurface
+                | OpenChat
         );
         if !c.connected
             && (mutation
@@ -889,6 +898,13 @@ impl Command {
             GitPull => c.git_reason.or(c.pull_reason),
             GitPush => c.git_reason.or(c.push_reason),
             RecoverUnsavedEdits => (!c.has_pane).then_some("Select a pane first"),
+            OpenChat => {
+                if !c.has_pane {
+                    Some("Select a pane first")
+                } else {
+                    c.chat_reason
+                }
+            }
             Copy => (!c.has_selection).then_some("Select terminal text to copy"),
             Paste | SelectAll | ClearScrollback if c.content_pane => Some(CONTENT_PANE_REASON),
             Paste => {
@@ -1947,6 +1963,30 @@ mod tests {
             Command::NextFloatingPane
                 .disabled_reason(&context)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn omp_chat_needs_a_pane_with_a_known_folder() {
+        let mut context = ready();
+        assert!(Command::OpenChat.disabled_reason(&context).is_none());
+        assert_eq!(Command::OpenChat.spec().id, "open_chat");
+        assert_eq!(Command::OpenChat.spec().category(), CommandCategory::Panes);
+        assert!(search("agent").any(|spec| spec.command == Command::OpenChat));
+        context.chat_reason = Some("no folder");
+        assert_eq!(
+            Command::OpenChat.disabled_reason(&context),
+            Some("no folder")
+        );
+        context.has_pane = false;
+        assert_eq!(
+            Command::OpenChat.disabled_reason(&context),
+            Some("Select a pane first")
+        );
+        context.connected = false;
+        assert_eq!(
+            Command::OpenChat.disabled_reason(&context),
+            Some("Reconnect to the server first")
         );
     }
 

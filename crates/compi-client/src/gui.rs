@@ -687,6 +687,8 @@ enum UiEvent {
     ProgramStatusChanged(compi_protocol::program_status::SurfaceProgramStatus),
     /// What one of the window's Monitor watchers saw.
     Monitor(workspace::monitor::MonitorEvent),
+    /// What one of the window's chat watchers saw.
+    Chat(workspace::chat::ChatUpdate),
     PerformanceSample(Result<workspace::performance::PerformanceSample, String>),
     TabDisconnected {
         tab_id: u64,
@@ -979,6 +981,8 @@ struct CompiApp {
     monitor: workspace::monitor::MonitorUi,
     /// Browser panes' pages; see `browser`.
     browser: workspace::browser::BrowserUi,
+    /// Chat panes' transcripts, drafts and watchers; see `chat`.
+    chat: workspace::chat::ChatUi,
     popup: Option<Popup>,
     /// A menu at the pointer: a right-click, a pane's grip.
     context_menu: Option<controls::ContextMenu>,

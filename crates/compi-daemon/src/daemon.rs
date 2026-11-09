@@ -677,10 +677,20 @@ fn handle_connection(
     // Set while a totals watch waits for its source to describe itself before answering.
     let mut system_totals_request: Option<u64> = None;
     let mut workspace_changed = false;
+    // The chat this connection watches, while it does.
+    let mut chat_watch: Option<std::sync::mpsc::Receiver<compi_protocol::chat::ChatEvent>> = None;
     let mut uploads = HashMap::<UploadId, ImageUpload>::new();
     let result = (|| -> Result<()> {
         while !stopping.load(Ordering::Acquire) && sink.is_alive() {
-            workspace_changed |= send_workspace_events(&sink, &mut workspace_events, &manager)?;
+            let changed = send_workspace_events(&sink, &mut workspace_events, &manager)?;
+            if changed {
+                // A chat whose pane closed ends with it.
+                if let Ok(workspace) = manager.snapshot() {
+                    crate::chat::hub().retain(&workspace);
+                }
+            }
+            workspace_changed |= changed;
+            send_chat_events(&sink, &mut chat_watch)?;
             if let Some(watch) = program_status_watch.as_mut() {
                 if std::mem::take(&mut workspace_changed) {
                     // Retires the runtimes of closed panes, which removes their status.
@@ -826,6 +836,73 @@ fn handle_connection(
                             png_base64,
                         },
                     })?;
+                }
+                ClientMessage::WatchChat { chat } => match chat.validate() {
+                    Ok(()) => {
+                        let (state, events) = crate::chat::hub().watch(&chat);
+                        sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ChatWatching { state },
+                        })?;
+                        chat_watch = Some(events);
+                    }
+                    Err(message) => {
+                        send_error(&sink, Some(request_id), ErrorCode::InvalidRequest, &message)
+                    }
+                },
+                ClientMessage::SendChat { chat, text, files } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().send(&chat, text, files),
+                )?,
+                ClientMessage::CancelChat { chat } => {
+                    answer_chat(&sink, request_id, crate::chat::hub().cancel(&chat))?
+                }
+                ClientMessage::AnswerChatPermission {
+                    chat,
+                    permission,
+                    option,
+                } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().answer(&chat, permission, option),
+                )?,
+                ClientMessage::AnswerChatQuestion {
+                    chat,
+                    question,
+                    answers,
+                } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().answer_question(&chat, question, answers),
+                )?,
+                ClientMessage::SetChatOption {
+                    chat,
+                    option,
+                    value,
+                } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().set_option(&chat, option, value),
+                )?,
+                // Waits for the harness, at most a few seconds; this connection is the
+                // asking window's own.
+                ClientMessage::ListChatSessions { chat } => {
+                    match crate::chat::hub().sessions(&chat) {
+                        Ok(sessions) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ChatSessions { sessions },
+                        })?,
+                        Err(message) => {
+                            send_error(&sink, Some(request_id), ErrorCode::InvalidRequest, &message)
+                        }
+                    }
+                }
+                ClientMessage::ResumeChat { chat, session } => {
+                    answer_chat(&sink, request_id, crate::chat::hub().resume(&chat, session))?
+                }
+                ClientMessage::RestartChat { chat } => {
+                    answer_chat(&sink, request_id, crate::chat::hub().restart(&chat))?
                 }
                 ClientMessage::WatchSystemTotals { source } => match Source::resolve(&source) {
                     Ok(source) => {
@@ -1698,6 +1775,44 @@ fn send_system_totals(
             break;
         }
         opened.delivered(sequence);
+    }
+    Ok(())
+}
+
+/// Sends the watched chat's changes, in order; a chat that ended stops the watch.
+fn send_chat_events(
+    sink: &ConnectionSink,
+    watch: &mut Option<std::sync::mpsc::Receiver<compi_protocol::chat::ChatEvent>>,
+) -> Result<()> {
+    let Some(events) = watch.as_ref() else {
+        return Ok(());
+    };
+    loop {
+        match events.try_recv() {
+            Ok(event) => sink.send_control(&ServerControl {
+                request_id: None,
+                message: ServerMessage::ChatChanged { event },
+            })?,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *watch = None;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn answer_chat(
+    sink: &ConnectionSink,
+    request_id: u64,
+    result: std::result::Result<(), String>,
+) -> Result<()> {
+    match result {
+        Ok(()) => sink.send_control(&ServerControl {
+            request_id: Some(request_id),
+            message: ServerMessage::ChatAccepted,
+        })?,
+        Err(message) => send_error(sink, Some(request_id), ErrorCode::InvalidRequest, &message),
     }
     Ok(())
 }

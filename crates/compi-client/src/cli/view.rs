@@ -111,7 +111,7 @@ pub(super) fn run(
                 }),
             )
         }
-        PaneContent::Files(_) | PaneContent::Browser(_) => {
+        PaneContent::Files(_) | PaneContent::Browser(_) | PaneContent::Chat(_) => {
             unreachable!("only Settings and Monitor are asked for")
         }
     };

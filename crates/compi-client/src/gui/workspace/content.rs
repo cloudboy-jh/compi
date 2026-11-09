@@ -1622,6 +1622,7 @@ impl CompiApp {
                 || self.settings_owns(&focused, window, cx)
                 || self.monitor_owns(&focused, window, cx)
                 || self.browser_owns(&focused, cx)
+                || self.chat_owns(&focused, window, cx)
         });
         if !ours {
             return;
@@ -1658,6 +1659,13 @@ impl CompiApp {
             Some(pane_id) if self.browser_pane_focus(pane_id).is_some() => {
                 let Some(wanted) = self.browser_keyboard(pane_id, window, cx) else {
                     // Its address field or the pane already has the keyboard.
+                    return;
+                };
+                wanted
+            }
+            Some(pane_id) if self.chat_pane_focus(pane_id).is_some() => {
+                let Some(wanted) = self.chat_keyboard(pane_id, window, cx) else {
+                    // Its composer, its text or the pane already has the keyboard.
                     return;
                 };
                 wanted
@@ -1699,6 +1707,7 @@ impl CompiApp {
         self.overlay.is_none()
             && (self.settings_search_has_keyboard(window, cx)
                 || self.monitor_search_has_keyboard(window, cx)
+                || self.chat_composer_has_keyboard(window, cx)
                 || self
                     .focused_pane()
                     .and_then(|pane| self.content.panes.get(pane))
@@ -1719,7 +1728,10 @@ impl CompiApp {
         if !self.editor_has_keyboard(window, cx) {
             return;
         }
-        if self.settings_search_key(key, window, cx) || self.monitor_search_key(key, window, cx) {
+        if self.settings_search_key(key, window, cx)
+            || self.monitor_search_key(key, window, cx)
+            || self.chat_composer_key(key, window, cx)
+        {
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1766,10 +1778,10 @@ impl CompiApp {
 
     /// Opens `file` (or, without one, the folder `root`) for `beside`. A terminal pane
     /// shows it in its view, in place of its shell; with `new_pane` only when it
-    /// carries no view yet. Otherwise a content pane of `beside`'s tab in `environment`
-    /// whose root holds the file shows it, unless `new_pane`; else a new pane split
-    /// beside `beside`, rooted at `root` or the file's folder. The file becomes the
-    /// active one, with the cursor on the 1-based `line`.
+    /// carries no view yet, and never in place of a chat. Otherwise a content pane of
+    /// `beside`'s tab in `environment` whose root holds the file shows it, unless
+    /// `new_pane`; else a new pane split beside `beside`, rooted at `root` or the file's
+    /// folder. The file becomes the active one, with the cursor on the 1-based `line`.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::gui) fn open_content_file(
         &mut self,
@@ -1793,7 +1805,11 @@ impl CompiApp {
             return;
         };
         if let Some(view) = leaf_node(&tab.layout, beside)
-            .filter(|leaf| leaf.surface_id().is_some() && (!new_pane || leaf.view().is_none()))
+            .filter(|leaf| {
+                leaf.surface_id().is_some()
+                    && (!new_pane || leaf.view().is_none())
+                    && leaf.content().and_then(PaneContent::chat).is_none()
+            })
             .map(|leaf| leaf.view().cloned())
         {
             self.content.released = None;
@@ -3397,6 +3413,9 @@ impl CompiApp {
                 pane_content.and_then(|content| content.browser()),
                 |pane, browser| pane.child(self.render_browser_body(&pane_id, &browser.url, cx)),
             )
+            .when_some(pane_content.and_then(PaneContent::chat), |pane, chat| {
+                pane.child(self.render_chat_pane(&pane_id, chat, cx))
+            })
             .when_some(
                 content.zip(ui).filter(|_| {
                     self.file_tree

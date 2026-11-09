@@ -3,6 +3,7 @@
 mod browse;
 mod capture;
 mod changes;
+mod chat;
 mod content;
 mod diff;
 mod help;
@@ -42,6 +43,7 @@ const COMMANDS: &[&str] = &[
     "settings",
     "monitor",
     "browse",
+    "chat",
     "layout",
     "run",
     "attach",
@@ -1107,6 +1109,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         "diff" => return diff::run(&mut client, &state, &target, options),
         "settings" | "monitor" => return view::run(&mut client, &state, &target, options),
         "browse" => return browse::run(&mut client, &state, &target, options),
+        "chat" => return chat::run(&mut client, &state, &target, options),
         "command" => return palette::run(&state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
@@ -1793,6 +1796,7 @@ fn validate(
         ("monitor", _) => (1, 2, &["--source"], &[]),
         ("files" | "edit" | "settings", _) => (1, 2, &[], &[]),
         ("browse", _) => (1, 2, &[], &["--down"]),
+        ("chat", _) => (1, 1, &[], &[]),
         ("notes", Some("search" | "backlinks")) => (3, 4, &[], &[]),
         ("notes", _) => (1, 2, &[], &["--edit"]),
         // `diff [PATH]` and `diff COMMIT [PATH]`.
@@ -2209,6 +2213,19 @@ mod tests {
         }
     }
     #[test]
+    fn chat_takes_no_arguments() {
+        for accepted in [
+            &["chat"][..],
+            &["--json", "chat"],
+            &["--pane", "pane-1", "chat"],
+        ] {
+            assert!(validated(accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [&["chat", "hello"][..], &["chat", "--down"]] {
+            assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
+        }
+    }
+    #[test]
     fn tab_groups_take_only_their_arguments() {
         for accepted in [
             &["tab", "group"][..],
@@ -2491,7 +2508,8 @@ mod tests {
     }
 
     #[test]
-    fn content_rows_report_files_settings_monitor_and_browser_panes() {
+    fn content_rows_report_files_settings_monitor_browser_and_chat_panes() {
+        use compi_protocol::chat::{ChatContent, ChatHarness};
         use compi_protocol::{
             BrowserContent, ContentEnvironment, FolderContent, MonitorContent, PaneContent,
             SessionId, SettingsContent, SettingsSection, TabId,
@@ -2556,5 +2574,17 @@ mod tests {
             row["content"],
             json!({"kind": "browser", "url": "http://localhost:3000/"})
         );
+        let chat = PaneContent::Chat(ChatContent {
+            id: "chat-1".into(),
+            harness: ChatHarness::Omp,
+            environment: ContentEnvironment::Host,
+            folder: "/work".into(),
+            session: None,
+        });
+        let row = content_row(&session, &tab, &PaneId::new("chat"), &chat);
+        assert_eq!(row["type"], "chat");
+        assert_eq!(row["content"]["kind"], "chat");
+        assert_eq!(row["content"]["id"], "chat-1");
+        assert_eq!(row["content"]["folder"], "/work");
     }
 }

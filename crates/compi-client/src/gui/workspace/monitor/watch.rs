@@ -3,7 +3,8 @@
 //! (and one window-wide icon fetcher). Each runs on its own thread and connection,
 //! reconnects after failures, stays released while an update holds the window's
 //! connections, and stops (closing its connection) [`LINGER`] after it stopped being
-//! wanted, so flicking between tabs or pages does not reconnect.
+//! wanted, so flicking between tabs or pages does not reconnect. Chat panes watch their
+//! chats the same way, through [`WatchSlot`], [`run`] and [`poll`].
 use super::*;
 use compi_protocol::system_metrics::{
     HostInfo, Process, ProcessTable, SystemSample, TOTALS_INTERVAL_MS, TotalsSample,
@@ -12,7 +13,7 @@ use compi_protocol::system_metrics::{
 /// Without a sample for three sampling intervals, the values shown are stale.
 const STALE_AFTER: Duration = Duration::from_millis(3 * TOTALS_INTERVAL_MS);
 /// A watcher outlives its last reason to run by this much.
-pub(super) const LINGER: Duration = Duration::from_secs(2);
+pub(in crate::gui::workspace) const LINGER: Duration = Duration::from_secs(2);
 /// How often a watching connection looks for samples and for being stopped.
 const WATCH_POLL: Duration = Duration::from_millis(50);
 /// Wait before reconnecting after the connection failed or was released.
@@ -58,7 +59,7 @@ struct Watcher {
 
 /// One kind of watcher: running while wanted, and [`LINGER`] after.
 #[derive(Default)]
-pub(super) struct WatchSlot {
+pub(in crate::gui::workspace) struct WatchSlot {
     watcher: Option<Watcher>,
     generation: u64,
     /// When it stopped being wanted.
@@ -66,7 +67,7 @@ pub(super) struct WatchSlot {
 }
 
 /// What [`WatchSlot::want`] did.
-pub(super) enum SlotChange {
+pub(in crate::gui::workspace) enum SlotChange {
     Unchanged,
     /// A new watcher should start with this generation and stop signal.
     Start(u64, mpsc::Receiver<()>),
@@ -76,17 +77,17 @@ pub(super) enum SlotChange {
 
 impl WatchSlot {
     /// Whether events of `generation` come from the running watcher.
-    pub(super) fn is_current(&self, generation: u64) -> bool {
+    pub(in crate::gui::workspace) fn is_current(&self, generation: u64) -> bool {
         self.watcher
             .as_ref()
             .is_some_and(|watcher| watcher.generation == generation)
     }
 
-    pub(super) fn is_running(&self) -> bool {
+    pub(in crate::gui::workspace) fn is_running(&self) -> bool {
         self.watcher.is_some()
     }
 
-    pub(super) fn want(&mut self, wanted: bool) -> SlotChange {
+    pub(in crate::gui::workspace) fn want(&mut self, wanted: bool) -> SlotChange {
         if wanted {
             self.unwanted_since = None;
             if self.watcher.is_some() {
@@ -108,7 +109,7 @@ impl WatchSlot {
     }
 
     /// Stops the watcher once unwanted for [`LINGER`]; whether it stopped.
-    pub(super) fn expire(&mut self) -> bool {
+    pub(in crate::gui::workspace) fn expire(&mut self) -> bool {
         if self
             .unwanted_since
             .is_some_and(|since| since.elapsed() >= LINGER)
@@ -122,17 +123,23 @@ impl WatchSlot {
     }
 }
 
-/// What every watcher needs from its window, and the source it watches.
+/// What a watching connection needs from its window.
 #[derive(Clone)]
-pub(super) struct WatchContext {
-    pub(super) target: ConnectionTarget,
-    pub(super) source: MonitorSource,
-    pub(super) sender: UiEventSender,
-    pub(super) quiesced: Arc<AtomicBool>,
-    pub(super) connection_guard: Arc<Mutex<()>>,
+pub(in crate::gui::workspace) struct WatchLink {
+    pub(in crate::gui::workspace) target: ConnectionTarget,
+    pub(in crate::gui::workspace) sender: UiEventSender,
+    pub(in crate::gui::workspace) quiesced: Arc<AtomicBool>,
+    pub(in crate::gui::workspace) connection_guard: Arc<Mutex<()>>,
 }
 
-enum WatchEnd {
+/// What every Monitor watcher needs: its window's link, and the source it watches.
+#[derive(Clone)]
+pub(super) struct WatchContext {
+    pub(super) link: WatchLink,
+    pub(super) source: MonitorSource,
+}
+
+pub(in crate::gui::workspace) enum WatchEnd {
     /// The window closed or stopped the watcher.
     Stopped,
     Failed(String),
@@ -147,8 +154,8 @@ const PAUSED_FOR_UPDATE: &str = "Paused while Compi updates";
 
 /// Keeps a watching connection up until stopped: connects, lets `follow` run it, and
 /// reports a failure through `failed` before reconnecting.
-fn run(
-    context: &WatchContext,
+pub(in crate::gui::workspace) fn run(
+    context: &WatchLink,
     stop: &mpsc::Receiver<()>,
     failed: impl Fn(String) -> bool,
     mut follow: impl FnMut(&mut DaemonClient) -> WatchEnd,
@@ -192,9 +199,9 @@ fn run(
 
 /// Reads events until stopped, the update pause, an error, or `event` says the window
 /// is gone; reports [`STALE_AFTER`] without a sample through `stale` once.
-fn poll(
+pub(in crate::gui::workspace) fn poll(
     client: &mut DaemonClient,
-    context: &WatchContext,
+    context: &WatchLink,
     stop: &mpsc::Receiver<()>,
     stale: impl Fn() -> bool,
     mut sampled: impl FnMut(ServerMessage) -> Option<bool>,
@@ -241,6 +248,7 @@ pub(super) fn watch_processes(context: WatchContext, generation: u64, stop: mpsc
     thread::spawn(move || {
         let send = |event| {
             context
+                .link
                 .sender
                 .send(UiEvent::Monitor(MonitorEvent::Processes {
                     source: context.source.clone(),
@@ -249,7 +257,7 @@ pub(super) fn watch_processes(context: WatchContext, generation: u64, stop: mpsc
                 }))
         };
         run(
-            &context,
+            &context.link,
             &stop,
             |error| send(ProcessesEvent::Failed(error)),
             |client| {
@@ -262,7 +270,7 @@ pub(super) fn watch_processes(context: WatchContext, generation: u64, stop: mpsc
                 let mut table = ProcessTable::default();
                 poll(
                     client,
-                    &context,
+                    &context.link,
                     &stop,
                     || send(ProcessesEvent::Stale),
                     |message| {
@@ -291,14 +299,17 @@ pub(super) fn watch_processes(context: WatchContext, generation: u64, stop: mpsc
 pub(super) fn watch_totals(context: WatchContext, generation: u64, stop: mpsc::Receiver<()>) {
     thread::spawn(move || {
         let send = |event: TotalsEvent| {
-            context.sender.send(UiEvent::Monitor(MonitorEvent::Totals {
-                source: context.source.clone(),
-                generation,
-                event: Box::new(event),
-            }))
+            context
+                .link
+                .sender
+                .send(UiEvent::Monitor(MonitorEvent::Totals {
+                    source: context.source.clone(),
+                    generation,
+                    event: Box::new(event),
+                }))
         };
         run(
-            &context,
+            &context.link,
             &stop,
             |error| send(TotalsEvent::Failed(error)),
             |client| {
@@ -315,7 +326,7 @@ pub(super) fn watch_totals(context: WatchContext, generation: u64, stop: mpsc::R
                 }
                 poll(
                     client,
-                    &context,
+                    &context.link,
                     &stop,
                     || send(TotalsEvent::Stale),
                     |message| {
@@ -343,11 +354,12 @@ pub(super) fn watch_icons(
     thread::spawn(move || {
         let send = |event: IconsEvent| {
             context
+                .link
                 .sender
                 .send(UiEvent::Monitor(MonitorEvent::Icons { generation, event }))
         };
         run(
-            &context,
+            &context.link,
             &stop,
             // Icons are not worth a message; the fetcher just reconnects.
             |_| true,
@@ -359,7 +371,7 @@ pub(super) fn watch_icons(
                     if stopped(&stop) {
                         return WatchEnd::Stopped;
                     }
-                    if context.quiesced.load(Ordering::Acquire) {
+                    if context.link.quiesced.load(Ordering::Acquire) {
                         return WatchEnd::Failed(PAUSED_FOR_UPDATE.into());
                     }
                     match requests.recv_timeout(WATCH_POLL) {

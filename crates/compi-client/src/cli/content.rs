@@ -133,9 +133,10 @@ pub(super) fn caller<'a>(
                 .is_some_and(|view| view.side == PaneSide::View);
             let files = view.and_then(|view| match view.content {
                 PaneContent::Files(folder) => Some(folder),
-                PaneContent::Settings(_) | PaneContent::Monitor(_) | PaneContent::Browser(_) => {
-                    None
-                }
+                PaneContent::Settings(_)
+                | PaneContent::Monitor(_)
+                | PaneContent::Browser(_)
+                | PaneContent::Chat(_) => None,
             });
             (environment, Some(surface), base, files, view_shown)
         }

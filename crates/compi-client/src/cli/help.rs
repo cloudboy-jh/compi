@@ -27,7 +27,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "Views",
         &[
-            "files", "edit", "notes", "diff", "browse", "settings", "monitor",
+            "files", "edit", "notes", "diff", "browse", "chat", "settings", "monitor",
         ],
     ),
     ("Palette", &["command"]),
@@ -435,6 +435,14 @@ pub(super) const ENTRIES: &[Entry] = &[
         summary: "Open a web page beside the terminal",
         detail: "Open URL in a Browser pane beside the selected terminal (below it with --down); the shell stays as it is. URL is an http, https or file URL, or about:blank; without a scheme, http:// is assumed, so localhost:3000 opens http://localhost:3000. Text pasted around a link (quotes, <...>, a Markdown link, a Local: prefix, trailing punctuation) is dropped. Without URL the pane opens on its home page (local servers your terminals printed, recent sites) with the keyboard in its address field, where a link can be pasted without shell quoting. From a Browser pane (--pane), that pane goes to URL. The page is the system web view's (WebView2 on Windows, WKWebView on macOS), with one persistent profile per instance. --json returns {pane_id, url, shown, not_shown, receipt, workspace}.",
         example: "compi browse 'localhost:3000/search?q=x'",
+    },
+    Entry {
+        command: "chat",
+        action: None,
+        usage: "chat",
+        summary: "Chat with OMP in the terminal's pane",
+        detail: "Start a new chat with OMP (the omp agent harness) in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. OMP works in the shell's current directory, in the terminal's environment (a WSL distribution runs omp there). The chat runs in the daemon and keeps going while the view is hidden; it ends when its pane or view closes. --json adds the chat's id and folder.",
+        example: "compi chat",
     },
     Entry {
         command: "settings",

@@ -1,4 +1,5 @@
 //! Compi's shared process contract, local transport, and runtime support.
+pub mod chat;
 mod client;
 pub mod frame;
 #[cfg_attr(unix, path = "identity_unix.rs")]
@@ -71,7 +72,10 @@ use std::fmt;
 // settings take a `PromptPlace`, which can be Windows PowerShell, and know `PromptShell::PowerShell`.
 // Version 37 adds tab groups: `WorkspaceSession::groups`, `WorkspaceTab::group`, where a tab
 // moved by `MoveTab` lands (`TabPlacement`) and the group mutations.
-pub const PROTOCOL_VERSION: u32 = 37;
+// Version 38 adds native agent chat: the Chat content kind (`ChatContent`), `WatchChat`
+// with `ChatWatching`/`ChatChanged`, and `SendChat`, `CancelChat`, `AnswerChatPermission`,
+// `AnswerChatQuestion`, `SetChatOption`, `ListChatSessions`, `ResumeChat` and `RestartChat`.
+pub const PROTOCOL_VERSION: u32 = 38;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -456,6 +460,56 @@ pub enum ClientMessage {
     GetAppIcon {
         group_id: String,
     },
+    /// Answers `ChatWatching` with the chat's whole state, starting its harness if it is
+    /// not running, then sends each change as `ChatChanged`, in order, while this
+    /// connection stays open. One chat per connection; a later watch replaces it.
+    WatchChat {
+        chat: chat::ChatContent,
+    },
+    /// Sends `text` as the next prompt of a running chat, with `files` (absolute paths in
+    /// the chat's environment) attached; refused while a turn runs.
+    SendChat {
+        chat: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+    },
+    /// Stops the chat's running turn.
+    CancelChat {
+        chat: String,
+    },
+    /// Answers the permission `permission` with `option`, or turns it down (`None`).
+    AnswerChatPermission {
+        chat: String,
+        permission: u64,
+        option: Option<String>,
+    },
+    /// Answers the question `question` with `answers` by field, or turns it down (`None`).
+    AnswerChatQuestion {
+        chat: String,
+        question: u64,
+        answers: Option<chat::ChatAnswers>,
+    },
+    /// Sets the harness setting `option` (`ChatOption::id`) to `value`.
+    SetChatOption {
+        chat: String,
+        option: String,
+        value: String,
+    },
+    /// The harness's sessions in the chat's folder, answered by `ChatSessions`.
+    ListChatSessions {
+        chat: String,
+    },
+    /// Starts the chat over in `session`, its history replayed, or in a new session
+    /// (`None`).
+    ResumeChat {
+        chat: String,
+        session: Option<String>,
+    },
+    /// Ends the chat's harness and starts it again, resuming its session if it has one.
+    RestartChat {
+        chat: String,
+    },
     ShutdownDaemon,
 }
 
@@ -606,6 +660,17 @@ pub enum ServerMessage {
     /// behind on reading is sent the newest one, never a backlog.
     SystemSampled {
         sample: system_metrics::SystemSample,
+    },
+    ChatWatching {
+        state: chat::ChatState,
+    },
+    /// Unsolicited, after `WatchChat`: one change to the watched chat.
+    ChatChanged {
+        event: chat::ChatEvent,
+    },
+    ChatAccepted,
+    ChatSessions {
+        sessions: Vec<chat::ChatSessionInfo>,
     },
     Error {
         code: ErrorCode,
@@ -1398,6 +1463,8 @@ pub enum PaneContent {
     Monitor(MonitorContent),
     /// A web page, shown by each client's system webview.
     Browser(BrowserContent),
+    /// A conversation with an agent harness, run by the daemon.
+    Chat(chat::ChatContent),
 }
 
 impl PaneContent {
@@ -1409,6 +1476,7 @@ impl PaneContent {
             Self::Settings(_) => Ok(()),
             Self::Monitor(monitor) => monitor.source.validate(),
             Self::Browser(browser) => browser.validate(),
+            Self::Chat(chat) => chat.validate(),
         }
     }
 
@@ -1419,6 +1487,7 @@ impl PaneContent {
             Self::Settings(_) => "Settings",
             Self::Monitor(_) => "Monitor",
             Self::Browser(_) => "Browser",
+            Self::Chat(_) => "Chat",
         }
     }
 
@@ -1426,7 +1495,7 @@ impl PaneContent {
     pub fn folder(&self) -> Option<&FolderContent> {
         match self {
             Self::Files(folder) => Some(folder),
-            Self::Settings(_) | Self::Monitor(_) | Self::Browser(_) => None,
+            Self::Settings(_) | Self::Monitor(_) | Self::Browser(_) | Self::Chat(_) => None,
         }
     }
 
@@ -1434,7 +1503,7 @@ impl PaneContent {
     pub fn settings(&self) -> Option<&SettingsContent> {
         match self {
             Self::Settings(settings) => Some(settings),
-            Self::Files(_) | Self::Monitor(_) | Self::Browser(_) => None,
+            Self::Files(_) | Self::Monitor(_) | Self::Browser(_) | Self::Chat(_) => None,
         }
     }
 
@@ -1442,7 +1511,15 @@ impl PaneContent {
     pub fn browser(&self) -> Option<&BrowserContent> {
         match self {
             Self::Browser(browser) => Some(browser),
-            Self::Files(_) | Self::Settings(_) | Self::Monitor(_) => None,
+            Self::Files(_) | Self::Settings(_) | Self::Monitor(_) | Self::Chat(_) => None,
+        }
+    }
+
+    /// The chat shown, when this shows a chat.
+    pub fn chat(&self) -> Option<&chat::ChatContent> {
+        match self {
+            Self::Chat(chat) => Some(chat),
+            Self::Files(_) | Self::Settings(_) | Self::Monitor(_) | Self::Browser(_) => None,
         }
     }
 
