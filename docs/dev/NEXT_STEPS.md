@@ -5,33 +5,27 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 ## Release state
 
 - **0.7.2** is published and Latest (2026-11-10 UTC). Daemon protocol 39, workspace format 10.
-- **0.7.3** is a draft, not published: tag `v0.7.3` at `9fae749`, release run [42758236641](https://github.com/cloudboy-jh/compi/actions/runs/42758236641). It holds resuming sessions in their saved folder, the session picker, transcript paging and one-line tool heads (`72545db`); protocol 39, format 10; updating restarts the daemon. Its draft read back clean (12 assets, signed metadata 0.7.3 / protocol 39, hashes matching `SHA256SUMS.txt`).
-- Decided 2026-11-10: the updater work below joins 0.7.3. Then delete the draft, move the unpublished tag to the new commit, rebuild, read back, publish.
+- **0.7.3** is a draft, not published: tag `v0.7.3` at `9fae749`, release run [42758236641](https://github.com/cloudboy-jh/compi/actions/runs/42758236641). That draft holds only the chat work (`72545db`). The updater work below joins 0.7.3: delete the draft, move the unpublished tag to the new commit, rebuild, read back, publish.
 
-## Now: updater cleanup and visibility (for 0.7.3)
+## In source for 0.7.3: updater (2026-11-10)
 
-Found 2026-11-10 on the owner's Windows install and in the code:
+Found on the owner's Windows install: nothing was ever removed (12 `versions\` folders, 730 MB of `stage-*` and about 180 handoff/review files in `.compi-update\`, 773 MB of finished Setup runs in `%LOCALAPPDATA%\Compi\installer\`); an available update showed nowhere outside Settings; checks ran once a day, failed ones too; a kept failure outranked a newer release. 0.7.2 went in through Setup.
 
-- Nothing is ever removed. Here: 12 folders in `versions\` (0.1.8 to 0.7.2, 1.1 GB besides the current one), 730 MB of `stage-*` packages and about 180 `handoff`/`review` files in `.compi-update\`, 847 MB of old Setup packages in `%LOCALAPPDATA%\Compi\installer\`.
-- An available update is invisible: the sidebar dot needs a downloaded update (`updates::shows_dot`), and automatic download is off by default.
-- Checks run at most once a day (`daily_check_due`); a failed check also waits a day (`last_check_unix` is written after every check).
-- A failure kept from an earlier attempt is shown ahead of a newer release, and its Try again reinstalls the old package; the timer's check does not clear it (only `request()` does).
-- 0.7.1 was the last in-app update here; 0.7.2 went in through Setup.
+- Checks: at start and on the 60 s tick when due, 6 h after a success or 1 h after a failure (`last_check_failed_unix`); `check_for_updates = false` stops them.
+- A newer offered version replaces a kept failure for an older one; Try again only for the same version.
+- Sidebar card (`gui/workspace/update_card.rs`, the What's new frame) and title-bar dot for an available, downloading, ready, blocked or failed update; **Later** hides it per version (`release-notes.json`). Card actions use the Settings activation path.
+- `compi_update::prune` runs once per process from the update thread: keeps the selected and task versions and any folder in use (a file that will not open exclusively), deletes other `versions\*` (moved into `.compi-update\prune-*` first), stale stages and transient files (older than this process minus 60 s), rollback leftovers; macOS `previous-*`/`failed-*` bundles unless `lsof` shows them open. Payload keys `HKCU\Software\Compi\Payloads\<ver>` go for deleted versions other than the registered MSI product. Deleting the registered product's folder is safe: no advertised entry points, payload components key on registry values, repair of an older version is refused by `guard_version`.
+- Launcher and helper refresh: the update payload carries `compi-launcher.exe`; apply renames the new launcher and helper into the root (old ones kept as `root-previous-*` and restored on rollback, locked files retried then left). Since 0.7.2's helper applies 0.7.3, `prune` also refreshes them on 0.7.3's first start.
+- Settings → Updates: status block (version, state, last check, size, "Updating ends N shells" or "restarts Compi's background service" before download), notes as Markdown, an Automatic group, Advanced last.
+- Setup: new window (see below) and run cleanup: finished run folders and the 0.1.x leftovers go at start and at completion; the package is kept as root `Compi.msi`, registered as an extra Windows Installer source so repair from Settings → Apps still finds it.
 
-Changes:
-
-1. Check at launch and every 6 hours; after a failed check, try again within the hour.
-2. Show a sidebar dot and one line when an update is available, not only when it is downloaded.
-3. A newer release replaces a kept failure.
-4. After an update completes (in the app or through Setup), keep the current and the previous version and remove older `versions\` folders, finished `stage-*` packages, worker copies, old handoff/review/receipt files and old Setup packages. Never touch anything an unfinished journal still names.
-
-Check: an install carrying old versions updates from 0.7.2 to the new build; the extra folders go, the previous version stays, and the sidebar showed the update before it was downloaded.
+To check before publishing: the update cycle on a copy with old versions (one version left, new root launcher and helper); a repair from Settings → Apps after Setup removed its run folder (the extra source registration is untested for a standard user).
 
 ## Planned, later
 
 - **Chat → OMP's TUI in the same pane** (asked 2026-11-10). Today Ctrl/Cmd+Shift+E shows the plain shell under the chat. The ⋯ menu gets **Open in terminal**: the daemon stops the chat's `omp acp` (two OMP processes must not write one session file), the pane shows its shell, and Compi types `omp --resume <session>` there, in the session's saved folder. Going back loads the session again with `session/load`, turns made in the TUI included (OMP shares sessions between ACP and its TUI both ways). Open: a shell already running a program (ask, or open a new tab as **Jump to project** does), PowerShell panes (`omp.exe`), noticing the TUI's exit to offer the chat again.
 - **Updates that keep shells.** Release metadata qualifies only the release's own daemon (`qualified_daemons = [version]` in the smoke scripts), so every update restarts the daemon, even with the protocol unchanged. Qualify the previous daemon when protocol and workspace format did not change.
-- **Updater upkeep.** On Windows the root `compi-update-worker.exe`, launcher and `Compi-Setup.exe` stay at the version Setup last installed; in-app updates never refresh them. Setup and the in-app updater keep two journals and two scheduled-task guards. The 0.1.x–0.3.0 migration paths and `INSTALLER_UPDATES_PLAN.md` (a 0.1.3-era plan) are out of date. macOS activation has never run natively.
+- **Updater upkeep.** Root `Compi-Setup.exe` still changes only through Setup. Setup and the in-app updater keep two journals and two scheduled-task guards. The 0.1.x–0.3.0 migration paths and `INSTALLER_UPDATES_PLAN.md` (a 0.1.3-era plan) are out of date. macOS activation has never run natively.
 - **Other chat harnesses:** OpenCode, Pi, Codex, Claude Code (vault order).
 - Vault features after chat: remote connections, general file drag-and-drop, more Windows shells.
 
