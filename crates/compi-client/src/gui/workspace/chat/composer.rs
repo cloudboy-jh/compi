@@ -909,6 +909,7 @@ impl CompiApp {
             colors,
             body_size: self.chat_body_size(),
             mono: self.typography.font.family.clone(),
+            mark: harness_mark(chat.harness),
             permission: None,
             retry: false,
             diff_refusal: None,

@@ -1740,6 +1740,7 @@ impl CompiApp {
             colors: *self.colors(),
             body_size: self.chat_body_size(),
             mono: self.typography.font.family.clone(),
+            mark: harness_mark(chat.harness),
             permission: state.permission.clone(),
             // Retry resends the last prompt after a turn that failed.
             retry: model.send_refusal(ChatDelivery::Prompt).is_none(),
@@ -1793,6 +1794,11 @@ impl CompiApp {
         }
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
+        // Every agent of the latest running call, so its dots show who is done.
+        let statuses: Vec<_> = match model.state.as_ref()?.entries.get(tool) {
+            Some(ChatEntry::Tool(call)) => call.agents.iter().map(|agent| agent.status).collect(),
+            _ => running.iter().map(|(_, agent)| agent.status).collect(),
+        };
         let id = chat.id.clone();
         Some(
             div()
@@ -1812,7 +1818,11 @@ impl CompiApp {
                         .hover(|style| style.bg(color(colors.surface_hover)))
                         .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(muted)
-                        .child(Spinner::new().with_size(Size::XSmall).color(muted))
+                        .child(rows::agents_mark(
+                            harness_mark(chat.harness),
+                            statuses,
+                            &colors,
+                        ))
                         .child(
                             div()
                                 .flex_1()

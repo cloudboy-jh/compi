@@ -668,6 +668,8 @@ pub(super) struct RowFrame {
     pub(super) body_size: Pixels,
     /// The terminal's font, for paths, commands and code.
     pub(super) mono: SharedString,
+    /// The harness's mark, which sub-agents' lines lead with.
+    pub(super) mark: &'static str,
     pub(super) permission: Option<ChatPermission>,
     /// A prompt can be sent: Retry after a failed turn acts.
     pub(super) retry: bool,
@@ -729,7 +731,7 @@ pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> An
             frame,
         ),
         ChatRow::AgentsFinished { tool, label } => {
-            render_agents_finished(index, *tool, label, frame)
+            render_agents_finished(index, *tool, label, rows, frame)
         }
         ChatRow::Error(message) => render_error(message, last && frame.retry, frame),
         ChatRow::Cancelled => div()
@@ -1049,14 +1051,24 @@ fn render_tool(
         .cursor_pointer()
         .hover(|style| style.bg(color(frame.colors.surface_hover)))
         .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
-        .child(controls::glyph(
-            row.icon,
-            if failed {
-                color(frame.colors.error)
+        .map(|head| {
+            if row.agents.is_empty() {
+                head.child(controls::glyph(
+                    row.icon,
+                    if failed {
+                        color(frame.colors.error)
+                    } else {
+                        muted
+                    },
+                ))
             } else {
-                muted
-            },
-        ))
+                head.child(agents_mark(
+                    frame.mark,
+                    row.agents.iter().map(|agent| agent.agent.status),
+                    &frame.colors,
+                ))
+            }
+        })
         .child(
             div()
                 .font_weight(FontWeight::MEDIUM)
@@ -1178,14 +1190,21 @@ pub(super) fn render_permission_block(
         .into_any_element()
 }
 
-/// The summary entry: one quiet line that shows the agents' call.
+/// The summary entry: one quiet line, led by the agents' mark, that shows their call.
 fn render_agents_finished(
     index: usize,
     tool: usize,
     label: &SharedString,
+    rows: &[ChatRow],
     frame: &RowFrame,
 ) -> AnyElement {
     let muted = frame.muted();
+    let statuses: Vec<ChatToolStatus> = match rows.get(tool) {
+        Some(ChatRow::Tool { tool, .. }) => {
+            tool.agents.iter().map(|agent| agent.agent.status).collect()
+        }
+        _ => Vec::new(),
+    };
     div()
         .id(("chat-agents-finished", index))
         .h(ui_rems(24.0))
@@ -1198,10 +1217,54 @@ fn render_agents_finished(
         .hover(|style| style.bg(color(frame.colors.surface_hover)))
         .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
         .text_color(muted)
-        .child(controls::glyph(IconName::Bot, muted))
+        .child(agents_mark(frame.mark, statuses, &frame.colors))
         .child(label.clone())
         .on_click(frame.act(move |this, chat, _, _| this.reveal_chat_tool(chat, tool)))
         .into_any_element()
+}
+
+/// Most dots the agents' mark draws; more agents show as `+N`.
+const MAX_AGENT_DOTS: usize = 8;
+
+/// Sub-agents' mark: the harness's own mark (they are more of it), then a dot per agent:
+/// a ring while it waits (muted) or runs (accent), filled once it ends: green when done,
+/// red when it failed, muted when stopped. Static, so it never repaints by itself.
+pub(super) fn agents_mark(
+    mark: &'static str,
+    statuses: impl IntoIterator<Item = ChatToolStatus>,
+    colors: &ThemeColors,
+) -> Div {
+    let statuses: Vec<ChatToolStatus> = statuses.into_iter().collect();
+    let more = statuses.len().saturating_sub(MAX_AGENT_DOTS);
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(ui_rems(3.0))
+        .child(img(mark).flex_none().size(ui_rems(14.0)))
+        .children(statuses.into_iter().take(MAX_AGENT_DOTS).map(|status| {
+            let (tint, ring) = match status {
+                ChatToolStatus::Pending => (colors.muted, true),
+                ChatToolStatus::Running => (colors.accent, true),
+                ChatToolStatus::Completed => (colors.added, false),
+                ChatToolStatus::Failed => (colors.error, false),
+                ChatToolStatus::Stopped => (colors.muted, false),
+            };
+            let dot = div().flex_none().size(ui_rems(6.0)).rounded_full();
+            if ring {
+                dot.border_1().border_color(color(tint))
+            } else {
+                dot.bg(color(tint))
+            }
+        }))
+        .when(more > 0, |mark| {
+            mark.child(
+                div()
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                    .text_color(color(modal_text_color(colors.muted, colors)))
+                    .child(format!("+{more}")),
+            )
+        })
 }
 
 /// An unfolded tool call: its edits as diffs, its sub-agents, else its input; then its
