@@ -464,7 +464,8 @@ pub struct ChatPlanLimit {
     pub left_percent: u8,
 }
 
-/// A session of the harness in the chat's folder, for resuming.
+/// A session of the harness in the chat's folder, for resuming. Sessions without a
+/// message are left out.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatSessionInfo {
     pub id: String,
@@ -473,9 +474,23 @@ pub struct ChatSessionInfo {
     /// When it last changed, as the harness reports it (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated: Option<String>,
+    /// The folder the harness saved it under, which can be another name of the chat's
+    /// folder (a link's target).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub messages: Option<u64>,
+    pub folder: Option<String>,
+    /// The saved session's size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// The first prompt, at most [`MAX_CHAT_SESSION_PREVIEW_CHARS`] characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+    /// The end of the last reply, at most [`MAX_CHAT_SESSION_PREVIEW_CHARS`] characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply: Option<String>,
 }
+
+/// How much of a session's first prompt and last reply its listing carries.
+pub const MAX_CHAT_SESSION_PREVIEW_CHARS: usize = 1200;
 
 /// A change to a [`ChatState`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

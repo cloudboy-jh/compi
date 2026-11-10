@@ -790,9 +790,7 @@ fn render_thought(
                     frame.muted(),
                 ))
                 .child(label)
-                .on_click(
-                    frame.act(move |this, chat, _, cx| this.toggle_chat_row(chat, index, cx)),
-                ),
+                .on_click(frame.act(move |this, chat, _, _| this.toggle_chat_row(chat, index))),
         )
         .when(open, |thought| {
             thought.child(
@@ -863,6 +861,20 @@ fn change_counts(added: u32, removed: u32, frame: &RowFrame) -> Div {
         )
 }
 
+/// `text`'s first non-blank line, with `…` when more follows.
+fn first_line(text: &str) -> SharedString {
+    let mut lines = text
+        .lines()
+        .map(str::trim_end)
+        .skip_while(|line| line.trim().is_empty());
+    let first = lines.next().unwrap_or_default();
+    if lines.any(|line| !line.trim().is_empty()) {
+        format!("{first} …").into()
+    } else {
+        first.to_owned().into()
+    }
+}
+
 /// A tool call: one line (icon, verb, target, changes, duration, status) that unfolds to
 /// its edits, or its input and output; the permission it waits on is drawn on it.
 fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> AnyElement {
@@ -877,9 +889,11 @@ fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> Any
         .permission
         .as_ref()
         .filter(|permission| permission.tool.as_deref() == Some(tool.id.as_str()));
+    // The head is one line high: a title or target with line breaks (OMP's `eval` title
+    // carries its code) shows its first line, or it draws over the rows below.
     let (verb, target) = match &row.target {
-        Some(target) => (SharedString::from(row.verb), Some(target.clone())),
-        None => (SharedString::from(tool.title.clone()), None),
+        Some(target) => (SharedString::from(row.verb), Some(first_line(target))),
+        None => (first_line(&tool.title), None),
     };
     let head = div()
         .id(("chat-tool", index))
@@ -937,7 +951,7 @@ fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> Any
             )
         })
         .child(div().flex_none().child(tool_status(tool.status, frame)))
-        .on_click(frame.act(move |this, chat, _, cx| this.toggle_chat_row(chat, index, cx)));
+        .on_click(frame.act(move |this, chat, _, _| this.toggle_chat_row(chat, index)));
     div()
         .flex()
         .flex_col()
@@ -1171,6 +1185,16 @@ fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_head_shows_the_first_line_of_a_title_with_line_breaks() {
+        assert_eq!(
+            first_line("[py] Listing commands\nimport json\n"),
+            "[py] Listing commands …"
+        );
+        assert_eq!(first_line("\n  \ncargo test\n\n"), "cargo test");
+        assert_eq!(first_line("ls -la"), "ls -la");
+    }
 
     fn tool(id: &str, kind: &str, input: Option<&str>) -> ChatTool {
         ChatTool {

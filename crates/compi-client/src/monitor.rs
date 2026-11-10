@@ -828,7 +828,7 @@ pub fn format_running_for(start_time: u64, now: u64) -> String {
     clippy::useless_conversion,
     reason = "`c_long` is 32 bits on some targets"
 )]
-fn local_offset(unix_seconds: u64) -> i64 {
+pub fn local_offset(unix_seconds: u64) -> i64 {
     let Ok(time) = libc::time_t::try_from(unix_seconds) else {
         return 0;
     };
@@ -841,7 +841,7 @@ fn local_offset(unix_seconds: u64) -> i64 {
 }
 
 #[cfg(windows)]
-fn local_offset(unix_seconds: u64) -> i64 {
+pub fn local_offset(unix_seconds: u64) -> i64 {
     use windows::Win32::Foundation::SYSTEMTIME;
     use windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
     let (year, month, day) = crate::updates::civil_date(unix_seconds);
@@ -880,7 +880,7 @@ fn local_offset(unix_seconds: u64) -> i64 {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn local_offset(_unix_seconds: u64) -> i64 {
+pub fn local_offset(_unix_seconds: u64) -> i64 {
     0
 }
 

@@ -5033,7 +5033,6 @@ impl CompiApp {
                 terminal_font,
                 chat_text_size,
                 window,
-                cx,
             );
         }
         if self.refresh_typography(window) {

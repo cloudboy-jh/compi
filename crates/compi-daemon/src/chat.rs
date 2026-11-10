@@ -23,6 +23,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod saved;
+
 /// The ACP version Compi speaks.
 const ACP_VERSION: u64 = 1;
 /// Standard error kept to explain an exit.
@@ -31,6 +33,8 @@ const STDERR_TAIL_BYTES: usize = 2048;
 const STOP_GRACE: Duration = Duration::from_millis(500);
 /// How long a window waits for the harness to list its sessions.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pages of a session listing read at most (OMP's are 50 sessions long).
+const MAX_LIST_PAGES: usize = 40;
 /// A whole state sent to a window stays this small; tool output and diffs of the oldest
 /// calls are left out beyond it, so a long session still fits one control frame.
 const WATCH_STATE_BYTES: usize = 6 * 1024 * 1024;
@@ -111,13 +115,19 @@ impl ChatHub {
         self.get(id)?.set_option(option, value)
     }
 
-    /// Blocks until the harness lists its sessions, at most `LIST_TIMEOUT`.
+    /// Blocks until the harness lists its sessions, at most `LIST_TIMEOUT`: newest first,
+    /// with the first prompt and last reply its files hold.
     pub fn sessions(&self, id: &str) -> Result<Vec<ChatSessionInfo>, String> {
-        let receiver = self.get(id)?.list_sessions()?;
-        match receiver.recv_timeout(LIST_TIMEOUT) {
-            Ok(result) => result,
-            Err(_) => Err("the harness did not list its sessions in time".into()),
-        }
+        let chat = self.get(id)?;
+        let receiver = chat.list_sessions()?;
+        let mut sessions = match receiver.recv_timeout(LIST_TIMEOUT) {
+            Ok(result) => result?,
+            Err(_) => return Err("the harness did not list its sessions in time".into()),
+        };
+        // RFC 3339 times in UTC, as OMP writes them, sort as text.
+        sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
+        saved::fill(&chat.content, &mut sessions);
+        Ok(sessions)
     }
 
     pub fn resume(&self, id: &str, session: Option<String>) -> Result<(), String> {
@@ -223,7 +233,18 @@ enum Pending {
     /// OMP's subscription plans and what is left of them (`_omp/usage`).
     Plans,
     SetOption,
-    List(mpsc::Sender<Result<Vec<ChatSessionInfo>, String>>),
+    /// The harness's sessions for a window, page by page (`nextCursor`).
+    List {
+        reply: mpsc::Sender<Result<Vec<ChatSessionInfo>, String>>,
+        listed: Vec<ChatSessionInfo>,
+        pages: usize,
+    },
+    /// Pages of the listing searched for the folder `session` was saved under, to load
+    /// it there.
+    Locate {
+        session: String,
+        pages: usize,
+    },
 }
 
 /// A prompt on its way to the harness: its text, attached files and images.
@@ -306,6 +327,10 @@ struct Inner {
     initialized: bool,
     can_load: bool,
     can_list: bool,
+    /// The folder each listed session was saved under. OMP lists a folder's sessions
+    /// under every name of it (a link and its target) but loads one only under the name
+    /// it was saved with.
+    session_folders: HashMap<String, String>,
     /// The harness takes prompts into a running turn (`_session/steering`).
     can_steer: bool,
     /// Prompts for after the running turn, in order, by ID; `state.queued` shows them.
@@ -504,10 +529,7 @@ impl Chat {
                     return;
                 };
                 let result = match message.get("error") {
-                    Some(error) => Err(error["message"]
-                        .as_str()
-                        .unwrap_or("unknown error")
-                        .to_owned()),
+                    Some(error) => Err(error_text(error)),
                     None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 self.answered(inner, pending, result);
@@ -569,8 +591,51 @@ impl Chat {
                     message: format!("{harness} didn't change the setting: {message}"),
                 },
             }),
-            (Pending::List(reply), result) => {
-                let _ = reply.send(result.map(|result| sessions(&result)));
+            (
+                Pending::List {
+                    reply,
+                    mut listed,
+                    pages,
+                },
+                Ok(result),
+            ) => {
+                inner.note_folders(&result);
+                listed.extend(sessions(&result));
+                match next_cursor(&result, pages) {
+                    Some(cursor) => self.list_page(
+                        inner,
+                        Some(cursor),
+                        Pending::List {
+                            reply,
+                            listed,
+                            pages: pages + 1,
+                        },
+                    ),
+                    None => {
+                        let _ = reply.send(Ok(listed));
+                    }
+                }
+            }
+            (Pending::List { reply, .. }, Err(error)) => {
+                let _ = reply.send(Err(error));
+            }
+            (Pending::Locate { session, pages }, result) => {
+                let cursor = result.ok().and_then(|result| {
+                    inner.note_folders(&result);
+                    next_cursor(&result, pages)
+                });
+                match (inner.session_folders.get(&session).cloned(), cursor) {
+                    (Some(folder), _) => self.load_session(inner, session, &folder),
+                    (None, Some(cursor)) => self.list_page(
+                        inner,
+                        Some(cursor),
+                        Pending::Locate {
+                            session,
+                            pages: pages + 1,
+                        },
+                    ),
+                    (None, None) => self.load_session(inner, session, &self.content.folder),
+                }
             }
             (Pending::Steer(prompt), Ok(result)) if result["outcome"] == "injected" => {
                 inner.end_thought();
@@ -650,21 +715,40 @@ impl Chat {
         inner.request("_omp/usage", json!({}), Pending::Plans);
     }
 
-    /// Loads `session`, whose history the harness replays, or starts a new one.
+    /// Loads `session`, whose history the harness replays, in the folder it was saved
+    /// under (looked up in the listing first when not known yet), or starts a new one.
     fn open_session(&self, inner: &mut Inner, session: Option<String>) {
-        let folder = &self.content.folder;
         match session.filter(|_| inner.can_load) {
-            Some(session) => inner.request(
-                "session/load",
-                json!({ "sessionId": session, "cwd": folder, "mcpServers": [] }),
-                Pending::LoadSession,
-            ),
+            Some(session) => match inner.session_folders.get(&session).cloned() {
+                Some(folder) => self.load_session(inner, session, &folder),
+                None if inner.can_list => {
+                    self.list_page(inner, None, Pending::Locate { session, pages: 1 });
+                }
+                None => self.load_session(inner, session, &self.content.folder),
+            },
             None => inner.request(
                 "session/new",
-                json!({ "cwd": folder, "mcpServers": [] }),
+                json!({ "cwd": self.content.folder, "mcpServers": [] }),
                 Pending::NewSession,
             ),
         }
+    }
+
+    fn load_session(&self, inner: &mut Inner, session: String, folder: &str) {
+        inner.request(
+            "session/load",
+            json!({ "sessionId": session, "cwd": folder, "mcpServers": [] }),
+            Pending::LoadSession,
+        );
+    }
+
+    /// Asks for a page of the sessions in the chat's folder; `None` is the first.
+    fn list_page(&self, inner: &mut Inner, cursor: Option<String>, pending: Pending) {
+        let mut params = json!({ "cwd": self.content.folder });
+        if let Some(cursor) = cursor {
+            params["cursor"] = cursor.into();
+        }
+        inner.request("session/list", params, pending);
     }
 
     fn ready_session(&self, inner: &Inner) -> Result<String, String> {
@@ -822,11 +906,15 @@ impl Chat {
                 self.content.harness.name()
             ));
         }
-        let (sender, receiver) = mpsc::channel();
-        inner.request(
-            "session/list",
-            json!({ "cwd": self.content.folder }),
-            Pending::List(sender),
+        let (reply, receiver) = mpsc::channel();
+        self.list_page(
+            &mut inner,
+            None,
+            Pending::List {
+                reply,
+                listed: Vec::new(),
+                pages: 1,
+            },
         );
         Ok(receiver)
     }
@@ -1002,11 +1090,23 @@ impl Inner {
     /// asked is out any more.
     fn fail_pending(&mut self) {
         for (_, pending) in self.pending.drain() {
-            if let Pending::List(reply) = pending {
+            if let Pending::List { reply, .. } = pending {
                 let _ = reply.send(Err("the harness stopped".into()));
             }
         }
         self.reading_plans = false;
+    }
+
+    /// Remembers the folder each session in a listing page was saved under.
+    fn note_folders(&mut self, result: &Value) {
+        for session in result["sessions"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(folder)) =
+                (session["sessionId"].as_str(), session["cwd"].as_str())
+            {
+                self.session_folders
+                    .insert(id.to_owned(), folder.to_owned());
+            }
+        }
     }
 
     /// A turn ended: tool calls still open will not report again, and nobody needs to
@@ -1568,11 +1668,13 @@ fn plans(result: &Value) -> Vec<ChatPlan> {
         .collect()
 }
 
+/// A listing page's sessions that hold a message.
 fn sessions(result: &Value) -> Vec<ChatSessionInfo> {
     result["sessions"]
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|session| session["_meta"]["messageCount"].as_u64() != Some(0))
         .filter_map(|session| {
             Some(ChatSessionInfo {
                 id: session["sessionId"].as_str()?.to_owned(),
@@ -1581,10 +1683,34 @@ fn sessions(result: &Value) -> Vec<ChatSessionInfo> {
                     .filter(|title| !title.is_empty())
                     .map(str::to_owned),
                 updated: session["updatedAt"].as_str().map(str::to_owned),
-                messages: session["_meta"]["messageCount"].as_u64(),
+                folder: session["cwd"].as_str().map(str::to_owned),
+                size: session["_meta"]["size"].as_u64(),
+                first_prompt: None,
+                last_reply: None,
             })
         })
         .collect()
+}
+
+/// The cursor of a listing's next page, unless `pages` were read already.
+fn next_cursor(result: &Value, pages: usize) -> Option<String> {
+    result["nextCursor"]
+        .as_str()
+        .filter(|cursor| !cursor.is_empty() && pages < MAX_LIST_PAGES)
+        .map(str::to_owned)
+}
+
+/// A JSON-RPC error as people read it: its message, then the harness's details (OMP
+/// says only "Internal error" in the message).
+fn error_text(error: &Value) -> String {
+    let message = error["message"].as_str().unwrap_or("unknown error");
+    match error["data"]["details"]
+        .as_str()
+        .filter(|details| !details.is_empty())
+    {
+        Some(details) => format!("{message}: {details}"),
+        None => message.to_owned(),
+    }
 }
 
 /// Suffix `__other` names a choice field's free-text companion (OMP's `ask`).

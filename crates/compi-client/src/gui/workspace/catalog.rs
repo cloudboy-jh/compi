@@ -567,7 +567,6 @@ impl CompiApp {
         terminal_font: crate::config::FontSettings,
         chat_text_size: f32,
         window: &mut Window,
-        cx: &mut App,
     ) {
         // The family and size follow live; line height and fallbacks do not.
         let terminal_font_changed = self.config.configured_font.family != terminal_font.family;
@@ -585,7 +584,7 @@ impl CompiApp {
         }
         if chat_text_size_changed {
             self.config.chat_text_size = chat_text_size;
-            self.remeasure_chats(cx);
+            self.remeasure_chats();
         }
         self.config.configured_appearance = appearance.clone();
         self.config.theme_favorites = favorites;
@@ -666,7 +665,6 @@ impl CompiApp {
                         self.config.configured_font.clone(),
                         self.config.chat_text_size,
                         target_window,
-                        target_cx,
                     );
                     target_cx.notify();
                 }

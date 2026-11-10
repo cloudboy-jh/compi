@@ -110,6 +110,7 @@ gpui_kit_assets::icon_assets!(
         Terminal,
         Wrench,
         Image,
+        RotateCcwClock,
     ]
 );
 

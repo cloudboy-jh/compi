@@ -1708,6 +1708,7 @@ impl CompiApp {
             && (self.settings_search_has_keyboard(window, cx)
                 || self.monitor_search_has_keyboard(window, cx)
                 || self.chat_composer_has_keyboard(window, cx)
+                || self.chat_sessions_search_has_keyboard(window, cx)
                 || self
                     .focused_pane()
                     .and_then(|pane| self.content.panes.get(pane))
@@ -1731,6 +1732,7 @@ impl CompiApp {
         if self.settings_search_key(key, window, cx)
             || self.monitor_search_key(key, window, cx)
             || self.chat_composer_key(key, window, cx)
+            || self.chat_sessions_search_key(key, window, cx)
         {
             cx.stop_propagation();
             cx.notify();

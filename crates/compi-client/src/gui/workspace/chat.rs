@@ -30,7 +30,6 @@ use gpui::{
     uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_component::spinner::Spinner;
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{RopeExt as _, Sizable as _, Size};
@@ -39,10 +38,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod composer;
 mod rows;
+mod scroller;
 mod sessions;
 
 use composer::{CompiCommand, Completion, OptionPicker, QuestionForm};
 use rows::{ChatRow, RowFrame};
+use scroller::TranscriptScroll;
+use sessions::SessionSheet;
 
 const HEADER_HEIGHT: f32 = 34.0;
 /// The composer grows with its text between these many lines.
@@ -147,19 +149,10 @@ enum Link {
 enum ChatMenu {
     /// The header's ⋯ menu.
     Header,
-    /// The session list, under the header's ⋯ button.
-    Sessions,
     /// The picker of the harness setting with this id.
     Option(String),
     /// The other settings.
     More,
-}
-
-/// The harness's sessions in the chat's folder, read when the list opens.
-enum Sessions {
-    Reading,
-    Listed(Vec<ChatSessionInfo>),
-    Failed(String),
 }
 
 /// Whether the chat's folder is in a Git repository, read once: Open in diff needs one.
@@ -183,7 +176,7 @@ struct ChatModel {
     state: Option<ChatState>,
     /// One per entry of `state`.
     rows: Rc<Vec<ChatRow>>,
-    scroller: Entity<MessageScrollerState>,
+    scroller: TranscriptScroll,
     composer: Entity<TextareaState>,
     _composer_events: Subscription,
     /// Keyboard focus of the pane; the composer and the transcript's text sit inside it.
@@ -206,9 +199,8 @@ struct ChatModel {
     menu: Option<ChatMenu>,
     /// The search of an open setting picker with many choices.
     picker: Option<OptionPicker>,
-    sessions: Sessions,
-    /// Words the session list keeps to (`/resume words`); empty keeps every session.
-    session_filter: String,
+    /// The session picker over the pane, while open.
+    sessions: Option<SessionSheet>,
     repo: Repo,
     /// The answers being given to the open question.
     question: Option<QuestionForm>,
@@ -392,9 +384,7 @@ impl ChatModel {
                     continue;
                 }
                 rows::update_row(&mut rows[index], was, now, &self.folder, cx);
-                self.scroller.update(cx, |scroller, cx| {
-                    scroller.remeasure_items(index..index + 1, cx);
-                });
+                self.scroller.remeasure_row(index);
             }
             let added = new.len() - old.len();
             rows.extend(
@@ -403,18 +393,14 @@ impl ChatModel {
                     .map(|entry| rows::chat_row(entry, &self.folder, cx)),
             );
             if added > 0 {
-                self.scroller.update(cx, |scroller, cx| {
-                    scroller.append(added, cx);
-                });
+                self.scroller.append(added);
             }
         } else {
             *rows = new
                 .iter()
                 .map(|entry| rows::chat_row(entry, &self.folder, cx))
                 .collect();
-            let count = rows.len();
-            self.scroller
-                .update(cx, |scroller, cx| scroller.reset(count, cx));
+            self.scroller.reset(rows.len());
         }
         self.state = Some(state);
     }
@@ -432,16 +418,12 @@ impl ChatModel {
             ChatEvent::Entry { entry } => {
                 Rc::make_mut(&mut self.rows).push(rows::chat_row(&entry, &self.folder, cx));
                 state.entries.push(entry);
-                self.scroller.update(cx, |scroller, cx| {
-                    scroller.append(1, cx);
-                });
+                self.scroller.append(1);
             }
             ChatEvent::Text { index, text } => {
                 if let Some(view) = self.rows.get(index).and_then(ChatRow::text_view) {
                     view.update(cx, |view, cx| view.push_str(&text, cx));
-                    self.scroller.update(cx, |scroller, cx| {
-                        scroller.remeasure_items(index..index + 1, cx);
-                    });
+                    self.scroller.remeasure_row(index);
                 }
                 state.apply(ChatEvent::Text { index, text });
             }
@@ -451,9 +433,7 @@ impl ChatModel {
                     Rc::make_mut(&mut self.rows).get_mut(index),
                 ) {
                     rows::update_row(row, was, &entry, &self.folder, cx);
-                    self.scroller.update(cx, |scroller, cx| {
-                        scroller.remeasure_items(index..index + 1, cx);
-                    });
+                    self.scroller.remeasure_row(index);
                 }
                 state.apply(ChatEvent::Replace { index, entry });
             }
@@ -614,17 +594,15 @@ impl CompiApp {
             self.global_error = Some(error);
             return;
         }
-        self.remeasure_chats(cx);
+        self.remeasure_chats();
         self.broadcast_global_appearance(window, cx);
         cx.notify();
     }
 
     /// Lays every chat's transcript out again, after its text size changed.
-    pub(super) fn remeasure_chats(&self, cx: &mut App) {
+    pub(super) fn remeasure_chats(&self) {
         for model in self.chat.chats.values() {
-            model
-                .scroller
-                .update(cx, |scroller, cx| scroller.remeasure(cx));
+            model.scroller.remeasure();
         }
     }
 
@@ -810,7 +788,7 @@ impl CompiApp {
             link: Link::Connecting,
             state: None,
             rows: Rc::default(),
-            scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
+            scroller: TranscriptScroll::new(cx.entity().downgrade()),
             composer,
             _composer_events: events,
             focus: cx.focus_handle(),
@@ -824,8 +802,7 @@ impl CompiApp {
             file_request: 0,
             menu: None,
             picker: None,
-            sessions: Sessions::Reading,
-            session_filter: String::new(),
+            sessions: None,
             repo: Repo::Reading,
             question: None,
             requests: 0,
@@ -1027,7 +1004,7 @@ impl CompiApp {
         match command {
             CompiCommand::New => self.resume_chat(chat, None, window, cx),
             CompiCommand::Resume | CompiCommand::Sessions => {
-                self.list_chat_sessions(chat, argument, cx);
+                self.open_chat_sessions(chat, &argument, window, cx);
             }
         }
     }
@@ -1193,15 +1170,13 @@ impl CompiApp {
     }
 
     /// Unfolds or folds row `index` of chat `chat`: a tool card or a thought.
-    fn toggle_chat_row(&mut self, chat: &str, index: usize, cx: &mut Context<Self>) {
+    fn toggle_chat_row(&mut self, chat: &str, index: usize) {
         let Some(model) = self.chat.chats.get_mut(chat) else {
             return;
         };
         if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
             row.toggle();
-            model.scroller.update(cx, |scroller, cx| {
-                scroller.remeasure_items(index..index + 1, cx);
-            });
+            model.scroller.remeasure_row(index);
         }
     }
 
@@ -1278,6 +1253,10 @@ impl CompiApp {
             *focused == model.focus
                 || model.focus.contains_focused(window, cx)
                 || model.composer.focus_handle(cx) == *focused
+                || model
+                    .sessions
+                    .as_ref()
+                    .is_some_and(|sheet| sheet.search_focus(cx) == *focused)
         })
     }
 
@@ -1286,10 +1265,10 @@ impl CompiApp {
         self.pane_chat(pane_id).map(|model| &model.focus)
     }
 
-    /// What should have the keyboard in chat pane `pane_id`: its composer, or `None` when
-    /// the composer, the transcript's text, a question's field or the pane already has
-    /// it. A composer focused in the frame that created it is not yet inside the pane's
-    /// focus.
+    /// What should have the keyboard in chat pane `pane_id`: the session picker's search
+    /// while it is open, else its composer; `None` when that, the transcript's text, a
+    /// question's field or the pane already has it. A field focused in the frame that
+    /// created it is not yet inside the pane's focus.
     pub(super) fn chat_keyboard(
         &self,
         pane_id: &PaneId,
@@ -1297,9 +1276,12 @@ impl CompiApp {
         cx: &App,
     ) -> Option<FocusHandle> {
         let model = self.pane_chat(pane_id)?;
-        let composer = model.composer.focus_handle(cx);
-        let held = model.focus.contains_focused(window, cx) || composer.is_focused(window);
-        (!held).then_some(composer)
+        let wanted = match &model.sessions {
+            Some(sheet) => sheet.search_focus(cx),
+            None => model.composer.focus_handle(cx),
+        };
+        let held = model.focus.contains_focused(window, cx) || wanted.is_focused(window);
+        (!held).then_some(wanted)
     }
 
     /// The focused chat pane's composer has the keyboard.
@@ -1309,36 +1291,17 @@ impl CompiApp {
     }
 
     /// Keys in the focused chat's composer, before the field's own: Ctrl+V (Cmd+V) with an
-    /// image on the clipboard attaches it; the completion list's arrows, Tab and Escape;
-    /// with the draft empty, Enter and Escape answer a waiting permission (its first
-    /// allow or reject option); else Escape leaves the draft and hands the keyboard to
-    /// the pane, where Escape again shows the shell.
+    /// image on the clipboard attaches it; the transcript's paging keys; the completion
+    /// list's arrows, Tab and Escape; with the draft empty, Enter and Escape answer a
+    /// waiting permission (its first allow or reject option); else Escape leaves the
+    /// draft and hands the keyboard to the pane, where Escape again shows the shell.
     pub(super) fn chat_composer_key(
         &mut self,
         key: &Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let modifiers = &key.modifiers;
-        let paste_modifier = if cfg!(target_os = "macos") {
-            modifiers.platform && !modifiers.control
-        } else {
-            modifiers.control && !modifiers.platform
-        };
-        if key.key == "v"
-            && paste_modifier
-            && !modifiers.alt
-            && !modifiers.shift
-            && self.chat_composer_has_keyboard(window, cx)
-        {
-            return self.paste_chat_image(cx);
-        }
-        if modifiers.control
-            || modifiers.alt
-            || modifiers.platform
-            || modifiers.shift
-            || !self.chat_composer_has_keyboard(window, cx)
-        {
+        if !self.chat_composer_has_keyboard(window, cx) {
             return false;
         }
         let Some(chat) = self
@@ -1348,6 +1311,21 @@ impl CompiApp {
         else {
             return false;
         };
+        let modifiers = &key.modifiers;
+        let paste_modifier = if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.control
+        } else {
+            modifiers.control && !modifiers.platform
+        };
+        if key.key == "v" && paste_modifier && !modifiers.alt && !modifiers.shift {
+            return self.paste_chat_image(cx);
+        }
+        if self.chat_scroll_key(&chat, key) {
+            return true;
+        }
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift {
+            return false;
+        }
         if self.chat_completion_key(&chat, &key.key, window, cx) {
             return true;
         }
@@ -1382,6 +1360,41 @@ impl CompiApp {
         }
     }
 
+    /// Page Up and Page Down scroll chat `chat`'s transcript by a page less a line, and
+    /// Ctrl+End (Cmd+Down) goes back to the newest entry, while no list or menu of the
+    /// chat is open; whether `key` was one of them.
+    fn chat_scroll_key(&self, chat: &str, key: &Keystroke) -> bool {
+        let Some(model) = self.chat.chats.get(chat) else {
+            return false;
+        };
+        if model.menu.is_some()
+            || model.picker.is_some()
+            || model.completion.is_some()
+            || model.sessions.is_some()
+        {
+            return false;
+        }
+        let modifiers = &key.modifiers;
+        let plain = !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift;
+        let latest = !modifiers.alt
+            && !modifiers.shift
+            && if cfg!(target_os = "macos") {
+                modifiers.platform && !modifiers.control && key.key == "down"
+            } else {
+                modifiers.control && !modifiers.platform && key.key == "end"
+            };
+        match key.key.as_str() {
+            "pageup" | "pagedown" if plain => {
+                // A line of message text stays in view across the page.
+                let line = self.chat_body_size() * 1.5;
+                model.scroller.page(key.key == "pagedown", line);
+            }
+            _ if latest => model.scroller.scroll_to_end(),
+            _ => return false,
+        }
+        true
+    }
+
     /// Keys in a chat pane that its composer and fields left alone.
     fn chat_key_down(
         &mut self,
@@ -1401,6 +1414,20 @@ impl CompiApp {
             return;
         }
         let key = &event.keystroke;
+        if let Some(sheet) = &model.sessions {
+            // Its search took its keys before it, and types the rest.
+            if !sheet.search_focus(cx).is_focused(window) {
+                self.chat_sessions_key(&chat, key, window, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+        if self.chat_scroll_key(&chat, key) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let modifiers = &key.modifiers;
         let plain = !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift;
         let escape = key.key == "escape" && plain;
@@ -1439,7 +1466,7 @@ impl CompiApp {
     }
 
     /// Chat pane `pane_id`, showing `chat`: a header, the transcript, and the composer
-    /// under whatever waits on the reader.
+    /// under whatever waits on the reader; the session picker over them while open.
     pub(super) fn render_chat_pane(
         &self,
         pane_id: &PaneId,
@@ -1452,6 +1479,7 @@ impl CompiApp {
         let colors = *self.colors();
         let key_pane = pane_id.clone();
         let pane = div()
+            .relative()
             .flex_1()
             .min_h_0()
             .min_w_0()
@@ -1466,7 +1494,10 @@ impl CompiApp {
             }))
             .child(self.render_chat_header(chat, model, cx))
             .child(self.render_chat_transcript(chat, model, cx))
-            .child(self.render_chat_footer(chat, model, cx));
+            .child(self.render_chat_footer(chat, model, cx))
+            .when_some(model.sessions.as_ref(), |pane, sheet| {
+                pane.child(self.render_chat_sessions(chat, model, sheet, cx))
+            });
         WithRemSize {
             rem: px(
                 DEFAULT_REM * self.config.chat_text_size / crate::config::DEFAULT_CHAT_TEXT_SIZE
@@ -1660,15 +1691,9 @@ impl CompiApp {
             .min_h_0()
             .min_w_0()
             .child(
-                MessageScroller::new(
-                    "chat-transcript",
-                    model.scroller.clone(),
-                    move |index, _, _| rows::render_row(&rows, index, &frame),
-                )
-                .with_row_style(StyleRefinement::default().pb(ui_rems(0.0)))
-                .with_jump_button_label("Latest")
-                .with_jump_button_renderer(|button| button.icon(IconName::ArrowDown))
-                .size_full(),
+                model
+                    .scroller
+                    .render(move |index| rows::render_row(&rows, index, &frame), cx),
             )
             .into_any_element()
     }
