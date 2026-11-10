@@ -16,7 +16,9 @@
 //! (`catalog`), which fills the pane and previews on the real panes until the Apply /
 //! Cancel bar decides. Monitor's page is Overview's cards, drawn on the page itself.
 use super::catalog::{CatalogTarget, GridStep};
+use super::chat::SECONDARY_KEY;
 use super::*;
+use crate::config::{ChatEnter, ChatOpen};
 use crate::gui::controls::IconName;
 use compi_protocol::chat::ChatApproval;
 use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
@@ -108,6 +110,11 @@ pub(super) enum SettingsAction {
     FontSize(Command),
     /// Zoom in, out or reset of the chat text size.
     ChatTextSize(Command),
+    /// Enter while OMP works: Left and Right pick Steer or Queue, Enter flips it.
+    ChatEnter,
+    /// Opening a chat: Left and Right pick in place or beside, Enter flips it.
+    ChatOpen,
+    ToggleChatAgentsBar,
     OpenConfiguration,
     /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
     /// the next keys pressed.
@@ -561,28 +568,6 @@ static ROWS: &[Row] = &[
         },
     ),
     row(
-        "chat-text-size",
-        SettingsSection::Interface,
-        "Chat text size",
-        "Agent chats, with their cards and composer, in every window.",
-        "zoom scale bigger smaller larger font agent omp",
-        |_| {
-            vec![
-                SettingsAction::ChatTextSize(Command::ZoomOut),
-                SettingsAction::ChatTextSize(Command::ZoomIn),
-                SettingsAction::ChatTextSize(Command::ZoomReset),
-            ]
-        },
-        |app, row, cx| {
-            app.render_size_row(
-                row,
-                app.config.chat_text_size,
-                SettingsAction::ChatTextSize,
-                cx,
-            )
-        },
-    ),
-    row(
         "density",
         SettingsSection::Interface,
         "Pane density",
@@ -936,6 +921,28 @@ static ROWS: &[Row] = &[
     ),
     // Chat.
     row(
+        "chat-text-size",
+        SettingsSection::Chat,
+        "Text size",
+        "Agent chats, with their cards and composer, in every window.",
+        "zoom scale bigger smaller larger font agent omp",
+        |_| {
+            vec![
+                SettingsAction::ChatTextSize(Command::ZoomOut),
+                SettingsAction::ChatTextSize(Command::ZoomIn),
+                SettingsAction::ChatTextSize(Command::ZoomReset),
+            ]
+        },
+        |app, row, cx| {
+            app.render_size_row(
+                row,
+                app.config.chat_text_size,
+                SettingsAction::ChatTextSize,
+                cx,
+            )
+        },
+    ),
+    row(
         "chat-approval",
         SettingsSection::Chat,
         "Approvals",
@@ -943,6 +950,41 @@ static ROWS: &[Row] = &[
         "approval permission ask allow edits everything yolo tools agent omp",
         |_| vec![SettingsAction::Select(Popup::ChatApproval)],
         |app, row, cx| app.render_chat_approval_row(row, cx),
+    ),
+    row(
+        "chat-enter",
+        SettingsSection::Chat,
+        "Enter while OMP works",
+        "Whether Enter steers the running turn or queues the message for after it.",
+        "steer queue send key ctrl cmd turn message composer agent omp",
+        |_| vec![SettingsAction::ChatEnter],
+        |app, row, cx| app.render_chat_enter_row(row, cx),
+    ),
+    row(
+        "chat-open",
+        SettingsSection::Chat,
+        "Opening a chat",
+        "Where OMP chat and compi chat open a chat from a terminal: in place of its shell or beside it.",
+        "split pane beside in place shell view palette agent omp",
+        |_| vec![SettingsAction::ChatOpen],
+        |app, row, cx| app.render_chat_open_row(row, cx),
+    ),
+    row(
+        "chat-agents-bar",
+        SettingsSection::Chat,
+        "Agents bar",
+        "While OMP's sub-agents run, list them above the message box.",
+        "sub-agents subagents task tasks running agent omp",
+        |_| vec![SettingsAction::ToggleChatAgentsBar],
+        |app, row, cx| {
+            app.render_toggle_row(
+                row,
+                app.config.chat_agents_bar,
+                SettingsAction::ToggleChatAgentsBar,
+                row_description("chat-agents-bar"),
+                cx,
+            )
+        },
     ),
     // Keyboard.
     page_row(
@@ -2430,6 +2472,26 @@ impl CompiApp {
                 });
                 current
             }
+            (
+                "left" | "right",
+                Some(Stop::Control {
+                    action: SettingsAction::ChatEnter,
+                    ..
+                }),
+            ) => {
+                self.set_chat_enter(ChatEnter::ALL[usize::from(key.key == "right")], cx);
+                current
+            }
+            (
+                "left" | "right",
+                Some(Stop::Control {
+                    action: SettingsAction::ChatOpen,
+                    ..
+                }),
+            ) => {
+                self.set_chat_open(ChatOpen::ALL[usize::from(key.key == "right")], cx);
+                current
+            }
             ("tab", _) => step(&order, current, !modifiers.shift),
             ("left" | "right", Some(Stop::Section(section))) => {
                 let index = SettingsSection::ALL
@@ -2537,6 +2599,23 @@ impl CompiApp {
                 if let Err(error) = self.config.save_focus_indicator(indicator) {
                     self.global_error = Some(error);
                 }
+            }
+            SettingsAction::ChatEnter => self.set_chat_enter(
+                match self.config.chat_enter {
+                    ChatEnter::Steer => ChatEnter::Queue,
+                    ChatEnter::Queue => ChatEnter::Steer,
+                },
+                cx,
+            ),
+            SettingsAction::ChatOpen => self.set_chat_open(
+                match self.config.chat_open {
+                    ChatOpen::InPlace => ChatOpen::Beside,
+                    ChatOpen::Beside => ChatOpen::InPlace,
+                },
+                cx,
+            ),
+            SettingsAction::ToggleChatAgentsBar => {
+                self.set_chat_agents_bar(!self.config.chat_agents_bar, cx);
             }
             SettingsAction::NotificationAttention => {
                 let mut settings = self.config.notifications;
@@ -3655,16 +3734,130 @@ impl CompiApp {
             self.global_error = Some(error);
             return;
         }
-        cx.defer(move |cx| {
-            for handle in cx.windows() {
-                if let Some(typed) = handle.downcast::<CompiApp>() {
-                    let _ = typed.update(cx, |app, _, cx| {
-                        app.config.chat_approval = approval;
-                        cx.notify();
-                    });
-                }
+        share_config_change(cx, move |config| config.chat_approval = approval);
+    }
+
+    /// Enter while OMP works: Steer or Queue, as a switch.
+    fn render_chat_enter_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let current = self.config.chat_enter;
+        let detail = match current {
+            ChatEnter::Steer => {
+                format!("Enter steers the running turn; {SECONDARY_KEY} queues for after it.")
             }
-        });
+            ChatEnter::Queue => {
+                format!("Enter queues for after the running turn; {SECONDARY_KEY} steers it.")
+            }
+        };
+        self.render_choice_row(
+            row,
+            SettingsAction::ChatEnter,
+            ChatEnter::ALL.map(|enter| {
+                (
+                    enter.label(),
+                    match enter {
+                        ChatEnter::Steer => "Into the running turn",
+                        ChatEnter::Queue => "After the running turn",
+                    },
+                    enter == current,
+                )
+            }),
+            |app, index, cx| app.set_chat_enter(ChatEnter::ALL[index], cx),
+            detail,
+            cx,
+        )
+    }
+
+    /// Opening a chat: in place of the shell or beside it, as a switch.
+    fn render_chat_open_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let current = self.config.chat_open;
+        let detail = match current {
+            ChatOpen::InPlace => {
+                "OMP chat and compi chat show the chat over the terminal's shell, which keeps running."
+            }
+            ChatOpen::Beside => {
+                "OMP chat and compi chat open the chat in a new pane beside the terminal."
+            }
+        };
+        self.render_choice_row(
+            row,
+            SettingsAction::ChatOpen,
+            ChatOpen::ALL.map(|open| {
+                (
+                    open.label(),
+                    match open {
+                        ChatOpen::InPlace => "Over the terminal's shell",
+                        ChatOpen::Beside => "In a new pane beside the terminal",
+                    },
+                    open == current,
+                )
+            }),
+            |app, index, cx| app.set_chat_open(ChatOpen::ALL[index], cx),
+            detail.into(),
+            cx,
+        )
+    }
+
+    /// A choice of two `options` (label, tooltip detail, picked) as a segmented switch, one
+    /// stop for `action`: a click or Left and Right pick, Enter moves to the other.
+    fn render_choice_row(
+        &self,
+        row: &RowCx,
+        action: SettingsAction,
+        options: [(&'static str, &'static str, bool); 2],
+        pick: fn(&mut Self, usize, &mut Context<Self>),
+        detail: String,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let focused = self.settings_focused(row, action);
+        let buttons = options
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, tip, picked))| {
+                let row = row.clone();
+                controls::text_button((row.row, index), label)
+                    .selected(picked)
+                    .detail(tip)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.focus_settings_control(&row, action);
+                        pick(this, index, cx);
+                        cx.notify();
+                    }))
+            });
+        let switch = controls::highlight(
+            focused,
+            controls::segmented((row.row, 9_usize), buttons),
+            cx,
+        )
+        .child(self.settings_focus_anchor(focused, cx))
+        .into_any_element();
+        self.settings_row(row.title, detail, switch, row.compact)
+    }
+
+    /// Saves what Enter does while OMP works and gives it to every window.
+    fn set_chat_enter(&mut self, enter: ChatEnter, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_chat_enter(enter) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_config_change(cx, move |config| config.chat_enter = enter);
+    }
+
+    /// Saves where a new chat opens and gives it to every window.
+    fn set_chat_open(&mut self, open: ChatOpen, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_chat_open(open) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_config_change(cx, move |config| config.chat_open = open);
+    }
+
+    /// Saves whether chats show the agents bar and gives it to every window.
+    fn set_chat_agents_bar(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_chat_agents_bar(shown) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_config_change(cx, move |config| config.chat_agents_bar = shown);
     }
 
     /// The folder new tabs start in when they open from no other pane; `None` is home.
@@ -5213,6 +5406,24 @@ fn share_launch_change(
     });
 }
 
+/// Gives every window a setting this one saved, since each keeps its own copy of the
+/// configuration.
+fn share_config_change(
+    cx: &mut Context<CompiApp>,
+    change: impl Fn(&mut crate::config::LoadedConfig) + 'static,
+) {
+    cx.defer(move |cx| {
+        for handle in cx.windows() {
+            if let Some(typed) = handle.downcast::<CompiApp>() {
+                let _ = typed.update(cx, |app, _, cx| {
+                    change(&mut app.config);
+                    cx.notify();
+                });
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5267,10 +5478,10 @@ mod tests {
             ids("font"),
             [
                 "ui-font",
-                "chat-text-size",
                 "terminal-font",
                 "font-size",
                 "custom-typography",
+                "chat-text-size",
                 COMMANDS_ROW
             ]
         );

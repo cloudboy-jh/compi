@@ -14,12 +14,6 @@ const FILE_SEARCH_DELAY: Duration = Duration::from_millis(150);
 const MAX_COMPLETIONS: usize = 50;
 /// The settings the composer row shows as pickers, in order; the rest go under More.
 const PICKED_SETTINGS: [&str; 3] = ["model", "thought_level", "mode"];
-/// The keys that queue the draft for after the running turn.
-const QUEUE_KEY: &str = if cfg!(target_os = "macos") {
-    "Cmd+Enter"
-} else {
-    "Ctrl+Enter"
-};
 /// The composer card's corner radius.
 const CARD_RADIUS: f32 = 10.0;
 /// The harness's mark in the empty draft.
@@ -478,8 +472,8 @@ fn option_entries(
     entries
 }
 
-/// Cost as the footer shows it.
-fn cost_label(cost: f64, currency: Option<&str>) -> String {
+/// Cost as the footer shows it, and the transcript's sub-agents.
+pub(super) fn cost_label(cost: f64, currency: Option<&str>) -> String {
     match currency {
         None | Some("USD") => format!("${cost:.2}"),
         Some(currency) => format!("{cost:.2} {currency}"),
@@ -1282,10 +1276,15 @@ impl CompiApp {
                                         .size(ui_rems(MARK_SIZE)),
                                 )
                                 .child(if working {
-                                    format!(
-                                        "Enter steers {}  ·  {QUEUE_KEY} queues for after",
-                                        chat.harness.name()
-                                    )
+                                    let harness = chat.harness.name();
+                                    match self.config.chat_enter {
+                                        crate::config::ChatEnter::Steer => format!(
+                                            "Enter steers {harness}  ·  {SECONDARY_KEY} queues for after"
+                                        ),
+                                        crate::config::ChatEnter::Queue => format!(
+                                            "Enter queues for after  ·  {SECONDARY_KEY} steers {harness}"
+                                        ),
+                                    }
                                 } else {
                                     format!(
                                         "Ask {} anything  ·  / commands  ·  @ files",

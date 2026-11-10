@@ -1,9 +1,10 @@
 //! The transcript's rows: one per entry. Messages are Markdown views; a thought is a dim
 //! line that unfolds to its text; a tool call is a card that folds, with its edits as
-//! inline diffs, and the permission it waits on drawn on it.
+//! inline diffs, its sub-agents as a line each, and the permission it waits on drawn on
+//! it.
 use super::*;
 use crate::diff::{self, FileDiff, LineKind, Whitespace};
-use compi_protocol::chat::{ChatTool, ChatToolStatus};
+use compi_protocol::chat::{ChatAgent, ChatAgentsFinished, ChatTool, ChatToolStatus};
 use gpui_component::text::TextViewStyle;
 
 /// An edit is unfolded at first while it changes at most this many lines.
@@ -38,6 +39,13 @@ pub(super) enum ChatRow {
         tool: Rc<ToolRow>,
         /// The reader's fold, else the card's own (`ToolRow::opens`).
         open: Option<bool>,
+        /// The sub-agents whose result the reader unfolded, by ID.
+        open_agents: Vec<String>,
+    },
+    /// The chat's sub-agents all finished; `tool` is the entry of their call.
+    AgentsFinished {
+        tool: usize,
+        label: SharedString,
     },
     Error(SharedString),
     Cancelled,
@@ -48,7 +56,9 @@ impl ChatRow {
     pub(super) fn text_view(&self) -> Option<&Entity<TextViewState>> {
         match self {
             Self::User { text, .. } | Self::Agent(text) | Self::Thought { text, .. } => Some(text),
-            Self::Tool { .. } | Self::Error(_) | Self::Cancelled => None,
+            Self::Tool { .. } | Self::AgentsFinished { .. } | Self::Error(_) | Self::Cancelled => {
+                None
+            }
         }
     }
 
@@ -56,8 +66,31 @@ impl ChatRow {
     pub(super) fn toggle(&mut self) {
         match self {
             Self::Thought { open, .. } => *open = !*open,
-            Self::Tool { tool, open } => *open = Some(!open.unwrap_or_else(|| tool.opens())),
-            Self::User { .. } | Self::Agent(_) | Self::Error(_) | Self::Cancelled => {}
+            Self::Tool { tool, open, .. } => *open = Some(!open.unwrap_or_else(|| tool.opens())),
+            Self::User { .. }
+            | Self::Agent(_)
+            | Self::AgentsFinished { .. }
+            | Self::Error(_)
+            | Self::Cancelled => {}
+        }
+    }
+
+    /// Unfolds a tool card.
+    pub(super) fn unfold(&mut self) {
+        if let Self::Tool { open, .. } = self {
+            *open = Some(true);
+        }
+    }
+
+    /// Shows or hides the result of a tool card's sub-agent `agent`.
+    pub(super) fn toggle_agent(&mut self, agent: &str) {
+        if let Self::Tool { open_agents, .. } = self {
+            match open_agents.iter().position(|open| open == agent) {
+                Some(index) => {
+                    open_agents.remove(index);
+                }
+                None => open_agents.push(agent.to_owned()),
+            }
         }
     }
 }
@@ -73,9 +106,19 @@ pub(super) struct ToolRow {
     /// Lines its edits add and remove.
     added: u32,
     removed: u32,
-    /// Its input (unless it shows edits) and output as selectable code blocks.
+    /// Its input (unless it shows edits or sub-agents) and output as selectable code
+    /// blocks.
     input: Option<Entity<TextViewState>>,
     output: Option<Entity<TextViewState>>,
+    agents: Vec<AgentRow>,
+    /// What its sub-agents cost together, when they reported it.
+    cost: Option<f64>,
+}
+
+/// A sub-agent as its line draws it, with its result as a Markdown view.
+struct AgentRow {
+    agent: ChatAgent,
+    result: Option<Entity<TextViewState>>,
 }
 
 /// One file an edit changed, as the card draws it.
@@ -114,23 +157,48 @@ impl ToolRow {
         let added = diffs.iter().map(|block| block.added).sum();
         let removed = diffs.iter().map(|block| block.removed).sum();
         // A card with edits shows them in place of its input, and in place of its output
-        // unless the edit failed or changed nothing, when the output says why.
-        let input = tool.input.as_ref().filter(|_| diffs.is_empty());
+        // unless the edit failed or changed nothing, when the output says why. A card with
+        // sub-agents shows them in place of both, unless it failed.
+        let agents = !tool.agents.is_empty();
+        let input = tool.input.as_ref().filter(|_| diffs.is_empty() && !agents);
         let output = tool.output.as_ref().filter(|_| {
-            diffs.is_empty() || tool.status == ChatToolStatus::Failed || added + removed == 0
+            tool.status == ChatToolStatus::Failed
+                || !agents && (diffs.is_empty() || added + removed == 0)
         });
+        let costs: Vec<f64> = tool.agents.iter().filter_map(|agent| agent.cost).collect();
         Self {
             target: tool_target(tool, folder),
             input: tool_view(
                 input,
                 before.map(|before| (before.tool.input.as_ref(), before.input.as_ref())),
+                tool_markdown,
                 cx,
             ),
             output: tool_view(
                 output,
                 before.map(|before| (before.tool.output.as_ref(), before.output.as_ref())),
+                tool_markdown,
                 cx,
             ),
+            agents: tool
+                .agents
+                .iter()
+                .map(|agent| {
+                    let shown = before.and_then(|before| {
+                        before.agents.iter().find(|row| row.agent.id == agent.id)
+                    });
+                    AgentRow {
+                        result: tool_view(
+                            agent.result.as_ref(),
+                            shown.map(|row| (row.agent.result.as_ref(), row.result.as_ref())),
+                            str::to_owned,
+                            cx,
+                        ),
+                        agent: agent.clone(),
+                    }
+                })
+                .collect(),
+            cost: (!costs.is_empty()).then(|| costs.iter().sum()),
             tool: tool.clone(),
             verb,
             icon,
@@ -140,9 +208,11 @@ impl ToolRow {
         }
     }
 
-    /// Unfolded until the reader folds it: a small edit, or a call that failed.
+    /// Unfolded until the reader folds it: a small edit, a call that failed, or one that
+    /// started sub-agents.
     fn opens(&self) -> bool {
         self.tool.status == ChatToolStatus::Failed
+            || !self.agents.is_empty()
             || (!self.diffs.is_empty() && self.added + self.removed <= SMALL_EDIT_LINES)
     }
 }
@@ -217,6 +287,7 @@ fn tool_kind(tool: &ChatTool) -> (&'static str, IconName) {
             Some("edit" | "write") => ("Edit", IconName::FilePen),
             Some("grep" | "glob" | "find" | "search") => ("Search", IconName::FileSearch),
             Some("fetch" | "web_search") => ("Fetch", IconName::Globe),
+            Some("task") => ("Agents", IconName::Bot),
             _ => ("Tool", IconName::Wrench),
         },
     }
@@ -248,22 +319,24 @@ fn tool_target(tool: &ChatTool, folder: &str) -> Option<SharedString> {
     .map(|value| relative_to(value, folder).into())
 }
 
-/// The view of a tool's input or output `text`: `before`'s view when it showed the same
-/// text, or that view given the new text, else a new one.
+/// The view of a tool's input or output, or an agent's result, `text` as `source` makes it
+/// Markdown: `before`'s view when it showed the same text, or that view given the new
+/// text, else a new one.
 fn tool_view(
     text: Option<&String>,
     before: Option<(Option<&String>, Option<&Entity<TextViewState>>)>,
+    source: fn(&str) -> String,
     cx: &mut App,
 ) -> Option<Entity<TextViewState>> {
     let text = text?;
     match before {
         Some((shown, Some(view))) if shown == Some(text) => Some(view.clone()),
         Some((_, Some(view))) => {
-            let source = tool_markdown(text);
+            let source = source(text);
             view.update(cx, |view, cx| view.set_text(&source, cx));
             Some(view.clone())
         }
-        _ => Some(markdown(&tool_markdown(text), cx)),
+        _ => Some(markdown(&source(text), cx)),
     }
 }
 
@@ -416,7 +489,8 @@ pub(super) fn continues(was: &ChatEntry, now: &ChatEntry) -> bool {
             now.starts_with(was.as_str())
         }
         (ChatEntry::Tool(was), ChatEntry::Tool(now)) => was.id == now.id,
-        (ChatEntry::Error { .. }, ChatEntry::Error { .. })
+        (ChatEntry::AgentsFinished(_), ChatEntry::AgentsFinished(_))
+        | (ChatEntry::Error { .. }, ChatEntry::Error { .. })
         | (ChatEntry::Cancelled, ChatEntry::Cancelled) => was == now,
         _ => false,
     }
@@ -457,10 +531,61 @@ pub(super) fn chat_row(entry: &ChatEntry, folder: &str, cx: &mut App) -> ChatRow
         ChatEntry::Tool(tool) => ChatRow::Tool {
             tool: Rc::new(ToolRow::new(tool, folder, None, cx)),
             open: None,
+            open_agents: Vec::new(),
+        },
+        ChatEntry::AgentsFinished(summary) => ChatRow::AgentsFinished {
+            tool: summary.tool,
+            label: agents_finished_label(summary),
         },
         ChatEntry::Error { message } => ChatRow::Error(message.clone().into()),
         ChatEntry::Cancelled => ChatRow::Cancelled,
     }
+}
+
+/// A summary entry's line: `2 agents finished · 15s · $0.20`.
+fn agents_finished_label(summary: &ChatAgentsFinished) -> SharedString {
+    let mut label = format!(
+        "{} {} finished · {}",
+        summary.count,
+        if summary.count == 1 {
+            "agent"
+        } else {
+            "agents"
+        },
+        duration_label(summary.duration_ms)
+    );
+    if let Some(cost) = summary.cost {
+        label.push_str(" · ");
+        label.push_str(&cost_label(cost, None));
+    }
+    label.into()
+}
+
+/// The sub-agents in `entries` that have not finished, each with the entry of its call.
+pub(super) fn running_agents(entries: &[ChatEntry]) -> Vec<(usize, &ChatAgent)> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
+            ChatEntry::Tool(tool) => Some((index, &tool.agents)),
+            _ => None,
+        })
+        .flat_map(|(index, agents)| {
+            agents
+                .iter()
+                .filter(|agent| agent.status.is_open())
+                .map(move |agent| (index, agent))
+        })
+        .collect()
+}
+
+/// How long a sub-agent has run: counting while it runs, else as it reported.
+pub(super) fn agent_time(agent: &ChatAgent) -> Option<String> {
+    let ms = match agent.started_ms {
+        Some(started) if agent.status.is_open() => now_ms().saturating_sub(started),
+        _ => agent.duration_ms,
+    };
+    (ms > 0).then(|| duration_label(ms))
 }
 
 /// Brings `row`, drawn from `was`, up to `now`: views keep their text (grown, or set
@@ -592,8 +717,19 @@ pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> An
             ended_ms,
             open,
         } => render_thought(index, text, *started_ms, *ended_ms, *open, frame),
-        ChatRow::Tool { tool, open } => {
-            render_tool(index, tool, open.unwrap_or_else(|| tool.opens()), frame)
+        ChatRow::Tool {
+            tool,
+            open,
+            open_agents,
+        } => render_tool(
+            index,
+            tool,
+            open.unwrap_or_else(|| tool.opens()),
+            open_agents,
+            frame,
+        ),
+        ChatRow::AgentsFinished { tool, label } => {
+            render_agents_finished(index, *tool, label, frame)
         }
         ChatRow::Error(message) => render_error(message, last && frame.retry, frame),
         ChatRow::Cancelled => div()
@@ -875,9 +1011,16 @@ fn first_line(text: &str) -> SharedString {
     }
 }
 
-/// A tool call: one line (icon, verb, target, changes, duration, status) that unfolds to
-/// its edits, or its input and output; the permission it waits on is drawn on it.
-fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> AnyElement {
+/// A tool call: one line (icon, verb, target, changes, duration, cost, status) that
+/// unfolds to its edits, its sub-agents, or its input and output; the permission it
+/// waits on is drawn on it.
+fn render_tool(
+    index: usize,
+    row: &ToolRow,
+    open: bool,
+    open_agents: &[String],
+    frame: &RowFrame,
+) -> AnyElement {
     let tool = &row.tool;
     let muted = frame.muted();
     let failed = tool.status == ChatToolStatus::Failed;
@@ -950,6 +1093,15 @@ fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> Any
                     .child(duration),
             )
         })
+        .when_some(row.cost, |head, cost| {
+            head.child(
+                div()
+                    .flex_none()
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .child(cost_label(cost, None)),
+            )
+        })
         .child(div().flex_none().child(tool_status(tool.status, frame)))
         .on_click(frame.act(move |this, chat, _, _| this.toggle_chat_row(chat, index)));
     div()
@@ -965,7 +1117,9 @@ fn render_tool(index: usize, row: &ToolRow, open: bool, frame: &RowFrame) -> Any
                     .child(render_permission_block(subject, permission, frame)),
             )
         })
-        .when(open, |card| card.child(render_tool_body(index, row, frame)))
+        .when(open, |card| {
+            card.child(render_tool_body(index, row, open_agents, frame))
+        })
         .into_any_element()
 }
 
@@ -1023,8 +1177,41 @@ pub(super) fn render_permission_block(
         .child(div().flex().flex_wrap().gap_2().children(options))
         .into_any_element()
 }
-/// An unfolded tool call: its edits as diffs, else its input; then its output.
-fn render_tool_body(index: usize, row: &ToolRow, frame: &RowFrame) -> AnyElement {
+
+/// The summary entry: one quiet line that shows the agents' call.
+fn render_agents_finished(
+    index: usize,
+    tool: usize,
+    label: &SharedString,
+    frame: &RowFrame,
+) -> AnyElement {
+    let muted = frame.muted();
+    div()
+        .id(("chat-agents-finished", index))
+        .h(ui_rems(24.0))
+        .px_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(ui_rems(4.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(color(frame.colors.surface_hover)))
+        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+        .text_color(muted)
+        .child(controls::glyph(IconName::Bot, muted))
+        .child(label.clone())
+        .on_click(frame.act(move |this, chat, _, _| this.reveal_chat_tool(chat, tool)))
+        .into_any_element()
+}
+
+/// An unfolded tool call: its edits as diffs, its sub-agents, else its input; then its
+/// output.
+fn render_tool_body(
+    index: usize,
+    row: &ToolRow,
+    open_agents: &[String],
+    frame: &RowFrame,
+) -> AnyElement {
     let tool = &row.tool;
     div()
         .ml_6()
@@ -1037,6 +1224,17 @@ fn render_tool_body(index: usize, row: &ToolRow, frame: &RowFrame) -> AnyElement
                 .enumerate()
                 .map(|(block, diff)| render_diff(index, block, diff, frame)),
         )
+        .when(!row.agents.is_empty(), |body| {
+            body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .children(row.agents.iter().enumerate().map(|(position, agent)| {
+                        let open = open_agents.contains(&agent.agent.id);
+                        render_agent(index, position, agent, open, frame)
+                    })),
+            )
+        })
         .when_some(row.input.as_ref(), |body, input| {
             body.child(tool_text("Input", input, false, frame))
         })
@@ -1048,6 +1246,131 @@ fn render_tool_body(index: usize, row: &ToolRow, frame: &RowFrame) -> AnyElement
                 frame,
             ))
         })
+        .into_any_element()
+}
+
+/// A sub-agent: one line (status, name, type, what it does or answered, time, cost) that
+/// unfolds, once it answered, to its answer.
+fn render_agent(
+    index: usize,
+    position: usize,
+    row: &AgentRow,
+    open: bool,
+    frame: &RowFrame,
+) -> AnyElement {
+    let agent = &row.agent;
+    let muted = frame.muted();
+    let doing = match (&agent.result, agent.status.is_open()) {
+        (Some(result), false) => Some(first_line(result)),
+        _ => agent.activity.as_deref().map(SharedString::from),
+    };
+    let micro = |text: SharedString| {
+        div()
+            .flex_none()
+            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+            .text_color(muted)
+            .child(text)
+    };
+    let id = agent.id.clone();
+    let head = div()
+        .id(("chat-agent", index * 1000 + position))
+        .h(ui_rems(22.0))
+        .px_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(ui_rems(4.0))
+        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+        .child(div().flex_none().child(tool_status(agent.status, frame)))
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .child(agent.id.clone()),
+        )
+        .when(!agent.agent.is_empty(), |head| {
+            head.child(micro(agent.agent.clone().into()))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                .text_color(muted)
+                .children(doing),
+        )
+        .when_some(agent_time(agent), |head, time| {
+            head.child(micro(time.into()))
+        })
+        .when_some(agent.cost, |head, cost| {
+            head.child(micro(cost_label(cost, None).into()))
+        })
+        .when(row.result.is_some(), |head| {
+            head.cursor_pointer()
+                .hover(|style| style.bg(color(frame.colors.surface_hover)))
+                .on_click(frame.act(move |this, chat, _, _| {
+                    this.toggle_chat_agent(chat, index, &id);
+                }))
+        });
+    div()
+        .flex()
+        .flex_col()
+        .child(head)
+        .when_some(row.result.as_ref().filter(|_| open), |agent_row, result| {
+            agent_row.child(
+                div()
+                    .ml_6()
+                    .pt_0p5()
+                    .pb_2()
+                    .child(agent_result(agent, result, frame)),
+            )
+        })
+        .into_any_element()
+}
+
+/// What a sub-agent answered: a label naming its model and tool calls over the Markdown,
+/// selectable, links open.
+fn agent_result(agent: &ChatAgent, view: &Entity<TextViewState>, frame: &RowFrame) -> AnyElement {
+    let mut label = String::from("Result");
+    if let Some(model) = &agent.model {
+        label.push_str(" · ");
+        label.push_str(model);
+    }
+    match agent.tool_count {
+        0 => {}
+        1 => label.push_str(" · 1 tool call"),
+        count => label.push_str(&format!(" · {count} tool calls")),
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(
+            div()
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                .text_color(frame.muted())
+                .child(label),
+        )
+        .child(
+            TextView::new(view)
+                .selectable(true)
+                .code_block_actions(copy_code_button)
+                .style(message_style(frame))
+                .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(color(modal_text_color(
+                    if agent.status == ChatToolStatus::Failed {
+                        frame.colors.error
+                    } else {
+                        frame.colors.foreground
+                    },
+                    &frame.colors,
+                ))),
+        )
         .into_any_element()
 }
 
@@ -1209,7 +1532,55 @@ mod tests {
             locations: Vec::new(),
             started_ms: 1,
             ended_ms: None,
+            agents: Vec::new(),
         }
+    }
+
+    #[test]
+    fn running_agents_and_their_summary_read_short() {
+        let agent = |id: &str, status: ChatToolStatus| ChatAgent {
+            id: id.into(),
+            agent: "sonic".into(),
+            status,
+            activity: None,
+            tool_count: 0,
+            started_ms: None,
+            duration_ms: 12_000,
+            cost: None,
+            model: None,
+            assignment: None,
+            result: None,
+        };
+        let mut task = tool("t", "other", None);
+        task.agents = vec![
+            agent("TaskA", ChatToolStatus::Completed),
+            agent("TaskB", ChatToolStatus::Running),
+        ];
+        let entries = [
+            ChatEntry::Cancelled,
+            ChatEntry::Tool(Box::new(task.clone())),
+        ];
+        let running = running_agents(&entries);
+        assert_eq!(running.len(), 1);
+        assert_eq!((running[0].0, running[0].1.id.as_str()), (1, "TaskB"));
+        assert_eq!(agent_time(&task.agents[0]).as_deref(), Some("12s"));
+        let summary = |count, cost| ChatAgentsFinished {
+            tool: 1,
+            count,
+            duration_ms: 15_000,
+            cost,
+        };
+        assert_eq!(
+            agents_finished_label(&summary(2, Some(0.2))),
+            "2 agents finished · 15s · $0.20"
+        );
+        assert_eq!(
+            agents_finished_label(&summary(1, None)),
+            "1 agent finished · 15s"
+        );
+        let finished = |count| ChatEntry::AgentsFinished(summary(count, None));
+        assert!(continues(&finished(2), &finished(2)));
+        assert!(!continues(&finished(2), &finished(3)));
     }
 
     #[test]

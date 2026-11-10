@@ -26,6 +26,8 @@ pub const MAX_CHAT_TOOL_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_CHAT_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 /// The largest side of an edit's diff kept; a larger edit keeps only its path.
 pub const MAX_CHAT_DIFF_BYTES: usize = 256 * 1024;
+/// The most of a sub-agent's result kept for display: its start.
+pub const MAX_CHAT_AGENT_RESULT_BYTES: usize = 32 * 1024;
 
 /// An installed agent program Compi can chat with.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -245,6 +247,8 @@ pub enum ChatEntry {
     },
     /// A tool call.
     Tool(Box<ChatTool>),
+    /// The last running sub-agent of the chat finished.
+    AgentsFinished(ChatAgentsFinished),
     /// A turn failed.
     Error { message: String },
     /// The turn was stopped.
@@ -277,7 +281,62 @@ pub struct ChatTool {
     pub started_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_ms: Option<u64>,
+    /// The sub-agents it started (OMP's `task`), in its order. The call runs while one
+    /// of them does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<ChatAgent>,
 }
+
+/// A sub-agent a tool call started, as last reported.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatAgent {
+    /// Its name (`TaskA`), unique in the session.
+    pub id: String,
+    /// Its type (`sonic`, `task`, …).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    pub status: ChatToolStatus,
+    /// What it does now: its current or latest tool's intent, else that tool and its
+    /// arguments; one short line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default)]
+    pub tool_count: u64,
+    /// When it began running, by the daemon's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
+    /// How long it has run, as it reported.
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// In US dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Its task, at most `MAX_CHAT_TOOL_INPUT_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+    /// What it answered once finished, at most `MAX_CHAT_AGENT_RESULT_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+
+// Cost is a reported figure, never NaN; equality on the bits is what a change check needs.
+impl Eq for ChatAgent {}
+
+/// The sub-agents that ran since none did have all finished: how many, from the first
+/// one's start to now, and their summed cost when reported. `tool` is the entry of the
+/// call that started the last of them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatAgentsFinished {
+    pub tool: usize,
+    pub count: usize,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+}
+
+impl Eq for ChatAgentsFinished {}
 
 /// One file an edit changed. Texts are absent when a side exceeded
 /// `MAX_CHAT_DIFF_BYTES` (`old_text` also when the file is new).
@@ -592,6 +651,7 @@ mod tests {
             locations: Vec::new(),
             started_ms: 1,
             ended_ms: None,
+            agents: Vec::new(),
         }))
     }
 
@@ -626,6 +686,24 @@ mod tests {
                 tool(ChatToolStatus::Completed),
             ]
         );
+    }
+
+    #[test]
+    fn a_summary_entry_is_tagged_like_the_others() {
+        let entry = ChatEntry::AgentsFinished(ChatAgentsFinished {
+            tool: 3,
+            count: 2,
+            duration_ms: 15_000,
+            cost: Some(0.2),
+        });
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "agents_finished", "tool": 3, "count": 2, "duration_ms": 15000, "cost": 0.2,
+            })
+        );
+        assert_eq!(serde_json::from_value::<ChatEntry>(json).unwrap(), entry);
     }
 
     #[test]

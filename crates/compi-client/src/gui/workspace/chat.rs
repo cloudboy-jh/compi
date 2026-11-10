@@ -41,7 +41,7 @@ mod rows;
 mod scroller;
 mod sessions;
 
-use composer::{CompiCommand, Completion, OptionPicker, QuestionForm};
+use composer::{CompiCommand, Completion, OptionPicker, QuestionForm, cost_label};
 use rows::{ChatRow, RowFrame};
 use scroller::TranscriptScroll;
 use sessions::SessionSheet;
@@ -50,6 +50,13 @@ const HEADER_HEIGHT: f32 = 34.0;
 /// The composer grows with its text between these many lines.
 const COMPOSER_MIN_ROWS: usize = 1;
 const COMPOSER_MAX_ROWS: usize = 8;
+/// The keys that do the other of steering and queueing while a turn runs; see
+/// `ChatModel::delivery`.
+pub(super) const SECONDARY_KEY: &str = if cfg!(target_os = "macos") {
+    "Cmd+Enter"
+} else {
+    "Ctrl+Enter"
+};
 
 /// `child` laid out and drawn with a rem of `rem`. A chat sizes everything in rems
 /// ([`ui_rems`]), as GPUI Kit's components do, so the whole chat scales with its text size.
@@ -316,12 +323,19 @@ fn token_label(tokens: u64) -> String {
 }
 
 impl ChatModel {
-    /// How Enter (or with `queue`, Ctrl+Enter) hands the draft over: into the running
-    /// turn while one runs, else as the next turn; queued after it on request.
-    fn delivery(&self, queue: bool) -> ChatDelivery {
+    /// How Enter, or with `secondary` Ctrl/Cmd+Enter, hands the draft over. While a turn
+    /// runs, Enter steers it or queues after it as `enter` says and the secondary key does
+    /// the other; otherwise Enter starts the next turn and the secondary key queues.
+    fn delivery(&self, secondary: bool, enter: crate::config::ChatEnter) -> ChatDelivery {
+        let working = self.state.as_ref().is_some_and(ChatState::working);
+        let queue = if working {
+            secondary != (enter == crate::config::ChatEnter::Queue)
+        } else {
+            secondary
+        };
         if queue {
             ChatDelivery::Queue
-        } else if self.state.as_ref().is_some_and(ChatState::working) {
+        } else if working {
             ChatDelivery::Steer
         } else {
             ChatDelivery::Prompt
@@ -515,9 +529,9 @@ fn watch_chat(
 }
 
 impl CompiApp {
-    /// OMP chat: a new chat in the focused terminal's folder, shown in its place; from
-    /// another pane, or a terminal already carrying a chat, in that pane's folder,
-    /// beside it.
+    /// OMP chat: a new chat in the focused terminal's folder, shown in its place or, as
+    /// Settings → Chat → Opening a chat says, beside it; from another pane, or a terminal
+    /// already carrying a chat, in that pane's folder, beside it.
     pub(super) fn open_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlay.is_some() {
             self.dismiss_overlay();
@@ -532,9 +546,10 @@ impl CompiApp {
         };
         let content = PaneContent::Chat(crate::chat::new_chat(environment, folder));
         // A chat ends when its view goes, so one a terminal carries is not replaced.
-        let in_place = self
-            .focused_terminal()
-            .filter(|terminal| self.pane_chat_content(terminal).is_none());
+        let in_place = self.focused_terminal().filter(|terminal| {
+            self.config.chat_open == crate::config::ChatOpen::InPlace
+                && self.pane_chat_content(terminal).is_none()
+        });
         if let Some(terminal) = in_place {
             self.show_view(&terminal, content, window, cx);
         } else if let Some(beside) = self.focused_pane().cloned() {
@@ -737,12 +752,15 @@ impl CompiApp {
             })
             .detach();
         }
+        // Elapsed times count each second while a turn or a sub-agent runs.
         let working = shown.iter().any(|id| {
             self.chat
                 .chats
                 .get(id)
                 .and_then(|model| model.state.as_ref())
-                .is_some_and(ChatState::working)
+                .is_some_and(|state| {
+                    state.working() || !rows::running_agents(&state.entries).is_empty()
+                })
         });
         if working && !self.chat.ticking {
             self.chat.ticking = true;
@@ -775,8 +793,8 @@ impl CompiApp {
             &composer,
             window,
             move |this, _, event: &InputEvent, window, cx| match event {
-                // Enter sends (or completes), Ctrl+Enter queues; Shift+Enter is a new
-                // line, the field's own.
+                // Enter sends (or completes), Ctrl+Enter is the other of steer and queue
+                // (see `ChatModel::delivery`); Shift+Enter is a new line, the field's own.
                 InputEvent::PressEnter {
                     secondary,
                     shift: false,
@@ -942,9 +960,16 @@ impl CompiApp {
     }
 
     /// Sends the composer's text, with its attachments: as the next prompt when the chat
-    /// waits for one, into the running turn while one runs, or, with `queue`, after it.
-    /// Runs Compi's own `/` command instead; with a completion open, Enter completes.
-    fn send_chat(&mut self, chat: &str, queue: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// waits for one, else into the running turn or after it as `ChatModel::delivery`
+    /// says for Enter or, with `secondary`, Ctrl/Cmd+Enter. Runs Compi's own `/` command
+    /// instead; with a completion open, Enter completes.
+    fn send_chat(
+        &mut self,
+        chat: &str,
+        secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.acknowledge_chat_results(chat);
         if self.accept_chat_completion(chat, window, cx) {
             return;
@@ -964,7 +989,7 @@ impl CompiApp {
             self.run_compi_command(chat, command, argument, window, cx);
             return;
         }
-        let delivery = model.delivery(queue);
+        let delivery = model.delivery(secondary, self.config.chat_enter);
         if model.send_refusal(delivery).is_some() {
             return;
         }
@@ -1191,6 +1216,29 @@ impl CompiApp {
         if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
             row.toggle();
             model.scroller.remeasure_row(index);
+        }
+    }
+
+    /// Shows or hides what sub-agent `agent` of the tool call at row `index` answered.
+    fn toggle_chat_agent(&mut self, chat: &str, index: usize, agent: &str) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
+            row.toggle_agent(agent);
+            model.scroller.remeasure_row(index);
+        }
+    }
+
+    /// Scrolls chat `chat`'s transcript to the tool call at row `index`, unfolded.
+    fn reveal_chat_tool(&mut self, chat: &str, index: usize) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
+            row.unfold();
+            model.scroller.remeasure_row(index);
+            model.scroller.scroll_to_row(index);
         }
     }
 
@@ -1508,6 +1556,7 @@ impl CompiApp {
             }))
             .child(self.render_chat_header(chat, model, cx))
             .child(self.render_chat_transcript(chat, model, cx))
+            .children(self.render_chat_agents(chat, model, cx))
             .child(self.render_chat_footer(chat, model, cx))
             .when_some(model.sessions.as_ref(), |pane, sheet| {
                 pane.child(self.render_chat_sessions(chat, model, sheet, cx))
@@ -1710,5 +1759,75 @@ impl CompiApp {
                     .render(move |index| rows::render_row(&rows, index, &frame), cx),
             )
             .into_any_element()
+    }
+
+    /// Over the composer while sub-agents of the chat run: how many, and what each does
+    /// (or how long it has run); a click shows their call. Settings → Chat turns it off.
+    fn render_chat_agents(
+        &self,
+        chat: &ChatContent,
+        model: &ChatModel,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.config.chat_agents_bar {
+            return None;
+        }
+        let running = rows::running_agents(&model.state.as_ref()?.entries);
+        let &(tool, _) = running.last()?;
+        let mut label = format!(
+            "{} {} running",
+            running.len(),
+            if running.len() == 1 {
+                "agent"
+            } else {
+                "agents"
+            }
+        );
+        for (_, agent) in &running {
+            label.push_str(" · ");
+            label.push_str(&agent.id);
+            if let Some(doing) = agent.activity.clone().or_else(|| rows::agent_time(agent)) {
+                label.push_str(": ");
+                label.push_str(&doing);
+            }
+        }
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let id = chat.id.clone();
+        Some(
+            div()
+                .flex_none()
+                .px_3()
+                .pt_1()
+                .child(
+                    div()
+                        .id("chat-agents")
+                        .h(ui_rems(24.0))
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(ui_rems(4.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(color(colors.surface_hover)))
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                        .text_color(muted)
+                        .child(Spinner::new().with_size(Size::XSmall).color(muted))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.reveal_chat_tool(&id, tool);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 }

@@ -440,8 +440,8 @@ pub(super) const ENTRIES: &[Entry] = &[
         command: "chat",
         action: None,
         usage: "chat",
-        summary: "Chat with OMP in the terminal's pane",
-        detail: "Start a new chat with OMP (the omp agent harness) in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. OMP works in the shell's current directory, in the terminal's environment (a WSL distribution runs omp there). The chat runs in the daemon and keeps going while the view is hidden; it ends when its pane or view closes. --json adds the chat's id and folder.",
+        summary: "Chat with OMP in or beside the terminal's pane",
+        detail: "Start a new chat with OMP (the omp agent harness) in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. OMP works in the shell's current directory, in the terminal's environment (a WSL distribution runs omp there). The chat runs in the daemon and keeps going while the view is hidden; it ends when its pane or view closes. --json adds the chat's id and folder.",
         example: "compi chat",
     },
     Entry {

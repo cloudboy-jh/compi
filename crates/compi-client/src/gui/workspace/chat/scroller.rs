@@ -3,7 +3,7 @@
 //! button back down. Kit's `MessageScroller` keeps its list to itself, so it cannot page;
 //! this keeps what Compi used of it and pages.
 use super::*;
-use gpui::{Axis, FollowMode, ListAlignment, ListState, Role, list};
+use gpui::{Axis, FollowMode, ListAlignment, ListOffset, ListState, Role, list};
 use gpui_component::scroll::{ScrollableElement as _, ScrollableMask};
 
 /// Rows laid out past the viewport's edges, so scrolling does not pop them in.
@@ -64,6 +64,14 @@ impl TranscriptScroll {
     pub(super) fn scroll_to_end(&self) {
         self.list.set_follow_mode(FollowMode::Tail);
         self.list.scroll_to_end();
+    }
+
+    /// Row `index` at the top, no longer following the newest entry.
+    pub(super) fn scroll_to_row(&self, index: usize) {
+        self.list.scroll_to(ListOffset {
+            item_ix: index,
+            offset_in_item: px(0.0),
+        });
     }
 
     /// The reader scrolled away from the newest entry.

@@ -82,7 +82,8 @@ use std::fmt;
 // (`ChatProgramStatusChanged`, on `WatchProgramStatus` connections) and
 // `AcknowledgeChatProgramStatus` removes its finished ones; `WatchChat`, `ResumeChat` and
 // `RestartChat` carry how the harness asks before running tools (`ChatApproval`). Settings
-// gains a Chat section.
+// gains a Chat section. A tool call carries the sub-agents it started (`ChatTool::agents`),
+// and `ChatEntry::AgentsFinished` marks when the last running one finished.
 pub const PROTOCOL_VERSION: u32 = 40;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;

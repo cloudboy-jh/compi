@@ -200,6 +200,78 @@ fn parse_chat_approval(value: &str) -> Option<ChatApproval> {
         .find(|approval| chat_approval_id(*approval) == value)
 }
 
+/// What Enter does with a chat's draft while a turn runs, `[chat] enter_while_working`;
+/// Ctrl/Cmd+Enter does the other. With no turn running, Enter sends either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatEnter {
+    /// Into the running turn.
+    #[default]
+    Steer,
+    /// Queued for after the running turn.
+    Queue,
+}
+
+impl ChatEnter {
+    pub const ALL: [Self; 2] = [Self::Steer, Self::Queue];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Queue => "queue",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Steer => "Steer",
+            Self::Queue => "Queue",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|enter| enter.id() == value)
+    }
+}
+
+/// Where the palette's OMP chat and `compi chat` open a chat started from a terminal,
+/// `[chat] open`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatOpen {
+    /// As the terminal's view, over its shell.
+    #[default]
+    InPlace,
+    /// In a new pane split beside the terminal.
+    Beside,
+}
+
+impl ChatOpen {
+    pub const ALL: [Self; 2] = [Self::InPlace, Self::Beside];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::InPlace => "in_place",
+            Self::Beside => "beside",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InPlace => "In place of the shell",
+            Self::Beside => "Beside it",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|open| open.id() == value)
+    }
+}
+
+fn default_chat_agents_bar() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdateSettings {
@@ -527,6 +599,15 @@ pub struct LoadedConfig {
     /// How chats' harnesses ask before running tools; see [`CHAT_APPROVALS`].
     #[serde(default)]
     pub chat_approval: ChatApproval,
+    /// What Enter does while a chat's turn runs; see [`ChatEnter`].
+    #[serde(default)]
+    pub chat_enter: ChatEnter,
+    /// Where a new chat opens; see [`ChatOpen`].
+    #[serde(default)]
+    pub chat_open: ChatOpen,
+    /// The bar listing a chat's running sub-agents above its composer, `[chat] agents_bar`.
+    #[serde(default = "default_chat_agents_bar")]
+    pub chat_agents_bar: bool,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Named pane arrangements, shape only, keyed by preset name.
@@ -559,6 +640,9 @@ impl Default for LoadedConfig {
             focus_indicator: FocusIndicator::default(),
             chat_text_size: DEFAULT_CHAT_TEXT_SIZE,
             chat_approval: ChatApproval::Harness,
+            chat_enter: ChatEnter::Steer,
+            chat_open: ChatOpen::InPlace,
+            chat_agents_bar: true,
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -878,6 +962,43 @@ impl LoadedConfig {
             approval => set_table_value(table, "approval", chat_approval_id(approval).into()),
         })?;
         self.chat_approval = approval;
+        Ok(())
+    }
+
+    /// Persist what Enter does while a chat's turn runs; Steer, the default, removes it.
+    pub fn save_chat_enter(&mut self, enter: ChatEnter) -> Result<(), String> {
+        update_table(&self.path, "chat", |table| match enter {
+            ChatEnter::Steer => {
+                table.remove("enter_while_working");
+            }
+            enter => set_table_value(table, "enter_while_working", enter.id().into()),
+        })?;
+        self.chat_enter = enter;
+        Ok(())
+    }
+
+    /// Persist where a new chat opens; In place, the default, removes it.
+    pub fn save_chat_open(&mut self, open: ChatOpen) -> Result<(), String> {
+        update_table(&self.path, "chat", |table| match open {
+            ChatOpen::InPlace => {
+                table.remove("open");
+            }
+            open => set_table_value(table, "open", open.id().into()),
+        })?;
+        self.chat_open = open;
+        Ok(())
+    }
+
+    /// Persist the agents bar; on, the default, removes it.
+    pub fn save_chat_agents_bar(&mut self, shown: bool) -> Result<(), String> {
+        update_table(&self.path, "chat", |table| {
+            if shown {
+                table.remove("agents_bar");
+            } else {
+                set_table_value(table, "agents_bar", false.into());
+            }
+        })?;
+        self.chat_agents_bar = shown;
         Ok(())
     }
 
@@ -1879,6 +2000,34 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                     "\"harness\", \"always_ask\", \"write\" or \"yolo\"",
                     "configuration",
                 ),
+            }
+        }
+        if let Some(value) = chat.get("enter_while_working") {
+            match value.as_str().and_then(ChatEnter::parse) {
+                Some(enter) => loaded.chat_enter = enter,
+                None => invalid(
+                    loaded,
+                    "chat.enter_while_working",
+                    "\"steer\" or \"queue\"",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = chat.get("open") {
+            match value.as_str().and_then(ChatOpen::parse) {
+                Some(open) => loaded.chat_open = open,
+                None => invalid(
+                    loaded,
+                    "chat.open",
+                    "\"in_place\" or \"beside\"",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = chat.get("agents_bar") {
+            match value.as_bool() {
+                Some(shown) => loaded.chat_agents_bar = shown,
+                None => invalid(loaded, "chat.agents_bar", "true or false", "configuration"),
             }
         }
     }
@@ -2997,6 +3146,96 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("chat.approval"))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_enter_open_and_agents_bar_default_round_trip_and_reject_invalid_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-chat-behaviour-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[chat]\n# retain me\ntext_size = 16\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(
+            (loaded.chat_enter, loaded.chat_open, loaded.chat_agents_bar),
+            (ChatEnter::Steer, ChatOpen::InPlace, true)
+        );
+        loaded.save_chat_enter(ChatEnter::Queue).unwrap();
+        loaded.save_chat_open(ChatOpen::Beside).unwrap();
+        loaded.save_chat_agents_bar(false).unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(
+            (
+                reloaded.chat_enter,
+                reloaded.chat_open,
+                reloaded.chat_agents_bar
+            ),
+            (ChatEnter::Queue, ChatOpen::Beside, false)
+        );
+        assert_eq!(reloaded.chat_text_size, 16.0);
+        let text = fs::read_to_string(&path).unwrap();
+        for line in [
+            "enter_while_working = \"queue\"",
+            "open = \"beside\"",
+            "agents_bar = false",
+            "# retain me",
+        ] {
+            assert!(text.contains(line), "{line}");
+        }
+        // Back to the defaults, the keys go.
+        loaded.save_chat_enter(ChatEnter::Steer).unwrap();
+        loaded.save_chat_open(ChatOpen::InPlace).unwrap();
+        loaded.save_chat_agents_bar(true).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        for key in ["enter_while_working", "open", "agents_bar"] {
+            assert!(!text.contains(key), "{key}");
+        }
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(
+            (
+                reloaded.chat_enter,
+                reloaded.chat_open,
+                reloaded.chat_agents_bar
+            ),
+            (ChatEnter::Steer, ChatOpen::InPlace, true)
+        );
+        // The file uses the serde names.
+        for enter in ChatEnter::ALL {
+            assert_eq!(serde_json::to_value(enter).unwrap(), enter.id());
+        }
+        for open in ChatOpen::ALL {
+            assert_eq!(serde_json::to_value(open).unwrap(), open.id());
+        }
+
+        let invalid = parse(
+            "version = 1\n[chat]\nenter_while_working = 'send'\nopen = 'tab'\nagents_bar = 'yes'",
+            FontOverrides::default(),
+        );
+        assert_eq!(
+            (
+                invalid.chat_enter,
+                invalid.chat_open,
+                invalid.chat_agents_bar
+            ),
+            (ChatEnter::Steer, ChatOpen::InPlace, true)
+        );
+        for key in ["chat.enter_while_working", "chat.open", "chat.agents_bar"] {
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|message| message.contains(key)),
+                "{key}"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

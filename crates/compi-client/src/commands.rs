@@ -470,7 +470,7 @@ impl Command {
             ),
             OpenBrowser => Some("Opens a web page in a pane beside the focused one."),
             OpenChat => Some(
-                "Starts a chat with OMP in the focused terminal's folder, in place of its shell; from another pane, beside it.",
+                "Starts a chat with OMP in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
             ),
             TestNotification => Some(
                 "Sends a notification the way your Notifications settings deliver one, with its sound.",
