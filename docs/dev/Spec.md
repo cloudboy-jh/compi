@@ -1123,7 +1123,7 @@ Compi is not a Windows application waiting for a Mac port. It is one persistent 
 
 - [Compi repository](https://github.com/cloudboy-jh/compi): existing implementation to migrate and preserve where compatible.
 - [SuperTerminal repository](https://github.com/sonnylazuardi/superterminal): reference for workspace structure, native terminal-first interaction, and platform separation, not a mandate to copy its stack.
-- [Next steps](NEXT_STEPS.md): the remaining editor and diff phases.
+- [Next steps](NEXT_STEPS.md): open work.
 - [Completed work](COMPLETED.md): implemented phases and dated verification evidence.
 - [Windows terminal test recipes](testcmds.md): existing exercises to adapt to the cross-platform qualification matrix.
 - [Historical Windows acceptance results](ACCEPTANCE_RESULTS_2026-09-02.md): dated evidence from the previous implementation, not current baseline qualification.
