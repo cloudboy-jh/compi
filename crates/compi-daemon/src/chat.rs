@@ -7,15 +7,15 @@
 //! (`ChatHub::retain`). The harness keeps its own session; a chat that knows its session
 //! resumes it (`session/load`) when it starts again, after a restart of the daemon too.
 use compi_protocol::chat::{
-    ChatAnswer, ChatAnswers, ChatChoice, ChatCommand, ChatContent, ChatDiff, ChatEntry, ChatEvent,
-    ChatField, ChatImage, ChatOption, ChatPermission, ChatPermissionOption, ChatQuestion,
-    ChatSessionInfo, ChatState, ChatStatus, ChatTool, ChatToolStatus, ChatUsage,
-    MAX_CHAT_ATTACHMENTS, MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES,
-    MAX_CHAT_PROMPT_BYTES, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
+    ChatAnswer, ChatAnswers, ChatChoice, ChatCommand, ChatContent, ChatDelivery, ChatDiff,
+    ChatEntry, ChatEvent, ChatField, ChatImage, ChatOption, ChatPermission, ChatPermissionOption,
+    ChatQuestion, ChatQueued, ChatSessionInfo, ChatState, ChatStatus, ChatTool, ChatToolStatus,
+    ChatUsage, MAX_CHAT_ATTACHMENTS, MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES,
+    MAX_CHAT_PROMPT_BYTES, MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
 };
 use compi_protocol::{ContentEnvironment, LayoutNode, WorkspaceSnapshot};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
@@ -74,8 +74,18 @@ impl ChatHub {
         text: String,
         files: Vec<String>,
         images: Vec<ChatImage>,
+        delivery: ChatDelivery,
     ) -> Result<(), String> {
-        self.get(id)?.send(text, files, images)
+        let prompt = Prompt {
+            text,
+            files,
+            images,
+        };
+        self.get(id)?.send(prompt, delivery)
+    }
+
+    pub fn remove_queued(&self, id: &str, queued: u64) -> Result<(), String> {
+        self.get(id)?.remove_queued(queued)
     }
 
     pub fn cancel(&self, id: &str) -> Result<(), String> {
@@ -207,8 +217,78 @@ enum Pending {
     NewSession,
     LoadSession,
     Prompt,
+    /// A prompt into the running turn; it waits its turn when the harness declines.
+    Steer(Prompt),
     SetOption,
     List(mpsc::Sender<Result<Vec<ChatSessionInfo>, String>>),
+}
+
+/// A prompt on its way to the harness: its text, attached files and images.
+struct Prompt {
+    text: String,
+    files: Vec<String>,
+    images: Vec<ChatImage>,
+}
+
+impl Prompt {
+    fn check(&self) -> Result<(), String> {
+        if self.text.trim().is_empty() && self.files.is_empty() && self.images.is_empty() {
+            return Err("nothing to send".into());
+        }
+        if self.text.len() > MAX_CHAT_PROMPT_BYTES {
+            return Err(format!(
+                "a prompt holds at most {MAX_CHAT_PROMPT_BYTES} bytes"
+            ));
+        }
+        if self.files.len() > MAX_CHAT_ATTACHMENTS {
+            return Err(format!(
+                "a prompt attaches at most {MAX_CHAT_ATTACHMENTS} files"
+            ));
+        }
+        if self.images.len() > MAX_CHAT_IMAGES {
+            return Err(format!("a prompt carries at most {MAX_CHAT_IMAGES} images"));
+        }
+        // Base64 is four bytes for three.
+        if let Some(image) = self
+            .images
+            .iter()
+            .find(|image| image.data.len() > MAX_CHAT_IMAGE_BYTES.div_ceil(3) * 4)
+        {
+            return Err(format!("{} is too large to send", image.name));
+        }
+        Ok(())
+    }
+
+    /// As ACP content blocks: the text, a link per file, the images.
+    fn blocks(&self) -> Vec<Value> {
+        let mut blocks = vec![json!({ "type": "text", "text": self.text })];
+        blocks.extend(self.files.iter().map(|path| {
+            json!({
+                "type": "resource_link",
+                "uri": file_uri(path),
+                "name": file_name(path),
+            })
+        }));
+        blocks.extend(
+            self.images.iter().map(
+                |image| json!({ "type": "image", "mimeType": image.mime, "data": image.data }),
+            ),
+        );
+        blocks
+    }
+
+    fn image_names(&self) -> Vec<String> {
+        self.images.iter().map(|image| image.name.clone()).collect()
+    }
+
+    /// As the transcript shows it, once the harness has it.
+    fn entry(&self) -> ChatEntry {
+        ChatEntry::User {
+            text: self.text.clone(),
+            files: self.files.clone(),
+            images: self.image_names(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -223,6 +303,14 @@ struct Inner {
     initialized: bool,
     can_load: bool,
     can_list: bool,
+    /// The harness takes prompts into a running turn (`_session/steering`).
+    can_steer: bool,
+    /// Prompts for after the running turn, in order, by ID; `state.queued` shows them.
+    queue: VecDeque<(u64, Prompt)>,
+    next_queued: u64,
+    /// A turn that did not end on its own holds the queue until a prompt is sent or
+    /// queued.
+    queue_held: bool,
     next_request: u64,
     pending: HashMap<u64, Pending>,
     /// Tool call IDs to their transcript entries.
@@ -431,6 +519,9 @@ impl Chat {
                 inner.initialized = true;
                 inner.can_load = capabilities["loadSession"].as_bool().unwrap_or(false);
                 inner.can_list = capabilities["sessionCapabilities"]["list"].is_object();
+                inner.can_steer = result["_meta"]["steering"]["supported"]
+                    .as_bool()
+                    .unwrap_or(false);
                 let session = inner.state.session.clone();
                 self.open_session(inner, session);
             }
@@ -450,6 +541,7 @@ impl Chat {
                 inner.emit(ChatEvent::Status {
                     status: ChatStatus::Ready,
                 });
+                inner.send_queued();
             }
             (Pending::LoadSession, Err(error)) => {
                 inner.emit(ChatEvent::Session { session: None });
@@ -473,6 +565,24 @@ impl Chat {
             }),
             (Pending::List(reply), result) => {
                 let _ = reply.send(result.map(|result| sessions(&result)));
+            }
+            (Pending::Steer(prompt), Ok(result)) if result["outcome"] == "injected" => {
+                inner.end_thought();
+                inner.activity_ms = now_ms();
+                inner.emit(ChatEvent::Entry {
+                    entry: prompt.entry(),
+                });
+                // A steer turns down the permission the harness was waiting on.
+                inner.permission_request = None;
+                if inner.state.permission.is_some() {
+                    inner.emit(ChatEvent::Permission { permission: None });
+                }
+            }
+            // The turn ended first, or the harness declined: the prompt waits its turn,
+            // first in line.
+            (Pending::Steer(prompt), _) => {
+                inner.enqueue(prompt, true);
+                inner.send_queued();
             }
             (Pending::Prompt, result) => {
                 let stop = match &result {
@@ -507,6 +617,9 @@ impl Chat {
                         status: ChatStatus::Ready,
                     });
                 }
+                // A stopped or failed turn holds the queue; one that ended goes on.
+                inner.queue_held = stop != "end_turn";
+                inner.send_queued();
             }
         }
     }
@@ -543,63 +656,50 @@ impl Chat {
             .ok_or_else(|| format!("{harness} has no session yet"))
     }
 
-    fn send(&self, text: String, files: Vec<String>, images: Vec<ChatImage>) -> Result<(), String> {
-        if text.trim().is_empty() && files.is_empty() && images.is_empty() {
-            return Err("nothing to send".into());
-        }
-        if text.len() > MAX_CHAT_PROMPT_BYTES {
-            return Err(format!(
-                "a prompt holds at most {MAX_CHAT_PROMPT_BYTES} bytes"
-            ));
-        }
-        if files.len() > MAX_CHAT_ATTACHMENTS {
-            return Err(format!(
-                "a prompt attaches at most {MAX_CHAT_ATTACHMENTS} files"
-            ));
-        }
-        if images.len() > MAX_CHAT_IMAGES {
-            return Err(format!("a prompt carries at most {MAX_CHAT_IMAGES} images"));
-        }
-        // Base64 is four bytes for three.
-        if let Some(image) = images
-            .iter()
-            .find(|image| image.data.len() > MAX_CHAT_IMAGE_BYTES.div_ceil(3) * 4)
-        {
-            return Err(format!("{} is too large to send", image.name));
-        }
+    /// Hands `prompt` to the harness as `delivery` says.
+    fn send(&self, prompt: Prompt, delivery: ChatDelivery) -> Result<(), String> {
+        prompt.check()?;
+        let harness = self.content.harness.name();
         let mut inner = self.lock();
-        let session = self.ready_session(&inner)?;
-        let mut prompt = vec![json!({ "type": "text", "text": text })];
-        prompt.extend(files.iter().map(|path| {
-            json!({
-                "type": "resource_link",
-                "uri": file_uri(path),
-                "name": file_name(path),
-            })
-        }));
-        prompt.extend(
-            images.iter().map(
-                |image| json!({ "type": "image", "mimeType": image.mime, "data": image.data }),
-            ),
-        );
-        let images = images.into_iter().map(|image| image.name).collect();
-        inner.emit(ChatEvent::Entry {
-            entry: ChatEntry::User {
-                text,
-                files,
-                images,
-            },
-        });
-        let since_ms = now_ms();
-        inner.activity_ms = since_ms;
-        inner.emit(ChatEvent::Status {
-            status: ChatStatus::Working { since_ms },
-        });
-        inner.request(
-            "session/prompt",
-            json!({ "sessionId": session, "prompt": prompt }),
-            Pending::Prompt,
-        );
+        let steer = delivery == ChatDelivery::Steer;
+        if steer && inner.state.working() && inner.can_steer {
+            let session = inner
+                .state
+                .session
+                .clone()
+                .ok_or_else(|| format!("{harness} has no session yet"))?;
+            let blocks = prompt.blocks();
+            inner.request(
+                "_session/steering",
+                json!({ "sessionId": session, "prompt": blocks }),
+                Pending::Steer(prompt),
+            );
+        } else if delivery == ChatDelivery::Prompt
+            || (steer && matches!(inner.state.status, ChatStatus::Ready))
+        {
+            let session = self.ready_session(&inner)?;
+            inner.start_prompt(session, prompt);
+        } else {
+            if let ChatStatus::Failed { .. } = inner.state.status {
+                return Err(format!("{harness} isn't running"));
+            }
+            if inner.queue.len() >= MAX_CHAT_QUEUED {
+                return Err(format!("at most {MAX_CHAT_QUEUED} prompts wait at once"));
+            }
+            inner.enqueue(prompt, false);
+            inner.queue_held = false;
+            inner.send_queued();
+        }
+        Ok(())
+    }
+
+    fn remove_queued(&self, queued: u64) -> Result<(), String> {
+        let mut inner = self.lock();
+        let Some(index) = inner.queue.iter().position(|(id, _)| *id == queued) else {
+            return Err("that prompt was already sent".into());
+        };
+        inner.queue.remove(index);
+        inner.publish_queue();
         Ok(())
     }
 
@@ -763,10 +863,73 @@ impl Inner {
     fn emit(&mut self, event: ChatEvent) {
         if let ChatEvent::Reset { .. } = event {
             self.tools.clear();
+            self.queue.clear();
+            self.queue_held = false;
         }
         self.watchers
             .retain(|watcher| watcher.send(event.clone()).is_ok());
         self.state.apply(event);
+    }
+
+    /// Starts a turn on `prompt`.
+    fn start_prompt(&mut self, session: String, prompt: Prompt) {
+        let blocks = prompt.blocks();
+        self.emit(ChatEvent::Entry {
+            entry: prompt.entry(),
+        });
+        let since_ms = now_ms();
+        self.activity_ms = since_ms;
+        self.queue_held = false;
+        self.emit(ChatEvent::Status {
+            status: ChatStatus::Working { since_ms },
+        });
+        self.request(
+            "session/prompt",
+            json!({ "sessionId": session, "prompt": blocks }),
+            Pending::Prompt,
+        );
+    }
+
+    /// Puts `prompt` at the end of the queue, or first in it.
+    fn enqueue(&mut self, prompt: Prompt, first: bool) {
+        self.next_queued += 1;
+        let queued = (self.next_queued, prompt);
+        if first {
+            self.queue.push_front(queued);
+        } else {
+            self.queue.push_back(queued);
+        }
+        self.publish_queue();
+    }
+
+    fn publish_queue(&mut self) {
+        let queued = self
+            .queue
+            .iter()
+            .map(|(id, prompt)| ChatQueued {
+                id: *id,
+                text: prompt.text.clone(),
+                files: prompt.files.clone(),
+                images: prompt.image_names(),
+            })
+            .collect();
+        self.emit(ChatEvent::Queued { queued });
+    }
+
+    /// Sends the first queued prompt when the chat waits for one and the queue is not
+    /// held.
+    fn send_queued(&mut self) {
+        if self.queue_held || !matches!(self.state.status, ChatStatus::Ready) {
+            return;
+        }
+        let Some(session) = self.state.session.clone() else {
+            return;
+        };
+        let Some((_, prompt)) = self.queue.pop_front() else {
+            return;
+        };
+        self.publish_queue();
+        self.start_prompt(session, prompt);
     }
 
     fn write(&mut self, message: &Value) {
@@ -1912,5 +2075,71 @@ mod tests {
     fn an_exit_message_keeps_the_last_lines() {
         assert_eq!(last_lines("a\nb\nc", 2), "b\nc");
         assert_eq!(last_lines("a", 3), "a");
+    }
+
+    #[test]
+    fn queued_prompts_wait_for_a_ready_chat_in_order_and_a_held_queue_for_the_next_prompt() {
+        let prompt = |text: &str| Prompt {
+            text: text.into(),
+            files: Vec::new(),
+            images: Vec::new(),
+        };
+        let last_user = |inner: &Inner| {
+            inner
+                .state
+                .entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    ChatEntry::User { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+        };
+        let ready = |inner: &mut Inner| {
+            inner.emit(ChatEvent::Status {
+                status: ChatStatus::Ready,
+            });
+        };
+        let mut inner = Inner {
+            state: ChatState {
+                session: Some("s".into()),
+                status: ChatStatus::Working { since_ms: 1 },
+                ..ChatState::default()
+            },
+            ..Inner::default()
+        };
+        inner.enqueue(prompt("one"), false);
+        inner.enqueue(prompt("two"), false);
+        inner.send_queued();
+        assert_eq!(
+            inner.state.queued.len(),
+            2,
+            "nothing goes while a turn runs"
+        );
+
+        // A stopped turn holds the queue.
+        ready(&mut inner);
+        inner.queue_held = true;
+        inner.send_queued();
+        assert_eq!(inner.state.queued.len(), 2);
+
+        // The next prompt goes first; the queue follows it, oldest first.
+        inner.start_prompt("s".into(), prompt("next"));
+        assert_eq!(last_user(&inner).as_deref(), Some("next"));
+        ready(&mut inner);
+        inner.send_queued();
+        assert_eq!(last_user(&inner).as_deref(), Some("one"));
+        assert!(inner.state.working());
+        let left: Vec<&str> = inner
+            .state
+            .queued
+            .iter()
+            .map(|queued| queued.text.as_str())
+            .collect();
+        assert_eq!(left, ["two"]);
+
+        // A declined steer waits first in line.
+        inner.enqueue(prompt("steer"), true);
+        assert_eq!(inner.state.queued[0].text, "steer");
     }
 }

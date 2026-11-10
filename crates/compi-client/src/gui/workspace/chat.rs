@@ -20,8 +20,8 @@ use super::monitor::watch::{self, LINGER, SlotChange, WatchEnd, WatchLink, Watch
 use super::*;
 use crate::gui::controls::{self, IconName, icon_button, text_button};
 use compi_protocol::chat::{
-    ChatAnswer, ChatAnswers, ChatContent, ChatEntry, ChatEvent, ChatHarness, ChatImage,
-    ChatPermission, ChatQuestion, ChatSessionInfo, ChatState, ChatStatus,
+    ChatAnswer, ChatAnswers, ChatContent, ChatDelivery, ChatEntry, ChatEvent, ChatHarness,
+    ChatImage, ChatPermission, ChatQuestion, ChatSessionInfo, ChatState, ChatStatus,
 };
 use compi_protocol::{ContentEnvironment, ContentTab, FolderContent, GitScope, PaneContent};
 use gpui::{
@@ -41,7 +41,7 @@ mod composer;
 mod rows;
 mod sessions;
 
-use composer::{Completion, OptionPicker, QuestionForm};
+use composer::{CompiCommand, Completion, OptionPicker, QuestionForm};
 use rows::{ChatRow, RowFrame};
 
 const HEADER_HEIGHT: f32 = 34.0;
@@ -207,6 +207,8 @@ struct ChatModel {
     /// The search of an open setting picker with many choices.
     picker: Option<OptionPicker>,
     sessions: Sessions,
+    /// Words the session list keeps to (`/resume words`); empty keeps every session.
+    session_filter: String,
     repo: Repo,
     /// The answers being given to the open question.
     question: Option<QuestionForm>,
@@ -320,8 +322,20 @@ fn token_label(tokens: u64) -> String {
 }
 
 impl ChatModel {
-    /// Why a prompt cannot be sent now.
-    fn send_refusal(&self) -> Option<&'static str> {
+    /// How Enter (or with `queue`, Ctrl+Enter) hands the draft over: into the running
+    /// turn while one runs, else as the next turn; queued after it on request.
+    fn delivery(&self, queue: bool) -> ChatDelivery {
+        if queue {
+            ChatDelivery::Queue
+        } else if self.state.as_ref().is_some_and(ChatState::working) {
+            ChatDelivery::Steer
+        } else {
+            ChatDelivery::Prompt
+        }
+    }
+
+    /// Why a prompt cannot be handed over as `delivery` now.
+    fn send_refusal(&self, delivery: ChatDelivery) -> Option<&'static str> {
         if self.requests > 0 {
             return Some("Wait for the last request to finish");
         }
@@ -331,11 +345,15 @@ impl ChatModel {
                 Link::Connecting | Link::Live => "Connecting to the chat",
             });
         };
-        match state.status {
-            ChatStatus::Ready => None,
-            ChatStatus::Starting => Some("Wait for the chat to start"),
-            ChatStatus::Working { .. } => Some("Wait for the reply, or stop it"),
-            ChatStatus::Failed { .. } => Some("Restart the chat first"),
+        match (&state.status, delivery) {
+            (ChatStatus::Ready, _)
+            | (ChatStatus::Starting, ChatDelivery::Queue)
+            | (ChatStatus::Working { .. }, ChatDelivery::Steer | ChatDelivery::Queue) => None,
+            (ChatStatus::Starting, _) => Some("Wait for the chat to start"),
+            (ChatStatus::Working { .. }, ChatDelivery::Prompt) => {
+                Some("Wait for the reply, or stop it")
+            }
+            (ChatStatus::Failed { .. }, _) => Some("Restart the chat first"),
         }
     }
 
@@ -769,12 +787,13 @@ impl CompiApp {
             &composer,
             window,
             move |this, _, event: &InputEvent, window, cx| match event {
-                // Enter sends (or completes); Shift+Enter is a new line, the field's own.
+                // Enter sends (or completes), Ctrl+Enter queues; Shift+Enter is a new
+                // line, the field's own.
                 InputEvent::PressEnter {
-                    secondary: false,
+                    secondary,
                     shift: false,
                 } => {
-                    this.send_chat(&id, window, cx);
+                    this.send_chat(&id, *secondary, window, cx);
                     cx.notify();
                 }
                 InputEvent::Change => {
@@ -806,6 +825,7 @@ impl CompiApp {
             menu: None,
             picker: None,
             sessions: Sessions::Reading,
+            session_filter: String::new(),
             repo: Repo::Reading,
             question: None,
             requests: 0,
@@ -933,20 +953,32 @@ impl CompiApp {
         self.chat_request(chat, message, None, window, cx);
     }
 
-    /// Sends the composer's text, with its attachments, as the next prompt when the
-    /// chat waits for one; with a completion open, Enter completes instead.
-    fn send_chat(&mut self, chat: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Sends the composer's text, with its attachments: as the next prompt when the chat
+    /// waits for one, into the running turn while one runs, or, with `queue`, after it.
+    /// Runs Compi's own `/` command instead; with a completion open, Enter completes.
+    fn send_chat(&mut self, chat: &str, queue: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.accept_chat_completion(chat, window, cx) {
             return;
         }
         let Some(model) = self.chat.chats.get(chat) else {
             return;
         };
-        if model.send_refusal().is_some() {
-            return;
-        }
         let draft = model.composer.read(cx).value();
         let text = draft.trim();
+        let harness_commands = model
+            .state
+            .as_ref()
+            .map(|state| state.commands.as_slice())
+            .unwrap_or_default();
+        if let Some((command, argument)) = composer::compi_command(text, harness_commands) {
+            let argument = argument.to_owned();
+            self.run_compi_command(chat, command, argument, window, cx);
+            return;
+        }
+        let delivery = model.delivery(queue);
+        if model.send_refusal(delivery).is_some() {
+            return;
+        }
         if text.is_empty() && model.attachments.is_empty() && model.images.is_empty() {
             return;
         }
@@ -955,8 +987,49 @@ impl CompiApp {
             text: text.to_owned(),
             files: model.attachments.clone(),
             images: model.images.clone(),
+            delivery,
         };
         self.chat_request(chat, message, Some(draft), window, cx);
+    }
+
+    /// Drops queued prompt `queued` before it is sent.
+    fn remove_queued_chat(
+        &mut self,
+        chat: &str,
+        queued: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message = ClientMessage::RemoveQueuedChat {
+            chat: chat.to_owned(),
+            queued,
+        };
+        self.chat_action(chat, message, window, cx);
+    }
+
+    /// Runs one of Compi's own `/` commands and clears the draft; attachments stay for
+    /// the next prompt.
+    fn run_compi_command(
+        &mut self,
+        chat: &str,
+        command: CompiCommand,
+        argument: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        model.completion = None;
+        model.composer.update(cx, |composer, cx| {
+            composer.set_value(String::new(), window, cx);
+        });
+        match command {
+            CompiCommand::New => self.resume_chat(chat, None, window, cx),
+            CompiCommand::Resume | CompiCommand::Sessions => {
+                self.list_chat_sessions(chat, argument, cx);
+            }
+        }
     }
 
     /// Retry after a failed turn: the last prompt again, with its files.
@@ -964,7 +1037,7 @@ impl CompiApp {
         let Some(model) = self.chat.chats.get(chat) else {
             return;
         };
-        if model.send_refusal().is_some() {
+        if model.send_refusal(ChatDelivery::Prompt).is_some() {
             return;
         }
         let Some((text, files)) = model.last_prompt() else {
@@ -975,6 +1048,7 @@ impl CompiApp {
             text: text.to_owned(),
             files: files.to_vec(),
             images: Vec::new(),
+            delivery: ChatDelivery::Prompt,
         };
         self.chat_action(chat, message, window, cx);
     }
@@ -1234,10 +1308,11 @@ impl CompiApp {
             .is_some_and(|model| model.composer.focus_handle(cx).is_focused(window))
     }
 
-    /// Keys in the focused chat's composer, before the field's own: the completion list's
-    /// arrows, Tab and Escape; with the draft empty, Enter and Escape answer a waiting
-    /// permission (its first allow or reject option); else Escape leaves the draft and
-    /// hands the keyboard to the pane, where Escape again shows the shell.
+    /// Keys in the focused chat's composer, before the field's own: Ctrl+V (Cmd+V) with an
+    /// image on the clipboard attaches it; the completion list's arrows, Tab and Escape;
+    /// with the draft empty, Enter and Escape answer a waiting permission (its first
+    /// allow or reject option); else Escape leaves the draft and hands the keyboard to
+    /// the pane, where Escape again shows the shell.
     pub(super) fn chat_composer_key(
         &mut self,
         key: &Keystroke,
@@ -1245,6 +1320,19 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let modifiers = &key.modifiers;
+        let paste_modifier = if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.control
+        } else {
+            modifiers.control && !modifiers.platform
+        };
+        if key.key == "v"
+            && paste_modifier
+            && !modifiers.alt
+            && !modifiers.shift
+            && self.chat_composer_has_keyboard(window, cx)
+        {
+            return self.paste_chat_image(cx);
+        }
         if modifiers.control
             || modifiers.alt
             || modifiers.platform
@@ -1386,6 +1474,12 @@ impl CompiApp {
             child: pane.into_any_element(),
         }
         .into_any_element()
+    }
+
+    /// Message text's size in pixels at the chat text size: `UI_BODY_TEXT_SIZE` in the
+    /// chat's rem.
+    fn chat_body_size(&self) -> Pixels {
+        px(UI_BODY_TEXT_SIZE * self.config.chat_text_size / crate::config::DEFAULT_CHAT_TEXT_SIZE)
     }
 
     /// The harness, the chat's title and folder, whether it is reachable, and its menu.
@@ -1550,10 +1644,11 @@ impl CompiApp {
             app: cx.entity().downgrade(),
             chat: chat.id.as_str().into(),
             colors: *self.colors(),
+            body_size: self.chat_body_size(),
             mono: self.typography.font.family.clone(),
             permission: state.permission.clone(),
             // Retry resends the last prompt after a turn that failed.
-            retry: model.send_refusal().is_none(),
+            retry: model.send_refusal(ChatDelivery::Prompt).is_none(),
             diff_refusal: match &model.repo {
                 Repo::At { .. } => None,
                 Repo::Reading => Some("Checking for a Git repository"),

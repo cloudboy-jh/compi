@@ -153,6 +153,48 @@ pub fn clipboard_image(path: &Path) -> Result<gpui::Image, String> {
     Ok(gpui::Image::from_bytes(format, bytes))
 }
 
+/// `bytes`, an image Compi can decode, as an agent chat takes it: PNG, JPEG, GIF or WebP
+/// of at most `max_bytes`, with its MIME type. One already so is kept as it is; another
+/// (a BMP, say, or a large screenshot) becomes a PNG, else a JPEG, halved in size until
+/// it fits.
+pub fn chat_image(bytes: Vec<u8>, max_bytes: usize) -> Result<(Vec<u8>, &'static str), String> {
+    let mime = |format| match format {
+        ImageFormat::Png => Some("image/png"),
+        ImageFormat::Jpeg => Some("image/jpeg"),
+        ImageFormat::Gif => Some("image/gif"),
+        ImageFormat::WebP => Some("image/webp"),
+        _ => None,
+    };
+    if let Some(mime) = image::guess_format(&bytes).ok().and_then(mime)
+        && bytes.len() <= max_bytes
+    {
+        return Ok((bytes, mime));
+    }
+    let (mut picture, _) = decode(&bytes)?;
+    drop(bytes);
+    let mut png = Vec::new();
+    picture
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|error| format!("Cannot encode the image: {error}"))?;
+    if png.len() <= max_bytes {
+        return Ok((png, "image/png"));
+    }
+    loop {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85)
+            .encode_image(&picture.to_rgb8())
+            .map_err(|error| format!("Cannot encode the image: {error}"))?;
+        if jpeg.len() <= max_bytes {
+            return Ok((jpeg, "image/jpeg"));
+        }
+        let (width, height) = (picture.width() / 2, picture.height() / 2);
+        if width < 64 || height < 64 {
+            return Err("The image is too large to send, even made smaller".into());
+        }
+        picture = picture.resize(width, height, image::imageops::FilterType::Triangle);
+    }
+}
+
 /// Standard Windows bitmap clipboard formats are not exposed by GPUI's PNG/GIF path.
 #[cfg(windows)]
 pub fn clipboard_bitmap() -> Result<Option<Vec<u8>>, String> {

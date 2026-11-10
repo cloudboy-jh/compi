@@ -12,6 +12,12 @@ const FILE_SEARCH_DELAY: Duration = Duration::from_millis(150);
 const MAX_COMPLETIONS: usize = 50;
 /// The settings the composer row shows as pickers, in order; the rest go under More.
 const PICKED_SETTINGS: [&str; 3] = ["model", "thought_level", "mode"];
+/// The keys that queue the draft for after the running turn.
+const QUEUE_KEY: &str = if cfg!(target_os = "macos") {
+    "Cmd+Enter"
+} else {
+    "Ctrl+Enter"
+};
 /// The composer card's corner radius.
 const CARD_RADIUS: f32 = 10.0;
 /// The harness's mark in the empty draft.
@@ -188,18 +194,106 @@ fn wanted(text: &str, cursor: usize) -> Option<Wanted<'_>> {
     (starts_word && !query.contains(char::is_whitespace)).then_some(Wanted::File { at, query })
 }
 
-/// The commands whose name starts with `query`, ignoring case.
-fn matching_commands<'a>(commands: &'a [ChatCommand], query: &str) -> Vec<&'a ChatCommand> {
-    let query = query.to_lowercase();
-    commands
-        .iter()
-        .filter(|command| {
+/// A `/` command Compi runs itself, whatever the harness; offered unless the harness has
+/// a command of the same name, which then wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CompiCommand {
+    New,
+    Resume,
+    Sessions,
+}
+
+impl CompiCommand {
+    const ALL: [Self; 3] = [Self::New, Self::Resume, Self::Sessions];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Resume => "resume",
+            Self::Sessions => "sessions",
+        }
+    }
+
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::New => None,
+            Self::Resume | Self::Sessions => Some("[title or id]"),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::New => "Start a new session",
+            Self::Resume => "Pick an earlier session in this folder to continue",
+            Self::Sessions => "List the sessions in this folder",
+        }
+    }
+
+    /// Whether the harness offers a command of this name.
+    fn shadowed(self, harness: &[ChatCommand]) -> bool {
+        harness.iter().any(|command| {
             command
                 .name
                 .trim_start_matches('/')
-                .to_lowercase()
-                .starts_with(&query)
+                .eq_ignore_ascii_case(self.name())
         })
+    }
+}
+
+/// Compi's command `text` runs, with what follows its name; `None` when `text` is not
+/// one, or the harness has a command of that name.
+pub(super) fn compi_command<'a>(
+    text: &'a str,
+    harness: &[ChatCommand],
+) -> Option<(CompiCommand, &'a str)> {
+    let rest = text.strip_prefix('/')?;
+    let (name, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let command = CompiCommand::ALL
+        .into_iter()
+        .find(|command| command.name().eq_ignore_ascii_case(name))?;
+    (!command.shadowed(harness)).then_some((command, argument.trim()))
+}
+
+/// A row of the `/` list: Compi's command or the harness's.
+#[derive(Clone, Copy)]
+enum ListedCommand<'a> {
+    Compi(CompiCommand),
+    Harness(&'a ChatCommand),
+}
+
+impl<'a> ListedCommand<'a> {
+    fn name(self) -> &'a str {
+        match self {
+            Self::Compi(command) => command.name(),
+            Self::Harness(command) => command.name.trim_start_matches('/'),
+        }
+    }
+
+    fn hint(self) -> Option<&'a str> {
+        match self {
+            Self::Compi(command) => command.hint(),
+            Self::Harness(command) => command.hint.as_deref(),
+        }
+    }
+
+    fn description(self) -> &'a str {
+        match self {
+            Self::Compi(command) => command.description(),
+            Self::Harness(command) => &command.description,
+        }
+    }
+}
+
+/// The commands whose name starts with `query`, ignoring case: Compi's first, then the
+/// harness's.
+fn matching_commands<'a>(harness: &'a [ChatCommand], query: &str) -> Vec<ListedCommand<'a>> {
+    let query = query.to_lowercase();
+    CompiCommand::ALL
+        .into_iter()
+        .filter(|command| !command.shadowed(harness))
+        .map(ListedCommand::Compi)
+        .chain(harness.iter().map(ListedCommand::Harness))
+        .filter(|command| command.name().to_lowercase().starts_with(&query))
         .take(MAX_COMPLETIONS)
         .collect()
 }
@@ -241,9 +335,13 @@ fn cost_label(cost: f64, currency: Option<&str>) -> String {
 impl Completion {
     fn count(&self, state: Option<&ChatState>) -> usize {
         match &self.kind {
-            CompletionKind::Commands { query } => {
-                state.map_or(0, |state| matching_commands(&state.commands, query).len())
-            }
+            CompletionKind::Commands { query } => matching_commands(
+                state
+                    .map(|state| state.commands.as_slice())
+                    .unwrap_or_default(),
+                query,
+            )
+            .len(),
             CompletionKind::Files {
                 found: Found::Listed(files),
                 ..
@@ -465,15 +563,18 @@ impl CompiApp {
         };
         let (text, caret) = match &completion.kind {
             CompletionKind::Commands { query } => {
-                let Some(command) = model.state.as_ref().and_then(|state| {
-                    matching_commands(&state.commands, query)
-                        .get(completion.highlight)
-                        .copied()
-                }) else {
+                let harness = model
+                    .state
+                    .as_ref()
+                    .map(|state| state.commands.as_slice())
+                    .unwrap_or_default();
+                let Some(command) = matching_commands(harness, query)
+                    .get(completion.highlight)
+                    .copied()
+                else {
                     return false;
                 };
-                let name = command.name.trim_start_matches('/');
-                let head = format!("/{name} ");
+                let head = format!("/{} ", command.name());
                 let caret = head.len();
                 (head + rest.trim_start(), caret)
             }
@@ -658,6 +759,7 @@ impl CompiApp {
             app: cx.entity().downgrade(),
             chat: chat.id.as_str().into(),
             colors,
+            body_size: self.chat_body_size(),
             mono: self.typography.font.family.clone(),
             permission: None,
             retry: false,
@@ -730,8 +832,84 @@ impl CompiApp {
                         )),
                 )
             })
+            .when_some(
+                state.filter(|state| !state.queued.is_empty()),
+                |footer, state| footer.child(self.render_chat_queue(chat, state, cx)),
+            )
             .child(self.render_chat_card(chat, model, &frame, cx))
             .child(self.render_chat_context(chat, model))
+            .into_any_element()
+    }
+
+    /// Prompts waiting for the running turn, oldest first, each with × to drop it. A
+    /// queue left after a stopped turn waits for the next prompt.
+    fn render_chat_queue(
+        &self,
+        chat: &ChatContent,
+        state: &ChatState,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let held = matches!(state.status, ChatStatus::Ready);
+        let rows = state.queued.iter().enumerate().map(|(index, queued)| {
+            let (id, queued_id) = (chat.id.clone(), queued.id);
+            let attached = queued.files.len() + queued.images.len();
+            let text = queued.text.lines().find(|line| !line.trim().is_empty());
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl_2()
+                .rounded(ui_rems(6.0))
+                .bg(color(colors.surface))
+                .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                        .text_color(muted)
+                        .child("Queued"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(text.unwrap_or_default().trim().to_owned()),
+                )
+                .when(attached > 0, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(format!("+{attached} attached")),
+                    )
+                })
+                .child(
+                    icon_button(("chat-queued", index), IconName::Close, "Remove from queue")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.remove_queued_chat(&id, queued_id, window, cx);
+                            cx.notify();
+                        })),
+                )
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(held, |queue| {
+                queue.child(
+                    div()
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                        .text_color(muted)
+                        .child("Stopped: these go after your next message"),
+                )
+            })
+            .children(rows)
             .into_any_element()
     }
 
@@ -853,6 +1031,7 @@ impl CompiApp {
         let colors = frame.colors;
         let muted = color(modal_text_color(colors.muted, &colors));
         let empty = model.composer.read(cx).value().is_empty();
+        let working = model.state.as_ref().is_some_and(ChatState::working);
         let composer = model.composer.clone();
         let remove = |index: usize, image: bool| {
             let id = chat.id.clone();
@@ -928,7 +1107,11 @@ impl CompiApp {
                     .pt_1()
                     // The field pads its text 10 px across and 8 px down; the hint sits
                     // where typing starts, 12 px in from the card and 12 px down.
-                    .child(Textarea::new(&model.composer).appearance(false))
+                    .child(
+                        Textarea::new(&model.composer)
+                            .appearance(false)
+                            .font_weight(FontWeight::NORMAL),
+                    )
                     .when(empty, |draft| {
                         draft.child(
                             div()
@@ -944,10 +1127,17 @@ impl CompiApp {
                                         .flex_none()
                                         .size(ui_rems(MARK_SIZE)),
                                 )
-                                .child(format!(
-                                    "Ask {} anything  ·  / commands  ·  @ files",
-                                    chat.harness.name()
-                                )),
+                                .child(if working {
+                                    format!(
+                                        "Enter steers {}  ·  {QUEUE_KEY} queues for after",
+                                        chat.harness.name()
+                                    )
+                                } else {
+                                    format!(
+                                        "Ask {} anything  ·  / commands  ·  @ files",
+                                        chat.harness.name()
+                                    )
+                                }),
                         )
                     }),
             )
@@ -1056,10 +1246,14 @@ impl CompiApp {
         };
         let rows: Vec<AnyElement> = match &completion.kind {
             CompletionKind::Commands { query } => {
-                let commands = model
-                    .state
-                    .as_ref()
-                    .map_or_else(Vec::new, |state| matching_commands(&state.commands, query));
+                let commands = matching_commands(
+                    model
+                        .state
+                        .as_ref()
+                        .map(|state| state.commands.as_slice())
+                        .unwrap_or_default(),
+                    query,
+                );
                 if commands.is_empty() {
                     vec![note(format!("No command starts with /{query}"))]
                 } else {
@@ -1067,7 +1261,7 @@ impl CompiApp {
                         .into_iter()
                         .enumerate()
                         .map(|(index, command)| {
-                            let name = command.name.trim_start_matches('/');
+                            let name = command.name();
                             let line = || {
                                 div()
                                     .min_w_0()
@@ -1095,19 +1289,30 @@ impl CompiApp {
                                             .flex()
                                             .gap_2()
                                             .child(div().flex_none().child(format!("/{name}")))
-                                            .when_some(command.hint.clone(), |row, hint| {
-                                                row.child(line().opacity(0.7).child(hint))
+                                            .when_some(command.hint(), |row, hint| {
+                                                row.child(
+                                                    line().opacity(0.7).child(hint.to_owned()),
+                                                )
                                             }),
                                     )
-                                    .when(!command.description.is_empty(), |column| {
+                                    .when(!command.description().is_empty(), |column| {
                                         column.child(
                                             line()
                                                 .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                                                 .opacity(0.7)
-                                                .child(command.description.clone()),
+                                                .child(command.description().to_owned()),
                                         )
                                     }),
                             )
+                            .when(matches!(command, ListedCommand::Compi(_)), |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                                        .opacity(0.7)
+                                        .child("Compi"),
+                                )
+                            })
                             .on_click(pick(index))
                             .into_any_element()
                         })
@@ -1223,9 +1428,9 @@ impl CompiApp {
                 .header()
                 .key("enter")
                 .loading(model.requests > 0)
-                .disabled_because(model.send_refusal())
+                .disabled_because(model.send_refusal(ChatDelivery::Prompt))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.send_chat(&id, window, cx);
+                    this.send_chat(&id, false, window, cx);
                     cx.notify();
                 }))
         };
@@ -1298,6 +1503,96 @@ impl CompiApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Ctrl+V (Cmd+V) in the focused chat's composer: an image on the clipboard (a
+    /// screenshot, say) is attached, made a PNG or JPEG small enough to send; whether
+    /// there was one. Text is left to the field's own paste.
+    pub(super) fn paste_chat_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(chat) = self
+            .focused_pane()
+            .and_then(|pane| self.pane_chat_content(pane))
+            .map(|chat| chat.id.clone())
+        else {
+            return false;
+        };
+        let clipboard = cx.read_from_clipboard();
+        #[cfg(windows)]
+        let has_text = clipboard
+            .as_ref()
+            .and_then(|item| item.text())
+            .is_some_and(|text| !text.is_empty());
+        let pasted = clipboard.and_then(|item| {
+            item.into_entries().find_map(|entry| match entry {
+                gpui::ClipboardEntry::Image(image) => Some(image.bytes),
+                _ => None,
+            })
+        });
+        // Windows screenshots often come only as a bitmap, which GPUI does not read; text
+        // copied with a picture of itself (from Office, say) pastes as text.
+        #[cfg(windows)]
+        let pasted = match pasted {
+            Some(bytes) => Some(Ok(bytes)),
+            None if has_text => None,
+            None => crate::image_input::clipboard_bitmap().transpose(),
+        };
+        #[cfg(not(windows))]
+        let pasted = pasted.map(Ok);
+        let Some(pasted) = pasted else {
+            return false;
+        };
+        let Some(model) = self.chat.chats.get_mut(&chat) else {
+            return true;
+        };
+        let bytes = match pasted {
+            Ok(bytes) if model.images.len() < MAX_CHAT_IMAGES => bytes,
+            Ok(_) => {
+                model.error = Some(format!("A prompt carries at most {MAX_CHAT_IMAGES} images"));
+                return true;
+            }
+            Err(error) => {
+                model.error = Some(error);
+                return true;
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_executor()
+                .spawn(async move { crate::image_input::chat_image(bytes, MAX_CHAT_IMAGE_BYTES) })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(model) = this.chat.chats.get_mut(&chat) else {
+                    return;
+                };
+                match image {
+                    Ok((bytes, mime)) if model.images.len() < MAX_CHAT_IMAGES => {
+                        use base64::Engine as _;
+                        let extension = mime.trim_start_matches("image/").replace("jpeg", "jpg");
+                        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        if !model.images.iter().any(|kept| kept.data == data) {
+                            model.images.push(ChatImage {
+                                name: format!(
+                                    "Pasted image {}.{extension}",
+                                    model.images.len() + 1
+                                ),
+                                mime: mime.to_owned(),
+                                data,
+                            });
+                        }
+                        model.error = None;
+                    }
+                    Ok(_) => {
+                        model.error =
+                            Some(format!("A prompt carries at most {MAX_CHAT_IMAGES} images"));
+                    }
+                    Err(error) => model.error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        true
     }
 
     /// A picker of one harness setting: its current choice, opening the choices.
@@ -1670,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn commands_match_by_name_prefix() {
+    fn commands_match_by_name_prefix_compi_first() {
         let command = |name: &str| ChatCommand {
             name: name.into(),
             description: String::new(),
@@ -1679,10 +1974,32 @@ mod tests {
         let commands = [command("review"), command("/plan"), command("Reset")];
         let names: Vec<&str> = matching_commands(&commands, "re")
             .iter()
-            .map(|command| command.name.as_str())
+            .map(|command| command.name())
             .collect();
-        assert_eq!(names, ["review", "Reset"]);
+        assert_eq!(names, ["resume", "review", "Reset"]);
         assert_eq!(matching_commands(&commands, "pl").len(), 1);
+    }
+
+    #[test]
+    fn a_harness_command_replaces_compis_of_the_same_name() {
+        let resume = ChatCommand {
+            name: "Resume".into(),
+            description: String::new(),
+            hint: None,
+        };
+        assert_eq!(
+            compi_command("/resume fix login", &[]),
+            Some((CompiCommand::Resume, "fix login"))
+        );
+        assert_eq!(compi_command("/new", &[]), Some((CompiCommand::New, "")));
+        assert_eq!(compi_command("/newer", &[]), None);
+        assert_eq!(
+            compi_command("/resume", std::slice::from_ref(&resume)),
+            None
+        );
+        let listed = matching_commands(std::slice::from_ref(&resume), "res");
+        assert_eq!(listed.len(), 1);
+        assert!(matches!(listed[0], ListedCommand::Harness(_)));
     }
 
     #[test]

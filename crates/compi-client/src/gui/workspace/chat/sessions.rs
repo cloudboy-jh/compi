@@ -1,6 +1,6 @@
 //! The header's ⋯ menu (New session, Resume…, Restart) and the session list Resume…
-//! opens: the harness's sessions in the chat's folder, newest first, the current one
-//! checked; a click resumes one.
+//! and `/resume` open: the harness's sessions in the chat's folder, newest first, the
+//! current one checked, kept to `/resume`'s words; a click resumes one.
 use super::*;
 
 /// Seconds since the Unix epoch of an RFC 3339 time (`2026-11-08T09:30:00.5Z`,
@@ -56,14 +56,31 @@ fn updated_label(updated: &str, now: i64) -> String {
     }
 }
 
+/// Whether `session` holds every word of `filter` in its title or id, ignoring case.
+fn session_matches(session: &ChatSessionInfo, filter: &str) -> bool {
+    let title = session.title.as_deref().unwrap_or_default().to_lowercase();
+    let id = session.id.to_lowercase();
+    filter
+        .to_lowercase()
+        .split_whitespace()
+        .all(|word| title.contains(word) || id.contains(word))
+}
+
 impl CompiApp {
-    /// Opens the session list and reads the harness's sessions for it.
-    fn list_chat_sessions(&mut self, chat: &str, cx: &mut Context<Self>) {
+    /// Opens the session list, kept to `filter`'s words, and reads the harness's
+    /// sessions for it.
+    pub(super) fn list_chat_sessions(
+        &mut self,
+        chat: &str,
+        filter: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(model) = self.chat.chats.get_mut(chat) else {
             return;
         };
         model.menu = Some(ChatMenu::Sessions);
         model.sessions = Sessions::Reading;
+        model.session_filter = filter;
         let target = self.target.clone();
         let chat = chat.to_owned();
         cx.spawn(async move |this, cx| {
@@ -134,7 +151,7 @@ impl CompiApp {
                     this.resume_chat(chat, None, window, cx);
                 }),
                 item("Resume…", |this, chat, _, cx| {
-                    this.list_chat_sessions(chat, cx)
+                    this.list_chat_sessions(chat, String::new(), cx)
                 }),
                 item("Restart", |this, chat, window, cx| {
                     this.set_chat_menu(chat, ChatMenu::Header, false);
@@ -150,8 +167,8 @@ impl CompiApp {
         .into_any_element()
     }
 
-    /// The harness's sessions in the chat's folder: title (else id), when it last
-    /// changed and its messages; the current one checked.
+    /// The harness's sessions in the chat's folder matching the list's filter: title
+    /// (else id), when it last changed and its messages; the current one checked.
     fn render_chat_sessions(
         &self,
         chat: &ChatContent,
@@ -175,14 +192,23 @@ impl CompiApp {
             .as_ref()
             .and_then(|state| state.session.as_deref());
         let now = i64::try_from(now_ms() / 1000).unwrap_or(i64::MAX);
+        let filter = model.session_filter.trim();
         let rows: Vec<AnyElement> = match &model.sessions {
             Sessions::Reading => vec![note("Reading sessions…".to_owned())],
             Sessions::Failed(error) => vec![note(error.clone())],
             Sessions::Listed(sessions) if sessions.is_empty() => {
                 vec![note("No earlier sessions in this folder".to_owned())]
             }
+            Sessions::Listed(sessions)
+                if !sessions
+                    .iter()
+                    .any(|session| session_matches(session, filter)) =>
+            {
+                vec![note(format!("No session matches “{filter}”"))]
+            }
             Sessions::Listed(sessions) => sessions
                 .iter()
+                .filter(|session| session_matches(session, filter))
                 .enumerate()
                 .map(|(index, session)| {
                     let here = current == Some(session.id.as_str());
@@ -238,7 +264,14 @@ impl CompiApp {
             .max_w(ui_rems(380.0))
             .max_h(ui_rems(360.0))
             .overflow_y_scroll()
-            .child(controls::menu_label_row("Resume a session", cx))
+            .child(controls::menu_label_row(
+                if filter.is_empty() {
+                    "Resume a session".to_owned()
+                } else {
+                    format!("Resume a session matching “{filter}”")
+                },
+                cx,
+            ))
             .children(rows)
             .into_any_element()
     }

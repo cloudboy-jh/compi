@@ -113,8 +113,12 @@ impl ToolRow {
         };
         let added = diffs.iter().map(|block| block.added).sum();
         let removed = diffs.iter().map(|block| block.removed).sum();
-        // A card with edits shows them in place of its input.
+        // A card with edits shows them in place of its input, and in place of its output
+        // unless the edit failed or changed nothing, when the output says why.
         let input = tool.input.as_ref().filter(|_| diffs.is_empty());
+        let output = tool.output.as_ref().filter(|_| {
+            diffs.is_empty() || tool.status == ChatToolStatus::Failed || added + removed == 0
+        });
         Self {
             target: tool_target(tool, folder),
             input: tool_view(
@@ -123,7 +127,7 @@ impl ToolRow {
                 cx,
             ),
             output: tool_view(
-                tool.output.as_ref(),
+                output,
                 before.map(|before| (before.tool.output.as_ref(), before.output.as_ref())),
                 cx,
             ),
@@ -535,6 +539,8 @@ pub(super) struct RowFrame {
     pub(super) app: WeakEntity<CompiApp>,
     pub(super) chat: Arc<str>,
     pub(super) colors: ThemeColors,
+    /// Message text's size at the chat's text size, which headings step up from.
+    pub(super) body_size: Pixels,
     /// The terminal's font, for paths, commands and code.
     pub(super) mono: SharedString,
     pub(super) permission: Option<ChatPermission>,
@@ -609,9 +615,33 @@ fn chat_text(view: &Entity<TextViewState>, tint: u32, frame: &RowFrame) -> AnyEl
     TextView::new(view)
         .selectable(true)
         .code_block_actions(copy_code_button)
+        .style(message_style(frame))
         .text_size(ui_rems(UI_BODY_TEXT_SIZE))
+        // The window's chrome is medium; reading text is regular, so bold and headings
+        // stand out from it.
+        .font_weight(FontWeight::NORMAL)
         .text_color(color(modal_text_color(tint, &frame.colors)))
         .into_any_element()
+}
+
+/// Messages' Markdown: headings a clear step above the body, and code that scales with
+/// the chat's text size like the rest.
+fn message_style(frame: &RowFrame) -> TextViewStyle {
+    TextViewStyle {
+        heading_base_font_size: frame.body_size,
+        ..TextViewStyle::default()
+    }
+    .paragraph_gap(gpui::rems(0.75))
+    .heading_font_size(|level, body| {
+        body * match level {
+            1 => 1.75,
+            2 => 1.45,
+            3 => 1.25,
+            4 => 1.1,
+            _ => 1.0,
+        }
+    })
+    .code_block(StyleRefinement::default().text_size(ui_rems(UI_SMALL_TEXT_SIZE)))
 }
 
 /// The Copy button in a code block's corner; a check for [`COPIED_FOR`] after a copy.
@@ -1015,7 +1045,9 @@ fn tool_text(
     error: bool,
     frame: &RowFrame,
 ) -> AnyElement {
-    let mut code_block = StyleRefinement::default().max_h(ui_rems(TOOL_TEXT_MAX_HEIGHT));
+    let mut code_block = StyleRefinement::default()
+        .max_h(ui_rems(TOOL_TEXT_MAX_HEIGHT))
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE));
     code_block.overflow.y = Some(gpui::Overflow::Scroll);
     div()
         .flex()

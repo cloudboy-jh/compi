@@ -14,6 +14,8 @@ pub const MAX_CHAT_SESSION_BYTES: usize = 256;
 pub const MAX_CHAT_PROMPT_BYTES: usize = 256 * 1024;
 /// Files one prompt may attach.
 pub const MAX_CHAT_ATTACHMENTS: usize = 64;
+/// Prompts one chat holds for after its running turn.
+pub const MAX_CHAT_QUEUED: usize = 32;
 /// Images one prompt may carry, each at most `MAX_CHAT_IMAGE_BYTES` before encoding, so
 /// a prompt stays well inside one control frame.
 pub const MAX_CHAT_IMAGES: usize = 4;
@@ -120,6 +122,9 @@ pub struct ChatState {
     /// A question the harness waits on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<ChatQuestion>,
+    /// Prompts waiting for the running turn to end, sent in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<ChatQueued>,
 }
 
 impl ChatState {
@@ -151,6 +156,7 @@ impl ChatState {
             ChatEvent::Usage { usage } => self.usage = usage,
             ChatEvent::Permission { permission } => self.permission = permission,
             ChatEvent::Question { question } => self.question = question,
+            ChatEvent::Queued { queued } => self.queued = queued,
         }
     }
 
@@ -411,6 +417,33 @@ impl ChatImage {
     }
 }
 
+/// How `SendChat` hands its prompt to the harness.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatDelivery {
+    /// As the next turn; refused while one runs.
+    #[default]
+    Prompt,
+    /// Into the running turn, which takes it at its next step; as the next turn when
+    /// none runs. Queued when the harness cannot steer or the chat is still starting.
+    Steer,
+    /// After the running turn and the prompts queued before it; at once when the chat
+    /// waits for a prompt.
+    Queue,
+}
+
+/// A prompt waiting for the running turn to end: its text, attached files and the names
+/// of its images.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatQueued {
+    pub id: u64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+}
+
 /// A session of the harness in the chat's folder, for resuming.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatSessionInfo {
@@ -469,6 +502,10 @@ pub enum ChatEvent {
     },
     Question {
         question: Option<ChatQuestion>,
+    },
+    /// The queued prompts, all of them.
+    Queued {
+        queued: Vec<ChatQueued>,
     },
 }
 

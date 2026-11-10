@@ -855,10 +855,16 @@ fn handle_connection(
                     text,
                     files,
                     images,
+                    delivery,
                 } => answer_chat(
                     &sink,
                     request_id,
-                    crate::chat::hub().send(&chat, text, files, images),
+                    crate::chat::hub().send(&chat, text, files, images, delivery),
+                )?,
+                ClientMessage::RemoveQueuedChat { chat, queued } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().remove_queued(&chat, queued),
                 )?,
                 ClientMessage::CancelChat { chat } => {
                     answer_chat(&sink, request_id, crate::chat::hub().cancel(&chat))?

@@ -75,7 +75,10 @@ use std::fmt;
 // Version 38 adds native agent chat: the Chat content kind (`ChatContent`), `WatchChat`
 // with `ChatWatching`/`ChatChanged`, and `SendChat`, `CancelChat`, `AnswerChatPermission`,
 // `AnswerChatQuestion`, `SetChatOption`, `ListChatSessions`, `ResumeChat` and `RestartChat`.
-pub const PROTOCOL_VERSION: u32 = 38;
+// Version 39 lets a chat prompt steer the running turn or wait for it (`SendChat::delivery`,
+// `ChatDelivery`), keeps the waiting prompts in `ChatState::queued` (`ChatEvent::Queued`)
+// and removes one with `RemoveQueuedChat`.
+pub const PROTOCOL_VERSION: u32 = 39;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -466,8 +469,8 @@ pub enum ClientMessage {
     WatchChat {
         chat: chat::ChatContent,
     },
-    /// Sends `text` as the next prompt of a running chat, with `files` (absolute paths in
-    /// the chat's environment) and `images` attached; refused while a turn runs.
+    /// Sends `text`, with `files` (absolute paths in the chat's environment) and `images`
+    /// attached, as `delivery` says: the next turn, into the running one, or after it.
     SendChat {
         chat: String,
         text: String,
@@ -475,6 +478,13 @@ pub enum ClientMessage {
         files: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<chat::ChatImage>,
+        #[serde(default)]
+        delivery: chat::ChatDelivery,
+    },
+    /// Drops the queued prompt `queued` (`ChatQueued::id`) before it is sent.
+    RemoveQueuedChat {
+        chat: String,
+        queued: u64,
     },
     /// Stops the chat's running turn.
     CancelChat {
