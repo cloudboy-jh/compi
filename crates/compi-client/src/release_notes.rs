@@ -1,4 +1,5 @@
-//! The running version's embedded release notes and their per-version seen state.
+//! The running version's embedded release notes, their per-version seen state, the
+//! update card's Later choice, and the inline Markdown of a notes line.
 //!
 //! The seen state is global to the process: every window reads it at render time,
 //! and a window that changes it must notify the others.
@@ -7,6 +8,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -112,12 +114,52 @@ pub fn of_release(manifest: &compi_update::ReleaseManifest) -> ReleaseNotes {
     })
 }
 
+/// A notes line as plain text and its code spans: `code` loses its backticks, **bold**
+/// its asterisks, and [a link](url) its target.
+pub fn inline(line: &str) -> (String, Vec<Range<usize>>) {
+    let mut text = String::with_capacity(line.len());
+    let mut code = Vec::new();
+    let mut rest = line;
+    while let Some(next) = rest.chars().next() {
+        if next == '`'
+            && let Some(end) = rest[1..].find('`')
+        {
+            let start = text.len();
+            text.push_str(&rest[1..=end]);
+            if text.len() > start {
+                code.push(start..text.len());
+            }
+            rest = &rest[end + 2..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("**") {
+            rest = after;
+            continue;
+        }
+        if next == '['
+            && let Some(close) = rest.find("](")
+            && !rest[1..close].contains(['[', ']'])
+            && let Some(end) = rest[close + 2..].find(')')
+        {
+            text.push_str(&rest[1..close]);
+            rest = &rest[close + 2 + end + 1..];
+            continue;
+        }
+        text.push(next);
+        rest = &rest[next.len_utf8()..];
+    }
+    (text, code)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seen {
     #[serde(default)]
     pub dot_cleared: Option<String>,
     #[serde(default)]
     pub dismissed: Option<String>,
+    /// The update the sidebar card's Later was chosen for.
+    #[serde(default)]
+    pub update_later: Option<String>,
 }
 
 impl Seen {
@@ -125,6 +167,7 @@ impl Seen {
         Self {
             dot_cleared: Some(version.to_owned()),
             dismissed: Some(version.to_owned()),
+            update_later: None,
         }
     }
 
@@ -151,6 +194,12 @@ pub fn dismiss(version: &str) -> bool {
     update(|seen| seen.dismissed = Some(version.to_owned()))
 }
 
+/// Hides the update card and dot for `version`. Returns whether the state changed;
+/// windows must be notified when it did.
+pub fn update_later(version: &str) -> bool {
+    update(|seen| seen.update_later = Some(version.to_owned()))
+}
+
 fn update(change: impl FnOnce(&mut Seen)) -> bool {
     let mut seen = SEEN.lock();
     let before = seen.clone();
@@ -167,12 +216,13 @@ fn update(change: impl FnOnce(&mut Seen)) -> bool {
 }
 
 fn load() -> Seen {
-    let Some(notes) = current() else {
+    let Ok(data) = compi_protocol::paths::data_dir() else {
         return Seen::default();
     };
-    match compi_protocol::paths::data_dir() {
-        Ok(data) => load_in(&data, &notes.version),
-        Err(_) => Seen::default(),
+    match current() {
+        Some(notes) => load_in(&data, &notes.version),
+        // Without notes there is nothing to record, but Later still holds.
+        None => read(&data.join(STATE_FILE)).unwrap_or_default(),
     }
 }
 
@@ -270,6 +320,20 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const NOTES: &str = "# 0.1.4\n\n- Floating terminals\n- Arrange panes\n\n## New\n\n- **Floating terminals:** float any pane.\n- Plain bullet\n\n## Limitations\n\n- Bash and **Zsh** only.\n";
+
+    #[test]
+    fn inline_code_and_links_lose_their_markup() {
+        let (text, code) = inline("Earlier chats open again from Resume… and `/resume`");
+        assert_eq!(text, "Earlier chats open again from Resume… and /resume");
+        assert_eq!(&text[code[0].clone()], "/resume");
+        let (text, code) = inline(
+            "**Windows:** run [Compi 0.7.3 Setup](https://example.test/a) once; `` and [x] stay",
+        );
+        assert_eq!(text, "Windows: run Compi 0.7.3 Setup once;  and [x] stay");
+        assert!(code.is_empty());
+        // An unclosed backtick is text.
+        assert_eq!(inline("a ` b").0, "a ` b");
+    }
 
     struct Directory(PathBuf);
     impl Directory {

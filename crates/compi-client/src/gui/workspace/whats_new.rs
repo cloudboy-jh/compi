@@ -1,7 +1,9 @@
 //! What's new for the running version: the title-bar dot, the sidebar card, and the
-//! notes view shared with Settings → Updates. Seen state is process-global.
+//! notes view shared with Settings → Updates and the update card. Seen state is
+//! process-global.
 use super::*;
 use crate::release_notes::{self, ReleaseNotes};
+use gpui::{HighlightStyle, StyledText};
 
 /// Keeps a long expanded card from pushing the sidebar footer off-screen.
 const CARD_MAX_HEIGHT: f32 = 320.0;
@@ -16,7 +18,7 @@ impl CompiApp {
         if let Some(notes) = release_notes::current()
             && release_notes::clear_dot(&notes.version)
         {
-            self.broadcast_whats_new(window, cx);
+            self.broadcast_seen(window, cx);
         }
     }
 
@@ -24,12 +26,12 @@ impl CompiApp {
         if let Some(notes) = release_notes::current()
             && release_notes::dismiss(&notes.version)
         {
-            self.broadcast_whats_new(window, cx);
+            self.broadcast_seen(window, cx);
         }
     }
 
     /// Every window renders from the shared seen state; repaint them all.
-    fn broadcast_whats_new(&self, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn broadcast_seen(&self, window: &Window, cx: &mut Context<Self>) {
         let current = Window::window_handle(window).window_id();
         for handle in cx.windows() {
             if handle.window_id() == current {
@@ -88,54 +90,91 @@ impl CompiApp {
                 this.dismiss_whats_new(window, cx);
                 cx.stop_propagation();
             }))
-            .child("×");
-        Some(
-            div()
-                .mx_2()
-                .mb_2()
-                .max_h(px(CARD_MAX_HEIGHT))
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .rounded_md()
-                .border_1()
-                .border_color(color(colors.border))
-                .bg(color(blend_rgb(colors.surface, colors.foreground, 0.04)))
-                .child(
-                    div()
-                        .flex_none()
-                        .pl_3()
-                        .pr_1()
-                        .pt_1()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .text_size(px(UI_SMALL_TEXT_SIZE))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(format!("What's new · {}", notes.version)),
-                        )
-                        .child(close),
+            .child("×")
+            .into_any_element();
+        Some(self.sidebar_card(
+            "whats-new-body",
+            format!("What's new · {}", notes.version),
+            Some(close),
+            self.render_release_notes_view(notes, expanded, more, link),
+        ))
+    }
+
+    /// A card at the foot of the sidebar: `title` with an optional `trailing` control,
+    /// then `body`, which scrolls when the card reaches its height limit.
+    pub(super) fn sidebar_card(
+        &self,
+        id: &'static str,
+        title: String,
+        trailing: Option<AnyElement>,
+        body: AnyElement,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        div()
+            .mx_2()
+            .mb_2()
+            .max_h(px(CARD_MAX_HEIGHT))
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(color(colors.border))
+            .bg(color(blend_rgb(colors.surface, colors.foreground, 0.04)))
+            .child(
+                div()
+                    .flex_none()
+                    .pl_3()
+                    .pr_1()
+                    .pt_1()
+                    .min_h(px(25.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(title),
+                    )
+                    .children(trailing),
+            )
+            .child(
+                div()
+                    .id(id)
+                    .flex_shrink(1.0)
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_3()
+                    .pb_2()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// A notes line with its inline Markdown: code spans in the terminal font on a tint.
+    pub(super) fn notes_text(&self, line: &str) -> StyledText {
+        let colors = *self.colors();
+        let (text, code) = release_notes::inline(line);
+        let family = self.typography.font.family.clone();
+        let tint = color(blend_rgb(colors.surface, colors.foreground, 0.1));
+        StyledText::new(text)
+            .with_highlights(code.iter().map(|range| {
+                (
+                    range.clone(),
+                    HighlightStyle {
+                        background_color: Some(tint),
+                        ..HighlightStyle::default()
+                    },
                 )
-                .child(
-                    div()
-                        .id("whats-new-body")
-                        .flex_shrink(1.0)
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .px_3()
-                        .pb_2()
-                        .child(self.render_release_notes_view(notes, expanded, more, link)),
-                )
-                .into_any_element(),
-        )
+            }))
+            .with_font_family_overrides(code.into_iter().map(|range| (range, family.clone())))
     }
 
     fn whats_new_button(
@@ -175,7 +214,7 @@ impl CompiApp {
                 .flex()
                 .gap_2()
                 .child(div().flex_none().child("•"))
-                .child(div().flex_1().min_w_0().child(text.to_owned()))
+                .child(div().flex_1().min_w_0().child(self.notes_text(text)))
         };
         div()
             .min_w_0()

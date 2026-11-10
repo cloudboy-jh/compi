@@ -22,6 +22,10 @@ use std::{
 pub const SETUP_DOWNLOAD_URL: &str =
     "https://github.com/cloudboy-jh/compi/releases/latest/download/Compi-Setup.exe";
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
+/// Wait after a successful check before the next automatic one.
+const CHECK_INTERVAL: u64 = 6 * 3_600;
+/// Wait after a failed check before the next automatic one.
+const RETRY_INTERVAL: u64 = 3_600;
 
 #[derive(Clone, Debug)]
 pub struct DaemonUpdateStatus {
@@ -45,6 +49,8 @@ pub enum Operation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
     pub operation: Operation,
+    /// The release a failed download or install was for; `None` for a check or repair.
+    pub version: Option<String>,
     /// Short and plain; the full detail is in the update log.
     pub message: String,
 }
@@ -79,8 +85,6 @@ pub struct UpdateSnapshot {
     pub daemons: Vec<DaemonUpdateStatus>,
     pub host_process_ids: Vec<u32>,
     pub recovery_available: bool,
-    /// Version whose sidebar dot the user has already seen.
-    dot_seen: Option<String>,
     /// The service has read the staged update and last outcome from disk.
     restored: bool,
 }
@@ -99,24 +103,31 @@ pub enum UpdateButton {
 }
 
 impl UpdateButton {
-    pub const fn label(self) -> &'static str {
+    /// `ending` is the number of shells `RestartEndShells` ends.
+    pub fn label(self, ending: usize) -> String {
         match self {
-            Self::CheckNow => "Check now",
-            Self::Download => "Download",
-            Self::Cancel => "Cancel",
-            Self::Restart => "Restart to update",
-            Self::RestartEndShells => "Restart and end shells",
-            Self::TryAgain => "Try again",
-            Self::DownloadSetup => "Download Setup",
+            Self::CheckNow => "Check now".into(),
+            Self::Download => "Download".into(),
+            Self::Cancel => "Cancel".into(),
+            Self::Restart => "Restart to update".into(),
+            Self::RestartEndShells => format!("Restart and end {}", shell_count(ending)),
+            Self::TryAgain => "Try again".into(),
+            Self::DownloadSetup => "Download Setup".into(),
         }
     }
 }
 
-/// What Settings → Updates shows: one status line and at most one action.
+/// What Settings → Updates shows: the state, facts under it, and at most one action.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpdateView {
     pub status: String,
+    /// When Compi last checked and, before a download, the download's size.
+    pub facts: Option<String>,
+    /// What installing the offered release ends or restarts, said before the restart.
+    pub consequence: Option<String>,
     pub button: Option<UpdateButton>,
+    /// Shells the restart ends, counted in the `RestartEndShells` label.
+    pub ending: usize,
     /// Download fraction, only while bytes are arriving.
     pub progress: Option<f32>,
     pub failed: bool,
@@ -126,23 +137,78 @@ impl UpdateView {
     fn new(status: impl Into<String>, button: Option<UpdateButton>) -> Self {
         Self {
             status: status.into(),
+            facts: None,
+            consequence: None,
             button,
+            ending: 0,
             progress: None,
             failed: false,
         }
     }
+
+    pub fn button_label(&self) -> Option<String> {
+        self.button.map(|button| button.label(self.ending))
+    }
+}
+
+/// What the sidebar card offers besides Later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardAction {
+    Update(UpdateButton),
+    /// Opens Settings → Updates.
+    Details,
+}
+
+/// The sidebar card: the offered release and its next step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateCard {
+    pub version: String,
+    pub title: String,
+    /// The notes' first summary line, the shells a restart ends, progress or the failure.
+    pub line: Option<String>,
+    pub progress: Option<f32>,
+    /// The primary action first.
+    pub actions: Vec<CardAction>,
+    /// Shells the restart ends, counted in the `RestartEndShells` label.
+    pub ending: usize,
+    pub failed: bool,
+    /// Later is offered: it hides the card and the dot for `version`.
+    pub later: bool,
+}
+
+/// Whether a daemon reporting `status` must restart for the release `manifest`.
+fn daemon_restart_needed(
+    manifest: &compi_update::ReleaseManifest,
+    status: &LifecycleStatus,
+) -> bool {
+    manifest.daemon_protocol != status.protocol_version
+        || !manifest
+            .qualified_daemon_versions
+            .iter()
+            .any(|version| version == &status.product_version)
+}
+
+/// Whether dotted numeric version `candidate` is above `than`; false when either isn't.
+fn newer(candidate: &str, than: &str) -> bool {
+    let parse = |version: &str| {
+        version
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+    };
+    matches!((parse(candidate), parse(than)), (Some(a), Some(b)) if a > b)
+}
+
+fn shell_count(count: usize) -> String {
+    format!("{count} {}", if count == 1 { "shell" } else { "shells" })
 }
 
 impl UpdateSnapshot {
     pub fn requires_daemon_restart(&self, status: &LifecycleStatus) -> bool {
-        self.release.as_ref().is_some_and(|release| {
-            release.manifest.daemon_protocol != status.protocol_version
-                || !release
-                    .manifest
-                    .qualified_daemon_versions
-                    .iter()
-                    .any(|version| version == &status.product_version)
-        })
+        self.release
+            .as_ref()
+            .is_some_and(|release| daemon_restart_needed(&release.manifest, status))
     }
     // Used by desktop activation only; Linux has no in-app update activation.
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -185,10 +251,42 @@ impl UpdateSnapshot {
     }
 
     pub fn ready_version(&self) -> Option<&str> {
-        if self.installing || self.failure.is_some() {
+        if self.installing || self.kept_failure().is_some() {
             return None;
         }
         self.ready().map(|prepared| prepared.version.as_str())
+    }
+
+    /// The version on offer: staged and current, else the newest found.
+    fn offered_version(&self) -> Option<&str> {
+        self.ready()
+            .map(|prepared| prepared.version.as_str())
+            .or_else(|| {
+                self.available_release
+                    .as_ref()
+                    .map(|release| release.manifest.version.as_str())
+            })
+    }
+
+    /// The failure still shown: a newer offer replaces a failure for an older version,
+    /// and any offer replaces a failed check.
+    pub fn kept_failure(&self) -> Option<&Failure> {
+        let failure = self.failure.as_ref()?;
+        match (failure.version.as_deref(), self.offered_version()) {
+            (Some(failed), Some(offered)) if newer(offered, failed) => None,
+            (None, Some(_)) if failure.operation == Operation::Check => None,
+            _ => Some(failure),
+        }
+    }
+
+    /// The release `operation` works on, recorded with its failure.
+    fn operation_version(&self, operation: Operation) -> Option<String> {
+        let release = match operation {
+            Operation::Download => self.available_release.as_ref().or(self.release.as_ref()),
+            Operation::Install | Operation::Reinstall => self.release.as_ref(),
+            Operation::Check | Operation::Repair => None,
+        };
+        release.map(|release| release.manifest.version.clone())
     }
 
     /// The release whose notes the page offers: staged, else newest available.
@@ -223,6 +321,39 @@ impl UpdateSnapshot {
                     .iter()
                     .map(move |surface| (target, &surface.surface_id))
             })
+    }
+
+    /// What installing the candidate ends or restarts, from the last look at the local
+    /// daemons; `None` before one, or when nothing restarts.
+    fn consequence(&self) -> Option<String> {
+        let candidate = self.candidate()?;
+        let mut restarts = false;
+        let mut shells = 0;
+        for status in self
+            .daemons
+            .iter()
+            .filter(|daemon| daemon.managed)
+            .filter_map(|daemon| daemon.status.as_ref().ok())
+            .filter(|status| daemon_restart_needed(&candidate.manifest, status))
+        {
+            restarts = true;
+            shells += status.live_surfaces.len();
+        }
+        match shells {
+            0 if restarts => Some("Updating restarts Compi's background service".into()),
+            0 => None,
+            count => Some(format!("Updating ends {}", shell_count(count))),
+        }
+    }
+
+    fn shell_names(
+        shells: &[SurfaceId],
+        name: impl Fn(&SurfaceId) -> Option<String>,
+    ) -> Vec<String> {
+        shells
+            .iter()
+            .map(|shell| name(shell).unwrap_or_else(|| "Terminal".into()))
+            .collect()
     }
 
     /// `name` resolves a shell to its pane or tab label when this window knows it.
@@ -264,8 +395,13 @@ impl UpdateSnapshot {
             }
             None => {}
         }
-        if let Some(failure) = &self.failure {
+        let checked = self
+            .preferences
+            .last_check_unix
+            .map(|last| format!("Checked {}", time_since(last, now)));
+        if let Some(failure) = self.kept_failure() {
             return UpdateView {
+                facts: checked,
                 failed: true,
                 ..UpdateView::new(failure.message.clone(), Some(UpdateButton::TryAgain))
             };
@@ -276,34 +412,154 @@ impl UpdateSnapshot {
             }
             let shells = self.ending_shells();
             if shells.is_empty() {
-                return UpdateView::new(
-                    format!("{} is ready", prepared.version),
-                    Some(UpdateButton::Restart),
-                );
+                return UpdateView {
+                    facts: checked,
+                    consequence: self.consequence(),
+                    ..UpdateView::new(
+                        format!("Compi {} is ready", prepared.version),
+                        Some(UpdateButton::Restart),
+                    )
+                };
             }
-            let names: Vec<String> = shells
-                .iter()
-                .map(|shell| name(shell).unwrap_or_else(|| "Terminal".into()))
-                .collect();
-            return UpdateView::new(
-                ending_shells_status(&names),
-                Some(UpdateButton::RestartEndShells),
-            );
+            return UpdateView {
+                facts: checked,
+                ending: shells.len(),
+                ..UpdateView::new(
+                    ending_shells_status(&Self::shell_names(&shells, name)),
+                    Some(UpdateButton::RestartEndShells),
+                )
+            };
         }
         if let Some(release) = &self.available_release {
-            return UpdateView::new(
-                format!(
-                    "{} available · {}",
-                    release.manifest.version,
-                    format_size(release.manifest.artifact.size)
-                ),
-                Some(UpdateButton::Download),
-            );
+            let size = format_size(release.manifest.artifact.size);
+            return UpdateView {
+                facts: Some(match checked {
+                    Some(checked) => format!("{checked} · {size}"),
+                    None => size,
+                }),
+                consequence: self.consequence(),
+                ..UpdateView::new(
+                    format!("Compi {} is available", release.manifest.version),
+                    Some(UpdateButton::Download),
+                )
+            };
         }
-        UpdateView::new(
-            checked_status(self.preferences.last_check_unix, now),
-            Some(UpdateButton::CheckNow),
-        )
+        UpdateView {
+            facts: checked,
+            ..UpdateView::new(
+                if self.preferences.last_check_unix.is_some() {
+                    "Up to date"
+                } else {
+                    "Not checked yet"
+                },
+                Some(UpdateButton::CheckNow),
+            )
+        }
+    }
+
+    /// The sidebar card, unless Later was chosen for its version. Failed checks and
+    /// repairs stay on the Updates page.
+    pub fn card(
+        &self,
+        now: u64,
+        later: Option<&str>,
+        name: impl Fn(&SurfaceId) -> Option<String>,
+    ) -> Option<UpdateCard> {
+        if self.installing || self.running == Some(Operation::Install) {
+            return None;
+        }
+        let summary = |release: &AvailableRelease| {
+            crate::release_notes::of_release(&release.manifest)
+                .summary
+                .into_iter()
+                .next()
+        };
+        let card = |version: &str, title: String, line, actions| UpdateCard {
+            version: version.to_owned(),
+            title,
+            line,
+            progress: None,
+            actions,
+            ending: 0,
+            failed: false,
+            later: true,
+        };
+        let card = if let Some(failure) = self.kept_failure() {
+            let version = failure.version.as_deref()?;
+            UpdateCard {
+                failed: true,
+                ..card(
+                    version,
+                    format!("Compi {version}"),
+                    Some(failure.message.clone()),
+                    vec![
+                        CardAction::Update(UpdateButton::TryAgain),
+                        CardAction::Details,
+                    ],
+                )
+            }
+        } else if let Some(operation @ (Operation::Download | Operation::Reinstall)) = self.running
+        {
+            let version = self.operation_version(operation)?;
+            let view = self.view(now, &name);
+            UpdateCard {
+                progress: view.progress,
+                later: false,
+                ..card(
+                    &version,
+                    format!("Compi {version}"),
+                    Some(view.status),
+                    vec![CardAction::Update(UpdateButton::Cancel)],
+                )
+            }
+        } else if let Some(prepared) = self.ready() {
+            let title = format!("Compi {} is ready", prepared.version);
+            let shells = self.ending_shells();
+            if let Some(blocker) = self.install_blocker() {
+                card(
+                    &prepared.version,
+                    title,
+                    Some(blocker.into()),
+                    vec![CardAction::Details],
+                )
+            } else if shells.is_empty() {
+                card(
+                    &prepared.version,
+                    title,
+                    self.release.as_deref().and_then(summary),
+                    vec![CardAction::Update(UpdateButton::Restart)],
+                )
+            } else {
+                UpdateCard {
+                    ending: shells.len(),
+                    ..card(
+                        &prepared.version,
+                        title,
+                        Some(ending_shells_status(&Self::shell_names(&shells, &name))),
+                        vec![CardAction::Update(UpdateButton::RestartEndShells)],
+                    )
+                }
+            }
+        } else {
+            let release = self.available_release.as_deref()?;
+            let version = &release.manifest.version;
+            card(
+                version,
+                format!("Compi {version} is available"),
+                summary(release),
+                vec![CardAction::Update(UpdateButton::Download)],
+            )
+        };
+        (later != Some(card.version.as_str())).then_some(card)
+    }
+
+    /// The title-bar dot: a release is on offer and Later wasn't chosen for it.
+    pub fn shows_dot(&self, later: Option<&str>) -> bool {
+        !self.installing
+            && self.kept_failure().is_none()
+            && self
+                .offered_version()
+                .is_some_and(|version| later != Some(version))
     }
 }
 
@@ -387,13 +643,6 @@ pub(crate) fn format_transfer(completed: u64, total: u64, joiner: &str) -> Strin
             (completed + 500) / 1_000,
             (total + 500) / 1_000
         )
-    }
-}
-
-fn checked_status(last: Option<u64>, now: u64) -> String {
-    match last {
-        Some(last) => format!("Up to date · checked {}", time_since(last, now)),
-        None => "Not checked yet".into(),
     }
 }
 
@@ -581,9 +830,7 @@ pub fn shared(config: &LoadedConfig, target: &ConnectionTarget) -> Arc<UpdateSer
         service.state.lock().preferences = config.updates.clone();
         // Carries the selected path to the serialized background writer, never writes UI state.
         let _ = service.sender.send(Request::Configure(config.clone()));
-        if config.updates.check_for_updates
-            && daily_check_due(config.updates.last_check_unix, now())
-        {
+        if check_due(&config.updates, now()) {
             service.check();
         }
         let _ = service.sender.send(Request::Review { full: false });
@@ -599,6 +846,7 @@ pub fn for_command() -> Arc<UpdateService> {
         check_for_updates: false,
         download_updates_automatically: false,
         last_check_unix: None,
+        last_check_failed_unix: None,
     };
     service
 }
@@ -691,8 +939,31 @@ fn adopt_staged(state: &Mutex<UpdateSnapshot>, version: &str) -> Result<(), Stri
     Ok(())
 }
 
-pub fn daily_check_due(last: Option<u64>, current: u64) -> bool {
-    last.is_none_or(|last| current >= last.saturating_add(86_400))
+/// An automatic check is due 6 h after the last successful one, or 1 h after a failed
+/// one; never while checks are off. A clock set back waits until it passes them again.
+fn check_due(settings: &UpdateSettings, now: u64) -> bool {
+    if !settings.check_for_updates {
+        return false;
+    }
+    let failed = settings
+        .last_check_failed_unix
+        .filter(|failed| settings.last_check_unix.is_none_or(|last| *failed >= last));
+    match failed {
+        Some(failed) => now >= failed.saturating_add(RETRY_INTERVAL),
+        None => settings
+            .last_check_unix
+            .is_none_or(|last| now >= last.saturating_add(CHECK_INTERVAL)),
+    }
+}
+
+/// Removes what finished updates and Setup runs left behind; logs, never shows.
+fn prune_installation() {
+    let result = InstallTarget::detect()
+        .map_err(|error| error.to_string())
+        .and_then(|target| compi_update::prune(&target).map_err(|error| error.to_string()));
+    if let Err(error) = result {
+        log(&format!("Removing old update files failed: {error}"));
+    }
 }
 
 fn now() -> u64 {
@@ -741,6 +1012,7 @@ impl UpdateService {
                             snapshot.installing = false;
                             snapshot.failure = Some(Failure {
                                 operation: Operation::Install,
+                                version: snapshot.operation_version(Operation::Install),
                                 message: "Couldn't confirm that the update installed and reopened"
                                     .into(),
                             });
@@ -755,6 +1027,7 @@ impl UpdateService {
                             snapshot.installing = false;
                             snapshot.failure = Some(Failure {
                                 operation: Operation::Install,
+                                version: snapshot.operation_version(Operation::Install),
                                 message: "Update installation and reopening weren't confirmed"
                                     .into(),
                             });
@@ -763,7 +1036,19 @@ impl UpdateService {
                     }
                 });
             }
+            // Once per process, when no update step runs or waits.
+            let mut pruned = false;
             loop {
+                if !pruned {
+                    let idle = {
+                        let snapshot = state.lock();
+                        snapshot.running.is_none() && !snapshot.installing
+                    };
+                    if idle {
+                        pruned = true;
+                        prune_installation();
+                    }
+                }
                 let request = match receiver.recv_timeout(Duration::from_secs(60)) {
                     Ok(request) => request,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -771,8 +1056,7 @@ impl UpdateService {
                         let mut snapshot = state.lock();
                         if snapshot.running.is_some()
                             || snapshot.installing
-                            || !snapshot.preferences.check_for_updates
-                            || !daily_check_due(snapshot.preferences.last_check_unix, now())
+                            || !check_due(&snapshot.preferences, now())
                         {
                             continue;
                         }
@@ -819,11 +1103,18 @@ impl UpdateService {
                             });
                             let mut snapshot = state.lock();
                             apply_checked_release(&mut snapshot, release);
-                            if snapshot.preferences.download_updates_automatically
-                                && snapshot.available_release.is_some()
-                                && snapshot.ready().is_none()
-                            {
+                            let offered =
+                                snapshot.available_release.is_some() && snapshot.ready().is_none();
+                            if offered && snapshot.preferences.download_updates_automatically {
                                 follow_up = Some(Request::Download);
+                            }
+                            drop(snapshot);
+                            // The page says what updating ends before anything downloads.
+                            if offered
+                                && follow_up.is_none()
+                                && let Err(error) = review(&state, &targets, false, &cancellation)
+                            {
+                                log(&format!("Reviewing affected work failed: {error}"));
                             }
                         }
                         Request::Download => {
@@ -953,6 +1244,7 @@ impl UpdateService {
                 let mut snapshot = state.lock();
                 snapshot.running = None;
                 snapshot.progress = None;
+                let succeeded = result.is_ok();
                 if let Err(detail) = result {
                     if cancellation.is_cancelled() {
                         log(&format!("{operation:?} cancelled: {detail}"));
@@ -960,16 +1252,29 @@ impl UpdateService {
                         log(&format!("{operation:?} failed: {detail}"));
                         if operation == Operation::Repair {
                             snapshot.repair = Some(RepairOutcome::Unavailable);
-                        } else {
+                        } else if operation != Operation::Check
+                            || snapshot
+                                .failure
+                                .as_ref()
+                                .is_none_or(|failure| failure.version.is_none())
+                        {
+                            // A failed update stays in view over a failed check.
                             snapshot.failure = Some(Failure {
                                 operation,
+                                version: snapshot.operation_version(operation),
                                 message: plain_failure(operation, &detail),
                             });
                         }
                     }
                 }
                 if operation == Operation::Check {
-                    snapshot.preferences.last_check_unix = Some(now());
+                    let checked = Some(now());
+                    if succeeded {
+                        snapshot.preferences.last_check_unix = checked;
+                        snapshot.preferences.last_check_failed_unix = None;
+                    } else {
+                        snapshot.preferences.last_check_failed_unix = checked;
+                    }
                     let preferences = snapshot.preferences.clone();
                     drop(snapshot);
                     if let Some(config) = config.as_mut()
@@ -1002,7 +1307,15 @@ impl UpdateService {
             return false;
         }
         snapshot.running = Some(operation);
-        snapshot.failure = None;
+        // A check keeps a failed update; only a newer release found replaces it.
+        if operation != Operation::Check
+            || snapshot
+                .failure
+                .as_ref()
+                .is_none_or(|failure| failure.version.is_none())
+        {
+            snapshot.failure = None;
+        }
         snapshot.repair = None;
         snapshot.progress = None;
         *self.cancellation.lock() = Cancellation::default();
@@ -1013,6 +1326,7 @@ impl UpdateService {
             snapshot.running = None;
             snapshot.failure = Some(Failure {
                 operation,
+                version: snapshot.operation_version(operation),
                 message: plain_failure(operation, ""),
             });
             return false;
@@ -1049,13 +1363,14 @@ impl UpdateService {
             Operation::Reinstall => Request::Reinstall,
             _ => return Err(format!("{operation:?} does not run from a command")),
         };
-        // A failure restored from the last update must not pass for this operation's.
         while {
             let snapshot = self.state.lock();
             !snapshot.restored || snapshot.running.is_some()
         } {
             thread::sleep(Duration::from_millis(20));
         }
+        // A failure restored from the last update must not pass for this operation's.
+        self.state.lock().failure = None;
         if !self.request(request) {
             return Err(plain_failure(operation, ""));
         }
@@ -1079,7 +1394,7 @@ impl UpdateService {
     /// review instead of restarting without a new click.
     pub fn retry(&self) {
         let mut snapshot = self.state.lock();
-        let Some(failure) = snapshot.failure.clone() else {
+        let Some(failure) = snapshot.kept_failure().cloned() else {
             return;
         };
         match failure.operation {
@@ -1126,61 +1441,70 @@ impl UpdateService {
         self.cancellation.lock().cancel();
     }
 
-    /// Whether a downloaded and verified update awaits a look at Settings → Updates.
-    pub fn shows_dot(&self) -> bool {
-        let snapshot = self.state.lock();
-        snapshot
-            .ready_version()
-            .is_some_and(|version| snapshot.dot_seen.as_deref() != Some(version))
-    }
-
-    /// The user is looking at Settings → Updates.
-    pub fn acknowledge_ready(&self) {
-        let mut snapshot = self.state.lock();
-        if let Some(version) = snapshot.ready_version().map(str::to_owned) {
-            snapshot.dot_seen = Some(version);
-        }
+    /// The title-bar dot; `later` is the version Later was chosen for.
+    pub fn shows_dot(&self, later: Option<&str>) -> bool {
+        self.state.lock().shows_dot(later)
     }
 
     /// Refreshes which shells a restart would end; called when the page opens.
     pub fn refresh_review(&self) {
         let snapshot = self.state.lock();
-        if snapshot.prepared.is_some() && snapshot.running.is_none() && !snapshot.installing {
+        if (snapshot.prepared.is_some() || snapshot.available_release.is_some())
+            && snapshot.running.is_none()
+            && !snapshot.installing
+        {
             drop(snapshot);
             self.request(Request::Review { full: false });
         }
     }
 }
 
+/// Asks the daemons a restart concerns for their state. Before a download only local
+/// daemons are asked, for the consequence the page states; remote hosts keep what an
+/// earlier review found.
 fn review(
     state: &Mutex<UpdateSnapshot>,
     targets: &Mutex<Vec<ConnectionTarget>>,
     full: bool,
     cancellation: &Cancellation,
 ) -> Result<(), String> {
-    let (prepared, mut registered) = {
+    let (prepared, mut registered, remote) = {
         let snapshot = state.lock();
-        let Some(prepared) = snapshot.prepared.clone() else {
+        if snapshot.prepared.is_none() && snapshot.available_release.is_none() {
             return Ok(());
-        };
+        }
+        let remote: Vec<DaemonUpdateStatus> = snapshot
+            .daemons
+            .iter()
+            .filter(|daemon| !daemon.managed)
+            .cloned()
+            .collect();
         let mut registered = targets.lock().clone();
         // A quick refresh keeps remote targets found by an earlier full review.
-        for daemon in snapshot.daemons.iter().filter(|daemon| !daemon.managed) {
+        for daemon in &remote {
             if !registered.contains(&daemon.target) {
                 registered.push(daemon.target.clone());
             }
         }
-        (prepared, registered)
+        (snapshot.prepared.clone(), registered, remote)
     };
-    if full {
-        for target in inspect_host_targets(&prepared, cancellation)? {
+    let root = match &prepared {
+        Some(prepared) => prepared.target.root.clone(),
+        None => {
+            InstallTarget::detect()
+                .map_err(|error| error.to_string())?
+                .root
+        }
+    };
+    if full && let Some(prepared) = &prepared {
+        for target in inspect_host_targets(prepared, cancellation)? {
             if !registered.contains(&target) {
                 registered.push(target);
             }
         }
     }
     let mut daemons = Vec::new();
-    match DaemonClient::local_lifecycle_statuses_for_install(&prepared.target.root) {
+    match DaemonClient::local_lifecycle_statuses_for_install(&root) {
         Ok(statuses) => {
             for status in statuses {
                 daemons.push(DaemonUpdateStatus {
@@ -1198,26 +1522,35 @@ fn review(
             status: Err(error.to_string()),
         }),
     }
-    for target in registered {
-        if daemons.iter().any(|daemon| daemon.target == target) {
-            continue;
+    if prepared.is_some() {
+        for target in registered {
+            if daemons.iter().any(|daemon| daemon.target == target) {
+                continue;
+            }
+            let status = target.lifecycle_status().map_err(|error| error.to_string());
+            daemons.push(DaemonUpdateStatus {
+                target,
+                managed: false,
+                status,
+            });
         }
-        let status = target.lifecycle_status().map_err(|error| error.to_string());
-        daemons.push(DaemonUpdateStatus {
-            target,
-            managed: false,
-            status,
-        });
+    } else {
+        daemons.extend(remote);
     }
     for daemon in &daemons {
         if let Err(error) = &daemon.status {
             log(&format!("Cannot inspect daemon: {error}"));
         }
     }
-    let hosts = affected_host_ids()?;
+    let hosts = match prepared {
+        Some(_) => Some(affected_host_ids()?),
+        None => None,
+    };
     let mut snapshot = state.lock();
     snapshot.daemons = daemons;
-    snapshot.host_process_ids = hosts;
+    if let Some(hosts) = hosts {
+        snapshot.host_process_ids = hosts;
+    }
     Ok(())
 }
 
@@ -1571,14 +1904,17 @@ fn restore_journal_status(snapshot: &mut UpdateSnapshot, journal: &compi_update:
             JournalStage::Activating | JournalStage::Activated | JournalStage::Relaunching
         );
     if journal.error.is_some() || snapshot.recovery_available {
+        let version = Some(journal.manifest.version.clone());
         snapshot.failure = Some(if snapshot.recovery_available {
             Failure {
                 operation: Operation::Reinstall,
+                version,
                 message: "Last update didn't install · Compi was restored".into(),
             }
         } else {
             Failure {
                 operation: Operation::Install,
+                version,
                 message: "Last update didn't finish installing and reopening Compi".into(),
             }
         });
@@ -1589,6 +1925,19 @@ fn restore_journal_status(snapshot: &mut UpdateSnapshot, journal: &compi_update:
 
 fn apply_checked_release(snapshot: &mut UpdateSnapshot, release: Option<AvailableRelease>) {
     let release = release.map(Arc::new);
+    // A successful check retires a failed check, and a newer release a failed update.
+    let retired =
+        snapshot
+            .failure
+            .as_ref()
+            .is_some_and(|failure| match (&failure.version, &release) {
+                (None, _) => failure.operation == Operation::Check,
+                (Some(failed), Some(found)) => newer(&found.manifest.version, failed),
+                (Some(_), None) => false,
+            });
+    if retired {
+        snapshot.failure = None;
+    }
     snapshot.available_release = release.clone();
     // A check never throws away a downloaded candidate; Download replaces it explicitly.
     if snapshot.prepared.is_none() {
@@ -1700,12 +2049,28 @@ pub fn stop_idle_update_daemons(root: &std::path::Path, version: &str) -> Result
 mod tests {
     use super::*;
     #[test]
-    fn daily_check_respects_boundary_and_backward_clock() {
-        assert!(daily_check_due(None, 0));
-        assert!(!daily_check_due(Some(100), 86_499));
-        assert!(daily_check_due(Some(100), 86_500));
-        assert!(!daily_check_due(Some(100), 99));
-        assert!(!daily_check_due(Some(u64::MAX), 100));
+    fn checks_are_due_six_hours_after_success_and_one_hour_after_failure() {
+        assert!(check_due(&UpdateSettings::default(), 0));
+        let mut settings = UpdateSettings {
+            last_check_unix: Some(1_000),
+            ..UpdateSettings::default()
+        };
+        assert!(!check_due(&settings, 1_000 + 5 * 3_600 + 59 * 60));
+        assert!(check_due(&settings, 1_000 + 6 * 3_600));
+        // A clock set back waits.
+        assert!(!check_due(&settings, 999));
+        settings.last_check_failed_unix = Some(50_000);
+        assert!(!check_due(&settings, 50_000 + 59 * 60));
+        assert!(check_due(&settings, 50_000 + 60 * 60));
+        // A failure before the last success no longer counts.
+        settings.last_check_unix = Some(60_000);
+        assert!(!check_due(&settings, 60_000 + 3_600));
+        assert!(check_due(&settings, 60_000 + 6 * 3_600));
+        settings.check_for_updates = false;
+        assert!(!check_due(&settings, 60_000 + 6 * 3_600));
+        settings.last_check_unix = None;
+        settings.last_check_failed_unix = None;
+        assert!(!check_due(&settings, 0));
     }
 
     fn release(version: &str, size: u64) -> Arc<AvailableRelease> {
@@ -1933,21 +2298,37 @@ mod tests {
         snapshot.preferences.last_check_unix = Some(10_000 - 300);
         assert_eq!(
             shown(&snapshot),
-            (
-                "Up to date · checked 5 min ago".into(),
-                Some(UpdateButton::CheckNow)
-            )
+            ("Up to date".into(), Some(UpdateButton::CheckNow))
+        );
+        assert_eq!(
+            snapshot.view(10_000, |_| None).facts.as_deref(),
+            Some("Checked 5 min ago")
         );
         snapshot.running = Some(Operation::Check);
         assert_eq!(shown(&snapshot), ("Checking for updates…".into(), None));
         snapshot.running = None;
         snapshot.available_release = Some(release("0.1.7", 13_200_000));
+        let view = snapshot.view(10_000, |_| None);
         assert_eq!(
-            shown(&snapshot),
+            (view.status.as_str(), view.facts.as_deref(), view.button),
             (
-                "0.1.7 available · 13.2 MB".into(),
+                "Compi 0.1.7 is available",
+                Some("Checked 5 min ago · 13.2 MB"),
                 Some(UpdateButton::Download)
             )
+        );
+        // No daemon seen yet: nothing to say about what updating ends.
+        assert_eq!(view.consequence, None);
+        let mut daemon = daemon();
+        daemon.protocol_version = 15;
+        snapshot.daemons.push(DaemonUpdateStatus {
+            target: ConnectionTarget::Local { instance: None },
+            managed: true,
+            status: Ok(daemon),
+        });
+        assert_eq!(
+            snapshot.view(10_000, |_| None).consequence.as_deref(),
+            Some("Updating restarts Compi's background service")
         );
     }
 
@@ -2002,12 +2383,12 @@ mod tests {
         let mut snapshot = candidate();
         assert_eq!(
             shown(&snapshot),
-            ("0.2.0 is ready".into(), Some(UpdateButton::Restart))
+            ("Compi 0.2.0 is ready".into(), Some(UpdateButton::Restart))
         );
         snapshot.daemons = vec![ending(0)];
         assert_eq!(
             shown(&snapshot),
-            ("0.2.0 is ready".into(), Some(UpdateButton::Restart))
+            ("Compi 0.2.0 is ready".into(), Some(UpdateButton::Restart))
         );
         snapshot.daemons = vec![ending(1)];
         assert_eq!(
@@ -2021,6 +2402,16 @@ mod tests {
         assert_eq!(
             shown(&snapshot).0,
             "Updating ends 3 shells: pwsh, Terminal, vim"
+        );
+        // The card offers the same consent, counted in its label.
+        let card = snapshot.card(0, None, |_| None).unwrap();
+        assert_eq!(
+            card.actions,
+            [CardAction::Update(UpdateButton::RestartEndShells)]
+        );
+        assert_eq!(
+            UpdateButton::RestartEndShells.label(card.ending),
+            "Restart and end 3 shells"
         );
         snapshot.daemons = vec![ending(5)];
         assert_eq!(
@@ -2046,6 +2437,7 @@ mod tests {
         let mut snapshot = candidate();
         snapshot.failure = Some(Failure {
             operation: Operation::Download,
+            version: Some("0.2.0".into()),
             message: plain_failure(
                 Operation::Download,
                 "error sending request for url (https://github.com/...)",
@@ -2094,7 +2486,7 @@ mod tests {
         assert_eq!(
             shown(&snapshot),
             (
-                "0.3.0 available · 13.2 MB".into(),
+                "Compi 0.3.0 is available".into(),
                 Some(UpdateButton::Download)
             )
         );
@@ -2136,7 +2528,6 @@ mod tests {
         assert_eq!(time_since(now - 172_800, now), "on Feb 27");
         assert_eq!(time_since(1_672_531_200, now), "on Jan 1, 2023");
         assert_eq!(civil_date(now), (2024, 2, 29));
-        assert_eq!(checked_status(None, now), "Not checked yet");
     }
 
     #[test]
@@ -2145,11 +2536,85 @@ mod tests {
         assert_eq!(snapshot.ready_version(), Some("0.2.0"));
         snapshot.failure = Some(Failure {
             operation: Operation::Install,
+            version: Some("0.2.0".into()),
             message: String::new(),
         });
         assert_eq!(snapshot.ready_version(), None);
         snapshot.failure = None;
         snapshot.available_release = Some(release("0.3.0", 1));
         assert_eq!(snapshot.ready_version(), None);
+    }
+
+    fn failed(version: &str) -> Failure {
+        Failure {
+            operation: Operation::Reinstall,
+            version: Some(version.into()),
+            message: "Last update didn't install · Compi was restored".into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_update_keeps_try_again_while_its_version_is_offered() {
+        let mut snapshot = UpdateSnapshot {
+            failure: Some(failed("0.7.3")),
+            ..UpdateSnapshot::default()
+        };
+        apply_checked_release(&mut snapshot, Some(release("0.7.3", 1).as_ref().clone()));
+        let view = snapshot.view(0, |_| None);
+        assert!(view.failed);
+        assert_eq!(view.button, Some(UpdateButton::TryAgain));
+        assert!(!snapshot.shows_dot(None));
+        let card = snapshot.card(0, None, |_| None).unwrap();
+        assert_eq!(
+            (card.version.as_str(), card.failed, card.actions[0]),
+            ("0.7.3", true, CardAction::Update(UpdateButton::TryAgain))
+        );
+    }
+
+    #[test]
+    fn a_newer_release_replaces_a_failed_update_for_an_older_one() {
+        let mut snapshot = UpdateSnapshot {
+            failure: Some(failed("0.7.3")),
+            ..UpdateSnapshot::default()
+        };
+        // Found by an earlier check: shown ahead of the failure before any new check.
+        snapshot.available_release = Some(release("0.7.4", 13_200_000));
+        assert_eq!(
+            shown(&snapshot),
+            (
+                "Compi 0.7.4 is available".into(),
+                Some(UpdateButton::Download)
+            )
+        );
+        apply_checked_release(
+            &mut snapshot,
+            Some(release("0.7.4", 13_200_000).as_ref().clone()),
+        );
+        assert_eq!(snapshot.failure, None);
+        assert!(snapshot.shows_dot(None));
+        let card = snapshot.card(0, None, |_| None).unwrap();
+        assert_eq!(
+            (card.title.as_str(), card.actions.as_slice(), card.later),
+            (
+                "Compi 0.7.4 is available",
+                [CardAction::Update(UpdateButton::Download)].as_slice(),
+                true
+            )
+        );
+        // Later hides the card and the dot for this version only.
+        assert!(snapshot.card(0, Some("0.7.4"), |_| None).is_none());
+        assert!(!snapshot.shows_dot(Some("0.7.4")));
+        assert!(snapshot.shows_dot(Some("0.7.3")));
+        // A failed check stays on the Updates page, behind the offer.
+        snapshot.failure = Some(Failure {
+            operation: Operation::Check,
+            version: None,
+            message: plain_failure(Operation::Check, "timed out"),
+        });
+        assert_eq!(shown(&snapshot).1, Some(UpdateButton::Download));
+        snapshot.available_release = None;
+        snapshot.release = None;
+        assert_eq!(shown(&snapshot).1, Some(UpdateButton::TryAgain));
+        assert!(snapshot.card(0, None, |_| None).is_none());
     }
 }

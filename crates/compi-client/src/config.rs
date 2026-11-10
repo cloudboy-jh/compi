@@ -177,11 +177,15 @@ fn default_chat_text_size() -> f32 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdateSettings {
-    /// Checks on launch when a day has passed, then daily while running.
+    /// Checks on launch and while running: 6 h after a successful check, 1 h after a
+    /// failed one.
     pub check_for_updates: bool,
     /// Downloads and verifies an available update after a check; never installs it.
     pub download_updates_automatically: bool,
+    /// The last successful check.
     pub last_check_unix: Option<u64>,
+    /// The last failed check, when it came after the last successful one.
+    pub last_check_failed_unix: Option<u64>,
 }
 
 impl Default for UpdateSettings {
@@ -190,6 +194,7 @@ impl Default for UpdateSettings {
             check_for_updates: true,
             download_updates_automatically: false,
             last_check_unix: None,
+            last_check_failed_unix: None,
         }
     }
 }
@@ -658,12 +663,18 @@ impl LoadedConfig {
                 "download_updates_automatically",
                 updates.download_updates_automatically.into(),
             );
-            if let Some(timestamp) = updates.last_check_unix {
-                set_table_value(
-                    table,
-                    "last_check_unix",
-                    (timestamp.min(i64::MAX as u64) as i64).into(),
-                );
+            for (key, timestamp) in [
+                ("last_check_unix", updates.last_check_unix),
+                ("last_check_failed_unix", updates.last_check_failed_unix),
+            ] {
+                match timestamp {
+                    Some(timestamp) => {
+                        set_table_value(table, key, (timestamp.min(i64::MAX as u64) as i64).into())
+                    }
+                    None => {
+                        table.remove(key);
+                    }
+                }
             }
         })?;
         self.updates = updates;
@@ -1929,16 +1940,26 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                 ),
             }
         }
-        if let Some(value) = updates.get("last_check_unix") {
-            match value.as_integer().filter(|value| *value >= 0) {
-                Some(value) => loaded.updates.last_check_unix = Some(value as u64),
-                None => invalid(
+        let mut timestamp = |key: &str| {
+            let value = updates.get(key)?;
+            let parsed = value.as_integer().filter(|value| *value >= 0);
+            if parsed.is_none() {
+                invalid(
                     loaded,
-                    "updates.last_check_unix",
+                    &format!("updates.{key}"),
                     "a nonnegative Unix timestamp",
                     "configuration",
-                ),
+                );
             }
+            parsed.map(|value| value as u64)
+        };
+        let last_check = timestamp("last_check_unix");
+        let last_failed = timestamp("last_check_failed_unix");
+        if last_check.is_some() {
+            loaded.updates.last_check_unix = last_check;
+        }
+        if last_failed.is_some() {
+            loaded.updates.last_check_failed_unix = last_failed;
         }
     }
     let Some(font) = document.get("font") else {
@@ -3020,6 +3041,7 @@ mod tests {
                         check_for_updates: false,
                         download_updates_automatically: true,
                         last_check_unix: Some(1234),
+                        last_check_failed_unix: Some(5678),
                     })
                     .unwrap();
             });
@@ -3032,6 +3054,7 @@ mod tests {
         assert!(!loaded.updates.check_for_updates);
         assert!(loaded.updates.download_updates_automatically);
         assert_eq!(loaded.updates.last_check_unix, Some(1234));
+        assert_eq!(loaded.updates.last_check_failed_unix, Some(5678));
         assert_eq!(loaded.ui_font, UiFontPreset::Inter);
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("# keep me"));

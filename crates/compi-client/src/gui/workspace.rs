@@ -35,6 +35,7 @@ pub(in crate::gui) mod tab_groups;
 pub(super) mod tree;
 mod tree_ui;
 pub(in crate::gui) mod unsaved;
+mod update_card;
 pub(in crate::gui) mod views;
 mod whats_new;
 static PREPARED_HANDOFF: LazyLock<Mutex<Option<std::path::PathBuf>>> =
@@ -925,10 +926,10 @@ impl CompiApp {
             sidebar_scroll: ScrollHandle::new(),
             sidebar_open: false,
             whats_new_expanded: false,
-            settings_whats_new_expanded: false,
             settings_update_notes_expanded: false,
             settings_update_advanced: false,
             update_dot: false,
+            update_card: None,
             updates_page_open: false,
             sidebar_width,
             sidebar_drag: false,
@@ -6085,6 +6086,7 @@ impl CompiApp {
                             .track_scroll(&self.sidebar_scroll)
                             .children(rows),
                     )
+                    .children(self.render_update_card(cx))
                     .children(self.render_whats_new_card(cx))
                     .child(
                         div()

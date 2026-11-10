@@ -50,7 +50,8 @@ const PUPIL: &[(f32, f32)] = &[
     (368., 260.),
 ];
 
-pub(super) fn paint(bounds: Bounds<Pixels>, tint: Hsla, window: &mut Window) {
+/// Paints the mark into the square at the top left of `bounds`.
+pub fn paint(bounds: Bounds<Pixels>, tint: Hsla, window: &mut Window) {
     let scale = f32::from(bounds.size.width.min(bounds.size.height)) / 1024.0;
     let at = |x: f32, y: f32| point(bounds.left() + px(x * scale), bounds.top() + px(y * scale));
     let mut path = PathBuilder::fill().with_style(gpui::PathStyle::Fill(

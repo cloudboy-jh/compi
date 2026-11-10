@@ -16,7 +16,7 @@ use compi_protocol::{
     LayoutNode, MutationId, MutationRequest, PaneId, SessionId, SettingsSection, SplitAxis, TabId,
     WorkspaceMutation, WorkspaceSnapshot, WorkspaceTab,
 };
-mod brand;
+pub mod brand;
 mod controls;
 mod lifecycle;
 mod open_with;
@@ -932,11 +932,12 @@ struct CompiApp {
     sidebar_scroll: ScrollHandle,
     sidebar_open: bool,
     whats_new_expanded: bool,
-    settings_whats_new_expanded: bool,
     settings_update_notes_expanded: bool,
     settings_update_advanced: bool,
-    /// A verified update is ready and the user has not opened Settings → Updates since.
+    /// A release is on offer and Later wasn't chosen for it.
     update_dot: bool,
+    /// The sidebar's update card as last drawn.
+    update_card: Option<crate::updates::UpdateCard>,
     updates_page_open: bool,
     sidebar_width: f32,
     sidebar_drag: bool,

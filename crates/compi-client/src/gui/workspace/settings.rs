@@ -57,15 +57,15 @@ pub(super) const REBUILD_ROW: &str = "rebuild-renderer";
 const COMMANDS_ROW: &str = "commands";
 
 /// Focusable controls of Settings → Updates. Which ones exist depends on the update
-/// state; see `update_stops`.
+/// state; see the Updates rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UpdateControl {
     Primary(crate::updates::UpdateButton),
     CheckForUpdates,
     DownloadAutomatically,
-    CandidateMore,
-    CandidateNotes,
-    WhatsNewMore,
+    /// More or Less of the notes.
+    NotesMore,
+    /// The notes' release page.
     ReleaseNotes,
     Advanced,
     Repair,
@@ -963,7 +963,7 @@ static ROWS: &[Row] = &[
         |_| Vec::new(),
         |app, _, width, cx| app.render_settings_monitor(width, cx),
     ),
-    // Updates.
+    // Updates: the status, the notes, the switches, then Advanced.
     row(
         "update-status",
         SettingsSection::Updates,
@@ -979,70 +979,59 @@ static ROWS: &[Row] = &[
         },
         |app, row, cx| app.render_update_status(row, cx),
     ),
-    row(
-        "check-for-updates",
-        SettingsSection::Updates,
-        "Check for updates",
-        "Look for new Compi releases.",
-        "update upgrade release automatic",
-        |_| vec![SettingsAction::Update(UpdateControl::CheckForUpdates)],
-        |app, row, cx| {
-            app.render_toggle_row(
-                row,
-                app.updates.snapshot().preferences.check_for_updates,
-                SettingsAction::Update(UpdateControl::CheckForUpdates),
-                "",
-                cx,
-            )
-        },
-    ),
-    row(
-        "download-automatically",
-        SettingsSection::Updates,
-        "Download updates automatically",
-        "Download a new release as soon as one is found.",
-        "update upgrade release automatic",
-        |_| vec![SettingsAction::Update(UpdateControl::DownloadAutomatically)],
-        |app, row, cx| {
-            app.render_toggle_row(
-                row,
-                app.updates
-                    .snapshot()
-                    .preferences
-                    .download_updates_automatically,
-                SettingsAction::Update(UpdateControl::DownloadAutomatically),
-                "",
-                cx,
-            )
-        },
-    ),
     shown_when(
-        |app| app.updates.snapshot().candidate().is_some(),
-        row(
+        |app| app.update_notes().is_some(),
+        page_row(
             "update-notes",
             SettingsSection::Updates,
-            "What's new in the update",
-            "Release notes of the version available.",
+            "What's new",
+            "Release notes of the update, or of the installed version.",
             "release notes changelog update",
-            |app| app.candidate_stops(),
-            |app, row, cx| app.render_candidate_notes(row, cx),
+            |app| app.update_notes_stops(),
+            |app, row, _, cx| app.render_update_notes(row, cx),
         ),
     ),
-    shown_when(
-        |_| crate::release_notes::current().is_some(),
+    grouped(
+        "Automatic",
         row(
-            "whats-new",
+            "check-for-updates",
             SettingsSection::Updates,
-            "What's new",
-            "Release notes of the installed version.",
-            "release notes changelog",
-            |_| {
-                vec![
-                    SettingsAction::Update(UpdateControl::WhatsNewMore),
-                    SettingsAction::Update(UpdateControl::ReleaseNotes),
-                ]
+            "Check for updates",
+            "Look for new Compi releases.",
+            "update upgrade release automatic",
+            |_| vec![SettingsAction::Update(UpdateControl::CheckForUpdates)],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.updates.snapshot().preferences.check_for_updates,
+                    SettingsAction::Update(UpdateControl::CheckForUpdates),
+                    "When Compi starts and every 6 hours while it runs.",
+                    cx,
+                )
             },
-            |app, row, cx| app.render_whats_new_notes(row, cx),
+        ),
+    ),
+    grouped(
+        "Automatic",
+        row(
+            "download-automatically",
+            SettingsSection::Updates,
+            "Download updates automatically",
+            "Download a new release as soon as one is found.",
+            "update upgrade release automatic",
+            |_| vec![SettingsAction::Update(UpdateControl::DownloadAutomatically)],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.updates
+                        .snapshot()
+                        .preferences
+                        .download_updates_automatically,
+                    SettingsAction::Update(UpdateControl::DownloadAutomatically),
+                    "Installing still waits for you.",
+                    cx,
+                )
+            },
         ),
     ),
     row(
@@ -4050,49 +4039,51 @@ impl CompiApp {
         None
     }
 
-    /// Every 200 ms: keeps a shown Updates section live and the sidebar dot current.
+    /// Every 200 ms: keeps a shown Updates section, the sidebar card and the dot current.
     pub(super) fn poll_updates(&mut self, cx: &mut Context<Self>) {
         let page = self.settings_section_shown(SettingsSection::Updates);
-        if page {
-            if !self.updates_page_open {
-                self.updates.refresh_review();
-            }
-            self.updates.acknowledge_ready();
+        if page && !self.updates_page_open {
+            self.updates.refresh_review();
         }
         self.updates_page_open = page;
-        let dot = self.updates.shows_dot();
-        if page || dot != self.update_dot {
+        let snapshot = self.updates.snapshot();
+        let later = crate::release_notes::seen().update_later;
+        let dot = snapshot.shows_dot(later.as_deref());
+        let card = snapshot.card(unix_now(), later.as_deref(), |surface| {
+            self.shell_label(surface)
+        });
+        if page || dot != self.update_dot || card != self.update_card {
             self.update_dot = dot;
+            self.update_card = card;
             cx.notify();
         }
     }
 
     /// What the Updates section shows for the current update state.
     fn update_view(&self) -> crate::updates::UpdateView {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         self.updates
             .snapshot()
-            .view(now, |surface| self.shell_label(surface))
+            .view(unix_now(), |surface| self.shell_label(surface))
     }
 
-    /// The available release's controls: More when its notes have details, then
-    /// Release notes.
-    fn candidate_stops(&self) -> Vec<SettingsAction> {
-        let snapshot = self.updates.snapshot();
-        let Some(release) = snapshot.candidate() else {
+    /// The notes the Updates page shows: the update's, else the installed version's.
+    fn update_notes(&self) -> Option<crate::release_notes::ReleaseNotes> {
+        match self.updates.snapshot().candidate() {
+            Some(release) => Some(crate::release_notes::of_release(&release.manifest)),
+            None => crate::release_notes::current().cloned(),
+        }
+    }
+
+    /// More when the notes have details, then Release notes.
+    fn update_notes_stops(&self) -> Vec<SettingsAction> {
+        let Some(notes) = self.update_notes() else {
             return Vec::new();
         };
         let mut stops = Vec::new();
-        if !crate::release_notes::of_release(&release.manifest)
-            .details
-            .is_empty()
-        {
-            stops.push(SettingsAction::Update(UpdateControl::CandidateMore));
+        if !notes.details.is_empty() {
+            stops.push(SettingsAction::Update(UpdateControl::NotesMore));
         }
-        stops.push(SettingsAction::Update(UpdateControl::CandidateNotes));
+        stops.push(SettingsAction::Update(UpdateControl::ReleaseNotes));
         stops
     }
 
@@ -4108,46 +4099,54 @@ impl CompiApp {
         stops
     }
 
+    /// An update action from Settings or the sidebar card; restarting asks about unsaved
+    /// edits first and consents to end exactly the shells shown.
+    pub(super) fn press_update_button(
+        &mut self,
+        button: crate::updates::UpdateButton,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::updates::UpdateButton;
+        match button {
+            UpdateButton::CheckNow => self.updates.check(),
+            UpdateButton::Download => self.updates.download(),
+            UpdateButton::Cancel => self.updates.cancel(),
+            // Installing restarts Compi: unsaved edits in any window ask first.
+            UpdateButton::Restart => self.guard_unsaved(
+                super::unsaved::CloseScope::App,
+                super::unsaved::AfterUnsaved::Install(Vec::new()),
+                window,
+                cx,
+            ),
+            // The listed shells are exactly what this click consents to end.
+            UpdateButton::RestartEndShells => self.guard_unsaved(
+                super::unsaved::CloseScope::App,
+                super::unsaved::AfterUnsaved::Install(self.updates.snapshot().ending_shells()),
+                window,
+                cx,
+            ),
+            UpdateButton::TryAgain => self.updates.retry(),
+            UpdateButton::DownloadSetup => {
+                if let Err(error) = open_web_url(crate::updates::SETUP_DOWNLOAD_URL) {
+                    self.global_error = Some(error);
+                }
+            }
+        }
+    }
+
     fn activate_update_control(
         &mut self,
         control: UpdateControl,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::updates::{Preference, UpdateButton};
+        use crate::updates::Preference;
         match control {
             UpdateControl::Primary(button) => {
-                let view = self.update_view();
                 // The state moved on since this button was drawn; the next frame shows it.
-                if view.button != Some(button) {
-                    return;
-                }
-                match button {
-                    UpdateButton::CheckNow => self.updates.check(),
-                    UpdateButton::Download => self.updates.download(),
-                    UpdateButton::Cancel => self.updates.cancel(),
-                    // Installing restarts Compi: unsaved edits in any window ask first.
-                    UpdateButton::Restart => self.guard_unsaved(
-                        super::unsaved::CloseScope::App,
-                        super::unsaved::AfterUnsaved::Install(Vec::new()),
-                        window,
-                        cx,
-                    ),
-                    // The listed shells are exactly what this click consents to end.
-                    UpdateButton::RestartEndShells => self.guard_unsaved(
-                        super::unsaved::CloseScope::App,
-                        super::unsaved::AfterUnsaved::Install(
-                            self.updates.snapshot().ending_shells(),
-                        ),
-                        window,
-                        cx,
-                    ),
-                    UpdateButton::TryAgain => self.updates.retry(),
-                    UpdateButton::DownloadSetup => {
-                        if let Err(error) = open_web_url(crate::updates::SETUP_DOWNLOAD_URL) {
-                            self.global_error = Some(error);
-                        }
-                    }
+                if self.update_view().button == Some(button) {
+                    self.press_update_button(button, window, cx);
                 }
             }
             UpdateControl::CheckForUpdates => {
@@ -4166,20 +4165,12 @@ impl CompiApp {
                     Preference::DownloadAutomatically(!enabled),
                 );
             }
-            UpdateControl::CandidateMore => {
+            UpdateControl::NotesMore => {
                 self.settings_update_notes_expanded = !self.settings_update_notes_expanded
             }
-            UpdateControl::CandidateNotes => {
-                if let Some(release) = self.updates.snapshot().candidate() {
-                    self.open_release_notes(&crate::release_notes::of_release(&release.manifest));
-                }
-            }
-            UpdateControl::WhatsNewMore => {
-                self.settings_whats_new_expanded = !self.settings_whats_new_expanded
-            }
             UpdateControl::ReleaseNotes => {
-                if let Some(notes) = crate::release_notes::current() {
-                    self.open_release_notes(notes);
+                if let Some(notes) = self.update_notes() {
+                    self.open_release_notes(&notes);
                 }
             }
             UpdateControl::Advanced => {
@@ -4195,16 +4186,16 @@ impl CompiApp {
     }
 
     /// The installed version as a row: the updater's status under it and its one
-    /// primary button on the right, the download's progress below while it runs.
+    /// primary button on the right, its facts and what updating ends under it, and the
+    /// download's progress below while it runs.
     fn render_update_status(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         use crate::updates::UpdateButton;
         let colors = *self.colors();
         let view = self.update_view();
-        let primary = view.button.map_or_else(
-            || div().into_any_element(),
-            |button| {
+        let primary = match (view.button, view.button_label()) {
+            (Some(button), Some(label)) => {
                 let action = SettingsAction::Update(UpdateControl::Primary(button));
-                let control = controls::text_button((row.row, 0_usize), button.label()).header();
+                let control = controls::text_button((row.row, 0_usize), label).header();
                 self.settings_control(
                     row,
                     action,
@@ -4215,23 +4206,58 @@ impl CompiApp {
                     },
                     cx,
                 )
-            },
-        );
+            }
+            _ => div().into_any_element(),
+        };
+        let line = |text: String, tint: u32| {
+            div()
+                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .line_height(px(UI_SMALL_LINE_HEIGHT))
+                .text_color(color(modal_text_color(tint, &colors)))
+                .child(text)
+        };
+        let compact = row.compact;
         div()
             .min_w_0()
             .flex()
             .flex_col()
-            .child(self.tinted_settings_row(
-                format!("Compi {}", env!("CARGO_PKG_VERSION")).into(),
-                view.status,
-                if view.failed {
-                    colors.error
-                } else {
-                    colors.muted
-                },
-                primary,
-                row.compact,
-            ))
+            .child(
+                div()
+                    .min_w_0()
+                    .min_h(px(52.0))
+                    .py_3()
+                    .flex()
+                    .gap_3()
+                    .when(compact, |status| status.flex_col().items_start())
+                    .when(!compact, |status| status.items_center().justify_between())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .when(!compact, |text| text.flex_auto().min_w(px(72.0)))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("Compi {}", env!("CARGO_PKG_VERSION"))),
+                            )
+                            .child(line(
+                                view.status,
+                                if view.failed {
+                                    colors.error
+                                } else {
+                                    colors.foreground
+                                },
+                            ))
+                            .children(view.facts.map(|facts| line(facts, colors.muted)))
+                            .children(
+                                view.consequence
+                                    .map(|consequence| line(consequence, colors.muted)),
+                            ),
+                    )
+                    .child(div().flex_none().flex().items_center().child(primary)),
+            )
             .when_some(view.progress, |summary, fraction| {
                 summary.child(
                     div().pb_3().child(
@@ -4252,72 +4278,51 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Release notes with More/Less and a link, titled with their version.
-    fn render_notes_row(
-        &self,
-        row: &RowCx,
-        notes: &crate::release_notes::ReleaseNotes,
-        expanded: bool,
-        more: UpdateControl,
-        link: UpdateControl,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let more_action = SettingsAction::Update(more);
-        let more = if notes.details.is_empty() && more == UpdateControl::CandidateMore {
+    /// The update's notes, else the installed version's, under "What's new in <version>",
+    /// with More/Less and the release page.
+    fn render_update_notes(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let Some(notes) = self.update_notes() else {
+            return div().into_any_element();
+        };
+        let colors = *self.colors();
+        let expanded = self.settings_update_notes_expanded;
+        let more = if notes.details.is_empty() {
             div().into_any_element()
         } else {
             self.settings_button(
                 row,
                 0,
                 if expanded { "Less" } else { "More" },
-                more_action,
+                SettingsAction::Update(UpdateControl::NotesMore),
                 cx,
             )
         };
-        let link = self.settings_button(row, 1, "Release notes", SettingsAction::Update(link), cx);
+        let link = self.settings_button(
+            row,
+            1,
+            "Release notes",
+            SettingsAction::Update(UpdateControl::ReleaseNotes),
+            cx,
+        );
         div()
             .min_w_0()
-            .py_3()
             .flex()
             .flex_col()
             .gap_2()
+            .child(settings_label_line(
+                Some(format!("What's new in {}", notes.version).into()),
+                None,
+            ))
             .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("What's new in {}", notes.version)),
+                settings_card(&colors).child(
+                    div()
+                        .min_w_0()
+                        .px_4()
+                        .py_3()
+                        .child(self.render_release_notes_view(&notes, expanded, more, link)),
+                ),
             )
-            .child(self.render_release_notes_view(notes, expanded, more, link))
             .into_any_element()
-    }
-
-    fn render_candidate_notes(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let snapshot = self.updates.snapshot();
-        let Some(release) = snapshot.candidate() else {
-            return div().into_any_element();
-        };
-        let notes = crate::release_notes::of_release(&release.manifest);
-        self.render_notes_row(
-            row,
-            &notes,
-            self.settings_update_notes_expanded,
-            UpdateControl::CandidateMore,
-            UpdateControl::CandidateNotes,
-            cx,
-        )
-    }
-
-    fn render_whats_new_notes(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let Some(notes) = crate::release_notes::current() else {
-            return div().into_any_element();
-        };
-        self.render_notes_row(
-            row,
-            notes,
-            self.settings_whats_new_expanded,
-            UpdateControl::WhatsNewMore,
-            UpdateControl::ReleaseNotes,
-            cx,
-        )
     }
 
     fn render_update_advanced(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
@@ -5074,6 +5079,14 @@ fn settings_label_line(label: Option<SharedString>, trailing: Option<Vec<AnyElem
         })
 }
 
+/// Seconds since the Unix epoch, for the update views' "Checked 5 min ago".
+pub(super) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn open_update_log() -> Result<(), String> {
     let path = crate::updates::update_log_path()
         .filter(|path| path.is_file())
@@ -5356,20 +5369,16 @@ mod tests {
     #[test]
     fn cards_are_labelled_only_in_sections_of_several_groups() {
         assert!(section_grouped(SettingsSection::Interface));
+        assert!(section_grouped(SettingsSection::Updates));
         for section in [
             SettingsSection::Terminal,
             SettingsSection::Keyboard,
             SettingsSection::Monitor,
-            SettingsSection::Updates,
         ] {
             assert!(!section_grouped(section), "{section:?}");
         }
-        // Updates' one card opens on the installed version.
-        assert_eq!(
-            rows_for(SettingsSection::Updates, "")
-                .next()
-                .map(|row| row.id),
-            Some("update-status")
-        );
+        // Updates opens on the installed version, unlabelled, ahead of its groups.
+        let updates = rows_for(SettingsSection::Updates, "").next().unwrap();
+        assert_eq!((updates.id, updates.group), ("update-status", None));
     }
 }
