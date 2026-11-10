@@ -1,35 +1,32 @@
-# 0.7.2
+# 0.7.3
 
-- Steer OMP while it works, or queue messages for after the turn
-- `/new`, `/resume` and `/sessions` in the chat's `/` list
-- Paste screenshots into the chat with Ctrl+V
-- Chat messages read at regular weight, with clearer headings and code that follows the chat text size
-- The model picker groups models by subscription and provider, and its search takes typing
+- Earlier chats open again from Resume… and `/resume`
+- A session picker with search and a preview of each session
+- Page Up and Page Down scroll the chat
 - Updating ends running shells: the daemon restarts
 
 ## Agent chat
 
-- **Steering:** while OMP works, Enter sends your message into the running turn, which takes it at its next step. **Queueing:** Ctrl+Enter (Cmd+Enter on macOS) holds a message for after the turn. Queued messages wait above the message box, each with × to remove it, and go one at a time as turns end. After **Stop**, the queue waits and goes after the next message you send.
-- The `/` list offers three commands of Compi's own, marked **Compi**: `/new` starts a new session, `/resume` and `/sessions` list the folder's sessions to pick from. Words after them (`/resume login`) narrow the list. A command of the same name from OMP replaces Compi's.
-- Ctrl+V (Cmd+V) with an image on the clipboard, such as a screenshot, attaches it to the next message. Large pictures are made smaller to fit; copied text still pastes as text.
-- Edits show only their diff. Their output shows when an edit failed or changed nothing.
-- Messages and the message box use regular weight instead of the interface's medium, so bold text and headings stand out; headings step up clearly in size, and code in messages and tool output grows with **Chat text size**.
-- The model picker lists your subscriptions first (for OMP, providers signed in with a plan, such as Claude or ChatGPT, with how much of the plan is left), then pay-per-use providers, each under its own heading. Search matches model and provider names, and arrow keys skip the headings.
+- **Resume…** in the ⋯ menu, `/resume` and `/sessions` open the session picker over the chat: the folder's sessions under Today, Yesterday, This week and Earlier, each with its title or first prompt, age and size, and a preview of the highlighted one's first prompt and last reply. Typing keeps the sessions holding every word in their title, first prompt, last reply, folder or ID. Up and Down, Page Up, Page Down, Home and End move; Enter resumes; Esc closes.
+- Page Up and Page Down scroll the conversation, also while typing a message; Ctrl+End (Cmd+Down on macOS) goes back to the newest message.
 
 ## Fixes
 
-- Typing into the model picker's search did nothing on Windows; it now filters as you type, and Space types a space instead of picking.
+- Resuming an earlier chat failed, and the chat started a new session instead, when the folder had been reached under another name, such as a link (`~/proj` pointing into `/mnt/c/…`). Each session now opens in the folder it was saved in.
+- The session list shows every session, not only the first 50 on Windows, and leaves out sessions with no messages.
+- A tool call whose title runs over several lines (OMP's code tool) no longer draws its code over the rows below.
 
 ## Updating
 
-- **Running shells end.** The update restarts the local daemon after you consent. Daemon protocol 39 (workspace format 10 is unchanged, so your workspace carries over). Save your work first. Remote daemons are not restarted by the local updater.
-- **Windows, from 0.3.0 or earlier:** run [Compi 0.7.2 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.7.2/Compi-0.7.2-Setup.exe) once; the older update helper cannot replace itself. From 0.3.1, update in the app.
+- **Running shells end.** The update restarts the local daemon after you consent. Daemon protocol 39 and workspace format 10 are unchanged, so your workspace carries over. Save your work first. Remote daemons are not restarted by the local updater.
+- **Windows, from 0.3.0 or earlier:** run [Compi 0.7.3 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.7.3/Compi-0.7.3-Setup.exe) once; the older update helper cannot replace itself. From 0.3.1, update in the app.
 
 ## Limitations
 
 - Agent chat supports OMP only so far, and OMP must already be installed. Other agents come next.
-- In the chat, **Open in diff** shows changes not yet staged; Resume lists sessions by ID because OMP gives them no titles; Retry resends attached files but not images.
-- A chat window resized can draw text overlapping in some cases; not yet reproduced, so not yet fixed.
+- In the chat, **Open in diff** shows changes not yet staged; Retry resends attached files but not images.
+- Text overlapping after resizing a chat window is still being looked into; one cause, multi-line tool titles, is fixed above.
+- The session picker has not yet been checked on screen on a Mac or with a Windows (not WSL) chat.
 - Tab groups and agent chat have not yet been checked on screen on a Mac.
 - Windows without WSL has not yet been tried on a PC that never had WSL installed.
 - macOS: Open with, Finder integration, clicking a system notification, the browser pane and the PDF, audio and video previews have not yet been checked on screen on a Mac.
