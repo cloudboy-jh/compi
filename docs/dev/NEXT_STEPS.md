@@ -5,7 +5,7 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 ## Release state
 
 - **0.7.2** is published and Latest (2026-11-10 UTC). Daemon protocol 39, workspace format 10.
-- **0.7.3** is a draft, not published: tag `v0.7.3` at `9fae749`, release run [42758236641](https://github.com/cloudboy-jh/compi/actions/runs/42758236641). That draft holds only the chat work (`72545db`). The updater work below joins 0.7.3: delete the draft, move the unpublished tag to the new commit, rebuild, read back, publish.
+- **0.7.3** is a draft awaiting review, not published: tag `v0.7.3` moved to `ad603c1` (the first draft at `9fae749` was deleted unpublished), release run [42877645833](https://github.com/cloudboy-jh/compi/actions/runs/42877645833). It holds the chat work (`72545db`) and the updater work below (`413f005`, `60c1019`, `656eaf5`). Read back: 12 assets; signed Windows, Setup and macOS metadata 0.7.3 / protocol 39 / qualified daemon 0.7.3 with the 0.7.3 notes; hashes match `SHA256SUMS.txt`; the update zip carries `compi-launcher.exe`.
 
 ## In source for 0.7.3: updater (2026-11-10)
 
@@ -20,6 +20,16 @@ Found on the owner's Windows install: nothing was ever removed (12 `versions\` f
 - Setup: new window (see below) and run cleanup: finished run folders and the 0.1.x leftovers go at start and at completion; the package is kept as root `Compi.msi`, registered as an extra Windows Installer source so repair from Settings → Apps still finds it.
 
 To check before publishing: the update cycle on a copy with old versions (one version left, new root launcher and helper); a repair from Settings → Apps after Setup removed its run folder (the extra source registration is untested for a standard user).
+
+## Next: Windows work from a WSL session
+
+Vault plan: `feat windows from wsl.md` (from an OMP session on 2026-11-08 that installed mods through Vortex from WSL `/tmp`). An agent in a WSL folder had to find the Windows home by listing `/mnt/c` and asking `pwsh.exe` for `$env:USERPROFILE`; `pwsh.exe` ran through `~/.compi/wincmd…` but `tasklist.exe` needed its full path; it could not see a Windows dialog it caused; searching `C:\Users\johns` from WSL timed out twice.
+
+1. At session start in WSL, tell the agent it runs in WSL on Windows and give it the Windows home folder in both forms (`C:\Users\…`, `/mnt/c/Users/…`). Where it goes is open: the shell bridge's environment (`COMPI_WINDOWS_FOLDERS` already carries `Home=`), `compi` CLI output an agent reads, or a file agents load.
+2. Put `cmd.exe`, `tasklist.exe` and `winget.exe` in the same `wincmd` folder as `pwsh.exe` (`shell_integration::WindowsCommands`), so they run without full paths.
+3. Let an agent capture an open Windows app window (a `compi` command returning an image path), so it can see dialogs it caused.
+
+Check: a fresh session in WSL `/tmp` names the Windows home folder, runs `tasklist` and `winget --version` without full paths, and describes a dialog open in another app. Not seen yet: UAC prompts, `winget` installs, why `cmd.exe /c start steam://…` did not start the game.
 
 ## Planned, later
 
@@ -39,7 +49,7 @@ To check before publishing: the update cycle on a copy with old versions (one ve
 ## CI and release
 
 - **Windows portable smoke is flaky.** 0.7.1 and 0.7.3 both failed it on the first attempt and passed on a rerun; 0.7.3's failed job then hung for 25 minutes in "Remove imported publisher certificate" and kept no logs. Make the step keep its diagnostics and time out instead of hanging.
-- **Installed in-app update check times out** waiting for the test GUI to attach (45 s), so release CI runs it with `continue-on-error`. First add evidence on timeout (`COMPI_PERF_LOG`, client startup log, screenshot), then a `workflow_dispatch` that reruns only `smoke-windows-installed-update.ps1` against an earlier run's artifact.
+- **Installed in-app update check never ran.** Its fixture copied the source without the `installer/bootstrapper` workspace member, so its first `cargo build` failed loading the workspace in every release run since at least 0.6.1; `continue-on-error` hid it. Fixed in `0519b8e`, after the 0.7.3 tag. In dry run [42879581522](https://github.com/cloudboy-jh/compi/actions/runs/42879581522) it now builds and installs, then times out on "test GUI attached to the original running shell" (the attach timeout first seen at 0.3.1), before any update. Next: evidence on timeout (`COMPI_PERF_LOG`, client startup log, screenshot), and a `workflow_dispatch` that reruns only `smoke-windows-installed-update.ps1`.
 - **Daemon handle-count test** (`repeated_surface_cycles_release_daemon_process_handles`) fails on some Windows runs, about +15 handles each time (225→241). Find the leak before changing the limit.
 - The daemon protocol is pinned by hand in five release scripts (`tools/sign-release-metadata.py`, `smoke-update-cycle.py`, `smoke-macos-bundle.sh`, `smoke-windows-distribution.ps1`, `smoke-windows-installed-update.ps1`); a missed bump already cost 0.5.0 a rebuild.
 
