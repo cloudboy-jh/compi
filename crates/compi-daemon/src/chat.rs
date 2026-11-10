@@ -1709,6 +1709,7 @@ impl Inner {
                 started_ms: now_ms(),
                 ended_ms: None,
                 agents: Vec::new(),
+                waits_on_agents: false,
             },
         };
         if let Some(name) = update["name"].as_str() {
@@ -1793,6 +1794,9 @@ impl Inner {
         }
         for item in details["results"].as_array().into_iter().flatten() {
             agent_result(&mut tool.agents, item);
+        }
+        if let Some(jobs) = details["jobs"].as_array().filter(|jobs| !jobs.is_empty()) {
+            tool.waits_on_agents = jobs.iter().all(|job| job["type"] == "task");
         }
         settle(&mut tool, was, now);
         let entry = ChatEntry::Tool(Box::new(tool));
@@ -2846,6 +2850,7 @@ mod tests {
                 started_ms: 0,
                 ended_ms: None,
                 agents: Vec::new(),
+                waits_on_agents: false,
             })));
         }
         let fitted = fit(state, 2500);
@@ -2957,6 +2962,9 @@ mod tests {
         );
         assert_eq!(tool.agents[1].status, ChatToolStatus::Pending);
         assert!(summaries(&inner).is_empty());
+        // A wait on agents only folds into their call; the task call itself does not.
+        assert!(tool_entry(&inner, 1).waits_on_agents);
+        assert!(!tool.waits_on_agents);
     }
 
     #[test]

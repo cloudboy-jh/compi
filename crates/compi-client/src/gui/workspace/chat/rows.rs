@@ -698,14 +698,24 @@ impl RowFrame {
     }
 }
 
+/// A row the transcript leaves out: a wait on sub-agents only, unless it failed. Their
+/// call and the agents bar show the same.
+fn hidden(row: &ChatRow) -> bool {
+    matches!(row, ChatRow::Tool { tool, .. }
+        if tool.tool.waits_on_agents && tool.tool.status != ChatToolStatus::Failed)
+}
+
 /// Row `index` of `rows`, with the gap under it: tool cards in a run pack tightly.
 pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> AnyElement {
     let Some(row) = rows.get(index) else {
         return div().into_any_element();
     };
-    let packed = matches!(row, ChatRow::Tool { .. })
-        && matches!(rows.get(index + 1), Some(ChatRow::Tool { .. }));
-    let last = index + 1 == rows.len();
+    if hidden(row) {
+        return div().into_any_element();
+    }
+    let next = rows[index + 1..].iter().find(|row| !hidden(row));
+    let packed = matches!(row, ChatRow::Tool { .. }) && matches!(next, Some(ChatRow::Tool { .. }));
+    let last = next.is_none();
     let body = match row {
         ChatRow::User {
             text,
@@ -1190,7 +1200,9 @@ pub(super) fn render_permission_block(
         .into_any_element()
 }
 
-/// The summary entry: one quiet line, led by the agents' mark, that shows their call.
+/// The summary entry: a thin rule across the transcript closing the agents' run, with
+/// ✓ (✕ when one failed), how many, how long and what they cost. A click shows their
+/// call.
 fn render_agents_finished(
     index: usize,
     tool: usize,
@@ -1199,26 +1211,27 @@ fn render_agents_finished(
     frame: &RowFrame,
 ) -> AnyElement {
     let muted = frame.muted();
-    let statuses: Vec<ChatToolStatus> = match rows.get(tool) {
-        Some(ChatRow::Tool { tool, .. }) => {
-            tool.agents.iter().map(|agent| agent.agent.status).collect()
-        }
-        _ => Vec::new(),
-    };
+    let failed = matches!(rows.get(tool), Some(ChatRow::Tool { tool, .. })
+        if tool.agents.iter().any(|agent| agent.agent.status == ChatToolStatus::Failed));
+    let rule = || div().flex_1().h(px(1.0)).bg(color(frame.colors.border));
     div()
         .id(("chat-agents-finished", index))
         .h(ui_rems(24.0))
-        .px_1()
         .flex()
         .items_center()
         .gap_2()
-        .rounded(ui_rems(4.0))
         .cursor_pointer()
-        .hover(|style| style.bg(color(frame.colors.surface_hover)))
-        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
         .text_color(muted)
-        .child(agents_mark(frame.mark, statuses, &frame.colors))
-        .child(label.clone())
+        .hover(|style| style.text_color(color(frame.colors.foreground)))
+        .child(rule())
+        .child(if failed {
+            controls::glyph(IconName::Close, color(frame.colors.error))
+        } else {
+            controls::glyph(IconName::Check, color(frame.colors.added))
+        })
+        .child(div().flex_none().whitespace_nowrap().child(label.clone()))
+        .child(rule())
         .on_click(frame.act(move |this, chat, _, _| this.reveal_chat_tool(chat, tool)))
         .into_any_element()
 }
@@ -1226,9 +1239,10 @@ fn render_agents_finished(
 /// Most dots the agents' mark draws; more agents show as `+N`.
 const MAX_AGENT_DOTS: usize = 8;
 
-/// Sub-agents' mark: the harness's own mark (they are more of it), then a dot per agent:
-/// a ring while it waits (muted) or runs (accent), filled once it ends: green when done,
-/// red when it failed, muted when stopped. Static, so it never repaints by itself.
+/// Sub-agents' mark: a ghost of the harness's own mark (they are more of it), then a dot
+/// per agent: a ring while it waits (muted) or runs (accent), filled once it ends: green
+/// when done, red when it failed, muted when stopped. Static, so it never repaints by
+/// itself.
 pub(super) fn agents_mark(
     mark: &'static str,
     statuses: impl IntoIterator<Item = ChatToolStatus>,
@@ -1236,12 +1250,19 @@ pub(super) fn agents_mark(
 ) -> Div {
     let statuses: Vec<ChatToolStatus> = statuses.into_iter().collect();
     let more = statuses.len().saturating_sub(MAX_AGENT_DOTS);
+    let ghost = color(modal_text_color(colors.muted, colors)).opacity(0.6);
     div()
         .flex_none()
         .flex()
         .items_center()
         .gap(ui_rems(3.0))
-        .child(img(mark).flex_none().size(ui_rems(14.0)))
+        .child(
+            gpui::svg()
+                .path(mark)
+                .flex_none()
+                .size(ui_rems(12.0))
+                .text_color(ghost),
+        )
         .children(statuses.into_iter().take(MAX_AGENT_DOTS).map(|status| {
             let (tint, ring) = match status {
                 ChatToolStatus::Pending => (colors.muted, true),
@@ -1596,6 +1617,7 @@ mod tests {
             started_ms: 1,
             ended_ms: None,
             agents: Vec::new(),
+            waits_on_agents: false,
         }
     }
 

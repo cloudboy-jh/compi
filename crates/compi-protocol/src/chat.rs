@@ -285,6 +285,10 @@ pub struct ChatTool {
     /// of them does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<ChatAgent>,
+    /// It only waits for sub-agents (OMP's `wait` on `task` jobs): their call and the
+    /// agents bar already show what it shows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waits_on_agents: bool,
 }
 
 /// A sub-agent a tool call started, as last reported.
@@ -652,6 +656,7 @@ mod tests {
             started_ms: 1,
             ended_ms: None,
             agents: Vec::new(),
+            waits_on_agents: false,
         }))
     }
 
