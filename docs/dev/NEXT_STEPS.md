@@ -40,6 +40,7 @@ Check: a fresh session in WSL `/tmp` names the Windows home folder, runs `taskli
 
 ## Open bugs
 
+- **Agent chat never notifies** (reported 2026-11-10). Notifications (`gui/workspace/notifications.rs`) and the tab/pane status glyphs come only from terminal surfaces' Program Status reports (OSC 7501, `notice_program_status`). A chat is daemon-owned ACP with no surface, so a finished turn, a waiting permission or question, or a failure says nothing outside the chat itself. Fix: feed chat transitions (turn ended → done, permission/question waiting → blocked, failed) into the same announcement path, with the same settings, focused-pane silence and click-to-pane.
 - Chat text overlap after resizing a window (reported 2026-11-09). One cause fixed for 0.7.3: tool rows whose title has line breaks drew over the rows below. Not confirmed to be the reported case; needs a screenshot or steps if it comes back.
 - A PowerShell tab in a `\\wsl.localhost` folder does not report it, so splits start in the last Windows folder.
 - `cargo dev` restart often says "did not exit after acknowledged shutdown" and keeps the old daemon (also seen with `cargo dev --stop` when the daemon had exited).
