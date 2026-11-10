@@ -5,23 +5,40 @@ use crate::plain;
 use crate::transaction::{self, Event, Outcome, Readiness};
 use compi_client::theme::{ThemeColors, ThemePreset};
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render, SharedString,
-    Styled, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img, prelude::*,
-    px, rgb, size,
+    Animation, AnimationExt, App, Bounds, BoxShadow, Context, FocusHandle, Focusable, Hsla,
+    IntoElement, ParentElement, PathBuilder, Pixels, Render, Role, SharedString, Styled, Toggled,
+    Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, actions, canvas, div,
+    point, prelude::*, px, rgb, size,
 };
 use std::env;
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread;
+use std::time::Duration;
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 
-const WINDOW_WIDTH: f32 = 600.0;
-const WINDOW_HEIGHT: f32 = 500.0;
-const COLORS: &ThemeColors = ThemePreset::DarkGlass.colors();
+const WINDOW_WIDTH: f32 = 420.0;
+const WINDOW_HEIGHT: f32 = 480.0;
+const MIN_WIDTH: f32 = 380.0;
+const MIN_HEIGHT: f32 = 440.0;
+/// The drag strip along the top, with the ×.
+const TOP_STRIP: f32 = 36.0;
+/// The square holding the glow, the ring and the mark.
+const EMBLEM: f32 = 200.0;
+const MARK: f32 = 136.0;
+const RING_RADIUS: f32 = 90.0;
+const RING_WIDTH: f32 = 3.0;
+/// Room under the name for a status word or error, the button and two short lines.
+const ACTION_HEIGHT: f32 = 132.0;
+/// The doctor's side inset.
+const INSET: f32 = 24.0;
+/// Static Segoe UI has real semibold faces; the variable family renders them regular.
+const DISPLAY_FONT: &str = "Segoe UI";
 /// Shells listed by name before "and N more".
 const LISTED_SHELLS: usize = 6;
 
@@ -39,6 +56,7 @@ pub enum PreviewState {
     Upgrade,
     Consent,
     Installing,
+    Checking,
     Complete,
     Error,
     Remove,
@@ -69,7 +87,7 @@ enum SurfaceState {
     Complete,
     Error(String),
     Doctor { fix_error: Option<String> },
-    Fixing(String),
+    Fixing,
 }
 
 struct InstallerApp {
@@ -92,11 +110,18 @@ struct InstallerApp {
     busy: Arc<AtomicBool>,
     focus_handle: FocusHandle,
     launch_failed: bool,
+    look: Look,
 }
 
 actions!(
     compi_installer,
-    [PrimaryAction, CloseInstaller, ToggleDataCleanup]
+    [
+        PrimaryAction,
+        CloseInstaller,
+        ToggleDataCleanup,
+        FocusNext,
+        FocusPrevious
+    ]
 );
 
 pub fn run(msi: &'static [u8], operation: InstallerOperation) {
@@ -208,6 +233,8 @@ fn run_mode(launch: LaunchMode) {
             gpui::KeyBinding::new("enter", PrimaryAction, Some("CompiInstaller")),
             gpui::KeyBinding::new("escape", CloseInstaller, Some("CompiInstaller")),
             gpui::KeyBinding::new("ctrl-d", ToggleDataCleanup, Some("CompiInstaller")),
+            gpui::KeyBinding::new("tab", FocusNext, Some("CompiInstaller")),
+            gpui::KeyBinding::new("shift-tab", FocusPrevious, Some("CompiInstaller")),
         ]);
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         let busy = Arc::new(AtomicBool::new(false));
@@ -216,6 +243,7 @@ fn run_mode(launch: LaunchMode) {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(MIN_WIDTH), px(MIN_HEIGHT))),
                     titlebar: Some(gpui::TitlebarOptions {
                         title: Some("Compi Setup".into()),
                         appears_transparent: true,
@@ -298,7 +326,7 @@ impl InstallerApp {
     fn new(
         launch: LaunchMode,
         busy: Arc<AtomicBool>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let (event_tx, event_rx) = async_channel::unbounded();
@@ -329,11 +357,23 @@ impl InstallerApp {
             remove_data: false,
             focus_handle: cx.focus_handle(),
             launch_failed: false,
+            look: look(window.appearance()),
         };
-        if matches!(this.launch, LaunchMode::Preview(PreviewState::Installing)) {
-            this.busy.store(true, Ordering::Release);
-            this.stage = "Copying files".into();
-            this.progress = Some(42);
+        cx.observe_window_appearance(window, |this, window, cx| {
+            this.look = look(window.appearance());
+            cx.notify();
+        })
+        .detach();
+        match this.launch {
+            LaunchMode::Preview(PreviewState::Installing) => {
+                this.busy.store(true, Ordering::Release);
+                this.stage = "Copying files".into();
+                this.progress = Some(42);
+            }
+            LaunchMode::Preview(PreviewState::Checking) => {
+                this.busy.store(true, Ordering::Release);
+            }
+            _ => {}
         }
         cx.spawn(async move |weak, cx| {
             while let Ok(event) = event_rx.recv().await {
@@ -418,10 +458,19 @@ impl InstallerApp {
         }
     }
 
-    /// Keyboard Enter. It never ends shells: that takes a click on a button listing them.
+    /// Keyboard Enter. It never ends shells or cancels: those take a button. A focused
+    /// button or checkbox handles Enter itself.
     fn primary_key(&mut self, _: &PrimaryAction, window: &mut Window, cx: &mut Context<Self>) {
+        if window
+            .focused(cx)
+            .is_some_and(|focused| focused != self.focus_handle)
+        {
+            cx.propagate();
+            return;
+        }
         match &self.state {
             SurfaceState::Ready if self.readiness.plan.needs_consent() => {}
+            SurfaceState::Installing => {}
             SurfaceState::Doctor { .. } => window.remove_window(),
             _ => self.primary_action(window, cx),
         }
@@ -442,15 +491,7 @@ impl InstallerApp {
                 let approved = self.readiness.daemons.clone();
                 self.start_installation(self.operation, approved, cx)
             }
-            SurfaceState::Installing => {
-                if self.cancellable {
-                    self.cancel.store(true, Ordering::Release);
-                    self.stage = "Cancelling".into();
-                    self.cancellable = false;
-                    cx.notify();
-                }
-            }
-            SurfaceState::Checking | SurfaceState::Fixing(_) => {}
+            SurfaceState::Installing | SurfaceState::Checking | SurfaceState::Fixing => {}
             SurfaceState::Doctor { .. } => self.fix_all(cx),
             SurfaceState::Complete => self.finish(window, cx),
             SurfaceState::Error(_) if self.launch_failed => {
@@ -491,7 +532,13 @@ impl InstallerApp {
     }
 
     fn close_installer(&mut self, _: &CloseInstaller, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.busy.load(Ordering::Acquire) {
+        self.dismiss(window, cx);
+    }
+
+    /// × and Escape: closes the window, or cancels the change while Windows Installer can
+    /// still undo it. A preview always closes.
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.busy.load(Ordering::Acquire) || matches!(self.launch, LaunchMode::Preview(_)) {
             window.remove_window();
         } else if matches!(self.state, SurfaceState::Installing) && self.cancellable {
             self.cancel.store(true, Ordering::Release);
@@ -503,7 +550,7 @@ impl InstallerApp {
 
     fn recheck(&mut self) {
         if self.operation == InstallerOperation::Repair {
-            self.run_doctor(Vec::new(), None);
+            self.run_doctor(Vec::new());
             return;
         }
         self.state = SurfaceState::Checking;
@@ -522,12 +569,13 @@ impl InstallerApp {
     }
 
     /// Applies `fixes` (none = just check), then checks again.
-    fn run_doctor(&mut self, fixes: Vec<Fix>, title: Option<String>) {
+    fn run_doctor(&mut self, fixes: Vec<Fix>) {
         self.busy.store(true, Ordering::Release);
         self.launch_failed = false;
-        self.state = match title {
-            Some(title) => SurfaceState::Fixing(title),
-            None => SurfaceState::Checking,
+        self.state = if fixes.is_empty() {
+            SurfaceState::Checking
+        } else {
+            SurfaceState::Fixing
         };
         let inspection = self.inspection.clone();
         let sender = self.event_tx.clone();
@@ -561,7 +609,7 @@ impl InstallerApp {
         };
         match finding.fix() {
             Some(Fix::Reinstall) => self.start_reinstall(cx),
-            Some(fix) => self.run_doctor(vec![fix], Some(finding.title())),
+            Some(fix) => self.run_doctor(vec![fix]),
             None => {}
         }
         cx.notify();
@@ -580,7 +628,7 @@ impl InstallerApp {
             return;
         }
         self.pending_reinstall = fixes.contains(&Fix::Reinstall);
-        self.run_doctor(fixes, Some("Fixing Compi".into()));
+        self.run_doctor(fixes);
     }
 
     fn start_reinstall(&mut self, cx: &mut Context<Self>) {
@@ -629,40 +677,49 @@ impl InstallerApp {
         });
     }
 
-    fn package_size(&self) -> Option<u64> {
-        match &self.launch {
-            LaunchMode::Live {
-                source: InstallerSource::Package(bytes),
-                ..
-            } => Some(bytes.len() as u64),
-            LaunchMode::Preview(_) => Some(43 * 1024 * 1024),
-            _ => None,
-        }
+    /// The installed version this run updates from.
+    fn updating_from(&self) -> Option<&str> {
+        self.readiness.installed.as_deref().filter(|installed| {
+            self.operation == InstallerOperation::Install && *installed != env!("CARGO_PKG_VERSION")
+        })
     }
 
-    fn action_label(&self) -> String {
-        let installed = self.readiness.installed.is_some();
-        match (&self.state, self.operation) {
-            (SurfaceState::Checking | SurfaceState::Fixing(_), _) => "Checking…".into(),
-            (SurfaceState::Ready, operation) if self.readiness.plan.needs_consent() => {
-                match operation {
-                    InstallerOperation::Install => "End shells and update",
-                    InstallerOperation::Repair => "End shells and reinstall",
-                    InstallerOperation::Remove => "End shells and remove",
-                }
-                .into()
+    /// Completion offers Open Compi unless Compi is gone or Windows must restart first.
+    fn opens_compi(&self) -> bool {
+        self.operation != InstallerOperation::Remove && !self.outcome.restart_required
+    }
+
+    fn primary_label(&self) -> Option<String> {
+        let plan = &self.readiness.plan;
+        Some(match (&self.state, self.operation) {
+            (SurfaceState::Checking | SurfaceState::Fixing | SurfaceState::Installing, _) => {
+                return None;
             }
-            (SurfaceState::Ready, InstallerOperation::Install) if installed => {
-                "Update Compi".into()
+            (SurfaceState::Ready, operation) if plan.needs_consent() => {
+                let count = plan.shells.len();
+                let action = match operation {
+                    InstallerOperation::Install if self.updating_from().is_some() => "update",
+                    InstallerOperation::Install | InstallerOperation::Repair => "reinstall",
+                    InstallerOperation::Remove => "remove",
+                };
+                format!("End {count} {} and {action}", shells_word(count))
             }
-            (SurfaceState::Ready, InstallerOperation::Install) => "Install Compi".into(),
-            (SurfaceState::Ready, InstallerOperation::Repair) => "Reinstall files".into(),
-            (SurfaceState::Ready, InstallerOperation::Remove) => "Remove Compi".into(),
-            (SurfaceState::Installing, _) if self.cancellable => "Cancel".into(),
-            (SurfaceState::Installing, _) => "Working…".into(),
-            (SurfaceState::Complete, InstallerOperation::Remove) => "Close".into(),
-            (SurfaceState::Complete, _) if self.outcome.restart_required => "Close".into(),
-            (SurfaceState::Complete, _) => "Open Compi".into(),
+            (SurfaceState::Ready, InstallerOperation::Install)
+                if self.updating_from().is_some() =>
+            {
+                "Update".into()
+            }
+            (SurfaceState::Ready, InstallerOperation::Install)
+                if self.readiness.installed.is_none() =>
+            {
+                "Install".into()
+            }
+            (SurfaceState::Ready, InstallerOperation::Install | InstallerOperation::Repair) => {
+                "Reinstall".into()
+            }
+            (SurfaceState::Ready, InstallerOperation::Remove) => "Remove".into(),
+            (SurfaceState::Complete, _) if self.opens_compi() => "Open Compi".into(),
+            (SurfaceState::Complete, _) => return None,
             (SurfaceState::Error(_), _) if self.launch_failed => "Open Compi".into(),
             (SurfaceState::Error(_), _) => "Try again".into(),
             (SurfaceState::Doctor { .. }, _) => {
@@ -678,7 +735,23 @@ impl InstallerApp {
                     }
                 }
             }
-        }
+        })
+    }
+
+    /// The one word under the name while Setup works.
+    fn status_word(&self) -> Option<&'static str> {
+        Some(match &self.state {
+            SurfaceState::Checking => "Checking",
+            SurfaceState::Fixing => "Fixing",
+            SurfaceState::Installing if self.cancel.load(Ordering::Acquire) => "Cancelling",
+            SurfaceState::Installing => match self.operation {
+                InstallerOperation::Install if self.updating_from().is_some() => "Updating",
+                InstallerOperation::Install if self.readiness.installed.is_none() => "Installing",
+                InstallerOperation::Install | InstallerOperation::Repair => "Reinstalling",
+                InstallerOperation::Remove => "Removing",
+            },
+            _ => return None,
+        })
     }
 
     fn findings(&self) -> &[Finding] {
@@ -695,340 +768,352 @@ impl InstallerApp {
         }
     }
 
-    fn render_header(&self) -> impl IntoElement {
+    /// The drag strip along the top and the ×, which closes, or cancels while Windows
+    /// Installer can still undo the change.
+    fn render_top(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.look.colors;
+        let busy = self.busy.load(Ordering::Acquire);
+        let closable =
+            !busy || (matches!(self.state, SurfaceState::Installing) && self.cancellable);
         div()
-            .h(px(44.0))
-            .flex_none()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w_full()
+            .h(px(TOP_STRIP))
             .flex()
-            .items_center()
-            .justify_between()
-            .pl_4()
-            .bg(rgb(COLORS.surface))
-            .border_b_1()
-            .border_color(rgb(COLORS.border))
-            .window_control_area(WindowControlArea::Drag)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(brand_mark())
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child("COMPI"),
-                    ),
+                    .flex_1()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
             )
-            .when(!self.busy.load(Ordering::Acquire), |header| {
-                header.child(
+            .when(closable, |strip| {
+                strip.child(
                     div()
                         .id("installer-close")
-                        .w(px(46.0))
+                        .role(Role::Button)
+                        .aria_label(if busy { "Cancel" } else { "Close" })
+                        .w(px(44.0))
                         .h_full()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(19.0))
-                        .text_color(rgb(COLORS.muted))
-                        .window_control_area(WindowControlArea::Close)
-                        .hover(|style| {
-                            style
-                                .bg(rgb(0x4a1f22))
-                                .text_color(rgb(COLORS.foreground))
-                                .cursor_pointer()
+                        .hover(move |style| {
+                            style.bg(Hsla::from(rgb(colors.foreground)).alpha(0.08))
                         })
-                        .on_click(|_, window, _| window.remove_window())
-                        .child("×"),
+                        .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
+                        .child(close_glyph(colors.muted)),
                 )
             })
     }
 
-    fn render_ready(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let version = env!("CARGO_PKG_VERSION");
-        let (title, description) = match (self.operation, &self.readiness.installed) {
-            (InstallerOperation::Install, Some(installed)) if installed == version => (
-                "Reinstall Compi".to_owned(),
-                format!("Version {version} is already installed."),
-            ),
-            (InstallerOperation::Install, Some(installed)) => (
-                "Update Compi".to_owned(),
-                format!("Version {installed} → {version}"),
-            ),
-            (InstallerOperation::Install, None) => (
-                "Install Compi".to_owned(),
-                "A terminal for WSL. Your shells keep running when you close the window."
-                    .to_owned(),
-            ),
-            (InstallerOperation::Repair, _) => (
-                "Reinstall files".to_owned(),
-                "Replaces Compi's program files. Your settings and workspaces are kept.".to_owned(),
-            ),
-            (InstallerOperation::Remove, _) => (
-                "Remove Compi".to_owned(),
-                "Your settings and workspaces are kept unless you choose to delete them."
-                    .to_owned(),
-            ),
-        };
-        let plan = &self.readiness.plan;
-        let detail = match (self.operation, self.package_size()) {
-            (InstallerOperation::Install, Some(bytes)) => {
-                Some(format!("Compi {version} · {}", plain::megabytes(bytes)))
-            }
+    /// Every screen but the doctor: the mark, the name, and one action.
+    fn render_stage(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.look.colors;
+        let error = match &self.state {
+            SurfaceState::Error(error) => Some(error.clone()),
             _ => None,
         };
         div()
             .flex_1()
-            .id("installer-ready-body")
-            .overflow_y_scroll()
+            .w_full()
             .flex()
             .flex_col()
-            .px(px(38.0))
-            .pt(px(34.0))
+            .items_center()
+            .justify_center()
+            .pt(px(TOP_STRIP))
+            .child(self.render_emblem())
             .child(
                 div()
-                    .text_size(px(25.0))
+                    .mt(px(12.0))
+                    .text_size(px(27.0))
+                    .line_height(px(34.0))
+                    .font_family(DISPLAY_FONT)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(title),
+                    .child("Compi"),
             )
+            // Fixed height, so the mark stays put from screen to screen.
             .child(
                 div()
-                    .mt_2()
-                    .max_w(px(500.0))
-                    .text_size(px(15.0))
-                    .line_height(px(22.0))
-                    .text_color(rgb(COLORS.muted))
-                    .child(description),
-            )
-            .when_some(detail, |content, detail| {
-                content.child(
-                    div()
-                        .mt_4()
-                        .text_size(px(13.0))
-                        .text_color(rgb(COLORS.muted))
-                        .child(detail),
-                )
-            })
-            .when(plan.needs_consent(), |content| {
-                let count = plan.shells.len();
-                let verb = match self.operation {
-                    InstallerOperation::Install => "Updating",
-                    InstallerOperation::Repair => "Reinstalling",
-                    InstallerOperation::Remove => "Removing Compi",
-                };
-                content.child(
-                    div()
-                        .mt_5()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
+                    .h(px(ACTION_HEIGHT))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .when_some(self.status_word(), |area, word| {
+                        area.child(
                             div()
-                                .text_size(px(15.0))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(COLORS.error))
-                                .child(format!("{verb} ends {count} {}:", shells_word(count))),
+                                .text_size(px(12.0))
+                                .text_color(rgb(colors.muted))
+                                .child(word),
                         )
-                        .child(
+                    })
+                    .when_some(error, |area, error| {
+                        area.child(
                             div()
-                                .text_size(px(14.0))
-                                .line_height(px(21.0))
-                                .child(shell_list(&plan.shells)),
+                                .max_w(px(320.0))
+                                .px_4()
+                                .text_center()
+                                .line_clamp(2)
+                                .text_size(px(13.0))
+                                .line_height(px(18.0))
+                                .text_color(Hsla::from(rgb(colors.error)).alpha(0.85))
+                                .child(error),
                         )
-                        .when(self.operation == InstallerOperation::Install, |content| {
-                            content.child(
-                                div()
-                                    .mt_1()
-                                    .text_size(px(13.0))
-                                    .text_color(rgb(COLORS.muted))
-                                    .child("They run an older version this update can't keep."),
-                            )
-                        }),
-                )
-            })
-            .when(
-                !plan.needs_consent() && plan.restarts_service(),
-                |content| {
-                    content.child(div().mt_5().text_size(px(14.0)).child(
-                        if self.operation == InstallerOperation::Remove {
-                            "Compi's background service will stop."
-                        } else {
-                            "Compi's background service will restart."
-                        },
-                    ))
-                },
+                    })
+                    .child(self.render_action(cx)),
             )
-            .when(self.operation == InstallerOperation::Remove, |content| {
-                content.child(
-                    div()
-                        .id("remove-managed-data")
-                        .tab_index(0)
-                        .mt_5()
-                        .text_size(px(14.0))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.remove_data = !this.remove_data;
-                            cx.notify();
-                        }))
-                        .child(format!(
-                            "{}  Also delete settings and workspaces",
-                            if self.remove_data { "☑" } else { "☐" }
-                        )),
-                )
-            })
     }
 
-    fn render_progress(&self) -> impl IntoElement {
-        let (title, line) = match &self.state {
-            SurfaceState::Checking if self.operation == InstallerOperation::Repair => {
-                ("Checking Compi…".to_owned(), String::new())
+    fn render_emblem(&self) -> impl IntoElement {
+        let colors = self.look.colors;
+        let reduced = *REDUCED_MOTION;
+        let halo = glow(colors.accent, self.look.glow);
+        let halo = if reduced {
+            halo.opacity(0.85).into_any_element()
+        } else {
+            halo.with_animation(
+                "installer-glow",
+                Animation::new(Duration::from_secs(4)).repeat(),
+                |halo, turn| halo.opacity(0.7 + 0.3 * (0.5 - 0.5 * (turn * TAU).cos())),
+            )
+            .into_any_element()
+        };
+        let progress = div()
+            .id("installer-progress")
+            .absolute()
+            .inset_0()
+            .role(Role::ProgressIndicator)
+            .aria_label(self.status_word().unwrap_or("Working"));
+        let ring = match &self.state {
+            SurfaceState::Installing if self.progress.is_some() => {
+                let percent = self.progress.unwrap_or(0).min(100);
+                Some(
+                    progress
+                        .aria_numeric_value(f64::from(percent))
+                        .aria_min_numeric_value(0.0)
+                        .aria_max_numeric_value(100.0)
+                        .child(ring(colors.accent, 0.0, percent as f32 / 100.0, true))
+                        .into_any_element(),
+                )
             }
-            SurfaceState::Checking => ("Checking your PC…".to_owned(), String::new()),
-            SurfaceState::Fixing(title) => (format!("{title}…"), String::new()),
-            _ => (
-                match self.operation {
-                    InstallerOperation::Install => "Installing Compi",
-                    InstallerOperation::Repair => "Reinstalling files",
-                    InstallerOperation::Remove => "Removing Compi",
-                }
-                .to_owned(),
-                match self.progress {
-                    Some(percent) => format!("{} · {percent}%", self.stage),
-                    None => self.stage.clone(),
-                },
+            SurfaceState::Installing | SurfaceState::Checking | SurfaceState::Fixing => {
+                Some(if reduced {
+                    progress
+                        .child(ring(colors.accent, 0.0, 0.0, true))
+                        .into_any_element()
+                } else {
+                    let accent = colors.accent;
+                    progress
+                        .with_animation(
+                            "installer-spin",
+                            Animation::new(Duration::from_millis(1400)).repeat(),
+                            move |progress, turn| progress.child(ring(accent, turn, 0.22, true)),
+                        )
+                        .into_any_element()
+                })
+            }
+            SurfaceState::Complete if !reduced => Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(glow(colors.accent, self.look.glow).with_animation(
+                        "installer-complete-glow",
+                        Animation::new(Duration::from_millis(1400)),
+                        |glow, delta| glow.opacity((delta * PI).sin()),
+                    ))
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .child(ring(colors.accent, 0.0, 1.0, false))
+                            .with_animation(
+                                "installer-complete-ring",
+                                Animation::new(Duration::from_millis(1200))
+                                    .with_easing(gpui::ease_in_out),
+                                |ring, delta| ring.opacity(1.0 - delta),
+                            ),
+                    )
+                    .into_any_element(),
             ),
+            _ => None,
         };
+        let inset = (EMBLEM - MARK) / 2.0;
         div()
-            .flex_1()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .px(px(44.0))
+            .relative()
+            .flex_none()
+            .size(px(EMBLEM))
+            .child(halo)
+            .children(ring)
             .child(
                 div()
-                    .w(px(42.0))
-                    .h(px(42.0))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(rgb(COLORS.accent))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(brand_mark()),
+                    .absolute()
+                    .top(px(inset))
+                    .left(px(inset))
+                    .child(mark(MARK, colors.accent)),
             )
-            .child(
-                div()
-                    .mt_5()
-                    .text_size(px(22.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .when(!line.is_empty(), |content| {
-                content.child(
-                    div()
-                        .mt_2()
-                        .text_size(px(14.0))
-                        .text_color(rgb(COLORS.muted))
-                        .child(line),
-                )
-            })
     }
 
-    fn render_complete(&self) -> impl IntoElement {
-        let version = self
-            .outcome
-            .version
-            .as_deref()
-            .unwrap_or(env!("CARGO_PKG_VERSION"));
-        let (title, detail) = match self.operation {
-            InstallerOperation::Remove => (
-                "Compi removed",
-                match &self.outcome.cleanup {
-                    Some(Ok(())) => "Your settings and workspaces were deleted.".to_owned(),
-                    Some(Err(error)) => error.clone(),
-                    None => "Your settings and workspaces were kept.".to_owned(),
-                },
-            ),
-            InstallerOperation::Repair => ("Compi is repaired", format!("Version {version}")),
-            InstallerOperation::Install => ("Compi is ready", format!("Version {version}")),
-        };
-        div()
-            .flex_1()
+    /// The pill and the short lines under it.
+    fn render_action(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.look.colors;
+        let ready = matches!(self.state, SurfaceState::Ready);
+        let consent = ready && self.readiness.plan.needs_consent();
+        let mut action = div()
+            .mt(px(20.0))
             .flex()
             .flex_col()
             .items_center()
-            .justify_center()
-            .px(px(44.0))
-            .child(
+            .gap(px(10.0));
+        if let Some(label) = self.primary_label() {
+            let fill = if consent { colors.error } else { colors.accent };
+            action = action.child(
+                pill(label, fill, colors)
+                    .on_click(cx.listener(|this, _, window, cx| this.primary_action(window, cx))),
+            );
+        } else if matches!(self.state, SurfaceState::Complete) {
+            action = action.child(
                 div()
-                    .w(px(42.0))
-                    .h(px(42.0))
-                    .rounded_full()
-                    .bg(rgb(COLORS.accent))
-                    .text_color(rgb(COLORS.background))
+                    .h(px(40.0))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .text_size(px(22.0))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("✓"),
-            )
-            .child(
-                div()
-                    .mt_5()
-                    .text_size(px(22.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .max_w(px(460.0))
                     .text_size(px(14.0))
-                    .text_color(rgb(COLORS.muted))
-                    .child(detail),
-            )
-            .when(self.outcome.restart_required, |content| {
-                content.child(
-                    div()
-                        .mt_3()
-                        .text_size(px(14.0))
-                        .child("Restart Windows to finish."),
-                )
-            })
+                    .text_color(rgb(colors.muted))
+                    .child(if self.operation == InstallerOperation::Remove {
+                        "Compi removed"
+                    } else {
+                        "Restart Windows to finish"
+                    }),
+            );
+        }
+        if consent {
+            action = action.child(self.render_consent_line());
+        }
+        if ready && self.operation == InstallerOperation::Remove {
+            action = action.child(self.render_data_checkbox(cx));
+        }
+        if let (SurfaceState::Complete, Some(Err(error))) = (&self.state, &self.outcome.cleanup) {
+            action = action.child(
+                div()
+                    .max_w(px(320.0))
+                    .text_center()
+                    .text_size(px(12.0))
+                    .text_color(Hsla::from(rgb(colors.error)).alpha(0.85))
+                    .child(error.clone()),
+            );
+        }
+        if matches!(self.state, SurfaceState::Error(_)) {
+            action = action.child(self.render_log_link(cx));
+        }
+        action
     }
 
-    fn render_error(&self, error: &str) -> impl IntoElement {
+    /// Ending shells stays explicit: their names, cut to one line, all of them on hover.
+    fn render_consent_line(&self) -> impl IntoElement {
+        let colors = self.look.colors;
+        let shells = &self.readiness.plan.shells;
+        let line: SharedString = format!(
+            "Ends {} {}: {}",
+            shells.len(),
+            shells_word(shells.len()),
+            shells.join(", ")
+        )
+        .into();
+        let tip = line.clone();
         div()
-            .flex_1()
-            .id("installer-error-body")
-            .overflow_y_scroll()
+            .id("consent-shells")
+            .max_w(px(320.0))
+            .truncate()
+            .text_size(px(12.0))
+            .text_color(rgb(colors.muted))
+            .aria_label(line.clone())
+            .tooltip(move |_, cx| {
+                cx.new(|_| Tip {
+                    text: tip.clone(),
+                    colors,
+                })
+                .into()
+            })
+            .child(line)
+    }
+
+    fn render_data_checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.look.colors;
+        let checked = self.remove_data;
+        let label = "Also delete settings and workspaces";
+        div()
+            .id("remove-managed-data")
+            .tab_index(0)
+            .role(Role::CheckBox)
+            .aria_toggled(if checked {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+            .aria_label(label)
+            .aria_keyshortcuts("Control+D")
+            .px(px(4.0))
+            .py(px(2.0))
             .flex()
-            .flex_col()
-            .px(px(38.0))
-            .pt(px(46.0))
+            .items_center()
+            .gap_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .focus_visible(move |style| style.border_color(rgb(colors.accent)))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.remove_data = !this.remove_data;
+                cx.notify();
+            }))
             .child(
                 div()
-                    .text_size(px(24.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(if self.attempted {
-                        "Setup couldn't finish"
-                    } else {
-                        "Setup can't continue yet"
-                    }),
+                    .size(px(14.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(if checked { colors.accent } else { colors.muted }))
+                    .text_size(px(10.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(colors.background))
+                    .when(checked, |box_| box_.bg(rgb(colors.accent)).child("✓")),
             )
             .child(
                 div()
-                    .mt_3()
-                    .max_w(px(500.0))
-                    .text_size(px(15.0))
-                    .line_height(px(22.0))
-                    .child(error.to_owned()),
+                    .text_size(px(12.0))
+                    .text_color(rgb(colors.muted))
+                    .child(label),
             )
+    }
+
+    fn render_log_link(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.look.colors;
+        div()
+            .id("open-installer-log")
+            .tab_index(0)
+            .role(Role::Link)
+            .aria_label("Open log")
+            .text_size(px(12.0))
+            .text_color(rgb(colors.muted))
+            .cursor_pointer()
+            .hover(move |style| style.text_color(rgb(colors.foreground)).underline())
+            .focus_visible(move |style| style.text_color(rgb(colors.foreground)).underline())
+            .child("Open log")
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Err(error) = Command::new("notepad.exe").arg(this.log_path()).spawn() {
+                    transaction::log(&format!("Opening the log failed: {error}"));
+                    this.state = SurfaceState::Error("The log couldn't be opened.".into());
+                    cx.notify();
+                }
+            }))
     }
 
     fn render_doctor(&self, fix_error: Option<&str>, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.look.colors;
         let findings = self.findings();
         let healthy = findings.is_empty();
         let reinstall_shells: Vec<String> = self
@@ -1036,53 +1121,39 @@ impl InstallerApp {
             .as_ref()
             .map(|inspection| doctor::reinstall_plan(&daemon_facts(&inspection.daemons)).shells)
             .unwrap_or_default();
-        let mut body = div()
-            .flex_1()
-            .id("doctor-body")
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .px(px(38.0))
-            .pt(px(28.0))
-            .pb(px(16.0))
-            .child(
-                div()
-                    .text_size(px(24.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(if healthy {
-                        "No problems found".to_owned()
-                    } else if findings.len() == 1 {
-                        "Compi has 1 problem".to_owned()
-                    } else {
-                        format!("Compi has {} problems", findings.len())
-                    }),
-            );
+        let mut body = body("doctor-body").child(headline(if healthy {
+            "No problems found".to_owned()
+        } else if findings.len() == 1 {
+            "Compi has 1 problem".to_owned()
+        } else {
+            format!("Compi has {} problems", findings.len())
+        }));
         if let Some(error) = fix_error {
             body = body.child(
                 div()
-                    .mt_3()
-                    .text_size(px(14.0))
-                    .line_height(px(20.0))
-                    .text_color(rgb(COLORS.error))
+                    .mt_2()
+                    .text_size(px(13.0))
+                    .line_height(px(19.0))
+                    .text_color(rgb(colors.error))
                     .child(format!("Couldn't fix it: {error}")),
             );
         }
         if healthy {
-            body = body
+            return body
                 .child(
                     div()
-                        .mt_2()
-                        .text_size(px(15.0))
-                        .text_color(rgb(COLORS.muted))
+                        .mt_1()
+                        .text_size(px(14.0))
+                        .text_color(rgb(colors.muted))
                         .child("Compi is set up correctly."),
                 )
                 .when(!reinstall_shells.is_empty(), |body| {
                     body.child(
                         div()
-                            .mt_5()
+                            .mt_4()
                             .text_size(px(13.0))
                             .line_height(px(19.0))
-                            .text_color(rgb(COLORS.muted))
+                            .text_color(rgb(colors.muted))
                             .child(format!(
                                 "Reinstalling files ends {} {}: {}",
                                 reinstall_shells.len(),
@@ -1091,84 +1162,81 @@ impl InstallerApp {
                             )),
                     )
                 });
-            return body;
         }
         for (index, finding) in findings.iter().enumerate() {
             let label = fix_label(finding);
             let shells = finding.shells();
-            body =
-                body.child(
-                    div()
-                        .mt_4()
-                        .p_3()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(COLORS.border))
-                        .bg(rgb(COLORS.surface))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
+            body = body.child(
+                div()
+                    .mt_3()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .bg(rgb(colors.surface))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(finding.title()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .line_height(px(19.0))
+                                    .text_color(rgb(colors.muted))
+                                    .child(finding.explanation()),
+                            )
+                            .when_some(finding.command(), |row, command| {
+                                row.child(
                                     div()
-                                        .text_size(px(15.0))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(finding.title()),
+                                        .mt_1()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(colors.background))
+                                        .font_family("Cascadia Mono")
+                                        .text_size(px(12.0))
+                                        .child(command),
                                 )
-                                .child(
+                            })
+                            .when(!shells.is_empty(), |row| {
+                                row.child(
                                     div()
                                         .text_size(px(13.0))
                                         .line_height(px(19.0))
-                                        .text_color(rgb(COLORS.muted))
-                                        .child(finding.explanation()),
+                                        .text_color(rgb(colors.error))
+                                        .child(format!("Ends: {}", shell_list(shells))),
                                 )
-                                .when_some(finding.command(), |row, command| {
-                                    row.child(
-                                        div()
-                                            .mt_1()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_sm()
-                                            .bg(rgb(COLORS.background))
-                                            .font_family("Cascadia Mono")
-                                            .text_size(px(13.0))
-                                            .child(command),
-                                    )
-                                })
-                                .when(!shells.is_empty(), |row| {
-                                    row.child(
-                                        div()
-                                            .text_size(px(13.0))
-                                            .line_height(px(19.0))
-                                            .text_color(rgb(COLORS.error))
-                                            .child(format!("Ends: {}", shell_list(shells))),
-                                    )
-                                }),
-                        )
-                        .when_some(label, |row, label| {
-                            row.child(button(("doctor-fix", index), label, false).on_click(
+                            }),
+                    )
+                    .when_some(label, |row, label| {
+                        row.child(
+                            button(("doctor-fix", index), label, false, colors).on_click(
                                 cx.listener(move |this, _, _, cx| this.fix_one(index, cx)),
-                            ))
-                        }),
-                );
+                            ),
+                        )
+                    }),
+            );
         }
         body
     }
 
-    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled = !matches!(self.state, SurfaceState::Checking | SurfaceState::Fixing(_))
-            && (!matches!(self.state, SurfaceState::Installing) || self.cancellable);
-        let label = self.action_label();
-        let doctor = matches!(self.state, SurfaceState::Doctor { .. });
-        let healthy = doctor && self.findings().is_empty();
-        let fixable = doctor && !all_fixes(self.findings()).is_empty();
-        let show_log = doctor || matches!(self.state, SurfaceState::Error(_));
+    fn render_doctor_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.look.colors;
+        let healthy = self.findings().is_empty();
+        let fixable = !all_fixes(self.findings()).is_empty();
         let reinstall_label = {
             let shells = self
                 .inspection
@@ -1186,86 +1254,55 @@ impl InstallerApp {
             }
         };
         div()
-            .h(px(76.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_between()
-            .px(px(38.0))
-            .border_t_1()
-            .border_color(rgb(COLORS.border))
-            .child(if show_log {
-                div()
-                    .id("open-installer-log")
-                    .tab_index(0)
-                    .text_size(px(13.0))
-                    .text_color(rgb(COLORS.muted))
-                    .cursor_pointer()
-                    .hover(|style| style.text_color(rgb(COLORS.foreground)))
-                    .child("Open log")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Err(error) = Command::new("notepad.exe").arg(this.log_path()).spawn()
-                        {
-                            transaction::log(&format!("Opening the log failed: {error}"));
-                            this.state = SurfaceState::Error("The log couldn't be opened.".into());
-                            cx.notify();
-                        }
-                    }))
-                    .into_any_element()
-            } else {
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(COLORS.muted))
-                    .child("Your projects are never touched")
-                    .into_any_element()
-            })
+            .gap_3()
+            .px(px(INSET))
+            .pt(px(12.0))
+            .pb(px(20.0))
+            .child(self.render_log_link(cx))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .when(healthy, |buttons| {
-                        buttons.child(button("doctor-reinstall", reinstall_label, false).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.start_reinstall(cx);
-                                cx.notify();
-                            }),
-                        ))
-                    })
-                    .when(fixable, |buttons| {
                         buttons.child(
-                            button("doctor-done", "Done".to_owned(), false)
-                                .on_click(cx.listener(|_, _, window, _| window.remove_window())),
-                        )
-                    })
-                    .when(doctor && !healthy && !fixable, |buttons| {
-                        buttons.child(
-                            button("doctor-recheck", "Check again".to_owned(), false).on_click(
+                            button("doctor-reinstall", reinstall_label, false, colors).on_click(
                                 cx.listener(|this, _, _, cx| {
-                                    this.run_doctor(Vec::new(), None);
+                                    this.start_reinstall(cx);
                                     cx.notify();
                                 }),
                             ),
                         )
                     })
-                    .child({
-                        let primary = button("installer-primary-action", label, true);
-                        if !enabled {
-                            primary
-                                .bg(rgb(COLORS.border))
-                                .text_color(rgb(COLORS.muted))
-                                .into_any_element()
-                        } else if doctor && !fixable {
-                            primary
-                                .on_click(cx.listener(|_, _, window, _| window.remove_window()))
-                                .into_any_element()
+                    .when(fixable, |buttons| {
+                        buttons.child(
+                            button("doctor-done", "Done", false, colors)
+                                .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+                        )
+                    })
+                    .when(!healthy && !fixable, |buttons| {
+                        buttons.child(
+                            button("doctor-recheck", "Check again", false, colors).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.run_doctor(Vec::new());
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                    })
+                    .when_some(self.primary_label(), |buttons, label| {
+                        let primary = button("installer-primary-action", label, true, colors);
+                        buttons.child(if fixable {
+                            primary.on_click(
+                                cx.listener(|this, _, window, cx| this.primary_action(window, cx)),
+                            )
                         } else {
-                            primary
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.primary_action(window, cx)
-                                }))
-                                .into_any_element()
-                        }
+                            primary.on_click(cx.listener(|_, _, window, _| window.remove_window()))
+                        })
                     }),
             )
     }
@@ -1275,38 +1312,270 @@ fn daemon_facts(daemons: &[Daemon]) -> Vec<doctor::RunningDaemon> {
     daemons.iter().map(|daemon| daemon.fact.clone()).collect()
 }
 
-fn button(
-    id: impl Into<gpui::ElementId>,
-    label: String,
-    primary: bool,
-) -> gpui::Stateful<gpui::Div> {
+#[derive(Clone, Copy)]
+struct Look {
+    colors: &'static ThemeColors,
+    /// Near-black, or near-white, tinted toward the accent.
+    backdrop: u32,
+    /// How strongly the accent glows on the backdrop.
+    glow: f32,
+}
+
+/// Setup follows Windows' app mode: Compi's default dark theme, or a neutral light one.
+fn look(appearance: WindowAppearance) -> Look {
+    match appearance {
+        WindowAppearance::Light | WindowAppearance::VibrantLight => Look {
+            colors: ThemePreset::GitHubLight.colors(),
+            backdrop: 0xf3f6fa,
+            glow: 0.55,
+        },
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => Look {
+            colors: ThemePreset::DarkGlass.colors(),
+            backdrop: 0x0f1209,
+            glow: 1.0,
+        },
+    }
+}
+
+static REDUCED_MOTION: LazyLock<bool> = LazyLock::new(reduced_motion);
+
+/// Windows turns off client-area animations under Settings → Accessibility →
+/// Visual effects → Animation effects.
+fn reduced_motion() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SystemParametersInfoW(
+            action: u32,
+            param: u32,
+            value: *mut core::ffi::c_void,
+            update: u32,
+        ) -> i32;
+    }
+    const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+    let mut enabled: i32 = 1;
+    // SAFETY: the action writes one BOOL to the provided, correctly sized buffer.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut enabled as *mut i32).cast(),
+            0,
+        )
+    };
+    ok != 0 && enabled == 0
+}
+
+/// Soft light behind the mark: translucent discs with wide blurred shadows (GPUI has no
+/// radial gradient).
+fn glow(accent: u32, strength: f32) -> gpui::Div {
+    let accent = Hsla::from(rgb(accent));
+    let center = EMBLEM / 2.0;
+    let disc = |size: f32, fill: f32, blur: f32, shadow: f32| {
+        div()
+            .absolute()
+            .top(px(center - size / 2.0))
+            .left(px(center - size / 2.0))
+            .size(px(size))
+            .rounded_full()
+            .bg(accent.alpha(fill * strength))
+            .shadow(vec![BoxShadow {
+                color: accent.alpha(shadow * strength),
+                offset: point(px(0.0), px(0.0)),
+                blur_radius: px(blur),
+                spread_radius: px(0.0),
+                inset: false,
+            }])
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .child(disc(150.0, 0.0, 110.0, 0.26))
+        .child(disc(90.0, 0.0, 60.0, 0.30))
+}
+
+/// A ring around the mark: `sweep` turns of it from `start` (0 is twelve o'clock), over a
+/// faint full track.
+fn ring(accent: u32, start: f32, sweep: f32, track: bool) -> impl IntoElement {
+    let accent = Hsla::from(rgb(accent));
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            if track {
+                paint_arc(bounds, 0.0, 1.0, accent.alpha(0.16), window);
+            }
+            if sweep > 0.0 {
+                paint_arc(bounds, start, sweep, accent, window);
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+fn paint_arc(bounds: Bounds<Pixels>, start: f32, sweep: f32, color: Hsla, window: &mut Window) {
+    let center = bounds.center();
+    let steps = ((sweep * 128.0).ceil() as usize).max(2);
+    let mut path = PathBuilder::stroke(px(RING_WIDTH));
+    for step in 0..=steps {
+        let angle = (start + sweep * step as f32 / steps as f32) * TAU - FRAC_PI_2;
+        let at = point(
+            center.x + px(RING_RADIUS * angle.cos()),
+            center.y + px(RING_RADIUS * angle.sin()),
+        );
+        if step == 0 {
+            path.move_to(at);
+        } else {
+            path.line_to(at);
+        }
+    }
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
+struct Tip {
+    text: SharedString,
+    colors: &'static ThemeColors,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors;
+        div()
+            .max_w(px(300.0))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
+            .font_family("Segoe UI Variable")
+            .text_size(px(12.0))
+            .line_height(px(17.0))
+            .text_color(rgb(colors.foreground))
+            .child(self.text.clone())
+    }
+}
+
+fn body(id: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .px(px(INSET))
+        .pt(px(TOP_STRIP))
+        .pb(px(8.0))
+}
+
+fn headline(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .text_size(px(20.0))
+        .line_height(px(28.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(text.into())
+}
+
+/// The wide primary button of every screen but the doctor.
+fn pill(label: String, fill: u32, colors: &'static ThemeColors) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("installer-primary-action")
         .tab_index(0)
-        .flex_none()
-        .min_w(px(if primary { 142.0 } else { 96.0 }))
-        .h(px(38.0))
-        .px_4()
-        .rounded_md()
+        .role(Role::Button)
+        .aria_label(SharedString::from(label.clone()))
+        .min_w(px(220.0))
+        .h(px(40.0))
+        .px(px(20.0))
         .flex()
         .items_center()
         .justify_center()
+        .rounded_full()
+        .border_2()
+        .border_color(gpui::transparent_black())
+        .bg(rgb(fill))
+        .text_color(rgb(colors.background))
         .text_size(px(14.0))
+        .font_family(DISPLAY_FONT)
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .cursor_pointer()
-        .when(primary, |button| {
-            button
-                .bg(rgb(COLORS.accent))
-                .text_color(rgb(COLORS.background))
-                .hover(|style| style.bg(rgb(0xcbea2f)))
+        .hover(|style| style.opacity(0.9))
+        .focus_visible(move |style| style.border_color(rgb(colors.foreground)))
+        .child(label)
+}
+
+/// The doctor's buttons.
+fn button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    primary: bool,
+    colors: &'static ThemeColors,
+) -> gpui::Stateful<gpui::Div> {
+    let label = label.into();
+    div()
+        .id(id)
+        .tab_index(0)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .flex_none()
+        .min_w(px(80.0))
+        .h(px(32.0))
+        .px(px(14.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .text_size(px(13.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .cursor_pointer()
+        .map(|button| {
+            if primary {
+                button
+                    .bg(rgb(colors.accent))
+                    .border_color(rgb(colors.accent))
+                    .text_color(rgb(colors.background))
+                    .hover(|style| style.opacity(0.88))
+                    .focus_visible(move |style| style.border_color(rgb(colors.foreground)))
+            } else {
+                button
+                    .bg(rgb(colors.surface))
+                    .border_color(rgb(colors.border))
+                    .hover(move |style| style.bg(rgb(colors.surface_hover)))
+                    .focus_visible(move |style| style.border_color(rgb(colors.accent)))
+            }
         })
-        .when(!primary, |button| {
-            button
-                .border_1()
-                .border_color(rgb(COLORS.border))
-                .hover(|style| style.bg(rgb(COLORS.surface)))
-        })
-        .child(SharedString::from(label))
+        .child(label)
+}
+
+/// The iris mark of Compi's title bar.
+fn mark(size: f32, tint: u32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            compi_client::gui::brand::paint(bounds, Hsla::from(rgb(tint)), window)
+        },
+    )
+    .size(px(size))
+}
+
+fn close_glyph(tint: u32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let at = |x: f32, y: f32| point(bounds.left() + px(x), bounds.top() + px(y));
+            let mut path = PathBuilder::stroke(px(1.25));
+            path.move_to(at(4.0, 4.0));
+            path.line_to(at(12.0, 12.0));
+            path.move_to(at(12.0, 4.0));
+            path.line_to(at(4.0, 12.0));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, Hsla::from(rgb(tint)));
+            }
+        },
+    )
+    .size(px(16.0))
 }
 
 impl Focusable for InstallerApp {
@@ -1317,20 +1586,8 @@ impl Focusable for InstallerApp {
 
 impl Render for InstallerApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match &self.state {
-            SurfaceState::Ready => self.render_ready(cx).into_any_element(),
-            SurfaceState::Installing | SurfaceState::Checking | SurfaceState::Fixing(_) => {
-                self.render_progress().into_any_element()
-            }
-            SurfaceState::Complete => self.render_complete().into_any_element(),
-            SurfaceState::Error(error) => self.render_error(error).into_any_element(),
-            SurfaceState::Doctor { fix_error } => {
-                let fix_error = fix_error.clone();
-                self.render_doctor(fix_error.as_deref(), cx)
-                    .into_any_element()
-            }
-        };
-        div()
+        let colors = self.look.colors;
+        let root = div()
             .key_context("CompiInstaller")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::primary_key))
@@ -1343,16 +1600,26 @@ impl Render for InstallerApp {
                     cx.notify();
                 }
             }))
+            .on_action(cx.listener(|_, _: &FocusNext, window, cx| window.focus_next(cx)))
+            .on_action(cx.listener(|_, _: &FocusPrevious, window, cx| window.focus_prev(cx)))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
+            .overflow_hidden()
             .font_family("Segoe UI Variable")
             .text_size(px(14.0))
-            .text_color(rgb(COLORS.foreground))
-            .bg(rgb(COLORS.background))
-            .child(self.render_header())
-            .child(content)
-            .child(self.render_footer(cx))
+            .text_color(rgb(colors.foreground))
+            .bg(rgb(self.look.backdrop));
+        let root = match &self.state {
+            SurfaceState::Doctor { fix_error } => {
+                let fix_error = fix_error.clone();
+                root.child(self.render_doctor(fix_error.as_deref(), cx))
+                    .child(self.render_doctor_actions(cx))
+            }
+            _ => root.child(self.render_stage(cx)),
+        };
+        root.child(self.render_top(cx))
     }
 }
 
@@ -1406,6 +1673,12 @@ fn preview_configuration(
             Readiness::default(),
             None,
         ),
+        PreviewState::Checking => (
+            InstallerOperation::Install,
+            SurfaceState::Checking,
+            Readiness::default(),
+            None,
+        ),
         PreviewState::Complete => (
             InstallerOperation::Install,
             SurfaceState::Complete,
@@ -1455,23 +1728,6 @@ fn preview_configuration(
             )
         }
     }
-}
-
-fn brand_mark() -> impl IntoElement {
-    static MARK: std::sync::LazyLock<Arc<gpui::RenderImage>> = std::sync::LazyLock::new(|| {
-        let mut rgba = image::load_from_memory(include_bytes!(
-            "../../../assets/Compi-desktopappicon-v4.png"
-        ))
-        .expect("approved embedded v4 artwork")
-        .into_rgba8();
-        for pixel in rgba.pixels_mut() {
-            pixel.0.swap(0, 2);
-        }
-        Arc::new(gpui::RenderImage::new(smallvec::smallvec![
-            image::Frame::new(rgba)
-        ]))
-    });
-    img(MARK.clone()).size(px(24.0))
 }
 
 pub(crate) fn ensure_supported_windows() -> Result<()> {

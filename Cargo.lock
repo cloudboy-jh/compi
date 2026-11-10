@@ -1326,11 +1326,9 @@ dependencies = [
  "compi-update",
  "gpui-pre",
  "gpui-pre-platform",
- "image",
  "semver",
  "serde",
  "serde_json",
- "smallvec",
  "windows 0.62.2",
  "winresource",
 ]

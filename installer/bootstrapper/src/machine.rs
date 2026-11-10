@@ -296,46 +296,6 @@ pub(crate) fn wsl_fact() -> Option<WslProblem> {
     }
 }
 
-const TERMINAL_STAGES: &[&str] = &[
-    "complete",
-    "rolled-back",
-    "cancelled-before-apply",
-    "failed-before-apply",
-    "reconciled-for-retry",
-];
-const INTERRUPTED_STAGES: &[&str] = &["staging", "applying", "rolling-back", "rollback-incomplete"];
-
-/// Setup attempt folders (`<pid>-<nanos>`) and the stage their journal records.
-fn setup_attempts() -> Vec<(PathBuf, String)> {
-    let Ok(installer) = transaction::data_root().map(|root| root.join("installer")) else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(installer) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.split_once('-'))
-                .is_some_and(|(pid, stamp)| {
-                    !pid.is_empty()
-                        && !stamp.is_empty()
-                        && pid.bytes().all(|b| b.is_ascii_digit())
-                        && stamp.bytes().all(|b| b.is_ascii_digit())
-                })
-        })
-        .filter_map(|path| {
-            let journal: serde_json::Value =
-                serde_json::from_slice(&fs::read(path.join("journal.json")).ok()?).ok()?;
-            let stage = journal.get("stage")?.as_str()?.to_owned();
-            Some((path, stage))
-        })
-        .collect()
-}
-
 fn update_interrupted(root: &Path) -> bool {
     let target = compi_update::InstallTarget {
         kind: compi_update::InstallationKind::InstalledWindows,
@@ -489,16 +449,18 @@ pub(crate) fn inspect() -> Result<Inspection> {
         .collect();
     // A running update or Setup holds the operation lock; its files are not leftovers.
     let idle = !root.is_dir() || compi_update::OperationLock::acquire(&root).is_ok();
-    let attempts = setup_attempts();
+    let attempts = transaction::installer_dir()
+        .map(|installer| transaction::setup_runs(&installer))
+        .unwrap_or_default();
     let unfinished = idle
         && (update_interrupted(&root)
             || attempts
                 .iter()
-                .any(|(_, stage)| INTERRUPTED_STAGES.contains(&stage.as_str())));
+                .any(|(_, stage)| transaction::INTERRUPTED_STAGES.contains(&stage.as_str())));
     let leftovers = idle
         && (attempts
             .iter()
-            .any(|(_, stage)| TERMINAL_STAGES.contains(&stage.as_str()))
+            .any(|(_, stage)| transaction::TERMINAL_STAGES.contains(&stage.as_str()))
             || crate::msi_actions::stale_lock_receipts(&root));
     let facts = Facts {
         own_protocol: compi_protocol::PROTOCOL_VERSION,
@@ -570,7 +532,7 @@ fn apply_inner(root: &Path, fix: &Fix, inspection: &Inspection) -> Result<()> {
         Fix::FinishOperation => {
             {
                 let _lock = compi_update::OperationLock::acquire(root)?;
-                transaction::recover(root, &transaction::data_root()?.join("installer"))?;
+                transaction::recover(root, &transaction::installer_dir()?)?;
             }
             compi_update::recover(&compi_update::InstallTarget {
                 kind: compi_update::InstallationKind::InstalledWindows,
@@ -581,12 +543,7 @@ fn apply_inner(root: &Path, fix: &Fix, inspection: &Inspection) -> Result<()> {
         Fix::ClearLeftovers => {
             let _lock = compi_update::OperationLock::acquire(root)?;
             crate::msi_actions::clear_stale_lock_receipts(root)?;
-            for (attempt, stage) in setup_attempts() {
-                if TERMINAL_STAGES.contains(&stage.as_str()) {
-                    transaction::clean_managed_data(&attempt)?;
-                }
-            }
-            Ok(())
+            transaction::prune_runs(root, &transaction::installer_dir()?, None)
         }
         Fix::RegisterTask => {
             let _lock = compi_update::OperationLock::acquire(root)?;

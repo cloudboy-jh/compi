@@ -33,7 +33,6 @@ impl std::error::Error for MsiFailure {}
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Outcome {
     pub restart_required: bool,
-    pub version: Option<String>,
     pub cleanup: Option<std::result::Result<(), String>>,
 }
 /// What Setup found before changing anything, shown to the user for approval.
@@ -631,6 +630,123 @@ pub(crate) fn recover(root: &Path, installer: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Journal stages after which a run folder holds nothing recovery needs.
+pub(crate) const TERMINAL_STAGES: &[&str] = &[
+    "complete",
+    "rolled-back",
+    "cancelled-before-apply",
+    "failed-before-apply",
+    "reconciled-for-retry",
+];
+pub(crate) const INTERRUPTED_STAGES: &[&str] =
+    &["staging", "applying", "rolling-back", "rollback-incomplete"];
+
+pub(crate) fn installer_dir() -> Result<PathBuf> {
+    Ok(data_root()?.join("installer"))
+}
+
+/// Setup run folders (`<pid>-<nanos>`) and the stage their journal records.
+pub(crate) fn setup_runs(installer: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(entries) = fs::read_dir(installer) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.split_once('-'))
+                .is_some_and(|(pid, stamp)| {
+                    !pid.is_empty()
+                        && !stamp.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit())
+                        && stamp.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+        .filter_map(|path| {
+            let journal: serde_json::Value =
+                serde_json::from_slice(&fs::read(path.join("journal.json")).ok()?).ok()?;
+            let stage = journal.get("stage")?.as_str()?.to_owned();
+            Some((path, stage))
+        })
+        .collect()
+}
+
+/// Finished run folders. `current` stays until its journal says complete.
+fn finished_runs(installer: &Path, current: Option<&Path>) -> Vec<PathBuf> {
+    setup_runs(installer)
+        .into_iter()
+        .filter(|(path, stage)| {
+            TERMINAL_STAGES.contains(&stage.as_str())
+                && (current != Some(path.as_path()) || stage == "complete")
+        })
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// Deletes finished Setup runs and stray files. The caller owns the operation lock.
+pub(crate) fn prune_runs(root: &Path, installer: &Path, current: Option<&Path>) -> Result<()> {
+    keep_repair_source(root, installer)?;
+    for run in finished_runs(installer, current) {
+        if let Err(error) = clean_managed_data(&run) {
+            log(&format!("Setup run {} kept: {error}", run.display()));
+        }
+    }
+    for entry in fs::read_dir(installer)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if entry.file_name().to_str().is_some_and(stray_file)
+            && path.is_file()
+            && let Err(error) = fs::remove_file(&path)
+        {
+            log(&format!("{} kept: {error}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Files earlier Setups and interrupted package copies left in the installer folder.
+fn stray_file(name: &str) -> bool {
+    matches!(
+        name,
+        "Compi-0.1.1.msi" | "upgrade-0.1.1.log" | "Compi.recovering.msi"
+    ) || (name.starts_with("Compi.") && name.ends_with(".next.msi"))
+}
+
+/// Windows Installer caches the package without its files, so repairing reads them from
+/// the folder Compi was installed from, usually a run folder. `Compi.msi` takes over as
+/// that source before run folders go; without an installed Compi it is deleted.
+fn keep_repair_source(root: &Path, installer: &Path) -> Result<()> {
+    let cache = installer.join("Compi.msi");
+    let Some(product) = owned_installed_product(root)? else {
+        if cache.is_file() {
+            fs::remove_file(&cache)?;
+        }
+        return Ok(());
+    };
+    let package = PathBuf::from(installed_product_property(&product.code, "InstallSource")?)
+        .join(installed_product_property(&product.code, "PackageName")?);
+    if package.is_file() && package != cache {
+        let next = installer.join("Compi.source.next.msi");
+        fs::copy(&package, &next)?;
+        atomic_replace(&next, &cache)?;
+    }
+    if !cache.is_file() {
+        // The source is gone already; no run folder can bring it back.
+        return Ok(());
+    }
+    let source = wide(std::ffi::OsString::from(format!("{}\\", installer.display())).as_os_str());
+    let code = wide(std::ffi::OsStr::new(&product.code));
+    // Per-user unmanaged context, network source type, appended to the product's list.
+    let result = unsafe {
+        MsiSourceListAddSourceExW(code.as_ptr(), std::ptr::null(), 2, 1, source.as_ptr(), 0)
+    };
+    if result != 0 {
+        return Err(format!("MsiSourceListAddSourceEx returned {result}").into());
+    }
+    Ok(())
+}
+
 /// Applies the operation. `approved` holds the daemon snapshots the user saw: any daemon
 /// the plan stops must be among them, and stops only if its shells are still as shown.
 pub(crate) fn perform(
@@ -654,9 +770,12 @@ pub(crate) fn perform(
     let readiness = preflight(operation)?;
     let root = root()?;
     let _lock = OperationLock::acquire(&root)?;
-    let installer = data_root()?.join("installer");
+    let installer = installer_dir()?;
     fs::create_dir_all(&installer)?;
     recover(&root, &installer)?;
+    if let Err(error) = prune_runs(&root, &installer, None) {
+        log(&format!("Earlier Setup runs kept: {error}"));
+    }
     let previous_selection = read_selection(&root)?;
     // Removing always targets the registered product: each Setup build carries its own
     // product code, and Windows Installer refuses to remove a package it never installed.
@@ -670,10 +789,6 @@ pub(crate) fn perform(
             InstallerSource::ProductCode(installed.code)
         }
         source => source,
-    };
-    let product_code = match &source {
-        InstallerSource::ProductCode(code) => Some(code.clone()),
-        _ => None,
     };
     let id = format!(
         "{}-{}",
@@ -830,33 +945,18 @@ pub(crate) fn perform(
         }
         .into());
     }
-    if let Some(staged) = &journal.package
-        && operation != InstallerOperation::Remove
-    {
-        let next = installer.join(format!("Compi.{id}.next.msi"));
-        fs::copy(staged, &next)?;
-        atomic_replace(&next, &cache)?;
-    }
     journal.stage = "complete".into();
     persist(&journal_path, &journal)?;
     if operation != InstallerOperation::Remove {
         // The stopped service comes back on the version Windows Installer just registered.
         restart_service(stopped_default);
     }
-    let version = if operation == InstallerOperation::Remove {
-        None
-    } else {
-        match product_code {
-            Some(code) => installed_product_version(&code)
-                .inspect_err(|error| log(&format!("Installed version unavailable: {error}")))
-                .ok(),
-            None => Some(env!("CARGO_PKG_VERSION").to_owned()),
-        }
-    };
+    if let Err(error) = prune_runs(&root, &installer, Some(attempt.as_path())) {
+        log(&format!("Setup run {} kept: {error}", attempt.display()));
+    }
     let mut outcome = Outcome {
         restart_required: code != 0,
         cleanup: None,
-        version,
     };
     if operation == InstallerOperation::Remove {
         // Update journals, staging and worker copies under the program folder belong
@@ -1044,6 +1144,14 @@ unsafe extern "system" {
         product: *mut u16,
     ) -> u32;
     fn MsiQueryProductStateW(product: *const u16) -> i32;
+    fn MsiSourceListAddSourceExW(
+        product: *const u16,
+        user_sid: *const u16,
+        context: u32,
+        options: u32,
+        source: *const u16,
+        index: u32,
+    ) -> u32;
 }
 struct Callback {
     cancel: Arc<AtomicBool>,
@@ -1322,6 +1430,46 @@ mod tests {
             previous_selection: None,
             initial_install: Some(true),
         }
+    }
+
+    #[test]
+    fn finished_runs_go_while_unfinished_and_current_runs_stay() {
+        let installer = RecoveryTemp::new();
+        let run = |name: &str, stage: &str| {
+            let path = installer.0.join(name);
+            fs::create_dir_all(&path).unwrap();
+            persist(&path.join("journal.json"), &initial_journal(stage)).unwrap();
+            path
+        };
+        let complete = run("10-1", "complete");
+        let rolled_back = run("11-2", "rolled-back");
+        run("12-3", "applying");
+        run("13-4", "staging");
+        run("14-5", "rollback-incomplete");
+        run("notes", "complete");
+        fs::create_dir_all(installer.0.join("15-6")).unwrap();
+        let current = run("16-7", "applying");
+        let mut finished = finished_runs(&installer.0, Some(current.as_path()));
+        finished.sort();
+        assert_eq!(finished, vec![complete, rolled_back]);
+        // A failed current run waits for the next Setup; a complete one goes now.
+        persist(
+            &current.join("journal.json"),
+            &initial_journal("rolled-back"),
+        )
+        .unwrap();
+        assert!(!finished_runs(&installer.0, Some(current.as_path())).contains(&current));
+        persist(&current.join("journal.json"), &initial_journal("complete")).unwrap();
+        assert!(finished_runs(&installer.0, Some(current.as_path())).contains(&current));
+    }
+
+    #[test]
+    fn stray_files_never_include_the_repair_source() {
+        assert!(!stray_file("Compi.msi"));
+        assert!(!stray_file("previous.msi"));
+        assert!(stray_file("Compi-0.1.1.msi"));
+        assert!(stray_file("upgrade-0.1.1.log"));
+        assert!(stray_file("Compi.123-456.next.msi"));
     }
 
     #[test]

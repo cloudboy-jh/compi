@@ -9,6 +9,7 @@ fn main() {
         Some("upgrade") => PreviewState::Upgrade,
         Some("consent") => PreviewState::Consent,
         Some("installing") => PreviewState::Installing,
+        Some("checking") => PreviewState::Checking,
         Some("complete") => PreviewState::Complete,
         Some("error") => PreviewState::Error,
         Some("remove") => PreviewState::Remove,
