@@ -4,8 +4,7 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 ## Release state
 
-- **0.7.2** is published and Latest (2026-11-10 UTC). Daemon protocol 39, workspace format 10.
-- **0.7.3** is a draft awaiting review, not published: tag `v0.7.3` moved to `ad603c1` (the first draft at `9fae749` was deleted unpublished), release run [42877645833](https://github.com/cloudboy-jh/compi/actions/runs/42877645833). It holds the chat work (`72545db`) and the updater work below (`413f005`, `60c1019`, `656eaf5`). Read back: 12 assets; signed Windows, Setup and macOS metadata 0.7.3 / protocol 39 / qualified daemon 0.7.3 with the 0.7.3 notes; hashes match `SHA256SUMS.txt`; the update zip carries `compi-launcher.exe`.
+- **0.7.3** is published and Latest (2026-11-10 19:10 UTC; tag `v0.7.3` at `ad603c1`, release run [42877645833](https://github.com/cloudboy-jh/compi/actions/runs/42877645833); the first draft at `9fae749` was deleted unpublished). Chat work (`72545db`) and the updater work below (`413f005`, `60c1019`, `656eaf5`). Read back: 12 assets; signed Windows, Setup and macOS metadata 0.7.3 / protocol 39 / qualified daemon 0.7.3 with the 0.7.3 notes; hashes match `SHA256SUMS.txt`; the update zip carries `compi-launcher.exe`; the GitHub API's latest release is v0.7.3. Not yet exercised: the in-app update from an installed 0.7.2.
 
 ## In source for 0.7.3: updater (2026-11-10)
 
