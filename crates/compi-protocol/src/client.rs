@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::frame;
-use crate::program_status::SurfaceProgramStatus;
+use crate::program_status::{ChatProgramStatus, SurfaceProgramStatus};
 use crate::{
     CONTROL_FRAME, ClientControl, ClientMessage, ContentEnvironment, ContentRange, DirectoryEntry,
     ErrorCode, FileContent, FileState, FileVersion, GitAction, GitBranches, GitChanges,
@@ -312,6 +312,8 @@ pub struct DaemonClient {
     workspace: Option<WorkspaceSnapshot>,
     /// Kept current by `ProgramStatusChanged` after `watch_program_status`.
     program_status: BTreeMap<SurfaceId, SurfaceProgramStatus>,
+    /// Kept current by `ChatProgramStatusChanged` after `watch_program_status`.
+    chat_program_status: BTreeMap<String, ChatProgramStatus>,
 }
 
 impl DaemonClient {
@@ -676,10 +678,11 @@ impl DaemonClient {
     }
 
     /// Starts receiving program status on this connection. When this returns,
-    /// `program_status` holds every terminal's current records; later changes arrive as
-    /// events and keep it current.
+    /// `program_status` and `chat_program_status` hold every terminal's and chat's current
+    /// records; later changes arrive as events and keep them current.
     pub fn watch_program_status(&mut self) -> Result<()> {
         self.program_status.clear();
+        self.chat_program_status.clear();
         match self.request_bounded(ClientMessage::WatchProgramStatus, Duration::from_secs(5))? {
             ServerMessage::ProgramStatusWatching => Ok(()),
             message => Err(unexpected_response(message)),
@@ -689,6 +692,11 @@ impl DaemonClient {
     /// Program status of every terminal that reports any, by surface.
     pub fn program_status(&self) -> &BTreeMap<SurfaceId, SurfaceProgramStatus> {
         &self.program_status
+    }
+
+    /// Program status of every chat that reports any, by chat ID.
+    pub fn chat_program_status(&self) -> &BTreeMap<String, ChatProgramStatus> {
+        &self.chat_program_status
     }
 
     /// Removes the surface's `done` and `error` records once the user has seen them.
@@ -809,8 +817,15 @@ impl DaemonClient {
     /// Starts watching `chat` on this connection, starting its harness if needed, and
     /// returns its whole state; each change then arrives as `ChatChanged`. Use a connection
     /// of its own: replies to other requests on it skip those events.
-    pub fn watch_chat(&mut self, chat: crate::chat::ChatContent) -> Result<crate::chat::ChatState> {
-        match self.request_bounded(ClientMessage::WatchChat { chat }, Duration::from_secs(10))? {
+    pub fn watch_chat(
+        &mut self,
+        chat: crate::chat::ChatContent,
+        approval: crate::chat::ChatApproval,
+    ) -> Result<crate::chat::ChatState> {
+        match self.request_bounded(
+            ClientMessage::WatchChat { chat, approval },
+            Duration::from_secs(10),
+        )? {
             ServerMessage::ChatWatching { state } => Ok(state),
             message => Err(unexpected_response(message)),
         }
@@ -1468,6 +1483,7 @@ impl DaemonClient {
             target: None,
             workspace: None,
             program_status: BTreeMap::new(),
+            chat_program_status: BTreeMap::new(),
         }
     }
 
@@ -1488,6 +1504,7 @@ impl DaemonClient {
             target: Some(target),
             workspace,
             program_status: BTreeMap::new(),
+            chat_program_status: BTreeMap::new(),
         }
     }
 
@@ -1551,6 +1568,14 @@ impl DaemonClient {
                 } else {
                     self.program_status
                         .insert(status.surface_id.clone(), status.clone());
+                }
+            }
+            ServerMessage::ChatProgramStatusChanged { status } => {
+                if status.records.is_empty() {
+                    self.chat_program_status.remove(&status.chat_id);
+                } else {
+                    self.chat_program_status
+                        .insert(status.chat_id.clone(), status.clone());
                 }
             }
             ServerMessage::SurfaceExited { identity, .. }

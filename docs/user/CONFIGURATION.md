@@ -40,9 +40,12 @@ Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, an
 
 **Settings → Interface → Chat text size** sizes agent chats with −, + and **Reset**. The messages and everything around them (header, tool cards, menus, the message box) grow together; the rest of the window keeps its size. With a chat focused, Ctrl+=, Ctrl+- and Ctrl+0 (Cmd on macOS) change the chat text size instead of the terminal font. It is saved in its own table, and every window follows it, including after editing the file by hand. Reset removes the key, returning to the default of 14.
 
+**Settings → Chat → Approvals** chooses how OMP asks before it runs tools in a chat. **Same as OMP** (the default) uses OMP's own `tools.approvalMode`, the setting OMP follows in a terminal; Compi reads it when the chat starts and hands it to OMP, which its chat mode would otherwise ignore. **Always ask** asks before anything but reading, **Allow edits** runs reads and edits and asks before commands, and **Allow everything** never asks. A change applies to new chats and to chats that start again (Restart in the ⋯ menu, or after the daemon restarts); a running chat keeps the mode it started with.
+
 ```toml
 [chat]
 text_size = 14 # 10 through 32
+approval = "harness" # harness (Same as OMP), always_ask, write or yolo
 ```
 
 ## Pane density

@@ -837,9 +837,9 @@ fn handle_connection(
                         },
                     })?;
                 }
-                ClientMessage::WatchChat { chat } => match chat.validate() {
+                ClientMessage::WatchChat { chat, approval } => match chat.validate() {
                     Ok(()) => {
-                        let (state, events) = crate::chat::hub().watch(&chat);
+                        let (state, events) = crate::chat::hub().watch(&chat, approval);
                         sink.send_control(&ServerControl {
                             request_id: Some(request_id),
                             message: ServerMessage::ChatWatching { state },
@@ -909,12 +909,20 @@ fn handle_connection(
                         }
                     }
                 }
-                ClientMessage::ResumeChat { chat, session } => {
-                    answer_chat(&sink, request_id, crate::chat::hub().resume(&chat, session))?
-                }
-                ClientMessage::RestartChat { chat } => {
-                    answer_chat(&sink, request_id, crate::chat::hub().restart(&chat))?
-                }
+                ClientMessage::ResumeChat {
+                    chat,
+                    session,
+                    approval,
+                } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().resume(&chat, session, approval),
+                )?,
+                ClientMessage::RestartChat { chat, approval } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().restart(&chat, approval),
+                )?,
                 ClientMessage::WatchSystemTotals { source } => match Source::resolve(&source) {
                     Ok(source) => {
                         system_totals_watch = Some(source.watch_totals());
@@ -987,6 +995,13 @@ fn handle_connection(
                         })?,
                         Err(error) => send_surface_error(&sink, request_id, &error),
                     }
+                }
+                ClientMessage::AcknowledgeChatProgramStatus { chat } => {
+                    crate::chat::hub().acknowledge(&chat);
+                    sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::ProgramStatusAcknowledged,
+                    })?;
                 }
                 ClientMessage::GetSurfaceMetadata {
                     surface_id,
@@ -1713,12 +1728,15 @@ fn send_program_status(
     watch: &mut ProgramStatusWatch,
     manager: &SurfaceManager,
 ) -> Result<()> {
-    for pending in watch.pending(manager.program_status(), Instant::now()) {
+    let pending = watch.pending(
+        manager.program_status(),
+        crate::chat::hub().program_status(),
+        Instant::now(),
+    );
+    for pending in pending {
         let sent = sink.send_control_if_room(&ServerControl {
             request_id: None,
-            message: ServerMessage::ProgramStatusChanged {
-                status: pending.status.clone(),
-            },
+            message: pending.message(),
         })?;
         if !sent {
             watch.retry();

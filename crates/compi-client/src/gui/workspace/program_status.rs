@@ -1,9 +1,13 @@
-//! Program status (OSC 7501) of every terminal. One watching connection per window
-//! follows all of them, attached or not, so background tabs show what needs the user.
+//! Program status of every terminal (OSC 7501) and every chat (reported by the daemon
+//! that runs it). One watching connection per window follows all of them, attached or
+//! not, so background tabs show what needs the user.
 use super::*;
 use crate::gui::controls::IconName;
 use crate::program_status::{self as status, Headline};
-use compi_protocol::program_status::{ProgramState, ProgramStatusRecord, SurfaceProgramStatus};
+use compi_protocol::PaneContent;
+use compi_protocol::program_status::{
+    ChatProgramStatus, ProgramState, ProgramStatusRecord, SurfaceProgramStatus,
+};
 use std::sync::mpsc;
 
 /// How often the watching connection looks for status and acknowledgements.
@@ -11,10 +15,15 @@ const WATCH_POLL: Duration = Duration::from_millis(50);
 /// Wait before reconnecting after the daemon connection failed or was released.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
-type Acknowledgement = (SurfaceId, compi_protocol::ProcessLifetimeId);
+/// Results the user has seen, for the watching connection to acknowledge.
+enum Acknowledgement {
+    Surface(SurfaceId, compi_protocol::ProcessLifetimeId),
+    Chat(String),
+}
 
 pub(in crate::gui) struct ProgramStatusUi {
     statuses: HashMap<SurfaceId, SurfaceProgramStatus>,
+    chats: HashMap<String, ChatProgramStatus>,
     acknowledgements: mpsc::Sender<Acknowledgement>,
 }
 
@@ -31,14 +40,23 @@ impl ProgramStatusUi {
         thread::spawn(move || watch(target, sender, requests, quiesced, connection_guard));
         Self {
             statuses: HashMap::new(),
+            chats: HashMap::new(),
             acknowledgements,
         }
     }
 
-    pub(in crate::gui) fn replace_all(&mut self, statuses: Vec<SurfaceProgramStatus>) {
+    pub(in crate::gui) fn replace_all(
+        &mut self,
+        statuses: Vec<SurfaceProgramStatus>,
+        chats: Vec<ChatProgramStatus>,
+    ) {
         self.statuses = statuses
             .into_iter()
             .map(|status| (status.surface_id.clone(), status))
+            .collect();
+        self.chats = chats
+            .into_iter()
+            .map(|status| (status.chat_id.clone(), status))
             .collect();
     }
 
@@ -50,9 +68,24 @@ impl ProgramStatusUi {
         }
     }
 
+    pub(in crate::gui) fn update_chat(&mut self, status: ChatProgramStatus) {
+        if status.records.is_empty() {
+            self.chats.remove(&status.chat_id);
+        } else {
+            self.chats.insert(status.chat_id.clone(), status);
+        }
+    }
+
     /// What `surface_id` last reported, of whichever process.
     pub(in crate::gui) fn status(&self, surface_id: &SurfaceId) -> Option<&SurfaceProgramStatus> {
         self.statuses.get(surface_id)
+    }
+
+    /// What chat `chat` last reported.
+    pub(in crate::gui) fn chat_records(&self, chat: &str) -> &[ProgramStatusRecord] {
+        self.chats
+            .get(chat)
+            .map_or(&[][..], |status| &status.records)
     }
 }
 
@@ -88,7 +121,12 @@ fn watch(
             return;
         }
         // What a lost connection reported is no longer known.
-        if std::mem::take(&mut showing) && !sender.send(UiEvent::ProgramStatusWatched(Vec::new())) {
+        if std::mem::take(&mut showing)
+            && !sender.send(UiEvent::ProgramStatusWatched {
+                surfaces: Vec::new(),
+                chats: Vec::new(),
+            })
+        {
             return;
         }
         thread::sleep(RECONNECT_DELAY);
@@ -108,8 +146,9 @@ fn follow(
     if client.watch_program_status().is_err() {
         return WatchEnd::Reconnect;
     }
-    let current = client.program_status().values().cloned().collect();
-    if !sender.send(UiEvent::ProgramStatusWatched(current)) {
+    let surfaces = client.program_status().values().cloned().collect();
+    let chats = client.chat_program_status().values().cloned().collect();
+    if !sender.send(UiEvent::ProgramStatusWatched { surfaces, chats }) {
         return WatchEnd::WindowClosed;
     }
     *showing = true;
@@ -119,10 +158,17 @@ fn follow(
         }
         loop {
             match requests.try_recv() {
-                Ok((surface_id, expected_lifetime)) => {
-                    let request = ClientMessage::AcknowledgeProgramStatus {
-                        surface_id,
-                        expected_lifetime,
+                Ok(acknowledgement) => {
+                    let request = match acknowledgement {
+                        Acknowledgement::Surface(surface_id, expected_lifetime) => {
+                            ClientMessage::AcknowledgeProgramStatus {
+                                surface_id,
+                                expected_lifetime,
+                            }
+                        }
+                        Acknowledgement::Chat(chat) => {
+                            ClientMessage::AcknowledgeChatProgramStatus { chat }
+                        }
                     };
                     if client.send(request).is_err() {
                         return WatchEnd::Reconnect;
@@ -133,15 +179,22 @@ fn follow(
             }
         }
         match client.poll_event() {
-            Ok(Some(ServerEvent::Control {
-                message: ServerMessage::ProgramStatusChanged { status },
-                ..
-            })) => {
-                if !sender.send(UiEvent::ProgramStatusChanged(status)) {
+            Ok(Some(ServerEvent::Control { message, .. })) => {
+                let event = match message {
+                    ServerMessage::ProgramStatusChanged { status } => {
+                        UiEvent::ProgramStatusChanged(status)
+                    }
+                    ServerMessage::ChatProgramStatusChanged { status } => {
+                        UiEvent::ChatProgramStatusChanged(status)
+                    }
+                    // Acknowledgement replies and workspace revisions.
+                    _ => continue,
+                };
+                if !sender.send(event) {
                     return WatchEnd::WindowClosed;
                 }
             }
-            // Acknowledgement replies and workspace revisions.
+            // Screen frames and the like.
             Ok(Some(_)) => {}
             Ok(None) => thread::sleep(WATCH_POLL),
             Err(_) => return WatchEnd::Reconnect,
@@ -149,9 +202,71 @@ fn follow(
     }
 }
 
+/// What a pane reports: its terminal's current process, then the chat it holds (a chat
+/// pane, or a terminal's chat view, shown or not). Kept apart so neither's records name
+/// the other's as their parent.
+#[derive(Clone, Copy)]
+struct PaneRecords<'a> {
+    surface: &'a [ProgramStatusRecord],
+    chat: &'a [ProgramStatusRecord],
+}
+
+impl PaneRecords<'_> {
+    fn is_empty(self) -> bool {
+        self.surface.is_empty() && self.chat.is_empty()
+    }
+
+    fn headline(self) -> Option<Headline> {
+        status::combine(
+            status::headline(self.surface)
+                .into_iter()
+                .chain(status::headline(self.chat)),
+        )
+    }
+
+    fn lines(self) -> Vec<String> {
+        let mut lines = status::record_lines(self.surface);
+        lines.extend(status::record_lines(self.chat));
+        lines
+    }
+}
+
+/// Every terminal and content leaf of `node`, in reading order.
+fn leaf_nodes<'a>(node: &'a LayoutNode, output: &mut Vec<&'a LayoutNode>) {
+    match node {
+        LayoutNode::Split { first, second, .. } => {
+            leaf_nodes(first, output);
+            leaf_nodes(second, output);
+        }
+        leaf => output.push(leaf),
+    }
+}
+
+/// The workspace, tab and pane holding chat `chat`, shown or not.
+pub(super) fn chat_place(
+    workspace: &WorkspaceSnapshot,
+    chat: &str,
+) -> Option<(SessionId, TabId, PaneId)> {
+    for session in &workspace.sessions {
+        for tab in &session.tabs {
+            let mut leaves = Vec::new();
+            leaf_nodes(&tab.layout, &mut leaves);
+            if let Some(pane_id) = leaves.into_iter().find_map(|leaf| {
+                leaf.content()
+                    .and_then(PaneContent::chat)
+                    .filter(|content| content.id == chat)
+                    .and(leaf.leaf_pane())
+            }) {
+                return Some((session.id.clone(), tab.id.clone(), pane_id.clone()));
+            }
+        }
+    }
+    None
+}
+
 impl CompiApp {
     /// The surface's records, when they belong to its current process.
-    pub(super) fn program_records(&self, surface_id: &SurfaceId) -> &[ProgramStatusRecord] {
+    fn program_records(&self, surface_id: &SurfaceId) -> &[ProgramStatusRecord] {
         let Some(reported) = self.program_status.statuses.get(surface_id) else {
             return &[];
         };
@@ -163,52 +278,67 @@ impl CompiApp {
         if current { &reported.records } else { &[] }
     }
 
+    fn leaf_records<'a>(&'a self, leaf: &LayoutNode) -> PaneRecords<'a> {
+        let surface = match leaf {
+            LayoutNode::Pane { surface_id, .. } => self.program_records(surface_id),
+            _ => &[],
+        };
+        let chat = leaf
+            .content()
+            .and_then(PaneContent::chat)
+            .map_or(&[][..], |chat| self.program_status.chat_records(&chat.id));
+        PaneRecords { surface, chat }
+    }
+
+    fn pane_records(&self, pane_id: &PaneId) -> PaneRecords<'_> {
+        let leaf = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| content::find_leaf(workspace, pane_id));
+        match leaf {
+            Some(leaf) => self.leaf_records(leaf),
+            None => PaneRecords {
+                surface: &[],
+                chat: &[],
+            },
+        }
+    }
+
     /// The state the tab's panes most need the user for.
     pub(super) fn tab_program_headline(&self, tab: &WorkspaceTab) -> Option<Headline> {
         let mut leaves = Vec::new();
-        collect_leaves(&tab.layout, &mut leaves);
+        leaf_nodes(&tab.layout, &mut leaves);
         status::combine(
             leaves
-                .iter()
-                .filter_map(|(_, surface)| surface.as_ref())
-                .filter_map(|surface| status::headline(self.program_records(surface))),
+                .into_iter()
+                .filter_map(|leaf| self.leaf_records(leaf).headline()),
         )
     }
 
     /// Hover text for the tab's program status. A tab of one pane has its name as the
     /// tooltip title, so only its records; otherwise every reporting pane by name, then
-    /// its records, so a program cannot pose as one in another terminal.
+    /// its records, so a program cannot pose as one in another pane.
     pub(super) fn tab_program_detail(&self, tab: &WorkspaceTab) -> String {
         let mut leaves = Vec::new();
-        collect_leaves(&tab.layout, &mut leaves);
-        if let [(_, Some(surface))] = leaves.as_slice() {
-            return self.pane_program_detail(surface);
+        leaf_nodes(&tab.layout, &mut leaves);
+        if let [leaf] = leaves.as_slice() {
+            return self.leaf_records(leaf).lines().join("\n");
         }
         let titles = self.tab_panes(tab);
         let mut lines = Vec::new();
-        for (pane_id, surface) in &leaves {
-            let Some(surface) = surface else { continue };
-            let records = self.program_records(surface);
+        for leaf in leaves {
+            let records = self.leaf_records(leaf);
             if records.is_empty() {
                 continue;
             }
             let title = titles
                 .iter()
-                .find(|pane| &pane.pane_id == pane_id)
-                .map_or("Terminal", |pane| pane.title.as_str());
+                .find(|pane| Some(&pane.pane_id) == leaf.leaf_pane())
+                .map_or("Pane", |pane| pane.title.as_str());
             lines.push(status::display_text(title));
-            lines.extend(
-                status::record_lines(records)
-                    .into_iter()
-                    .map(|line| format!("  {line}")),
-            );
+            lines.extend(records.lines().into_iter().map(|line| format!("  {line}")));
         }
         lines.join("\n")
-    }
-
-    /// Hover text for one pane: its name is the tooltip title, so only its records.
-    fn pane_program_detail(&self, surface_id: &SurfaceId) -> String {
-        status::record_lines(self.program_records(surface_id)).join("\n")
     }
 
     fn program_state_color(&self, state: ProgramState) -> u32 {
@@ -234,10 +364,9 @@ impl CompiApp {
         controls::glyph(icon, color(self.program_state_color(state)))
     }
 
-    /// The surface's status glyph, when its program reports one: a pane row in the
-    /// tab menu.
-    pub(super) fn program_glyph(&self, surface_id: &SurfaceId) -> Option<gpui_component::Icon> {
-        let headline = status::headline(self.program_records(surface_id))?;
+    /// The pane's status glyph, when it reports one: a pane row in the tab menu.
+    pub(super) fn program_glyph(&self, pane_id: &PaneId) -> Option<gpui_component::Icon> {
+        let headline = self.pane_records(pane_id).headline()?;
         Some(self.program_state_glyph(headline.state))
     }
 
@@ -305,9 +434,9 @@ impl CompiApp {
         &self,
         index: usize,
         pane_id: &PaneId,
-        surface_id: &SurfaceId,
     ) -> Option<AnyElement> {
-        let headline = status::headline(self.program_records(surface_id))?;
+        let records = self.pane_records(pane_id);
+        let headline = records.headline()?;
         let (title, _) = self.floating_caption(pane_id);
         let tint = color(self.program_state_color(headline.state));
         Some(
@@ -324,7 +453,7 @@ impl CompiApp {
                 .child(div().size(px(6.0)).rounded_full().bg(tint))
                 .tooltip(controls::tooltip(
                     status::display_text(&title),
-                    Some(self.pane_program_detail(surface_id).into()),
+                    Some(records.lines().join("\n").into()),
                     None,
                 ))
                 .into_any_element(),
@@ -335,16 +464,17 @@ impl CompiApp {
     pub(super) fn render_floating_program_status(
         &self,
         index: usize,
-        surface_id: &SurfaceId,
+        pane_id: &PaneId,
         title: &str,
     ) -> Option<AnyElement> {
-        let headline = status::headline(self.program_records(surface_id))?;
+        let records = self.pane_records(pane_id);
+        let headline = records.headline()?;
         Some(self.render_program_status(
             ("floating-program-status", index),
             headline,
             true,
             status::display_text(title),
-            self.pane_program_detail(surface_id),
+            records.lines().join("\n"),
         ))
     }
 
@@ -366,6 +496,26 @@ impl CompiApp {
         let _ = self
             .program_status
             .acknowledgements
-            .send((surface_id.clone(), lifetime.clone()));
+            .send(Acknowledgement::Surface(
+                surface_id.clone(),
+                lifetime.clone(),
+            ));
+    }
+
+    /// Typing in a chat's composer, or sending from it, means the user has seen its
+    /// finished results; removed at once like a terminal's.
+    pub(super) fn acknowledge_chat_results(&mut self, chat: &str) {
+        if !status::has_results(self.program_status.chat_records(chat)) {
+            return;
+        }
+        if let Some(reported) = self.program_status.chats.get_mut(chat) {
+            reported
+                .records
+                .retain(|record| !matches!(record.state, ProgramState::Done | ProgramState::Error));
+        }
+        let _ = self
+            .program_status
+            .acknowledgements
+            .send(Acknowledgement::Chat(chat.to_owned()));
     }
 }

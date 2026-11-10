@@ -699,9 +699,13 @@ enum UiEvent {
         tab_id: u64,
         message: ServerMessage,
     },
-    /// Every terminal's program status, replacing what was known.
-    ProgramStatusWatched(Vec<compi_protocol::program_status::SurfaceProgramStatus>),
+    /// Every terminal's and chat's program status, replacing what was known.
+    ProgramStatusWatched {
+        surfaces: Vec<compi_protocol::program_status::SurfaceProgramStatus>,
+        chats: Vec<compi_protocol::program_status::ChatProgramStatus>,
+    },
     ProgramStatusChanged(compi_protocol::program_status::SurfaceProgramStatus),
+    ChatProgramStatusChanged(compi_protocol::program_status::ChatProgramStatus),
     /// What one of the window's Monitor watchers saw.
     Monitor(workspace::monitor::MonitorEvent),
     /// What one of the window's chat watchers saw.

@@ -51,6 +51,34 @@ impl ChatHarness {
     }
 }
 
+/// How the harness asks before running tools, as Compi starts it. `Harness` keeps the
+/// harness's own setting (OMP's `tools.approvalMode`, which `omp acp` does not read by
+/// itself, so the daemon looks it up and passes it on).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatApproval {
+    #[default]
+    Harness,
+    /// Ask before anything but reading.
+    AlwaysAsk,
+    /// Run reads and edits; ask before commands.
+    Write,
+    /// Run everything without asking.
+    Yolo,
+}
+
+impl ChatApproval {
+    /// OMP's `--approval-mode` value; `None` keeps the harness's own setting.
+    pub fn omp_mode(self) -> Option<&'static str> {
+        match self {
+            Self::Harness => None,
+            Self::AlwaysAsk => Some("always-ask"),
+            Self::Write => Some("write"),
+            Self::Yolo => Some("yolo"),
+        }
+    }
+}
+
 /// A content pane chatting with `harness` in `folder`. The transcript lives in the
 /// daemon under `id`; `session` is the harness's own session, kept so the chat can be
 /// resumed once the daemon restarts.

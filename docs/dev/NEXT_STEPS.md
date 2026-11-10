@@ -20,16 +20,21 @@ Found on the owner's Windows install: nothing was ever removed (12 `versions\` f
 
 The update cycle and launcher/helper refresh were seen on the owner's install after publishing (see Release state). Still unchecked: a repair from Settings → Apps after Setup removed its run folder (the extra source registration is untested for a standard user).
 
-## Next: agent chat in Program Status (0.7.4, decided 2026-11-10)
+## In source for 0.7.4: agent chat in Program Status, chat approvals (decided 2026-11-10)
 
 Program Status records are kept per terminal surface (`SurfaceProgramStatus { surface_id, process_lifetime_id, records }`, fed by OSC 7501 and watched through `WatchProgramStatus`). A chat is daemon-owned ACP with no surface of its own, so nothing built on Program Status sees it: no notifications (`gui/workspace/notifications.rs`, `notice_program_status`), no tab glyph, pane dot or floating-title status, no sidebar or palette status line, no hover card, nothing in `compi --json pane list`/`pane show` for an agent or script to read. OMP in a plain terminal reports all of this.
 
 1. Daemon: each chat publishes Program Status records itself: working while a turn runs, blocked (permission or question) while one waits, done when a turn ends, failed on an error, with OMP as the app and the session title as the message.
-2. Protocol: status keyed by the chat's pane (or chat ID) as well as by surface, carried by `WatchProgramStatus` (a protocol bump, so updating restarts the daemon; release pins move with it).
+2. Protocol 40: `ChatProgramStatus { chat_id, records }` sent as `ChatProgramStatusChanged` on `WatchProgramStatus` connections; `AcknowledgeChatProgramStatus { chat }`; release pins moved to 40.
 3. Client: tab glyphs, pane dots, floating titles, the sidebar and palette line, hover cards and notifications read chat records like terminal ones; click-to-pane, focused-pane silence and the notification settings apply; typing or sending in the composer acknowledges done, as a key press in a terminal does.
 4. CLI: `compi pane list`/`pane show` carry `program_status` for chat panes.
+5. Approvals: `omp acp` (18.18.6) ignores `tools.approvalMode`: with `yolo` set it still sent `session/request_permission` for `bash`; `--approval-mode yolo` did not. `WatchChat::approval` (`ChatApproval`, Settings → Chat → Approvals, `[chat] approval`) picks the mode; the default, Same as OMP, runs `omp config get tools.approvalMode` in the chat's environment and folder before each start and passes a valid value as `--approval-mode`.
 
-Check: in `cargo dev`, a chat in a background tab shows working, then a blocked glyph and a notification for a permission, then done with a notification that opens the pane; the focused chat stays silent; `compi --json pane list` shows the same states.
+Done in source 2026-11-10 (not committed or released). The daemon publishes from a lock guard (`chat::Locked`), so a turn that ends into a queued prompt never shows a passing `done`. `RestartChat` and `ResumeChat` also carry the approval, so Restart picks up a changed setting.
+
+Seen in `cargo dev` on Windows (a WSL chat in a background tab, driven over the protocol with a throwaway client, `PrintWindow` captures, the dev instance's toast history): with OMP set to yolo and Same as OMP, `echo` ran with no permission (working, then done, then nothing after `AcknowledgeChatProgramStatus`); after Restart with Always ask, the same prompt went working, blocked on a permission (the tab chip showed the blocked glyph), and after Allow once working, then done (a green check on the tab); Windows' history held the "OMP finished" toast, tagged for the chat, with the tab name; `compi --json pane list` gave the chat pane `program_status` `done` with app OMP; Settings → Chat showed Approvals at Same as OMP. Checks: `cargo fmt --check`, warning-denied workspace Clippy (Windows), Linux `cargo check --workspace --all-targets`, and the protocol, daemon `chat`/`program_status` and client `notifications`/`program_status`/`config`/`settings`/`cli` unit tests.
+
+Not seen yet: clicking a notification to open the chat; the focused chat staying quiet (needs Compi active); typing in the composer clearing done; the pane dot, floating title, sidebar and palette lines and hover cards for a chat; picking another Approvals choice in Settings (the config tests cover saving it); a Windows (`omp.exe`) chat's approval lookup; macOS.
 
 ## After that: Windows work from a WSL session
 

@@ -18,6 +18,7 @@
 use super::catalog::{CatalogTarget, GridStep};
 use super::*;
 use crate::gui::controls::IconName;
+use compi_protocol::chat::ChatApproval;
 use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
 use gpui::Entity;
 use gpui_component::Sizable as _;
@@ -932,6 +933,16 @@ static ROWS: &[Row] = &[
                 .collect()
         },
         |app, row, cx| app.render_prompt_group(row, cx),
+    ),
+    // Chat.
+    row(
+        "chat-approval",
+        SettingsSection::Chat,
+        "Approvals",
+        "How OMP asks before it runs tools. Applies to new chats and chats that start again.",
+        "approval permission ask allow edits everything yolo tools agent omp",
+        |_| vec![SettingsAction::Select(Popup::ChatApproval)],
+        |app, row, cx| app.render_chat_approval_row(row, cx),
     ),
     // Keyboard.
     page_row(
@@ -3586,6 +3597,76 @@ impl CompiApp {
         share_launch_change(cx, move |launch| launch.profile.windows_shell = shell);
     }
 
+    /// Approvals: a dropdown of how a chat's OMP asks before it runs tools.
+    fn render_chat_approval_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let popup = Popup::ChatApproval;
+        let action = SettingsAction::Select(popup);
+        let focused = self.settings_focused(row, action);
+        let current = self.config.chat_approval;
+        let options = crate::config::CHAT_APPROVALS.into_iter().map(|approval| {
+            controls::select_option(chat_approval_label(approval)).detail(match approval {
+                ChatApproval::Harness => "OMP's own approval setting",
+                ChatApproval::AlwaysAsk => "Ask before anything but reading",
+                ChatApproval::Write => "Read and edit; ask before commands",
+                ChatApproval::Yolo => "Run every tool without asking",
+            })
+        });
+        let open_row = row.clone();
+        let select = controls::select(
+            "chat-approval-select",
+            options,
+            crate::config::CHAT_APPROVALS
+                .iter()
+                .position(|approval| *approval == current),
+            self.popup == Some(popup),
+        )
+        .placeholder(chat_approval_label(current))
+        .focused(focused)
+        .anchor(Anchor::TopRight)
+        .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+            this.focus_settings_control(&open_row, action);
+            this.set_popup(popup, *open);
+            cx.notify();
+        }))
+        .on_pick(cx.listener(|this, index: &usize, _, cx| {
+            if let Some(approval) = crate::config::CHAT_APPROVALS.get(*index) {
+                this.set_chat_approval(*approval, cx);
+            }
+            cx.notify();
+        }));
+        let control = div()
+            .relative()
+            .flex_none()
+            .child(select)
+            .child(self.settings_focus_anchor(focused, cx))
+            .into_any_element();
+        self.settings_row(
+            row.title,
+            row_description("chat-approval").into(),
+            control,
+            row.compact,
+        )
+    }
+
+    /// Saves the chat approval and gives it to every window, whose chat watchers pass
+    /// it on when they next connect.
+    fn set_chat_approval(&mut self, approval: ChatApproval, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_chat_approval(approval) {
+            self.global_error = Some(error);
+            return;
+        }
+        cx.defer(move |cx| {
+            for handle in cx.windows() {
+                if let Some(typed) = handle.downcast::<CompiApp>() {
+                    let _ = typed.update(cx, |app, _, cx| {
+                        app.config.chat_approval = approval;
+                        cx.notify();
+                    });
+                }
+            }
+        });
+    }
+
     /// The folder new tabs start in when they open from no other pane; `None` is home.
     fn starting_folder(&self) -> Option<&str> {
         self.config
@@ -5036,6 +5117,16 @@ pub(super) fn settings_card(colors: &ThemeColors) -> Div {
         .bg(color(colors.surface))
 }
 
+/// What Approvals calls `approval`.
+fn chat_approval_label(approval: ChatApproval) -> &'static str {
+    match approval {
+        ChatApproval::Harness => "Same as OMP",
+        ChatApproval::AlwaysAsk => "Always ask",
+        ChatApproval::Write => "Allow edits",
+        ChatApproval::Yolo => "Allow everything",
+    }
+}
+
 /// The section bar icon of `section`.
 fn section_icon(section: SettingsSection) -> IconName {
     match section {
@@ -5047,6 +5138,7 @@ fn section_icon(section: SettingsSection) -> IconName {
         SettingsSection::Updates => IconName::CircleArrowDown,
         SettingsSection::Advanced => IconName::SlidersHorizontal,
         SettingsSection::Notifications => IconName::Bell,
+        SettingsSection::Chat => IconName::MessageSquare,
     }
 }
 

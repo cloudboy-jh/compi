@@ -111,6 +111,7 @@ gpui_kit_assets::icon_assets!(
         Wrench,
         Image,
         RotateCcwClock,
+        MessageSquare,
     ]
 );
 
@@ -2043,6 +2044,7 @@ mod tests {
             IconName::Server,
             IconName::Clock,
             IconName::Bell,
+            IconName::MessageSquare,
             IconName::Cloud,
             IconName::Search,
             IconName::Folder,

@@ -1021,10 +1021,7 @@ impl CompiApp {
             pane.pane_id.clone(),
             pane.pane_id.clone(),
         );
-        let glyph = pane
-            .surface_id
-            .as_ref()
-            .and_then(|surface| self.program_glyph(surface));
+        let glyph = self.program_glyph(&pane.pane_id);
         let close_title = self.close_pane_title(&pane.pane_id);
         controls::menu_row(("tab-menu-pane", index), lit, false, cx)
             .group(group.clone())

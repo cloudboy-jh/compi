@@ -78,7 +78,12 @@ use std::fmt;
 // Version 39 lets a chat prompt steer the running turn or wait for it (`SendChat::delivery`,
 // `ChatDelivery`), keeps the waiting prompts in `ChatState::queued` (`ChatEvent::Queued`),
 // removes one with `RemoveQueuedChat`, and names the subscription plans (`ChatState::plans`).
-pub const PROTOCOL_VERSION: u32 = 39;
+// Version 40 puts chats in program status: the daemon reports each chat's records
+// (`ChatProgramStatusChanged`, on `WatchProgramStatus` connections) and
+// `AcknowledgeChatProgramStatus` removes its finished ones; `WatchChat`, `ResumeChat` and
+// `RestartChat` carry how the harness asks before running tools (`ChatApproval`). Settings
+// gains a Chat section.
+pub const PROTOCOL_VERSION: u32 = 40;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -416,13 +421,19 @@ pub enum ClientMessage {
         place: prompt::PromptPlace,
         request: Box<prompt::PromptRequest>,
     },
-    /// Sends each terminal's current program status as `ProgramStatusChanged`, answers
+    /// Sends each terminal's and each chat's current program status as
+    /// `ProgramStatusChanged` and `ChatProgramStatusChanged`, answers
     /// `ProgramStatusWatching`, then sends every later change on this connection.
     WatchProgramStatus,
     /// The user has seen the surface's results: removes its `done` and `error` records.
     AcknowledgeProgramStatus {
         surface_id: SurfaceId,
         expected_lifetime: ProcessLifetimeId,
+    },
+    /// The user has seen the chat's results: removes its `done` and `error` records.
+    /// Answered by `ProgramStatusAcknowledged`.
+    AcknowledgeChatProgramStatus {
+        chat: String,
     },
     /// Answers `SystemMetricsWatching`, then sends `SystemSampled` of `source` every few
     /// seconds while this connection stays open. Sampling runs only while some connection
@@ -466,8 +477,11 @@ pub enum ClientMessage {
     /// Answers `ChatWatching` with the chat's whole state, starting its harness if it is
     /// not running, then sends each change as `ChatChanged`, in order, while this
     /// connection stays open. One chat per connection; a later watch replaces it.
+    /// `approval` applies from the harness's next start (this one, when it starts it).
     WatchChat {
         chat: chat::ChatContent,
+        #[serde(default)]
+        approval: chat::ChatApproval,
     },
     /// Sends `text`, with `files` (absolute paths in the chat's environment) and `images`
     /// attached, as `delivery` says: the next turn, into the running one, or after it.
@@ -517,10 +531,16 @@ pub enum ClientMessage {
     ResumeChat {
         chat: String,
         session: Option<String>,
+        /// Applies from the harness's next start, this one when the resume starts it.
+        #[serde(default)]
+        approval: chat::ChatApproval,
     },
-    /// Ends the chat's harness and starts it again, resuming its session if it has one.
+    /// Ends the chat's harness and starts it again, resuming its session if it has one,
+    /// with `approval`.
     RestartChat {
         chat: String,
+        #[serde(default)]
+        approval: chat::ChatApproval,
     },
     ShutdownDaemon,
 }
@@ -639,6 +659,11 @@ pub enum ServerMessage {
     /// Unsolicited, after `WatchProgramStatus`: the terminal's complete current records.
     ProgramStatusChanged {
         status: program_status::SurfaceProgramStatus,
+    },
+    /// Unsolicited, after `WatchProgramStatus`: the chat's complete current records; none
+    /// once it reports nothing or has ended.
+    ChatProgramStatusChanged {
+        status: program_status::ChatProgramStatus,
     },
     ProgramStatusWatching,
     ProgramStatusAcknowledged,
@@ -1742,6 +1767,7 @@ pub enum SettingsSection {
     Interface,
     Notifications,
     Terminal,
+    Chat,
     Keyboard,
     /// Monitor's Overview. Saved as "performance", the section's name before it
     /// became Monitor, so older workspace files still load.
@@ -1752,11 +1778,12 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Appearance,
         Self::Interface,
         Self::Notifications,
         Self::Terminal,
+        Self::Chat,
         Self::Keyboard,
         Self::Monitor,
         Self::Updates,
@@ -1769,6 +1796,7 @@ impl SettingsSection {
             Self::Interface => "Interface",
             Self::Notifications => "Notifications",
             Self::Terminal => "Terminal",
+            Self::Chat => "Chat",
             Self::Keyboard => "Keyboard",
             Self::Monitor => "Monitor",
             Self::Updates => "Updates",

@@ -20,8 +20,8 @@ use super::monitor::watch::{self, LINGER, SlotChange, WatchEnd, WatchLink, Watch
 use super::*;
 use crate::gui::controls::{self, IconName, icon_button, text_button};
 use compi_protocol::chat::{
-    ChatAnswer, ChatAnswers, ChatContent, ChatDelivery, ChatEntry, ChatEvent, ChatHarness,
-    ChatImage, ChatPermission, ChatQuestion, ChatSessionInfo, ChatState, ChatStatus,
+    ChatAnswer, ChatAnswers, ChatApproval, ChatContent, ChatDelivery, ChatEntry, ChatEvent,
+    ChatHarness, ChatImage, ChatPermission, ChatQuestion, ChatSessionInfo, ChatState, ChatStatus,
 };
 use compi_protocol::{ContentEnvironment, ContentTab, FolderContent, GitScope, PaneContent};
 use gpui::{
@@ -218,6 +218,8 @@ pub(in crate::gui) struct ChatUi {
     chats: HashMap<String, ChatModel>,
     /// A redraw is due for a working chat's elapsed times.
     ticking: bool,
+    /// Settings → Chat → Approvals, which each watcher's next `WatchChat` passes on.
+    approval: Arc<Mutex<ChatApproval>>,
 }
 
 /// Every chat in `node` with its pane: content panes, and terminal views on either side.
@@ -457,11 +459,12 @@ impl ChatModel {
 }
 
 /// Starts the watcher of chat `id`: each connection watches `chat` as it is then, so a
-/// session the pane learned resumes after a daemon restart.
+/// session the pane learned resumes after a daemon restart, with `approval` as it is then.
 fn watch_chat(
     link: WatchLink,
     id: Arc<str>,
     chat: Arc<Mutex<ChatContent>>,
+    approval: Arc<Mutex<ChatApproval>>,
     generation: u64,
     stop: mpsc::Receiver<()>,
 ) {
@@ -481,7 +484,10 @@ fn watch_chat(
                 let Ok(content) = chat.lock().map(|chat| chat.clone()) else {
                     return WatchEnd::Stopped;
                 };
-                let state = match client.watch_chat(content) {
+                let Ok(approval) = approval.lock().map(|approval| *approval) else {
+                    return WatchEnd::Stopped;
+                };
+                let state = match client.watch_chat(content, approval) {
                     Ok(state) => state,
                     Err(error) => {
                         return WatchEnd::Failed(format!("The daemon can't run the chat: {error}"));
@@ -697,6 +703,9 @@ impl CompiApp {
             self.prepare_chat_question(id, window, cx);
             self.prepare_chat_picker(id, window, cx);
         }
+        if let Ok(mut approval) = self.chat.approval.lock() {
+            *approval = self.config.chat_approval;
+        }
         let link = self.watch_link();
         let mut linger = false;
         for (id, model) in &mut self.chat.chats {
@@ -707,6 +716,7 @@ impl CompiApp {
                         link.clone(),
                         id.as_str().into(),
                         model.watched.clone(),
+                        self.chat.approval.clone(),
                         generation,
                         stop,
                     );
@@ -775,6 +785,7 @@ impl CompiApp {
                     cx.notify();
                 }
                 InputEvent::Change => {
+                    this.acknowledge_chat_results(&id);
                     this.chat_composer_changed(&id, cx);
                     cx.notify();
                 }
@@ -934,6 +945,7 @@ impl CompiApp {
     /// waits for one, into the running turn while one runs, or, with `queue`, after it.
     /// Runs Compi's own `/` command instead; with a completion open, Enter completes.
     fn send_chat(&mut self, chat: &str, queue: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.acknowledge_chat_results(chat);
         if self.accept_chat_completion(chat, window, cx) {
             return;
         }
@@ -1040,6 +1052,7 @@ impl CompiApp {
     fn restart_chat(&mut self, chat: &str, window: &mut Window, cx: &mut Context<Self>) {
         let message = ClientMessage::RestartChat {
             chat: chat.to_owned(),
+            approval: self.config.chat_approval,
         };
         self.chat_action(chat, message, window, cx);
     }
@@ -1058,6 +1071,7 @@ impl CompiApp {
         let message = ClientMessage::ResumeChat {
             chat: chat.to_owned(),
             session,
+            approval: self.config.chat_approval,
         };
         self.chat_action(chat, message, window, cx);
     }

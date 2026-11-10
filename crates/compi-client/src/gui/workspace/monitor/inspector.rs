@@ -255,7 +255,7 @@ impl CompiApp {
     }
 
     /// Open terminal: shows the pane of terminal `surface` (its tab, and its shell
-    /// where it shows a view) and focuses it. Notifications open their pane the same way.
+    /// where it shows a view) and focuses it.
     pub(in crate::gui::workspace) fn open_process_terminal(
         &mut self,
         surface: &SurfaceId,
@@ -270,6 +270,20 @@ impl CompiApp {
             self.global_error = Some("That terminal is no longer open".into());
             return;
         };
+        self.reveal_pane(session, tab, pane_id, PaneSide::Terminal, window, cx);
+    }
+
+    /// Selects tab `tab` of workspace `session`, turns `pane_id` to `side` where it
+    /// carries a view, and focuses it. Notifications open their pane the same way.
+    pub(in crate::gui::workspace) fn reveal_pane(
+        &mut self,
+        session: SessionId,
+        tab: TabId,
+        pane_id: PaneId,
+        side: PaneSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_tab().map(|selected| &selected.id) != Some(&tab) {
             if let Some(workspace) = &self.workspace {
                 self.state.select_session(workspace, &session);
@@ -277,13 +291,13 @@ impl CompiApp {
             let hidden = self.state.hidden_tabs.contains(&tab);
             self.select_terminal(tab, hidden);
         }
-        let shows_view = self.workspace.as_ref().is_some_and(|workspace| {
+        let turned = self.workspace.as_ref().is_some_and(|workspace| {
             content::find_leaf(workspace, &pane_id)
                 .and_then(LayoutNode::view)
-                .is_some_and(|view| view.side == PaneSide::View)
+                .is_some_and(|view| view.side != side)
         });
-        if shows_view {
-            self.set_pane_side(&pane_id, PaneSide::Terminal);
+        if turned {
+            self.set_pane_side(&pane_id, side);
         }
         self.focus_pane(pane_id);
         window.focus(&self.focus_handle, cx);

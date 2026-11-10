@@ -6,18 +6,21 @@
 //! A chat is keyed by its pane's chat ID and ends when no pane or view holds it any more
 //! (`ChatHub::retain`). The harness keeps its own session; a chat that knows its session
 //! resumes it (`session/load`) when it starts again, after a restart of the daemon too.
+use crate::program_status::ChatStatusHub;
 use compi_protocol::chat::{
-    ChatAnswer, ChatAnswers, ChatChoice, ChatCommand, ChatContent, ChatDelivery, ChatDiff,
-    ChatEntry, ChatEvent, ChatField, ChatHarness, ChatImage, ChatOption, ChatPermission,
+    ChatAnswer, ChatAnswers, ChatApproval, ChatChoice, ChatCommand, ChatContent, ChatDelivery,
+    ChatDiff, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatImage, ChatOption, ChatPermission,
     ChatPermissionOption, ChatPlan, ChatPlanLimit, ChatQuestion, ChatQueued, ChatSessionInfo,
     ChatState, ChatStatus, ChatTool, ChatToolStatus, ChatUsage, MAX_CHAT_ATTACHMENTS,
     MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES,
     MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
 };
+use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
 use compi_protocol::{ContentEnvironment, LayoutNode, WorkspaceSnapshot};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
@@ -38,9 +41,14 @@ const MAX_LIST_PAGES: usize = 40;
 /// A whole state sent to a window stays this small; tool output and diffs of the oldest
 /// calls are left out beyond it, so a long session still fits one control frame.
 const WATCH_STATE_BYTES: usize = 6 * 1024 * 1024;
-/// Where `omp` is installed when a login shell's search path lacks it: its install
-/// script's and Bun's folders.
-const UNIX_COMMAND: &str = r#"PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin" exec omp acp"#;
+/// How long the lookup of OMP's own approval setting may take; the harness starts without
+/// it after that.
+const APPROVAL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// The modes `omp acp --approval-mode` takes.
+const OMP_APPROVAL_MODES: [&str; 4] = ["always-ask", "always-ask-cached", "write", "yolo"];
+/// `omp` in a login shell, its arguments to follow. Where `omp` is installed when a login
+/// shell's search path lacks it: its install script's and Bun's folders.
+const UNIX_COMMAND: &str = r#"PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin" exec omp"#;
 #[cfg(windows)]
 const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 
@@ -48,6 +56,7 @@ const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 #[derive(Default)]
 pub struct ChatHub {
     chats: Mutex<HashMap<String, Arc<Chat>>>,
+    status: ChatStatusHub,
 }
 
 /// The daemon's chats.
@@ -58,19 +67,37 @@ pub fn hub() -> &'static ChatHub {
 
 impl ChatHub {
     /// The chat's whole state and a receiver of its later changes, starting the chat if it
-    /// is not running.
-    pub fn watch(&self, content: &ChatContent) -> (ChatState, mpsc::Receiver<ChatEvent>) {
+    /// is not running. `approval` applies from the harness's next start, this one when it
+    /// starts it.
+    pub fn watch(
+        &self,
+        content: &ChatContent,
+        approval: ChatApproval,
+    ) -> (ChatState, mpsc::Receiver<ChatEvent>) {
         let chat = {
             let mut chats = lock(&self.chats);
             chats
                 .entry(content.id.clone())
-                .or_insert_with(|| Chat::start(content.clone()))
+                .or_insert_with(|| Chat::start(content.clone(), approval))
                 .clone()
         };
         let mut inner = chat.lock();
+        inner.approval = approval;
         let (sender, receiver) = mpsc::channel();
         inner.watchers.push(sender);
         (fit(inner.state.clone(), WATCH_STATE_BYTES), receiver)
+    }
+
+    /// Program status of every chat.
+    pub fn program_status(&self) -> &ChatStatusHub {
+        &self.status
+    }
+
+    /// The user has seen the chat's result: it no longer shows as done or failed.
+    pub fn acknowledge(&self, id: &str) {
+        if let Ok(chat) = self.get(id) {
+            chat.lock().unseen = None;
+        }
     }
 
     pub fn send(
@@ -130,12 +157,21 @@ impl ChatHub {
         Ok(sessions)
     }
 
-    pub fn resume(&self, id: &str, session: Option<String>) -> Result<(), String> {
-        self.get(id)?.resume(session)
+    pub fn resume(
+        &self,
+        id: &str,
+        session: Option<String>,
+        approval: ChatApproval,
+    ) -> Result<(), String> {
+        let chat = self.get(id)?;
+        chat.lock().approval = approval;
+        chat.resume(session)
     }
 
-    pub fn restart(&self, id: &str) -> Result<(), String> {
-        self.get(id)?.restart();
+    pub fn restart(&self, id: &str, approval: ChatApproval) -> Result<(), String> {
+        let chat = self.get(id)?;
+        chat.lock().approval = approval;
+        chat.restart();
         Ok(())
     }
 
@@ -317,7 +353,15 @@ impl Prompt {
 
 #[derive(Default)]
 struct Inner {
+    /// The chat's ID, which its program status goes under.
+    chat_id: String,
     state: ChatState,
+    /// How the harness asks before running tools, from its next start.
+    approval: ChatApproval,
+    /// How the last turn or the harness ended, until the user has seen it.
+    unseen: Option<Unseen>,
+    /// The program status record last published.
+    published: Option<ProgramStatusRecord>,
     watchers: Vec<mpsc::Sender<ChatEvent>>,
     agent: Option<Agent>,
     /// Bumped on every start, so a stopped harness's reader changes nothing.
@@ -356,6 +400,38 @@ struct Inner {
     activity_ms: u64,
 }
 
+/// What the user has not seen yet of a chat that waits.
+#[derive(Debug, PartialEq)]
+enum Unseen {
+    Done,
+    /// The turn failed, or the harness did; the message the transcript or status shows.
+    Error(String),
+}
+
+/// A chat's locked state. Letting go of it publishes the chat's program status, so
+/// watchers see where the changes made under the lock ended, never a step on the way.
+struct Locked<'a>(MutexGuard<'a, Inner>);
+
+impl Deref for Locked<'_> {
+    type Target = Inner;
+
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+
+impl DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.0
+    }
+}
+
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        self.0.publish_status();
+    }
+}
+
 /// How a question field's answer goes back to the harness.
 #[derive(Clone)]
 struct FieldShape {
@@ -375,14 +451,16 @@ struct Agent {
 }
 
 impl Chat {
-    fn start(content: ChatContent) -> Arc<Self> {
+    fn start(content: ChatContent, approval: ChatApproval) -> Arc<Self> {
         let chat = Arc::new(Self {
             inner: Mutex::new(Inner {
+                chat_id: content.id.clone(),
                 state: ChatState {
                     harness: content.harness,
                     session: content.session.clone(),
                     ..ChatState::default()
                 },
+                approval,
                 ..Inner::default()
             }),
             content,
@@ -391,16 +469,49 @@ impl Chat {
         chat
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        lock(&self.inner)
+    fn lock(&self) -> Locked<'_> {
+        Locked(lock(&self.inner))
     }
 
-    /// Starts the harness and asks it to initialize; the rest follows its answers.
+    /// Starts the harness as the chat's approval says. OMP's own setting, which `omp acp`
+    /// does not read, is looked up first on a thread of its own, no lock held; the status
+    /// stays `Starting` meanwhile.
     fn spawn(self: &Arc<Self>, inner: &mut Inner) {
         inner.generation += 1;
         inner.initialized = false;
         let generation = inner.generation;
-        let mut child = match command(&self.content).and_then(|mut command| {
+        if let Some(mode) = inner.approval.omp_mode() {
+            self.launch(inner, generation, Some(mode));
+            return;
+        }
+        let chat = self.clone();
+        let looking_up = thread::Builder::new()
+            .name("compi-chat-approval".into())
+            .spawn(move || {
+                let mode = configured_approval(&chat.content);
+                let mut inner = chat.lock();
+                if !inner.closed && inner.generation == generation {
+                    chat.launch(&mut inner, generation, mode);
+                }
+            });
+        if looking_up.is_err() {
+            self.launch(inner, generation, None);
+        }
+    }
+
+    /// Runs the harness, with `approval_mode` when there is one, and asks it to
+    /// initialize; the rest follows its answers.
+    fn launch(
+        self: &Arc<Self>,
+        inner: &mut Inner,
+        generation: u64,
+        approval_mode: Option<&'static str>,
+    ) {
+        let mut args = vec!["acp"];
+        if let Some(mode) = approval_mode {
+            args.extend(["--approval-mode", mode]);
+        }
+        let mut child = match command(&self.content, &args).and_then(|mut command| {
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -666,41 +777,7 @@ impl Chat {
                 }
             }
             (Pending::Prompt, result) => {
-                let stop = match &result {
-                    Ok(result) => result["stopReason"]
-                        .as_str()
-                        .unwrap_or("end_turn")
-                        .to_owned(),
-                    Err(_) => "error".to_owned(),
-                };
-                inner.end_turn();
-                match (stop.as_str(), result) {
-                    ("end_turn", _) => {}
-                    ("cancelled", _) => inner.emit(ChatEvent::Entry {
-                        entry: ChatEntry::Cancelled,
-                    }),
-                    (_, Err(message)) => inner.emit(ChatEvent::Entry {
-                        entry: ChatEntry::Error { message },
-                    }),
-                    (reason, Ok(_)) => inner.emit(ChatEvent::Entry {
-                        entry: ChatEntry::Error {
-                            message: match reason {
-                                "max_tokens" => "The reply reached the model's token limit.".into(),
-                                "max_turn_requests" => "The turn reached its request limit.".into(),
-                                "refusal" => "The model refused to go on.".into(),
-                                other => format!("The turn ended: {other}."),
-                            },
-                        },
-                    }),
-                }
-                if !matches!(inner.state.status, ChatStatus::Failed { .. }) {
-                    inner.emit(ChatEvent::Status {
-                        status: ChatStatus::Ready,
-                    });
-                }
-                // A stopped or failed turn holds the queue; one that ended goes on.
-                inner.queue_held = stop != "end_turn";
-                inner.send_queued();
+                inner.prompt_ended(result);
                 self.read_plans(inner);
             }
         }
@@ -975,19 +1052,80 @@ impl Chat {
 impl Inner {
     /// Applies `event` and sends it to every watcher still listening.
     fn emit(&mut self, event: ChatEvent) {
-        if let ChatEvent::Reset { .. } = event {
-            self.tools.clear();
-            self.queue.clear();
-            self.queue_held = false;
+        match &event {
+            ChatEvent::Reset { .. } => {
+                self.tools.clear();
+                self.queue.clear();
+                self.queue_held = false;
+                self.unseen = None;
+            }
+            ChatEvent::Status {
+                status: ChatStatus::Failed { message },
+            } => self.unseen = Some(Unseen::Error(message.clone())),
+            _ => {}
         }
         self.watchers
             .retain(|watcher| watcher.send(event.clone()).is_ok());
         self.state.apply(event);
     }
 
+    /// What the chat's program status shows (state, blocked kind, message): what waits
+    /// on the user, else a running turn, else a result the user has not seen; nothing
+    /// while the chat waits for a prompt, or once it has ended.
+    fn status_shown(&self) -> Option<(ProgramState, Option<BlockedKind>, Option<&str>)> {
+        if self.closed {
+            return None;
+        }
+        let title = self.state.title.as_deref();
+        if self.state.permission.is_some() {
+            Some((ProgramState::Blocked, Some(BlockedKind::Permission), title))
+        } else if self.state.question.is_some() {
+            Some((ProgramState::Blocked, Some(BlockedKind::Question), title))
+        } else if self.state.working() {
+            Some((ProgramState::Working, None, title))
+        } else {
+            match &self.unseen {
+                Some(Unseen::Done) => Some((ProgramState::Done, None, title)),
+                Some(Unseen::Error(message)) => Some((ProgramState::Error, None, Some(message))),
+                None => None,
+            }
+        }
+    }
+
+    /// Publishes the chat's program status when it differs from what was published.
+    fn publish_status(&mut self) {
+        let shown = self.status_shown();
+        let unchanged = match (shown, &self.published) {
+            (None, None) => true,
+            (Some((state, kind, message)), Some(published)) => {
+                published.state == state
+                    && published.kind == kind
+                    && published.message.as_deref() == message
+            }
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        let record = shown.map(|(state, kind, message)| ProgramStatusRecord {
+            id: None,
+            state,
+            kind,
+            progress: None,
+            app: Some(self.state.harness.name().to_owned()),
+            title: None,
+            message: message.map(str::to_owned),
+        });
+        hub()
+            .status
+            .publish(&self.chat_id, record.iter().cloned().collect());
+        self.published = record;
+    }
+
     /// Starts a turn on `prompt`.
     fn start_prompt(&mut self, session: String, prompt: Prompt) {
         let blocks = prompt.blocks();
+        self.unseen = None;
         self.emit(ChatEvent::Entry {
             entry: prompt.entry(),
         });
@@ -1002,6 +1140,51 @@ impl Inner {
             json!({ "sessionId": session, "prompt": blocks }),
             Pending::Prompt,
         );
+    }
+
+    /// The running turn ended with `result`. How it ended stays unseen until the user
+    /// looks, unless it was cancelled; a turn that did not end on its own holds the queue,
+    /// one that did goes on to the next prompt.
+    fn prompt_ended(&mut self, result: Result<Value, String>) {
+        let stop = match &result {
+            Ok(result) => result["stopReason"]
+                .as_str()
+                .unwrap_or("end_turn")
+                .to_owned(),
+            Err(_) => "error".to_owned(),
+        };
+        self.end_turn();
+        let unseen = match (stop.as_str(), result) {
+            ("end_turn", _) => Some(Unseen::Done),
+            ("cancelled", _) => {
+                self.emit(ChatEvent::Entry {
+                    entry: ChatEntry::Cancelled,
+                });
+                None
+            }
+            (_, Err(message)) => Some(Unseen::Error(message)),
+            (reason, Ok(_)) => Some(Unseen::Error(match reason {
+                "max_tokens" => "The reply reached the model's token limit.".into(),
+                "max_turn_requests" => "The turn reached its request limit.".into(),
+                "refusal" => "The model refused to go on.".into(),
+                other => format!("The turn ended: {other}."),
+            })),
+        };
+        if let Some(Unseen::Error(message)) = &unseen {
+            self.emit(ChatEvent::Entry {
+                entry: ChatEntry::Error {
+                    message: message.clone(),
+                },
+            });
+        }
+        self.unseen = unseen;
+        if !matches!(self.state.status, ChatStatus::Failed { .. }) {
+            self.emit(ChatEvent::Status {
+                status: ChatStatus::Ready,
+            });
+        }
+        self.queue_held = stop != "end_turn";
+        self.send_queued();
     }
 
     /// Puts `prompt` at the end of the queue, or first in it.
@@ -1979,8 +2162,39 @@ fn last_lines(text: &str, count: usize) -> &str {
     &text[start..]
 }
 
-/// The harness's command in its environment and folder.
-fn command(content: &ChatContent) -> Result<Command, String> {
+/// OMP's own `tools.approvalMode` in the chat's environment and folder, when it is a mode
+/// `omp acp` takes; `None` when the lookup fails or takes longer than
+/// `APPROVAL_LOOKUP_TIMEOUT`. The value is the last line: a login shell's profile may
+/// print before it.
+fn configured_approval(content: &ChatContent) -> Option<&'static str> {
+    let mut child = command(content, &["config", "get", "tools.approvalMode"])
+        .ok()?
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let output = child.stdout.take().expect("stdout is piped");
+    let (sender, receiver) = mpsc::channel();
+    // Read on a thread of its own, so a lookup that hangs is given up on time.
+    let _ = thread::Builder::new()
+        .name("compi-chat-config".into())
+        .spawn(move || {
+            let mut text = String::new();
+            let _ = output.take(16 * 1024).read_to_string(&mut text);
+            let _ = sender.send(text);
+        });
+    let text = receiver.recv_timeout(APPROVAL_LOOKUP_TIMEOUT);
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = text.ok()?;
+    let value = text.lines().map(str::trim).rfind(|line| !line.is_empty())?;
+    OMP_APPROVAL_MODES.into_iter().find(|mode| *mode == value)
+}
+
+/// The harness's command with `args` in its environment and folder. The arguments go
+/// into a shell script unquoted, so they are fixed words.
+fn command(content: &ChatContent, args: &[&'static str]) -> Result<Command, String> {
     if matches!(content.environment, ContentEnvironment::Host)
         && !std::path::Path::new(&content.folder).is_dir()
     {
@@ -1994,7 +2208,7 @@ fn command(content: &ChatContent) -> Result<Command, String> {
                 windows_program(content.harness.program()).ok_or_else(|| not_installed(content))?;
             let mut command = Command::new(program);
             command
-                .arg("acp")
+                .args(args)
                 .current_dir(&content.folder)
                 .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
             Ok(command)
@@ -2009,7 +2223,8 @@ fn command(content: &ChatContent) -> Result<Command, String> {
             }
             // The user's login shell, for the search path their profile sets.
             let script = format!(
-                r#"shell=$(getent passwd "$(id -u)" | cut -d: -f7); exec "${{shell:-/bin/sh}}" -lc '{UNIX_COMMAND}'"#
+                r#"shell=$(getent passwd "$(id -u)" | cut -d: -f7); exec "${{shell:-/bin/sh}}" -lc '{UNIX_COMMAND} {}'"#,
+                args.join(" ")
             );
             command
                 .args([
@@ -2027,7 +2242,7 @@ fn command(content: &ChatContent) -> Result<Command, String> {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
             let mut command = Command::new(shell);
             command
-                .args(["-lc", UNIX_COMMAND])
+                .args(["-lc", &format!("{UNIX_COMMAND} {}", args.join(" "))])
                 .current_dir(&content.folder);
             Ok(command)
         }
@@ -2324,5 +2539,113 @@ mod tests {
         // A declined steer waits first in line.
         inner.enqueue(prompt("steer"), true);
         assert_eq!(inner.state.queued[0].text, "steer");
+    }
+
+    #[test]
+    fn program_status_shows_what_waits_then_an_unseen_result_until_a_prompt_or_acknowledge() {
+        let prompt = || Prompt {
+            text: "go".into(),
+            files: Vec::new(),
+            images: Vec::new(),
+        };
+        let shown = |inner: &Inner| {
+            inner
+                .status_shown()
+                .map(|(state, kind, message)| (state, kind, message.map(str::to_owned)))
+        };
+        let title = Some("Fix it".to_owned());
+        let mut inner = Inner {
+            chat_id: "chat-status-test".into(),
+            state: ChatState {
+                session: Some("s".into()),
+                title: title.clone(),
+                status: ChatStatus::Ready,
+                ..ChatState::default()
+            },
+            ..Inner::default()
+        };
+        assert_eq!(shown(&inner), None, "an idle chat reports nothing");
+
+        inner.start_prompt("s".into(), prompt());
+        assert_eq!(
+            shown(&inner),
+            Some((ProgramState::Working, None, title.clone()))
+        );
+        inner.permission(
+            json!(1),
+            &json!({
+                "toolCall": { "toolCallId": "t1", "title": "rm x", "kind": "execute" },
+                "options": [{ "optionId": "a", "name": "Allow once", "kind": "allow_once" }],
+            }),
+        );
+        inner.question(
+            json!(2),
+            &json!({ "message": "Which?", "requestedSchema": { "type": "object", "properties": {} } }),
+        );
+        assert_eq!(
+            shown(&inner),
+            Some((
+                ProgramState::Blocked,
+                Some(BlockedKind::Permission),
+                title.clone()
+            )),
+            "a permission beats a question and a running turn"
+        );
+        inner.emit(ChatEvent::Permission { permission: None });
+        assert_eq!(
+            shown(&inner),
+            Some((
+                ProgramState::Blocked,
+                Some(BlockedKind::Question),
+                title.clone()
+            ))
+        );
+
+        inner.prompt_ended(Ok(json!({ "stopReason": "end_turn" })));
+        assert_eq!(
+            shown(&inner),
+            Some((ProgramState::Done, None, title.clone()))
+        );
+        inner.publish_status();
+        assert_eq!(
+            inner
+                .published
+                .as_ref()
+                .map(|record| (record.state, record.app.as_deref())),
+            Some((ProgramState::Done, Some("OMP")))
+        );
+        // Sending clears it.
+        inner.start_prompt("s".into(), prompt());
+        inner.prompt_ended(Ok(json!({ "stopReason": "cancelled" })));
+        assert_eq!(shown(&inner), None, "a cancelled turn leaves no result");
+
+        inner.start_prompt("s".into(), prompt());
+        inner.prompt_ended(Ok(json!({ "stopReason": "end_turn" })));
+        inner.unseen = None;
+        assert_eq!(shown(&inner), None, "acknowledged");
+
+        inner.start_prompt("s".into(), prompt());
+        inner.prompt_ended(Err("boom".into()));
+        assert_eq!(
+            shown(&inner),
+            Some((ProgramState::Error, None, Some("boom".into())))
+        );
+        inner.emit(ChatEvent::Reset {
+            state: Box::default(),
+        });
+        assert_eq!(shown(&inner), None, "a restart clears it");
+
+        inner.emit(ChatEvent::Status {
+            status: ChatStatus::Failed {
+                message: "OMP stopped".into(),
+            },
+        });
+        assert_eq!(
+            shown(&inner),
+            Some((ProgramState::Error, None, Some("OMP stopped".into())))
+        );
+        inner.closed = true;
+        inner.publish_status();
+        assert_eq!(inner.published, None, "a closed chat reports nothing");
     }
 }

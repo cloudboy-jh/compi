@@ -16,6 +16,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use compi_protocol::chat::ChatApproval;
 use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES, SplitAxis, WindowsShell};
 use serde::{Deserialize, Serialize};
 
@@ -172,6 +173,31 @@ pub const MAX_CHAT_TEXT_SIZE: f32 = 32.0;
 
 fn default_chat_text_size() -> f32 {
     DEFAULT_CHAT_TEXT_SIZE
+}
+
+/// Chat approvals, `[chat] approval`: how a chat's harness asks before it runs tools,
+/// in Settings' order. Harness keeps the harness's own setting.
+pub const CHAT_APPROVALS: [ChatApproval; 4] = [
+    ChatApproval::Harness,
+    ChatApproval::AlwaysAsk,
+    ChatApproval::Write,
+    ChatApproval::Yolo,
+];
+
+/// `approval`'s name in the configuration file: its protocol (serde) name.
+pub const fn chat_approval_id(approval: ChatApproval) -> &'static str {
+    match approval {
+        ChatApproval::Harness => "harness",
+        ChatApproval::AlwaysAsk => "always_ask",
+        ChatApproval::Write => "write",
+        ChatApproval::Yolo => "yolo",
+    }
+}
+
+fn parse_chat_approval(value: &str) -> Option<ChatApproval> {
+    CHAT_APPROVALS
+        .into_iter()
+        .find(|approval| chat_approval_id(*approval) == value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,6 +524,9 @@ pub struct LoadedConfig {
     /// Message text size of every chat; see [`DEFAULT_CHAT_TEXT_SIZE`].
     #[serde(default = "default_chat_text_size")]
     pub chat_text_size: f32,
+    /// How chats' harnesses ask before running tools; see [`CHAT_APPROVALS`].
+    #[serde(default)]
+    pub chat_approval: ChatApproval,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Named pane arrangements, shape only, keyed by preset name.
@@ -529,6 +558,7 @@ impl Default for LoadedConfig {
             confirm_close: false,
             focus_indicator: FocusIndicator::default(),
             chat_text_size: DEFAULT_CHAT_TEXT_SIZE,
+            chat_approval: ChatApproval::Harness,
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -836,6 +866,18 @@ impl LoadedConfig {
             }
         })?;
         self.chat_text_size = size.unwrap_or(DEFAULT_CHAT_TEXT_SIZE);
+        Ok(())
+    }
+
+    /// Persist the chat approval; Harness, the default, removes it.
+    pub fn save_chat_approval(&mut self, approval: ChatApproval) -> Result<(), String> {
+        update_table(&self.path, "chat", |table| match approval {
+            ChatApproval::Harness => {
+                table.remove("approval");
+            }
+            approval => set_table_value(table, "approval", chat_approval_id(approval).into()),
+        })?;
+        self.chat_approval = approval;
         Ok(())
     }
 
@@ -1814,19 +1856,30 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
             }
         }
     }
-    if let Some(chat) = table(&document, "chat", loaded)
-        && let Some(value) = chat.get("text_size")
-    {
-        match number(value).filter(|value| {
-            valid_number(*value, MIN_CHAT_TEXT_SIZE.into(), MAX_CHAT_TEXT_SIZE.into())
-        }) {
-            Some(size) => loaded.chat_text_size = size as f32,
-            None => invalid(
-                loaded,
-                "chat.text_size",
-                "a finite number from 10 through 32",
-                "configuration",
-            ),
+    if let Some(chat) = table(&document, "chat", loaded) {
+        if let Some(value) = chat.get("text_size") {
+            match number(value).filter(|value| {
+                valid_number(*value, MIN_CHAT_TEXT_SIZE.into(), MAX_CHAT_TEXT_SIZE.into())
+            }) {
+                Some(size) => loaded.chat_text_size = size as f32,
+                None => invalid(
+                    loaded,
+                    "chat.text_size",
+                    "a finite number from 10 through 32",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = chat.get("approval") {
+            match value.as_str().and_then(parse_chat_approval) {
+                Some(approval) => loaded.chat_approval = approval,
+                None => invalid(
+                    loaded,
+                    "chat.approval",
+                    "\"harness\", \"always_ask\", \"write\" or \"yolo\"",
+                    "configuration",
+                ),
+            }
         }
     }
     if let Some(notifications) = table(&document, "notifications", loaded) {
@@ -2893,6 +2946,56 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("workspace.focus_indicator"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_approval_defaults_to_harness_round_trips_and_rejects_unknown_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-chat-approval-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[chat]\n# retain me\ntext_size = 16\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.chat_approval, ChatApproval::Harness);
+        loaded.save_chat_approval(ChatApproval::AlwaysAsk).unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.chat_approval, ChatApproval::AlwaysAsk);
+        assert_eq!(reloaded.chat_text_size, 16.0);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("approval = \"always_ask\"") && text.contains("# retain me"));
+        loaded.save_chat_approval(ChatApproval::Harness).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("approval"));
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).chat_approval,
+            ChatApproval::Harness
+        );
+        // The file uses the protocol's names.
+        for approval in CHAT_APPROVALS {
+            assert_eq!(
+                serde_json::to_value(approval).unwrap(),
+                chat_approval_id(approval)
+            );
+        }
+
+        let invalid = parse(
+            "version = 1\n[chat]\napproval = 'never'",
+            FontOverrides::default(),
+        );
+        assert_eq!(invalid.chat_approval, ChatApproval::Harness);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("chat.approval"))
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -1,4 +1,5 @@
-//! Program status records reported by programs through OSC 7501.
+//! Program status records reported by programs through OSC 7501, and by the daemon for
+//! the chats it runs.
 //!
 //! Every text field is untrusted program output: the daemon has checked it against the
 //! protocol's limits and refused control characters, but nothing else.
@@ -45,5 +46,14 @@ pub struct ProgramStatusRecord {
 pub struct SurfaceProgramStatus {
     pub surface_id: SurfaceId,
     pub process_lifetime_id: ProcessLifetimeId,
+    pub records: Vec<ProgramStatusRecord>,
+}
+
+/// What a chat's harness is doing, reported by the daemon that runs it: one root record
+/// at most (working, blocked on a permission or question, done or error); none while the
+/// chat waits for a prompt with nothing unseen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatProgramStatus {
+    pub chat_id: String,
     pub records: Vec<ProgramStatusRecord>,
 }

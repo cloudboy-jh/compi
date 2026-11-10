@@ -892,7 +892,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         }
         "pane" => {
             if matches!(action, Some("list" | "show")) {
-                // Pane rows carry each terminal's current program status.
+                // Pane rows carry each terminal's and chat's current program status.
                 client.watch_program_status()?;
             }
             if action == Some("list") {
@@ -1279,7 +1279,8 @@ fn pane_surface<'a>(
 
 /// One `pane list`/`pane show` entry. Terminals report their surface, fresh runtime
 /// metadata, program status and any view they carry; content panes have no process and
-/// report what they show: files, Settings or Monitor.
+/// report what they show: files, Settings or Monitor. A chat, as a pane or a terminal's
+/// view, adds its own program status.
 fn pane_row(
     client: &mut DaemonClient,
     state: &WorkspaceSnapshot,
@@ -1288,6 +1289,12 @@ fn pane_row(
     leaf: &LayoutNode,
 ) -> std::result::Result<Value, CliError> {
     use crate::cli_window::PaneType;
+    let chat_status = leaf
+        .content()
+        .and_then(compi_protocol::PaneContent::chat)
+        .and_then(|chat| client.chat_program_status().get(&chat.id))
+        .map_or(&[][..], |status| &status.records)
+        .to_vec();
     Ok(match leaf {
         LayoutNode::Pane {
             pane_id,
@@ -1295,19 +1302,26 @@ fn pane_row(
             view,
         } => {
             let surface = pane_surface(state, surface_id)?;
-            let program_status = client
+            let mut program_status = client
                 .program_status()
                 .get(surface_id)
                 .filter(|status| status.process_lifetime_id == surface.process_lifetime_id)
                 .map_or(&[][..], |status| &status.records)
                 .to_vec();
+            program_status.extend(chat_status);
             let mut row = json!({"workspace_id":session.id,"tab_id":tab.id,"pane_id":pane_id,"type":PaneType::Terminal,"surface":surface,"metadata":client.surface_metadata(surface)?,"program_status":program_status});
             if let Some(view) = view {
                 row["view"] = json!(view);
             }
             row
         }
-        LayoutNode::Content { pane_id, content } => content_row(session, tab, pane_id, content),
+        LayoutNode::Content { pane_id, content } => {
+            let mut row = content_row(session, tab, pane_id, content);
+            if content.chat().is_some() {
+                row["program_status"] = json!(chat_status);
+            }
+            row
+        }
         LayoutNode::Split { .. } => unreachable!("pane rows are built only for leaf nodes"),
     })
 }

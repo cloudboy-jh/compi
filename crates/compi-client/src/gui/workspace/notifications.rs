@@ -1,7 +1,7 @@
-//! Notifications: a terminal's program reporting (OSC 7501) that it needs the user
-//! (`blocked`: a permission, a question or a sign-in) or that its work is done tells
-//! the user, in Compi (a toast at the bottom right of the window showing the pane) or
-//! from the system, and a click goes to its pane.
+//! Notifications: a terminal's program reporting (OSC 7501), or a chat reporting, that
+//! it needs the user (`blocked`: a permission, a question or a sign-in) or that its work
+//! is done tells the user, in Compi (a toast at the bottom right of the window showing
+//! the pane) or from the system, and a click goes to its pane.
 //!
 //! Only transitions count: a record entering `blocked` or `done` in a status change.
 //! The snapshot a window's watching connection starts with (and restarts with after a
@@ -23,9 +23,9 @@ use crate::config::{NotificationDelivery, NotificationSound};
 use crate::gui::controls::IconName;
 use crate::gui::os_notifications::{self, OsNotice, OsStatus, OsSubmit, SoundPlayed};
 use crate::program_status::{display_text, inherited_app};
-use compi_protocol::ProcessLifetimeId;
+use compi_protocol::PaneSide;
 use compi_protocol::program_status::{
-    BlockedKind, ProgramState, ProgramStatusRecord, SurfaceProgramStatus,
+    BlockedKind, ChatProgramStatus, ProgramState, ProgramStatusRecord, SurfaceProgramStatus,
 };
 use gpui::WindowId;
 use std::cell::RefCell;
@@ -66,12 +66,19 @@ pub(in crate::gui) enum NoticeKind {
     Note,
 }
 
-/// One notification: what it says and the terminal it opens.
+/// What a notification opens: a terminal, or the pane holding a chat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::gui) enum NoticeTarget {
+    Surface(SurfaceId),
+    Chat(String),
+}
+
+/// One notification: what it says and what it opens.
 #[derive(Clone, Debug)]
 pub(in crate::gui) struct Notice {
     kind: NoticeKind,
-    /// The terminal and its process; none for a test.
-    target: Option<(SurfaceId, ProcessLifetimeId)>,
+    /// None for a test or a note.
+    target: Option<NoticeTarget>,
     title: String,
     /// The program's message, bounded; may be empty.
     message: String,
@@ -109,9 +116,9 @@ struct NotificationWindows(Vec<(WindowId, ConnectionTarget)>);
 
 impl gpui::Global for NotificationWindows {}
 
-/// The terminal each system notification opens, by tag.
+/// What each system notification opens, by tag.
 #[derive(Default)]
-struct NotificationRoutes(HashMap<String, (ConnectionTarget, SurfaceId)>);
+struct NotificationRoutes(HashMap<String, (ConnectionTarget, NoticeTarget)>);
 
 impl gpui::Global for NotificationRoutes {}
 
@@ -165,7 +172,7 @@ impl NotificationsUi {
     }
 }
 
-/// Once per process: system notification clicks open their terminal.
+/// Once per process: system notification clicks open their pane.
 pub(in crate::gui) fn init(target: &ConnectionTarget, cx: &mut App) {
     let instance = target.state_instance();
     os_notifications::init(cx, instance.as_deref(), open_route);
@@ -237,20 +244,28 @@ fn delivery_detail(delivery: NotificationDelivery) -> String {
     }
 }
 
+/// What the terminal reported last, as the baseline of `after`: records of another
+/// process are none for this one.
+fn surface_baseline<'a>(
+    before: Option<&'a SurfaceProgramStatus>,
+    after: &SurfaceProgramStatus,
+) -> &'a [ProgramStatusRecord] {
+    before
+        .filter(|before| before.process_lifetime_id == after.process_lifetime_id)
+        .map_or(&[][..], |before| before.records.as_slice())
+}
+
 /// The record a status change announces, if any: one entering `blocked` (when
-/// `attention`) before one entering `done` (when `finished`). `before` is what the
-/// terminal reported last; records of another process are no baseline for this one.
+/// `attention`) before one entering `done` (when `finished`). `previous` is what the
+/// terminal or chat reported last.
 fn announced<'a>(
-    before: Option<&SurfaceProgramStatus>,
-    after: &'a SurfaceProgramStatus,
+    previous: &[ProgramStatusRecord],
+    after: &'a [ProgramStatusRecord],
     attention: bool,
     finished: bool,
 ) -> Option<(NoticeKind, &'a ProgramStatusRecord)> {
-    let previous = before
-        .filter(|before| before.process_lifetime_id == after.process_lifetime_id)
-        .map_or(&[][..], |before| before.records.as_slice());
     let entered = |state: ProgramState| {
-        after.records.iter().find(|record| {
+        after.iter().find(|record| {
             record.state == state
                 && previous
                     .iter()
@@ -321,9 +336,16 @@ fn notice_text(
     (title, message)
 }
 
-/// A short tag for the system: one per terminal, so a newer notification replaces it.
-fn tag(surface_id: &SurfaceId) -> String {
-    let digest = Sha256::digest(surface_id.as_str().as_bytes());
+/// A short tag for the system: one per terminal or chat, so a newer notification
+/// replaces it.
+fn tag(target: &NoticeTarget) -> String {
+    let digest = match target {
+        NoticeTarget::Surface(surface_id) => Sha256::digest(surface_id.as_str().as_bytes()),
+        NoticeTarget::Chat(chat) => Sha256::new()
+            .chain_update(b"chat:")
+            .chain_update(chat.as_bytes())
+            .finalize(),
+    };
     let hex: String = digest[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -331,10 +353,10 @@ fn tag(surface_id: &SurfaceId) -> String {
     format!("compi-{hex}")
 }
 
-/// A system notification was clicked: the window showing its terminal (else any window
-/// of its target that has it) opens it. A terminal that is gone opens nothing.
+/// A system notification was clicked: the window showing its pane (else any window of
+/// its target that has it) opens it. A pane that is gone opens nothing.
 fn open_route(tag: &str, cx: &mut App) {
-    let Some((target, surface_id)) = cx
+    let Some((target, notice_target)) = cx
         .try_global::<NotificationRoutes>()
         .and_then(|routes| routes.0.get(tag).cloned())
     else {
@@ -348,8 +370,8 @@ fn open_route(tag: &str, cx: &mut App) {
         let Ok((same, has, shows)) = typed.read(cx).map(|app| {
             (
                 app.target == target,
-                app.surface_place(&surface_id).is_some(),
-                app.shows_surface(&surface_id),
+                app.notice_place(&notice_target).is_some(),
+                app.shows_notice_target(&notice_target),
             )
         }) else {
             continue;
@@ -365,7 +387,7 @@ fn open_route(tag: &str, cx: &mut App) {
     }
     if let Some(typed) = fallback {
         let _ = typed.update(cx, |app, window, cx| {
-            app.open_notice_target(&surface_id, window, cx);
+            app.open_notice_target(&notice_target, window, cx);
         });
     }
 }
@@ -388,16 +410,19 @@ impl CompiApp {
             .is_none_or(|(id, _)| *id == self.notifications.window_id)
     }
 
-    /// The tab and pane of terminal `surface_id`, when this window's workspace has it.
-    fn surface_place(&self, surface_id: &SurfaceId) -> Option<(TabId, PaneId)> {
+    /// The workspace, tab and pane of `target`, when this window's workspace has it.
+    fn notice_place(&self, target: &NoticeTarget) -> Option<(SessionId, TabId, PaneId)> {
         let workspace = self.workspace.as_ref()?;
-        monitor::surface_pane(workspace, surface_id).map(|(_, tab, pane)| (tab, pane))
+        match target {
+            NoticeTarget::Surface(surface_id) => monitor::surface_pane(workspace, surface_id),
+            NoticeTarget::Chat(chat) => program_status::chat_place(workspace, chat),
+        }
     }
 
-    /// Whether this window shows the tab of terminal `surface_id`.
-    fn shows_surface(&self, surface_id: &SurfaceId) -> bool {
-        let (Some(workspace), Some((tab_id, _))) =
-            (self.workspace.as_ref(), self.surface_place(surface_id))
+    /// Whether this window shows the tab of `target`.
+    fn shows_notice_target(&self, target: &NoticeTarget) -> bool {
+        let (Some(workspace), Some((_, tab_id, _))) =
+            (self.workspace.as_ref(), self.notice_place(target))
         else {
             return false;
         };
@@ -408,6 +433,12 @@ impl CompiApp {
             .any(|tab| tab.id == tab_id)
     }
 
+    /// Whether this window announces now: some kind is on and it is the oldest window.
+    fn announcing(&self, cx: &App) -> bool {
+        let settings = self.config.notifications;
+        (settings.attention || settings.finished) && self.announces(cx)
+    }
+
     /// Before `status` replaces what its terminal reported: announces what it newly
     /// needs the user for, unless another window announces or the user is using it.
     pub(super) fn notice_program_status(
@@ -415,8 +446,7 @@ impl CompiApp {
         status: &SurfaceProgramStatus,
         cx: &mut Context<Self>,
     ) {
-        let settings = self.config.notifications;
-        if !settings.attention && !settings.finished || !self.announces(cx) {
+        if !self.announcing(cx) {
             return;
         }
         // Only the terminal's current process speaks.
@@ -428,12 +458,54 @@ impl CompiApp {
         if !current {
             return;
         }
-        let before = self.program_status.status(&status.surface_id);
-        let Some((kind, record)) = announced(before, status, settings.attention, settings.finished)
-        else {
+        let settings = self.config.notifications;
+        let previous = surface_baseline(self.program_status.status(&status.surface_id), status);
+        let Some((kind, record)) = announced(
+            previous,
+            &status.records,
+            settings.attention,
+            settings.finished,
+        ) else {
             return;
         };
-        let Some((tab_id, pane_id)) = self.surface_place(&status.surface_id) else {
+        let target = NoticeTarget::Surface(status.surface_id.clone());
+        self.announce(target, kind, record, &status.records, cx);
+    }
+
+    /// Before `status` replaces what its chat reported: announces like a terminal's.
+    pub(super) fn notice_chat_program_status(
+        &mut self,
+        status: &ChatProgramStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.announcing(cx) {
+            return;
+        }
+        let settings = self.config.notifications;
+        let previous = self.program_status.chat_records(&status.chat_id);
+        let Some((kind, record)) = announced(
+            previous,
+            &status.records,
+            settings.attention,
+            settings.finished,
+        ) else {
+            return;
+        };
+        let target = NoticeTarget::Chat(status.chat_id.clone());
+        self.announce(target, kind, record, &status.records, cx);
+    }
+
+    /// Tells the user `record` of `target` needs them or finished, unless they are using
+    /// its pane or this window's workspace does not have it.
+    fn announce(
+        &mut self,
+        target: NoticeTarget,
+        kind: NoticeKind,
+        record: &ProgramStatusRecord,
+        records: &[ProgramStatusRecord],
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, tab_id, pane_id)) = self.notice_place(&target) else {
             return;
         };
         if self.in_use(&pane_id, cx) {
@@ -448,13 +520,10 @@ impl CompiApp {
         let place = tab
             .map(|tab| bounded(&self.tab_label(tab)))
             .unwrap_or_default();
-        let (title, message) = notice_text(kind, record, &status.records, &pane_title);
+        let (title, message) = notice_text(kind, record, records, &pane_title);
         let notice = Notice {
             kind,
-            target: Some((
-                status.surface_id.clone(),
-                status.process_lifetime_id.clone(),
-            )),
+            target: Some(target),
             title,
             message,
             place,
@@ -507,11 +576,11 @@ impl CompiApp {
         let mut system_sound = false;
         if os {
             let tag = match &notice.target {
-                Some((surface_id, _)) => {
-                    let tag = tag(surface_id);
+                Some(target) => {
+                    let tag = tag(target);
                     cx.default_global::<NotificationRoutes>()
                         .0
-                        .insert(tag.clone(), (self.target.clone(), surface_id.clone()));
+                        .insert(tag.clone(), (self.target.clone(), target.clone()));
                     tag
                 }
                 None => "compi-test".to_owned(),
@@ -539,7 +608,7 @@ impl CompiApp {
             match notice
                 .target
                 .as_ref()
-                .and_then(|(surface_id, _)| self.window_showing(surface_id, cx))
+                .and_then(|target| self.window_showing(target, cx))
             {
                 Some(handle) => {
                     cx.defer(move |cx| {
@@ -559,14 +628,14 @@ impl CompiApp {
         outcome.join(". ")
     }
 
-    /// Another window that shows the tab of `surface_id`; `None` when it is this one,
-    /// or none does (this window shows the toast).
+    /// Another window that shows the tab of `target`; `None` when it is this one, or
+    /// none does (this window shows the toast).
     fn window_showing(
         &self,
-        surface_id: &SurfaceId,
+        target: &NoticeTarget,
         cx: &App,
     ) -> Option<gpui::WindowHandle<CompiApp>> {
-        if self.shows_surface(surface_id) {
+        if self.shows_notice_target(target) {
             return None;
         }
         cx.windows().into_iter().find_map(|handle| {
@@ -577,18 +646,15 @@ impl CompiApp {
             typed
                 .read(cx)
                 .ok()
-                .filter(|app| app.target == self.target && app.shows_surface(surface_id))
+                .filter(|app| app.target == self.target && app.shows_notice_target(target))
                 .map(|_| typed)
         })
     }
 
-    /// Shows `notice` as a toast, replacing one from the same terminal.
+    /// Shows `notice` as a toast, replacing one from the same terminal or chat.
     fn push_toast(&mut self, notice: Notice, cx: &mut Context<Self>) {
         let toasts = &mut self.notifications.toasts;
-        toasts.retain(|toast| {
-            toast.notice.target.as_ref().map(|(surface, _)| surface)
-                != notice.target.as_ref().map(|(surface, _)| surface)
-        });
+        toasts.retain(|toast| toast.notice.target != notice.target);
         toasts.push(Toast {
             id: self.notifications.next_id,
             notice,
@@ -936,18 +1002,22 @@ impl CompiApp {
         self.push_toast(notice, cx);
     }
 
-    /// Opens the terminal `surface_id` from a notification and brings its window
-    /// forward; a terminal that is gone opens nothing.
+    /// Opens the pane of `target` from a notification, with the terminal or the chat
+    /// showing, and brings its window forward; a pane that is gone opens nothing.
     pub(super) fn open_notice_target(
         &mut self,
-        surface_id: &SurfaceId,
+        target: &NoticeTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.surface_place(surface_id).is_none() {
+        let Some((session, tab, pane_id)) = self.notice_place(target) else {
             return;
-        }
-        self.open_process_terminal(surface_id, window, cx);
+        };
+        let side = match target {
+            NoticeTarget::Surface(_) => PaneSide::Terminal,
+            NoticeTarget::Chat(_) => PaneSide::View,
+        };
+        self.reveal_pane(session, tab, pane_id, side, window, cx);
         window.activate_window();
         cx.activate(true);
     }
@@ -986,8 +1056,8 @@ impl CompiApp {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.notifications.toasts.retain(|toast| toast.id != id);
-                    if let Some((surface_id, _)) = &target {
-                        this.open_notice_target(surface_id, window, cx);
+                    if let Some(target) = &target {
+                        this.open_notice_target(target, window, cx);
                     }
                     cx.notify();
                 }))
@@ -1071,6 +1141,7 @@ impl CompiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compi_protocol::ProcessLifetimeId;
 
     fn record(id: Option<&str>, state: ProgramState) -> ProgramStatusRecord {
         ProgramStatusRecord {
@@ -1098,7 +1169,8 @@ mod tests {
         attention: bool,
         finished: bool,
     ) -> Option<NoticeKind> {
-        announced(before, after, attention, finished).map(|(kind, _)| kind)
+        let previous = surface_baseline(before, after);
+        announced(previous, &after.records, attention, finished).map(|(kind, _)| kind)
     }
 
     #[test]
@@ -1181,7 +1253,7 @@ mod tests {
             Some(NoticeKind::Attention)
         );
         assert_eq!(
-            announced(Some(&one_blocked), &two_blocked, true, true)
+            announced(&one_blocked.records, &two_blocked.records, true, true)
                 .map(|(_, record)| record.id.as_deref()),
             Some(Some("b"))
         );
@@ -1254,10 +1326,16 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_short_stable_and_per_terminal() {
-        let a = tag(&SurfaceId::new("surface-1a17e9e24a8-364c-4"));
-        assert_eq!(a, tag(&SurfaceId::new("surface-1a17e9e24a8-364c-4")));
-        assert_ne!(a, tag(&SurfaceId::new("surface-2")));
+    fn tags_are_short_stable_and_per_terminal_or_chat() {
+        let surface = |id: &str| NoticeTarget::Surface(SurfaceId::new(id));
+        let a = tag(&surface("surface-1a17e9e24a8-364c-4"));
+        assert_eq!(a, tag(&surface("surface-1a17e9e24a8-364c-4")));
+        assert_ne!(a, tag(&surface("surface-2")));
         assert!(a.len() <= 32 && a.is_ascii());
+        // A chat never shares a terminal's tag, even under the same name.
+        let chat = tag(&NoticeTarget::Chat("surface-2".into()));
+        assert_ne!(chat, tag(&surface("surface-2")));
+        assert_eq!(chat, tag(&NoticeTarget::Chat("surface-2".into())));
+        assert!(chat.len() <= 32 && chat.is_ascii());
     }
 }

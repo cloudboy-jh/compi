@@ -448,6 +448,8 @@ pub(super) enum Popup {
     NotificationFocusedPane,
     /// Settings → Notifications → Sound.
     NotificationSound,
+    /// Settings → Chat → Approvals.
+    ChatApproval,
     /// The theme list's More menu.
     CatalogMenu,
     /// The Appearance controls under the sidebar's Appearance button.
@@ -2162,10 +2164,16 @@ impl CompiApp {
                 request,
                 result,
             } => self.prompt_responded(job, request, result),
-            UiEvent::ProgramStatusWatched(statuses) => self.program_status.replace_all(statuses),
+            UiEvent::ProgramStatusWatched { surfaces, chats } => {
+                self.program_status.replace_all(surfaces, chats)
+            }
             UiEvent::ProgramStatusChanged(status) => {
                 self.notice_program_status(&status, cx);
                 self.program_status.update(status);
+            }
+            UiEvent::ChatProgramStatusChanged(status) => {
+                self.notice_chat_program_status(&status, cx);
+                self.program_status.update_chat(status);
             }
             UiEvent::Monitor(event) => self.monitor_event(event),
             UiEvent::Chat(update) => self.chat_event(update, cx),
@@ -4708,8 +4716,6 @@ struct TabPane {
     directory: Option<String>,
     /// Floating in this window; shown in the pane list.
     floating: bool,
-    /// The terminal's surface; `None` for a content pane.
-    surface_id: Option<SurfaceId>,
 }
 
 impl CompiApp {
@@ -4737,7 +4743,6 @@ impl CompiApp {
                         pane_id,
                         title,
                         directory,
-                        surface_id: None,
                     })
                 }
                 LayoutNode::Pane {
@@ -4792,7 +4797,6 @@ impl CompiApp {
             pane_id,
             title,
             directory,
-            surface_id: Some(surface_id.clone()),
         }
     }
 
@@ -6369,11 +6373,7 @@ impl CompiApp {
                 })
                 .when(
                     self.pane_drag.is_none() && self.config.program_status.panes,
-                    |pane| {
-                        pane.children(geometry.surface_id.as_ref().and_then(|surface| {
-                            self.render_pane_program_status(index, &geometry.pane_id, surface)
-                        }))
-                    },
+                    |pane| pane.children(self.render_pane_program_status(index, &geometry.pane_id)),
                 )
                 .when_some(edge, |pane, edge| {
                     // Drawn last so the outline is never covered; it has no hitbox.
@@ -6804,12 +6804,12 @@ impl CompiApp {
         let moving = drag.is_some();
         let docking = drag.is_some_and(|drag| drag.dock.is_some());
         let (title, tab_label) = self.floating_caption(&pane_id);
-        let program_status = float
-            .pane
-            .surface_id
-            .as_ref()
-            .filter(|_| self.config.program_status.panes)
-            .and_then(|surface| self.render_floating_program_status(index, surface, &title));
+        let program_status = self
+            .config
+            .program_status
+            .panes
+            .then(|| self.render_floating_program_status(index, &pane_id, &title))
+            .flatten();
         let body = layout::Rect {
             x: 0.0,
             y: FLOAT_TITLE_HEIGHT,
