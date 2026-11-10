@@ -440,13 +440,13 @@ pub(super) enum Popup {
     UiFont,
     /// Settings → Terminal → Terminal font.
     TerminalFont,
-    /// Settings → Terminal → Shell (Windows).
+    /// Settings → Terminal → Default shell (Windows).
     Shell,
-    /// Settings → Notifications → Delivery.
+    /// Settings → Notifications → Show notifications.
     NotificationDelivery,
     /// Settings → Notifications → Focused pane.
     NotificationFocusedPane,
-    /// Settings → Notifications → Sound.
+    /// Settings → Notifications → Notification sound.
     NotificationSound,
     /// Settings → Chat → Approvals.
     ChatApproval,
@@ -929,7 +929,6 @@ impl CompiApp {
             sidebar_open: false,
             whats_new_expanded: false,
             settings_update_notes_expanded: false,
-            settings_update_advanced: false,
             update_dot: false,
             update_card: None,
             updates_page_open: false,

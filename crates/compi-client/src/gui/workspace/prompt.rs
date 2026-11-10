@@ -3,7 +3,7 @@
 //! and apply one from a confirm popover on its row. Previews never touch the
 //! terminal theme, layout, or anything persisted; files change only through a
 //! plan the user confirmed.
-use super::settings::{RowCx, SettingsAction};
+use super::settings::{RowCx, SettingsAction, row_description};
 use super::*;
 use compi_protocol::prompt::{
     MAX_PREVIEW_STYLES, PromptConfig, PromptEnvironment, PromptFileChange, PromptOperation,
@@ -1493,7 +1493,15 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().font_weight(FontWeight::MEDIUM).child(group.title))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(group.title))
+                    .child(self.prompt_note(row_description(group.row))),
+            )
             .child(header);
         if let Some(Err(error)) = &state.environment {
             column = column
@@ -1538,7 +1546,12 @@ impl CompiApp {
                 },
             ))
             .into_any_element();
-        self.settings_row("Shell", String::new(), controls, compact)
+        self.settings_row(
+            "Shell",
+            "The shell whose prompt you're setting.".into(),
+            controls,
+            compact,
+        )
     }
 
     fn render_prompt_details(&self, environment: &PromptEnvironment) -> AnyElement {
@@ -1663,7 +1676,12 @@ impl CompiApp {
                     )
                 }))
                 .into_any_element();
-            form = form.child(self.settings_row("Provider", String::new(), providers, compact));
+            form = form.child(self.settings_row(
+                "Provider",
+                "The program that draws the prompt.".into(),
+                providers,
+                compact,
+            ));
         }
         form = form.child(match &state.selected {
             Some(selected) if !installed(environment, selected.provider) => self.prompt_note(
@@ -1676,7 +1694,7 @@ impl CompiApp {
         form = form.child(
             self.settings_row(
                 "Also use outside Compi",
-                String::new(),
+                "Add it to your login shell's startup file, so other terminals show it too.".into(),
                 div()
                     .when(environment.login_shell.shell.is_none(), |toggle| {
                         toggle.opacity(0.5)

@@ -66,9 +66,9 @@ agents_bar = true
 
 When more than one pane is visible, the focused pane is marked as set under **Focus indicator** below; terminal colours are unchanged. Floating panes keep their shadow and title strip and use the same corner radius. Switching density resizes terminals through the normal resize path, so running programs keep running and reflow once.
 
-## Tab metadata
+## Tab details
 
-**Settings → Interface → Tab metadata** writes independent global caption/hover preferences:
+**Settings → Interface → Tab details** writes independent global caption/hover preferences:
 
 ```toml
 [metadata]

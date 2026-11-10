@@ -1,3 +1,4 @@
+use super::settings::settings_group_label;
 use super::*;
 use compi_protocol::{ProcessMetrics, RuntimeMetrics};
 
@@ -270,7 +271,7 @@ impl CompiApp {
                 true,
             ))
             .child(self.render_sparkline(&self.performance.fps_history))
-            .child(self.settings_subheading("Resources"))
+            .child(settings_group_label("Resources"))
             .child(metric(
                 "Compi window",
                 process_summary(latest.and_then(|latest| latest.client_cpu), client),
@@ -297,7 +298,7 @@ impl CompiApp {
                 ),
                 true,
             ))
-            .child(self.settings_subheading("Renderer"))
+            .child(settings_group_label("Renderer"))
             .child(metric(
                 "Cached text rows",
                 format!("{} / {}", cache.shaped_rows, cache.shaped_capacity),

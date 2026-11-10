@@ -1,3 +1,4 @@
+use super::settings::settings_group_label;
 use super::*;
 use crate::gui::controls::IconName;
 use gpui::{Animation, AnimationExt, ease_out_quint};
@@ -729,7 +730,7 @@ impl CompiApp {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(self.settings_subheading("Configuration"))
+                                    .child(settings_group_label("Configuration"))
                                     .child(
                                         div()
                                             .text_size(px(UI_SMALL_TEXT_SIZE))
@@ -776,9 +777,7 @@ impl CompiApp {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(
-                                        self.settings_subheading(&format!("Pane {}", view.pane_id)),
-                                    )
+                                    .child(settings_group_label(format!("Pane {}", view.pane_id)))
                                     .when(!details.is_empty(), |pane| {
                                         pane.child(
                                             div()

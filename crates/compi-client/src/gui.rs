@@ -937,7 +937,6 @@ struct CompiApp {
     sidebar_open: bool,
     whats_new_expanded: bool,
     settings_update_notes_expanded: bool,
-    settings_update_advanced: bool,
     /// A release is on offer and Later wasn't chosen for it.
     update_dot: bool,
     /// The sidebar's update card as last drawn.

@@ -1,4 +1,6 @@
-use super::settings::{RowCx, SettingsAction, SettingsHost, THEME_BAR_ROW, settings_card};
+use super::settings::{
+    RowCx, SettingsAction, SettingsHost, THEME_BAR_ROW, settings_card, settings_group_label,
+};
 use super::*;
 use crate::gui::controls::IconName;
 use crate::theme::{ThemeDefinition, ThemeId};
@@ -1138,15 +1140,16 @@ impl CompiApp {
                     ),
                 )
             })
-            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(
-                if catalog.remove_mode {
+            .child(
+                settings_group_label(if catalog.remove_mode {
                     "Remove local themes"
                 } else if terminal {
                     "Terminal colors"
                 } else {
                     "Theme"
-                },
-            ))
+                })
+                .flex_none(),
+            )
             .child(
                 div()
                     .relative()
@@ -1216,11 +1219,11 @@ impl CompiApp {
                 .gap_4()
                 .text_size(px(UI_SMALL_TEXT_SIZE))
                 .line_height(px(UI_SMALL_LINE_HEIGHT))
-                .child(self.settings_subheading("Selected theme attribution"))
+                .child(settings_group_label("Selected theme attribution"))
                 .child(attribution.attribution().to_owned())
-                .child(self.settings_subheading("Bundled theme licenses"))
+                .child(settings_group_label("Bundled theme licenses"))
                 .child(crate::theme::THEME_ATTRIBUTION)
-                .child(self.settings_subheading("Bundled font licenses"))
+                .child(settings_group_label("Bundled font licenses"))
                 .child(crate::font_catalog::FONT_ATTRIBUTION)
                 .into_any_element()
         } else {

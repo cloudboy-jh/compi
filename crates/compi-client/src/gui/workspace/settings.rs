@@ -8,13 +8,13 @@
 //! persists with the pane; the search, scroll and keyboard highlight are this
 //! window's.
 //!
-//! A pane draws a one-line header (title, section icons, search); the selected icon
-//! names the section, so a page is just its cards of rows, each under its group's
-//! label when the section has more than one group, with the header rows (the scope
-//! switch, Monitor's Open as pane) at the right end of the first label line. The
-//! Appearance page and Advanced's terminal colors page end in the theme grid
-//! (`catalog`), which fills the pane and previews on the real panes until the Apply /
-//! Cancel bar decides. Monitor's page is Overview's cards, drawn on the page itself.
+//! A pane draws a one-line header (title, section icons, search). A section's page
+//! opens with its heading: its name and a line on what it covers, with the header rows
+//! (the scope switch, Monitor's Open as pane) at its right end. Then come its cards of
+//! rows, each under its group's label. The Appearance page and Advanced's terminal
+//! colors page end in the theme grid (`catalog`), which fills the pane and previews on
+//! the real panes until the Apply / Cancel bar decides. Monitor's page is Overview's
+//! cards, drawn on the page itself.
 use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
 use super::*;
@@ -70,7 +70,6 @@ pub(super) enum UpdateControl {
     NotesMore,
     /// The notes' release page.
     ReleaseNotes,
-    Advanced,
     Repair,
     OpenLog,
 }
@@ -248,7 +247,7 @@ pub(super) struct RowCx {
     pub(super) row: &'static str,
     pub(super) title: &'static str,
     pub(super) compact: bool,
-    /// Drawn on the page's first label line rather than as a row.
+    /// Drawn on the page's heading line rather than as a row.
     pub(super) header: bool,
 }
 
@@ -271,8 +270,8 @@ pub(super) struct Row {
     title: &'static str,
     description: &'static str,
     keywords: &'static str,
-    /// Drawn at the right end of the page's first label line rather than in a card;
-    /// search results show it as a row.
+    /// Drawn at the right end of the page's heading line rather than in a card; search
+    /// results show it as a row.
     header: bool,
     /// Whether it shows now; some rows depend on other settings.
     shown: fn(&CompiApp) -> bool,
@@ -372,7 +371,7 @@ const fn in_header(row: Row) -> Row {
     }
 }
 
-/// A Tab metadata toggle; `stops` and `render` name its index.
+/// A Tab details toggle; `stops` and `render` name its index.
 const fn metadata_row(
     id: &'static str,
     title: &'static str,
@@ -381,13 +380,13 @@ const fn metadata_row(
     render: fn(&CompiApp, &RowCx, &Context<CompiApp>) -> AnyElement,
 ) -> Row {
     grouped(
-        "Tab metadata",
+        "Tab details",
         row(
             id,
             SettingsSection::Interface,
             title,
             description,
-            "tab caption",
+            "tab caption metadata",
             stops,
             render,
         ),
@@ -442,7 +441,7 @@ static ROWS: &[Row] = &[
                     row,
                     app.scoped_appearance().transparent_background,
                     SettingsAction::ToggleTransparency,
-                    "",
+                    row_description("transparency"),
                     cx,
                 )
             },
@@ -487,7 +486,13 @@ static ROWS: &[Row] = &[
                 let appearance = app.scoped_appearance();
                 let blurred = appearance.background_effect == BackgroundEffect::Blurred;
                 if appearance.transparent_background {
-                    app.render_toggle_row(row, blurred, SettingsAction::ToggleBlur, "", cx)
+                    app.render_toggle_row(
+                        row,
+                        blurred,
+                        SettingsAction::ToggleBlur,
+                        row_description("blur"),
+                        cx,
+                    )
                 } else {
                     app.settings_row(
                         row.title,
@@ -533,7 +538,7 @@ static ROWS: &[Row] = &[
         row(
             THEME_ROW,
             SettingsSection::Appearance,
-            "Theme",
+            "Current theme",
             "The color theme of the interface and terminals.",
             "colors color scheme dark light catalog browse favorites",
             |app| {
@@ -551,70 +556,85 @@ static ROWS: &[Row] = &[
         ),
     ),
     // Interface.
-    row(
-        "ui-font",
-        SettingsSection::Interface,
-        "Interface font",
-        "The font of menus, tabs and Settings.",
-        "typeface family ui",
-        |_| vec![SettingsAction::Select(Popup::UiFont)],
-        |app, row, cx| {
-            app.settings_row(
-                row.title,
-                String::new(),
-                app.render_font_select(row, Popup::UiFont, cx),
-                row.compact,
-            )
-        },
+    grouped(
+        "Text",
+        row(
+            "ui-font",
+            SettingsSection::Interface,
+            "Interface font",
+            "Sidebar, tabs, menus and Settings.",
+            "typeface family ui",
+            |_| vec![SettingsAction::Select(Popup::UiFont)],
+            |app, row, cx| {
+                app.settings_row(
+                    row.title,
+                    row_description(row.row).into(),
+                    app.render_font_select(row, Popup::UiFont, cx),
+                    row.compact,
+                )
+            },
+        ),
     ),
-    row(
-        "density",
-        SettingsSection::Interface,
-        "Pane density",
-        "Rounded panes with gaps between them, or edge to edge.",
-        "comfy compact gaps spacing islands",
-        |_| {
-            crate::theme::WorkspaceDensity::ALL
-                .map(SettingsAction::Density)
-                .to_vec()
-        },
-        |app, row, cx| app.render_density_row(row, cx),
+    grouped(
+        "Layout",
+        row(
+            "density",
+            SettingsSection::Interface,
+            "Pane density",
+            "Rounded panes with gaps between them, or edge to edge.",
+            "comfy compact gaps spacing islands",
+            |_| {
+                crate::theme::WorkspaceDensity::ALL
+                    .map(SettingsAction::Density)
+                    .to_vec()
+            },
+            |app, row, cx| app.render_density_row(row, cx),
+        ),
     ),
-    row(
-        "sidebar-width",
-        SettingsSection::Interface,
-        "Sidebar width",
-        "Reset the sidebar to its default width.",
-        "reset",
-        |_| vec![SettingsAction::ResetSidebar],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                format!("{:.0}px", app.sidebar_width),
-                "Reset width",
-                SettingsAction::ResetSidebar,
-                false,
-                cx,
-            )
-        },
+    grouped(
+        "Layout",
+        row(
+            "sidebar-width",
+            SettingsSection::Interface,
+            "Sidebar width",
+            "Drag the sidebar's edge to resize it, or reset it to its default width.",
+            "reset",
+            |_| vec![SettingsAction::ResetSidebar],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    format!(
+                        "{:.0}px. Drag the sidebar's edge to resize it.",
+                        app.sidebar_width
+                    ),
+                    "Reset width",
+                    SettingsAction::ResetSidebar,
+                    false,
+                    cx,
+                )
+            },
+        ),
     ),
-    row(
-        "window-layout",
-        SettingsSection::Interface,
-        "Window layout",
-        "Restore the saved layout defaults.",
-        "reset",
-        |_| vec![SettingsAction::ResetLayout],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                "Restore the saved layout defaults.".into(),
-                "Reset layout",
-                SettingsAction::ResetLayout,
-                false,
-                cx,
-            )
-        },
+    grouped(
+        "Layout",
+        row(
+            "window-layout",
+            SettingsSection::Interface,
+            "Window layout",
+            "Resets this window's layout without changing your tabs.",
+            "reset",
+            |_| vec![SettingsAction::ResetLayout],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    row_description(row.row).into(),
+                    "Reset layout",
+                    SettingsAction::ResetLayout,
+                    false,
+                    cx,
+                )
+            },
+        ),
     ),
     metadata_row(
         "metadata-directory",
@@ -707,7 +727,7 @@ static ROWS: &[Row] = &[
         row(
             "notification-delivery",
             SettingsSection::Notifications,
-            "Delivery",
+            "Show notifications",
             "Where notifications appear: in Compi, from the system, or both.",
             "notify alert toast banner system in-app automatic both",
             |_| vec![SettingsAction::Select(Popup::NotificationDelivery)],
@@ -813,7 +833,7 @@ static ROWS: &[Row] = &[
         row(
             "notification-sound",
             SettingsSection::Notifications,
-            "Sound",
+            "Notification sound",
             "The sound a notification plays, when the system's sound and quiet settings allow it.",
             "notify audio chime bell play preview",
             |app| {
@@ -829,162 +849,195 @@ static ROWS: &[Row] = &[
     // Terminal.
     shown_when(
         |_| cfg!(windows),
-        row(
-            "shell",
-            SettingsSection::Terminal,
+        grouped(
             "Shell",
-            "What new tabs and splits start: Windows PowerShell or WSL.",
-            "powershell wsl linux bash windows default distribution",
-            |_| vec![SettingsAction::Select(Popup::Shell)],
-            |app, row, cx| app.render_shell_row(row, cx),
+            row(
+                "shell",
+                SettingsSection::Terminal,
+                "Default shell",
+                "What new tabs and splits start: Windows PowerShell or WSL.",
+                "powershell wsl linux bash windows default distribution",
+                |_| vec![SettingsAction::Select(Popup::Shell)],
+                |app, row, cx| app.render_shell_row(row, cx),
+            ),
         ),
     ),
-    row(
-        "starting-folder",
-        SettingsSection::Terminal,
-        "Starting folder",
-        "Where a new tab starts when it doesn't open from another pane's folder.",
-        "working directory cwd home project default folder",
-        |app| {
-            let mut stops = vec![SettingsAction::ChooseStartingFolder];
-            if app.starting_folder().is_some() {
-                stops.push(SettingsAction::StartAtHome);
-            }
-            stops
-        },
-        |app, row, cx| app.render_starting_folder_row(row, cx),
+    grouped(
+        "Shell",
+        row(
+            "starting-folder",
+            SettingsSection::Terminal,
+            "Starting folder",
+            "Where a new tab starts when it doesn't open from another pane's folder.",
+            "working directory cwd home project default folder",
+            |app| {
+                let mut stops = vec![SettingsAction::ChooseStartingFolder];
+                if app.starting_folder().is_some() {
+                    stops.push(SettingsAction::StartAtHome);
+                }
+                stops
+            },
+            |app, row, cx| app.render_starting_folder_row(row, cx),
+        ),
     ),
-    row(
-        "terminal-font",
-        SettingsSection::Terminal,
-        "Terminal font",
-        "The font terminals draw text in.",
-        "typeface family monospace",
-        |_| vec![SettingsAction::Select(Popup::TerminalFont)],
-        |app, row, cx| {
-            app.settings_row(
-                row.title,
-                String::new(),
-                app.render_font_select(row, Popup::TerminalFont, cx),
-                row.compact,
-            )
-        },
+    grouped(
+        "Font",
+        row(
+            "terminal-font",
+            SettingsSection::Terminal,
+            "Terminal font",
+            "Terminal and editor text.",
+            "typeface family monospace",
+            |_| vec![SettingsAction::Select(Popup::TerminalFont)],
+            |app, row, cx| {
+                app.settings_row(
+                    row.title,
+                    row_description(row.row).into(),
+                    app.render_font_select(row, Popup::TerminalFont, cx),
+                    row.compact,
+                )
+            },
+        ),
     ),
-    row(
-        "font-size",
-        SettingsSection::Terminal,
-        "Font size",
-        "Terminal and editor text, in every window.",
-        "zoom scale bigger smaller larger text line height",
-        |_| {
-            vec![
-                SettingsAction::FontSize(Command::ZoomOut),
-                SettingsAction::FontSize(Command::ZoomIn),
-                SettingsAction::FontSize(Command::ZoomReset),
-            ]
-        },
-        |app, row, cx| {
-            app.render_size_row(row, app.font_settings.size, SettingsAction::FontSize, cx)
-        },
+    grouped(
+        "Font",
+        row(
+            "font-size",
+            SettingsSection::Terminal,
+            "Font size",
+            "Zooms terminal and editor text in every window.",
+            "zoom scale bigger smaller larger text line height",
+            |_| {
+                vec![
+                    SettingsAction::FontSize(Command::ZoomOut),
+                    SettingsAction::FontSize(Command::ZoomIn),
+                    SettingsAction::FontSize(Command::ZoomReset),
+                ]
+            },
+            |app, row, cx| {
+                app.render_size_row(row, app.font_settings.size, SettingsAction::FontSize, cx)
+            },
+        ),
     ),
-    row(
-        "custom-typography",
-        SettingsSection::Terminal,
-        "Custom typography",
-        "Set a custom font, line height or fallback fonts in the configuration file.",
-        "toml config",
-        |_| vec![SettingsAction::OpenConfiguration],
-        |app, row, cx| {
-            app.render_button_row(
-                row,
-                row_description("custom-typography").into(),
-                "Edit configuration",
-                SettingsAction::OpenConfiguration,
-                false,
-                cx,
-            )
-        },
+    grouped(
+        "Font",
+        row(
+            "custom-typography",
+            SettingsSection::Terminal,
+            "Custom typography",
+            "Set a custom font, line height or fallback fonts in the configuration file.",
+            "toml config",
+            |_| vec![SettingsAction::OpenConfiguration],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    row_description("custom-typography").into(),
+                    "Edit configuration",
+                    SettingsAction::OpenConfiguration,
+                    false,
+                    cx,
+                )
+            },
+        ),
     ),
-    row(
-        PROMPT_ROW,
-        SettingsSection::Terminal,
-        "Shell prompt",
-        "Choose an Oh My Posh or Starship prompt for Compi's shells.",
-        "oh my posh starship ps1 theme bash zsh wsl distribution history restore",
-        |app| {
-            app.prompt_actions()
-                .into_iter()
-                .map(SettingsAction::Prompt)
-                .collect()
-        },
-        |app, row, cx| app.render_prompt_group(row, cx),
+    grouped(
+        "Prompt",
+        row(
+            PROMPT_ROW,
+            SettingsSection::Terminal,
+            "Shell prompt",
+            "Choose an Oh My Posh or Starship prompt for Compi's shells.",
+            "oh my posh starship ps1 theme bash zsh wsl distribution history restore",
+            |app| {
+                app.prompt_actions()
+                    .into_iter()
+                    .map(SettingsAction::Prompt)
+                    .collect()
+            },
+            |app, row, cx| app.render_prompt_group(row, cx),
+        ),
     ),
     // Chat.
-    row(
-        "chat-text-size",
-        SettingsSection::Chat,
-        "Text size",
-        "Agent chats, with their cards and composer, in every window.",
-        "zoom scale bigger smaller larger font agent omp",
-        |_| {
-            vec![
-                SettingsAction::ChatTextSize(Command::ZoomOut),
-                SettingsAction::ChatTextSize(Command::ZoomIn),
-                SettingsAction::ChatTextSize(Command::ZoomReset),
-            ]
-        },
-        |app, row, cx| {
-            app.render_size_row(
-                row,
-                app.config.chat_text_size,
-                SettingsAction::ChatTextSize,
-                cx,
-            )
-        },
+    grouped(
+        "Messages",
+        row(
+            "chat-text-size",
+            SettingsSection::Chat,
+            "Text size",
+            "Agent chats, with their cards and composer, in every window.",
+            "zoom scale bigger smaller larger font agent omp",
+            |_| {
+                vec![
+                    SettingsAction::ChatTextSize(Command::ZoomOut),
+                    SettingsAction::ChatTextSize(Command::ZoomIn),
+                    SettingsAction::ChatTextSize(Command::ZoomReset),
+                ]
+            },
+            |app, row, cx| {
+                app.render_size_row(
+                    row,
+                    app.config.chat_text_size,
+                    SettingsAction::ChatTextSize,
+                    cx,
+                )
+            },
+        ),
     ),
-    row(
-        "chat-approval",
-        SettingsSection::Chat,
-        "Approvals",
-        "How OMP asks before it runs tools. Applies to new chats and chats that start again.",
-        "approval permission ask allow edits everything yolo tools agent omp",
-        |_| vec![SettingsAction::Select(Popup::ChatApproval)],
-        |app, row, cx| app.render_chat_approval_row(row, cx),
+    grouped(
+        "Messages",
+        row(
+            "chat-enter",
+            SettingsSection::Chat,
+            "Enter while OMP works",
+            "Whether Enter steers the running turn or queues the message for after it.",
+            "steer queue send key ctrl cmd turn message composer agent omp",
+            |_| vec![SettingsAction::ChatEnter],
+            |app, row, cx| app.render_chat_enter_row(row, cx),
+        ),
     ),
-    row(
-        "chat-enter",
-        SettingsSection::Chat,
-        "Enter while OMP works",
-        "Whether Enter steers the running turn or queues the message for after it.",
-        "steer queue send key ctrl cmd turn message composer agent omp",
-        |_| vec![SettingsAction::ChatEnter],
-        |app, row, cx| app.render_chat_enter_row(row, cx),
+    grouped(
+        "Opening",
+        row(
+            "chat-open",
+            SettingsSection::Chat,
+            "Opening a chat",
+            "Where OMP chat and compi chat open a chat from a terminal: in place of its shell or beside it.",
+            "split pane beside in place shell view palette agent omp",
+            |_| vec![SettingsAction::ChatOpen],
+            |app, row, cx| app.render_chat_open_row(row, cx),
+        ),
     ),
-    row(
-        "chat-open",
-        SettingsSection::Chat,
-        "Opening a chat",
-        "Where OMP chat and compi chat open a chat from a terminal: in place of its shell or beside it.",
-        "split pane beside in place shell view palette agent omp",
-        |_| vec![SettingsAction::ChatOpen],
-        |app, row, cx| app.render_chat_open_row(row, cx),
+    grouped(
+        "OMP",
+        row(
+            "chat-approval",
+            SettingsSection::Chat,
+            "Approvals",
+            "How OMP asks before it runs tools. Applies to new chats and chats that start again.",
+            "approval permission ask allow edits everything yolo tools agent omp",
+            |_| vec![SettingsAction::Select(Popup::ChatApproval)],
+            |app, row, cx| app.render_chat_approval_row(row, cx),
+        ),
     ),
-    row(
-        "chat-agents-bar",
-        SettingsSection::Chat,
-        "Agents bar",
-        "While OMP's sub-agents run, list them above the message box.",
-        "sub-agents subagents task tasks running agent omp",
-        |_| vec![SettingsAction::ToggleChatAgentsBar],
-        |app, row, cx| {
-            app.render_toggle_row(
-                row,
-                app.config.chat_agents_bar,
-                SettingsAction::ToggleChatAgentsBar,
-                row_description("chat-agents-bar"),
-                cx,
-            )
-        },
+    grouped(
+        "OMP",
+        row(
+            "chat-agents-bar",
+            SettingsSection::Chat,
+            "Agents bar",
+            "While OMP's sub-agents run, list them above the message box.",
+            "sub-agents subagents task tasks running agent omp",
+            |_| vec![SettingsAction::ToggleChatAgentsBar],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.config.chat_agents_bar,
+                    SettingsAction::ToggleChatAgentsBar,
+                    row_description("chat-agents-bar"),
+                    cx,
+                )
+            },
+        ),
     ),
     // Keyboard.
     page_row(
@@ -1016,21 +1069,24 @@ static ROWS: &[Row] = &[
         |_| Vec::new(),
         |app, _, width, cx| app.render_settings_monitor(width, cx),
     ),
-    // Updates: the status, the notes, the switches, then Advanced.
-    row(
-        "update-status",
-        SettingsSection::Updates,
-        "Compi version",
-        "The installed version and what the updater is doing.",
-        "update upgrade release version download install restart",
-        |app| {
-            app.update_view()
-                .button
-                .map(|button| SettingsAction::Update(UpdateControl::Primary(button)))
-                .into_iter()
-                .collect()
-        },
-        |app, row, cx| app.render_update_status(row, cx),
+    // Updates: the version, the notes, the switches, then Advanced.
+    grouped(
+        "Version",
+        row(
+            "update-status",
+            SettingsSection::Updates,
+            "Compi version",
+            "The installed version and what the updater is doing.",
+            "update upgrade release version download install restart",
+            |app| {
+                app.update_view()
+                    .button
+                    .map(|button| SettingsAction::Update(UpdateControl::Primary(button)))
+                    .into_iter()
+                    .collect()
+            },
+            |app, row, cx| app.render_update_status(row, cx),
+        ),
     ),
     shown_when(
         |app| app.update_notes().is_some(),
@@ -1087,14 +1143,24 @@ static ROWS: &[Row] = &[
             },
         ),
     ),
-    row(
-        "update-advanced",
-        SettingsSection::Updates,
-        "Repair and update log",
-        "Repair the installation or read the update log.",
-        "advanced repair log troubleshoot",
-        |app| app.update_advanced_stops(),
-        |app, row, cx| app.render_update_advanced(row, cx),
+    grouped(
+        "Advanced",
+        row(
+            "update-advanced",
+            SettingsSection::Updates,
+            "Repair and update log",
+            "When updating goes wrong: repair the installation, or read what the updater did.",
+            "advanced repair log troubleshoot",
+            |_| {
+                let mut stops = Vec::with_capacity(2);
+                if cfg!(windows) {
+                    stops.push(SettingsAction::Update(UpdateControl::Repair));
+                }
+                stops.push(SettingsAction::Update(UpdateControl::OpenLog));
+                stops
+            },
+            |app, row, cx| app.render_update_advanced(row, cx),
+        ),
     ),
     // Advanced.
     in_header(row(
@@ -1201,13 +1267,13 @@ static ROWS: &[Row] = &[
             "configuration",
             SettingsSection::Advanced,
             "Configuration",
-            "Open the configuration file.",
+            "Settings as a TOML file, including some found only there.",
             "toml config file edit",
             |_| vec![SettingsAction::OpenConfiguration],
             |app, row, cx| {
                 app.render_button_row(
                     row,
-                    String::new(),
+                    row_description("configuration").into(),
                     "Open file",
                     SettingsAction::OpenConfiguration,
                     false,
@@ -1366,16 +1432,24 @@ fn terminal_key_notice(keys: &str) -> Option<String> {
     })
 }
 
-/// Whether `section`'s rows (header rows aside) fall into more than one group, so its
-/// cards show their group's label; one group shows just the card.
-fn section_grouped(section: SettingsSection) -> bool {
-    let mut groups = ROWS
-        .iter()
-        .filter(|row| row.section == section && !row.header)
-        .map(|row| row.group);
-    groups
-        .next()
-        .is_some_and(|first| groups.any(|group| group != first))
+/// The line under `section`'s heading: what its page covers.
+fn section_summary(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Appearance => "Theme and how the window looks.",
+        SettingsSection::Interface => {
+            "Fonts, pane layout, tab details, closing, focus and program status."
+        }
+        SettingsSection::Notifications => "When and where Compi tells you a program needs you.",
+        SettingsSection::Terminal => "Shell, starting folder, font and prompt.",
+        SettingsSection::Chat => "How agent chats look and behave.",
+        SettingsSection::Keyboard => {
+            "Click a shortcut, then press the new keys. Escape cancels; Backspace leaves the \
+             command without one."
+        }
+        SettingsSection::Monitor => "This computer's processes and what they use.",
+        SettingsSection::Updates => "Compi's version, what's new and how it updates.",
+        SettingsSection::Advanced => "Terminal colors and performance details.",
+    }
 }
 
 /// Keyboard order: the search field and section list when `pane`, then each row's
@@ -2906,17 +2980,6 @@ impl CompiApp {
         ));
     }
 
-    pub(super) fn settings_subheading(&self, label: &str) -> AnyElement {
-        let colors = *self.colors();
-        div()
-            .pb_1()
-            .text_size(px(UI_MICRO_TEXT_SIZE))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(color(modal_text_color(colors.muted, &colors)))
-            .child(label.to_uppercase())
-            .into_any_element()
-    }
-
     /// `control` as `action` of `row`: a click takes the highlight and acts, and the
     /// highlight draws a ring around it.
     pub(super) fn settings_control(
@@ -3315,8 +3378,8 @@ impl CompiApp {
         )
     }
 
-    /// Monitor's Open as pane: a button at the right end of the page's first label
-    /// line or, in search results, a row.
+    /// Monitor's Open as pane: a button at the right end of the page's heading line
+    /// or, in search results, a row.
     fn render_open_monitor_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         if row.header {
             return self.settings_button(row, 0, row.title, SettingsAction::OpenMonitor, cx);
@@ -3332,7 +3395,7 @@ impl CompiApp {
     }
 
     /// Global defaults or This window: a small switch, at the right end of the page's
-    /// first label line or, in search results and Quick Appearance, as a row.
+    /// heading line or, in search results and Quick Appearance, as a row.
     fn render_scope_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let focused = self.settings_focused(row, SettingsAction::Scope);
         let options = [
@@ -3519,7 +3582,7 @@ impl CompiApp {
         self.settings_row(
             row.title,
             if enabled {
-                String::new()
+                row_description(row.row).into()
             } else {
                 "Needs a transparent background.".into()
             },
@@ -4361,18 +4424,6 @@ impl CompiApp {
         stops
     }
 
-    /// Advanced, then while it is open Repair (Windows) and Open update log.
-    fn update_advanced_stops(&self) -> Vec<SettingsAction> {
-        let mut stops = vec![SettingsAction::Update(UpdateControl::Advanced)];
-        if self.settings_update_advanced {
-            if cfg!(windows) {
-                stops.push(SettingsAction::Update(UpdateControl::Repair));
-            }
-            stops.push(SettingsAction::Update(UpdateControl::OpenLog));
-        }
-        stops
-    }
-
     /// An update action from Settings or the sidebar card; restarting asks about unsaved
     /// edits first and consents to end exactly the shells shown.
     pub(super) fn press_update_button(
@@ -4446,9 +4497,6 @@ impl CompiApp {
                 if let Some(notes) = self.update_notes() {
                     self.open_release_notes(&notes);
                 }
-            }
-            UpdateControl::Advanced => {
-                self.settings_update_advanced = !self.settings_update_advanced
             }
             UpdateControl::Repair => self.updates.repair(),
             UpdateControl::OpenLog => {
@@ -4583,10 +4631,10 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_2()
-            .child(settings_label_line(
-                Some(format!("What's new in {}", notes.version).into()),
-                None,
-            ))
+            .child(settings_group_label(format!(
+                "What's new in {}",
+                notes.version
+            )))
             .child(
                 settings_card(&colors).child(
                     div()
@@ -4599,54 +4647,35 @@ impl CompiApp {
             .into_any_element()
     }
 
+    /// Repair (Windows) and Open update log.
     fn render_update_advanced(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let open = self.settings_update_advanced;
-        let disclosure = self.settings_control(
-            row,
-            SettingsAction::Update(UpdateControl::Advanced),
-            controls::text_button((row.row, 0_usize), "Advanced")
-                .icon(if open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .header()
-                .ghost(),
-            cx,
-        );
-        div()
-            .min_w_0()
-            .py_3()
+        let buttons = div()
             .flex()
-            .flex_col()
-            .items_start()
+            .flex_wrap()
             .gap_2()
-            .child(disclosure)
-            .when(open, |content| {
-                content.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .when(cfg!(windows), |buttons| {
-                            buttons.child(self.settings_button(
-                                row,
-                                1,
-                                "Repair Compi",
-                                SettingsAction::Update(UpdateControl::Repair),
-                                cx,
-                            ))
-                        })
-                        .child(self.settings_button(
-                            row,
-                            2,
-                            "Open update log",
-                            SettingsAction::Update(UpdateControl::OpenLog),
-                            cx,
-                        )),
-                )
+            .when(cfg!(windows), |buttons| {
+                buttons.child(self.settings_button(
+                    row,
+                    1,
+                    "Repair Compi",
+                    SettingsAction::Update(UpdateControl::Repair),
+                    cx,
+                ))
             })
-            .into_any_element()
+            .child(self.settings_button(
+                row,
+                2,
+                "Open update log",
+                SettingsAction::Update(UpdateControl::OpenLog),
+                cx,
+            ))
+            .into_any_element();
+        self.settings_row(
+            row.title,
+            row_description(row.row).into(),
+            buttons,
+            row.compact,
+        )
     }
 
     /// The command whose shortcut the Settings pane `pane_id` is recording, while that
@@ -4850,14 +4879,6 @@ impl CompiApp {
             .map_or("", |pane| pane.query.as_str());
         let recording = self.recording_shortcut(pane_id);
         let platform = commands::Platform::current();
-        let hint = div()
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .line_height(px(UI_SMALL_LINE_HEIGHT))
-            .text_color(color(modal_text_color(colors.muted, &colors)))
-            .child(
-                "Click a shortcut, then press the new keys. Escape cancels; \
-                 Backspace leaves the command without one.",
-            );
         let groups = command_groups(query).into_iter().map(|(category, group)| {
             let lines = group.into_iter().enumerate().map(|(position, index)| {
                 let spec = &commands::REGISTRY[index];
@@ -4925,7 +4946,7 @@ impl CompiApp {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(settings_label_line(Some(category.label().into()), None))
+                .child(settings_group_label(category.label()))
                 .child(settings_card(&colors).children(lines))
         });
         div()
@@ -4933,44 +4954,99 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_5()
-            .child(hint)
             .children(groups)
+            .into_any_element()
+    }
+
+    /// `row` drawn for `host`: on its page's heading line when `header`, else as a row,
+    /// stacked when `compact`; a page row gets the page's `width`.
+    fn draw_settings_row(
+        &self,
+        host: &SettingsHost,
+        row: &Row,
+        header: bool,
+        compact: bool,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let row_cx = RowCx {
+            host: host.clone(),
+            row: row.id,
+            title: row.title,
+            compact: compact && !header,
+            header,
+        };
+        match row.draw {
+            Draw::Card(render) => render(self, &row_cx, cx),
+            Draw::Page(render) => render(self, &row_cx, width, cx),
+        }
+    }
+
+    /// The top of `section`'s page: its name and what it covers, with its `header` rows
+    /// (the scope switch, Open as pane) at the right end, wrapping under them when the
+    /// page is narrow.
+    fn render_settings_heading(
+        &self,
+        host: &SettingsHost,
+        section: SettingsSection,
+        header: &[&'static Row],
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        div()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x_3()
+            .gap_y_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(section.label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .line_height(px(UI_SMALL_LINE_HEIGHT))
+                            .text_color(color(modal_text_color(colors.muted, &colors)))
+                            .child(section_summary(section)),
+                    ),
+            )
+            .when(!header.is_empty(), |heading| {
+                heading.child(
+                    div().ml_auto().flex().items_center().gap_2().children(
+                        header
+                            .iter()
+                            .map(|row| self.draw_settings_row(host, row, true, false, 0.0, cx)),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
     /// `rows` in cards: consecutive rows of one section and group share a card, with
     /// hairlines between its rows; a page row draws in place of a card, `width` wide.
-    /// A label above a card names its group when the section has more than one; in
-    /// search results (`search`) every card has one, "Section · Group" or just the
-    /// section. `header` rows (the scope switch) sit at the right end of the first
-    /// label line.
-    #[allow(clippy::too_many_arguments)]
+    /// A label above a card names its group; in search results (`search`) every card
+    /// has one, "Section · Group" or just the section.
     fn render_settings_cards(
         &self,
         host: &SettingsHost,
         rows: &[&'static Row],
-        header: &[&'static Row],
         search: bool,
         compact: bool,
         width: f32,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = *self.colors();
-        let draw = |row: &Row, header: bool| {
-            let row_cx = RowCx {
-                host: host.clone(),
-                row: row.id,
-                title: row.title,
-                compact: compact && !header,
-                header,
-            };
-            match row.draw {
-                Draw::Card(render) => render(self, &row_cx, cx),
-                Draw::Page(render) => render(self, &row_cx, width, cx),
-            }
-        };
-        let mut header = (!header.is_empty())
-            .then(|| header.iter().map(|row| draw(row, true)).collect::<Vec<_>>());
+        let draw = |row: &Row| self.draw_settings_row(host, row, false, compact, width, cx);
         let mut elements = Vec::new();
         let in_card = |row: &Row| matches!(row.draw, Draw::Card(_));
         // A page row splits its group into runs; only the first is labelled.
@@ -4981,8 +5057,7 @@ impl CompiApp {
             let first = run[0];
             let continued = previous.replace((first.section, first.group))
                 == Some((first.section, first.group));
-            let group = first.group.filter(|_| section_grouped(first.section));
-            let label: Option<SharedString> = match (search, group) {
+            let label: Option<SharedString> = match (search, first.group) {
                 _ if continued => None,
                 (true, Some(group)) => Some(format!("{} · {group}", first.section.label()).into()),
                 (true, None) => Some(first.section.label().into()),
@@ -4997,28 +5072,23 @@ impl CompiApp {
                             .when(index > 0, |line| {
                                 line.border_t_1().border_color(color(colors.border))
                             })
-                            .child(draw(row, false))
+                            .child(draw(row))
                     }))
                     .into_any_element()
             } else {
-                draw(first, false)
+                draw(first)
             };
-            let trailing = header.take();
-            elements.push(if label.is_some() || trailing.is_some() {
-                div()
+            elements.push(match label {
+                Some(label) => div()
                     .min_w_0()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(settings_label_line(label, trailing))
+                    .child(settings_group_label(label))
                     .child(card)
-                    .into_any_element()
-            } else {
-                card
+                    .into_any_element(),
+                None => card,
             });
-        }
-        if let Some(trailing) = header {
-            elements.push(settings_label_line(None, Some(trailing)).into_any_element());
         }
         elements
     }
@@ -5083,13 +5153,18 @@ impl CompiApp {
                     .into_iter()
                     .filter(|row| row.id != THEME_ROW)
                     .partition(|row| row.header);
-                page = page.children(
-                    self.render_settings_cards(
-                        &host, &rows, &header, false, stacked, page_width, cx,
-                    )
-                    .into_iter()
-                    .map(|card| div().flex_none().child(card)),
-                );
+                page = page
+                    .child(div().flex_none().child(self.render_settings_heading(
+                        &host,
+                        pane.section,
+                        &header,
+                        cx,
+                    )))
+                    .children(
+                        self.render_settings_cards(&host, &rows, false, stacked, page_width, cx)
+                            .into_iter()
+                            .map(|card| div().flex_none().child(card)),
+                    );
             }
             // Short panes scroll the whole page; the grid keeps a usable height.
             div()
@@ -5122,10 +5197,14 @@ impl CompiApp {
                         .into_any_element(),
                 ]
             } else if searching {
-                self.render_settings_cards(&host, &rows, &[], true, stacked, page_width, cx)
+                self.render_settings_cards(&host, &rows, true, stacked, page_width, cx)
             } else {
                 let (header, rows): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.header);
-                self.render_settings_cards(&host, &rows, &header, false, stacked, page_width, cx)
+                let mut body = vec![self.render_settings_heading(&host, pane.section, &header, cx)];
+                body.extend(
+                    self.render_settings_cards(&host, &rows, false, stacked, page_width, cx),
+                );
+                body
             };
             div()
                 .relative()
@@ -5270,7 +5349,6 @@ impl CompiApp {
                                         self.render_settings_cards(
                                             &host,
                                             &rows,
-                                            &[],
                                             false,
                                             false,
                                             QUICK_APPEARANCE_WIDTH,
@@ -5335,33 +5413,13 @@ fn section_icon(section: SettingsSection) -> IconName {
     }
 }
 
-/// The line above a card: its `label` on the left and `trailing` controls (the scope
-/// switch) at the right end, wrapping under the label when the page is narrow.
-fn settings_label_line(label: Option<SharedString>, trailing: Option<Vec<AnyElement>>) -> Div {
+/// A group's label: the line above its card, or a heading inside one.
+pub(super) fn settings_group_label(label: impl Into<SharedString>) -> Div {
     div()
         .min_w_0()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_x_3()
-        .gap_y_2()
-        .children(label.map(|label| {
-            div()
-                .min_w_0()
-                .text_size(px(UI_SMALL_TEXT_SIZE))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(label)
-        }))
-        .when_some(trailing, |line, trailing| {
-            line.child(
-                div()
-                    .ml_auto()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .children(trailing),
-            )
-        })
+        .text_size(px(UI_SMALL_TEXT_SIZE))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(label.into())
 }
 
 /// Seconds since the Unix epoch, for the update views' "Checked 5 min ago".
@@ -5505,16 +5563,15 @@ mod tests {
             ["show-fps", RESOURCES_ROW, DIAGNOSTICS_ROW]
         );
         assert!(ids("network").contains(&MONITOR_ROW));
-        // A group name finds its rows.
-        assert_eq!(
-            settings("tab metadata"),
-            [
-                "metadata-directory",
-                "metadata-process",
-                "metadata-git",
-                "metadata-dimensions"
-            ]
-        );
+        // A group name finds its rows; so does the group's old name.
+        let tab_details = [
+            "metadata-directory",
+            "metadata-process",
+            "metadata-git",
+            "metadata-dimensions",
+        ];
+        assert_eq!(settings("tab details"), tab_details);
+        assert_eq!(settings("tab metadata"), tab_details);
         // Every term must match.
         assert!(ids("font zebra").is_empty());
         assert!(ids("zebra").is_empty());
@@ -5651,8 +5708,8 @@ mod tests {
                 action: SettingsAction::ThemeFavorite
             })
         );
-        // The scope switch sits on the first label line, so it comes first in its
-        // sections; that line is its first group's: Window, and Colors in Advanced.
+        // The scope switch sits on the page's heading line, so it comes first in its
+        // sections, ahead of their first group: Window, and Colors in Advanced.
         for (section, group) in [
             (SettingsSection::Appearance, "Window"),
             (SettingsSection::Advanced, "Colors"),
@@ -5660,7 +5717,6 @@ mod tests {
             let mut rows = rows_for(section, "");
             assert!(rows.next().unwrap().header);
             assert_eq!(rows.next().unwrap().group, Some(group));
-            assert!(section_grouped(section));
         }
         // Monitor's Open as pane leads its page the same way, above Overview.
         let mut monitor = rows_for(SettingsSection::Monitor, "");
@@ -5670,18 +5726,75 @@ mod tests {
     }
 
     #[test]
-    fn cards_are_labelled_only_in_sections_of_several_groups() {
-        assert!(section_grouped(SettingsSection::Interface));
-        assert!(section_grouped(SettingsSection::Updates));
-        for section in [
-            SettingsSection::Terminal,
-            SettingsSection::Keyboard,
-            SettingsSection::Monitor,
-        ] {
-            assert!(!section_grouped(section), "{section:?}");
+    fn every_row_sits_under_a_group_label_in_a_fixed_order() {
+        // Only page rows that draw their own labels have no group: the command list,
+        // Overview and the release notes.
+        let ungrouped: Vec<_> = ROWS
+            .iter()
+            .filter(|row| !row.header && row.group.is_none())
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ungrouped, [COMMANDS_ROW, MONITOR_ROW, "update-notes"]);
+        assert!(
+            ROWS.iter()
+                .filter(|row| ungrouped.contains(&row.id))
+                .all(|row| matches!(row.draw, Draw::Page(_)))
+        );
+        // Each section's labels top to bottom; a page row stands for its own.
+        let groups = |section| {
+            let mut groups: Vec<&str> = Vec::new();
+            for row in rows_for(section, "").filter(|row| !row.header) {
+                let group = row.group.unwrap_or(row.title);
+                if groups.last() != Some(&group) {
+                    groups.push(group);
+                }
+            }
+            groups
+        };
+        assert_eq!(groups(SettingsSection::Appearance), ["Window", "Theme"]);
+        assert_eq!(
+            groups(SettingsSection::Interface),
+            [
+                "Text",
+                "Layout",
+                "Tab details",
+                "Closing",
+                "Focus",
+                "Program status"
+            ]
+        );
+        assert_eq!(
+            groups(SettingsSection::Notifications),
+            ["Delivery", "Events", "Sound"]
+        );
+        assert_eq!(
+            groups(SettingsSection::Terminal),
+            ["Shell", "Font", "Prompt"]
+        );
+        assert_eq!(
+            groups(SettingsSection::Chat),
+            ["Messages", "Opening", "OMP"]
+        );
+        assert_eq!(groups(SettingsSection::Keyboard), ["Commands"]);
+        assert_eq!(groups(SettingsSection::Monitor), ["Monitor"]);
+        assert_eq!(
+            groups(SettingsSection::Updates),
+            ["Version", "What's new", "Automatic", "Advanced"]
+        );
+        assert_eq!(
+            groups(SettingsSection::Advanced),
+            ["Colors", PERFORMANCE_GROUP, RECOVERY_GROUP]
+        );
+        // Every page says what it covers, and every row what it does, without
+        // repeating its group's label.
+        assert!(
+            SettingsSection::ALL
+                .iter()
+                .all(|section| !section_summary(*section).is_empty())
+        );
+        for row in ROWS {
+            assert!(!row.description.is_empty(), "{}", row.id);
+            assert_ne!(row.group, Some(row.title), "{}", row.id);
         }
-        // Updates opens on the installed version, unlabelled, ahead of its groups.
-        let updates = rows_for(SettingsSection::Updates, "").next().unwrap();
-        assert_eq!((updates.id, updates.group), ("update-status", None));
     }
 }

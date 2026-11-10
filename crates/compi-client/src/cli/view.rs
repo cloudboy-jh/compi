@@ -209,6 +209,10 @@ mod tests {
             settings(SettingsSection::Monitor)
         );
         assert_eq!(
+            wanted("settings", Some("chat"), None, None).unwrap(),
+            settings(SettingsSection::Chat)
+        );
+        assert_eq!(
             wanted(
                 "settings",
                 None,
