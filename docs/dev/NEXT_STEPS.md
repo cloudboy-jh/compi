@@ -6,7 +6,7 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 - **0.7.3** is published and Latest (2026-11-10 19:10 UTC; tag `v0.7.3` at `ad603c1`, release run [42877645833](https://github.com/cloudboy-jh/compi/actions/runs/42877645833); the first draft at `9fae749` was deleted unpublished). Chat work (`72545db`) and the updater work below (`413f005`, `60c1019`, `656eaf5`). Read back: 12 assets; signed Windows, Setup and macOS metadata 0.7.3 / protocol 39 / qualified daemon 0.7.3 with the 0.7.3 notes; hashes match `SHA256SUMS.txt`; the update zip carries `compi-launcher.exe`; the GitHub API's latest release is v0.7.3. In-app update from the owner's installed 0.7.2 (Settings → Updates) worked: selection 0.7.3; on first start the update log read "Refreshed compi.exe from 0.7.3", "Refreshed compi-update-worker.exe from 0.7.3" (root hashes equal the payload's launcher and helper) and "Cleanup removed 221 item(s), 1697 MB" (`.compi-update` 730 MB → 2 MB). Kept: `versions\0.5.0` (a 0.5.0 window still running) and `0.4.1`, `0.6.0` (rename refused with os error 32 at that moment, no Compi process running from them afterwards; expected to go on a later start).
 
-## In source for 0.7.3: updater (2026-11-10)
+## Shipped in 0.7.3: updater (2026-11-10)
 
 Found on the owner's Windows install: nothing was ever removed (12 `versions\` folders, 730 MB of `stage-*` and about 180 handoff/review files in `.compi-update\`, 773 MB of finished Setup runs in `%LOCALAPPDATA%\Compi\installer\`); an available update showed nowhere outside Settings; checks ran once a day, failed ones too; a kept failure outranked a newer release. 0.7.2 went in through Setup.
 
@@ -18,9 +18,20 @@ Found on the owner's Windows install: nothing was ever removed (12 `versions\` f
 - Settings → Updates: status block (version, state, last check, size, "Updating ends N shells" or "restarts Compi's background service" before download), notes as Markdown, an Automatic group, Advanced last.
 - Setup: new window (see below) and run cleanup: finished run folders and the 0.1.x leftovers go at start and at completion; the package is kept as root `Compi.msi`, registered as an extra Windows Installer source so repair from Settings → Apps still finds it.
 
-To check before publishing: the update cycle on a copy with old versions (one version left, new root launcher and helper); a repair from Settings → Apps after Setup removed its run folder (the extra source registration is untested for a standard user).
+The update cycle and launcher/helper refresh were seen on the owner's install after publishing (see Release state). Still unchecked: a repair from Settings → Apps after Setup removed its run folder (the extra source registration is untested for a standard user).
 
-## Next: Windows work from a WSL session
+## Next: agent chat in Program Status (0.7.4, decided 2026-11-10)
+
+Program Status records are kept per terminal surface (`SurfaceProgramStatus { surface_id, process_lifetime_id, records }`, fed by OSC 7501 and watched through `WatchProgramStatus`). A chat is daemon-owned ACP with no surface of its own, so nothing built on Program Status sees it: no notifications (`gui/workspace/notifications.rs`, `notice_program_status`), no tab glyph, pane dot or floating-title status, no sidebar or palette status line, no hover card, nothing in `compi --json pane list`/`pane show` for an agent or script to read. OMP in a plain terminal reports all of this.
+
+1. Daemon: each chat publishes Program Status records itself: working while a turn runs, blocked (permission or question) while one waits, done when a turn ends, failed on an error, with OMP as the app and the session title as the message.
+2. Protocol: status keyed by the chat's pane (or chat ID) as well as by surface, carried by `WatchProgramStatus` (a protocol bump, so updating restarts the daemon; release pins move with it).
+3. Client: tab glyphs, pane dots, floating titles, the sidebar and palette line, hover cards and notifications read chat records like terminal ones; click-to-pane, focused-pane silence and the notification settings apply; typing or sending in the composer acknowledges done, as a key press in a terminal does.
+4. CLI: `compi pane list`/`pane show` carry `program_status` for chat panes.
+
+Check: in `cargo dev`, a chat in a background tab shows working, then a blocked glyph and a notification for a permission, then done with a notification that opens the pane; the focused chat stays silent; `compi --json pane list` shows the same states.
+
+## After that: Windows work from a WSL session
 
 Vault plan: `feat windows from wsl.md` (from an OMP session on 2026-11-08 that installed mods through Vortex from WSL `/tmp`). An agent in a WSL folder had to find the Windows home by listing `/mnt/c` and asking `pwsh.exe` for `$env:USERPROFILE`; `pwsh.exe` ran through `~/.compi/wincmd…` but `tasklist.exe` needed its full path; it could not see a Windows dialog it caused; searching `C:\Users\johns` from WSL timed out twice.
 
@@ -40,7 +51,6 @@ Check: a fresh session in WSL `/tmp` names the Windows home folder, runs `taskli
 
 ## Open bugs
 
-- **Agent chat is outside Program Status** (reported 2026-11-10). Program Status records are kept per terminal surface (`SurfaceProgramStatus { surface_id, process_lifetime_id, records }`, fed by OSC 7501 and watched through `WatchProgramStatus`). A chat is daemon-owned ACP with no surface of its own, so nothing built on Program Status sees it: no notifications (`gui/workspace/notifications.rs`, `notice_program_status`), no tab glyph, pane dot or floating-title status, no sidebar or palette status line, no hover card, nothing in `compi --json pane list`/`pane show` for an agent or script to read. OMP in a plain terminal reports all of this. Fix in the daemon: the chat publishes Program Status records itself (working while a turn runs, blocked for a permission or question, done when a turn ends, failed on an error), keyed by its pane rather than a surface (a protocol addition, so a daemon restart), so every consumer picks it up unchanged; typing in the composer acknowledges done like a key press in a terminal.
 - Chat text overlap after resizing a window (reported 2026-11-09). One cause fixed for 0.7.3: tool rows whose title has line breaks drew over the rows below. Not confirmed to be the reported case; needs a screenshot or steps if it comes back.
 - A PowerShell tab in a `\\wsl.localhost` folder does not report it, so splits start in the last Windows folder.
 - `cargo dev` restart often says "did not exit after acknowledged shutdown" and keeps the old daemon (also seen with `cargo dev --stop` when the daemon had exited).
