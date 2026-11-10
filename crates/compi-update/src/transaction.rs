@@ -2,8 +2,10 @@ use crate::*;
 use fs2::FileExt;
 use rand::RngCore;
 use std::{
+    collections::HashSet,
+    ffi::OsString,
     process::{Child, Command},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InstallationKind {
@@ -852,10 +854,122 @@ fn rollback(path: &Path, journal: &mut Journal) -> Result<()> {
                 restore_owned_task(journal, task)?;
             }
             restore_selection(&journal.target.root, journal.prior_selection.as_ref())?;
+            restore_root_files(journal);
         }
     }
     journal.phase = JournalStage::RolledBack;
     atomic_json(path, journal)
+}
+/// Root files an in-app update refreshes from its payload: (payload file, root file).
+/// Packages before the launcher joined the payload leave the root launcher as it is.
+const ROOT_REFRESH: [(&str, &str); 2] = [
+    ("compi-launcher.exe", "compi.exe"),
+    ("compi-update-worker.exe", "compi-update-worker.exe"),
+];
+fn root_backup(journal: &Journal, name: &str) -> PathBuf {
+    state_dir(&journal.target.root).join(format!("root-previous-{}-{name}", journal.attempt))
+}
+/// Replaces the root launcher and helper with the activated payload's copies and keeps the
+/// old ones for rollback. Never fails the update: a file that stays locked keeps its old copy.
+/// Renames, not overwrites, so a running launcher or helper image can still be replaced.
+fn refresh_root_files(journal: &Journal) {
+    let root = &journal.target.root;
+    let Ok(payload) = version_path(root, &journal.manifest.version) else {
+        return;
+    };
+    for (source, name) in ROOT_REFRESH {
+        let source = payload.join(source);
+        let destination = root.join(name);
+        if !source.is_file() || compare_payload(&source, &destination).is_ok() {
+            continue;
+        }
+        let next = state_dir(root).join(format!("root-next-{}-{name}", journal.attempt));
+        let backup = root_backup(journal, name);
+        let result = (|| -> Result<()> {
+            fs::copy(&source, &next)?;
+            let previous = destination.is_file();
+            if previous {
+                rename_retrying(&destination, &backup)?;
+            }
+            if let Err(error) = rename_retrying(&next, &destination) {
+                if previous {
+                    rename_retrying(&backup, &destination)?;
+                }
+                return Err(error);
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_file(&next);
+        match result {
+            Ok(()) => update_log(
+                root,
+                &format!("Refreshed {name} from {}", journal.manifest.version),
+            ),
+            Err(error) => update_log(root, &format!("Kept the previous {name}: {error}")),
+        }
+    }
+}
+/// Puts back what `refresh_root_files` replaced. Best effort: the newer launcher and helper
+/// also work with the restored selection.
+fn restore_root_files(journal: &Journal) {
+    let root = &journal.target.root;
+    for (_, name) in ROOT_REFRESH {
+        let backup = root_backup(journal, name);
+        if !backup.is_file() {
+            continue;
+        }
+        let destination = root.join(name);
+        let replaced = state_dir(root).join(format!("root-failed-{}-{name}", journal.attempt));
+        let result = (|| -> Result<()> {
+            let present = destination.is_file();
+            if present {
+                rename_retrying(&destination, &replaced)?;
+            }
+            if let Err(error) = rename_retrying(&backup, &destination) {
+                if present {
+                    rename_retrying(&replaced, &destination)?;
+                }
+                return Err(error);
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_file(&replaced);
+        if let Err(error) = result {
+            update_log(
+                root,
+                &format!("Could not restore the previous {name}: {error}"),
+            );
+        }
+    }
+}
+/// The root launcher exits right after starting Compi, and scanners hold new files briefly.
+fn rename_retrying(from: &Path, to: &Path) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+/// Appends to the plain-text log beside the journal, which the client also writes.
+fn update_log(root: &Path, message: &str) {
+    let path = state_dir(root).join("update.log");
+    let _ = (|| -> std::io::Result<()> {
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 1024 * 1024) {
+            fs::rename(&path, path.with_extension("log.old"))?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        writeln!(file, "{now} {message}")
+    })();
 }
 /// Check activation ownership before releasing GUI hosts or stopping the default daemon.
 pub fn preflight_activation(prepared: &PreparedUpdate, replace_default_daemon: bool) -> Result<()> {
@@ -1139,6 +1253,7 @@ fn apply_authenticated(
                 if journal.prior_task.is_some() {
                     install_verified_task(journal)?;
                 }
+                refresh_root_files(journal);
             }
         }
         journal.phase = JournalStage::Activated;
@@ -1718,6 +1833,446 @@ pub fn relaunch_request(target: &InstallTarget) -> Result<Option<RelaunchRequest
 
 pub fn operation_journal_path(target: &InstallTarget) -> PathBuf {
     state_dir(&target.root).join("journal.json")
+}
+
+/// Updater files that only matter while an activation runs or until the process that asked
+/// for them reads them.
+const TRANSIENT_PREFIXES: [&str; 9] = [
+    "request-",
+    "handoff-",
+    "rollback-handoff-",
+    "review-",
+    "receipt-",
+    "rollback-receipt-",
+    "cli-install-",
+    "worker-",
+    ".write-",
+];
+#[derive(Default)]
+struct Removed {
+    count: u32,
+    bytes: u64,
+}
+/// Deletes what no transaction needs: every `versions\<v>` except the selected client and
+/// task generations and folders still in use, staging other than the pending or retryable
+/// package, retained macOS bundles nothing runs from, rollback leftovers, and transient
+/// files older than this process. Does nothing while another operation holds the lock or a
+/// journal is mid-activation. Quiet: outcomes go to the update log only.
+pub fn prune(target: &InstallTarget) -> Result<()> {
+    let Ok(_lock) = OperationLock::acquire(&target.root) else {
+        return Ok(());
+    };
+    prune_locked(
+        target,
+        process_started().and_then(|started| started.checked_sub(Duration::from_secs(60))),
+        &directory_in_use,
+    )
+}
+/// `transient_cutoff`: transient files last touched before it are stale; `None` keeps them.
+fn prune_locked(
+    target: &InstallTarget,
+    transient_cutoff: Option<SystemTime>,
+    in_use: &dyn Fn(&Path) -> bool,
+) -> Result<()> {
+    let root = &target.root;
+    let state = state_dir(root);
+    let journal =
+        match validate_no_symlink_components(&state).and_then(|_| operation_status(target)) {
+            Ok(journal) => journal,
+            Err(error) => {
+                update_log(root, &format!("Cleanup skipped: {error}"));
+                return Ok(());
+            }
+        };
+    if journal.as_ref().is_some_and(|journal| {
+        matches!(
+            journal.phase,
+            JournalStage::Activating | JournalStage::Activated | JournalStage::Relaunching
+        )
+    }) {
+        return Ok(());
+    }
+    let mut removed = Removed::default();
+    if target.kind != InstallationKind::MacBundle {
+        // The root helper applies updates, so a helper from before root refresh leaves the
+        // root launcher and helper behind; bring them up to the completed update's payload.
+        if let Some(journal) = &journal
+            && journal.phase == JournalStage::Complete
+            && read_selection(root)
+                .ok()
+                .flatten()
+                .is_some_and(|selection| selection.version == journal.manifest.version)
+        {
+            refresh_root_files(journal);
+        }
+        prune_versions(target, &state, in_use, &mut removed);
+    }
+    prune_state(
+        target,
+        journal.as_ref(),
+        transient_cutoff,
+        in_use,
+        &mut removed,
+    )?;
+    if target.kind == InstallationKind::MacBundle
+        && let Some(mut journal) = journal
+    {
+        // Retained bundles stay attributed for daemon lifecycle until they are gone.
+        let retained = journal.retained_backups.len();
+        journal
+            .retained_backups
+            .retain(|backup| fs::symlink_metadata(backup).is_ok());
+        let backup = journal
+            .backup
+            .take_if(|backup| fs::symlink_metadata(backup).is_err());
+        if retained != journal.retained_backups.len() || backup.is_some() {
+            atomic_json(&operation_journal_path(target), &journal)?;
+        }
+    }
+    if removed.count > 0 {
+        update_log(
+            root,
+            &format!(
+                "Cleanup removed {} item(s), {} MB",
+                removed.count,
+                removed.bytes / 1_000_000
+            ),
+        );
+    }
+    Ok(())
+}
+fn prune_versions(
+    target: &InstallTarget,
+    state: &Path,
+    in_use: &dyn Fn(&Path) -> bool,
+    removed: &mut Removed,
+) {
+    let root = &target.root;
+    let selection = match read_selection(root) {
+        Ok(Some(selection)) => selection,
+        Ok(None) => return,
+        Err(error) => {
+            update_log(root, &format!("Kept every version: {error}"));
+            return;
+        }
+    };
+    let Ok(entries) = fs::read_dir(root.join("versions")) else {
+        return;
+    };
+    #[cfg(windows)]
+    let registered = (target.kind == InstallationKind::InstalledWindows)
+        .then(registered_msi_version)
+        .flatten();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(version) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if version_path(root, &version).is_err()
+            || version == selection.version
+            || version == selection.task_version
+        {
+            continue;
+        }
+        if retire(root, state, &entry.path(), in_use, removed) {
+            // The registered product keeps its key; uninstall removes it.
+            #[cfg(windows)]
+            if registered
+                .as_deref()
+                .is_some_and(|product| product != version)
+            {
+                forget_payload_key(&version);
+            }
+        }
+    }
+}
+fn prune_state(
+    target: &InstallTarget,
+    journal: Option<&Journal>,
+    transient_cutoff: Option<SystemTime>,
+    in_use: &dyn Fn(&Path) -> bool,
+    removed: &mut Removed,
+) -> Result<()> {
+    let root = &target.root;
+    let state = state_dir(root);
+    let mut kept_stage = None;
+    let mut protected = HashSet::<OsString>::new();
+    if let Some(journal) = journal {
+        protected.insert(format!("worker-{}.log", journal.attempt).into());
+        // A pending package installs from its stage; a rolled-back one retries from it.
+        // Their requests name the handoffs a manual restore of the old views needs.
+        if matches!(
+            journal.phase,
+            JournalStage::Prepared | JournalStage::RolledBack
+        ) {
+            kept_stage = Some(format!("stage-{}", journal.attempt));
+            let request = format!("request-{}.json", journal.attempt);
+            if let Ok(request) = read_json::<RelaunchRequest>(&state.join(&request), 1024 * 1024) {
+                for host in request
+                    .hosts
+                    .iter()
+                    .chain(request.rollback_hosts.iter().map(|old| &old.host))
+                {
+                    for path in host
+                        .arguments
+                        .iter()
+                        .map(Path::new)
+                        .chain([host.receipt_path.as_path()])
+                    {
+                        protected.extend(path.file_name().map(OsString::from));
+                    }
+                }
+            }
+            protected.insert(request.into());
+            for suffix in ["", ".exe"] {
+                protected.insert(format!("worker-{}{suffix}", journal.attempt).into());
+            }
+        }
+    }
+    for entry in fs::read_dir(&state)? {
+        let entry = entry?;
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            if name.starts_with("prune-")
+                || (name.starts_with("stage-") && kept_stage.as_deref() != Some(name))
+            {
+                remove_entry(root, &path, true, removed);
+            } else if target.kind == InstallationKind::MacBundle
+                && (name.starts_with("previous-") || name.starts_with("failed-"))
+                && name.ends_with(".app")
+            {
+                retire(root, &state, &path, in_use, removed);
+            }
+        } else if kind.is_file() {
+            let leftover = name.starts_with("root-")
+                || (name.starts_with("task-rollback-") && name.ends_with(".xml"));
+            let stale = TRANSIENT_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                && !protected.contains(&file_name)
+                && transient_cutoff.is_some_and(|cutoff| {
+                    entry
+                        .metadata()
+                        .ok()
+                        .and_then(|metadata| last_touched(&metadata))
+                        .is_some_and(|touched| touched < cutoff)
+                });
+            if leftover || stale {
+                remove_entry(root, &path, false, removed);
+            }
+        }
+    }
+    Ok(())
+}
+/// The later of creation and modification: a copy keeps its source's modification time.
+fn last_touched(metadata: &fs::Metadata) -> Option<SystemTime> {
+    [metadata.created().ok(), metadata.modified().ok()]
+        .into_iter()
+        .flatten()
+        .max()
+}
+fn remove_entry(root: &Path, path: &Path, directory: bool, removed: &mut Removed) {
+    let bytes = tree_size(path);
+    let result = if directory {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match result {
+        Ok(()) => {
+            removed.count += 1;
+            removed.bytes += bytes;
+        }
+        Err(error) => update_log(
+            root,
+            &format!("Could not remove {}: {error}", path.display()),
+        ),
+    }
+}
+/// Moves a payload folder into the state directory, then deletes it, so nothing can start
+/// from a half-deleted folder. Returns whether it left its place.
+fn retire(
+    root: &Path,
+    state: &Path,
+    path: &Path,
+    in_use: &dyn Fn(&Path) -> bool,
+    removed: &mut Removed,
+) -> bool {
+    if in_use(path) {
+        update_log(root, &format!("Kept {}: in use", path.display()));
+        return false;
+    }
+    let tombstone = state.join(format!("prune-{}", unique_id()));
+    if let Err(error) = fs::rename(path, &tombstone) {
+        update_log(root, &format!("Kept {}: {error}", path.display()));
+        return false;
+    }
+    remove_entry(root, &tombstone, true, removed);
+    true
+}
+fn tree_size(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
+    }
+    fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| tree_size(&entry.path()))
+            .sum()
+    })
+}
+/// Windows: a running image or loaded DLL refuses an exclusive write open, as does any file
+/// another process holds without full sharing. Checked per file because a folder rename
+/// alone does not prove nothing runs below it.
+#[cfg(windows)]
+fn directory_in_use(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    fn walk(path: &Path) -> std::io::Result<bool> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let busy = if entry.file_type()?.is_dir() {
+                walk(&entry.path())?
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(entry.path())
+                    .is_err()
+            };
+            if busy {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    walk(path).unwrap_or(true)
+}
+/// macOS: renamed bundles keep their running images, so ask lsof for any open file below.
+/// lsof exits 1 with no output when nothing is open; anything else keeps the bundle.
+#[cfg(target_os = "macos")]
+fn directory_in_use(path: &Path) -> bool {
+    Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg("+D")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_or(true, |output| {
+            output.status.code() != Some(1) || !output.stdout.is_empty()
+        })
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn directory_in_use(_: &Path) -> bool {
+    false
+}
+#[cfg(windows)]
+fn process_started() -> Option<SystemTime> {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the pseudo-handle needs no closing; all four outputs are valid FILETIMEs.
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return None;
+    }
+    // 100 ns ticks since 1601-01-01.
+    let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    UNIX_EPOCH.checked_add(Duration::from_nanos(
+        ticks.checked_sub(116_444_736_000_000_000)? * 100,
+    ))
+}
+#[cfg(not(windows))]
+fn process_started() -> Option<SystemTime> {
+    let output = Command::new("ps")
+        .args(["-o", "etime=", "-p", &std::process::id().to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let elapsed = parse_elapsed(String::from_utf8(output.stdout).ok()?.trim())?;
+    SystemTime::now().checked_sub(Duration::from_secs(elapsed))
+}
+/// `ps` elapsed time: `[[dd-]hh:]mm:ss`.
+#[cfg(not(windows))]
+fn parse_elapsed(text: &str) -> Option<u64> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let mut seconds = 0u64;
+    for part in clock.split(':') {
+        seconds = seconds * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + seconds)
+}
+/// Version of the product Windows Installer has registered, from the entry its MSI writes.
+#[cfg(windows)]
+fn registered_msi_version() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+    let key = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Compi");
+    let value = wide("DisplayVersion");
+    let mut buffer = [0u16; 64];
+    let mut size = std::mem::size_of_val(&buffer) as u32;
+    // SAFETY: NUL-terminated names; `size` is the buffer's byte length.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let length = buffer[..size as usize / 2]
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(size as usize / 2);
+    String::from_utf16(&buffer[..length]).ok()
+}
+/// Deletes the key path of a removed payload's permanent MSI components. Only for versions
+/// whose product is no longer registered; a later package of that version installs it again.
+#[cfg(windows)]
+fn forget_payload_key(version: &str) {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
+    let key = wide(&format!("Software\\Compi\\Payloads\\{version}"));
+    // SAFETY: a NUL-terminated key name; a missing key is reported, not created.
+    unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key.as_ptr()) };
+}
+#[cfg(windows)]
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain([0]).collect()
 }
 
 #[cfg(test)]
@@ -2452,5 +3007,196 @@ done
         assert!(OperationLock::acquire(directory.path()).is_err());
         drop(lock);
         let _next = OperationLock::acquire(directory.path()).unwrap();
+    }
+    fn entries(directory: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+    fn versions_fixture(target: &InstallTarget, versions: &[&str]) {
+        for version in versions {
+            let folder = target.root.join("versions").join(version);
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(folder.join("compi.exe"), version).unwrap();
+        }
+    }
+    #[test]
+    fn prune_keeps_selected_task_in_use_and_pending_stage_only() {
+        let directory = tempdir();
+        let target = InstallTarget {
+            kind: InstallationKind::PortableWindows,
+            root: directory.path().join("Compi"),
+        };
+        versions_fixture(&target, &["1.0.0", "1.5.0", "1.8.0", "2.0.0", "3.0.0"]);
+        fs::create_dir(target.root.join("versions/not-a-version")).unwrap();
+        let selected = Selection {
+            schema: 1,
+            version: "2.0.0".into(),
+            task_version: "1.5.0".into(),
+        };
+        restore_selection(&target.root, Some(&selected)).unwrap();
+        let pending = journal(target.clone(), Some(selected), JournalStage::Prepared);
+        let state = state_dir(&target.root);
+        fs::create_dir_all(&pending.stage).unwrap();
+        atomic_json(&state.join("journal.json"), &pending).unwrap();
+        let finished_stage = state.join(format!("stage-{}", "b".repeat(32)));
+        fs::create_dir_all(finished_stage.join("payload")).unwrap();
+        let pending_request = format!("request-{}.json", pending.attempt);
+        let stale = [
+            "request-old.json",
+            "handoff-1-a.json",
+            "review-rollback-1-a.json",
+            "cli-install-a.json",
+            "root-previous-old-compi.exe",
+        ];
+        let unrelated = ["notes.txt", "msi-snapshot.json"];
+        for name in stale
+            .iter()
+            .chain(&unrelated)
+            .chain([&pending_request.as_str()])
+        {
+            fs::write(state.join(name), b"{}").unwrap();
+        }
+        let busy = target.root.join("versions").join("1.8.0");
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        prune_locked(&target, Some(later), &|path| path == busy).unwrap();
+        assert_eq!(
+            entries(&target.root.join("versions")),
+            ["1.5.0", "1.8.0", "2.0.0", "not-a-version"]
+        );
+        assert!(pending.stage.is_dir());
+        assert!(!finished_stage.exists());
+        assert!(state.join(&pending_request).exists());
+        assert!(stale.iter().all(|name| !state.join(name).exists()));
+        assert!(unrelated.iter().all(|name| state.join(name).exists()));
+        assert_eq!(
+            operation_status(&target).unwrap().unwrap().phase,
+            JournalStage::Prepared
+        );
+    }
+    #[test]
+    fn prune_changes_nothing_mid_activation_or_while_another_operation_runs() {
+        let directory = tempdir();
+        let target = InstallTarget {
+            kind: InstallationKind::PortableWindows,
+            root: directory.path().join("Compi"),
+        };
+        versions_fixture(&target, &["1.0.0", "2.0.0"]);
+        let selected = Selection {
+            schema: 1,
+            version: "2.0.0".into(),
+            task_version: "2.0.0".into(),
+        };
+        restore_selection(&target.root, Some(&selected)).unwrap();
+        let state = state_dir(&target.root);
+        let stage = state.join(format!("stage-{}", "b".repeat(32)));
+        fs::create_dir_all(&stage).unwrap();
+        {
+            let _operation = OperationLock::acquire(&target.root).unwrap();
+            prune(&target).unwrap();
+        }
+        assert!(stage.exists());
+        let interrupted = journal(target.clone(), Some(selected), JournalStage::Relaunching);
+        atomic_json(&state.join("journal.json"), &interrupted).unwrap();
+        prune(&target).unwrap();
+        assert!(stage.exists());
+        assert_eq!(entries(&target.root.join("versions")), ["1.0.0", "2.0.0"]);
+    }
+    #[test]
+    fn mac_prune_drops_removed_bundles_from_the_journal() {
+        let directory = tempdir();
+        let target = InstallTarget {
+            kind: InstallationKind::MacBundle,
+            root: directory.path().join("Compi.app"),
+        };
+        fs::create_dir(&target.root).unwrap();
+        let mut completed = journal(target.clone(), None, JournalStage::Complete);
+        let state = state_dir(&target.root);
+        let running = state.join(format!("previous-{}.app", "a".repeat(32)));
+        let latest = state.join(format!("previous-{}.app", completed.attempt));
+        let failed = state.join(format!("failed-{}.app", "c".repeat(32)));
+        for bundle in [&running, &latest, &failed] {
+            fs::create_dir_all(bundle.join("Contents")).unwrap();
+        }
+        completed.retained_backups = vec![running.clone(), latest.clone()];
+        completed.backup = Some(latest.clone());
+        atomic_json(&state.join("journal.json"), &completed).unwrap();
+        prune_locked(&target, None, &|path| path == running).unwrap();
+        assert!(running.exists() && !latest.exists() && !failed.exists());
+        let saved = operation_status(&target).unwrap().unwrap();
+        assert_eq!(saved.retained_backups, [running]);
+        assert!(saved.backup.is_none());
+    }
+    #[test]
+    fn rollback_restores_the_root_launcher_and_helper_an_activation_refreshed() {
+        let directory = tempdir();
+        let target = InstallTarget {
+            kind: InstallationKind::InstalledWindows,
+            root: directory.path().join("Compi"),
+        };
+        let activated = journal(target.clone(), None, JournalStage::Activated);
+        let payload = target.root.join("versions/2.0.0");
+        fs::create_dir_all(&payload).unwrap();
+        fs::create_dir_all(state_dir(&target.root)).unwrap();
+        let launcher = target.root.join("compi.exe");
+        let helper = target.root.join("compi-update-worker.exe");
+        fs::write(&launcher, "old launcher").unwrap();
+        fs::write(&helper, "old helper").unwrap();
+        fs::write(payload.join("compi-update-worker.exe"), "new helper").unwrap();
+        // A package from before the launcher joined the payload leaves it alone.
+        refresh_root_files(&activated);
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "old launcher");
+        assert_eq!(fs::read_to_string(&helper).unwrap(), "new helper");
+        fs::write(payload.join("compi-launcher.exe"), "new launcher").unwrap();
+        refresh_root_files(&activated);
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "new launcher");
+        restore_root_files(&activated);
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "old launcher");
+        assert_eq!(fs::read_to_string(&helper).unwrap(), "old helper");
+        assert!(
+            entries(&state_dir(&target.root))
+                .iter()
+                .all(|name| !name.starts_with("root-"))
+        );
+    }
+    #[test]
+    fn prune_refreshes_root_files_only_for_the_selected_completed_update() {
+        let directory = tempdir();
+        let target = InstallTarget {
+            kind: InstallationKind::InstalledWindows,
+            root: directory.path().join("Compi"),
+        };
+        let payload = target.root.join("versions/2.0.0");
+        fs::create_dir_all(&payload).unwrap();
+        fs::write(payload.join("compi-launcher.exe"), "new launcher").unwrap();
+        let launcher = target.root.join("compi.exe");
+        fs::write(&launcher, "old launcher").unwrap();
+        let completed = journal(target.clone(), None, JournalStage::Complete);
+        atomic_json(&state_dir(&target.root).join("journal.json"), &completed).unwrap();
+        // A later Setup selected another version; its root files are Setup's own.
+        let other = Selection {
+            schema: 1,
+            version: "3.0.0".into(),
+            task_version: "3.0.0".into(),
+        };
+        restore_selection(&target.root, Some(&other)).unwrap();
+        prune_locked(&target, None, &|_| true).unwrap();
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "old launcher");
+        let selected = Selection {
+            version: "2.0.0".into(),
+            task_version: "2.0.0".into(),
+            ..other
+        };
+        restore_selection(&target.root, Some(&selected)).unwrap();
+        prune_locked(&target, None, &|_| false).unwrap();
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "new launcher");
+        assert!(
+            entries(&state_dir(&target.root))
+                .iter()
+                .all(|name| !name.starts_with("root-"))
+        );
     }
 }

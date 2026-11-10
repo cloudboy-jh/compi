@@ -281,6 +281,9 @@ print(json.dumps(m['setup']))
     foreach ($name in @('compi.exe', 'compi-daemon.exe', 'compi-update-worker.exe', 'conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt')) {
         Copy-Item -LiteralPath (Join-Path $bin $name) -Destination $candidateDirectory
     }
+    Copy-Item -LiteralPath (Join-Path $bin 'compi-launcher.exe') -Destination (Join-Path $candidateDirectory 'compi-launcher.exe')
+    $candidateHelperHash = Hash (Join-Path $candidateDirectory 'compi-update-worker.exe')
+    $candidateLauncherHash = Hash (Join-Path $candidateDirectory 'compi-launcher.exe')
     Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $candidateDirectory
     $candidateArchive = Join-Path $run "Compi-$futureVersion-Windows-x64-update-fixture.zip"
     Compress-Archive -Path (Join-Path $candidateDirectory '*') -DestinationPath $candidateArchive
@@ -297,11 +300,13 @@ print(json.dumps(m['setup']))
     $cycle = Get-Content -LiteralPath $cycleReceipts[0] -Raw | ConvertFrom-Json
     if ($cycle.installation_kind -ne 'InstalledWindows' -or -not $cycle.fixture -or $cycle.account_sid -ne $sid -or
         $cycle.from_version -ne $version -or $cycle.to_version -ne $futureVersion -or
-        $cycle.artifact_sha256 -ne (Hash $candidateArchive) -or $cycle.stable_helper_sha256 -ne $fixtureHelperHash) {
+        $cycle.artifact_sha256 -ne (Hash $candidateArchive) -or $cycle.stable_helper_sha256 -ne $candidateHelperHash) {
         throw 'Installed cycle receipt does not match the exact owned disposable fixture'
     }
     $finalInstalled = Read-Installed $futureVersion 'future-installed'
-    if ((Hash (Join-Path $root 'compi-update-worker.exe')) -ne $fixtureHelperHash) { throw 'Update changed the stable root helper to the staged candidate' }
+    # The fixture's helper applies the candidate, so the update refreshes the root launcher and helper.
+    if ((Hash (Join-Path $root 'compi-update-worker.exe')) -ne $candidateHelperHash) { throw 'Update did not refresh the root helper from the candidate' }
+    if ((Hash (Join-Path $root 'compi.exe')) -ne $candidateLauncherHash) { throw 'Update did not refresh the root launcher from the candidate' }
     Write-Json (Join-Path $run 'installed-qualification.json') @{
         schema = 1; platform = 'windows-x86_64'; version = $version; account_sid = $sid;
         setup_migration_receipt = 'setup-migration-evidence.json'; installed_fixture_cycle_receipt = $cycleReceipts[0];

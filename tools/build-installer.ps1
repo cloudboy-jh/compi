@@ -189,13 +189,15 @@ try {
         Copy-Item -LiteralPath (Join-Path $productBin $file) -Destination $versionDirectory
     }
     Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $versionDirectory
+    # In-app updates copy this over the root compi.exe launcher.
+    Copy-Item -LiteralPath $launcherSource -Destination (Join-Path $versionDirectory 'compi-launcher.exe')
     Copy-Item -LiteralPath $launcherSource -Destination (Join-Path $portableStaging 'compi.exe')
     Copy-Item -LiteralPath $helperSource -Destination $portableStaging
     Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $portableStaging
     [System.IO.File]::WriteAllText((Join-Path $portableStaging 'selection.json'),
         (@{schema = 1; version = $version; task_version = $version} | ConvertTo-Json -Compress),
         [System.Text.UTF8Encoding]::new($false))
-    # The updater consumes the complete payload, not the stable launch wrapper.
+    # The updater consumes the complete versions\<v> payload, including the launcher copy.
     foreach ($destination in @($portableDestination, $updateDestination)) {
         if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }
     }

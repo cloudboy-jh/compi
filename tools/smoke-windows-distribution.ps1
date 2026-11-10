@@ -58,7 +58,7 @@ $artifactHashes = @($artifactPaths | ForEach-Object {
 })
 [System.IO.File]::WriteAllText((Join-Path $evidence 'artifact-hashes.json'),
     ($artifactHashes | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
-foreach ($path in @('compi.exe', 'compi-update-worker.exe', "versions\$version\compi.exe", "versions\$version\compi-daemon.exe", "versions\$version\conpty.dll", "versions\$version\OpenConsole.exe", "versions\$version\ConPTY-LICENSE.txt", "versions\$version\LICENSE")) {
+foreach ($path in @('compi.exe', 'compi-update-worker.exe', "versions\$version\compi.exe", "versions\$version\compi-daemon.exe", "versions\$version\compi-launcher.exe", "versions\$version\conpty.dll", "versions\$version\OpenConsole.exe", "versions\$version\ConPTY-LICENSE.txt", "versions\$version\LICENSE")) {
     if (-not (Test-Path -LiteralPath (Join-Path $portableDirectory $path))) { throw "Portable package is missing $path" }
 }
 $isolatedData = Join-Path $evidence ('profile-' + [guid]::NewGuid().ToString('N'))
