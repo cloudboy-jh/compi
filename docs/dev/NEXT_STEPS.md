@@ -20,7 +20,7 @@ Found on the owner's Windows install: nothing was ever removed (12 `versions\` f
 
 The update cycle and launcher/helper refresh were seen on the owner's install after publishing (see Release state). Still unchecked: a repair from Settings → Apps after Setup removed its run folder (the extra source registration is untested for a standard user).
 
-## In source for 0.7.4: agent chat in Program Status, chat approvals, Settings → Chat, sub-agents (decided 2026-11-10)
+## Prepared as 0.7.4 (not yet tagged): agent chat in Program Status, chat approvals, Settings → Chat, sub-agents, Settings consistency (2026-11-10)
 
 Program Status records are kept per terminal surface (`SurfaceProgramStatus { surface_id, process_lifetime_id, records }`, fed by OSC 7501 and watched through `WatchProgramStatus`). A chat is daemon-owned ACP with no surface of its own, so nothing built on Program Status sees it: no notifications (`gui/workspace/notifications.rs`, `notice_program_status`), no tab glyph, pane dot or floating-title status, no sidebar or palette status line, no hover card, nothing in `compi --json pane list`/`pane show` for an agent or script to read. OMP in a plain terminal reports all of this.
 
