@@ -187,8 +187,10 @@ try {
     foreach ($name in @('Cargo.toml', 'Cargo.lock', 'LICENSE', 'crates', 'vendor', 'assets', 'docs', '.cargo')) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $source -Recurse
     }
-    New-Item -ItemType Directory -Path (Join-Path $source 'tools'), (Join-Path $source 'target\conpty-runtime') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $source 'tools'), (Join-Path $source 'installer'), (Join-Path $source 'target\conpty-runtime') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $projectRoot 'tools\compi-dev') -Destination (Join-Path $source 'tools') -Recurse
+    # A workspace member: cargo loads every member's manifest before building any package.
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'installer\bootstrapper') -Destination (Join-Path $source 'installer') -Recurse
     Copy-Item -LiteralPath (Join-Path $projectRoot 'target\conpty-runtime\x64') -Destination (Join-Path $source 'target\conpty-runtime') -Recurse
     $env:CARGO_TARGET_DIR = $build
     Push-Location $source
