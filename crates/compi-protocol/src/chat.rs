@@ -125,6 +125,9 @@ pub struct ChatState {
     /// Prompts waiting for the running turn to end, sent in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<ChatQueued>,
+    /// The model providers signed in with a subscription plan, with what is left of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plans: Vec<ChatPlan>,
 }
 
 impl ChatState {
@@ -157,6 +160,7 @@ impl ChatState {
             ChatEvent::Permission { permission } => self.permission = permission,
             ChatEvent::Question { question } => self.question = question,
             ChatEvent::Queued { queued } => self.queued = queued,
+            ChatEvent::Plans { plans } => self.plans = plans,
         }
     }
 
@@ -444,6 +448,22 @@ pub struct ChatQueued {
     pub images: Vec<String>,
 }
 
+/// A model provider used through a subscription plan rather than paid per use.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatPlan {
+    /// As model values name it before their `/` (`anthropic`, `openai-codex`).
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<ChatPlanLimit>,
+}
+
+/// One usage window of a plan (`5 Hour`, `7 days`) and how much of it is left.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatPlanLimit {
+    pub label: String,
+    pub left_percent: u8,
+}
+
 /// A session of the harness in the chat's folder, for resuming.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatSessionInfo {
@@ -506,6 +526,9 @@ pub enum ChatEvent {
     /// The queued prompts, all of them.
     Queued {
         queued: Vec<ChatQueued>,
+    },
+    Plans {
+        plans: Vec<ChatPlan>,
     },
 }
 

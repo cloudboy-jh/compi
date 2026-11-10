@@ -8,10 +8,11 @@
 //! resumes it (`session/load`) when it starts again, after a restart of the daemon too.
 use compi_protocol::chat::{
     ChatAnswer, ChatAnswers, ChatChoice, ChatCommand, ChatContent, ChatDelivery, ChatDiff,
-    ChatEntry, ChatEvent, ChatField, ChatImage, ChatOption, ChatPermission, ChatPermissionOption,
-    ChatQuestion, ChatQueued, ChatSessionInfo, ChatState, ChatStatus, ChatTool, ChatToolStatus,
-    ChatUsage, MAX_CHAT_ATTACHMENTS, MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES,
-    MAX_CHAT_PROMPT_BYTES, MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
+    ChatEntry, ChatEvent, ChatField, ChatHarness, ChatImage, ChatOption, ChatPermission,
+    ChatPermissionOption, ChatPlan, ChatPlanLimit, ChatQuestion, ChatQueued, ChatSessionInfo,
+    ChatState, ChatStatus, ChatTool, ChatToolStatus, ChatUsage, MAX_CHAT_ATTACHMENTS,
+    MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES,
+    MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
 };
 use compi_protocol::{ContentEnvironment, LayoutNode, WorkspaceSnapshot};
 use serde_json::{Map, Value, json};
@@ -219,6 +220,8 @@ enum Pending {
     Prompt,
     /// A prompt into the running turn; it waits its turn when the harness declines.
     Steer(Prompt),
+    /// OMP's subscription plans and what is left of them (`_omp/usage`).
+    Plans,
     SetOption,
     List(mpsc::Sender<Result<Vec<ChatSessionInfo>, String>>),
 }
@@ -311,6 +314,8 @@ struct Inner {
     /// A turn that did not end on its own holds the queue until a prompt is sent or
     /// queued.
     queue_held: bool,
+    /// A plans request is out; another waits for it.
+    reading_plans: bool,
     next_request: u64,
     pending: HashMap<u64, Pending>,
     /// Tool call IDs to their transcript entries.
@@ -542,6 +547,7 @@ impl Chat {
                     status: ChatStatus::Ready,
                 });
                 inner.send_queued();
+                self.read_plans(inner);
             }
             (Pending::LoadSession, Err(error)) => {
                 inner.emit(ChatEvent::Session { session: None });
@@ -584,6 +590,16 @@ impl Chat {
                 inner.enqueue(prompt, true);
                 inner.send_queued();
             }
+            (Pending::Plans, result) => {
+                inner.reading_plans = false;
+                // A harness without the method, or one that failed, keeps what it had.
+                if let Ok(result) = result {
+                    let plans = plans(&result);
+                    if plans != inner.state.plans {
+                        inner.emit(ChatEvent::Plans { plans });
+                    }
+                }
+            }
             (Pending::Prompt, result) => {
                 let stop = match &result {
                     Ok(result) => result["stopReason"]
@@ -620,8 +636,18 @@ impl Chat {
                 // A stopped or failed turn holds the queue; one that ended goes on.
                 inner.queue_held = stop != "end_turn";
                 inner.send_queued();
+                self.read_plans(inner);
             }
         }
+    }
+
+    /// Asks OMP for its subscription plans, unless a request is out already.
+    fn read_plans(&self, inner: &mut Inner) {
+        if self.content.harness != ChatHarness::Omp || inner.reading_plans {
+            return;
+        }
+        inner.reading_plans = true;
+        inner.request("_omp/usage", json!({}), Pending::Plans);
     }
 
     /// Loads `session`, whose history the harness replays, or starts a new one.
@@ -972,13 +998,15 @@ impl Inner {
         }
     }
 
-    /// Windows waiting on a session listing hear the harness is gone.
+    /// Windows waiting on a session listing hear the harness is gone; nothing it was
+    /// asked is out any more.
     fn fail_pending(&mut self) {
         for (_, pending) in self.pending.drain() {
             if let Pending::List(reply) = pending {
                 let _ = reply.send(Err("the harness stopped".into()));
             }
         }
+        self.reading_plans = false;
     }
 
     /// A turn ended: tool calls still open will not report again, and nobody needs to
@@ -1509,6 +1537,35 @@ fn choice(value: &Value, group: Option<String>) -> Option<ChatChoice> {
             .map(str::to_owned),
         group,
     })
+}
+
+/// The subscription plans in OMP's usage reports: each provider, and per window the
+/// share left.
+fn plans(result: &Value) -> Vec<ChatPlan> {
+    result["reports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|report| {
+            let provider = report["provider"].as_str()?.to_owned();
+            let limits = report["limits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|limit| {
+                    let amount = &limit["amount"];
+                    let left = amount["remainingFraction"].as_f64().or_else(|| {
+                        Some(amount["remaining"].as_f64()? / amount["limit"].as_f64()?)
+                    })?;
+                    Some(ChatPlanLimit {
+                        label: limit["label"].as_str()?.to_owned(),
+                        left_percent: (left.clamp(0.0, 1.0) * 100.0).round() as u8,
+                    })
+                })
+                .collect();
+            Some(ChatPlan { provider, limits })
+        })
+        .collect()
 }
 
 fn sessions(result: &Value) -> Vec<ChatSessionInfo> {

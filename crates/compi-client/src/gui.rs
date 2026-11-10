@@ -179,6 +179,13 @@ fn run_application(
         let mut config = config;
         if !empty_measurement {
             gpui_component::init(cx);
+            // A popover takes Space as Confirm; in a text field inside one (the model
+            // search), Space types a space.
+            cx.bind_keys([gpui::KeyBinding::new(
+                "space",
+                gpui::NoAction,
+                Some("Popover > Input"),
+            )]);
             workspace::notifications::init(&target, cx);
             if let Err(error) = crate::font_catalog::register_bundled(cx.text_system()) {
                 config.diagnostics.push(error);

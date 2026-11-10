@@ -76,8 +76,8 @@ use std::fmt;
 // with `ChatWatching`/`ChatChanged`, and `SendChat`, `CancelChat`, `AnswerChatPermission`,
 // `AnswerChatQuestion`, `SetChatOption`, `ListChatSessions`, `ResumeChat` and `RestartChat`.
 // Version 39 lets a chat prompt steer the running turn or wait for it (`SendChat::delivery`,
-// `ChatDelivery`), keeps the waiting prompts in `ChatState::queued` (`ChatEvent::Queued`)
-// and removes one with `RemoveQueuedChat`.
+// `ChatDelivery`), keeps the waiting prompts in `ChatState::queued` (`ChatEvent::Queued`),
+// removes one with `RemoveQueuedChat`, and names the subscription plans (`ChatState::plans`).
 pub const PROTOCOL_VERSION: u32 = 39;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;

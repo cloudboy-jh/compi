@@ -1042,9 +1042,13 @@ fn kit_popover(
 
 /// The content of a popup holding the keyboard: `on_key` sees every key except
 /// Escape, which closes the popup, and no key reaches the window behind it. Kit's
-/// popover turns Enter and Space into its Confirm action; it arrives as `enter`.
+/// popover turns Enter and Space into its Confirm action; it arrives as `enter`. A key
+/// typing a character while a text field inside the popup has the keyboard (a search)
+/// goes on to the field: on Windows, a key down marked handled never becomes its
+/// character.
 fn popup_keys(focus: &FocusHandle, on_key: Option<KeyHandler>) -> Div {
     let confirm = on_key.clone();
+    let own = focus.clone();
     div()
         .track_focus(focus)
         .on_action(move |_: &Confirm, window, cx| {
@@ -1053,6 +1057,14 @@ fn popup_keys(focus: &FocusHandle, on_key: Option<KeyHandler>) -> Div {
             }
         })
         .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            let modifiers = &event.keystroke.modifiers;
+            let types = event.keystroke.key_char.is_some()
+                && !modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform;
+            if types && own.contains_focused(window, cx) && !own.is_focused(window) {
+                return;
+            }
             cx.stop_propagation();
             if let Some(on_key) = &on_key {
                 on_key(&event.keystroke, window, cx);

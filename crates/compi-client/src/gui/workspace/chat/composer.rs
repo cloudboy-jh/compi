@@ -3,7 +3,9 @@
 //! composer with its attachments and its `/` command and `@` file lists, and a row of the
 //! harness's settings, context use and Send or Stop.
 use super::*;
-use compi_protocol::chat::{ChatCommand, ChatOption, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES};
+use compi_protocol::chat::{
+    ChatChoice, ChatCommand, ChatOption, ChatPlan, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES,
+};
 use controls::MenuEntry;
 
 /// Typing pauses this long before a file search.
@@ -35,14 +37,14 @@ pub(super) struct OptionPicker {
     option: String,
     search: Entity<InputState>,
     _events: Subscription,
-    /// Index into the matches.
+    /// Index into the listed choices, in their grouped order.
     highlight: usize,
     scroll: UniformListScrollHandle,
 }
 
 impl OptionPicker {
     /// The choices matching the search, as indices into `option.choices`: every word
-    /// of the search in the name, value or group, ignoring case.
+    /// of the search in the name, value, group or provider, ignoring case.
     fn matches(&self, option: &ChatOption, cx: &App) -> Vec<usize> {
         let query = self.search.read(cx).value().to_lowercase();
         let words: Vec<&str> = query.split_whitespace().collect();
@@ -56,7 +58,9 @@ impl OptionPicker {
                         "{} {} {}",
                         choice.name,
                         choice.value,
-                        choice.group.as_deref().unwrap_or_default()
+                        choice_provider(choice)
+                            .map(provider_name)
+                            .unwrap_or_default()
                     )
                     .to_lowercase();
                     words.iter().all(|word| haystack.contains(word))
@@ -65,6 +69,156 @@ impl OptionPicker {
             .map(|(index, _)| index)
             .collect()
     }
+
+    /// The matches laid out under their providers' headings.
+    fn layout(&self, option: &ChatOption, plans: &[ChatPlan], cx: &App) -> PickerLayout {
+        picker_layout(option, &self.matches(option, cx), plans)
+    }
+}
+
+/// A row of a searched setting list.
+#[derive(Debug, PartialEq)]
+enum PickerRow {
+    /// A provider's heading: its name, its plan's usage or that it is paid per use, and
+    /// how many of its choices are listed.
+    Heading {
+        title: String,
+        detail: Option<String>,
+        count: usize,
+    },
+    /// A choice, by index into `option.choices`.
+    Choice(usize),
+}
+
+/// The rows of a searched setting list, and the row of each choice in the order arrow
+/// keys step through them.
+struct PickerLayout {
+    rows: Vec<PickerRow>,
+    choices: Vec<usize>,
+}
+
+impl PickerLayout {
+    /// The choice (index into `option.choices`) listed `listed`th.
+    fn choice(&self, listed: usize) -> Option<usize> {
+        match self.rows.get(*self.choices.get(listed)?)? {
+            PickerRow::Choice(index) => Some(*index),
+            PickerRow::Heading { .. } => None,
+        }
+    }
+}
+
+/// The provider a model choice belongs to: its group, else its value before the `/`.
+fn choice_provider(choice: &ChatChoice) -> Option<&str> {
+    choice
+        .group
+        .as_deref()
+        .or_else(|| choice.value.split_once('/').map(|(provider, _)| provider))
+}
+
+/// A provider as people know it: `openai-codex` is OpenAI Codex.
+fn provider_name(provider: &str) -> String {
+    let known = match provider {
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "openai-codex" => "OpenAI Codex",
+        "openrouter" => "OpenRouter",
+        "amazon-bedrock" => "Amazon Bedrock",
+        "google" => "Google",
+        "google-vertex" => "Google Vertex",
+        "github-copilot" => "GitHub Copilot",
+        "xai" => "xAI",
+        "deepseek" => "DeepSeek",
+        _ => "",
+    };
+    if !known.is_empty() {
+        return known.to_owned();
+    }
+    provider
+        .split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut letters = word.chars();
+            letters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(letters).collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `matches` (indices into `option.choices`) under a heading per provider: providers
+/// with a subscription plan first, then those paid per use; in each, the current
+/// choice's provider first, then by name. Choices keep their order within a provider.
+/// Without providers, the matches as they are.
+fn picker_layout(option: &ChatOption, matches: &[usize], plans: &[ChatPlan]) -> PickerLayout {
+    let provider_of = |index: usize| choice_provider(&option.choices[index]);
+    if matches.iter().all(|&index| provider_of(index).is_none()) {
+        return PickerLayout {
+            rows: matches
+                .iter()
+                .map(|&index| PickerRow::Choice(index))
+                .collect(),
+            choices: (0..matches.len()).collect(),
+        };
+    }
+    let current = option
+        .choices
+        .iter()
+        .find(|choice| choice.value == option.current)
+        .and_then(choice_provider);
+    let mut providers: Vec<Option<&str>> = Vec::new();
+    for &index in matches {
+        if !providers.contains(&provider_of(index)) {
+            providers.push(provider_of(index));
+        }
+    }
+    let plan = |provider: Option<&str>| {
+        plans
+            .iter()
+            .find(|plan| Some(plan.provider.as_str()) == provider)
+    };
+    providers.sort_by_key(|&provider| {
+        (
+            plan(provider).is_none(),
+            provider.is_none(),
+            provider != current,
+            provider.map(provider_name).unwrap_or_default(),
+        )
+    });
+    let mut layout = PickerLayout {
+        rows: Vec::new(),
+        choices: Vec::new(),
+    };
+    for provider in providers {
+        let listed: Vec<usize> = matches
+            .iter()
+            .copied()
+            .filter(|&index| provider_of(index) == provider)
+            .collect();
+        let detail = match plan(provider) {
+            Some(plan) => {
+                let tightest = plan.limits.iter().min_by_key(|limit| limit.left_percent);
+                Some(match tightest {
+                    Some(limit) => format!(
+                        "Subscription · {}: {}% left",
+                        limit.label, limit.left_percent
+                    ),
+                    None => "Subscription".to_owned(),
+                })
+            }
+            None => provider.map(|_| "Pay per use".to_owned()),
+        };
+        layout.rows.push(PickerRow::Heading {
+            title: provider.map_or_else(|| "Other".to_owned(), provider_name),
+            detail,
+            count: listed.len(),
+        });
+        for index in listed {
+            layout.choices.push(layout.rows.len());
+            layout.rows.push(PickerRow::Choice(index));
+        }
+    }
+    layout
 }
 
 /// What the system picker returned, sorted: files by the path the chat's environment
@@ -1626,7 +1780,14 @@ impl CompiApp {
                 .picker
                 .as_ref()
                 .filter(|picker| open && picker.option == option.id)
-                .map(|picker| self.render_chat_picker(chat, option, picker, cx));
+                .map(|picker| {
+                    let plans = model
+                        .state
+                        .as_ref()
+                        .map(|state| state.plans.as_slice())
+                        .unwrap_or_default();
+                    self.render_chat_picker(chat, option, picker, plans, cx)
+                });
             let keys = {
                 let (app, id) = (cx.entity().downgrade(), chat.id.clone());
                 move |key: &Keystroke, window: &mut Window, cx: &mut App| {
@@ -1663,38 +1824,81 @@ impl CompiApp {
     }
 
     /// A long choice list (models): a search field over a virtual list of the choices
-    /// matching it, the current one checked, the highlighted one picked by Enter.
+    /// matching it under their providers' headings, the current one checked, the
+    /// highlighted one picked by Enter.
     fn render_chat_picker(
         &self,
         chat: &ChatContent,
         option: &ChatOption,
         picker: &OptionPicker,
+        plans: &[ChatPlan],
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let matches = Rc::new(picker.matches(option, cx));
-        let highlight = picker.highlight.min(matches.len().saturating_sub(1));
+        let layout = picker.layout(option, plans, cx);
+        let highlighted = layout
+            .choices
+            .get(picker.highlight.min(layout.choices.len().saturating_sub(1)))
+            .copied();
+        let grouped = layout
+            .rows
+            .iter()
+            .any(|row| matches!(row, PickerRow::Heading { .. }));
+        let empty = layout.choices.is_empty();
+        let count = layout.rows.len();
+        let rows = Rc::new(layout.rows);
         let choices = Rc::new(option.choices.clone());
         let current = option.current.clone();
         let (id, setting) = (chat.id.clone(), option.id.clone());
-        let count = matches.len();
-        let list = {
-            let matches = matches.clone();
-            uniform_list(
-                "chat-picker-list",
-                count,
-                cx.processor(move |_, range: Range<usize>, _, cx| {
-                    range
-                        .map(|row| {
-                            let choice = &choices[matches[row]];
+        let list = uniform_list(
+            "chat-picker-list",
+            count,
+            cx.processor(move |_, range: Range<usize>, _, cx| {
+                range
+                    .map(|row| match &rows[row] {
+                        PickerRow::Heading {
+                            title,
+                            detail,
+                            count,
+                        } => div()
+                            .id(("chat-picker-heading", row))
+                            .h(ui_rems(PICKER_ROW_HEIGHT))
+                            .px_2()
+                            .flex()
+                            .items_end()
+                            .pb_1()
+                            .gap_x_2()
+                            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                                    .text_color(color(modal_text_color(colors.foreground, &colors)))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title.clone()),
+                            )
+                            .when_some(detail.clone(), |heading, detail| {
+                                heading.child(div().min_w_0().truncate().child(detail))
+                            })
+                            .child(div().flex_1())
+                            .child(div().flex_none().child(count.to_string()))
+                            .into_any_element(),
+                        PickerRow::Choice(index) => {
+                            let choice = &choices[*index];
                             let (id, setting, value) =
                                 (id.clone(), setting.clone(), choice.value.clone());
-                            let detail =
-                                choice.group.clone().or_else(|| choice.description.clone());
+                            // A heading names the provider; ungrouped choices keep their
+                            // own detail.
+                            let detail = (!grouped)
+                                .then(|| {
+                                    choice.group.clone().or_else(|| choice.description.clone())
+                                })
+                                .flatten();
                             controls::menu_row(
                                 ("chat-picker-row", row),
-                                row == highlight,
+                                Some(row) == highlighted,
                                 choice.value == current,
                                 cx,
                             )
@@ -1719,39 +1923,34 @@ impl CompiApp {
                                         .child(detail),
                                 )
                             })
-                            .on_click(cx.listener(
-                                move |this, _: &ClickEvent, window, cx| {
-                                    this.set_chat_option(
-                                        &id,
-                                        setting.clone(),
-                                        value.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                    this.set_chat_menu(
-                                        &id,
-                                        ChatMenu::Option(setting.clone()),
-                                        false,
-                                    );
-                                    cx.notify();
-                                },
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .h(ui_rems(
-                PICKER_ROW_HEIGHT * count.clamp(1, PICKER_ROWS) as f32,
-            ))
-            .track_scroll(&picker.scroll)
-        };
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.set_chat_option(
+                                    &id,
+                                    setting.clone(),
+                                    value.clone(),
+                                    window,
+                                    cx,
+                                );
+                                this.set_chat_menu(&id, ChatMenu::Option(setting.clone()), false);
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h(ui_rems(
+            PICKER_ROW_HEIGHT * count.clamp(1, PICKER_ROWS) as f32,
+        ))
+        .track_scroll(&picker.scroll);
         controls::menu_surface(cx)
             .w(ui_rems(PICKER_WIDTH))
             .flex()
             .flex_col()
             .gap_1()
             .child(Input::new(&picker.search).appearance(true))
-            .when(matches.is_empty(), |panel| {
+            .when(empty, |panel| {
                 panel.child(
                     div()
                         .px_2()
@@ -1762,7 +1961,7 @@ impl CompiApp {
                         .child(format!("No {} matches", option.name.to_lowercase())),
                 )
             })
-            .when(!matches.is_empty(), |panel| panel.child(list))
+            .when(!empty, |panel| panel.child(list))
             .into_any_element()
     }
 
@@ -1822,23 +2021,38 @@ impl CompiApp {
                 _ => {}
             },
         );
-        window.focus(&search.focus_handle(cx), cx);
-        let current = model.state.as_ref().and_then(|state| {
-            let shown = state.options.iter().find(|shown| shown.id == option)?;
-            shown
-                .choices
-                .iter()
-                .position(|choice| choice.value == shown.current)
-        });
+        // The popover takes the keyboard as it opens, after this; the next frame gives
+        // it back to the search.
+        let handle = search.focus_handle(cx);
+        window.focus(&handle, cx);
+        window.on_next_frame(move |window, cx| window.focus(&handle, cx));
+        let (highlight, current_row) = model
+            .state
+            .as_ref()
+            .and_then(|state| {
+                let shown = state.options.iter().find(|shown| shown.id == option)?;
+                let current = shown
+                    .choices
+                    .iter()
+                    .position(|choice| choice.value == shown.current)?;
+                let all: Vec<usize> = (0..shown.choices.len()).collect();
+                let layout = picker_layout(shown, &all, &state.plans);
+                let listed = layout
+                    .choices
+                    .iter()
+                    .position(|&row| layout.rows[row] == PickerRow::Choice(current))?;
+                Some((listed, layout.choices[listed]))
+            })
+            .unzip();
         let scroll = UniformListScrollHandle::new();
-        if let Some(current) = current {
-            scroll.scroll_to_item(current, ScrollStrategy::Center);
+        if let Some(row) = current_row {
+            scroll.scroll_to_item(row, ScrollStrategy::Center);
         }
         model.picker = Some(OptionPicker {
             option,
             search,
             _events: events,
-            highlight: current.unwrap_or(0),
+            highlight: highlight.unwrap_or(0),
             scroll,
         });
     }
@@ -1864,7 +2078,8 @@ impl CompiApp {
         let Some(option) = state.options.iter().find(|shown| shown.id == picker.option) else {
             return;
         };
-        let count = picker.matches(option, cx).len();
+        let layout = picker.layout(option, &state.plans, cx);
+        let count = layout.choices.len();
         if count == 0 {
             return;
         }
@@ -1875,9 +2090,14 @@ impl CompiApp {
             "pageup" => picker.highlight.saturating_sub(PICKER_ROWS),
             _ => return,
         };
-        picker
-            .scroll
-            .scroll_to_item(picker.highlight, ScrollStrategy::Nearest);
+        // The first choice of a provider brings its heading into view too.
+        let row = layout.choices[picker.highlight];
+        let row = if row > 0 && matches!(layout.rows[row - 1], PickerRow::Heading { .. }) {
+            row - 1
+        } else {
+            row
+        };
+        picker.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -1897,9 +2117,9 @@ impl CompiApp {
         let Some(option) = state.options.iter().find(|shown| shown.id == picker.option) else {
             return;
         };
-        let matches = picker.matches(option, cx);
-        let Some(&index) = matches.get(picker.highlight.min(matches.len().saturating_sub(1)))
-        else {
+        let layout = picker.layout(option, &state.plans, cx);
+        let listed = picker.highlight.min(layout.choices.len().saturating_sub(1));
+        let Some(index) = layout.choice(listed) else {
             return;
         };
         let (setting, value) = (option.id.clone(), option.choices[index].value.clone());
@@ -1978,6 +2198,81 @@ mod tests {
             .collect();
         assert_eq!(names, ["resume", "review", "Reset"]);
         assert_eq!(matching_commands(&commands, "pl").len(), 1);
+    }
+
+    #[test]
+    fn models_list_subscriptions_first_then_the_current_provider_then_by_name() {
+        let choice = |value: &str| ChatChoice {
+            value: value.into(),
+            name: value.rsplit('/').next().unwrap().into(),
+            description: None,
+            group: None,
+        };
+        let option = ChatOption {
+            id: "model".into(),
+            name: "Model".into(),
+            category: Some("model".into()),
+            current: "openrouter/glm".into(),
+            choices: vec![
+                choice("amazon-bedrock/haiku"),
+                choice("anthropic/opus"),
+                choice("openrouter/glm"),
+                choice("openai-codex/gpt"),
+                choice("anthropic/sonnet"),
+            ],
+        };
+        let plans = [
+            ChatPlan {
+                provider: "openai-codex".into(),
+                limits: Vec::new(),
+            },
+            ChatPlan {
+                provider: "anthropic".into(),
+                limits: vec![
+                    compi_protocol::chat::ChatPlanLimit {
+                        label: "5 Hour".into(),
+                        left_percent: 60,
+                    },
+                    compi_protocol::chat::ChatPlanLimit {
+                        label: "7 Day".into(),
+                        left_percent: 80,
+                    },
+                ],
+            },
+        ];
+        let layout = picker_layout(&option, &[0, 1, 2, 3, 4], &plans);
+        let shown: Vec<String> = layout
+            .rows
+            .iter()
+            .map(|row| match row {
+                PickerRow::Heading {
+                    title,
+                    detail,
+                    count,
+                } => format!(
+                    "# {title} ({}) {count}",
+                    detail.as_deref().unwrap_or_default()
+                ),
+                PickerRow::Choice(index) => option.choices[*index].value.clone(),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "# Anthropic (Subscription · 5 Hour: 60% left) 2",
+                "anthropic/opus",
+                "anthropic/sonnet",
+                "# OpenAI Codex (Subscription) 1",
+                "openai-codex/gpt",
+                "# OpenRouter (Pay per use) 1",
+                "openrouter/glm",
+                "# Amazon Bedrock (Pay per use) 1",
+                "amazon-bedrock/haiku",
+            ]
+        );
+        // Arrow keys step through choices only.
+        assert_eq!(layout.choice(2), Some(3));
+        assert_eq!(layout.choices.len(), 5);
     }
 
     #[test]
