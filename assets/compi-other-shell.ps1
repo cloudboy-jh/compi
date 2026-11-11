@@ -34,6 +34,8 @@ while IFS= read -r kind && IFS= read -r folder && IFS= read -r encoded; do
     printf '\036%sE\037' "$mark" >&2
 done
 '@
+    # A Windows checkout may give this file CRLF line endings; Bash needs LF.
+    $worker = $worker.Replace("`r`n", "`n")
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = 'wsl.exe'
     $workerPath = '/tmp/' + $global:__compi_bash_mark + '.sh'
