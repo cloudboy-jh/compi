@@ -12,10 +12,11 @@ use super::browser::MediaSource;
 use super::changes::{ChangesSettings, DiffTab, RepoStatus, SidebarMode};
 use super::git_gutter::GitGutter;
 use super::tree::{Entry, FileTree, filter_rows};
-use super::tree_ui::tree_entry_icon;
+use super::tree_ui::tree_row_icon;
 use super::unsaved::{self, Backup, Backups, SaveTicket};
 use super::*;
 use crate::gui::controls::{self, ChipTone, IconName, icon_button, text_button};
+use crate::gui::language_icons::LanguageIcon;
 use crate::gui::open_with;
 use compi_protocol::{
     ContentEnvironment, ContentTab, DirectoryEntry, ErrorCode, FileContent, FileKind, FileState,
@@ -737,6 +738,17 @@ pub(super) fn language_for(path: &str) -> &'static str {
         (".profile", "bash"),
         (".zshrc", "bash"),
     ];
+    let name = file_name(path);
+    NAMES
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, language)| *language)
+        .or_else(|| extension_language(name.rsplit_once('.')?.1))
+        .unwrap_or("text")
+}
+
+/// The highlighter language of files ending in `.extension`, in any case.
+fn extension_language(extension: &str) -> Option<&'static str> {
     const EXTENSIONS: &[(&str, &str)] = &[
         ("rs", "rust"),
         ("toml", "toml"),
@@ -773,17 +785,47 @@ pub(super) fn language_for(path: &str) -> &'static str {
         ("bash", "bash"),
         ("zsh", "bash"),
     ];
-    let name = file_name(path);
-    NAMES
+    EXTENSIONS
         .iter()
-        .find(|(known, _)| *known == name)
-        .or_else(|| {
-            let (_, extension) = name.rsplit_once('.')?;
-            EXTENSIONS
-                .iter()
-                .find(|(known, _)| known.eq_ignore_ascii_case(extension))
-        })
-        .map_or("text", |(_, language)| language)
+        .find(|(known, _)| known.eq_ignore_ascii_case(extension))
+        .map(|(_, language)| *language)
+}
+
+/// What names a language: a file's path, or the tag after a code block's opening fence.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum LanguageHint<'a> {
+    Path(&'a str),
+    Fence(&'a str),
+}
+
+/// The bundled icon of the language `hint` names, so a file shows the same icon in the
+/// Files tree, on its tab and in a chat. A fence tag is a language's name (`rust`,
+/// `c++`) or what its files end in (`rs`, `yml`). JSX and PowerShell files have icons
+/// of their own, though the highlighter reads JSX as JavaScript and has no PowerShell
+/// grammar.
+pub(super) fn language_icon(hint: LanguageHint<'_>) -> Option<LanguageIcon> {
+    const ICON_ONLY: &[(&str, &str)] = &[
+        ("jsx", "jsx"),
+        ("ps1", "powershell"),
+        ("psm1", "powershell"),
+    ];
+    let icon_only = |extension: &str| {
+        ICON_ONLY
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(extension))
+            .map(|(_, language)| *language)
+    };
+    let language = match hint {
+        LanguageHint::Path(path) => file_name(path)
+            .rsplit_once('.')
+            .and_then(|(_, extension)| icon_only(extension))
+            .unwrap_or_else(|| language_for(path)),
+        LanguageHint::Fence(tag) => match LanguageIcon::of(tag) {
+            Some(icon) => return Some(icon),
+            None => icon_only(tag).or_else(|| extension_language(tag))?,
+        },
+    };
+    LanguageIcon::of(language)
 }
 
 fn is_save_key(key: &Keystroke) -> bool {
@@ -3624,6 +3666,7 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = *self.colors();
+        let dark = self.theme.is_dark();
         // The density of the terminal's file tree.
         let row_height = self.typography.cell_height.max(18.0);
         // Keys reach the folder rather than an editor.
@@ -3731,7 +3774,13 @@ impl CompiApp {
                                     )
                                 })),
                         )
-                        .child(tree_entry_icon(folder, row.expanded, color(tint)))
+                        .child(tree_row_icon(
+                            &row.path,
+                            folder,
+                            row.expanded,
+                            color(tint),
+                            dark,
+                        ))
                         .child(
                             div()
                                 .ml_1()
@@ -3900,6 +3949,7 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = *self.colors();
+        let dark = self.theme.is_dark();
         let toggle_pane = pane_id.clone();
         let environment = self.environment_label(&ui.environment);
         let tabs = content.tabs.iter().enumerate().map(|(index, tab)| {
@@ -3953,6 +4003,10 @@ impl CompiApp {
                 .when(glyph, |tab| {
                     tab.child(controls::glyph(IconName::FileDiff, color(colors.muted)))
                 })
+                .when_some(
+                    language_icon(LanguageHint::Path(tab.path())),
+                    |tab, icon| tab.child(icon.image(dark)),
+                )
                 .child(
                     div()
                         .min_w_0()
@@ -4454,6 +4508,64 @@ mod tests {
         assert_eq!(language_for("/work/web/app.tsx"), "tsx");
         assert_eq!(language_for("/work/Makefile"), "text");
         assert_eq!(language_for("/work/notes"), "text");
+    }
+
+    #[test]
+    fn language_icons_follow_paths_and_fence_tags() {
+        use LanguageHint::{Fence, Path};
+        for (path, icon) in [
+            ("/work/src/main.rs", LanguageIcon::Rust),
+            (r"C:\work\Cargo.lock", LanguageIcon::Toml),
+            ("/home/me/.zshrc", LanguageIcon::Bash),
+            ("/work/run.sh", LanguageIcon::Bash),
+            ("/work/run.zsh", LanguageIcon::Bash),
+            ("/work/README.MD", LanguageIcon::Markdown),
+            ("/work/web/app.mts", LanguageIcon::TypeScript),
+            ("/work/web/app.tsx", LanguageIcon::Tsx),
+            // Highlighted as JavaScript, but a file of its own kind.
+            ("/work/web/App.jsx", LanguageIcon::Jsx),
+            // No grammar, still an icon.
+            (r"C:\work\Build.PS1", LanguageIcon::PowerShell),
+            ("/work/tools/Compi.psm1", LanguageIcon::PowerShell),
+        ] {
+            assert_eq!(language_icon(Path(path)), Some(icon), "{path}");
+        }
+        for (tag, icon) in [
+            ("rust", LanguageIcon::Rust),
+            ("rs", LanguageIcon::Rust),
+            ("py", LanguageIcon::Python),
+            ("js", LanguageIcon::JavaScript),
+            ("ts", LanguageIcon::TypeScript),
+            ("jsx", LanguageIcon::Jsx),
+            ("tsx", LanguageIcon::Tsx),
+            ("yml", LanguageIcon::Yaml),
+            ("jsonc", LanguageIcon::Json),
+            ("JSON", LanguageIcon::Json),
+            ("md", LanguageIcon::Markdown),
+            ("c++", LanguageIcon::Cpp),
+            ("sh", LanguageIcon::Bash),
+            ("bash", LanguageIcon::Bash),
+            ("zsh", LanguageIcon::Bash),
+            ("shell", LanguageIcon::Bash),
+            ("powershell", LanguageIcon::PowerShell),
+            ("pwsh", LanguageIcon::PowerShell),
+            ("ps1", LanguageIcon::PowerShell),
+            ("psm1", LanguageIcon::PowerShell),
+        ] {
+            assert_eq!(language_icon(Fence(tag)), Some(icon), "{tag}");
+        }
+        // A file named like a language is not a file in it, and a tag is not a path.
+        for path in [
+            "/work/notes.txt",
+            "/work/Makefile",
+            "/work/bin/go",
+            "/work/c++",
+        ] {
+            assert_eq!(language_icon(Path(path)), None, "{path}");
+        }
+        for tag in ["", "text", "diff", "mermaid", "main.rs"] {
+            assert_eq!(language_icon(Fence(tag)), None, "{tag}");
+        }
     }
 
     #[test]

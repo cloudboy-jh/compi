@@ -13,10 +13,29 @@ $global:__compi_prompt_dir = Join-Path $HOME '.compi\prompt'
 $global:__compi_prompt_original = $function:prompt
 $global:__compi_prompt_variables = @(Get-ChildItem env: |
     Where-Object { $_.Name -like 'POSH_*' -or $_.Name -like 'STARSHIP_*' })
-function global:__compi_prompt_load([string] $name) {
+function global:__compi_prompt_load([string] $name, [switch] $CheckDependencies) {
     $path = Join-Path $global:__compi_prompt_dir $name
+    $ErrorActionPreference = 'Stop'
     if (Test-Path -LiteralPath $path) {
-        # A script block is not held to the script execution policy the way a file is.
+        # State, rather than generated script contents, identifies the dependency.
+        # This also protects scripts written by Compi versions without preflight.
+        $statePath = Join-Path $global:__compi_prompt_dir 'state.json'
+        if (-not (Test-Path -LiteralPath $statePath)) {
+            throw 'Compi prompt state is missing. Refresh Prompt settings and apply the selected theme again. Your current prompt has not been changed.'
+        }
+        $state = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+        $applied = @($state.compi)
+        if ($name -eq 'live.ps1' -and $state.normal.shell -eq 'power_shell') {
+            $applied += $state.normal
+        }
+        if ($applied | Where-Object { $_.config.provider -eq 'oh_my_posh' }) {
+            $keyHandler = Get-Command Get-PSReadLineKeyHandler -ErrorAction Stop
+            if (-not $keyHandler.Parameters.ContainsKey('Chord')) {
+                throw 'Oh My Posh theme changes require a newer PSReadLine with Get-PSReadLineKeyHandler -Chord. Run Install-Module PSReadLine -Scope CurrentUser -Force, then open a new terminal and refresh Prompt settings. Your current prompt has not been changed.'
+            }
+        }
+        if ($CheckDependencies) { return }
+        # A script block is not held to the execution policy the way a file is.
         . ([ScriptBlock]::Create([IO.File]::ReadAllText($path)))
     }
 }
@@ -25,7 +44,11 @@ function global:__compi_prompt_token {
     if (Test-Path -LiteralPath $path) { [IO.File]::ReadAllText($path).Trim() } else { '' }
 }
 $global:__compi_prompt_seen = __compi_prompt_token
-__compi_prompt_load 'compi.ps1'
+# A broken prompt provider must not prevent the shell's directory and input hooks
+# from being installed. Its error remains visible at startup.
+try { __compi_prompt_load 'compi.ps1' } catch {
+    [Console]::Error.WriteLine("Compi prompt: $($_.Exception.Message)")
+}
 $global:__compi_prompt = $function:prompt
 $global:__compi_pid_reported = $false
 # Prompt settings changed: back to your prompt, then load what is applied now. This runs
@@ -36,16 +59,37 @@ $null = Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action {
     if ($token -ne $global:__compi_prompt_seen) {
         $global:__compi_prompt_seen = $token
         $wrapper = $function:global:prompt
-        Get-ChildItem env: |
-            Where-Object { $_.Name -like 'POSH_*' -or $_.Name -like 'STARSHIP_*' } |
-            ForEach-Object { Remove-Item -LiteralPath "env:$($_.Name)" }
-        foreach ($variable in $global:__compi_prompt_variables) {
-            Set-Item -LiteralPath "env:$($variable.Name)" -Value $variable.Value
+        $previousPrompt = $global:__compi_prompt
+        $previousVariables = @(Get-ChildItem env: |
+            Where-Object { $_.Name -like 'POSH_*' -or $_.Name -like 'STARSHIP_*' })
+        $reset = $false
+        try {
+            # Validate in the running shell before changing its prompt or provider variables.
+            __compi_prompt_load 'live.ps1' -CheckDependencies | Out-Null
+            $reset = $true
+            Get-ChildItem env: |
+                Where-Object { $_.Name -like 'POSH_*' -or $_.Name -like 'STARSHIP_*' } |
+                ForEach-Object { Remove-Item -LiteralPath "env:$($_.Name)" }
+            foreach ($variable in $global:__compi_prompt_variables) {
+                Set-Item -LiteralPath "env:$($variable.Name)" -Value $variable.Value
+            }
+            $function:global:prompt = $global:__compi_prompt_original
+            __compi_prompt_load 'live.ps1' | Out-Null
+            $global:__compi_prompt = $function:global:prompt
+        } catch {
+            if ($reset) {
+                Get-ChildItem env: |
+                    Where-Object { $_.Name -like 'POSH_*' -or $_.Name -like 'STARSHIP_*' } |
+                    ForEach-Object { Remove-Item -LiteralPath "env:$($_.Name)" }
+                foreach ($variable in $previousVariables) {
+                    Set-Item -LiteralPath "env:$($variable.Name)" -Value $variable.Value
+                }
+                $global:__compi_prompt = $previousPrompt
+            }
+            [Console]::Error.WriteLine("Compi prompt: $($_.Exception.Message)")
+        } finally {
+            $function:global:prompt = $wrapper
         }
-        $function:global:prompt = $global:__compi_prompt_original
-        __compi_prompt_load 'live.ps1' *> $null
-        $global:__compi_prompt = $function:global:prompt
-        $function:global:prompt = $wrapper
         try { [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt() } catch { }
     }
 }

@@ -18,6 +18,7 @@ use compi_protocol::{
 };
 pub mod brand;
 mod controls;
+mod language_icons;
 mod lifecycle;
 mod open_with;
 mod os_notifications;
@@ -1517,7 +1518,10 @@ impl CompiApp {
             if let Some(point) = clicked_link {
                 let snapshot = tab.mirror.snapshot();
                 if let Some(uri) = web_link_at(snapshot, point) {
-                    if let Err(error) = open_web_url(&uri) {
+                    // An address of this machine opens here, in place of the shell.
+                    if !self.open_local_link(pane_id, &uri, window, cx)
+                        && let Err(error) = open_web_url(&uri)
+                    {
                         self.global_error = Some(format!("Could not open link: {error}"));
                     }
                 } else if let Some(location) = file_link_at(snapshot, point) {

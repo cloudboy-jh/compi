@@ -1209,11 +1209,6 @@ fn apply_mutation(
         }
         WorkspaceMutation::ShowView { pane_id, content } => {
             validate_content(content).map_err(invalid)?;
-            if content.browser().is_some() {
-                return Err(invalid(
-                    "a browser opens in a pane of its own, not in place of a shell".into(),
-                ));
-            }
             let (tab, mut leaf) = pane_leaf(&mut workspace.sessions, pane_id)
                 .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
             let view = terminal_view(&mut leaf).map_err(invalid)?;
@@ -5724,20 +5719,22 @@ mod tests {
         }
         let message = reject("update-viewless", update(&terminal, host_content(&[])));
         assert!(message.contains("without a view"), "{message}");
-        // A browser opens in its own pane, never in place of a shell; nor does an
-        // invalid URL reach the workspace.
+        // An invalid URL reaches the workspace neither as a view nor as a pane.
         let browser =
             |url: &str| PaneContent::Browser(compi_protocol::BrowserContent { url: url.into() });
-        let message = reject(
-            "show-browser",
-            show_view(&terminal, browser("http://localhost:3000/")),
-        );
-        assert!(message.contains("pane of its own"), "{message}");
-        let message = reject(
-            "open-script",
-            open_content(&terminal, browser("javascript:alert(1)")),
-        );
-        assert!(message.contains("scheme"), "{message}");
+        for (id, operation) in [
+            (
+                "show-script",
+                show_view(&terminal, browser("javascript:alert(1)")),
+            ),
+            (
+                "open-script",
+                open_content(&terminal, browser("javascript:alert(1)")),
+            ),
+        ] {
+            let message = reject(id, operation);
+            assert!(message.contains("scheme"), "{id}: {message}");
+        }
         let missing = PaneId::new("missing-pane");
         for (id, operation) in [
             ("show-missing", show_view(&missing, host_content(&[]))),
@@ -5833,6 +5830,94 @@ mod tests {
             }
         );
         assert_eq!(moved.surfaces, before.surfaces);
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_browser_view_shows_flips_follows_its_page_closes_and_moves_out() {
+        let (actor, effects, surface, terminal) = running_terminal();
+        let before = actor.snapshot().unwrap();
+        let browser =
+            |url: &str| PaneContent::Browser(compi_protocol::BrowserContent { url: url.into() });
+        let layout = || actor.snapshot().unwrap().sessions[0].tabs[0].layout.clone();
+        let home = browser("http://localhost:5173/");
+        let about = browser("http://localhost:5173/about");
+
+        let receipt = mutate_current(&actor, "show", show_view(&terminal, home.clone())).unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(
+            layout(),
+            viewing(&terminal, &surface, &home, PaneSide::View)
+        );
+        // The shell shows again and the view keeps its page.
+        mutate_current(
+            &actor,
+            "flip",
+            WorkspaceMutation::SetPaneSide {
+                pane_id: terminal.clone(),
+                side: PaneSide::Terminal,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            layout(),
+            viewing(&terminal, &surface, &home, PaneSide::Terminal)
+        );
+        // The page going elsewhere updates the view's URL on the side it is on.
+        mutate_current(
+            &actor,
+            "navigate",
+            WorkspaceMutation::UpdateContent {
+                pane_id: terminal.clone(),
+                content: about.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            layout(),
+            viewing(&terminal, &surface, &about, PaneSide::Terminal)
+        );
+        // Showing an address again shows the view at it.
+        mutate_current(&actor, "show-again", show_view(&terminal, home.clone())).unwrap();
+        assert_eq!(
+            layout(),
+            viewing(&terminal, &surface, &home, PaneSide::View)
+        );
+        mutate_current(
+            &actor,
+            "close",
+            WorkspaceMutation::CloseView {
+                pane_id: terminal.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(layout(), before.sessions[0].tabs[0].layout);
+
+        mutate_current(&actor, "show-about", show_view(&terminal, about.clone())).unwrap();
+        let receipt = mutate_current(
+            &actor,
+            "move",
+            WorkspaceMutation::MoveViewToPane {
+                pane_id: terminal.clone(),
+                axis: SplitAxis::Vertical,
+                geometry: split_geometry(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            layout(),
+            LayoutNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::terminal(terminal.clone(), surface.id.clone())),
+                second: Box::new(LayoutNode::Content {
+                    pane_id: receipt.affected_panes[1].clone(),
+                    content: about,
+                }),
+            }
+        );
+        // The shell ran through all of it at its size.
+        assert_eq!(actor.snapshot().unwrap().surfaces, before.surfaces);
         assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
     }
 

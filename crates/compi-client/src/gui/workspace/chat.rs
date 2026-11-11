@@ -1219,27 +1219,40 @@ impl CompiApp {
         }
     }
 
-    /// Shows or hides what sub-agent `agent` of the tool call at row `index` answered.
-    fn toggle_chat_agent(&mut self, chat: &str, index: usize, agent: &str) {
+    /// Folds or unfolds `part` of sub-agent `agent` of the tool call at row `index`: its
+    /// line, the rest of its task or its earlier steps.
+    fn toggle_chat_agent(&mut self, chat: &str, index: usize, agent: &str, part: rows::AgentPart) {
         let Some(model) = self.chat.chats.get_mut(chat) else {
             return;
         };
         if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
-            row.toggle_agent(agent);
+            row.toggle_agent(agent, part);
             model.scroller.remeasure_row(index);
         }
     }
 
-    /// Scrolls chat `chat`'s transcript to the tool call at row `index`, unfolded.
-    fn reveal_chat_tool(&mut self, chat: &str, index: usize) {
+    /// Scrolls to a call, unfolding its named agent or all of its agents.
+    fn reveal_chat_tool(&mut self, chat: &str, index: usize, agent: Option<&str>) {
         let Some(model) = self.chat.chats.get_mut(chat) else {
             return;
         };
         if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
-            row.unfold();
+            row.unfold(agent);
             model.scroller.remeasure_row(index);
             model.scroller.scroll_to_row(index);
         }
+    }
+
+    /// Opens every agent call named by the running bar or a wave's final card.
+    fn reveal_chat_agent_tools(&mut self, chat: &str, tools: &[usize]) {
+        let Some((&first, rest)) = tools.split_first() else {
+            return;
+        };
+        // Reveal the first last, so opening the other calls keeps this scroll target.
+        for &tool in rest {
+            self.reveal_chat_tool(chat, tool, None);
+        }
+        self.reveal_chat_tool(chat, first, None);
     }
 
     /// Open in diff: the uncommitted change of `path`, which a tool of chat `chat`
@@ -1749,6 +1762,10 @@ impl CompiApp {
                 Repo::Reading => Some("Checking for a Git repository"),
                 Repo::None => Some("The chat's folder is not in a Git repository"),
             },
+            dark: self.theme.is_dark(),
+            syntax: gpui_component::theme::Theme::global(cx)
+                .highlight_theme
+                .clone(),
         });
         div()
             .flex_1()
@@ -1763,7 +1780,8 @@ impl CompiApp {
     }
 
     /// Over the composer while sub-agents of the chat run: how many, and what each does
-    /// (or how long it has run); a click shows their call. Settings → Chat turns it off.
+    /// (or how long it has run); a click opens every running agent's call and details.
+    /// Settings → Chat turns it off.
     fn render_chat_agents(
         &self,
         chat: &ChatContent,
@@ -1800,6 +1818,12 @@ impl CompiApp {
             _ => running.iter().map(|(_, agent)| agent.status).collect(),
         };
         let id = chat.id.clone();
+        let mut tools = Vec::new();
+        for &(tool, _) in &running {
+            if tools.last() != Some(&tool) {
+                tools.push(tool);
+            }
+        }
         Some(
             div()
                 .flex_none()
@@ -1833,7 +1857,7 @@ impl CompiApp {
                                 .child(label),
                         )
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.reveal_chat_tool(&id, tool);
+                            this.reveal_chat_agent_tools(&id, &tools);
                             cx.notify();
                         })),
                 )

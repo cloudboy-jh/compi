@@ -98,6 +98,52 @@ pub fn work_tree_path(repo: &str, path: &str) -> String {
     }
 }
 
+/// A WSL path in Windows syntax: `/mnt/c/…` is `C:\…` (the share refuses drive
+/// mounts), anything else `\\wsl.localhost\<distribution>\…`.
+pub fn wsl_windows_path(distribution: &str, path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("/mnt/") {
+        let (drive, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if let [letter] = drive.as_bytes()
+            && letter.is_ascii_alphabetic()
+        {
+            return format!(
+                r"{}:\{}",
+                letter.to_ascii_uppercase() as char,
+                tail.replace('/', "\\")
+            );
+        }
+    }
+    format!(
+        r"\\wsl.localhost\{distribution}\{}",
+        path.trim_start_matches('/').replace('/', "\\")
+    )
+}
+
+/// The `file:` URL of an absolute path of this computer: `C:\a b\x.html` is
+/// `file:///C:/a%20b/x.html`, `\\server\share\x` is `file://server/share/x`, and
+/// `/a/b` is `file:///a/b`.
+pub fn file_url(path: &str, windows: bool) -> String {
+    let (host, path) = match path.strip_prefix(r"\\").filter(|_| windows) {
+        Some(share) => {
+            let (server, rest) = share.split_once('\\').unwrap_or((share, ""));
+            (server, format!("/{rest}"))
+        }
+        None if windows => ("", format!("/{path}")),
+        None => ("", path.to_owned()),
+    };
+    let mut url = format!("file://{host}");
+    for byte in path.bytes() {
+        match byte {
+            b'\\' if windows => url.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                url.push(byte as char);
+            }
+            _ => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +172,23 @@ mod tests {
             work_tree_path("/home/me/proj/", "src/a.rs"),
             "/home/me/proj/src/a.rs"
         );
+    }
+
+    #[test]
+    fn files_of_this_computer_have_file_urls() {
+        assert_eq!(
+            file_url(r"C:\Users\me\my app\index.html", true),
+            "file:///C:/Users/me/my%20app/index.html"
+        );
+        assert_eq!(
+            file_url(r"\\wsl.localhost\Ubuntu\home\me\app\index.html", true),
+            "file://wsl.localhost/Ubuntu/home/me/app/index.html"
+        );
+        assert_eq!(
+            file_url("/home/me/café/a#b?.html", false),
+            "file:///home/me/caf%C3%A9/a%23b%3F.html"
+        );
+        // A backslash is part of a Unix name.
+        assert_eq!(file_url(r"/tmp/a\b", false), "file:///tmp/a%5Cb");
     }
 }

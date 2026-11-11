@@ -1225,6 +1225,8 @@ impl CompiApp {
                 .child(crate::theme::THEME_ATTRIBUTION)
                 .child(settings_group_label("Bundled font licenses"))
                 .child(crate::font_catalog::FONT_ATTRIBUTION)
+                .child(settings_group_label("Bundled icon licenses"))
+                .child(crate::gui::language_icons::ATTRIBUTION)
                 .into_any_element()
         } else {
             let groups = self.catalog_groups();

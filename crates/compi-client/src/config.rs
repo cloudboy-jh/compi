@@ -268,6 +268,44 @@ impl ChatOpen {
     }
 }
 
+/// What a terminal does when a local server it printed an address for answers,
+/// `[workspace] dev_server`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevServer {
+    /// A card in the terminal offers the page.
+    #[default]
+    Offer,
+    /// The page shows in place of the shell, once for each start of the server.
+    Open,
+    /// No card and no page.
+    Nothing,
+}
+
+impl DevServer {
+    pub const ALL: [Self; 3] = [Self::Offer, Self::Open, Self::Nothing];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Offer => "offer",
+            Self::Open => "open",
+            Self::Nothing => "nothing",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Offer => "Offer to open",
+            Self::Open => "Open automatically",
+            Self::Nothing => "Do nothing",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.id() == value)
+    }
+}
+
 fn default_chat_agents_bar() -> bool {
     true
 }
@@ -608,6 +646,9 @@ pub struct LoadedConfig {
     /// The bar listing a chat's running sub-agents above its composer, `[chat] agents_bar`.
     #[serde(default = "default_chat_agents_bar")]
     pub chat_agents_bar: bool,
+    /// What a terminal does when a dev server starts in it; see [`DevServer`].
+    #[serde(default)]
+    pub dev_server: DevServer,
     pub provenance: ConfigProvenance,
     pub diagnostics: Vec<String>,
     /// Named pane arrangements, shape only, keyed by preset name.
@@ -643,6 +684,7 @@ impl Default for LoadedConfig {
             chat_enter: ChatEnter::Steer,
             chat_open: ChatOpen::InPlace,
             chat_agents_bar: true,
+            dev_server: DevServer::Offer,
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -723,6 +765,29 @@ impl LoadedConfig {
         })?;
         if let Ok(launch) = &mut self.launch {
             launch.profile.working_directory = folder;
+        }
+        Ok(())
+    }
+
+    /// Whether new shells route clearly foreign commands on Enter.
+    pub fn other_shell_commands(&self) -> bool {
+        self.launch.as_ref().is_ok_and(|launch| {
+            launch
+                .env
+                .get("COMPI_OTHER_SHELL_COMMANDS")
+                .is_none_or(|value| value != "0")
+        })
+    }
+
+    pub fn save_other_shell_commands(&mut self, enabled: bool) -> Result<(), String> {
+        update_table(&self.path, "shell", |table| {
+            set_table_value(table, "other_shell_commands", enabled.into());
+        })?;
+        if let Ok(launch) = &mut self.launch {
+            launch.env.insert(
+                "COMPI_OTHER_SHELL_COMMANDS".into(),
+                if enabled { "1" } else { "0" }.into(),
+            );
         }
         Ok(())
     }
@@ -999,6 +1064,19 @@ impl LoadedConfig {
             }
         })?;
         self.chat_agents_bar = shown;
+        Ok(())
+    }
+
+    /// Persist what a terminal does when a dev server starts; Offer, the default,
+    /// removes it.
+    pub fn save_dev_server(&mut self, action: DevServer) -> Result<(), String> {
+        update_table(&self.path, "workspace", |table| match action {
+            DevServer::Offer => {
+                table.remove("dev_server");
+            }
+            action => set_table_value(table, "dev_server", action.id().into()),
+        })?;
+        self.dev_server = action;
         Ok(())
     }
 
@@ -1562,6 +1640,20 @@ fn apply_launch(document: &toml::Table, loaded: &mut LoadedConfig) {
             ),
         }
     }
+    let other = match shell.get("other_shell_commands") {
+        None => true,
+        Some(value) => match value.as_bool() {
+            Some(enabled) => enabled,
+            None => {
+                errors.push("shell.other_shell_commands must be true or false".into());
+                true
+            }
+        },
+    };
+    launch.env.insert(
+        "COMPI_OTHER_SHELL_COMMANDS".into(),
+        if other { "1" } else { "0" }.into(),
+    );
     if let Some(limits) = table(document, "limits", loaded) {
         for (key, max, target) in [
             ("scrollback_lines", 100_000, &mut launch.scrollback_lines),
@@ -2104,6 +2196,17 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                     loaded,
                     "workspace.focus_indicator",
                     "\"marker\", \"outline\", \"dim\" or \"none\"",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = workspace.get("dev_server") {
+            match value.as_str().and_then(DevServer::parse) {
+                Some(action) => loaded.dev_server = action,
+                None => invalid(
+                    loaded,
+                    "workspace.dev_server",
+                    "\"offer\", \"open\" or \"nothing\"",
                     "configuration",
                 ),
             }
@@ -3095,6 +3198,50 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("workspace.focus_indicator"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dev_server_defaults_to_offer_round_trips_and_rejects_unknown_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-dev-server-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[workspace]\nconfirm_close = true\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.dev_server, DevServer::Offer);
+        for action in [DevServer::Open, DevServer::Nothing] {
+            loaded.save_dev_server(action).unwrap();
+            let reloaded = load(Some(&path), FontOverrides::default());
+            assert_eq!(reloaded.dev_server, action);
+            assert!(reloaded.confirm_close);
+        }
+        // The default leaves no key behind.
+        loaded.save_dev_server(DevServer::Offer).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("dev_server"));
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).dev_server,
+            DevServer::Offer
+        );
+
+        let invalid = parse(
+            "version = 1\n[workspace]\ndev_server = 'ask'",
+            FontOverrides::default(),
+        );
+        assert_eq!(invalid.dev_server, DevServer::Offer);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("workspace.dev_server"))
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -34,7 +34,10 @@ pub fn classify(path: &str) -> &'static [Component] {
         // way a wire-contract change does.
         "Cargo.toml" | "Cargo.lock" => return &[Client, Daemon],
         // Scripts the daemon embeds.
-        "assets/compi-shell.sh" | "assets/compi-shell.ps1" | "assets/compi-monitor.sh" => {
+        "assets/compi-shell.sh"
+        | "assets/compi-shell.ps1"
+        | "assets/compi-other-shell.ps1"
+        | "assets/compi-monitor.sh" => {
             return &[Daemon];
         }
         "assets/Compi-desktopappicon-v4.ico" => return &[Client, Daemon],
@@ -103,6 +106,7 @@ mod tests {
         for script in [
             "assets/compi-shell.sh",
             "assets/compi-shell.ps1",
+            "assets/compi-other-shell.ps1",
             "assets/compi-monitor.sh",
         ] {
             assert_eq!(classify(script), &[Daemon], "{script}");

@@ -27,9 +27,18 @@
 //! view when another pane, the address field or an overlay takes focus, and before a
 //! page holding it hides or closes (AppKit would leave it with nothing, and every key
 //! would beep).
+//!
+//! A terminal pane can carry a Browser as its view (see `views.rs`): the page then
+//! draws in place of the shell, with the same toolbar, home page and notices, keyed by
+//! the terminal's `PaneId`. Its page is made when the view first shows, hides while the
+//! shell shows instead (keeping its history and scroll position) and goes with the
+//! view or the pane. Escape with the keyboard in the pane and not in its address goes
+//! back to the shell, as in other views; with the keyboard in the page, Escape is the
+//! page's and Compi's **Toggle view** chord goes back (forwarded on Windows like the
+//! other chords). Dev-server cards and local links open pages this way (`browser_servers.rs`).
 use super::*;
 use crate::gui::controls::IconName;
-use compi_protocol::{BrowserContent, PaneContent};
+use compi_protocol::{BrowserContent, PaneContent, PaneSide, PaneView};
 #[cfg(windows)]
 use gpui::Keystroke;
 use gpui::{Bounds, Entity, FocusHandle, Subscription, Task, canvas};
@@ -46,6 +55,8 @@ mod media;
 pub(in crate::gui) use media::MediaSource;
 #[path = "browser_home.rs"]
 mod home;
+#[path = "browser_servers.rs"]
+mod servers;
 
 /// The toolbar above the page.
 const TOOLBAR_HEIGHT: f32 = 34.0;
@@ -452,15 +463,32 @@ pub(in crate::gui) struct BrowserUi {
     media: media::MediaPages,
     /// Blank panes' home pages.
     home: home::HomeUi,
+    /// Terminal panes' dev-server cards.
+    servers: servers::ServersUi,
 }
 
-/// Every Browser pane of `tab`, with the URL the daemon holds.
-fn browser_leaves(node: &LayoutNode, output: &mut Vec<(PaneId, String)>) {
+/// Every pane of `node` holding a page, with the URL the daemon holds and whether the
+/// page is on show: a Browser pane's always, a terminal's Browser view while it shows
+/// rather than its shell.
+fn browser_leaves(node: &LayoutNode, output: &mut Vec<(PaneId, String, bool)>) {
     match node {
         LayoutNode::Content {
             pane_id,
             content: PaneContent::Browser(browser),
-        } => output.push((pane_id.clone(), browser.url.clone())),
+        } => output.push((pane_id.clone(), browser.url.clone(), true)),
+        LayoutNode::Pane {
+            pane_id,
+            view:
+                Some(PaneView {
+                    content: PaneContent::Browser(browser),
+                    side,
+                }),
+            ..
+        } => output.push((
+            pane_id.clone(),
+            browser.url.clone(),
+            *side == PaneSide::View,
+        )),
         LayoutNode::Split { first, second, .. } => {
             browser_leaves(first, output);
             browser_leaves(second, output);
@@ -805,7 +833,7 @@ impl CompiApp {
                 }
             }
         }
-        let kept = |pane: &PaneId| wanted.iter().any(|(wanted, _)| wanted == pane);
+        let kept = |pane: &PaneId| wanted.iter().any(|(wanted, ..)| wanted == pane);
         self.browser.pages.retain(|pane, _| kept(pane));
         self.browser.panes.retain(|pane, _| kept(pane));
         self.browser.failed.retain(|pane, _| kept(pane));
@@ -832,20 +860,29 @@ impl CompiApp {
             self.browser.home.follow(None, false);
             return;
         }
-        for (pane_id, url) in &wanted {
+        for (pane_id, url, _) in &wanted {
             if !self.browser.panes.contains_key(pane_id) {
                 let pane = self.new_browser_pane(pane_id, url, window, cx);
                 self.browser.panes.insert(pane_id.clone(), pane);
             }
         }
-        let focused = self.focused_pane().cloned();
+        // A terminal showing its shell keeps the keyboard there; once its view shows,
+        // its page is focused as if focus had just arrived.
+        let focused = self
+            .focused_pane()
+            .filter(|pane| {
+                !wanted
+                    .iter()
+                    .any(|(wanted, _, shown)| wanted == *pane && !shown)
+            })
+            .cloned();
         let arrived = focused != self.browser.focused;
         self.browser.focused = focused.clone();
         // Focus arriving at a blank page goes to its address, to type or paste one.
         if arrived
             && !overlay
             && let Some(pane_id) = &focused
-            && let Some((_, daemon)) = wanted.iter().find(|(wanted, _)| wanted == pane_id)
+            && let Some((_, daemon, _)) = wanted.iter().find(|(wanted, ..)| wanted == pane_id)
         {
             let address = self
                 .browser
@@ -866,19 +903,22 @@ impl CompiApp {
         // The home page whose tab's servers come first: the focused one, else the first.
         let mut home_here: Option<&PaneId> = None;
         let mut home_focused = false;
-        for (pane_id, daemon) in &wanted {
+        for (pane_id, daemon, shown) in &wanted {
             let own = focused.as_ref() == Some(pane_id);
             let float_index = self
                 .float_layouts
                 .iter()
                 .position(|float| &float.pane.pane_id == pane_id);
-            let drawn = float_index.is_some()
-                || self
-                    .layout
-                    .as_ref()
-                    .is_some_and(|layout| layout.pane(pane_id).is_some());
+            let drawn = *shown
+                && (float_index.is_some()
+                    || self
+                        .layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.pane(pane_id).is_some()));
             let Some(page) = self.browser.pages.get_mut(pane_id) else {
-                if !self.browser.creating.contains(pane_id)
+                // A view's page is made when the view first shows.
+                if *shown
+                    && !self.browser.creating.contains(pane_id)
                     && !self.browser.failed.contains_key(pane_id)
                 {
                     missing.push((pane_id.clone(), daemon.clone()));
@@ -1318,16 +1358,23 @@ impl CompiApp {
                     this.focus_address(&key_pane, window, cx);
                     cx.stop_propagation();
                     cx.notify();
-                } else if keystroke.key == "escape"
-                    && plain
-                    && this
+                } else if keystroke.key == "escape" && plain {
+                    let editing = this
                         .browser
                         .panes
                         .get(&key_pane)
-                        .is_some_and(|pane| pane.address.focus_handle(cx).is_focused(window))
-                {
-                    this.revert_address(&key_pane, window, cx);
-                    cx.stop_propagation();
+                        .is_some_and(|pane| pane.address.focus_handle(cx).is_focused(window));
+                    if editing {
+                        this.revert_address(&key_pane, window, cx);
+                        cx.stop_propagation();
+                    } else if this.handle_app_key(event, window, cx)
+                        || this.escape_to_shell(&key_pane)
+                    {
+                        // Escape with nothing else to dismiss shows a terminal's shell
+                        // again.
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
                 }
             }))
             .child(self.render_browser_toolbar(pane_id, pane, page, cx))

@@ -3,9 +3,17 @@
 //! inline diffs, its sub-agents as a line each, and the permission it waits on drawn on
 //! it.
 use super::*;
-use crate::diff::{self, FileDiff, LineKind, Whitespace};
-use compi_protocol::chat::{ChatAgent, ChatAgentsFinished, ChatTool, ChatToolStatus};
+use crate::diff::{self, FileDiff, LineKind, Side, Whitespace};
+use crate::gui::language_icons::LanguageIcon;
+use crate::gui::workspace::content::{LanguageHint, language_for, language_icon};
+use crate::gui::workspace::diff_view::line_styles;
+use compi_protocol::chat::{ChatAgent, ChatAgentsFinished, ChatDiff, ChatTool, ChatToolStatus};
+use gpui::{HighlightStyle, StyledText};
+use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
+use gpui_component::input::Rope;
 use gpui_component::text::TextViewStyle;
+use gpui_component::theme::Theme;
+use std::cell::RefCell;
 
 /// An edit is unfolded at first while it changes at most this many lines.
 const SMALL_EDIT_LINES: u32 = 30;
@@ -18,6 +26,17 @@ const ROW_GAP: f32 = 12.0;
 const PACKED_GAP: f32 = 2.0;
 /// How long a code block's Copy button shows its check after a copy.
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+/// Where a message's code starts in its block: under the language and Copy button in
+/// the block's corner, which sit 8 px down and are 20 px tall.
+const CODE_CORNER_HEIGHT: f32 = 30.0;
+/// Steps an open sub-agent lists until the reader asks for the earlier ones: its latest.
+const LATEST_AGENT_STEPS: usize = 10;
+/// How high a step's line is, and the muted lines around the steps.
+const AGENT_STEP_HEIGHT: f32 = 20.0;
+/// A sub-agent's task shows this many of its lines and characters until the reader asks
+/// for all of it.
+const TASK_PREVIEW_LINES: usize = 3;
+const TASK_PREVIEW_CHARS: usize = 240;
 
 /// One transcript entry as drawn: cheap to clone into the transcript's row renderer,
 /// with what the reader unfolded.
@@ -39,8 +58,8 @@ pub(super) enum ChatRow {
         tool: Rc<ToolRow>,
         /// The reader's fold, else the card's own (`ToolRow::opens`).
         open: Option<bool>,
-        /// The sub-agents whose result the reader unfolded, by ID.
-        open_agents: Vec<String>,
+        /// The sub-agent lines the reader unfolded.
+        open_agents: Vec<OpenAgent>,
     },
     /// The chat's sub-agents all finished; `tool` is the entry of their call.
     AgentsFinished {
@@ -75,24 +94,79 @@ impl ChatRow {
         }
     }
 
-    /// Unfolds a tool card.
-    pub(super) fn unfold(&mut self) {
-        if let Self::Tool { open, .. } = self {
+    /// Unfolds a tool card and its named sub-agent, or all its sub-agents.
+    pub(super) fn unfold(&mut self, agent: Option<&str>) {
+        if let Self::Tool {
+            tool,
+            open,
+            open_agents,
+        } = self
+        {
             *open = Some(true);
-        }
-    }
-
-    /// Shows or hides the result of a tool card's sub-agent `agent`.
-    pub(super) fn toggle_agent(&mut self, agent: &str) {
-        if let Self::Tool { open_agents, .. } = self {
-            match open_agents.iter().position(|open| open == agent) {
-                Some(index) => {
-                    open_agents.remove(index);
+            for agent in tool
+                .agents
+                .iter()
+                .filter(|row| agent.is_none_or(|id| row.agent.id == id))
+            {
+                if !open_agents.iter().any(|open| open.id == agent.agent.id) {
+                    open_agents.push(OpenAgent::new(&agent.agent.id));
                 }
-                None => open_agents.push(agent.to_owned()),
             }
         }
     }
+
+    /// Folds or unfolds `part` of a tool card's sub-agent `agent`. A line folded forgets
+    /// how much of its task and steps showed.
+    pub(super) fn toggle_agent(&mut self, agent: &str, part: AgentPart) {
+        let Self::Tool { open_agents, .. } = self else {
+            return;
+        };
+        let position = open_agents.iter().position(|open| open.id == agent);
+        match (part, position) {
+            (AgentPart::Line, Some(position)) => {
+                open_agents.remove(position);
+            }
+            (AgentPart::Line, None) => open_agents.push(OpenAgent::new(agent)),
+            (AgentPart::Task, Some(position)) => {
+                open_agents[position].whole_task = !open_agents[position].whole_task;
+            }
+            (AgentPart::Steps, Some(position)) => {
+                open_agents[position].all_steps = !open_agents[position].all_steps;
+            }
+            (AgentPart::Task | AgentPart::Steps, None) => {}
+        }
+    }
+}
+
+/// A sub-agent line the reader unfolded, and how much of it they asked for.
+#[derive(Clone)]
+pub(super) struct OpenAgent {
+    id: String,
+    /// All of a long task shows, not only its first lines.
+    whole_task: bool,
+    /// Every step the daemon holds shows, not only the latest.
+    all_steps: bool,
+}
+
+impl OpenAgent {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            whole_task: false,
+            all_steps: false,
+        }
+    }
+}
+
+/// What a click in a sub-agent's line folds or unfolds.
+#[derive(Clone, Copy)]
+pub(super) enum AgentPart {
+    /// The line itself: its task, steps and answer.
+    Line,
+    /// The rest of a long task.
+    Task,
+    /// The steps before the latest.
+    Steps,
 }
 
 /// A tool call as its card draws it.
@@ -100,6 +174,8 @@ pub(super) struct ToolRow {
     tool: ChatTool,
     verb: &'static str,
     icon: IconName,
+    /// The language icon of the file it reads or edits, drawn in place of `icon`.
+    language: Option<LanguageIcon>,
     /// What it works on: a path (relative to the chat's folder), a command, a query.
     target: Option<SharedString>,
     diffs: Vec<DiffBlock>,
@@ -128,8 +204,12 @@ struct DiffBlock {
     path: String,
     /// Relative to the chat's folder when inside it.
     label: SharedString,
+    /// The file's language icon, when Compi has one.
+    language: Option<LanguageIcon>,
     /// `None` when a side was too large to keep.
     lines: Option<Rc<[DiffText]>>,
+    /// The lines' syntax colours, as last drawn; see [`DiffBlock::syntax`].
+    syntax: Rc<RefCell<Option<DiffSyntax>>>,
     /// Lines past `MAX_DIFF_LINES`.
     more: usize,
     added: u32,
@@ -137,9 +217,24 @@ struct DiffBlock {
 }
 
 enum DiffText {
-    Line(LineKind, SharedString),
+    Line {
+        kind: LineKind,
+        /// The side the line is from, and the byte it starts at in that side's text.
+        side: Side,
+        start: usize,
+        text: SharedString,
+    },
     /// Unchanged lines not shown.
     Fold(u32),
+}
+
+/// The syntax styles of one line, by bytes of the line.
+type LineStyles = Vec<(Range<usize>, HighlightStyle)>;
+
+/// A diff's syntax colours in one theme: the styles of each of its lines.
+struct DiffSyntax {
+    theme: Arc<HighlightTheme>,
+    lines: Rc<[LineStyles]>,
 }
 
 impl ToolRow {
@@ -167,6 +262,7 @@ impl ToolRow {
         });
         let costs: Vec<f64> = tool.agents.iter().filter_map(|agent| agent.cost).collect();
         Self {
+            language: tool_language(tool, folder),
             target: tool_target(tool, folder),
             input: tool_view(
                 input,
@@ -218,13 +314,15 @@ impl ToolRow {
 }
 
 impl DiffBlock {
-    fn new(edit: &compi_protocol::chat::ChatDiff, folder: &str) -> Self {
+    fn new(edit: &ChatDiff, folder: &str) -> Self {
         let label = relative_to(&edit.path, folder).into();
         let Some(new) = &edit.new_text else {
             return Self {
                 path: edit.path.clone(),
                 label,
+                language: language_icon(LanguageHint::Path(&edit.path)),
                 lines: None,
+                syntax: Rc::default(),
                 more: 0,
                 added: 0,
                 removed: 0,
@@ -241,10 +339,12 @@ impl DiffBlock {
             .iter()
             .take(MAX_DIFF_LINES)
             .filter_map(|row| match row {
-                diff::Row::Unified { line, .. } => Some(DiffText::Line(
-                    line.kind,
-                    file.line(line.side, line.ix).to_owned().into(),
-                )),
+                diff::Row::Unified { line, .. } => Some(DiffText::Line {
+                    kind: line.kind,
+                    side: line.side,
+                    start: file.line_start(line.side, line.ix),
+                    text: file.line(line.side, line.ix).to_owned().into(),
+                }),
                 diff::Row::Fold { hidden, .. } => Some(DiffText::Fold(*hidden)),
                 diff::Row::Split { .. } => None,
             })
@@ -252,12 +352,97 @@ impl DiffBlock {
         Self {
             path: edit.path.clone(),
             label,
+            language: language_icon(LanguageHint::Path(&edit.path)),
             lines: Some(lines),
+            syntax: Rc::default(),
             more,
             added: file.added(),
             removed: file.removed(),
         }
     }
+
+    /// Each line's syntax colours in `theme`, by the file's language as in the diff view.
+    /// They are made from `edit`'s texts when the block is first drawn, and again when
+    /// the theme's colours change.
+    fn syntax(&self, edit: &ChatDiff, theme: &Arc<HighlightTheme>) -> Rc<[LineStyles]> {
+        let mut syntax = self.syntax.borrow_mut();
+        if let Some(made) = syntax
+            .as_ref()
+            .filter(|made| Arc::ptr_eq(&made.theme, theme) || *made.theme == **theme)
+        {
+            return made.lines.clone();
+        }
+        let lines = self.lines.as_deref().unwrap_or_default();
+        let language = language_for(&self.path);
+        // A side's lines are in the order of its text: from the first shown to the last
+        // is all the highlighter has to colour.
+        let side_styles = |side: Side, text: Option<&str>| {
+            let mut shown = lines.iter().filter_map(|line| match line {
+                DiffText::Line {
+                    side: from,
+                    start,
+                    text,
+                    ..
+                } if *from == side => Some(*start..*start + text.len()),
+                _ => None,
+            });
+            let (Some(first), Some(text)) = (shown.next(), text) else {
+                return Vec::new();
+            };
+            let end = shown.next_back().map_or(first.end, |last| last.end);
+            highlight(text, first.start..end, language, theme)
+        };
+        let old = side_styles(Side::Old, edit.old_text.as_deref());
+        let new = side_styles(Side::New, edit.new_text.as_deref());
+        let lines: Rc<[LineStyles]> = lines
+            .iter()
+            .map(|line| match line {
+                DiffText::Line {
+                    side, start, text, ..
+                } => {
+                    let styles = match side {
+                        Side::Old => &old,
+                        Side::New => &new,
+                    };
+                    line_styles(styles, *start..*start + text.len())
+                        .into_iter()
+                        .filter_map(|(range, style)| Some((range, style?)))
+                        .collect()
+                }
+                DiffText::Fold(_) => Vec::new(),
+            })
+            .collect();
+        *syntax = Some(DiffSyntax {
+            theme: theme.clone(),
+            lines: lines.clone(),
+        });
+        lines
+    }
+}
+
+/// Syntax styles over `span` of `text`, sorted and disjoint, from the diff view's
+/// highlighter. One highlighter is kept per language: making one compiles the grammar's
+/// queries, which is too slow to do again for every diff a chat draws.
+fn highlight(
+    text: &str,
+    span: Range<usize>,
+    language: &'static str,
+    theme: &HighlightTheme,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    thread_local! {
+        static HIGHLIGHTERS: RefCell<HashMap<&'static str, SyntaxHighlighter>> =
+            RefCell::new(HashMap::new());
+    }
+    if language == "text" || span.is_empty() {
+        return Vec::new();
+    }
+    HIGHLIGHTERS.with_borrow_mut(|highlighters| {
+        let highlighter = highlighters
+            .entry(language)
+            .or_insert_with(|| SyntaxHighlighter::new(language));
+        highlighter.update(None, &Rope::from(text), None);
+        highlighter.styles(&span, theme)
+    })
 }
 
 /// `path` relative to `folder` when it lies inside it.
@@ -291,6 +476,16 @@ fn tool_kind(tool: &ChatTool) -> (&'static str, IconName) {
             _ => ("Tool", IconName::Wrench),
         },
     }
+}
+
+/// The language icon of the file a Read or Edit works on. What other tools work on is a
+/// command, a pattern or an address, which may end like a file's name.
+fn tool_language(tool: &ChatTool, folder: &str) -> Option<LanguageIcon> {
+    let (_, icon) = tool_kind(tool);
+    if !matches!(icon, IconName::FileText | IconName::FilePen) {
+        return None;
+    }
+    language_icon(LanguageHint::Path(&tool_target(tool, folder)?))
 }
 
 /// What a tool call works on: the file it touched, else the command, path, pattern,
@@ -675,6 +870,10 @@ pub(super) struct RowFrame {
     pub(super) retry: bool,
     /// Why Open in diff cannot act.
     pub(super) diff_refusal: Option<&'static str>,
+    /// The theme is dark, for the flavour of language icons.
+    pub(super) dark: bool,
+    /// The theme's syntax colours, for inline diffs.
+    pub(super) syntax: Arc<HighlightTheme>,
 }
 
 impl RowFrame {
@@ -695,6 +894,15 @@ impl RowFrame {
             })
             .ok();
         }
+    }
+
+    /// What a message's code blocks show in their corner; see [`code_block_corner`].
+    fn code_corner(
+        &self,
+    ) -> impl Fn(&gpui_base::text::CodeBlock, &mut Window, &mut App) -> Div + Send + Sync + 'static
+    {
+        let (dark, muted) = (self.dark, self.muted());
+        move |block, window, cx| code_block_corner(block, dark, muted, window, cx)
     }
 }
 
@@ -757,12 +965,12 @@ pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> An
         .into_any_element()
 }
 
-/// A user or agent message as Markdown: selectable, links open, code highlighted with a
-/// Copy button.
+/// A user or agent message as Markdown: selectable, links open, code highlighted with
+/// its language and a Copy button.
 fn chat_text(view: &Entity<TextViewState>, tint: u32, frame: &RowFrame) -> AnyElement {
     TextView::new(view)
         .selectable(true)
-        .code_block_actions(copy_code_button)
+        .code_block_actions(frame.code_corner())
         .style(message_style(frame))
         .text_size(ui_rems(UI_BODY_TEXT_SIZE))
         // The window's chrome is medium; reading text is regular, so bold and headings
@@ -773,7 +981,8 @@ fn chat_text(view: &Entity<TextViewState>, tint: u32, frame: &RowFrame) -> AnyEl
 }
 
 /// Messages' Markdown: headings a clear step above the body, and code that scales with
-/// the chat's text size like the rest.
+/// the chat's text size like the rest and starts below its corner's language and Copy
+/// button, so they never cover the first line.
 fn message_style(frame: &RowFrame) -> TextViewStyle {
     TextViewStyle {
         heading_base_font_size: frame.body_size,
@@ -789,7 +998,11 @@ fn message_style(frame: &RowFrame) -> TextViewStyle {
             _ => 1.0,
         }
     })
-    .code_block(StyleRefinement::default().text_size(ui_rems(UI_SMALL_TEXT_SIZE)))
+    .code_block(
+        StyleRefinement::default()
+            .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+            .pt(px(CODE_CORNER_HEIGHT)),
+    )
 }
 
 /// The Copy button in a code block's corner; a check for [`COPIED_FOR`] after a copy.
@@ -824,6 +1037,36 @@ fn copy_code_button(
         })
         .detach();
     })
+}
+
+/// The corner of a message's code block: the icon and name of its language, when the
+/// tag after the fence names one Compi has an icon for, then the Copy button.
+fn code_block_corner(
+    block: &gpui_base::text::CodeBlock,
+    dark: bool,
+    muted: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
+    let language = block
+        .lang()
+        .and_then(|tag| language_icon(LanguageHint::Fence(&tag)));
+    // The block's own font is the code's; the name reads as a label.
+    let label_font = Theme::global(cx).font_family.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .when_some(language, |corner, icon| {
+            corner.pl_1().child(icon.image(dark)).child(
+                div()
+                    .font_family(label_font)
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .child(icon.name()),
+            )
+        })
+        .child(copy_code_button(block, window, cx))
 }
 
 /// A file attached to a prompt, or about to be.
@@ -1030,7 +1273,7 @@ fn render_tool(
     index: usize,
     row: &ToolRow,
     open: bool,
-    open_agents: &[String],
+    open_agents: &[OpenAgent],
     frame: &RowFrame,
 ) -> AnyElement {
     let tool = &row.tool;
@@ -1062,7 +1305,24 @@ fn render_tool(
         .hover(|style| style.bg(color(frame.colors.surface_hover)))
         .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
         .map(|head| {
-            if row.agents.is_empty() {
+            if !row.agents.is_empty() {
+                head.child(agents_mark(
+                    frame.mark,
+                    row.agents.iter().map(|agent| agent.agent.status),
+                    &frame.colors,
+                ))
+            } else if let Some(language) = row.language {
+                // In the glyph's 12 px box, which the 16 px icon is centred on, so the
+                // verb stays in line with other tools'.
+                head.child(
+                    div()
+                        .flex_none()
+                        .w(ui_rems(12.0))
+                        .flex()
+                        .justify_center()
+                        .child(language.image(frame.dark)),
+                )
+            } else {
                 head.child(controls::glyph(
                     row.icon,
                     if failed {
@@ -1070,12 +1330,6 @@ fn render_tool(
                     } else {
                         muted
                     },
-                ))
-            } else {
-                head.child(agents_mark(
-                    frame.mark,
-                    row.agents.iter().map(|agent| agent.agent.status),
-                    &frame.colors,
                 ))
             }
         })
@@ -1201,8 +1455,8 @@ pub(super) fn render_permission_block(
 }
 
 /// The summary entry: a thin rule across the transcript closing the agents' run, with
-/// ✓ (✕ when one failed), how many, how long and what they cost. A click shows their
-/// call.
+/// ✓ (✕ when one failed, a stop mark when one stopped), how many, how long and what
+/// they cost. A click opens every call and agent in the wave.
 fn render_agents_finished(
     index: usize,
     tool: usize,
@@ -1211,8 +1465,16 @@ fn render_agents_finished(
     frame: &RowFrame,
 ) -> AnyElement {
     let muted = frame.muted();
-    let failed = matches!(rows.get(tool), Some(ChatRow::Tool { tool, .. })
-        if tool.agents.iter().any(|agent| agent.agent.status == ChatToolStatus::Failed));
+    let tools = finished_agent_tools(rows, index, tool);
+    let has_status = |status| {
+        tools.iter().any(|&index| {
+            matches!(rows.get(index),
+            Some(ChatRow::Tool { tool, .. })
+                if tool.agents.iter().any(|agent| agent.agent.status == status))
+        })
+    };
+    let failed = has_status(ChatToolStatus::Failed);
+    let stopped = has_status(ChatToolStatus::Stopped);
     let rule = || div().flex_1().h(px(1.0)).bg(color(frame.colors.border));
     div()
         .id(("chat-agents-finished", index))
@@ -1227,13 +1489,32 @@ fn render_agents_finished(
         .child(rule())
         .child(if failed {
             controls::glyph(IconName::Close, color(frame.colors.error))
+        } else if stopped {
+            controls::glyph(IconName::Ban, muted)
         } else {
             controls::glyph(IconName::Check, color(frame.colors.added))
         })
         .child(div().flex_none().whitespace_nowrap().child(label.clone()))
         .child(rule())
-        .on_click(frame.act(move |this, chat, _, _| this.reveal_chat_tool(chat, tool)))
+        .on_click(frame.act(move |this, chat, _, _| this.reveal_chat_agent_tools(chat, &tools)))
         .into_any_element()
+}
+
+/// Every call in the wave closed by this summary, not only its latest call.
+fn finished_agent_tools(rows: &[ChatRow], index: usize, tool: usize) -> Vec<usize> {
+    let start = rows[..index]
+        .iter()
+        .rposition(|row| matches!(row, ChatRow::AgentsFinished { .. }))
+        .map_or(0, |index| index + 1);
+    rows.iter()
+        .enumerate()
+        .take(tool.saturating_add(1))
+        .skip(start)
+        .filter_map(|(index, row)| match row {
+            ChatRow::Tool { tool, .. } if !tool.agents.is_empty() => Some(index),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Most dots the agents' mark draws; more agents show as `+N`.
@@ -1293,7 +1574,7 @@ pub(super) fn agents_mark(
 fn render_tool_body(
     index: usize,
     row: &ToolRow,
-    open_agents: &[String],
+    open_agents: &[OpenAgent],
     frame: &RowFrame,
 ) -> AnyElement {
     let tool = &row.tool;
@@ -1305,8 +1586,9 @@ fn render_tool_body(
         .children(
             row.diffs
                 .iter()
+                .zip(&tool.diffs)
                 .enumerate()
-                .map(|(block, diff)| render_diff(index, block, diff, frame)),
+                .map(|(block, (diff, edit))| render_diff(index, block, diff, edit, frame)),
         )
         .when(!row.agents.is_empty(), |body| {
             body.child(
@@ -1314,7 +1596,7 @@ fn render_tool_body(
                     .flex()
                     .flex_col()
                     .children(row.agents.iter().enumerate().map(|(position, agent)| {
-                        let open = open_agents.contains(&agent.agent.id);
+                        let open = open_agents.iter().find(|open| open.id == agent.agent.id);
                         render_agent(index, position, agent, open, frame)
                     })),
             )
@@ -1334,12 +1616,12 @@ fn render_tool_body(
 }
 
 /// A sub-agent: one line (status, name, type, what it does or answered, time, cost) that
-/// unfolds, once it answered, to its answer.
+/// unfolds, running or not, to its task, its steps and, once it answered, its answer.
 fn render_agent(
     index: usize,
     position: usize,
     row: &AgentRow,
-    open: bool,
+    open: Option<&OpenAgent>,
     frame: &RowFrame,
 ) -> AnyElement {
     let agent = &row.agent;
@@ -1393,27 +1675,264 @@ fn render_agent(
         .when_some(agent.cost, |head, cost| {
             head.child(micro(cost_label(cost, None).into()))
         })
-        .when(row.result.is_some(), |head| {
-            head.cursor_pointer()
-                .hover(|style| style.bg(color(frame.colors.surface_hover)))
-                .on_click(frame.act(move |this, chat, _, _| {
-                    this.toggle_chat_agent(chat, index, &id);
-                }))
-        });
+        .cursor_pointer()
+        .hover(|style| style.bg(color(frame.colors.surface_hover)))
+        .on_click(frame.act(move |this, chat, _, _| {
+            this.toggle_chat_agent(chat, index, &id, AgentPart::Line);
+        }));
     div()
         .flex()
         .flex_col()
         .child(head)
-        .when_some(row.result.as_ref().filter(|_| open), |agent_row, result| {
+        .when_some(open, |agent_row, open| {
+            let task = agent
+                .assignment
+                .as_deref()
+                .filter(|task| !task.trim().is_empty());
             agent_row.child(
                 div()
                     .ml_6()
                     .pt_0p5()
                     .pb_2()
-                    .child(agent_result(agent, result, frame)),
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(task.map(|task| {
+                        agent_task(index, position, agent, task, open.whole_task, frame)
+                    }))
+                    .children(agent_steps(index, position, agent, open.all_steps, frame))
+                    .when_some(row.result.as_ref(), |body, result| {
+                        body.child(agent_result(agent, result, frame))
+                    }),
             )
         })
         .into_any_element()
+}
+
+/// A muted line of an open sub-agent, as high as a step: its task's label, how many
+/// steps came before the ones listed. With `fold` (the line's element name and the part)
+/// a click folds or unfolds that part of sub-agent `agent` of the call at row `index`,
+/// and the line looks clickable as the agent's own does.
+fn agent_note(
+    label: SharedString,
+    fold: Option<(&'static str, AgentPart)>,
+    index: usize,
+    position: usize,
+    agent: &str,
+    frame: &RowFrame,
+) -> AnyElement {
+    let note = div()
+        .h(ui_rems(AGENT_STEP_HEIGHT))
+        .px_1()
+        .flex()
+        .items_center()
+        .rounded(ui_rems(4.0))
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+        .text_color(frame.muted())
+        .whitespace_nowrap()
+        .child(label);
+    let Some((name, part)) = fold else {
+        return note.into_any_element();
+    };
+    let agent = agent.to_owned();
+    note.id((name, index * 1000 + position))
+        .cursor_pointer()
+        .hover(|style| style.bg(color(frame.colors.surface_hover)))
+        .on_click(frame.act(move |this, chat, _, _| {
+            this.toggle_chat_agent(chat, index, &agent, part);
+        }))
+        .into_any_element()
+}
+
+/// The start of a sub-agent's `task` that shows at first: its first lines with text, up
+/// to `TASK_PREVIEW_CHARS` characters, ending in `…` when more follows; and whether
+/// more does.
+fn task_preview(task: &str) -> (SharedString, bool) {
+    let mut lines = task
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty());
+    let mut preview = lines
+        .by_ref()
+        .take(TASK_PREVIEW_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut more = lines.next().is_some();
+    let cut = preview
+        .char_indices()
+        .nth(TASK_PREVIEW_CHARS)
+        .map(|(end, _)| end);
+    if let Some(end) = cut {
+        preview.truncate(end);
+        preview.truncate(preview.trim_end().len());
+        more = true;
+    }
+    if more {
+        preview.push_str(" …");
+    }
+    (preview.into(), more)
+}
+
+/// A sub-agent's task under its label: muted, its first lines until the reader asks for
+/// all of a long one.
+fn agent_task(
+    index: usize,
+    position: usize,
+    agent: &ChatAgent,
+    task: &str,
+    whole: bool,
+    frame: &RowFrame,
+) -> AnyElement {
+    let (preview, long) = task_preview(task);
+    let label = match (long, whole) {
+        (false, _) => "Task",
+        (true, false) => "Task · Show all",
+        (true, true) => "Task · Show less",
+    };
+    div()
+        .flex()
+        .flex_col()
+        .child(agent_note(
+            label.into(),
+            long.then_some(("chat-agent-task", AgentPart::Task)),
+            index,
+            position,
+            &agent.id,
+            frame,
+        ))
+        .child(
+            div()
+                .px_1()
+                .min_w_0()
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                .text_color(frame.muted())
+                .child(if long && whole {
+                    SharedString::from(task.trim().to_owned())
+                } else {
+                    preview
+                }),
+        )
+        .into_any_element()
+}
+
+/// Which of the `held` steps the daemon sent for a sub-agent its open line lists: the
+/// latest `LATEST_AGENT_STEPS`, or all once the reader asked (`all`). With them the
+/// muted line over the list and whether a click on it switches between the two: how
+/// many earlier steps a click shows (or the way back), and how many of the agent's
+/// `calls` are older than what the daemon holds.
+fn shown_steps(held: usize, calls: u64, all: bool) -> (Range<usize>, Option<(String, bool)>) {
+    let earlier = |count: u64| {
+        if count == 1 {
+            "1 earlier step".to_owned()
+        } else {
+            format!("{count} earlier steps")
+        }
+    };
+    let dropped = calls.saturating_sub(held as u64);
+    // One step more than the latest is listed: a line saying so would take its place.
+    let folds = held > LATEST_AGENT_STEPS + 1;
+    let start = if folds && !all {
+        held - LATEST_AGENT_STEPS
+    } else {
+        0
+    };
+    let line = match (folds, dropped) {
+        (false, 0) => None,
+        (false, _) if held == 0 => Some((
+            format!(
+                "{dropped} {} no longer kept",
+                if dropped == 1 { "step" } else { "steps" }
+            ),
+            false,
+        )),
+        (false, _) => Some((format!("{} no longer kept", earlier(dropped)), false)),
+        (true, 0) if all => Some((format!("Show only the latest {LATEST_AGENT_STEPS}"), true)),
+        (true, 0) => Some((earlier(start as u64), true)),
+        (true, _) if all => Some((
+            format!(
+                "Show only the latest {LATEST_AGENT_STEPS} · {} no longer kept",
+                earlier(dropped)
+            ),
+            true,
+        )),
+        (true, _) => Some((
+            format!(
+                "{} · {dropped} before them no longer kept",
+                earlier(start as u64)
+            ),
+            true,
+        )),
+    };
+    (start..held, line)
+}
+
+/// A step's status as its mark shows it: one still running once its agent ended did not
+/// finish, so it shows as stopped instead of spinning.
+fn step_status(step: ChatToolStatus, agent: ChatToolStatus) -> ChatToolStatus {
+    if step.is_open() && !agent.is_open() {
+        ChatToolStatus::Stopped
+    } else {
+        step
+    }
+}
+
+/// An open sub-agent's steps, a line each (the tool rows' status mark, then its text cut
+/// to the line): the latest under a line saying how many came before, which a click
+/// shows. Nothing when it made no step, but a note while it may still make one.
+fn agent_steps(
+    index: usize,
+    position: usize,
+    agent: &ChatAgent,
+    all: bool,
+    frame: &RowFrame,
+) -> Option<Div> {
+    let (shown, line) = shown_steps(agent.steps.len(), agent.tool_count, all);
+    let line: Option<(SharedString, Option<(&'static str, AgentPart)>)> = match line {
+        Some((label, folds)) => Some((
+            label.into(),
+            folds.then_some(("chat-agent-steps", AgentPart::Steps)),
+        )),
+        None if shown.is_empty() && agent.status.is_open() => Some(("No steps yet".into(), None)),
+        None => None,
+    };
+    if shown.is_empty() && line.is_none() {
+        return None;
+    }
+    let muted = frame.muted();
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .children(
+                line.map(|(label, fold)| {
+                    agent_note(label, fold, index, position, &agent.id, frame)
+                }),
+            )
+            .children(agent.steps[shown].iter().map(|step| {
+                div()
+                    .h(ui_rems(AGENT_STEP_HEIGHT))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(tool_status(step_status(step.status, agent.status), frame)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(step.text.clone()),
+                    )
+            })),
+    )
 }
 
 /// What a sub-agent answered: a label naming its model and tool calls over the Markdown,
@@ -1442,7 +1961,7 @@ fn agent_result(agent: &ChatAgent, view: &Entity<TextViewState>, frame: &RowFram
         .child(
             TextView::new(view)
                 .selectable(true)
-                .code_block_actions(copy_code_button)
+                .code_block_actions(frame.code_corner())
                 .style(message_style(frame))
                 .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                 .font_weight(FontWeight::NORMAL)
@@ -1491,8 +2010,16 @@ fn tool_text(
         .into_any_element()
 }
 
-/// One edited file: its path and changes with Open in diff, then its lines.
-fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -> AnyElement {
+/// One edited file: its language, path and changes with Open in diff, then its lines
+/// in the diff view's colours: syntax by the file's language, `+` and `−` as added and
+/// removed. `edit` holds the texts `diff` was made from.
+fn render_diff(
+    index: usize,
+    block: usize,
+    diff: &DiffBlock,
+    edit: &ChatDiff,
+    frame: &RowFrame,
+) -> AnyElement {
     let path = diff.path.clone();
     let open = text_button(("chat-open-diff", index * 1000 + block), "Open in diff")
         .ghost()
@@ -1500,36 +2027,42 @@ fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -
         .on_click(frame.act(move |this, chat, window, cx| {
             this.open_chat_diff(chat, &path, window, cx);
         }));
-    let added_row = color(frame.colors.added).opacity(0.12);
-    let removed_row = color(frame.colors.removed).opacity(0.12);
+    let added = color(frame.colors.added);
+    let removed = color(frame.colors.removed);
+    let syntax = diff.syntax(edit, &frame.syntax);
     let lines = diff.lines.as_ref().map(|lines| {
-        lines.iter().map(|line| match line {
-            DiffText::Line(kind, text) => {
-                let (marker, background) = match kind {
-                    LineKind::Added => ("+", Some(added_row)),
-                    LineKind::Removed => ("−", Some(removed_row)),
-                    LineKind::Context | LineKind::Formatting => (" ", None),
-                };
-                div()
-                    .flex()
+        lines
+            .iter()
+            .zip(syntax.iter())
+            .map(|(line, styles)| match line {
+                DiffText::Line { kind, text, .. } => {
+                    let (marker, tint, background) = match kind {
+                        LineKind::Added => ("+", added, Some(added.opacity(0.12))),
+                        LineKind::Removed => ("−", removed, Some(removed.opacity(0.12))),
+                        LineKind::Context | LineKind::Formatting => (" ", frame.muted(), None),
+                    };
+                    div()
+                        .flex()
+                        .px_1()
+                        .when_some(background, |line, background| line.bg(background))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(ui_rems(14.0))
+                                .text_color(tint)
+                                .child(marker),
+                        )
+                        .child(div().min_w_0().child(
+                            StyledText::new(text.clone()).with_highlights(styles.iter().cloned()),
+                        ))
+                        .into_any_element()
+                }
+                DiffText::Fold(hidden) => div()
                     .px_1()
-                    .when_some(background, |line, background| line.bg(background))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(ui_rems(14.0))
-                            .text_color(frame.muted())
-                            .child(marker),
-                    )
-                    .child(div().min_w_0().child(text.clone()))
-                    .into_any_element()
-            }
-            DiffText::Fold(hidden) => div()
-                .px_1()
-                .text_color(frame.muted())
-                .child(format!("⋯ {hidden} unchanged lines"))
-                .into_any_element(),
-        })
+                    .text_color(frame.muted())
+                    .child(format!("⋯ {hidden} unchanged lines"))
+                    .into_any_element(),
+            })
     });
     div()
         .flex()
@@ -1547,6 +2080,9 @@ fn render_diff(index: usize, block: usize, diff: &DiffBlock, frame: &RowFrame) -
                 .items_center()
                 .gap_2()
                 .bg(color(frame.colors.surface))
+                .when_some(diff.language, |head, language| {
+                    head.child(language.image(frame.dark))
+                })
                 .child(
                     div()
                         .min_w_0()
@@ -1622,6 +2158,92 @@ mod tests {
     }
 
     #[test]
+    fn wave_navigation_opens_running_and_finished_agent_details() {
+        let call = |id: &str| {
+            let mut task = tool(id, "other", None);
+            task.agents.push(ChatAgent {
+                id: id.into(),
+                agent: "sonic".into(),
+                status: ChatToolStatus::Running,
+                activity: Some("Reading the sample".into()),
+                tool_count: 1,
+                started_ms: Some(1),
+                duration_ms: 0,
+                cost: None,
+                model: None,
+                assignment: Some("Review the sample".into()),
+                result: None,
+                steps: Vec::new(),
+            });
+            ChatRow::Tool {
+                tool: Rc::new(ToolRow {
+                    agents: task
+                        .agents
+                        .iter()
+                        .cloned()
+                        .map(|agent| AgentRow {
+                            agent,
+                            result: None,
+                        })
+                        .collect(),
+                    tool: task,
+                    verb: "Task",
+                    icon: IconName::Check,
+                    language: None,
+                    target: None,
+                    diffs: Vec::new(),
+                    added: 0,
+                    removed: 0,
+                    input: None,
+                    output: None,
+                    cost: None,
+                }),
+                open: Some(false),
+                open_agents: Vec::new(),
+            }
+        };
+        let summary = |tool| ChatRow::AgentsFinished {
+            tool,
+            label: "finished".into(),
+        };
+        let mut rows = vec![call("old"), summary(0), call("A"), call("B"), summary(3)];
+        let tools = finished_agent_tools(&rows, 4, 3);
+        assert_eq!(tools, [2, 3]);
+        for &index in &tools {
+            rows[index].unfold(None);
+            let ChatRow::Tool {
+                tool,
+                open,
+                open_agents,
+            } = &mut rows[index]
+            else {
+                unreachable!();
+            };
+            assert_eq!(*open, Some(true));
+            assert_eq!(open_agents.len(), 1);
+            assert_eq!(open_agents[0].id, tool.agents[0].agent.id);
+            open_agents[0].whole_task = true;
+            // The same expanded line survives its running-to-completed transition.
+            let tool = Rc::get_mut(tool).unwrap();
+            tool.agents[0].agent.status = ChatToolStatus::Completed;
+            tool.agents[0].agent.result = Some("Review complete".into());
+            rows[index].unfold(None);
+            let ChatRow::Tool { open_agents, .. } = &rows[index] else {
+                unreachable!();
+            };
+            assert_eq!(open_agents.len(), 1);
+            assert!(open_agents[0].whole_task);
+            let id = open_agents[0].id.clone();
+            rows[index].toggle_agent(&id, AgentPart::Line);
+            let ChatRow::Tool { open_agents, .. } = &rows[index] else {
+                unreachable!();
+            };
+            assert!(open_agents.is_empty());
+            rows[index].unfold(Some(&id));
+        }
+    }
+
+    #[test]
     fn running_agents_and_their_summary_read_short() {
         let agent = |id: &str, status: ChatToolStatus| ChatAgent {
             id: id.into(),
@@ -1635,6 +2257,7 @@ mod tests {
             model: None,
             assignment: None,
             result: None,
+            steps: Vec::new(),
         };
         let mut task = tool("t", "other", None);
         task.agents = vec![
@@ -1669,6 +2292,92 @@ mod tests {
     }
 
     #[test]
+    fn an_open_agent_lists_its_latest_steps_under_a_count_of_the_earlier() {
+        let line = |label: &str, folds: bool| Some((label.to_owned(), folds));
+        // A few steps all show, with nothing over them.
+        assert_eq!(shown_steps(0, 0, false), (0..0, None));
+        assert_eq!(shown_steps(10, 10, false), (0..10, None));
+        // One more than the latest shows too: a line saying so would take its place.
+        assert_eq!(shown_steps(11, 11, false), (0..11, None));
+        assert_eq!(
+            shown_steps(12, 12, false),
+            (2..12, line("2 earlier steps", true))
+        );
+        assert_eq!(
+            shown_steps(44, 44, false),
+            (34..44, line("34 earlier steps", true))
+        );
+        // Asked for, they all show, with the way back.
+        assert_eq!(
+            shown_steps(44, 44, true),
+            (0..44, line("Show only the latest 10", true))
+        );
+        // The daemon holds only an agent's latest steps: the line counts the ones it
+        // dropped apart, as a click cannot show them.
+        let held = compi_protocol::chat::MAX_CHAT_AGENT_STEPS;
+        assert_eq!(
+            shown_steps(held, held as u64 + 34, false),
+            (
+                held - 10..held,
+                line("190 earlier steps · 34 before them no longer kept", true)
+            )
+        );
+        assert_eq!(
+            shown_steps(held, held as u64 + 34, true),
+            (
+                0..held,
+                line(
+                    "Show only the latest 10 · 34 earlier steps no longer kept",
+                    true
+                )
+            )
+        );
+        // With too few left to fold, the line only says so.
+        assert_eq!(
+            shown_steps(5, 6, false),
+            (0..5, line("1 earlier step no longer kept", false))
+        );
+        assert_eq!(
+            shown_steps(0, 12, false),
+            (0..0, line("12 steps no longer kept", false))
+        );
+        // A count behind the steps drops nothing.
+        assert_eq!(shown_steps(3, 2, false), (0..3, None));
+        // A step still running once its agent ended did not finish.
+        let (running, done) = (ChatToolStatus::Running, ChatToolStatus::Completed);
+        assert_eq!(step_status(running, running), running);
+        assert_eq!(step_status(running, done), ChatToolStatus::Stopped);
+        assert_eq!(
+            step_status(ChatToolStatus::Pending, ChatToolStatus::Failed),
+            ChatToolStatus::Stopped
+        );
+        assert_eq!(
+            step_status(ChatToolStatus::Failed, done),
+            ChatToolStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_long_task_shows_its_start_until_asked_for() {
+        let preview = |task: &str| {
+            let (text, long) = task_preview(task);
+            (text.to_string(), long)
+        };
+        assert_eq!(preview("Fix the bug"), ("Fix the bug".to_owned(), false));
+        // Blank lines are left out, so three lines with text all show.
+        assert_eq!(
+            preview("\n# Goal\n\nOne\n  Two  \n"),
+            ("# Goal\nOne\n  Two".to_owned(), false)
+        );
+        assert_eq!(preview("A\nB\nC\nD"), ("A\nB\nC …".to_owned(), true));
+        // One long line is cut between characters, not inside one.
+        assert_eq!(
+            preview(&"é".repeat(TASK_PREVIEW_CHARS + 60)),
+            (format!("{} …", "é".repeat(TASK_PREVIEW_CHARS)), true)
+        );
+    }
+
+    #[test]
     fn entries_that_went_on_keep_their_rows() {
         let agent = |text: &str| ChatEntry::Agent { text: text.into() };
         let call = |id: &str| ChatEntry::Tool(Box::new(tool(id, "read", None)));
@@ -1698,6 +2407,25 @@ mod tests {
         assert_eq!(tool_target(&tool("3", "other", None), "/work"), None);
         assert_eq!(relative_to(r"C:\work\a.rs", r"C:\work\"), "a.rs");
         assert_eq!(relative_to("/elsewhere/a.rs", "/work"), "/elsewhere/a.rs");
+    }
+
+    #[test]
+    fn only_a_file_read_or_edited_takes_a_language_icon() {
+        let mut read = tool("1", "read", None);
+        read.locations = vec!["/work/src/main.rs".into()];
+        assert_eq!(tool_language(&read, "/work"), Some(LanguageIcon::Rust));
+        let edit = tool("2", "edit", Some(r#"{ "path": "/work/web/app.ts" }"#));
+        assert_eq!(
+            tool_language(&edit, "/work"),
+            Some(LanguageIcon::TypeScript)
+        );
+        let notes = tool("3", "read", Some(r#"{ "path": "/work/notes.txt" }"#));
+        assert_eq!(tool_language(&notes, "/work"), None);
+        // A command or a pattern that ends like a file's name is not a file.
+        let run = tool("4", "execute", Some(r#"{ "command": "python build.py" }"#));
+        assert_eq!(tool_language(&run, "/work"), None);
+        let search = tool("5", "search", Some(r#"{ "pattern": "*.rs" }"#));
+        assert_eq!(tool_language(&search, "/work"), None);
     }
 
     #[test]

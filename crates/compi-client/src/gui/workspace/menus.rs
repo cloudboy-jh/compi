@@ -68,6 +68,7 @@ impl PaneAction {
             Self::ShowSide => match facts.view {
                 Some("Settings") => "Show Settings",
                 Some("Monitor") => "Show Monitor",
+                Some("Browser") => "Show Browser",
                 _ => "Show Files",
             },
             Self::MoveToNewTab => "Move to new tab",
@@ -78,6 +79,7 @@ impl PaneAction {
             Self::CloseView => match facts.view {
                 Some("Settings") => "Close Settings",
                 Some("Monitor") => "Close Monitor",
+                Some("Browser") => "Close Browser",
                 _ => "Close Files",
             },
             Self::Close => "Close pane",

@@ -1,12 +1,18 @@
-//! What OMP saved of each session, read from its files for the session list: the first
-//! prompt and the end of the last reply. ACP lists neither. OMP keeps a session as
-//! `<agent folder>/sessions/<folder>/<time>_<id>.jsonl`, one JSON entry a line, its
-//! agent folder `$PI_CODING_AGENT_DIR`, else `~/.omp/agent`. A session whose file is not
-//! found keeps what the harness listed.
+//! What OMP saved of each session, read from its files: for the session list, the first
+//! prompt and the end of the last reply (ACP lists neither); for a chat with sub-agents,
+//! the ones that finished and each one's tool calls (ACP reports those only while a turn
+//! runs, and the calls only as the latest few). OMP keeps a session as
+//! `<agent folder>/sessions/<folder>/<time>_<id>.jsonl`, one JSON entry a line, and its
+//! sub-agents' own sessions as `<time>_<id>/<agent>.jsonl` beside it; its agent folder is
+//! `$PI_CODING_AGENT_DIR`, else `~/.omp/agent`. A session whose file is not found keeps
+//! what the harness reported.
 use compi_protocol::ContentEnvironment;
-use compi_protocol::chat::{ChatContent, ChatSessionInfo, MAX_CHAT_SESSION_PREVIEW_CHARS};
+use compi_protocol::chat::{
+    ChatAgentStep, ChatContent, ChatSessionInfo, ChatToolStatus, MAX_CHAT_AGENT_STEPS,
+    MAX_CHAT_SESSION_PREVIEW_CHARS,
+};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -16,6 +22,8 @@ use std::time::SystemTime;
 const HEAD_BYTES: u64 = 1024 * 1024;
 /// How much of a file's end is read for the last reply.
 const TAIL_BYTES: u64 = 512 * 1024;
+/// How much of a file one look for sub-agents' news reads.
+const AGENTS_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Fills in each session's first prompt and last reply from its file.
 pub(super) fn fill(content: &ChatContent, sessions: &mut [ChatSessionInfo]) {
@@ -25,7 +33,8 @@ pub(super) fn fill(content: &ChatContent, sessions: &mut [ChatSessionInfo]) {
     let Some(root) = sessions_folder(&content.environment) else {
         return;
     };
-    let files = session_files(&root, sessions);
+    let wanted: HashSet<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+    let files = session_files(&root, &wanted);
     for session in sessions {
         if let Some(path) = files.get(&session.id) {
             let saved = read(path);
@@ -33,6 +42,166 @@ pub(super) fn fill(content: &ChatContent, sessions: &mut [ChatSessionInfo]) {
             session.last_reply = saved.last_reply;
         }
     }
+}
+
+/// The file OMP keeps `session` in, where the chat's harness runs.
+pub(super) fn session_file(content: &ChatContent, session: &str) -> Option<PathBuf> {
+    let root = sessions_folder(&content.environment)?;
+    session_files(&root, &HashSet::from([session])).remove(session)
+}
+
+/// The sub-agents OMP noted as finished in the lines of `path` from `offset` on, each as
+/// a `wait` call lists a job (`id`, `type`, `status`, `durationMs`, `resultText`). OMP
+/// writes an `async-result` entry when a background job ends. `offset` moves past the
+/// whole lines read; a line still being written is read next time.
+pub(super) fn finished_agents(path: &Path, offset: &mut u64) -> Vec<Value> {
+    let mut jobs = Vec::new();
+    for line in new_lines(path, offset).lines() {
+        if !line.contains(r#""customType":"async-result""#) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let content = entry["content"].as_str().unwrap_or_default();
+        for job in entry["details"]["jobs"].as_array().into_iter().flatten() {
+            let id = job["agentId"].as_str().or_else(|| job["jobId"].as_str());
+            let (Some(id), "task") = (id, job["type"].as_str().unwrap_or_default()) else {
+                continue;
+            };
+            jobs.push(serde_json::json!({
+                "id": id,
+                "type": "task",
+                "status": job["status"],
+                "durationMs": job["durationMs"],
+                "resultText": task_result(content, id),
+            }));
+        }
+    }
+    jobs
+}
+
+/// The whole lines `path` gained from `offset` on, at most `AGENTS_BYTES` a look.
+/// `offset` moves past them; a line still being written is read next time.
+fn new_lines(path: &Path, offset: &mut u64) -> String {
+    let Ok(len) = std::fs::metadata(path).map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    // A file rewritten shorter is read on from its end.
+    if len <= *offset {
+        *offset = len;
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|mut file| {
+        file.seek(SeekFrom::Start(*offset))?;
+        file.take(AGENTS_BYTES).read_to_end(&mut bytes)
+    });
+    if read.is_err() {
+        return String::new();
+    }
+    let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        // One line longer than a look reads holds no news.
+        if bytes.len() as u64 == AGENTS_BYTES {
+            *offset += AGENTS_BYTES;
+        }
+        return String::new();
+    };
+    *offset += end as u64 + 1;
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// A sub-agent's tool calls as its own session file tells them, kept from look to look.
+#[derive(Default)]
+pub(super) struct AgentSteps {
+    offset: u64,
+    /// The tool call ID of each step kept, in the steps' order.
+    calls: VecDeque<String>,
+    /// The latest `MAX_CHAT_AGENT_STEPS` calls, oldest first.
+    pub(super) steps: VecDeque<ChatAgentStep>,
+    /// Every call it made, those no longer kept included.
+    pub(super) count: u64,
+}
+
+impl AgentSteps {
+    /// Reads what `path` (the sub-agent's session file) gained; whether a call began or
+    /// ended. OMP writes a `tool_execution_start` entry as a call begins and its
+    /// `toolResult` message as it ends.
+    pub(super) fn read(&mut self, path: &Path) -> bool {
+        let mut changed = false;
+        for line in new_lines(path, &mut self.offset).lines() {
+            if line.contains(r#""customType":"tool_execution_start""#) {
+                let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let data = &entry["data"];
+                let (Some(call), Some(text)) = (data["toolCallId"].as_str(), step_text(data))
+                else {
+                    continue;
+                };
+                if self.steps.len() == MAX_CHAT_AGENT_STEPS {
+                    self.steps.pop_front();
+                    self.calls.pop_front();
+                }
+                self.calls.push_back(call.to_owned());
+                self.steps.push_back(ChatAgentStep {
+                    text,
+                    status: ChatToolStatus::Running,
+                });
+                self.count += 1;
+                changed = true;
+            } else if line.contains(r#""role":"toolResult""#) {
+                let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let message = &entry["message"];
+                let Some(step) = message["toolCallId"]
+                    .as_str()
+                    .and_then(|call| self.calls.iter().rposition(|kept| kept == call))
+                else {
+                    continue;
+                };
+                self.steps[step].status = if message["isError"].as_bool() == Some(true) {
+                    ChatToolStatus::Failed
+                } else {
+                    ChatToolStatus::Completed
+                };
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// A call's line: the intent the agent stated, else the tool with the argument that
+/// says most (a command, a path, what it searched for).
+fn step_text(data: &Value) -> Option<String> {
+    let stated = data["intent"]
+        .as_str()
+        .map(str::trim)
+        .filter(|intent| !intent.is_empty());
+    if let Some(intent) = stated {
+        return super::short_line(intent);
+    }
+    let tool = data["toolName"].as_str()?;
+    let argument = ["command", "path", "pattern", "query", "url"]
+        .into_iter()
+        .find_map(|key| data["args"][key].as_str());
+    match argument {
+        Some(argument) => super::short_line(&format!("{tool} {argument}")),
+        None => super::short_line(tool),
+    }
+}
+
+/// The `<task-result id="…">…</task-result>` block of the sub-agent `id` in a notice.
+fn task_result<'a>(notice: &'a str, id: &str) -> Option<&'a str> {
+    let start = notice.find(&format!(r#"<task-result id="{id}""#))?;
+    let block = &notice[start..];
+    const CLOSE: &str = "</task-result>";
+    Some(match block.find(CLOSE) {
+        Some(end) => &block[..end + CLOSE.len()],
+        None => block,
+    })
 }
 
 /// Where the harness's environment keeps OMP's sessions, as this daemon reaches it.
@@ -87,9 +256,8 @@ fn wsl_sessions_folder(distribution: &str) -> Option<PathBuf> {
     Some(folder)
 }
 
-/// The files of `sessions` under `root`, by session ID.
-fn session_files(root: &Path, sessions: &[ChatSessionInfo]) -> HashMap<String, PathBuf> {
-    let wanted: HashSet<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+/// The session files under `root` of the session IDs `wanted`, by ID.
+fn session_files(root: &Path, wanted: &HashSet<&str>) -> HashMap<String, PathBuf> {
     let mut files = HashMap::new();
     let Ok(folders) = std::fs::read_dir(root) else {
         return files;
@@ -277,6 +445,133 @@ mod tests {
         std::fs::write(&path, lines[..6].join("\n") + "\n").unwrap();
         let saved = read(&path);
         assert_eq!(saved.last_reply.as_deref(), Some("done"));
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn finished_sub_agents_are_read_once_each_from_whole_lines() {
+        let folder = std::env::temp_dir().join(format!("compi-agents-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("2026-11-10T03-05-40-956Z_01a1.jsonl");
+        let notice = |id: &str, status: &str, output: &str| {
+            serde_json::json!({
+                "type": "custom_message", "customType": "async-result",
+                "content": format!("<system-notice>\nBackground job {id} has {status}.\n<task-result id=\"{id}\" agent=\"sonic\" status=\"{status}\" duration=\"9s\">\n\n<output>\n{output}\n</output>\n</task-result>\n\n{id} is now idle\n</system-notice>"),
+                "details": { "jobs": [
+                    { "jobId": id, "type": "task", "status": status, "agentId": id, "durationMs": 9578 },
+                    { "jobId": "bg_1", "type": "bash", "status": "completed" },
+                ] },
+            })
+            .to_string()
+        };
+        let earlier = notice("Old", "completed", "before the agents started") + "\n";
+        std::fs::write(&path, &earlier).unwrap();
+        let mut offset = earlier.len() as u64;
+        assert!(finished_agents(&path, &mut offset).is_empty());
+
+        let first = line("assistant", None, "spawned")
+            + "\n"
+            + &notice("A", "completed", "A is done")
+            + "\n";
+        let second = notice("B", "failed", "B broke");
+        // The second entry is still being written.
+        let cut = second.len() / 2;
+        std::fs::write(&path, format!("{earlier}{first}{}", &second[..cut])).unwrap();
+        let jobs = finished_agents(&path, &mut offset);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(
+            (
+                jobs[0]["id"].as_str(),
+                jobs[0]["status"].as_str(),
+                jobs[0]["durationMs"].as_u64()
+            ),
+            (Some("A"), Some("completed"), Some(9578))
+        );
+        let text = jobs[0]["resultText"].as_str().unwrap();
+        assert!(text.starts_with("<task-result id=\"A\"") && text.ends_with("</task-result>"));
+        assert!(text.contains("A is done"));
+        assert!(finished_agents(&path, &mut offset).is_empty());
+
+        std::fs::write(&path, format!("{earlier}{first}{second}\n")).unwrap();
+        let jobs = finished_agents(&path, &mut offset);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(
+            (jobs[0]["id"].as_str(), jobs[0]["status"].as_str()),
+            (Some("B"), Some("failed"))
+        );
+        assert!(finished_agents(&path, &mut offset).is_empty());
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_sub_agents_calls_are_kept_in_order_with_how_each_ended() {
+        let folder = std::env::temp_dir().join(format!("compi-steps-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("AgentA.jsonl");
+        let start = |call: &str, data: Value| {
+            let mut data = data;
+            data["toolCallId"] = call.into();
+            serde_json::json!({ "type": "custom", "customType": "tool_execution_start", "data": data })
+                .to_string()
+        };
+        let result = |call: &str, failed: bool| {
+            serde_json::json!({ "type": "message", "message": {
+                "role": "toolResult", "toolCallId": call, "content": [], "isError": failed,
+            } })
+            .to_string()
+        };
+        let first = [
+            start(
+                "c1",
+                serde_json::json!({ "toolName": "read", "args": { "path": "a.rs" }, "intent": "Reading the\n  parser" }),
+            ),
+            result("c1", false),
+            start(
+                "c2",
+                serde_json::json!({ "toolName": "bash", "args": { "command": "cargo test", "timeout": 5 } }),
+            ),
+        ];
+        std::fs::write(&path, first.join("\n") + "\n").unwrap();
+        let mut steps = AgentSteps::default();
+        assert!(steps.read(&path));
+        let shown = |steps: &AgentSteps| -> Vec<(String, ChatToolStatus)> {
+            steps
+                .steps
+                .iter()
+                .map(|step| (step.text.clone(), step.status))
+                .collect()
+        };
+        assert_eq!(
+            shown(&steps),
+            [
+                ("Reading the parser".to_owned(), ChatToolStatus::Completed),
+                ("bash cargo test".to_owned(), ChatToolStatus::Running),
+            ]
+        );
+        assert!(!steps.read(&path));
+
+        // More calls than are kept: the oldest go, and a result still finds its call.
+        let mut more = vec![result("c2", true)];
+        for index in 0..MAX_CHAT_AGENT_STEPS {
+            more.push(start(
+                &format!("n{index}"),
+                serde_json::json!({ "toolName": "grep", "args": {} }),
+            ));
+        }
+        more.push(result(&format!("n{}", MAX_CHAT_AGENT_STEPS - 1), false));
+        let all = first.iter().chain(&more).cloned().collect::<Vec<_>>();
+        std::fs::write(&path, all.join("\n") + "\n").unwrap();
+        assert!(steps.read(&path));
+        assert_eq!(steps.count, MAX_CHAT_AGENT_STEPS as u64 + 2);
+        assert_eq!(steps.steps.len(), MAX_CHAT_AGENT_STEPS);
+        assert_eq!(
+            (steps.steps[0].text.as_str(), steps.steps[0].status),
+            ("grep", ChatToolStatus::Running)
+        );
+        assert_eq!(
+            steps.steps.back().map(|step| step.status),
+            Some(ChatToolStatus::Completed)
+        );
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

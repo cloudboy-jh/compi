@@ -24,8 +24,8 @@
 //! The list has a keyboard selection (`changes_list_key`) kept by what a row shows, so it
 //! survives a new listing; it follows the diff that opens.
 use super::content::{
-    CHECK_INTERVAL, FILE_TAB_HEIGHT, PaneUi, TREE_INDENT, TREE_INSET, file_name, find_content,
-    reusable_content, same_folder,
+    CHECK_INTERVAL, FILE_TAB_HEIGHT, LanguageHint, PaneUi, TREE_INDENT, TREE_INSET, file_name,
+    find_content, language_icon, reusable_content, same_folder,
 };
 use super::diff_view::{DiffSettings, DiffStyle, DiffView, HunkButton, HunkClicked, LayoutMode};
 use super::files::FileScope;
@@ -3658,6 +3658,7 @@ impl CompiApp {
             .and_then(|content| content.active_diff())
             .and_then(|(file, scope)| Some((repo_relative(repo.repo_of(scope)?, file)?, scope)));
         let colors = *self.colors();
+        let dark = self.theme.is_dark();
         let tree = self.content.changes.tree;
         let row_height = self
             .typography
@@ -3926,12 +3927,14 @@ impl CompiApp {
                             (if added > 0 { digits(added) + 2 } else { 0 })
                                 + if removed > 0 { digits(removed) + 2 } else { 0 }
                         });
-                        // What the folder may take once the letter, name and counts have
-                        // theirs.
+                        let language = language_icon(LanguageHint::Path(&change.path));
+                        // What the folder may take once the letter, the language icon,
+                        // the name and the counts have theirs.
                         let room = list_width
                             - inset
                             - 8.0 * 3.0
                             - 14.0
+                            - if language.is_some() { 20.0 } else { 0.0 }
                             - name.chars().count() as f32 * SMALL_GLYPH_WIDTH
                             - counts_chars as f32 * MICRO_GLYPH_WIDTH;
                         // The Line endings only group lists flat in tree mode too.
@@ -4033,6 +4036,7 @@ impl CompiApp {
                                             .text_color(color(kind_color(kind, &colors)))
                                             .child(status_letter(kind)),
                                     )
+                                    .when_some(language, |item, icon| item.child(icon.image(dark)))
                                     .child(
                                         div()
                                             .min_w_0()

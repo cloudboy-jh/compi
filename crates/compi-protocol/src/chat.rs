@@ -28,6 +28,8 @@ pub const MAX_CHAT_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_CHAT_DIFF_BYTES: usize = 256 * 1024;
 /// The most of a sub-agent's result kept for display: its start.
 pub const MAX_CHAT_AGENT_RESULT_BYTES: usize = 32 * 1024;
+/// The most tool calls of a sub-agent kept for display: its latest.
+pub const MAX_CHAT_AGENT_STEPS: usize = 200;
 
 /// An installed agent program Compi can chat with.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -323,14 +325,26 @@ pub struct ChatAgent {
     /// What it answered once finished, at most `MAX_CHAT_AGENT_RESULT_BYTES`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// The tool calls it made, oldest first, at most its latest `MAX_CHAT_AGENT_STEPS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ChatAgentStep>,
 }
 
 // Cost is a reported figure, never NaN; equality on the bits is what a change check needs.
 impl Eq for ChatAgent {}
 
-/// The sub-agents that ran since none did have all finished: how many, from the first
-/// one's start to now, and their summed cost when reported. `tool` is the entry of the
-/// call that started the last of them.
+/// One tool call of a sub-agent: what it said it was doing, else the tool and its
+/// argument, in one short line, and whether it runs, ended or failed. One still running
+/// when its agent has ended did not finish.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatAgentStep {
+    pub text: String,
+    pub status: ChatToolStatus,
+}
+
+/// The sub-agents that ran since none did have all finished: how many, their elapsed
+/// time from reported starts/finishes, and their summed cost when reported. Late
+/// corrections replace the same entry. `tool` is the last call in the wave.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatAgentsFinished {
     pub tool: usize,

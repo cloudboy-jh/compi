@@ -4,27 +4,33 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 ## Release state
 
-- **0.7.4** tagged `v0.7.4` at `715fefa` (2026-11-10); release run [42919485431](https://github.com/cloudboy-jh/compi/actions/runs/42919485431). Next: check the draft (12 assets, signed metadata 0.7.4 / protocol 40 / qualified daemon 0.7.4, hashes against `SHA256SUMS.txt`), publish, then update from the installed 0.7.3. Protocol 39 → 40, so updating restarts the daemon.
-- **0.7.3** is Latest until then (published 2026-11-10 19:10 UTC).
+- **0.7.4** is Latest: published 2026-11-10 23:18 UTC, tagged `v0.7.4` at `715fefa`, release run [42919485431](https://github.com/cloudboy-jh/compi/actions/runs/42919485431), 12 assets. Not seen: the update from an installed 0.7.3 (protocol 39 → 40, so it restarts the daemon).
 
 ## 0.7.4: not seen yet
 
 - Clicking a chat's notification to open it; the focused chat staying quiet (needs Compi active); typing in the composer clearing done.
 - A chat's pane dot, floating title, sidebar and palette lines and hover card.
-- Stopping a turn while sub-agents run (OMP may send no final status, leaving them "running" until restart); a resumed session's replay of an old task call; OMP's blocking task path (`details.results[]`).
+- Stopping a turn while sub-agents run on screen; OMP's blocking task path (`details.results[]`). Saved completions after a cancelled parent turn have a daemon regression check.
 - Settings → Chat: another Approvals choice picked in Settings, Queue, Beside, the agents bar off.
 - A Windows (`omp.exe`) chat's approval lookup and status.
 - Settings → Advanced: the performance readout is still a block of figures, not rows.
 
-## Next: Windows work from a WSL session
+## Latest source: checks left (asked 2026-11-10)
 
-Vault plan: `feat windows from wsl.md` (from an OMP session on 2026-11-08 that installed mods through Vortex from WSL `/tmp`). An agent in a WSL folder had to find the Windows home by listing `/mnt/c` and asking `pwsh.exe` for `$env:USERPROFILE`; `pwsh.exe` ran through `~/.compi/wincmd…` but `tasklist.exe` needed its full path; it could not see a Windows dialog it caused; searching `C:\Users\johns` from WSL timed out twice.
+Commands from the other shell, dev-server cards and in-place browsing, Catppuccin language icons, and clickable sub-agent task/step lists are implemented. Details and observed checks: [Completed work](COMPLETED.md).
 
-1. At session start in WSL, tell the agent it runs in WSL on Windows and give it the Windows home folder in both forms (`C:\Users\…`, `/mnt/c/Users/…`). Where it goes is open: the shell bridge's environment (`COMPI_WINDOWS_FOLDERS` already carries `Home=`), `compi` CLI output an agent reads, or a file agents load.
-2. Put `cmd.exe`, `tasklist.exe` and `winget.exe` in the same `wincmd` folder as `pwsh.exe` (`shell_integration::WindowsCommands`), so they run without full paths.
+- macOS browser views and icon rendering: the only known Mac, `bruisedpear`, was offline on 2026-11-11, with no Mac SSH host configured. Native checks could not run. Physical Ctrl/Cmd-click on a local link and the view-toggle chord while the web page has the keyboard also remain unobserved.
+- Alternative line editors are not intercepted; custom executable/argument profiles keep their existing behavior. The other-shell setting applies to new shells. Tab completion stays with the current shell.
+
+## Waiting: Windows work from a WSL session
+
+Vault plan: `feat windows from wsl.md` (from an OMP session on 2026-11-08 that installed mods through Vortex from WSL `/tmp`).
+
+1. At session start in WSL, tell the agent it runs in WSL on Windows and give it the Windows home folder in both forms. Where it goes is open: for OMP chats `--append-system-prompt` if `omp acp` takes it (unchecked); a `compi` command an agent reads; a line users add to their own agent file.
+2. Done already: `cmd.exe`, `tasklist.exe` and `winget.exe` are in every `~/.compi/wincmd.<id>` index (the launchers cover the whole Windows search path; all three ran from `/tmp` on 2026-11-10). The session's agent ran `tasklist.exe 2>/dev/null | grep -i cybe` while the game was not running, saw nothing and switched to the full path.
 3. Let an agent capture an open Windows app window (a `compi` command returning an image path), so it can see dialogs it caused.
 
-Check: a fresh session in WSL `/tmp` names the Windows home folder, runs `tasklist` and `winget --version` without full paths, and describes a dialog open in another app. Not seen yet: UAC prompts, `winget` installs, why `cmd.exe /c start steam://…` did not start the game.
+Not seen yet: UAC prompts, `winget` installs, why `cmd.exe /c start steam://…` did not start the game.
 
 ## Planned, later
 

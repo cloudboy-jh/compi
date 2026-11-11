@@ -62,30 +62,12 @@ pub(super) fn native_path(environment: &ContentEnvironment, path: &str) -> Optio
             if !cfg!(windows) || !path.starts_with('/') {
                 return None;
             }
-            Some(PathBuf::from(wsl_windows_path(distribution, path)))
+            Some(PathBuf::from(crate::content_path::wsl_windows_path(
+                distribution,
+                path,
+            )))
         }
     }
-}
-
-/// A WSL path in Windows syntax: `/mnt/c/…` is `C:\…` (the share refuses drive
-/// mounts), anything else `\\wsl.localhost\<distribution>\…`.
-fn wsl_windows_path(distribution: &str, path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("/mnt/") {
-        let (drive, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        if let [letter] = drive.as_bytes()
-            && letter.is_ascii_alphabetic()
-        {
-            return format!(
-                r"{}:\{}",
-                letter.to_ascii_uppercase() as char,
-                tail.replace('/', "\\")
-            );
-        }
-    }
-    format!(
-        r"\\wsl.localhost\{distribution}\{}",
-        path.trim_start_matches('/').replace('/', "\\")
-    )
 }
 
 /// Where a path the system hands Compi lives (Explorer's Open with, Finder's Open
@@ -547,6 +529,7 @@ mod tests {
 
     #[test]
     fn wsl_paths_open_through_their_drive_or_the_distribution_share() {
+        use crate::content_path::wsl_windows_path;
         assert_eq!(
             wsl_windows_path("Ubuntu", "/mnt/c/Users/me/notes.md"),
             r"C:\Users\me\notes.md"

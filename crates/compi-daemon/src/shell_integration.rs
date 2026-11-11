@@ -70,7 +70,29 @@ pub(crate) fn windows_folders() -> Option<String> {
 pub(crate) fn powershell_argv() -> Vec<OsString> {
     static ENCODED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         use base64::Engine;
-        let script: Vec<u8> = include_str!("../../../assets/compi-shell.ps1")
+        use std::io::Write as _;
+        // Keep the encoded bootstrap below Windows' command-line length limit.
+        let mut compressed =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        compressed
+            .write_all(
+                concat!(
+                    include_str!("../../../assets/compi-shell.ps1"),
+                    "\n",
+                    include_str!("../../../assets/compi-other-shell.ps1"),
+                )
+                .as_bytes(),
+            )
+            .expect("write PowerShell integration to memory");
+        let payload = base64::engine::general_purpose::STANDARD.encode(
+            compressed
+                .finish()
+                .expect("finish PowerShell integration in memory"),
+        );
+        let bootstrap = format!(
+            "$b=[Convert]::FromBase64String('{payload}');$m=[IO.MemoryStream]::new($b,0,$b.Length);$g=[IO.Compression.GZipStream]::new($m,[IO.Compression.CompressionMode]::Decompress);$r=[IO.StreamReader]::new($g);try{{. ([ScriptBlock]::Create($r.ReadToEnd()))}}finally{{$r.Dispose()}}"
+        );
+        let script: Vec<u8> = bootstrap
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect();
@@ -1103,6 +1125,17 @@ mod tests {
 mod windows_tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn powershell_integration_fits_the_windows_command_line() {
+        use std::os::windows::ffi::OsStrExt as _;
+        let args = powershell_argv();
+        let length: usize = args.iter().map(|arg| arg.encode_wide().count() + 3).sum();
+        assert!(
+            length < 30_000,
+            "PowerShell startup needs {length} UTF-16 units"
+        );
+    }
 
     #[test]
     fn wsl_startup_preserves_bash_rc_and_imports_login_functions() {

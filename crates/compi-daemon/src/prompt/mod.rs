@@ -113,6 +113,7 @@ struct Facts {
     /// Windows PowerShell's profile, which runs outside Compi.
     profile: Option<String>,
     execution_policy: Option<String>,
+    psreadline_chord: Option<bool>,
     state: PromptState,
     state_error: Option<String>,
     backups: Vec<Manifest>,
@@ -267,6 +268,7 @@ fn parse_probe(output: &str) -> Facts {
             "profile_sources_bashrc" => facts.profile_sources_bashrc = Some(rest == "yes"),
             "profile" => facts.profile = Some(rest.to_owned()),
             "execution_policy" => facts.execution_policy = Some(rest.to_owned()),
+            "psreadline_chord" => facts.psreadline_chord = Some(rest == "True"),
             "state" => match serde_json::from_str(rest) {
                 Ok(state) => facts.state = state,
                 Err(error) => facts.state_error = Some(error.to_string()),
@@ -504,6 +506,13 @@ fn notes(
 ) -> Vec<String> {
     let mut notes = Vec::new();
     if target.is_windows() {
+        if facts.binary(PromptProvider::OhMyPosh).is_some() && facts.psreadline_chord != Some(true)
+        {
+            notes.push(
+                "Oh My Posh theme changes require PSReadLine's Get-PSReadLineKeyHandler -Chord API. Run Install-Module PSReadLine -Scope CurrentUser -Force, open a new terminal, then refresh Prompt settings. Compi leaves the working prompt unchanged until this dependency is available."
+                    .into(),
+            );
+        }
         if let Some(policy) = facts
             .execution_policy
             .as_deref()
@@ -927,6 +936,15 @@ fn prepare(
     facts: &Facts,
     operation: &PromptOperation,
 ) -> Result<Prepared, Failure> {
+    if let PromptOperation::Apply { config, .. } = operation
+        && config.provider == PromptProvider::OhMyPosh
+        && target.is_windows()
+        && facts.psreadline_chord != Some(true)
+    {
+        return Err(invalid(
+            "Oh My Posh theme changes require PSReadLine's Get-PSReadLineKeyHandler -Chord API. Run Install-Module PSReadLine -Scope CurrentUser -Force, open a new terminal, then refresh Prompt settings. No prompt settings were changed.",
+        ));
+    }
     let base = facts.base();
     let shells = target.shells();
     let login = PromptShell::from_path(&facts.login_shell).filter(|shell| shells.contains(shell));
@@ -1659,13 +1677,18 @@ done"#;
         let facts = parse_probe(
             "host\tbox\nhome\t/h\nlogin_shell\t/usr/bin/zsh\nprovider\tstarship\t/b/starship\tstarship 1.2.3\n\
              windows\toh-my-posh\t/mnt/c/x/oh-my-posh.exe\ntheme\t/t/b.omp.json\ntheme\t/t/a.omp.json\n\
-             theme\t/a/b.omp.yaml\n\
+             theme\t/a/b.omp.yaml\npsreadline_chord\tFalse\n\
              startup\t/h/.zshrc\t12:eval \"$(starship init zsh)\"\nstate\tnot json\nnoise\n\
              backup\t{\"id\":\"1\",\"created_ms\":1,\"description\":\"d\",\"entries\":[]}\n\
              backup\t{\"id\":\"../x\",\"created_ms\":2,\"description\":\"d\",\"entries\":[]}\n",
         );
         assert_eq!(facts.binary(PromptProvider::Starship), Some("/b/starship"));
         assert_eq!(facts.providers[0].2, "1.2.3");
+        assert_eq!(facts.psreadline_chord, Some(false));
+        assert_eq!(
+            parse_probe("psreadline_chord\tTrue\n").psreadline_chord,
+            Some(true)
+        );
         assert_eq!(
             facts.windows,
             [(PromptProvider::OhMyPosh, "/mnt/c/x/oh-my-posh.exe".into())]

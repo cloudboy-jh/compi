@@ -18,7 +18,7 @@
 use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
 use super::*;
-use crate::config::{ChatEnter, ChatOpen};
+use crate::config::{ChatEnter, ChatOpen, DevServer};
 use crate::gui::controls::IconName;
 use compi_protocol::chat::ChatApproval;
 use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
@@ -113,6 +113,9 @@ pub(super) enum SettingsAction {
     ChatEnter,
     /// Opening a chat: Left and Right pick in place or beside, Enter flips it.
     ChatOpen,
+    /// When a dev server starts: Left and Right step through the choices, Enter moves
+    /// to the next.
+    DevServer,
     ToggleChatAgentsBar,
     OpenConfiguration,
     /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
@@ -140,6 +143,7 @@ pub(super) enum SettingsAction {
     FocusIndicator(crate::theme::FocusIndicator),
     ProgramStatus(usize),
     NotificationAttention,
+    OtherShellCommands,
     NotificationFinished,
     PlayNotificationSound,
     OpenNotificationSystemSettings,
@@ -880,6 +884,29 @@ static ROWS: &[Row] = &[
             |app, row, cx| app.render_starting_folder_row(row, cx),
         ),
     ),
+    shown_when(
+        |_| cfg!(windows),
+        grouped(
+            "Shell",
+            row(
+                "other-shell-commands",
+                SettingsSection::Terminal,
+                "Commands from the other shell",
+                "Runs clearly PowerShell or Bash commands in the right shell on Enter. Applies to new shells.",
+                "powershell bash zsh wsl commands typed paste",
+                |_| vec![SettingsAction::OtherShellCommands],
+                |app, row, cx| {
+                    app.render_toggle_row(
+                        row,
+                        app.config.other_shell_commands(),
+                        SettingsAction::OtherShellCommands,
+                        row_description("other-shell-commands"),
+                        cx,
+                    )
+                },
+            ),
+        ),
+    ),
     grouped(
         "Font",
         row(
@@ -938,6 +965,18 @@ static ROWS: &[Row] = &[
                     cx,
                 )
             },
+        ),
+    ),
+    grouped(
+        "Dev servers",
+        row(
+            "dev-server",
+            SettingsSection::Terminal,
+            "When a dev server starts",
+            "What a terminal does once a local address it printed, such as localhost:5173, answers.",
+            "localhost browser web page preview open card automatically vite npm port http",
+            |_| vec![SettingsAction::DevServer],
+            |app, row, cx| app.render_dev_server_row(row, cx),
         ),
     ),
     grouped(
@@ -1440,7 +1479,7 @@ fn section_summary(section: SettingsSection) -> &'static str {
             "Fonts, pane layout, tab details, closing, focus and program status."
         }
         SettingsSection::Notifications => "When and where Compi tells you a program needs you.",
-        SettingsSection::Terminal => "Shell, starting folder, font and prompt.",
+        SettingsSection::Terminal => "Shell, starting folder, font, dev servers and prompt.",
         SettingsSection::Chat => "How agent chats look and behave.",
         SettingsSection::Keyboard => {
             "Click a shortcut, then press the new keys. Escape cancels; Backspace leaves the \
@@ -2566,6 +2605,25 @@ impl CompiApp {
                 self.set_chat_open(ChatOpen::ALL[usize::from(key.key == "right")], cx);
                 current
             }
+            (
+                "left" | "right",
+                Some(Stop::Control {
+                    action: SettingsAction::DevServer,
+                    ..
+                }),
+            ) => {
+                let index = DevServer::ALL
+                    .iter()
+                    .position(|action| *action == self.config.dev_server)
+                    .unwrap_or(0);
+                let next = if key.key == "right" {
+                    (index + 1).min(DevServer::ALL.len() - 1)
+                } else {
+                    index.saturating_sub(1)
+                };
+                self.set_dev_server(DevServer::ALL[next], cx);
+                current
+            }
             ("tab", _) => step(&order, current, !modifiers.shift),
             ("left" | "right", Some(Stop::Section(section))) => {
                 let index = SettingsSection::ALL
@@ -2688,8 +2746,29 @@ impl CompiApp {
                 },
                 cx,
             ),
+            SettingsAction::DevServer => self.set_dev_server(
+                match self.config.dev_server {
+                    DevServer::Offer => DevServer::Open,
+                    DevServer::Open => DevServer::Nothing,
+                    DevServer::Nothing => DevServer::Offer,
+                },
+                cx,
+            ),
             SettingsAction::ToggleChatAgentsBar => {
                 self.set_chat_agents_bar(!self.config.chat_agents_bar, cx);
+            }
+            SettingsAction::OtherShellCommands => {
+                let enabled = !self.config.other_shell_commands();
+                if let Err(error) = self.config.save_other_shell_commands(enabled) {
+                    self.global_error = Some(error);
+                } else {
+                    share_launch_change(cx, move |launch| {
+                        launch.env.insert(
+                            "COMPI_OTHER_SHELL_COMMANDS".into(),
+                            if enabled { "1" } else { "0" }.into(),
+                        );
+                    });
+                }
             }
             SettingsAction::NotificationAttention => {
                 let mut settings = self.config.notifications;
@@ -3860,13 +3939,45 @@ impl CompiApp {
         )
     }
 
-    /// A choice of two `options` (label, tooltip detail, picked) as a segmented switch, one
-    /// stop for `action`: a click or Left and Right pick, Enter moves to the other.
-    fn render_choice_row(
+    /// When a dev server starts: the card, the page by itself, or nothing, as a switch.
+    fn render_dev_server_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let current = self.config.dev_server;
+        let detail = match current {
+            DevServer::Offer => {
+                "A card at the terminal's bottom right offers the page once the address answers."
+            }
+            DevServer::Open => {
+                "The page shows in place of the shell once the address answers, one time for each start of the server."
+            }
+            DevServer::Nothing => "The terminal stays as it is.",
+        };
+        self.render_choice_row(
+            row,
+            SettingsAction::DevServer,
+            DevServer::ALL.map(|action| {
+                (
+                    action.label(),
+                    match action {
+                        DevServer::Offer => "A card in the terminal",
+                        DevServer::Open => "The page, in place of the shell",
+                        DevServer::Nothing => "No card and no page",
+                    },
+                    action == current,
+                )
+            }),
+            |app, index, cx| app.set_dev_server(DevServer::ALL[index], cx),
+            detail.into(),
+            cx,
+        )
+    }
+
+    /// A choice among `options` (label, tooltip detail, picked) as a segmented switch, one
+    /// stop for `action`: a click or Left and Right pick, Enter moves to the next.
+    fn render_choice_row<const N: usize>(
         &self,
         row: &RowCx,
         action: SettingsAction,
-        options: [(&'static str, &'static str, bool); 2],
+        options: [(&'static str, &'static str, bool); N],
         pick: fn(&mut Self, usize, &mut Context<Self>),
         detail: String,
         cx: &Context<Self>,
@@ -3912,6 +4023,16 @@ impl CompiApp {
             return;
         }
         share_config_change(cx, move |config| config.chat_open = open);
+    }
+
+    /// Saves what a terminal does when a dev server starts and gives it to every
+    /// window, whose terminals follow it from their next check.
+    fn set_dev_server(&mut self, action: DevServer, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_dev_server(action) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_config_change(cx, move |config| config.dev_server = action);
     }
 
     /// Saves whether chats show the agents bar and gives it to every window.
@@ -5769,7 +5890,7 @@ mod tests {
         );
         assert_eq!(
             groups(SettingsSection::Terminal),
-            ["Shell", "Font", "Prompt"]
+            ["Shell", "Font", "Dev servers", "Prompt"]
         );
         assert_eq!(
             groups(SettingsSection::Chat),

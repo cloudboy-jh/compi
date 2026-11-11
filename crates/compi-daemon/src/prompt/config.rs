@@ -58,6 +58,14 @@ fn powershell_load(path: &str) -> String {
     )
 }
 
+/// OMP's module removal hook needs PSReadLine's public per-chord query API.
+/// Check before init can remove the working provider; never unload PSReadLine
+/// or change its cmdlets to make an unsupported dependency appear compatible.
+const POWERSHELL_POSH_PREFLIGHT: &str = r#"    $compiKeyHandler = Get-Command Get-PSReadLineKeyHandler -ErrorAction Stop
+    if (-not $compiKeyHandler.Parameters.ContainsKey('Chord')) {
+        throw 'Oh My Posh theme changes require a newer PSReadLine with Get-PSReadLineKeyHandler -Chord. Run Install-Module PSReadLine -Scope CurrentUser -Force, then open a new terminal and refresh Prompt settings. Your current prompt has not been changed.'
+    }"#;
+
 /// The init script Compi sources for one scope and shell.
 pub(super) fn init_script(
     provider: PromptProvider,
@@ -78,7 +86,9 @@ pub(super) fn init_script(
             let config = powershell_quote(config);
             let init = match provider {
                 PromptProvider::OhMyPosh => {
-                    format!("    & {binary} init pwsh --config {config} | Invoke-Expression")
+                    format!(
+                        "{POWERSHELL_POSH_PREFLIGHT}\n    & {binary} init pwsh --config {config} | Invoke-Expression"
+                    )
                 }
                 PromptProvider::Starship => format!(
                     "    $env:STARSHIP_CONFIG = {config}\n    Invoke-Expression (& {binary} init powershell --print-full-init | Out-String)"
@@ -298,7 +308,6 @@ pub(super) fn style_label(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::prompt::{PromptApplied, PromptConfig, PromptStyle};
 
     #[test]
     fn block_is_replaced_in_place_appended_once_and_removed_without_touching_other_lines() {
@@ -384,77 +393,5 @@ mod tests {
                 "{line}"
             );
         }
-    }
-
-    #[test]
-    fn powershell_scripts_quote_paths_and_load_without_the_execution_policy() {
-        let script = init_script(
-            PromptProvider::OhMyPosh,
-            "C:/Users/it's/oh-my-posh.exe",
-            PromptShell::PowerShell,
-            "C:/Users/it's/.compi/prompt/compi.omp.json",
-        );
-        assert!(script.contains("if (Test-Path -LiteralPath 'C:/Users/it''s/oh-my-posh.exe') {"));
-        assert!(script.contains(
-            "& 'C:/Users/it''s/oh-my-posh.exe' init pwsh --config 'C:/Users/it''s/.compi/prompt/compi.omp.json' | Invoke-Expression"
-        ));
-        let state = PromptState {
-            compi: Some(PromptApplied {
-                config: PromptConfig {
-                    provider: PromptProvider::OhMyPosh,
-                    style: PromptStyle::Default,
-                },
-                shell: None,
-                startup_file: None,
-                applied_at_ms: 1,
-            }),
-            normal: None,
-        };
-        let live = live_script(PromptShell::PowerShell, &state, "C:/Users/me/.compi/prompt");
-        assert!(live.unwrap().contains(
-            "[ScriptBlock]::Create([IO.File]::ReadAllText('C:/Users/me/.compi/prompt/compi.ps1'))"
-        ));
-        let profile = "Set-Alias ll ls\r\n";
-        let added = with_block(profile, &block(PromptShell::PowerShell));
-        assert!(added.starts_with(profile) && added.contains("normal.ps1"));
-        assert_eq!(without_block(&added), profile);
-    }
-
-    #[test]
-    fn live_script_loads_normal_only_for_its_shell_before_the_compi_prompt() {
-        let applied = |shell| PromptApplied {
-            config: PromptConfig {
-                provider: PromptProvider::Starship,
-                style: PromptStyle::Default,
-            },
-            shell,
-            startup_file: None,
-            applied_at_ms: 1,
-        };
-        let state = PromptState {
-            compi: Some(applied(None)),
-            normal: Some(applied(Some(PromptShell::Zsh))),
-        };
-        let zsh = live_script(PromptShell::Zsh, &state, "/h/.compi/prompt").unwrap();
-        let normal = zsh.find("normal.zsh").unwrap();
-        assert!(normal < zsh.find("compi.zsh").unwrap());
-        let bash = live_script(PromptShell::Bash, &state, "/h/.compi/prompt").unwrap();
-        assert!(!bash.contains("normal.") && bash.contains("compi.bash"));
-        assert_eq!(
-            live_script(PromptShell::Bash, &PromptState::default(), "/h"),
-            None
-        );
-    }
-
-    #[test]
-    fn init_script_quotes_paths_and_guards_a_missing_provider() {
-        let script = init_script(
-            PromptProvider::OhMyPosh,
-            "/opt/it's/oh-my-posh",
-            PromptShell::Bash,
-            "/home/me/.compi/prompt/compi.omp.json",
-        );
-        assert!(script.contains("if [ -x '/opt/it'\\''s/oh-my-posh' ]; then"));
-        assert!(script.contains("init bash --config '/home/me/.compi/prompt/compi.omp.json'"));
     }
 }

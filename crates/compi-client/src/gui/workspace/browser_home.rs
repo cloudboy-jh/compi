@@ -71,11 +71,13 @@ impl HomeUi {
     }
 }
 
-/// Each logical line of `snapshot`, history first: soft-wrapped rows joined.
-fn snapshot_lines(snapshot: &ScreenSnapshot) -> Vec<String> {
+/// Each logical line of `snapshot`, its last `history_rows` history rows first:
+/// soft-wrapped rows joined.
+pub(super) fn snapshot_lines(snapshot: &ScreenSnapshot, history_rows: usize) -> Vec<String> {
+    let skipped = snapshot.scrollback.len().saturating_sub(history_rows);
     let history = snapshot
         .scrollback
-        .iter()
+        .range(skipped..)
         .map(|row| (Cow::Borrowed(row.text.as_str()), row.wrapped));
     let screen = snapshot.cells.iter().map(|row| {
         let text: String = row.cells.iter().map(|cell| cell.text.as_str()).collect();
@@ -101,7 +103,7 @@ fn join_wrapped<'a>(rows: impl Iterator<Item = (Cow<'a, str>, bool)>) -> Vec<Str
 }
 
 /// The loopback addresses `lines` mention, newest (last) first, each once.
-fn local_links(lines: &[String]) -> Vec<String> {
+pub(super) fn local_links(lines: &[String]) -> Vec<String> {
     let mut found = Vec::new();
     for line in lines.iter().rev() {
         for (at, _) in line.match_indices("://") {
@@ -136,7 +138,7 @@ fn local_links(lines: &[String]) -> Vec<String> {
 /// of this machine: `localhost` or a name under it, `127.x.x.x` or `[::1]`. A server
 /// listening on every interface (`0.0.0.0`, `[::]`) is opened at `localhost`; a bare
 /// `/` path is dropped, so one server reads the same however it was printed.
-fn local_link(token: &str) -> Option<String> {
+pub(super) fn local_link(token: &str) -> Option<String> {
     let url = BrowserContent::from_typed(token).ok()?.url;
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
@@ -178,7 +180,7 @@ fn split_port(authority: &str) -> (&str, Option<&str>) {
 }
 
 /// Whether something accepts connections where `url` points, as the page would reach it.
-fn listening(url: &str) -> bool {
+pub(super) fn listening(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };
@@ -204,7 +206,7 @@ fn listening(url: &str) -> bool {
 }
 
 /// An address as a row shows it: without its scheme, or the trailing `/` of a site.
-fn display_address(url: &str) -> &str {
+pub(super) fn display_address(url: &str) -> &str {
     let shown = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -261,7 +263,7 @@ impl CompiApp {
                     let Ok(snapshot) = client.inspect_surface(&surface, true) else {
                         continue;
                     };
-                    for url in local_links(&snapshot_lines(&snapshot)) {
+                    for url in local_links(&snapshot_lines(&snapshot, usize::MAX)) {
                         if !links.iter().any(|link| link.url == url) {
                             links.push(HomeLink {
                                 url,

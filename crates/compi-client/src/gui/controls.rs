@@ -119,7 +119,7 @@ gpui_kit_assets::icon_assets!(
 pub(super) const OMP_MARK: &str = "brands/omp.svg";
 
 /// The application's assets: GPUI Kit's default icons, the extra Lucide icons Compi
-/// uses (`ExtraIcons`) and harness marks.
+/// uses (`ExtraIcons`), harness marks and language icons.
 pub(super) struct Assets;
 
 impl AssetSource for Assets {
@@ -128,6 +128,9 @@ impl AssetSource for Assets {
             return Ok(Some(Cow::Borrowed(include_bytes!(
                 "../../assets/brands/omp.svg"
             ))));
+        }
+        if let Some(bytes) = super::language_icons::file(path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
         }
         if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));

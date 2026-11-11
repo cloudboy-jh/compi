@@ -1,4 +1,5 @@
-//! Views in place. A terminal pane can carry a view (Files, Settings, Monitor or a chat) shown
+//! Views in place. A terminal pane can carry a view (Files, Settings, Monitor, a web
+//! page or a chat) shown
 //! in place of its shell, which keeps running underneath at its size: the layout still
 //! sizes the pane in cells, so its PTY never shrinks for the view. The view shares the
 //! terminal's `PaneId`, so its content's client state (`ContentUi`, `SettingsUi`,
@@ -7,7 +8,8 @@
 //! to the shell, whose program hears it lost focus. Cmd/Ctrl+Shift+E flips the side,
 //! Escape with nothing left to dismiss in the view goes back to the shell, and the pane
 //! menu shows either side; Move to its own pane puts the view in a pane of its own
-//! beside the shell, and its client state follows it to that pane.
+//! beside the shell, and its client state follows it to that pane (a web page loads
+//! again there, at its address).
 //!
 //! `compi tree` shows the shell's folder in its Files view with **Enter folder**, which
 //! answers the shell waiting for a folder to change to; leaving the view any other way

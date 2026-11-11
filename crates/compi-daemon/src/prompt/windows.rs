@@ -98,7 +98,7 @@ pub(super) fn probe_output(target: &Target) -> Result<String, String> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[Environment]::GetFolderPath('MyDocuments'); Get-ExecutionPolicy",
+            "[Environment]::GetFolderPath('MyDocuments'); Get-ExecutionPolicy; Import-Module PSReadLine -ErrorAction Stop; (Get-Command Get-PSReadLineKeyHandler -ErrorAction Stop).Parameters.ContainsKey('Chord')",
         ],
     );
     let mut lines = shell.lines().map(str::trim);
@@ -123,6 +123,9 @@ pub(super) fn probe_output(target: &Target) -> Result<String, String> {
     }
     if let Some(policy) = lines.next().filter(|line| !line.is_empty()) {
         records.push(format!("execution_policy\t{policy}"));
+    }
+    if let Some(supported) = lines.next().filter(|line| !line.is_empty()) {
+        records.push(format!("psreadline_chord\t{supported}"));
     }
     if let Some(binary) = find(PromptProvider::OhMyPosh.executable()) {
         let version = output(target, &binary, &["--version"]);

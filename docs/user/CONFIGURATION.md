@@ -131,4 +131,13 @@ focus_indicator = "marker" # marker, outline, dim, or none
 
 Floating panes keep their **Keyboard** label with every option. When the system asks for reduced motion (Windows Animation effects off, or macOS Reduce motion), the arrival outline shows for the same time without fading; this is read when Compi starts.
 
+## Dev servers
+
+**Settings → Terminal → When a dev server starts** chooses what a terminal does once a local address it printed, such as `http://localhost:5173/`, answers: **Offer to open** (default) shows a card with the address at the pane's bottom right, **Open automatically** shows the page in place of the shell once for each start of the server, and **Do nothing** leaves the terminal as it is.
+
+```toml
+[workspace]
+dev_server = "offer" # offer, open, or nothing
+```
+
 [Back to README](../../README.md)

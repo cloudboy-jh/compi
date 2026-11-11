@@ -1,6 +1,7 @@
 //! The pickers drawn over the pane they serve: `compi z`'s Jump to project, which
 //! answers the shell that asked, and Switch branch / Create branch (see `branches`).
 //! Browsing folders is the Files view's (see `views`).
+use super::content::{LanguageHint, language_icon};
 use super::*;
 use gpui::prelude::*;
 
@@ -185,6 +186,7 @@ impl CompiApp {
             return div().into_any_element();
         };
         let colors = *self.colors();
+        let dark = self.theme.is_dark();
         let can_enter = tree.project_mode && tree.selected().is_some_and(|row| row.directory);
         let input = cx.entity();
         let focus = self.focus_handle.clone();
@@ -227,7 +229,8 @@ impl CompiApp {
                         .when(!selected, |entry| {
                             entry.hover(move |style| style.bg(color(colors.surface_hover)))
                         })
-                        .child(tree_entry_icon(
+                        .child(tree_row_icon(
+                            &row.path,
                             folder,
                             false,
                             color(if selected {
@@ -237,6 +240,7 @@ impl CompiApp {
                             } else {
                                 colors.muted
                             }),
+                            dark,
                         ))
                         .child(div().ml_1().child(row.path.clone())),
                 )
@@ -405,6 +409,24 @@ impl CompiApp {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// A tree row's icon: the language icon of a file in a language Compi has one for, else
+/// the folder or page outline in `tint`.
+pub(super) fn tree_row_icon(
+    path: &str,
+    folder: bool,
+    expanded: bool,
+    tint: Hsla,
+    dark: bool,
+) -> AnyElement {
+    match (!folder)
+        .then(|| language_icon(LanguageHint::Path(path)))
+        .flatten()
+    {
+        Some(icon) => icon.image(dark).into_any_element(),
+        None => tree_entry_icon(folder, expanded, tint).into_any_element(),
     }
 }
 

@@ -1587,12 +1587,21 @@ impl BrowserContent {
     pub const BLANK: &str = "about:blank";
 
     /// The page an address typed, pasted or passed on the command line names: as given
-    /// when it has a scheme (`https://…`, `about:blank`), else an `http://` location
-    /// such as `localhost:3000`, `example.com/docs` or `//example.com`. Text around a
-    /// pasted address is dropped first (see `clean_typed`). Refused as `validate`
-    /// refuses.
+    /// when it has a scheme (`https://…`, `about:blank`), a bare port (`3000`, `:3000`)
+    /// as that port of this machine, else an `http://` location such as
+    /// `localhost:3000`, `example.com/docs` or `//example.com`. Text around a pasted
+    /// address is dropped first (see `clean_typed`). Refused as `validate` refuses.
     pub fn from_typed(typed: &str) -> Result<Self, String> {
         let typed = clean_typed(typed);
+        let port = typed.strip_prefix(':').unwrap_or(&typed);
+        if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return match port.parse::<u16>() {
+                Ok(port) if port != 0 => Ok(Self {
+                    url: format!("http://localhost:{port}"),
+                }),
+                _ => Err(format!("{typed} is not a port between 1 and 65535")),
+            };
+        }
         // A scheme is letters before a colon not followed by a port number.
         let scheme = typed.split_once(':').is_some_and(|(scheme, rest)| {
             scheme
@@ -2828,6 +2837,10 @@ mod content_tests {
     fn typed_addresses_assume_http_without_a_scheme() {
         let typed = |text: &str| BrowserContent::from_typed(text).map(|content| content.url);
         assert_eq!(typed("localhost:3000").unwrap(), "http://localhost:3000");
+        // A bare port is this machine's.
+        assert_eq!(typed("5173").unwrap(), "http://localhost:5173");
+        assert_eq!(typed(":8080").unwrap(), "http://localhost:8080");
+        assert!(typed("0").is_err() && typed("65536").is_err() && typed(":").is_err());
         assert_eq!(
             typed("  example.com/a?b ").unwrap(),
             "http://example.com/a?b"

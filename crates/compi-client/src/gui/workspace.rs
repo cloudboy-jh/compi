@@ -1076,6 +1076,7 @@ impl CompiApp {
                     .update(cx, |this, cx| {
                         this.poll_metadata(cx);
                         this.poll_browser_home(cx);
+                        this.poll_dev_servers(cx);
                         this.expire_toasts(cx);
                         let now = Instant::now();
                         let mut scroll_expired = false;
@@ -6747,6 +6748,11 @@ impl CompiApp {
                             .bg(color(colors.muted).opacity(0.32)),
                     )
                 },
+            )
+            .children(
+                (!tree_active)
+                    .then(|| self.render_server_card(&pane_id, rect.width, new_lines > 0, cx))
+                    .flatten(),
             )
             .when(!tree_active && new_lines > 0, |pane| {
                 pane.child(

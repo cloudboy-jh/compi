@@ -52,6 +52,8 @@ const OMP_APPROVAL_MODES: [&str; 4] = ["always-ask", "always-ask-cached", "write
 const UNIX_COMMAND: &str = r#"PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin" exec omp"#;
 /// The longest line a sub-agent's activity keeps, in characters.
 const AGENT_ACTIVITY_CHARS: usize = 160;
+/// How often a chat with sub-agents running looks in the session's file for their ends.
+const AGENT_POLL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 
@@ -220,7 +222,7 @@ fn chat_ids(node: &LayoutNode, output: &mut HashSet<String>) {
 }
 
 /// `state` within `budget` bytes of JSON: the oldest tool calls lose their output, diffs,
-/// input and their sub-agents' results and tasks until it fits.
+/// input and their sub-agents' results, tasks and steps until it fits.
 fn fit(mut state: ChatState, budget: usize) -> ChatState {
     let size = |state: &ChatState| serde_json::to_vec(state).map_or(0, |bytes| bytes.len());
     let mut over = size(&state).saturating_sub(budget);
@@ -240,6 +242,10 @@ fn fit(mut state: ChatState, budget: usize) -> ChatState {
             for agent in &mut tool.agents {
                 freed += agent.result.take().map_or(0, |text| text.len());
                 freed += agent.assignment.take().map_or(0, |text| text.len());
+                freed += std::mem::take(&mut agent.steps)
+                    .iter()
+                    .map(|step| step.text.len())
+                    .sum::<usize>();
             }
             over = over.saturating_sub(freed);
             if over == 0 {
@@ -358,6 +364,11 @@ impl Prompt {
     }
 }
 
+struct FinishedAgentWave {
+    entry: usize,
+    tools: Vec<usize>,
+}
+
 #[derive(Default)]
 struct Inner {
     /// The chat's ID, which its program status goes under.
@@ -399,6 +410,14 @@ struct Inner {
     /// Entries of the tool calls whose sub-agents ran since none did; once none of them
     /// runs, the transcript gets a summary.
     agent_wave: Vec<usize>,
+    /// Calls already included in a finished wave and the card to refresh on late reports.
+    agents_summarized: HashMap<usize, Arc<FinishedAgentWave>>,
+    /// Bumped when the transcript resets, even without restarting the harness.
+    agents_revision: u64,
+    /// Parent-file bytes already consumed, retained between waves of agents.
+    agents_offset: u64,
+    /// The harness generation and transcript revision watched by the file reader.
+    agents_watched: Option<(u64, u64)>,
     /// The JSON-RPC ID of the permission request `state.permission` shows.
     permission_request: Option<Value>,
     next_permission: u64,
@@ -644,7 +663,9 @@ impl Chat {
         let id = message.get("id").cloned();
         match (method, id) {
             (Some(method), Some(id)) => inner.agent_request(method, id, &message["params"]),
-            (Some("session/update"), None) => inner.update(&message["params"]["update"]),
+            (Some("session/update"), None) => {
+                inner.update(&message["params"]["update"]);
+            }
             (Some(_), None) => {}
             (None, Some(id)) => {
                 let Some(pending) = id.as_u64().and_then(|id| inner.pending.remove(&id)) else {
@@ -657,6 +678,94 @@ impl Chat {
                 self.answered(inner, pending, result);
             }
             (None, None) => {}
+        }
+        self.watch_agents(inner);
+    }
+
+    /// While sub-agents run, reads OMP's session files for what ACP leaves out: the ones
+    /// that finished, and each one's tool calls. OMP reports a sub-agent over ACP only
+    /// while a turn runs: one that ends after its turn would show as running for good.
+    fn watch_agents(self: &Arc<Self>, inner: &mut Inner) {
+        let generation = inner.generation;
+        let revision = inner.agents_revision;
+        let watch = (generation, revision);
+        // Replayed calls must all exist before saved completions are consumed.
+        if inner
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::LoadSession))
+            || inner.agents_watched == Some(watch)
+            || inner.open_agents().is_empty()
+        {
+            return;
+        }
+        let offset = inner.agents_offset;
+        let chat = self.clone();
+        let watching = thread::Builder::new()
+            .name("compi-chat-agents".into())
+            .spawn(move || {
+                // Replay existing completions too: they may predate this process.
+                let mut file = None;
+                // Each open agent's own file, read from its start.
+                let mut steps: HashMap<String, saved::AgentSteps> = HashMap::new();
+                loop {
+                    let (session, open) = {
+                        let mut inner = chat.lock();
+                        let open = inner.open_agents();
+                        if inner.closed
+                            || inner.generation != generation
+                            || inner.agents_revision != revision
+                            || open.is_empty()
+                        {
+                            if inner.agents_watched == Some(watch) {
+                                inner.agents_watched = None;
+                            }
+                            return;
+                        }
+                        (inner.state.session.clone(), open)
+                    };
+                    match &mut file {
+                        None => {
+                            file = session
+                                .and_then(|session| saved::session_file(&chat.content, &session))
+                                .map(|path| (path, offset));
+                        }
+                        Some((path, offset)) => {
+                            // Their calls first, so one that ended shows its last ones.
+                            steps.retain(|id, _| open.contains(id));
+                            let folder = path.with_extension("");
+                            for id in &open {
+                                // An agent's name is a file's name here, never a path.
+                                if id.contains(['/', '\\']) || id.starts_with('.') {
+                                    continue;
+                                }
+                                let read = steps.entry(id.clone()).or_default();
+                                if read.read(&folder.join(format!("{id}.jsonl"))) {
+                                    let mut inner = chat.lock();
+                                    if !inner.closed
+                                        && inner.generation == generation
+                                        && inner.agents_revision == revision
+                                    {
+                                        inner.agent_steps(id, read);
+                                    }
+                                }
+                            }
+                            let jobs = saved::finished_agents(path, offset);
+                            let mut inner = chat.lock();
+                            if !inner.closed
+                                && inner.generation == generation
+                                && inner.agents_revision == revision
+                            {
+                                inner.agents_offset = *offset;
+                                inner.fill_results(&jobs, now_ms());
+                            }
+                        }
+                    }
+                    thread::sleep(AGENT_POLL);
+                }
+            });
+        if watching.is_ok() {
+            inner.agents_watched = Some(watch);
         }
     }
 
@@ -1067,6 +1176,10 @@ impl Inner {
             ChatEvent::Reset { .. } => {
                 self.tools.clear();
                 self.agent_wave.clear();
+                self.agents_summarized.clear();
+                self.agents_revision += 1;
+                self.agents_watched = None;
+                self.agents_offset = 0;
                 self.queue.clear();
                 self.queue_held = false;
                 self.unseen = None;
@@ -1855,51 +1968,132 @@ impl Inner {
         }
     }
 
-    /// The sub-agents of the call at `index` changed: running ones join the wave, and
-    /// once none of the wave runs, the transcript ends with its summary.
+    /// Recomputes one wave from reported agent times, not the time a late update arrived.
+    fn agent_summary(&self, tools: &[usize]) -> Option<ChatAgentsFinished> {
+        let mut count = 0;
+        let mut started_ms: Option<u64> = None;
+        let mut ended_ms = 0;
+        let mut duration_ms = 0;
+        let mut cost = None;
+        for &index in tools {
+            let Some(ChatEntry::Tool(tool)) = self.state.entries.get(index) else {
+                continue;
+            };
+            for agent in &tool.agents {
+                if agent.status.is_open() {
+                    return None;
+                }
+                count += 1;
+                duration_ms = duration_ms.max(agent.duration_ms);
+                if let Some(started) = agent.started_ms {
+                    started_ms = Some(started_ms.map_or(started, |first| first.min(started)));
+                    let ended = if agent.duration_ms == 0 {
+                        tool.ended_ms.unwrap_or(started)
+                    } else {
+                        started.saturating_add(agent.duration_ms)
+                    };
+                    ended_ms = ended_ms.max(ended);
+                }
+                if let Some(reported) = agent.cost {
+                    cost = Some(cost.unwrap_or(0.0) + reported);
+                }
+            }
+        }
+        (count > 0).then(|| ChatAgentsFinished {
+            tool: tools.iter().copied().max().unwrap_or(0),
+            count,
+            duration_ms: duration_ms
+                .max(started_ms.map_or(0, |started| ended_ms.saturating_sub(started))),
+            cost,
+        })
+    }
+
+    /// Refreshes an existing card in place, or ends the current wave with one new card.
     fn note_agents(&mut self, index: usize) {
         let Some(ChatEntry::Tool(tool)) = self.state.entries.get(index) else {
             return;
         };
-        if tool
-            .agents
-            .iter()
-            .any(|agent| agent.status == ChatToolStatus::Running)
-            && !self.agent_wave.contains(&index)
-        {
-            self.agent_wave.push(index);
-        }
-        let agents: Vec<&ChatAgent> = self
-            .agent_wave
-            .iter()
-            .filter_map(|&index| match self.state.entries.get(index) {
-                Some(ChatEntry::Tool(tool)) => Some(&tool.agents),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        if agents.is_empty() || agents.iter().any(|agent| agent.status.is_open()) {
+        if let Some(wave) = self.agents_summarized.get(&index) {
+            let Some(summary) = self.agent_summary(&wave.tools) else {
+                return;
+            };
+            let index = wave.entry;
+            let entry = ChatEntry::AgentsFinished(summary);
+            if self.state.entries.get(index) != Some(&entry) {
+                self.emit(ChatEvent::Replace { index, entry });
+            }
             return;
         }
-        let duration_ms = match agents.iter().filter_map(|agent| agent.started_ms).min() {
-            Some(started) => now_ms().saturating_sub(started),
-            None => agents
-                .iter()
-                .map(|agent| agent.duration_ms)
-                .max()
-                .unwrap_or(0),
+        if !tool.agents.is_empty() && !self.agent_wave.contains(&index) {
+            self.agent_wave.push(index);
+        }
+        let Some(summary) = self.agent_summary(&self.agent_wave) else {
+            return;
         };
-        let costs: Vec<f64> = agents.iter().filter_map(|agent| agent.cost).collect();
-        let summary = ChatAgentsFinished {
-            tool: self.agent_wave.iter().copied().max().unwrap_or(index),
-            count: agents.len(),
-            duration_ms,
-            cost: (!costs.is_empty()).then(|| costs.iter().sum()),
-        };
-        self.agent_wave.clear();
+        let wave = Arc::new(FinishedAgentWave {
+            entry: self.state.entries.len(),
+            tools: std::mem::take(&mut self.agent_wave),
+        });
+        for &tool in &wave.tools {
+            self.agents_summarized.insert(tool, Arc::clone(&wave));
+        }
         self.emit(ChatEvent::Entry {
             entry: ChatEntry::AgentsFinished(summary),
         });
+    }
+
+    /// The sub-agents still running or waiting for the saved answer after a final progress report.
+    fn open_agents(&self) -> Vec<String> {
+        self.state
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Tool(tool) => Some(&tool.agents),
+                _ => None,
+            })
+            .flatten()
+            .filter(|agent| {
+                agent.status.is_open()
+                    || (agent.status == ChatToolStatus::Completed && agent.result.is_none())
+            })
+            .map(|agent| agent.id.clone())
+            .collect()
+    }
+
+    /// The tool calls the sub-agent `id` made, as its own session file tells them, on
+    /// the latest call that started one of its name: they replace the ones shown, and
+    /// the latest says what it does now.
+    fn agent_steps(&mut self, id: &str, read: &saved::AgentSteps) {
+        let found = self
+            .state
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| match entry {
+                ChatEntry::Tool(tool) => tool
+                    .agents
+                    .iter()
+                    .position(|agent| agent.id == id)
+                    .map(|agent| (index, agent, tool)),
+                _ => None,
+            });
+        let Some((index, agent, tool)) = found else {
+            return;
+        };
+        let mut tool = tool.clone();
+        let agent = &mut tool.agents[agent];
+        agent.steps = read.steps.iter().cloned().collect();
+        agent.tool_count = agent.tool_count.max(read.count);
+        if agent.status.is_open()
+            && let Some(step) = read.steps.back()
+        {
+            agent.activity = Some(step.text.clone());
+        }
+        let entry = ChatEntry::Tool(tool);
+        if self.state.entries[index] != entry {
+            self.emit(ChatEvent::Replace { index, entry });
+        }
     }
 }
 
@@ -1958,6 +2152,7 @@ fn new_agent(id: &str) -> ChatAgent {
         model: None,
         assignment: None,
         result: None,
+        steps: Vec::new(),
     }
 }
 
@@ -1990,7 +2185,7 @@ fn agent_progress(agents: &mut Vec<ChatAgent>, item: &Value, now: u64) {
     if status == ChatToolStatus::Running && agent.started_ms.is_none() {
         agent.started_ms = Some(now.saturating_sub(agent.duration_ms));
     }
-    if let Some(cost) = item["cost"].as_f64().filter(|cost| *cost > 0.0) {
+    if let Some(cost) = item["cost"].as_f64().filter(|cost| *cost >= 0.0) {
         agent.cost = Some(cost);
     }
     if let Some(model) = item["resolvedModel"].as_str() {
@@ -2027,8 +2222,8 @@ fn agent_result(agents: &mut Vec<ChatAgent>, item: &Value) {
         } else {
             ChatToolStatus::Failed
         };
-        agent.duration_ms = item["durationMs"].as_u64().unwrap_or(agent.duration_ms);
     }
+    agent.duration_ms = item["durationMs"].as_u64().unwrap_or(agent.duration_ms);
     if let Some(kind) = item["agent"].as_str() {
         kind.clone_into(&mut agent.agent);
     }
@@ -2037,7 +2232,7 @@ fn agent_result(agents: &mut Vec<ChatAgent>, item: &Value) {
     }
     if let Some(cost) = item["usage"]["cost"]["total"]
         .as_f64()
-        .filter(|cost| *cost > 0.0)
+        .filter(|cost| *cost >= 0.0)
     {
         agent.cost = Some(cost);
     }
@@ -2060,8 +2255,8 @@ fn job_result(agent: &mut ChatAgent, job: &Value) {
     }
     if agent.status.is_open() {
         agent.status = status;
-        agent.duration_ms = job["durationMs"].as_u64().unwrap_or(agent.duration_ms);
     }
+    agent.duration_ms = job["durationMs"].as_u64().unwrap_or(agent.duration_ms);
     let output = job["resultText"]
         .as_str()
         .map(task_output)
@@ -2071,6 +2266,9 @@ fn job_result(agent: &mut ChatAgent, job: &Value) {
         .find(|text| !text.is_empty());
     if let Some(output) = output {
         agent.result = Some(head(output.to_owned(), MAX_CHAT_AGENT_RESULT_BYTES));
+    } else if agent.result.is_none() {
+        // A finished job can have no text; it is still no longer awaiting its answer.
+        agent.result = Some(String::new());
     }
 }
 
@@ -2130,6 +2328,11 @@ fn activity(item: &Value) -> Option<String> {
     } else {
         item["lastIntent"].as_str()?.to_owned()
     };
+    short_line(&text)
+}
+
+/// `text` on one line, at most `AGENT_ACTIVITY_CHARS`; nothing of a blank one.
+fn short_line(text: &str) -> Option<String> {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.is_empty() {
         return None;
@@ -2938,10 +3141,7 @@ mod tests {
         assert_eq!(a.model.as_deref(), Some("anthropic/claude-haiku"));
         assert_eq!(a.assignment.as_deref(), Some("Do TaskA"));
         assert!(a.started_ms.is_some());
-        assert_eq!(
-            (b.status, b.cost, b.started_ms),
-            (ChatToolStatus::Pending, None, None)
-        );
+        assert_eq!((b.status, b.started_ms), (ChatToolStatus::Pending, None));
 
         inner.update(&json!({
             "sessionUpdate": "tool_call", "toolCallId": "w1", "name": "wait", "title": "wait",
@@ -3066,6 +3266,182 @@ mod tests {
             seen.apply(event);
         }
         assert_eq!(seen, inner.state);
+    }
+
+    #[test]
+    fn saved_completions_finish_replayed_agents_after_a_cancelled_parent_turn() {
+        let folder =
+            std::env::temp_dir().join(format!("compi-replay-agents-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("parent.jsonl");
+        // The completion already exists when ACP replays the last running progress.
+        let completion = json!({
+            "type": "custom_message", "customType": "async-result",
+            "content": "<task-result id=\"TaskA\"><output>Reviewed the sample.</output></task-result>",
+            "details": { "jobs": [{
+                "agentId": "TaskA", "jobId": "TaskA", "type": "task",
+                "status": "completed", "durationMs": 9000,
+            }] },
+        });
+        std::fs::write(&path, format!("{completion}\n")).unwrap();
+        let steps_path = folder.join("TaskA.jsonl");
+        std::fs::write(
+            &steps_path,
+            format!(
+                "{}\n{}\n",
+                json!({ "type": "custom", "customType": "tool_execution_start", "data": {
+                "toolCallId": "read1", "toolName": "read", "intent": "Reading the sample",
+            } }),
+                json!({ "type": "message", "message": {
+                "role": "toolResult", "toolCallId": "read1", "isError": false,
+            } }),
+            ),
+        )
+        .unwrap();
+        let mut inner = Inner::default();
+        let mut seen = inner.state.clone();
+        let (sender, receiver) = mpsc::channel();
+        inner.watchers.push(sender);
+        start_task(&mut inner);
+        inner.update(&task_update(
+            "completed",
+            json!([agent_progress_item("TaskA", "running", 0.05),]),
+        ));
+        inner.prompt_ended(Ok(json!({ "stopReason": "cancelled" })));
+        assert_eq!(
+            tool_entry(&inner, 0).agents[0].status,
+            ChatToolStatus::Running
+        );
+
+        let mut steps = saved::AgentSteps::default();
+        assert!(steps.read(&steps_path));
+        inner.agent_steps("TaskA", &steps);
+        let mut offset = 0;
+        let jobs = saved::finished_agents(&path, &mut offset);
+        inner.fill_results(&jobs, now_ms());
+        let tool = tool_entry(&inner, 0);
+        assert_eq!(tool.status, ChatToolStatus::Completed);
+        let agent = &tool.agents[0];
+        assert_eq!(agent.status, ChatToolStatus::Completed);
+        assert_eq!(agent.result.as_deref(), Some("Reviewed the sample."));
+        assert_eq!(agent.steps[0].status, ChatToolStatus::Completed);
+        assert!(inner.open_agents().is_empty());
+        assert_eq!(summaries(&inner).len(), 1);
+        assert!(summaries(&inner)[0].duration_ms >= 9000);
+        inner.fill_results(&jobs, now_ms());
+        assert_eq!(summaries(&inner).len(), 1);
+        for event in receiver.try_iter() {
+            seen.apply(event);
+        }
+        assert_eq!(seen, inner.state);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn late_agent_updates_refresh_their_wave_without_moving_other_cards() {
+        let mut inner = Inner::default();
+        let mut seen = inner.state.clone();
+        let (sender, receiver) = mpsc::channel();
+        inner.watchers.push(sender);
+        let report = |call: &str, id: &str, status: &str, cost: f64| {
+            let mut update =
+                task_update("completed", json!([agent_progress_item(id, status, cost)]));
+            update["toolCallId"] = json!(call);
+            update
+        };
+        let call = |id| {
+            json!({
+                "sessionUpdate": "tool_call", "toolCallId": id, "name": "task",
+                "kind": "other", "status": "pending",
+            })
+        };
+        start_task(&mut inner);
+        inner.update(&report("task1", "TaskA", "running", 0.05));
+        inner.update(&call("task2"));
+        inner.update(&report("task2", "TaskB", "running", 0.10));
+        inner.update(&report("task1", "TaskA", "completed", 0.05));
+        inner.update(&report("task2", "TaskB", "completed", 0.10));
+        let first_card = inner.state.entries.len() - 1;
+        assert_eq!(summaries(&inner)[0].count, 2);
+
+        inner.update(&call("task3"));
+        inner.update(&report("task3", "TaskC", "completed", 0.20));
+        let second_card = inner.state.entries.len() - 1;
+        let second = summaries(&inner)[1].clone();
+        let entries = inner.state.entries.len();
+        let mut late = task_update(
+            "completed",
+            json!([
+                agent_progress_item("TaskA", "completed", 0.08),
+                agent_progress_item("TaskD", "completed", 0.02),
+            ]),
+        );
+        late["rawOutput"]["details"]["progress"][0]["durationMs"] = json!(8000);
+        late["rawOutput"]["details"]["progress"][1]["durationMs"] = json!(7000);
+        inner.update(&late);
+        // Repeated reports do not append another card or change a later wave's card.
+        inner.update(&late);
+        assert_eq!(inner.state.entries.len(), entries);
+        let ChatEntry::AgentsFinished(first) = &inner.state.entries[first_card] else {
+            panic!("the original ending card moved");
+        };
+        assert_eq!((first.tool, first.count), (1, 3));
+        assert!(first.duration_ms >= 8000);
+        assert!((first.cost.unwrap() - 0.20).abs() < 1e-9);
+        assert_eq!(
+            inner.state.entries[second_card],
+            ChatEntry::AgentsFinished(second)
+        );
+        assert_eq!(summaries(&inner).len(), 2);
+        for event in receiver.try_iter() {
+            seen.apply(event);
+        }
+        assert_eq!(seen, inner.state);
+    }
+
+    #[test]
+    fn late_final_results_refresh_time_and_zero_cost_without_elapsed_time_drift() {
+        let mut inner = Inner::default();
+        start_task(&mut inner);
+        inner.update(&task_update(
+            "in_progress",
+            json!([agent_progress_item("TaskA", "running", 0.05),]),
+        ));
+        // A fixed start makes using the late report's wall clock visibly incorrect.
+        let ChatEntry::Tool(tool) = &mut inner.state.entries[0] else {
+            unreachable!();
+        };
+        tool.started_ms = 1000;
+        tool.agents[0].started_ms = Some(1000);
+        inner.update(&task_update(
+            "completed",
+            json!([agent_progress_item("TaskA", "completed", 0.10),]),
+        ));
+        assert_eq!(summaries(&inner)[0].duration_ms, 4000);
+        inner.update(&task_update(
+            "completed",
+            json!([agent_progress_item("TaskA", "completed", 0.20),]),
+        ));
+        assert_eq!(summaries(&inner)[0].duration_ms, 4000);
+        assert_eq!(summaries(&inner)[0].cost, Some(0.20));
+        inner.update(&json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "task1", "status": "completed",
+            "rawOutput": { "details": { "results": [{
+                "id": "TaskA", "exitCode": 0, "durationMs": 7000,
+                "usage": { "cost": { "total": 0.0 } }, "output": "Final review.",
+            }] } },
+        }));
+        assert_eq!(summaries(&inner)[0].duration_ms, 7000);
+        assert_eq!(summaries(&inner)[0].cost, Some(0.0));
+        let jobs = [json!({
+            "id": "TaskA", "type": "task", "status": "completed",
+            "durationMs": 9000, "resultText": "Final timing.",
+        })];
+        inner.fill_results(&jobs, now_ms());
+        inner.fill_results(&jobs, now_ms());
+        assert_eq!(summaries(&inner).len(), 1);
+        assert_eq!(summaries(&inner)[0].duration_ms, 9000);
+        assert_eq!(summaries(&inner)[0].cost, Some(0.0));
     }
 
     #[test]

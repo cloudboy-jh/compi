@@ -1345,7 +1345,7 @@ impl<'a> Expanded<'a> {
 
 /// The styles of the line spanning `line` (bytes of the whole text) relative to the line,
 /// covering it without gaps; `None` where no style applies. `styles` are sorted and disjoint.
-fn line_styles(
+pub(super) fn line_styles(
     styles: &[(Range<usize>, HighlightStyle)],
     line: Range<usize>,
 ) -> Vec<(Range<usize>, Option<HighlightStyle>)> {

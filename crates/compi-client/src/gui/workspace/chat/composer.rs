@@ -913,6 +913,10 @@ impl CompiApp {
             permission: None,
             retry: false,
             diff_refusal: None,
+            dark: self.theme.is_dark(),
+            syntax: gpui_component::theme::Theme::global(cx)
+                .highlight_theme
+                .clone(),
         };
         div()
             .flex_none()
