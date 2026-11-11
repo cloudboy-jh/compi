@@ -4,8 +4,9 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 ## Release state
 
-- **0.8.1** is tagged `v0.8.1` at `15c432e` (2026-11-11), not published. Its Release and Core CI runs sat queued with no jobs started for over an hour (no GitHub incident listed; API cancel of the stuck runs answers "completed"). The tag was re-pushed once on the same commit before any draft existed.
-- **0.8.0** is Latest: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets. Cross-platform Core CI and both package jobs passed, including Windows Setup/in-app update and copied Mac bundle checks. Installed 0.7.4 discovers the update; it was not activated in the working instance. Protocol 40 and workspace format 10 are unchanged, but the new daemon is required, so installing ends local shells and chats after consent.
+- **0.8.1** is Latest: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3` (release prep `15c432e` plus a docs commit), release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Windows and macOS package jobs passed. Signed update and Setup metadata say version 0.8.1, protocol 40 and the 0.8.1 notes, with hashes matching `SHA256SUMS.txt`. Installed 0.8.0 (`compi update --check`) discovers it; it was not activated in the working instance. The daemon changed, so installing ends local shells and chats after consent.
+  - The first tag runs (on `15c432e`) stayed queued with no jobs for over an hour and the API refuses to cancel them ("completed"); a new push to `main` got jobs created, so the unpublished tag was moved to `d5fb6e3` before any draft existed. Those stale runs still show as queued.
+- **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
 
 ## 0.7.4: not seen yet
 
