@@ -2,6 +2,14 @@
 
 This is an implementation history with dated verification evidence, not a claim of current cross-platform qualification. The latest recorded Windows handoff is summarized first; unfinished work is tracked in [Next steps](NEXT_STEPS.md).
 
+## 0.8.0 (2026-11-11)
+
+Published as Latest at 2026-11-11 16:10 UTC from `v0.8.0`, source cutoff `7c122629a83076dce281e26024fdfd694a7081af`: shell routing/settings, in-place dev-server browsing, language icons and chat diff colours, live agent details/completion recovery, prompt reload checks and late ending-card corrections. User changes: [release notes](../user/release-notes.md).
+
+Local Windows formatting, warning-denied workspace Clippy and workspace library/binary tests (excluding Setup's separate test target) passed. [Core CI 43051504602](https://github.com/cloudboy-jh/compi/actions/runs/43051504602) passed on Linux, Windows and macOS. [Release 43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818) passed both package jobs, Windows portable and Setup/in-app update checks, copied Mac bundle checks and metadata signing. Downloaded all 12 draft assets; verified all nine checksum entries, all three Ed25519-signed manifests and their payload sizes/hashes, and that stable/versioned Setup are identical. Metadata requires the 0.8.0 daemon, retaining protocol 40 and workspace format 10.
+
+After publication, GitHub reported stable Latest v0.8.0 with 12 assets. The installed 0.7.4 client's `update --check` reported 0.8.0 available with the signed notes' first summary and a 44,235,355-byte update payload. The working installation and chat were not restarted or updated. Native Mac UI checks for the new features remain open; passing CI package checks do not replace them.
+
 ## 0.7.3 updater and 0.7.4 work (moved from Next steps, 2026-11-10)
 
 Kept as written when moved; open items are in [Next steps](NEXT_STEPS.md).

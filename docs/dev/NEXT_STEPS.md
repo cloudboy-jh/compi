@@ -4,7 +4,7 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 ## Release state
 
-- **0.7.4** is Latest: published 2026-11-10 23:18 UTC, tagged `v0.7.4` at `715fefa`, release run [42919485431](https://github.com/cloudboy-jh/compi/actions/runs/42919485431), 12 assets. Not seen: the update from an installed 0.7.3 (protocol 39 → 40, so it restarts the daemon).
+- **0.8.0** is Latest: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets. Cross-platform Core CI and both package jobs passed, including Windows Setup/in-app update and copied Mac bundle checks. Installed 0.7.4 discovers the update; it was not activated in the working instance. Protocol 40 and workspace format 10 are unchanged, but the new daemon is required, so installing ends local shells and chats after consent.
 
 ## 0.7.4: not seen yet
 
@@ -15,9 +15,9 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 - A Windows (`omp.exe`) chat's approval lookup and status.
 - Settings → Advanced: the performance readout is still a block of figures, not rows.
 
-## Latest source: checks left (asked 2026-11-10)
+## 0.8.0: checks left
 
-Commands from the other shell, dev-server cards and in-place browsing, Catppuccin language icons, and clickable sub-agent task/step lists are implemented. Details and observed checks: [Completed work](COMPLETED.md).
+Commands from the other shell, dev-server cards and in-place browsing, Catppuccin language icons, clickable sub-agent task/step lists, completion recovery and ending-card corrections shipped in 0.8.0. Details and observed checks: [Completed work](COMPLETED.md).
 
 - macOS browser views and icon rendering: the only known Mac, `bruisedpear`, was offline on 2026-11-11, with no Mac SSH host configured. Native checks could not run. Physical Ctrl/Cmd-click on a local link and the view-toggle chord while the web page has the keyboard also remain unobserved.
 - Alternative line editors are not intercepted; custom executable/argument profiles keep their existing behavior. The other-shell setting applies to new shells. Tab completion stays with the current shell.
