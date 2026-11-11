@@ -358,8 +358,8 @@ impl CompiApp {
                             .appearance(false)
                             .bordered(false)
                             .readonly(true)
-                            .font_family(self.typography.font.family.clone())
-                            .text_size(px(self.typography.font_size))
+                            .font_family(self.file_typography().font.family.clone())
+                            .text_size(px(self.file_typography().font_size))
                             .size_full()
                     })),
             )

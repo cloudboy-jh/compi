@@ -175,6 +175,11 @@ fn default_chat_text_size() -> f32 {
     DEFAULT_CHAT_TEXT_SIZE
 }
 
+/// File text size, `[files] text_size`, in logical pixels: the monospace text of editors,
+/// diffs, large text and folder trees. Unset, it follows the terminal font size.
+pub const MIN_FILE_TEXT_SIZE: f32 = 8.0;
+pub const MAX_FILE_TEXT_SIZE: f32 = 32.0;
+
 /// Chat approvals, `[chat] approval`: how a chat's harness asks before it runs tools,
 /// in Settings' order. Harness keeps the harness's own setting.
 pub const CHAT_APPROVALS: [ChatApproval; 4] = [
@@ -634,6 +639,10 @@ pub struct LoadedConfig {
     /// Message text size of every chat; see [`DEFAULT_CHAT_TEXT_SIZE`].
     #[serde(default = "default_chat_text_size")]
     pub chat_text_size: f32,
+    /// Monospace text size of every file pane, or `None` to follow the terminal font size;
+    /// see [`MIN_FILE_TEXT_SIZE`].
+    #[serde(default)]
+    pub file_text_size: Option<f32>,
     /// How chats' harnesses ask before running tools; see [`CHAT_APPROVALS`].
     #[serde(default)]
     pub chat_approval: ChatApproval,
@@ -680,6 +689,7 @@ impl Default for LoadedConfig {
             confirm_close: false,
             focus_indicator: FocusIndicator::default(),
             chat_text_size: DEFAULT_CHAT_TEXT_SIZE,
+            file_text_size: None,
             chat_approval: ChatApproval::Harness,
             chat_enter: ChatEnter::Steer,
             chat_open: ChatOpen::InPlace,
@@ -1015,6 +1025,32 @@ impl LoadedConfig {
             }
         })?;
         self.chat_text_size = size.unwrap_or(DEFAULT_CHAT_TEXT_SIZE);
+        Ok(())
+    }
+
+    /// Persist the file text size, or remove it (`None`) to follow the terminal font size.
+    pub fn save_file_text_size(&mut self, size: Option<f32>) -> Result<(), String> {
+        if size.is_some_and(|size| {
+            !valid_number(
+                f64::from(size),
+                MIN_FILE_TEXT_SIZE.into(),
+                MAX_FILE_TEXT_SIZE.into(),
+            )
+        }) {
+            return Err(format!(
+                "File text size must be from {MIN_FILE_TEXT_SIZE} through {MAX_FILE_TEXT_SIZE}"
+            ));
+        }
+        update_table(&self.path, "files", |table| match size {
+            Some(size) if size.fract() == 0.0 => {
+                set_table_value(table, "text_size", i64::from(size as i32).into());
+            }
+            Some(size) => set_table_value(table, "text_size", f64::from(size).into()),
+            None => {
+                table.remove("text_size");
+            }
+        })?;
+        self.file_text_size = size;
         Ok(())
     }
 
@@ -2067,6 +2103,21 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                     "configuration",
                 ),
             }
+        }
+    }
+    if let Some(files) = table(&document, "files", loaded)
+        && let Some(value) = files.get("text_size")
+    {
+        match number(value).filter(|value| {
+            valid_number(*value, MIN_FILE_TEXT_SIZE.into(), MAX_FILE_TEXT_SIZE.into())
+        }) {
+            Some(size) => loaded.file_text_size = Some(size as f32),
+            None => invalid(
+                loaded,
+                "files.text_size",
+                "a finite number from 8 through 32",
+                "configuration",
+            ),
         }
     }
     if let Some(chat) = table(&document, "chat", loaded) {
@@ -3292,6 +3343,54 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("chat.approval"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_text_size_follows_the_terminal_round_trips_and_rejects_invalid_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-file-text-size-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[files]\n# retain me\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.file_text_size, None);
+        loaded.save_file_text_size(Some(17.0)).unwrap();
+        assert_eq!(loaded.file_text_size, Some(17.0));
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.file_text_size, Some(17.0));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("text_size = 17") && text.contains("# retain me"));
+        assert!(
+            loaded
+                .save_file_text_size(Some(MAX_FILE_TEXT_SIZE + 1.0))
+                .is_err()
+        );
+        loaded.save_file_text_size(None).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("text_size"));
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).file_text_size,
+            None
+        );
+
+        let invalid = parse(
+            "version = 1\n[files]\ntext_size = 4",
+            FontOverrides::default(),
+        );
+        assert_eq!(invalid.file_text_size, None);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("files.text_size"))
         );
         fs::remove_dir_all(root).unwrap();
     }

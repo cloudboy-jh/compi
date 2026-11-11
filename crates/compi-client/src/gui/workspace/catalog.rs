@@ -568,12 +568,14 @@ impl CompiApp {
         density: crate::theme::WorkspaceDensity,
         terminal_font: crate::config::FontSettings,
         chat_text_size: f32,
+        file_text_size: Option<f32>,
         window: &mut Window,
     ) {
         // The family and size follow live; line height and fallbacks do not.
         let terminal_font_changed = self.config.configured_font.family != terminal_font.family;
         let font_size_changed = self.config.configured_font.size != terminal_font.size;
         let chat_text_size_changed = self.config.chat_text_size != chat_text_size;
+        let file_text_size_changed = self.config.file_text_size != file_text_size;
         if self.config.configured_appearance == appearance
             && self.config.theme_favorites == favorites
             && self.config.ui_font == ui_font
@@ -581,6 +583,7 @@ impl CompiApp {
             && !terminal_font_changed
             && !font_size_changed
             && !chat_text_size_changed
+            && !file_text_size_changed
         {
             return;
         }
@@ -588,6 +591,8 @@ impl CompiApp {
             self.config.chat_text_size = chat_text_size;
             self.remeasure_chats();
         }
+        // Files pick their typography up when they next draw (`prepare_content`).
+        self.config.file_text_size = file_text_size;
         self.config.configured_appearance = appearance.clone();
         self.config.theme_favorites = favorites;
         self.config.ui_font = ui_font;
@@ -666,6 +671,7 @@ impl CompiApp {
                         self.config.density,
                         self.config.configured_font.clone(),
                         self.config.chat_text_size,
+                        self.config.file_text_size,
                         target_window,
                     );
                     target_cx.notify();

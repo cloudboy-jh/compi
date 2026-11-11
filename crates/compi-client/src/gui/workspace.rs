@@ -1244,6 +1244,7 @@ impl CompiApp {
                                 density: loaded.density,
                                 terminal_font: loaded.configured_font,
                                 chat_text_size: loaded.chat_text_size,
+                                file_text_size: loaded.file_text_size,
                                 diagnostics: loaded.diagnostics,
                             });
                         }
@@ -2080,6 +2081,7 @@ impl CompiApp {
                 density,
                 terminal_font,
                 chat_text_size,
+                file_text_size,
                 diagnostics,
             } => {
                 self.pending_appearance_reload = Some((
@@ -2089,6 +2091,7 @@ impl CompiApp {
                     density,
                     terminal_font,
                     chat_text_size,
+                    file_text_size,
                 ));
                 self.config_diagnostics = diagnostics;
                 self.global_warning =
@@ -4235,6 +4238,8 @@ impl CompiApp {
             Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => {
                 if self.focused_pane_shows_chat() {
                     self.step_chat_text_size(command, window, cx);
+                } else if self.focused_content().is_some() {
+                    self.step_file_text_size(command, window, cx);
                 } else {
                     let size = zoom_size(
                         command,
@@ -5027,8 +5032,15 @@ impl CompiApp {
                 window.on_next_frame(move |_, cx| cx.notify(view_id));
             }
         }
-        if let Some((appearance, favorites, ui_font, density, terminal_font, chat_text_size)) =
-            self.pending_appearance_reload.take()
+        if let Some((
+            appearance,
+            favorites,
+            ui_font,
+            density,
+            terminal_font,
+            chat_text_size,
+            file_text_size,
+        )) = self.pending_appearance_reload.take()
         {
             self.sync_global_appearance(
                 appearance,
@@ -5037,6 +5049,7 @@ impl CompiApp {
                 density,
                 terminal_font,
                 chat_text_size,
+                file_text_size,
                 window,
             );
         }

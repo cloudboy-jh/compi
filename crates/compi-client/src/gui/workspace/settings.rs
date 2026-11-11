@@ -107,6 +107,8 @@ pub(super) enum SettingsAction {
     ResetSidebar,
     ResetLayout,
     FontSize(Command),
+    /// Zoom in, out or reset of the file text size.
+    FileTextSize(Command),
     /// Zoom in, out or reset of the chat text size.
     ChatTextSize(Command),
     /// Enter while OMP works: Left and Right pick Steer or Queue, Enter flips it.
@@ -932,7 +934,7 @@ static ROWS: &[Row] = &[
             "font-size",
             SettingsSection::Terminal,
             "Font size",
-            "Zooms terminal and editor text in every window.",
+            "Zooms terminal text in every window. Files follow it unless File text size is set.",
             "zoom scale bigger smaller larger text line height",
             |_| {
                 vec![
@@ -943,6 +945,26 @@ static ROWS: &[Row] = &[
             },
             |app, row, cx| {
                 app.render_size_row(row, app.font_settings.size, SettingsAction::FontSize, cx)
+            },
+        ),
+    ),
+    grouped(
+        "Font",
+        row(
+            "file-text-size",
+            SettingsSection::Terminal,
+            "File text size",
+            "Editors, diffs, Markdown and folder trees in every window. Reset follows the font size.",
+            "zoom scale bigger smaller larger font editor diff markdown files changes",
+            |_| {
+                vec![
+                    SettingsAction::FileTextSize(Command::ZoomOut),
+                    SettingsAction::FileTextSize(Command::ZoomIn),
+                    SettingsAction::FileTextSize(Command::ZoomReset),
+                ]
+            },
+            |app, row, cx| {
+                app.render_size_row(row, app.file_text_size(), SettingsAction::FileTextSize, cx)
             },
         ),
     ),
@@ -2881,6 +2903,7 @@ impl CompiApp {
             SettingsAction::ResetLayout => self.execute(Command::ResetClientLayout, window, cx),
             SettingsAction::FontSize(command) => self.execute(command, window, cx),
             SettingsAction::ChatTextSize(command) => self.step_chat_text_size(command, window, cx),
+            SettingsAction::FileTextSize(command) => self.step_file_text_size(command, window, cx),
             SettingsAction::OpenConfiguration => {
                 self.execute(Command::OpenConfiguration, window, cx)
             }
@@ -5659,6 +5682,7 @@ mod tests {
                 "ui-font",
                 "terminal-font",
                 "font-size",
+                "file-text-size",
                 "custom-typography",
                 "chat-text-size",
                 COMMANDS_ROW

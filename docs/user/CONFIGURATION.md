@@ -36,7 +36,14 @@ size = 14 # 6 through 72
 
 Terminal presets include the platform default, JetBrains Mono, IBM Plex Mono, and Atkinson Hyperlegible Mono. Custom installed families remain supported through `font.family`. Bundled font notices and SIL Open Font License 1.1 text are in [`crates/compi-client/fonts/ATTRIBUTION.txt`](../../crates/compi-client/fonts/ATTRIBUTION.txt).
 
-**Settings → Terminal → Font size** shows the terminal and editor text size with −, + and **Reset**; Ctrl+= and Ctrl+- (Cmd on macOS) step it by one, and Ctrl/Cmd+0 resets it. The size is saved as `font.size` and every window follows it, including after editing the file by hand. Reset removes the key, returning to the default of 14.
+**Settings → Terminal → Font size** sizes terminal text with −, + and **Reset**; with a terminal focused, Ctrl+= and Ctrl+- (Cmd on macOS) step it by one, and Ctrl/Cmd+0 resets it. The size is saved as `font.size` and every window follows it, including after editing the file by hand. Reset removes the key, returning to the default of 14.
+
+**Settings → Terminal → File text size** sizes file panes: the editor, diffs, the Markdown Read view, large text previews, and the Files and Changes lists. With one of them focused, Ctrl+=, Ctrl+- and Ctrl/Cmd+0 change this size instead of the terminal font. Until you set it, file panes follow the terminal font size. It is saved as `files.text_size` (8 through 32); Reset removes the key.
+
+```toml
+[files]
+text_size = 15 # 8 through 32; unset follows font.size
+```
 
 ## Chat
 

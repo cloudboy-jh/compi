@@ -94,6 +94,9 @@ pub(in crate::gui) struct ContentUi {
     pub(super) changes_seed: Option<(ContentEnvironment, GitChanges)>,
     /// A diff asked for in a pane this window has not drawn yet: `open_diff`'s arguments.
     pub(super) pending_diff: Option<(PaneId, String, Option<GitScope>, Option<u32>)>,
+    /// File panes' typography at the file text size, and the terminal typography it was
+    /// resolved beside; see `file_typography`.
+    file_typography: Option<(Arc<TerminalTypography>, Arc<TerminalTypography>)>,
 }
 
 impl ContentUi {
@@ -1160,10 +1163,91 @@ impl CompiApp {
         files
     }
 
+    /// The file text size in effect: the one set, else the terminal font size.
+    pub(super) fn file_text_size(&self) -> f32 {
+        self.config
+            .file_text_size
+            .unwrap_or(self.typography.font_size)
+    }
+
+    /// File panes' monospace text (editors, diffs, large text, folder trees): the terminal
+    /// font at the file text size, with its cell height derived as the terminal's is. The
+    /// terminal's own until a set size has been resolved (`prepare_content`).
+    pub(super) fn file_typography(&self) -> &Arc<TerminalTypography> {
+        match (&self.content.file_typography, self.config.file_text_size) {
+            (Some((terminal, file)), Some(size))
+                if Arc::ptr_eq(terminal, &self.typography) && file.font_size == size =>
+            {
+                file
+            }
+            _ => &self.typography,
+        }
+    }
+
+    /// `size` logical pixels of interface text in a file pane, scaled as its monospace
+    /// text is from the terminal font size: unchanged while the file text size follows it.
+    pub(super) fn file_ui_size(&self, size: f32) -> Pixels {
+        px(size * self.file_typography().font_size / self.typography.font_size)
+    }
+
+    /// Resolves the file text size's typography when it or the terminal font changed.
+    fn refresh_file_typography(&mut self, window: &Window) {
+        let Some(size) = self.config.file_text_size else {
+            self.content.file_typography = None;
+            return;
+        };
+        if self
+            .content
+            .file_typography
+            .as_ref()
+            .is_some_and(|(terminal, file)| {
+                Arc::ptr_eq(terminal, &self.typography) && file.font_size == size
+            })
+        {
+            return;
+        }
+        let file = if size == self.typography.font_size {
+            self.typography.clone()
+        } else {
+            let settings = FontSettings {
+                size,
+                ..self.font_settings.clone()
+            };
+            Arc::new(TerminalTypography::resolve(&settings, window))
+        };
+        self.content.file_typography = Some((self.typography.clone(), file));
+    }
+
+    /// Zoom in, out or reset (`command`) of the file text size, in every window. Steps
+    /// start from the size in effect; Reset follows the terminal font size again.
+    pub(super) fn step_file_text_size(
+        &mut self,
+        command: Command,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (min, max) = (
+            crate::config::MIN_FILE_TEXT_SIZE,
+            crate::config::MAX_FILE_TEXT_SIZE,
+        );
+        let size =
+            zoom_size(command, self.file_text_size(), min, max).map(|size| size.clamp(min, max));
+        if size == self.config.file_text_size {
+            return;
+        }
+        if let Err(error) = self.config.save_file_text_size(size) {
+            self.global_error = Some(error);
+            return;
+        }
+        self.broadcast_global_appearance(window, cx);
+        cx.notify();
+    }
+
     /// Before drawing: state for every visible content pane, a read for each shown file
     /// not yet loaded, editors for files just read, text read again into its editor,
     /// pending line reveals, and active diff tabs read and given the window's look.
     pub(super) fn prepare_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_file_typography(window);
         let mut work = Vec::new();
         if let Some(workspace) = &self.workspace {
             for pane_id in self.shown_content_panes() {
@@ -3569,7 +3653,7 @@ impl CompiApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_size(self.file_ui_size(UI_MICRO_TEXT_SIZE))
                     .text_color(color(colors.muted))
                     .child(content.folder_name().to_owned()),
             )
@@ -3601,7 +3685,8 @@ impl CompiApp {
             _ => unix_home(&content.root),
         };
         // Roughly how many caption characters fit; the middle goes before the pane clips.
-        let fits = ((width - 24.0) / (UI_MICRO_TEXT_SIZE * 0.6)).max(12.0) as usize;
+        let caption_size = self.file_ui_size(UI_MICRO_TEXT_SIZE);
+        let fits = ((width - 24.0) / (f32::from(caption_size) * 0.6)).max(12.0) as usize;
         let root = content.root.clone();
         div()
             .size_full()
@@ -3628,7 +3713,7 @@ impl CompiApp {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .text_size(px(UI_BODY_TEXT_SIZE))
+                                    .text_size(self.file_ui_size(UI_BODY_TEXT_SIZE))
                                     .child(content.folder_name().to_owned()),
                             )
                             .child(controls::chip(
@@ -3642,7 +3727,7 @@ impl CompiApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_size(caption_size)
                             .text_color(color(colors.muted))
                             .child(caption_path(&content.root, home, fits))
                             .tooltip(controls::tooltip(root, None, None)),
@@ -3667,8 +3752,8 @@ impl CompiApp {
     ) -> impl IntoElement {
         let colors = *self.colors();
         let dark = self.theme.is_dark();
-        // The density of the terminal's file tree.
-        let row_height = self.typography.cell_height.max(18.0);
+        // The density of the file tree, from the file text size's line height.
+        let row_height = self.file_typography().cell_height.max(18.0);
         // Keys reach the folder rather than an editor.
         let keyboard = self.keyboard_content_pane() == Some(pane_id)
             && (active.is_none() || self.content.released.as_ref() == Some(pane_id));
@@ -3818,7 +3903,7 @@ impl CompiApp {
             div()
                 .flex_none()
                 .w(px(1.0))
-                .h(px(UI_SMALL_LINE_HEIGHT - 4.0))
+                .h(self.file_ui_size(UI_SMALL_LINE_HEIGHT - 4.0))
                 .bg(color(colors.accent))
         });
         let filter = div()
@@ -3905,7 +3990,7 @@ impl CompiApp {
             .min_h_0()
             .flex()
             .flex_col()
-            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .text_size(self.file_ui_size(UI_SMALL_TEXT_SIZE))
             .child(filter)
             .children(enter)
             .when_some(ui.tree.error.as_deref(), |tree, error| {
@@ -4375,8 +4460,8 @@ impl CompiApp {
                         .appearance(false)
                         .bordered(false)
                         .readonly(!editor.writable)
-                        .font_family(self.typography.font.family.clone())
-                        .text_size(px(self.typography.font_size))
+                        .font_family(self.file_typography().font.family.clone())
+                        .text_size(px(self.file_typography().font_size))
                         .size_full(),
                 )
                 .children(self.render_gutter(pane_id, path, cx))
@@ -4390,10 +4475,10 @@ impl CompiApp {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .text_size(self.file_ui_size(UI_SMALL_TEXT_SIZE))
                     .child(
                         div()
-                            .text_size(px(UI_BODY_TEXT_SIZE))
+                            .text_size(self.file_ui_size(UI_BODY_TEXT_SIZE))
                             .child(file_name(path).to_owned()),
                     )
                     .child(div().text_color(color(colors.muted)).child(format!(
@@ -4403,7 +4488,7 @@ impl CompiApp {
                     )))
                     .child(
                         div()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_size(self.file_ui_size(UI_MICRO_TEXT_SIZE))
                             .text_color(color(colors.muted))
                             .child(path.to_owned()),
                     )
@@ -4427,7 +4512,7 @@ impl CompiApp {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .text_size(self.file_ui_size(UI_SMALL_TEXT_SIZE))
                     .child(format!("Cannot open {}", file_name(path)))
                     .child(
                         div()
@@ -4436,7 +4521,7 @@ impl CompiApp {
                     )
                     .child(
                         div()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_size(self.file_ui_size(UI_MICRO_TEXT_SIZE))
                             .text_color(color(colors.muted))
                             .child(path.to_owned()),
                     )
@@ -4454,7 +4539,7 @@ impl CompiApp {
             }
             Some(FileBody::Loading | FileBody::Read(..)) | None => area
                 .p_3()
-                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .text_size(self.file_ui_size(UI_SMALL_TEXT_SIZE))
                 .text_color(color(colors.muted))
                 .child(
                     if ui

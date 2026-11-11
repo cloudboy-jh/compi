@@ -1629,7 +1629,7 @@ impl CompiApp {
                     ),
             )
             .child(
-                slot.text_size(px(UI_MICRO_TEXT_SIZE))
+                slot.text_size(self.file_ui_size(UI_MICRO_TEXT_SIZE))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(color(kind_color(*kind, &colors)))
                     .child(status_letter(*kind)),
@@ -1955,7 +1955,7 @@ impl CompiApp {
         }
         let style = DiffStyle {
             colors: *self.colors(),
-            typography: self.typography.clone(),
+            typography: self.file_typography().clone(),
         };
         for ui in self.content.panes.values() {
             for (tab, state) in &ui.diffs {
@@ -2145,7 +2145,7 @@ impl CompiApp {
     ) {
         let style = DiffStyle {
             colors: *self.colors(),
-            typography: self.typography.clone(),
+            typography: self.file_typography().clone(),
         };
         let settings = self.content.changes.diff;
         let Some(PaneUi {
@@ -3374,7 +3374,7 @@ impl CompiApp {
             .flex_wrap()
             .items_center()
             .gap_x_2()
-            .text_size(px(UI_MICRO_TEXT_SIZE))
+            .text_size(self.file_ui_size(UI_MICRO_TEXT_SIZE))
             .text_color(color(colors.muted))
             .whitespace_nowrap()
             .child(self.render_branch_status(pane_id, listing, cx))
@@ -3388,7 +3388,7 @@ impl CompiApp {
                     .children(line_counts(added, removed, &colors).map(|counts| {
                         div()
                             .flex_none()
-                            .font_family(self.typography.font.family.clone())
+                            .font_family(self.file_typography().font.family.clone())
                             .child(counts)
                     }))
             })
@@ -3454,7 +3454,7 @@ impl CompiApp {
             .min_h_0()
             .flex()
             .flex_col()
-            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .text_size(self.file_ui_size(UI_SMALL_TEXT_SIZE))
             .child(header)
             .children(self.render_commit_box(pane_id, repo, listing, cx))
             .child(body)
@@ -3473,7 +3473,7 @@ impl CompiApp {
                             .py_1()
                             .border_t_1()
                             .border_color(color(colors.border))
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_size(self.file_ui_size(UI_MICRO_TEXT_SIZE))
                             .text_color(color(colors.muted))
                             .child(format!(
                                 "Showing the first {} changes",
@@ -3604,13 +3604,17 @@ impl CompiApp {
             .justify_center()
             .gap_1()
             .text_color(color(colors.muted))
-            .child(div().text_size(px(UI_BODY_TEXT_SIZE)).child(title))
+            .child(
+                div()
+                    .text_size(self.file_ui_size(UI_BODY_TEXT_SIZE))
+                    .child(title),
+            )
             .when_some(detail, |message, (detail, tint)| {
                 message.child(
                     div()
                         .max_w(px(480.0))
                         .text_center()
-                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_size(self.file_ui_size(UI_MICRO_TEXT_SIZE))
                         .text_color(color(tint))
                         .child(detail),
                 )
@@ -3660,12 +3664,16 @@ impl CompiApp {
         let colors = *self.colors();
         let dark = self.theme.is_dark();
         let tree = self.content.changes.tree;
-        let row_height = self
-            .typography
+        let typography = self.file_typography();
+        let row_height = typography
             .cell_height
             .max(controls::ControlSize::Row.height());
         let list_width = repo.list_width.get();
-        let mono = self.typography.font.family.clone();
+        let mono = typography.font.family.clone();
+        // Text and the glyph widths that elide folders, at the file text size.
+        let micro = self.file_ui_size(UI_MICRO_TEXT_SIZE);
+        let scale = f32::from(self.file_ui_size(1.0));
+        let (small_glyph, micro_glyph) = (SMALL_GLYPH_WIDTH * scale, MICRO_GLYPH_WIDTH * scale);
         let chosen_row = repo.selected_row().filter(|_| keyboard);
         rows.iter()
             .zip(range)
@@ -3773,7 +3781,7 @@ impl CompiApp {
                             },
                         ));
                         base.pl(px(TREE_INSET))
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_size(micro)
                             .text_color(color(colors.muted))
                             .hover(move |style| style.text_color(color(colors.foreground)))
                             .when_some(tooltip, |row, tooltip| row.tooltip(tooltip))
@@ -3826,7 +3834,7 @@ impl CompiApp {
                                 this.move_changes(&mover, &scope, paths, true, window, cx);
                             }));
                         base.pl(px(TREE_INSET))
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_size(micro)
                             .text_color(color(colors.muted))
                             .hover(move |style| style.text_color(color(colors.foreground)))
                             .child(
@@ -3859,7 +3867,7 @@ impl CompiApp {
                             },
                         ));
                         base.pl(px(TREE_INSET))
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_size(micro)
                             .text_color(color(colors.muted))
                             .hover(move |style| style.text_color(color(colors.foreground)))
                             .tooltip(controls::tooltip(
@@ -3935,12 +3943,12 @@ impl CompiApp {
                             - 8.0 * 3.0
                             - 14.0
                             - if language.is_some() { 20.0 } else { 0.0 }
-                            - name.chars().count() as f32 * SMALL_GLYPH_WIDTH
-                            - counts_chars as f32 * MICRO_GLYPH_WIDTH;
+                            - name.chars().count() as f32 * small_glyph
+                            - counts_chars as f32 * micro_glyph;
                         // The Line endings only group lists flat in tree mode too.
                         let flat = !tree || change.line_endings_only;
                         let folder = (flat && !folder.is_empty())
-                            .then(|| truncate_middle(folder, (room / MICRO_GLYPH_WIDTH) as usize))
+                            .then(|| truncate_middle(folder, (room / micro_glyph) as usize))
                             .filter(|folder| folder.chars().count() >= 4);
                         let scope = &change.scope;
                         let deleted = change.kind == GitChangeKind::Deleted;
@@ -4032,7 +4040,7 @@ impl CompiApp {
                                             .w(px(14.0))
                                             .flex_none()
                                             .font_family(mono.clone())
-                                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                                            .text_size(micro)
                                             .text_color(color(kind_color(kind, &colors)))
                                             .child(status_letter(kind)),
                                     )
@@ -4056,7 +4064,7 @@ impl CompiApp {
                                                 .min_w_0()
                                                 .overflow_hidden()
                                                 .text_ellipsis()
-                                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                .text_size(micro)
                                                 .text_color(color(colors.muted))
                                                 .child(folder.into_owned()),
                                         )
@@ -4067,7 +4075,7 @@ impl CompiApp {
                                             div()
                                                 .flex_none()
                                                 .font_family(mono.clone())
-                                                .text_size(px(UI_MICRO_TEXT_SIZE))
+                                                .text_size(micro)
                                                 .map(|counts| {
                                                     if actions_shown {
                                                         counts.invisible()

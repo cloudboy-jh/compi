@@ -610,6 +610,7 @@ enum UiEvent {
         density: crate::theme::WorkspaceDensity,
         terminal_font: FontSettings,
         chat_text_size: f32,
+        file_text_size: Option<f32>,
         diagnostics: Vec<String>,
     },
     ImagePrepared {
@@ -891,6 +892,19 @@ enum SettingsScope {
     Global,
     Window,
 }
+
+/// Global appearance read again from the configuration file, applied at the next draw:
+/// theme, favorites, interface font, density, terminal font, chat and file text sizes.
+type AppearanceReload = (
+    AppearanceSettings,
+    Vec<ThemeId>,
+    UiFontPreset,
+    crate::theme::WorkspaceDensity,
+    FontSettings,
+    f32,
+    Option<f32>,
+);
+
 struct CompiApp {
     started_at: Instant,
     target: ConnectionTarget,
@@ -970,14 +984,7 @@ struct CompiApp {
     theme_library: ThemeLibrary,
     ui_font: UiFontPreset,
     theme_catalog: Option<workspace::catalog::CatalogState>,
-    pending_appearance_reload: Option<(
-        AppearanceSettings,
-        Vec<ThemeId>,
-        UiFontPreset,
-        crate::theme::WorkspaceDensity,
-        FontSettings,
-        f32,
-    )>,
+    pending_appearance_reload: Option<AppearanceReload>,
     pending_image_inputs: HashSet<u64>,
     image_previews: VecDeque<workspace::media::ImagePreview>,
     image_inspector: Option<workspace::media::InspectorState>,

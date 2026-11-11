@@ -56,7 +56,7 @@ pub(super) struct DiffSettings {
     pub whitespace: Whitespace,
 }
 
-/// The window's colors and terminal font, set by the pane before each draw.
+/// The window's colors and file text typography, set by the pane before each draw.
 #[derive(Clone)]
 pub(super) struct DiffStyle {
     pub colors: ThemeColors,

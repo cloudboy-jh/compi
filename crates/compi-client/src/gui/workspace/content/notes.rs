@@ -843,7 +843,8 @@ impl CompiApp {
                                 .on_link_click(move |url, _, window, cx| {
                                     link_plugin.open_link(url, window, cx)
                                 })
-                                .text_size(px(UI_BODY_TEXT_SIZE))
+                                // Headings follow the body's size.
+                                .text_size(self.file_ui_size(UI_BODY_TEXT_SIZE))
                                 .text_color(color(colors.foreground))
                                 .size_full(),
                         )
