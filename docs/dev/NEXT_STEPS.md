@@ -19,6 +19,12 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 Commands from the other shell, dev-server cards and in-place browsing, Catppuccin language icons, clickable sub-agent task/step lists, completion recovery and ending-card corrections shipped in 0.8.0. Details and observed checks: [Completed work](COMPLETED.md).
 
+Smoke test 2026-11-11 (installed 0.8.0, OMP chat in WSL, `compi-landingpage` repo):
+
+- **Passed:** the Open card on a `python3 -m http.server` pane opened the page in place, Toggle view returned to the terminal and the server kept serving. In WSL Bash, PowerShell commands ran in PowerShell, `$compiDemo` survived between commands and `Set-Location C:\Windows` moved the Bash prompt to `/mnt/c/Windows`.
+- **Failed:** PowerShell → WSL routing, chat code colours, finding a sub-agent to open (see Fixed after 0.8.0).
+- **Not confirmed:** added/removed markers in chat diffs; a finished sub-agent no longer looking busy.
+
 - macOS browser views and icon rendering: the only known Mac, `bruisedpear`, was offline on 2026-11-11, with no Mac SSH host configured. Native checks could not run. Physical Ctrl/Cmd-click on a local link and the view-toggle chord while the web page has the keyboard also remain unobserved.
 - Alternative line editors are not intercepted; custom executable/argument profiles keep their existing behavior. The other-shell setting applies to new shells. Tab completion stays with the current shell.
 
@@ -38,6 +44,18 @@ Not seen yet: UAC prompts, `winget` installs, why `cmd.exe /c start steam://…`
 - **Updates that keep shells.** Release metadata qualifies only the release's own daemon (`qualified_daemons = [version]` in the smoke scripts), so every update restarts the daemon, even with the protocol unchanged. Qualify the previous daemon when protocol and workspace format did not change.
 - **Updater upkeep.** A repair from Settings → Apps after Setup removed its run folder is untested. Root `Compi-Setup.exe` still changes only through Setup. Setup and the in-app updater keep two journals and two scheduled-task guards. The 0.1.x–0.3.0 migration paths and `INSTALLER_UPDATES_PLAN.md` (a 0.1.3-era plan) are out of date. macOS activation has never run natively.
 - **Other chat harnesses:** OpenCode, Pi, Codex, Claude Code (vault order).
+
+## Fixed after 0.8.0, not released
+
+- **PowerShell → WSL routing.** A Windows checkout gave `assets/compi-other-shell.ps1` CRLF line endings, so the Bash companion written to WSL `/tmp` had them too: `trap`/the read loop failed and `rm -f -- "$0"` missed the file. The script now turns CRLF into LF before writing the companion.
+- **Chat code colours.** The uncoloured "JavaScript block" was the output of a `read theme.js` tool call, fenced without a language. Read output now takes the file's language from its path. Message fences already coloured (javascript/js, typescript, rust, python, bash, json, yaml, toml, html, css, go); `jsx`, `shell`, `zsh`, `console` and capitalised tags still don't, as gpui-component has no aliases for them.
+- **Sub-agents hard to find.** Each sub-agent line has a chevron and opens on a click anywhere on it; each running agent in the agents bar opens and scrolls to its line.
+- **Question card layout.** The daemon read form fields from a sorted JSON map and sorted them again; `serde_json` now keeps order (`preserve_order` in `compi-daemon`) and fields follow the form. OMP's HTML-form `{name}_other` field now joins its choices (only `__other` did), the heading drops lines repeating a field title, and Other is a chip after the choices that opens its text field when picked (seen: typed "postgres" reached OMP as the field's answer).
+- **`compi` in agent shells.** Chat harnesses get the terminal's CLI environment (`cli_environment`): `COMPI_INSTANCE`, the CLI paths, and `COMPI_SURFACE_ID` when the chat shows in place of a terminal (a chat beside one has no surface, so commands needing a pane take `--pane`). In WSL the `~/.compi/shell/compi` bridge is installed and put first on PATH after the login profile; Windows `omp.exe` chats get `compi.exe`'s folder first on PATH. Unchecked: a distribution whose `/etc/profile` resets PATH for OMP's own login shells.
+- **Tool cards.** Actions are one line; failed ones stay folded and show their first error line. Opened, a command is one `$ command` line with Copy, and output shows its last 12 lines with **Show all**.
+- **File text size** (asked 2026-11-11): Settings → Terminal → File text size (`[files] text_size`, 8–32, unset follows the terminal font). Zoom keys in an editor, diff, Markdown Read view, large text, Files or Changes step it instead of the terminal font.
+
+Seen in `cargo dev` on Windows (2026-11-11): Ctrl+=/−/0 in the Markdown Read view and the diff changed only `files.text_size`; in a terminal they changed only `font.size`. A PowerShell tab ran `uname -sr`, kept an exported variable for the next command and left no companion script in WSL `/tmp`. In a WSL OMP chat, a failed `ls` stayed one line with its error, `command -v compi` gave `~/.compi/shell/compi` with `COMPI_INSTANCE`, the CLI paths and the pane's `COMPI_SURFACE_ID`, a Read of a `.rs` file opened with colours, a finished scout opened from its chevron line, and a radio-group-plus-textarea form showed the legend once, "Other…", then Notes, and its answer reached OMP. Not seen: the agents-bar click while agents run; macOS. Read output keeps OMP's `N:` line prefixes, so a line starting with a comment highlights as code.
 
 ## Open bugs
 
