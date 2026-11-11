@@ -1,6 +1,44 @@
 use crate::Result;
 use std::ffi::OsString;
 
+/// What a Compi shell needs to run the CLI as its pane's: the pane's surface (none for a
+/// chat that shows in no terminal), the daemon's instance, and the CLI and its data
+/// folder, for WSL as Windows paths, which the shell bridge's `compi` converts.
+pub(crate) fn cli_environment(
+    surface: Option<&str>,
+    instance: Option<&str>,
+    wsl: bool,
+) -> Result<Vec<(&'static str, String)>> {
+    let cli =
+        std::env::current_exe()?.with_file_name(if cfg!(windows) { "compi.exe" } else { "compi" });
+    let mut environment = Vec::with_capacity(4);
+    if let Some(surface) = surface {
+        environment.push(("COMPI_SURFACE_ID", surface.to_owned()));
+    }
+    environment.extend([
+        ("COMPI_INSTANCE", instance.unwrap_or("").to_owned()),
+        (
+            if wsl {
+                "COMPI_CLI_WINDOWS"
+            } else {
+                "COMPI_CLI"
+            },
+            cli.to_string_lossy().into_owned(),
+        ),
+        (
+            if wsl {
+                "COMPI_CLI_DATA_DIR_WINDOWS"
+            } else {
+                "COMPI_DATA_DIR"
+            },
+            compi_protocol::paths::data_dir()?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    Ok(environment)
+}
+
 const BRIDGE: &str = include_str!("../../../assets/compi-shell.sh");
 const BASH_FUNCTIONS: [&str; 20] = [
     "compi",
@@ -244,6 +282,16 @@ fn install_unix(directory: &std::path::Path) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Installs the shell bridge, whose `~/.compi/shell/compi` runs the CLI, in the daemon's
+/// home, as a terminal's launch does; a chat's harness puts that folder on its path.
+#[cfg(unix)]
+pub(crate) fn install_home_bridge() -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or("HOME is not set")?;
+    install_unix(&std::path::Path::new(&home).join(".compi/shell"))
 }
 
 fn shell_files() -> [(&'static str, &'static str); 7] {
@@ -764,26 +812,18 @@ unset commands root point type options path windows entry
     };
 }
 
+/// The WSL shell bridges installed since the daemon started, by distribution and home.
 #[cfg(windows)]
-pub(crate) fn prepare_wsl(
-    distribution: Option<&str>,
+static BRIDGES: std::sync::Mutex<Vec<WslBridge>> = std::sync::Mutex::new(Vec::new());
+
+/// The shell bridge of `distribution` and `home_override` in `bridges`, installed first
+/// unless the one installed earlier is still in place.
+#[cfg(windows)]
+fn installed_bridge<'a>(
+    bridges: &'a mut Vec<WslBridge>,
+    distribution: &str,
     home_override: Option<&str>,
-    prompt_command: Option<&str>,
-    login: bool,
-    argv: &mut Vec<OsString>,
-) -> Result<()> {
-    static BRIDGES: std::sync::Mutex<Vec<WslBridge>> = std::sync::Mutex::new(Vec::new());
-    let default_distribution;
-    let distribution = match distribution {
-        Some(name) => name,
-        None => {
-            default_distribution = compi_protocol::wsl::directory_distribution(None)?;
-            &default_distribution
-        }
-    };
-    let mut bridges = BRIDGES
-        .lock()
-        .map_err(|_| "WSL bridge cache was poisoned")?;
+) -> Result<&'a mut WslBridge> {
     if let Some(index) = bridges.iter().position(|bridge| {
         bridge.distribution == distribution && bridge.home.as_deref() == home_override
     }) {
@@ -828,7 +868,40 @@ pub(crate) fn prepare_wsl(
             bridges.len() - 1
         }
     };
-    let bridge = &mut bridges[index];
+    Ok(&mut bridges[index])
+}
+
+/// Installs `distribution`'s shell bridge, whose `~/.compi/shell/compi` runs the Windows
+/// CLI, as a terminal's launch does; a chat's harness puts that folder on its path.
+#[cfg(windows)]
+pub(crate) fn install_wsl_bridge(distribution: &str) -> Result<()> {
+    let mut bridges = BRIDGES
+        .lock()
+        .map_err(|_| "WSL bridge cache was poisoned")?;
+    installed_bridge(&mut bridges, distribution, None)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_wsl(
+    distribution: Option<&str>,
+    home_override: Option<&str>,
+    prompt_command: Option<&str>,
+    login: bool,
+    argv: &mut Vec<OsString>,
+) -> Result<()> {
+    let default_distribution;
+    let distribution = match distribution {
+        Some(name) => name,
+        None => {
+            default_distribution = compi_protocol::wsl::directory_distribution(None)?;
+            &default_distribution
+        }
+    };
+    let mut bridges = BRIDGES
+        .lock()
+        .map_err(|_| "WSL bridge cache was poisoned")?;
+    let bridge = installed_bridge(&mut bridges, distribution, home_override)?;
     if let Some(commands) = windows_commands()
         && bridge.commands.as_deref() != Some(commands.digest.as_str())
     {

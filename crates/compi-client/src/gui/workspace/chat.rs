@@ -1231,6 +1231,17 @@ impl CompiApp {
         }
     }
 
+    /// Shows all of the output of the tool call at row `index`, or only its last lines.
+    fn toggle_chat_output(&mut self, chat: &str, index: usize, cx: &mut App) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
+            row.toggle_output(&model.folder, cx);
+            model.scroller.remeasure_row(index);
+        }
+    }
+
     /// Scrolls to a call, unfolding its named agent or all of its agents.
     fn reveal_chat_tool(&mut self, chat: &str, index: usize, agent: Option<&str>) {
         let Some(model) = self.chat.chats.get_mut(chat) else {
@@ -1779,9 +1790,10 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Over the composer while sub-agents of the chat run: how many, and what each does
-    /// (or how long it has run); a click opens every running agent's call and details.
-    /// Settings → Chat turns it off.
+    /// Over the composer while sub-agents of the chat run: how many, then each by name
+    /// with what it does (or how long it has run). A click on the count opens every
+    /// running agent's call; a click on an agent unfolds its task, steps and result in the
+    /// transcript and scrolls to it. Settings → Chat turns it off.
     fn render_chat_agents(
         &self,
         chat: &ChatContent,
@@ -1793,7 +1805,7 @@ impl CompiApp {
         }
         let running = rows::running_agents(&model.state.as_ref()?.entries);
         let &(tool, _) = running.last()?;
-        let mut label = format!(
+        let count = format!(
             "{} {} running",
             running.len(),
             if running.len() == 1 {
@@ -1802,21 +1814,49 @@ impl CompiApp {
                 "agents"
             }
         );
-        for (_, agent) in &running {
-            label.push_str(" · ");
-            label.push_str(&agent.id);
-            if let Some(doing) = agent.activity.clone().or_else(|| rows::agent_time(agent)) {
-                label.push_str(": ");
-                label.push_str(&doing);
-            }
-        }
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
+        let hover = color(colors.surface_hover);
+        let foreground = color(colors.foreground);
         // Every agent of the latest running call, so its dots show who is done.
         let statuses: Vec<_> = match model.state.as_ref()?.entries.get(tool) {
             Some(ChatEntry::Tool(call)) => call.agents.iter().map(|agent| agent.status).collect(),
             _ => running.iter().map(|(_, agent)| agent.status).collect(),
         };
+        let agents: Vec<_> = running
+            .iter()
+            .enumerate()
+            .map(|(position, &(tool, agent))| {
+                let mut label = agent.id.clone();
+                if let Some(doing) = agent.activity.clone().or_else(|| rows::agent_time(agent)) {
+                    label.push_str(": ");
+                    label.push_str(&doing);
+                }
+                let (id, agent) = (chat.id.clone(), agent.id.clone());
+                div()
+                    .id(("chat-agents-agent", position))
+                    .min_w_0()
+                    .h_full()
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .rounded(ui_rems(4.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(hover).text_color(foreground))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(label),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.reveal_chat_tool(&id, tool, Some(agent.as_str()));
+                        cx.notify();
+                    }))
+            })
+            .collect();
         let id = chat.id.clone();
         let mut tools = Vec::new();
         for &(tool, _) in &running {
@@ -1831,35 +1871,46 @@ impl CompiApp {
                 .pt_1()
                 .child(
                     div()
-                        .id("chat-agents")
                         .h(ui_rems(24.0))
-                        .px_1()
                         .flex()
                         .items_center()
-                        .gap_2()
-                        .rounded(ui_rems(4.0))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(color(colors.surface_hover)))
+                        .gap_1()
                         .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(muted)
-                        .child(rows::agents_mark(
-                            harness_mark(chat.harness),
-                            statuses,
-                            &colors,
-                        ))
+                        .child(
+                            div()
+                                .id("chat-agents")
+                                .flex_none()
+                                .h_full()
+                                .px_1()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded(ui_rems(4.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(hover).text_color(foreground))
+                                .child(rows::agents_mark(
+                                    harness_mark(chat.harness),
+                                    statuses,
+                                    &colors,
+                                ))
+                                .child(div().whitespace_nowrap().child(count))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.reveal_chat_agent_tools(&id, &tools);
+                                    cx.notify();
+                                })),
+                        )
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .gap_1()
                                 .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(label),
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.reveal_chat_agent_tools(&id, &tools);
-                            cx.notify();
-                        })),
+                                .children(agents),
+                        ),
                 )
                 .into_any_element(),
         )

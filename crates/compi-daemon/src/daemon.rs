@@ -452,6 +452,7 @@ pub fn run(instance: Option<&str>) -> Result<()> {
     let _singleton = DaemonSingleton::acquire(&names.mutex)?;
     compi_protocol::perf::log_startup_metric("daemon_singleton_ready_ms", started_at.elapsed());
     let manager = Arc::new(SurfaceManager::persistent(instance)?);
+    crate::chat::hub().set_instance(instance);
     compi_protocol::perf::log_startup_metric("daemon_store_ready_ms", started_at.elapsed());
     launch::check_system()?;
     compi_protocol::perf::log_startup_metric("daemon_host_ready_ms", started_at.elapsed());
@@ -839,7 +840,11 @@ fn handle_connection(
                 }
                 ClientMessage::WatchChat { chat, approval } => match chat.validate() {
                     Ok(()) => {
-                        let (state, events) = crate::chat::hub().watch(&chat, approval);
+                        let surface = manager
+                            .snapshot()
+                            .ok()
+                            .and_then(|workspace| crate::chat::chat_surface(&workspace, &chat.id));
+                        let (state, events) = crate::chat::hub().watch(&chat, approval, surface);
                         sink.send_control(&ServerControl {
                             request_id: Some(request_id),
                             message: ServerMessage::ChatWatching { state },

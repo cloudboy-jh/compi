@@ -17,13 +17,13 @@ use compi_protocol::chat::{
     MAX_CHAT_TOOL_OUTPUT_BYTES,
 };
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
-use compi_protocol::{ContentEnvironment, LayoutNode, WorkspaceSnapshot};
+use compi_protocol::{ContentEnvironment, LayoutNode, SurfaceId, WorkspaceSnapshot};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -47,9 +47,11 @@ const WATCH_STATE_BYTES: usize = 6 * 1024 * 1024;
 const APPROVAL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// The modes `omp acp --approval-mode` takes.
 const OMP_APPROVAL_MODES: [&str; 4] = ["always-ask", "always-ask-cached", "write", "yolo"];
-/// `omp` in a login shell, its arguments to follow. Where `omp` is installed when a login
-/// shell's search path lacks it: its install script's and Bun's folders.
-const UNIX_COMMAND: &str = r#"PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin" exec omp"#;
+/// `omp` in a login shell, its arguments to follow. The shell bridge's folder comes first
+/// on its search path, so `compi` runs the CLI as in a terminal. Where `omp` is installed
+/// when a login shell's search path lacks it: its install script's and Bun's folders.
+const UNIX_COMMAND: &str =
+    r#"PATH="$HOME/.compi/shell:$PATH:$HOME/.local/bin:$HOME/.bun/bin" exec omp"#;
 /// The longest line a sub-agent's activity keeps, in characters.
 const AGENT_ACTIVITY_CHARS: usize = 160;
 /// How often a chat with sub-agents running looks in the session's file for their ends.
@@ -62,6 +64,8 @@ const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 pub struct ChatHub {
     chats: Mutex<HashMap<String, Arc<Chat>>>,
     status: ChatStatusHub,
+    /// The daemon's instance, which harnesses get as a terminal's shell does.
+    instance: OnceLock<Option<String>>,
 }
 
 /// The daemon's chats.
@@ -71,23 +75,33 @@ pub fn hub() -> &'static ChatHub {
 }
 
 impl ChatHub {
+    /// Names the daemon's instance for the harnesses started from now on.
+    pub fn set_instance(&self, instance: Option<&str>) {
+        let _ = self.instance.set(instance.map(str::to_owned));
+    }
+
     /// The chat's whole state and a receiver of its later changes, starting the chat if it
     /// is not running. `approval` applies from the harness's next start, this one when it
-    /// starts it.
+    /// starts it; so does `surface`, the terminal whose view shows the chat, if one does.
     pub fn watch(
         &self,
         content: &ChatContent,
         approval: ChatApproval,
+        surface: Option<SurfaceId>,
     ) -> (ChatState, mpsc::Receiver<ChatEvent>) {
         let chat = {
             let mut chats = lock(&self.chats);
             chats
                 .entry(content.id.clone())
-                .or_insert_with(|| Chat::start(content.clone(), approval))
+                .or_insert_with(|| {
+                    let instance = self.instance.get().cloned().flatten();
+                    Chat::start(content.clone(), instance, approval, surface.clone())
+                })
                 .clone()
         };
         let mut inner = chat.lock();
         inner.approval = approval;
+        inner.surface = surface;
         let (sender, receiver) = mpsc::channel();
         inner.watchers.push(sender);
         (fit(inner.state.clone(), WATCH_STATE_BYTES), receiver)
@@ -180,22 +194,23 @@ impl ChatHub {
         Ok(())
     }
 
-    /// Ends every chat no pane or view of `workspace` holds any more.
+    /// Ends every chat no pane or view of `workspace` holds any more, and notes the
+    /// terminal each other one shows in for its harness's next start.
     pub fn retain(&self, workspace: &WorkspaceSnapshot) {
         let mut chats = lock(&self.chats);
         if chats.is_empty() {
             return;
         }
-        let mut held = HashSet::new();
-        for tab in workspace.sessions.iter().flat_map(|session| &session.tabs) {
-            chat_ids(&tab.layout, &mut held);
-        }
-        chats.retain(|id, chat| {
-            let keep = held.contains(id);
-            if !keep {
-                chat.close();
+        let mut held = held_chats(workspace);
+        chats.retain(|id, chat| match held.remove(id) {
+            Some(surface) => {
+                lock(&chat.inner).surface = surface;
+                true
             }
-            keep
+            None => {
+                chat.close();
+                false
+            }
         });
     }
 
@@ -207,15 +222,31 @@ impl ChatHub {
     }
 }
 
-fn chat_ids(node: &LayoutNode, output: &mut HashSet<String>) {
+/// The terminal whose view shows chat `id` in `workspace`; `None` when a content pane
+/// shows it, or nothing does.
+pub fn chat_surface(workspace: &WorkspaceSnapshot, id: &str) -> Option<SurfaceId> {
+    held_chats(workspace).remove(id).flatten()
+}
+
+/// Every chat a pane or view of `workspace` holds, with the terminal it shows in when a
+/// terminal's view holds it.
+fn held_chats(workspace: &WorkspaceSnapshot) -> HashMap<String, Option<SurfaceId>> {
+    let mut held = HashMap::new();
+    for tab in workspace.sessions.iter().flat_map(|session| &session.tabs) {
+        chat_leaves(&tab.layout, &mut held);
+    }
+    held
+}
+
+fn chat_leaves(node: &LayoutNode, output: &mut HashMap<String, Option<SurfaceId>>) {
     match node {
         LayoutNode::Split { first, second, .. } => {
-            chat_ids(first, output);
-            chat_ids(second, output);
+            chat_leaves(first, output);
+            chat_leaves(second, output);
         }
         leaf => {
             if let Some(chat) = leaf.content().and_then(|content| content.chat()) {
-                output.insert(chat.id.clone());
+                output.insert(chat.id.clone(), leaf.surface_id().cloned());
             }
         }
     }
@@ -268,6 +299,8 @@ fn now_ms() -> u64 {
 
 struct Chat {
     content: ChatContent,
+    /// The daemon's instance, as `COMPI_INSTANCE` names it.
+    instance: Option<String>,
     inner: Mutex<Inner>,
 }
 
@@ -427,6 +460,8 @@ struct Inner {
     /// When the transcript last moved (a prompt, a reply chunk, a tool report): a thought
     /// that follows began then, since the harness sends its text only once it is done.
     activity_ms: u64,
+    /// The terminal whose view shows the chat, which the harness's shell context names.
+    surface: Option<SurfaceId>,
 }
 
 /// What the user has not seen yet of a chat that waits.
@@ -480,7 +515,12 @@ struct Agent {
 }
 
 impl Chat {
-    fn start(content: ChatContent, approval: ChatApproval) -> Arc<Self> {
+    fn start(
+        content: ChatContent,
+        instance: Option<String>,
+        approval: ChatApproval,
+        surface: Option<SurfaceId>,
+    ) -> Arc<Self> {
         let chat = Arc::new(Self {
             inner: Mutex::new(Inner {
                 chat_id: content.id.clone(),
@@ -490,9 +530,11 @@ impl Chat {
                     ..ChatState::default()
                 },
                 approval,
+                surface,
                 ..Inner::default()
             }),
             content,
+            instance,
         });
         chat.spawn(&mut chat.lock());
         chat
@@ -502,34 +544,33 @@ impl Chat {
         Locked(lock(&self.inner))
     }
 
-    /// Starts the harness as the chat's approval says. OMP's own setting, which `omp acp`
-    /// does not read, is looked up first on a thread of its own, no lock held; the status
-    /// stays `Starting` meanwhile.
+    /// Starts the harness as the chat's approval says. Compi's shell bridge is installed
+    /// where it runs and OMP's own setting, which `omp acp` does not read, is looked up
+    /// first, on a thread of its own, no lock held; the status stays `Starting` meanwhile.
     fn spawn(self: &Arc<Self>, inner: &mut Inner) {
         inner.generation += 1;
         inner.initialized = false;
         let generation = inner.generation;
-        if let Some(mode) = inner.approval.omp_mode() {
-            self.launch(inner, generation, Some(mode));
-            return;
-        }
+        let chosen = inner.approval.omp_mode();
         let chat = self.clone();
-        let looking_up = thread::Builder::new()
-            .name("compi-chat-approval".into())
+        let preparing = thread::Builder::new()
+            .name("compi-chat-start".into())
             .spawn(move || {
-                let mode = configured_approval(&chat.content);
+                install_bridge(&chat.content);
+                let mode = chosen.or_else(|| configured_approval(&chat.content));
                 let mut inner = chat.lock();
                 if !inner.closed && inner.generation == generation {
                     chat.launch(&mut inner, generation, mode);
                 }
             });
-        if looking_up.is_err() {
-            self.launch(inner, generation, None);
+        if preparing.is_err() {
+            self.launch(inner, generation, chosen);
         }
     }
 
     /// Runs the harness, with `approval_mode` when there is one, and asks it to
-    /// initialize; the rest follows its answers.
+    /// initialize; the rest follows its answers. It gets the shell context a terminal in
+    /// its folder gets, so `compi` there acts on this workspace.
     fn launch(
         self: &Arc<Self>,
         inner: &mut Inner,
@@ -540,7 +581,15 @@ impl Chat {
         if let Some(mode) = approval_mode {
             args.extend(["--approval-mode", mode]);
         }
-        let mut child = match command(&self.content, &args).and_then(|mut command| {
+        let wsl = matches!(self.content.environment, ContentEnvironment::Wsl { .. });
+        let mut child = match crate::shell_integration::cli_environment(
+            inner.surface.as_ref().map(SurfaceId::as_str),
+            self.instance.as_deref(),
+            wsl,
+        )
+        .map_err(|error| format!("Couldn't prepare Compi's shell context: {error}"))
+        .and_then(|environment| command(&self.content, &environment, &args))
+        .and_then(|mut command| {
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -2487,11 +2536,8 @@ fn error_text(error: &Value) -> String {
     }
 }
 
-/// Suffix `__other` names a choice field's free-text companion (OMP's `ask`).
-const OTHER_SUFFIX: &str = "__other";
-
-/// A form's fields, in the order its keys sort naturally (`q2` before `q10`), and how to
-/// send each answer back.
+/// A form's fields in the order the form lists them, and how to send each answer back.
+/// A choice field's free-text companion (see `companion`) becomes its Other.
 fn form_fields(schema: &Value) -> (Vec<ChatField>, Vec<FieldShape>) {
     let empty = Map::new();
     let properties = schema["properties"].as_object().unwrap_or(&empty);
@@ -2501,73 +2547,30 @@ fn form_fields(schema: &Value) -> (Vec<ChatField>, Vec<FieldShape>) {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    let mut keys: Vec<&String> = properties
-        .keys()
-        .filter(|key| {
-            // A companion stands alone only when its choice field is missing.
-            key.strip_suffix(OTHER_SUFFIX)
-                .is_none_or(|base| !properties.contains_key(base))
+    let listed: Vec<(&String, &Value, String, Vec<ChatChoice>, bool)> = properties
+        .iter()
+        .map(|(key, property)| {
+            let kind = property["type"].as_str().unwrap_or("string").to_owned();
+            let (choices, multi) = field_choices(&kind, property);
+            (key, property, kind, choices, multi)
         })
         .collect();
-    keys.sort_by_key(|key| natural(key));
+    // Each choice field's companion; one whose choice field is missing stands alone.
+    let companions: Vec<(&str, String)> = listed
+        .iter()
+        .filter(|(_, _, _, choices, _)| !choices.is_empty())
+        .filter_map(|(key, ..)| Some((key.as_str(), companion(properties, key)?)))
+        .collect();
     let mut fields = Vec::new();
     let mut shapes = Vec::new();
-    for key in keys {
-        let property = &properties[key.as_str()];
-        let kind = property["type"].as_str().unwrap_or("string").to_owned();
-        let listed = |value: &Value| -> Vec<ChatChoice> {
-            let from_one_of = value["oneOf"]
-                .as_array()
-                .or_else(|| value["anyOf"].as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|item| {
-                    let value = item["const"].as_str()?.to_owned();
-                    Some(ChatChoice {
-                        name: item["title"].as_str().unwrap_or(&value).to_owned(),
-                        value,
-                        description: None,
-                        group: None,
-                    })
-                });
-            let from_enum = value["enum"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|item| {
-                    let value = item.as_str()?.to_owned();
-                    Some(ChatChoice {
-                        name: value.clone(),
-                        value,
-                        description: None,
-                        group: None,
-                    })
-                });
-            from_one_of.chain(from_enum).collect()
-        };
-        let (choices, multi) = match kind.as_str() {
-            "array" => (listed(&property["items"]), true),
-            "boolean" => (
-                vec![
-                    ChatChoice {
-                        value: "true".into(),
-                        name: "Yes".into(),
-                        description: None,
-                        group: None,
-                    },
-                    ChatChoice {
-                        value: "false".into(),
-                        name: "No".into(),
-                        description: None,
-                        group: None,
-                    },
-                ],
-                false,
-            ),
-            _ => (listed(property), false),
-        };
-        let other_key = format!("{key}{OTHER_SUFFIX}");
-        let other = properties.contains_key(&other_key);
+    for (key, property, kind, choices, multi) in listed {
+        if companions.iter().any(|(_, other)| other == key) {
+            continue;
+        }
+        let other_key = companions
+            .iter()
+            .find(|(base, _)| base == key)
+            .map(|(_, other)| other.clone());
         fields.push(ChatField {
             key: key.clone(),
             title: property["title"]
@@ -2577,39 +2580,90 @@ fn form_fields(schema: &Value) -> (Vec<ChatField>, Vec<FieldShape>) {
                 .to_owned(),
             choices,
             multi,
-            other,
+            other: other_key.is_some(),
             required: required.contains(key.as_str()),
         });
         shapes.push(FieldShape {
             key: key.clone(),
             kind,
-            other: other.then_some(other_key),
+            other: other_key,
         });
     }
     (fields, shapes)
 }
 
-/// Sorts `q2` before `q10`: runs of digits compare as numbers.
-fn natural(key: &str) -> Vec<(String, u64)> {
-    let mut parts = Vec::new();
-    let mut text = String::new();
-    let mut digits = String::new();
-    for c in key.chars() {
-        if c.is_ascii_digit() {
-            digits.push(c);
-        } else {
-            if !digits.is_empty() {
-                parts.push((
-                    std::mem::take(&mut text),
-                    digits.parse().unwrap_or(u64::MAX),
-                ));
-                digits.clear();
-            }
-            text.push(c);
-        }
+/// A field's choices, from its `oneOf`, `anyOf` or `enum` (its items' for an array, which
+/// takes several), or Yes and No for a boolean; none for a text field.
+fn field_choices(kind: &str, property: &Value) -> (Vec<ChatChoice>, bool) {
+    let listed = |value: &Value| -> Vec<ChatChoice> {
+        let from_one_of = value["oneOf"]
+            .as_array()
+            .or_else(|| value["anyOf"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let value = item["const"].as_str()?.to_owned();
+                Some(ChatChoice {
+                    name: item["title"].as_str().unwrap_or(&value).to_owned(),
+                    value,
+                    description: None,
+                    group: None,
+                })
+            });
+        let from_enum = value["enum"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let value = item.as_str()?.to_owned();
+                Some(ChatChoice {
+                    name: value.clone(),
+                    value,
+                    description: None,
+                    group: None,
+                })
+            });
+        from_one_of.chain(from_enum).collect()
+    };
+    match kind {
+        "array" => (listed(&property["items"]), true),
+        "boolean" => (
+            vec![
+                ChatChoice {
+                    value: "true".into(),
+                    name: "Yes".into(),
+                    description: None,
+                    group: None,
+                },
+                ChatChoice {
+                    value: "false".into(),
+                    name: "No".into(),
+                    description: None,
+                    group: None,
+                },
+            ],
+            false,
+        ),
+        _ => (listed(property), false),
     }
-    parts.push((text, digits.parse().unwrap_or(0)));
-    parts
+}
+
+/// The key of choice field `key`'s free-text companion, if the form has one: `{key}__other`
+/// (OMP's `ask`), or `{key}_other` with a `_` added for each name the form already used
+/// (OMP's HTML forms).
+fn companion(properties: &Map<String, Value>, key: &str) -> Option<String> {
+    let ask = format!("{key}__other");
+    if properties.contains_key(&ask) {
+        return Some(ask);
+    }
+    let mut other = format!("{key}_other");
+    if !properties.contains_key(&other) {
+        return None;
+    }
+    while properties.contains_key(&format!("{other}_")) {
+        other.push('_');
+    }
+    Some(other)
 }
 
 /// The form's `content`: each answer in its field's type; typed text for a choice field
@@ -2758,7 +2812,7 @@ fn last_lines(text: &str, count: usize) -> &str {
 /// `APPROVAL_LOOKUP_TIMEOUT`. The value is the last line: a login shell's profile may
 /// print before it.
 fn configured_approval(content: &ChatContent) -> Option<&'static str> {
-    let mut child = command(content, &["config", "get", "tools.approvalMode"])
+    let mut child = command(content, &[], &["config", "get", "tools.approvalMode"])
         .ok()?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2783,9 +2837,38 @@ fn configured_approval(content: &ChatContent) -> Option<&'static str> {
     OMP_APPROVAL_MODES.into_iter().find(|mode| *mode == value)
 }
 
-/// The harness's command with `args` in its environment and folder. The arguments go
-/// into a shell script unquoted, so they are fixed words.
-fn command(content: &ChatContent, args: &[&'static str]) -> Result<Command, String> {
+/// Installs Compi's shell bridge where the chat's harness runs, as a terminal's launch
+/// does, so `compi` there runs the CLI. A failure is logged; the harness starts anyway.
+fn install_bridge(content: &ChatContent) {
+    let installed = match &content.environment {
+        // A Windows harness finds `compi.exe` in the CLI's folder, first on its path.
+        #[cfg(windows)]
+        ContentEnvironment::Host => Ok(()),
+        #[cfg(windows)]
+        ContentEnvironment::Wsl { distribution } => {
+            crate::shell_integration::install_wsl_bridge(distribution)
+        }
+        #[cfg(unix)]
+        ContentEnvironment::Host => crate::shell_integration::install_home_bridge(),
+        #[cfg(unix)]
+        ContentEnvironment::Wsl { .. } => Ok(()),
+    };
+    if let Err(error) = installed {
+        eprintln!(
+            "compi-daemon: could not install the shell bridge for chat {}: {error}",
+            content.id
+        );
+    }
+}
+
+/// The harness's command with `args` in its environment and folder, and `environment`
+/// (Compi's shell context, from `shell_integration::cli_environment`) in its own. The
+/// arguments go into a shell script unquoted, so they are fixed words.
+fn command(
+    content: &ChatContent,
+    environment: &[(&'static str, String)],
+    args: &[&'static str],
+) -> Result<Command, String> {
     if matches!(content.environment, ContentEnvironment::Host)
         && !std::path::Path::new(&content.folder).is_dir()
     {
@@ -2801,7 +2884,19 @@ fn command(content: &ChatContent, args: &[&'static str]) -> Result<Command, Stri
             command
                 .args(args)
                 .current_dir(&content.folder)
-                .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+                .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+                .envs(environment.iter().map(|(key, value)| (*key, value)));
+            // The CLI's folder comes first on the search path, as in a PowerShell pane.
+            if let Some((_, cli)) = environment.iter().find(|(key, _)| *key == "COMPI_CLI")
+                && let Some(folder) = std::path::Path::new(cli).parent()
+            {
+                let mut path = folder.as_os_str().to_owned();
+                if let Some(inherited) = std::env::var_os("PATH") {
+                    path.push(";");
+                    path.push(inherited);
+                }
+                command.env("PATH", path);
+            }
             Ok(command)
         }
         #[cfg(windows)]
@@ -2817,15 +2912,23 @@ fn command(content: &ChatContent, args: &[&'static str]) -> Result<Command, Stri
                 r#"shell=$(getent passwd "$(id -u)" | cut -d: -f7); exec "${{shell:-/bin/sh}}" -lc '{UNIX_COMMAND} {}'"#,
                 args.join(" ")
             );
-            command
-                .args([
-                    "--distribution",
-                    distribution,
-                    "--cd",
-                    &content.folder,
-                    "--exec",
-                ])
-                .args(["/bin/sh", "-c", &script]);
+            command.args([
+                "--distribution",
+                distribution,
+                "--cd",
+                &content.folder,
+                "--exec",
+            ]);
+            // Set in Linux, as a WSL terminal's are: Windows variables reach it only
+            // through `WSLENV`.
+            if !environment.is_empty() {
+                command.arg("/usr/bin/env").args(
+                    environment
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}")),
+                );
+            }
+            command.args(["/bin/sh", "-c", &script]);
             Ok(command)
         }
         #[cfg(unix)]
@@ -2834,7 +2937,8 @@ fn command(content: &ChatContent, args: &[&'static str]) -> Result<Command, Stri
             let mut command = Command::new(shell);
             command
                 .args(["-lc", &format!("{UNIX_COMMAND} {}", args.join(" "))])
-                .current_dir(&content.folder);
+                .current_dir(&content.folder)
+                .envs(environment.iter().map(|(key, value)| (*key, value)));
             Ok(command)
         }
         #[cfg(unix)]
@@ -2866,6 +2970,45 @@ mod tests {
             ChatEntry::Tool(tool) => tool,
             other => panic!("entry {index} is {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_chat_has_the_surface_of_the_terminal_carrying_it_and_none_in_a_content_pane() {
+        use compi_protocol::{PaneContent, PaneId, PaneSide, PaneView, SplitAxis};
+        let chat = |id: &str| {
+            PaneContent::Chat(ChatContent {
+                id: id.into(),
+                harness: ChatHarness::Omp,
+                environment: ContentEnvironment::Host,
+                folder: "/work".into(),
+                session: None,
+            })
+        };
+        let layout = LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane {
+                pane_id: PaneId::new("pane-1"),
+                surface_id: SurfaceId::new("surface-1"),
+                view: Some(PaneView {
+                    content: chat("in-terminal"),
+                    side: PaneSide::View,
+                }),
+            }),
+            second: Box::new(LayoutNode::Content {
+                pane_id: PaneId::new("pane-2"),
+                content: chat("beside"),
+            }),
+        };
+        let mut held = HashMap::new();
+        chat_leaves(&layout, &mut held);
+        assert_eq!(
+            held,
+            HashMap::from([
+                ("in-terminal".to_owned(), Some(SurfaceId::new("surface-1"))),
+                ("beside".to_owned(), None),
+            ])
+        );
     }
 
     #[test]
@@ -2976,11 +3119,11 @@ mod tests {
         });
         let (fields, shapes) = form_fields(&schema);
         let keys: Vec<&str> = fields.iter().map(|field| field.key.as_str()).collect();
-        assert_eq!(keys, ["ok", "q0", "q2", "q10"]);
-        let colour = &fields[1];
+        assert_eq!(keys, ["q10", "q2", "q0", "ok"]);
+        let colour = &fields[2];
         assert!(colour.other && colour.required && !colour.multi);
         assert_eq!(colour.choices.len(), 2);
-        assert!(fields[2].multi);
+        assert!(fields[1].multi);
 
         let answers = ChatAnswers::from([
             (
@@ -3006,6 +3149,34 @@ mod tests {
         assert_eq!(
             form_content(&shapes, answers),
             json!({ "q0__other": "green", "q2": ["a", "b"], "ok": true, "q10": "x" })
+        );
+    }
+
+    #[test]
+    fn an_html_form_keeps_its_order_and_its_other_field_joins_its_choices() {
+        // OMP's HTML form: a radio group with an Other field, then a textarea.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "store": { "type": "string", "title": "Session store",
+                           "oneOf": [{ "const": "redis", "title": "Redis" }, { "const": "sql", "title": "SQL" }] },
+                "store_other": { "type": "string", "title": "Session store — Other" },
+                "notes": { "type": "string", "title": "Notes" },
+            },
+        });
+        let (fields, shapes) = form_fields(&schema);
+        let keys: Vec<&str> = fields.iter().map(|field| field.key.as_str()).collect();
+        assert_eq!(keys, ["store", "notes"]);
+        assert!(fields[0].other && fields[1].choices.is_empty());
+        let answers = ChatAnswers::from([(
+            "store".into(),
+            ChatAnswer::Text {
+                text: "files".into(),
+            },
+        )]);
+        assert_eq!(
+            form_content(&shapes, answers),
+            json!({ "store_other": "files" })
         );
     }
 

@@ -317,6 +317,8 @@ struct FieldForm {
     picked: Vec<String>,
     /// A text field's answer, or a choice field's Other.
     text: Option<Entity<InputState>>,
+    /// A choice field's Other chip is picked, showing its text field.
+    other: bool,
 }
 
 /// What the text before the cursor asks to complete.
@@ -478,6 +480,25 @@ pub(super) fn cost_label(cost: f64, currency: Option<&str>) -> String {
         None | Some("USD") => format!("${cost:.2}"),
         Some(currency) => format!("{cost:.2} {currency}"),
     }
+}
+
+/// A question's message without the lines that repeat a field's title, which shows over
+/// its field instead (an HTML form's legend is both).
+fn question_heading(question: &ChatQuestion) -> String {
+    question
+        .message
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !question
+                .fields
+                .iter()
+                .any(|field| field.title.trim() == line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 impl Completion {
@@ -784,10 +805,11 @@ impl CompiApp {
                     let placeholder = if field.choices.is_empty() {
                         "Answer"
                     } else {
-                        "Other"
+                        "Your answer"
                     };
                     cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
                 }),
+                other: false,
             })
             .collect();
         model.question = Some(QuestionForm {
@@ -819,6 +841,36 @@ impl CompiApp {
             form.picked.push(value);
         } else {
             form.picked = vec![value];
+            form.other = false;
+        }
+    }
+
+    /// Picks or unpicks the Other chip of field `field`: picked, its text field shows and
+    /// takes the keyboard; one-choice fields drop their picked choice.
+    fn pick_chat_other(&mut self, chat: &str, field: usize, window: &mut Window, cx: &mut App) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        let multi = model
+            .state
+            .as_ref()
+            .and_then(|state| state.question.as_ref()?.fields.get(field))
+            .is_some_and(|field| field.multi);
+        let Some(form) = model
+            .question
+            .as_mut()
+            .and_then(|form| form.fields.get_mut(field))
+        else {
+            return;
+        };
+        form.other = !form.other;
+        if form.other {
+            if !multi {
+                form.picked.clear();
+            }
+            if let Some(text) = &form.text {
+                text.update(cx, |state, cx| state.focus(window, cx));
+            }
         }
     }
 
@@ -831,9 +883,11 @@ impl CompiApp {
     ) -> Result<ChatAnswers, String> {
         let mut answers = ChatAnswers::new();
         for (field, answer) in question.fields.iter().zip(&form.fields) {
+            // A choice field's text counts only while its Other chip is picked.
             let text = answer
                 .text
                 .as_ref()
+                .filter(|_| field.choices.is_empty() || answer.other)
                 .map(|text| text.read(cx).value().trim().to_owned())
                 .filter(|text| !text.is_empty());
             if let Some(text) = text {
@@ -1066,8 +1120,10 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// A question the harness asks: its message, a row of choices per field (one or
-    /// several), a text field where it takes words, then Submit and Skip.
+    /// A question the harness asks: its message, then each field in the form's order
+    /// under its title (shown once, not repeated by the message): a row of choices (one or
+    /// several) with an Other chip that opens a text field where the harness takes one, a
+    /// text field for a field without choices, then Submit and Skip.
     fn render_chat_question(
         &self,
         chat: &ChatContent,
@@ -1076,8 +1132,8 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
-        let muted = color(modal_text_color(colors.muted, &colors));
         let refusal = Self::chat_question_answers(question, form, cx).err();
+        let heading = question_heading(question);
         let fields =
             question
                 .fields
@@ -1085,6 +1141,7 @@ impl CompiApp {
                 .zip(&form.fields)
                 .enumerate()
                 .map(|(index, (field, answer))| {
+                    let other = field.other && !field.choices.is_empty();
                     let choices = field
                         .choices
                         .iter()
@@ -1105,27 +1162,35 @@ impl CompiApp {
                                     cx.notify();
                                 },
                             ))
-                        });
+                        })
+                        .chain(other.then(|| {
+                            let id = chat.id.clone();
+                            text_button(("chat-choice", index * 1000 + 999), "Other")
+                                .selected(answer.other)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.pick_chat_other(&id, index, window, cx);
+                                    cx.notify();
+                                }))
+                        }));
+                    let text = answer
+                        .text
+                        .as_ref()
+                        .filter(|_| field.choices.is_empty() || answer.other);
                     div()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .when(
-                            !field.title.is_empty()
-                                && field.title.trim() != question.message.trim(),
-                            |column| {
-                                column.child(
-                                    div()
-                                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                                        .text_color(muted)
-                                        .child(field.title.clone()),
-                                )
-                            },
-                        )
+                        .when(!field.title.is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                                    .child(field.title.clone()),
+                            )
+                        })
                         .when(!field.choices.is_empty(), |column| {
                             column.child(div().flex().flex_wrap().gap_1().children(choices))
                         })
-                        .when_some(answer.text.as_ref(), |column, text| {
+                        .when_some(text, |column, text| {
                             column.child(Input::new(text).appearance(true))
                         })
                 });
@@ -1137,11 +1202,9 @@ impl CompiApp {
             .gap_2()
             .rounded(ui_rems(6.0))
             .bg(color(colors.surface))
-            .child(
-                div()
-                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
-                    .child(question.message.clone()),
-            )
+            .when(!heading.is_empty(), |card| {
+                card.child(div().text_size(ui_rems(UI_SMALL_TEXT_SIZE)).child(heading))
+            })
             .children(fields)
             .child(
                 div()

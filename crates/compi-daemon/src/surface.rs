@@ -562,33 +562,8 @@ impl Surface {
         };
         // A WSL shell runs the Windows CLI through the bridge; a host shell runs it directly.
         let wsl = distribution.is_some();
-        let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) {
-            "compi.exe"
-        } else {
-            "compi"
-        });
-        let environment = [
-            ("COMPI_SURFACE_ID", info.id.as_str().to_owned()),
-            ("COMPI_INSTANCE", instance.unwrap_or("").to_owned()),
-            (
-                if wsl {
-                    "COMPI_CLI_WINDOWS"
-                } else {
-                    "COMPI_CLI"
-                },
-                cli.to_string_lossy().into_owned(),
-            ),
-            (
-                if wsl {
-                    "COMPI_CLI_DATA_DIR_WINDOWS"
-                } else {
-                    "COMPI_DATA_DIR"
-                },
-                compi_protocol::paths::data_dir()?
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        ];
+        let environment =
+            crate::shell_integration::cli_environment(Some(info.id.as_str()), instance, wsl)?;
         if wsl {
             let exec = launch
                 .argv

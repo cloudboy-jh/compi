@@ -1,5 +1,5 @@
 //! The transcript's rows: one per entry. Messages are Markdown views; a thought is a dim
-//! line that unfolds to its text; a tool call is a card that folds, with its edits as
+//! line that unfolds to its text; a tool call is a line that unfolds, with its edits as
 //! inline diffs, its sub-agents as a line each, and the permission it waits on drawn on
 //! it.
 use super::*;
@@ -21,6 +21,10 @@ const SMALL_EDIT_LINES: u32 = 30;
 const MAX_DIFF_LINES: usize = 400;
 /// How tall a tool's input or output gets before it scrolls.
 const TOOL_TEXT_MAX_HEIGHT: f32 = 240.0;
+/// Lines of a tool's output that show until the reader asks for all of it: its last.
+const TOOL_OUTPUT_TAIL_LINES: usize = 12;
+/// Characters of a failed call's error its line keeps; the line ends in `…` well before.
+const FAILURE_CHARS: usize = 300;
 /// Gap under a row, and under a tool card followed by another.
 const ROW_GAP: f32 = 12.0;
 const PACKED_GAP: f32 = 2.0;
@@ -136,6 +140,15 @@ impl ChatRow {
             (AgentPart::Task | AgentPart::Steps, None) => {}
         }
     }
+
+    /// Shows all of a tool card's output, or only its last lines again.
+    pub(super) fn toggle_output(&mut self, folder: &str, cx: &mut App) {
+        if let Self::Tool { tool, .. } = self {
+            let before: &ToolRow = tool;
+            let next = ToolRow::new(&before.tool, folder, Some(before), !before.all_output, cx);
+            *tool = Rc::new(next);
+        }
+    }
 }
 
 /// A sub-agent line the reader unfolded, and how much of it they asked for.
@@ -182,10 +195,20 @@ pub(super) struct ToolRow {
     /// Lines its edits add and remove.
     added: u32,
     removed: u32,
-    /// Its input (unless it shows edits or sub-agents) and output as selectable code
-    /// blocks.
+    /// The command it runs, shown in place of its input.
+    command: Option<SharedString>,
+    /// What went wrong, when it failed: the first line of its error output.
+    failure: Option<SharedString>,
+    /// Its input (unless it shows a command, edits or sub-agents) and output as
+    /// selectable code blocks; the output's last lines only, unless `all_output`.
     input: Option<Entity<TextViewState>>,
     output: Option<Entity<TextViewState>>,
+    /// The language its output's block is highlighted in: a Read's file's.
+    output_language: Option<&'static str>,
+    /// The reader asked for all of its output.
+    all_output: bool,
+    /// Lines its whole output has.
+    output_lines: usize,
     agents: Vec<AgentRow>,
     /// What its sub-agents cost together, when they reported it.
     cost: Option<f64>,
@@ -238,7 +261,13 @@ struct DiffSyntax {
 }
 
 impl ToolRow {
-    fn new(tool: &ChatTool, folder: &str, before: Option<&ToolRow>, cx: &mut App) -> Self {
+    fn new(
+        tool: &ChatTool,
+        folder: &str,
+        before: Option<&ToolRow>,
+        all_output: bool,
+        cx: &mut App,
+    ) -> Self {
         let (verb, icon) = tool_kind(tool);
         // An update with the same edits keeps the diffs already built.
         let diffs = match before.filter(|before| before.tool.diffs == tool.diffs) {
@@ -253,29 +282,56 @@ impl ToolRow {
         let removed = diffs.iter().map(|block| block.removed).sum();
         // A card with edits shows them in place of its input, and in place of its output
         // unless the edit failed or changed nothing, when the output says why. A card with
-        // sub-agents shows them in place of both, unless it failed.
+        // sub-agents shows them in place of both, unless it failed. A command shows in
+        // place of the input it came in.
         let agents = !tool.agents.is_empty();
-        let input = tool.input.as_ref().filter(|_| diffs.is_empty() && !agents);
-        let output = tool.output.as_ref().filter(|_| {
-            tool.status == ChatToolStatus::Failed
-                || !agents && (diffs.is_empty() || added + removed == 0)
-        });
+        let shows_input = diffs.is_empty() && !agents;
+        let command = tool_command(tool).filter(|_| shows_input);
+        let input = tool
+            .input
+            .as_ref()
+            .filter(|_| shows_input && command.is_none());
+        let failed = tool.status == ChatToolStatus::Failed;
+        let target = tool_target(tool, folder);
+        // What a Read returns is the file it read: its block takes the file's language,
+        // so it is coloured as the file is in an editor. A failed Read returns an error.
+        let output_language = match (verb, target.as_deref()) {
+            ("Read", Some(path)) if !failed => {
+                Some(language_for(path)).filter(|language| *language != "text")
+            }
+            _ => None,
+        };
+        let output = tool
+            .output
+            .as_deref()
+            .filter(|_| failed || !agents && (diffs.is_empty() || added + removed == 0));
+        let (output, output_lines) = match output {
+            Some(text) => {
+                let (view, lines) = output_view(text, output_language, all_output, before, cx);
+                (Some(view), lines)
+            }
+            None => (None, 0),
+        };
         let costs: Vec<f64> = tool.agents.iter().filter_map(|agent| agent.cost).collect();
         Self {
             language: tool_language(tool, folder),
-            target: tool_target(tool, folder),
+            target,
+            command,
+            failure: tool
+                .output
+                .as_deref()
+                .filter(|_| failed)
+                .and_then(failure_line),
             input: tool_view(
                 input,
                 before.map(|before| (before.tool.input.as_ref(), before.input.as_ref())),
                 tool_markdown,
                 cx,
             ),
-            output: tool_view(
-                output,
-                before.map(|before| (before.tool.output.as_ref(), before.output.as_ref())),
-                tool_markdown,
-                cx,
-            ),
+            output,
+            output_language,
+            all_output,
+            output_lines,
             agents: tool
                 .agents
                 .iter()
@@ -304,11 +360,10 @@ impl ToolRow {
         }
     }
 
-    /// Unfolded until the reader folds it: a small edit, a call that failed, or one that
-    /// started sub-agents.
+    /// Unfolded until the reader folds it: a small edit, or a call that started
+    /// sub-agents. A failed call stays one line, which says what went wrong.
     fn opens(&self) -> bool {
-        self.tool.status == ChatToolStatus::Failed
-            || !self.agents.is_empty()
+        !self.agents.is_empty()
             || (!self.diffs.is_empty() && self.added + self.removed <= SMALL_EDIT_LINES)
     }
 }
@@ -535,13 +590,66 @@ fn tool_view(
     }
 }
 
-/// A tool's input or output as one fenced code block: YAML-like when it is a JSON object
-/// or list, else the text as it came.
+/// The view of a tool's output `text`, in `language` when it is code in a known one: all
+/// of it, or its last `TOOL_OUTPUT_TAIL_LINES` lines; `before`'s view when it showed the
+/// same, or that view given the new text, else a new one. With it, how many lines the
+/// whole output has.
+fn output_view(
+    text: &str,
+    language: Option<&'static str>,
+    all: bool,
+    before: Option<&ToolRow>,
+    cx: &mut App,
+) -> (Entity<TextViewState>, usize) {
+    let shown = before.and_then(|before| Some((before, before.output.as_ref()?)));
+    if let Some((before, view)) = shown
+        && before.all_output == all
+        && before.output_language == language
+        && before.tool.output.as_deref() == Some(text)
+    {
+        return (view.clone(), before.output_lines);
+    }
+    let (language, body) = match language {
+        Some(language) => (language, text.trim_end().to_owned()),
+        None => tool_body(text),
+    };
+    let lines = body.lines().count();
+    let source = fenced(
+        language,
+        if all {
+            body.as_str()
+        } else {
+            last_lines(&body, TOOL_OUTPUT_TAIL_LINES)
+        },
+    );
+    let view = match shown {
+        Some((_, view)) => {
+            view.update(cx, |view, cx| view.set_text(&source, cx));
+            view.clone()
+        }
+        None => markdown(&source, cx),
+    };
+    (view, lines)
+}
+
+/// A tool's input or output as one fenced code block; see [`tool_body`].
 fn tool_markdown(text: &str) -> String {
-    let (language, body) = match json_text(text) {
+    let (language, body) = tool_body(text);
+    fenced(language, &body)
+}
+
+/// A tool's input or output as its code block shows it, with the block's language:
+/// YAML-like when it is a JSON object or list, else the text as it came.
+fn tool_body(text: &str) -> (&'static str, String) {
+    match json_text(text) {
         Some(body) => ("yaml", body),
         None => ("", text.trim_end().to_owned()),
-    };
+    }
+}
+
+/// `body` as a fenced code block in `language`, its fence longer than any run of
+/// backticks in it.
+fn fenced(language: &str, body: &str) -> String {
     let longest = body
         .split(|character| character != '`')
         .map(str::len)
@@ -549,6 +657,67 @@ fn tool_markdown(text: &str) -> String {
         .unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
     format!("{fence}{language}\n{body}\n{fence}")
+}
+
+/// The last `count` lines of `text`; all of it when it has no more.
+fn last_lines(text: &str, count: usize) -> &str {
+    text.match_indices('\n')
+        .rev()
+        .nth(count.saturating_sub(1))
+        .map_or(text, |(at, _)| &text[at + 1..])
+}
+
+/// The command a call runs, when its input is one: a Run's input text, or the `command`
+/// field of a call's input (a Run's `cmd` too; a list of words joined with spaces).
+fn tool_command(tool: &ChatTool) -> Option<SharedString> {
+    let input = tool.input.as_deref()?;
+    let runs = tool_kind(tool).0 == "Run";
+    let command = match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(value) => {
+            let field = value
+                .get("command")
+                .or_else(|| value.get("cmd").filter(|_| runs))?;
+            match field {
+                serde_json::Value::String(command) => command.clone(),
+                serde_json::Value::Array(words) => words
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()?
+                    .join(" "),
+                _ => return None,
+            }
+        }
+        Err(_) if runs => input.to_owned(),
+        Err(_) => return None,
+    };
+    let command = command.trim();
+    (!command.is_empty()).then(|| command.to_owned().into())
+}
+
+/// What a failed call's line says went wrong: the first line with text of its error
+/// output (of its `error`, `message` or `stderr` when it is JSON), cut to
+/// `FAILURE_CHARS`.
+fn failure_line(output: &str) -> Option<SharedString> {
+    let value = serde_json::from_str::<serde_json::Value>(output).ok();
+    let field = value.as_ref().and_then(|value| {
+        ["error", "message", "stderr"]
+            .iter()
+            .find_map(|key| value.get(*key)?.as_str())
+    });
+    let converted;
+    let text = match field {
+        Some(field) => field,
+        None => {
+            converted = value.is_some().then(|| json_text(output)).flatten();
+            converted.as_deref().unwrap_or(output)
+        }
+    };
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let end = line
+        .char_indices()
+        .nth(FAILURE_CHARS)
+        .map_or(line.len(), |(end, _)| end);
+    Some(line[..end].to_owned().into())
 }
 
 /// A JSON object or list as `key: value` lines: values unquoted and aligned, lists of
@@ -724,7 +893,7 @@ pub(super) fn chat_row(entry: &ChatEntry, folder: &str, cx: &mut App) -> ChatRow
             open: false,
         },
         ChatEntry::Tool(tool) => ChatRow::Tool {
-            tool: Rc::new(ToolRow::new(tool, folder, None, cx)),
+            tool: Rc::new(ToolRow::new(tool, folder, None, false, cx)),
             open: None,
             open_agents: Vec::new(),
         },
@@ -801,7 +970,8 @@ pub(super) fn update_row(
     let same_kind = std::mem::discriminant(was) == std::mem::discriminant(now);
     match (&mut *row, now) {
         (ChatRow::Tool { tool, .. }, ChatEntry::Tool(now)) if tool.tool.id == now.id => {
-            *tool = Rc::new(ToolRow::new(now, folder, Some(tool), cx));
+            let all_output = tool.all_output;
+            *tool = Rc::new(ToolRow::new(now, folder, Some(tool), all_output, cx));
         }
         (
             ChatRow::Thought {
@@ -1266,9 +1436,9 @@ fn first_line(text: &str) -> SharedString {
     }
 }
 
-/// A tool call: one line (icon, verb, target, changes, duration, cost, status) that
-/// unfolds to its edits, its sub-agents, or its input and output; the permission it
-/// waits on is drawn on it.
+/// A tool call: one line (icon, verb, target, what went wrong, changes, duration, cost,
+/// status) that unfolds to its edits, its sub-agents, or its command or input and
+/// output; the permission it waits on is drawn on it.
 fn render_tool(
     index: usize,
     row: &ToolRow,
@@ -1354,6 +1524,18 @@ fn render_tool(
                     .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                     .text_color(muted)
                     .child(target),
+            )
+        })
+        .when_some(row.failure.clone(), |head, failure| {
+            head.child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                    .text_color(color(frame.colors.error))
+                    .child(failure),
             )
         })
         .child(div().flex_1())
@@ -1569,8 +1751,8 @@ pub(super) fn agents_mark(
         })
 }
 
-/// An unfolded tool call: its edits as diffs, its sub-agents, else its input; then its
-/// output.
+/// An unfolded tool call: its edits as diffs, its sub-agents, else its command or input;
+/// then its output.
 fn render_tool_body(
     index: usize,
     row: &ToolRow,
@@ -1582,7 +1764,7 @@ fn render_tool_body(
         .ml_6()
         .flex()
         .flex_col()
-        .gap_2()
+        .gap_1()
         .children(
             row.diffs
                 .iter()
@@ -1601,22 +1783,21 @@ fn render_tool_body(
                     })),
             )
         })
+        .when_some(row.command.clone(), |body, command| {
+            body.child(command_line(index, command, frame))
+        })
         .when_some(row.input.as_ref(), |body, input| {
-            body.child(tool_text("Input", input, false, frame))
+            body.child(tool_text(input, false, frame))
         })
         .when_some(row.output.as_ref(), |body, output| {
-            body.child(tool_text(
-                "Output",
-                output,
-                tool.status == ChatToolStatus::Failed,
-                frame,
-            ))
+            body.child(tool_output(index, row, output, frame))
         })
         .into_any_element()
 }
 
-/// A sub-agent: one line (status, name, type, what it does or answered, time, cost) that
-/// unfolds, running or not, to its task, its steps and, once it answered, its answer.
+/// A sub-agent: one line (a disclosure chevron, status, name, type, what it does or
+/// answered, time, cost) that unfolds anywhere on it, running or not, to its task, its
+/// steps and, once it answered, its answer.
 fn render_agent(
     index: usize,
     position: usize,
@@ -1647,6 +1828,14 @@ fn render_agent(
         .gap_2()
         .rounded(ui_rems(4.0))
         .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+        .child(controls::glyph(
+            if open.is_some() {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            },
+            muted,
+        ))
         .child(div().flex_none().child(tool_status(agent.status, frame)))
         .child(
             div()
@@ -1977,36 +2166,97 @@ fn agent_result(agent: &ChatAgent, view: &Entity<TextViewState>, frame: &RowFram
         .into_any_element()
 }
 
-/// A tool's input or output: a label over its code block, selectable with Copy, which
-/// scrolls once tall.
-fn tool_text(
-    label: &'static str,
-    view: &Entity<TextViewState>,
-    error: bool,
-    frame: &RowFrame,
-) -> AnyElement {
+/// A tool's input or output: its code block, selectable with Copy, which scrolls once
+/// tall; on a quiet fill without a border, as tool activity stays light.
+fn tool_text(view: &Entity<TextViewState>, error: bool, frame: &RowFrame) -> AnyElement {
     let mut code_block = StyleRefinement::default()
         .max_h(ui_rems(TOOL_TEXT_MAX_HEIGHT))
+        .px_2()
+        .py_1p5()
+        .border_0()
         .text_size(ui_rems(UI_MICRO_TEXT_SIZE));
     code_block.overflow.y = Some(gpui::Overflow::Scroll);
+    TextView::new(view)
+        .selectable(true)
+        .code_block_actions(copy_code_button)
+        .style(TextViewStyle::default().code_block(code_block))
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+        .when(error, |text| text.text_color(color(frame.colors.error)))
+        .into_any_element()
+}
+
+/// The command a call runs, whole, in the code font after a `$`, with a button that
+/// copies it.
+fn command_line(index: usize, command: SharedString, frame: &RowFrame) -> AnyElement {
+    let copied = command.clone();
+    div()
+        .flex()
+        .items_start()
+        .gap_1()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .px_1()
+                .py_0p5()
+                .overflow_hidden()
+                .font_family(frame.mono.clone())
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                .text_color(frame.muted())
+                .child(format!("$ {command}")),
+        )
+        .child(
+            icon_button(("chat-copy-command", index), IconName::Copy, "Copy command").on_click(
+                move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied.to_string()));
+                },
+            ),
+        )
+        .into_any_element()
+}
+
+/// A call's output, error-tinted when it failed: its last `TOOL_OUTPUT_TAIL_LINES`
+/// lines under a line saying how many came before, which a click shows; once shown, the
+/// line folds them again.
+fn tool_output(
+    index: usize,
+    row: &ToolRow,
+    view: &Entity<TextViewState>,
+    frame: &RowFrame,
+) -> AnyElement {
+    let earlier = row.output_lines.saturating_sub(TOOL_OUTPUT_TAIL_LINES);
+    let fold = (earlier > 0).then(|| {
+        let label = match (row.all_output, earlier) {
+            (true, _) => format!("Show only the last {TOOL_OUTPUT_TAIL_LINES} lines"),
+            (false, 1) => "1 earlier line · Show all".to_owned(),
+            (false, _) => format!("{earlier} earlier lines · Show all"),
+        };
+        div()
+            .id(("chat-tool-output", index))
+            .h(ui_rems(AGENT_STEP_HEIGHT))
+            .px_1()
+            .flex()
+            .items_center()
+            .rounded(ui_rems(4.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(color(frame.colors.surface_hover)))
+            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+            .text_color(frame.muted())
+            .whitespace_nowrap()
+            .child(label)
+            .on_click(frame.act(move |this, chat, _, cx| {
+                this.toggle_chat_output(chat, index, cx);
+            }))
+    });
     div()
         .flex()
         .flex_col()
-        .gap_0p5()
-        .child(
-            div()
-                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                .text_color(frame.muted())
-                .child(label),
-        )
-        .child(
-            TextView::new(view)
-                .selectable(true)
-                .code_block_actions(copy_code_button)
-                .style(TextViewStyle::default().code_block(code_block))
-                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                .when(error, |text| text.text_color(color(frame.colors.error))),
-        )
+        .children(fold)
+        .child(tool_text(
+            view,
+            row.tool.status == ChatToolStatus::Failed,
+            frame,
+        ))
         .into_any_element()
 }
 
@@ -2194,8 +2444,13 @@ mod tests {
                     diffs: Vec::new(),
                     added: 0,
                     removed: 0,
+                    command: None,
+                    failure: None,
                     input: None,
                     output: None,
+                    output_language: None,
+                    all_output: false,
+                    output_lines: 0,
                     cost: None,
                 }),
                 open: Some(false),
@@ -2469,5 +2724,60 @@ mod tests {
         assert_eq!(json_text(r#"{"command": "ls"#), None);
         // A fence outlasts any backticks in the text.
         assert_eq!(tool_markdown("a ``` b"), "````\na ``` b\n````");
+    }
+
+    #[test]
+    fn a_tool_output_shows_its_last_lines() {
+        assert_eq!(last_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(last_lines("a\nb\nc", 3), "a\nb\nc");
+        assert_eq!(last_lines("a\nb\nc", 12), "a\nb\nc");
+        assert_eq!(last_lines("", 12), "");
+    }
+
+    #[test]
+    fn a_failed_call_says_its_first_error_line() {
+        let line = |output: &str| failure_line(output).map(|line| line.to_string());
+        assert_eq!(
+            line("\n  \nerror: no such file\nmore detail\n").as_deref(),
+            Some("error: no such file")
+        );
+        assert_eq!(
+            line(r#"{ "error": "Permission denied\nat line 2" }"#).as_deref(),
+            Some("Permission denied")
+        );
+        // JSON without an error field reads as its fields do.
+        assert_eq!(
+            line(r#"{ "code": 2, "text": "x" }"#).as_deref(),
+            Some("code: 2")
+        );
+        assert_eq!(line("   \n"), None);
+        let long = "é".repeat(FAILURE_CHARS + 10);
+        assert_eq!(
+            line(&long).map(|line| line.chars().count()),
+            Some(FAILURE_CHARS)
+        );
+    }
+
+    #[test]
+    fn a_command_shows_in_place_of_its_input() {
+        let command = |kind: &str, input: &str| {
+            tool_command(&tool("1", kind, Some(input))).map(|command| command.to_string())
+        };
+        assert_eq!(
+            command("execute", r#"{ "command": "cargo test", "timeout": 60 }"#).as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            command("execute", r#"{ "command": ["bash", "-lc", "ls"] }"#).as_deref(),
+            Some("bash -lc ls")
+        );
+        assert_eq!(command("execute", "ls -la\n").as_deref(), Some("ls -la"));
+        assert_eq!(
+            command("other", r#"{ "command": "make" }"#).as_deref(),
+            Some("make")
+        );
+        // Only a Run's `cmd` or text is a command.
+        assert_eq!(command("other", r#"{ "cmd": "make" }"#), None);
+        assert_eq!(command("read", "notes.txt"), None);
     }
 }
