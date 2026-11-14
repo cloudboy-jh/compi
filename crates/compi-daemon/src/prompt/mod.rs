@@ -787,8 +787,33 @@ fn preview(
             target::error_text(&output)
         )));
     }
-    let renders = parse_preview(&String::from_utf8_lossy(&output.stdout), styles.len());
+    let mut renders = parse_preview(&String::from_utf8_lossy(&output.stdout), styles.len());
+    if provider == PromptProvider::OhMyPosh && shell == PromptShell::Zsh {
+        for render in &mut renders {
+            render.success.left = unwrap_zsh_escapes(&render.success.left);
+            render.success.right = unwrap_zsh_escapes(&render.success.right);
+        }
+    }
     Ok(PromptPreview { renders })
+}
+
+// Oh My Posh can wrap ANSI sequences for Zsh even with --escape=false.
+// These markers are for Zsh's prompt width calculation, not terminal output.
+fn unwrap_zsh_escapes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("%{\x1b") {
+        output.push_str(&rest[..start]);
+        let wrapped = &rest[start + 2..];
+        let Some(end) = wrapped.find("%}") else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        output.push_str(&wrapped[..end]);
+        rest = &wrapped[end + 2..];
+    }
+    output.push_str(rest);
+    output
 }
 
 fn parse_preview(output: &str, count: usize) -> Vec<PromptStyleRender> {
@@ -1320,6 +1345,16 @@ fn execute(target: &Target, facts: &Facts, prepared: &Prepared) -> Result<(), Fa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zsh_preview_unwraps_ansi_without_dropping_text_or_colors() {
+        let raw = "%{\x1b[31m%}red%{\x1b[0m%} %{literal%} %{\x1b]0;title\x07%}";
+        assert_eq!(
+            unwrap_zsh_escapes(raw),
+            "\x1b[31mred\x1b[0m %{literal%} \x1b]0;title\x07"
+        );
+        assert_eq!(unwrap_zsh_escapes("x%{\x1b[31m"), "x%{\x1b[31m");
+    }
 
     const SETUP: &str = r#"set -eu
 home=$1

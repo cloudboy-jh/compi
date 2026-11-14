@@ -49,6 +49,8 @@ Not seen yet: UAC prompts, `winget` installs, why `cmd.exe /c start steam://…`
 
 ## Fixed after 0.8.0, not released
 
+- **macOS Oh My Posh previews:** Oh My Posh wraps ANSI sequences in `%{` and `%}` for Zsh even when asked for unescaped output; Compi now removes those wrappers from previews while keeping the colours and text.
+
 - **PowerShell → WSL routing.** A Windows checkout gave `assets/compi-other-shell.ps1` CRLF line endings, so the Bash companion written to WSL `/tmp` had them too: `trap`/the read loop failed and `rm -f -- "$0"` missed the file. The script now turns CRLF into LF before writing the companion.
 - **Chat code colours.** The uncoloured "JavaScript block" was the output of a `read theme.js` tool call, fenced without a language. Read output now takes the file's language from its path. Message fences already coloured (javascript/js, typescript, rust, python, bash, json, yaml, toml, html, css, go); `jsx`, `shell`, `zsh`, `console` and capitalised tags still don't, as gpui-component has no aliases for them.
 - **Sub-agents hard to find.** Each sub-agent line has a chevron and opens on a click anywhere on it; each running agent in the agents bar opens and scrolls to its line.
