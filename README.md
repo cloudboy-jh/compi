@@ -10,7 +10,7 @@ Close the window and your shells keep running. [Download Compi](https://github.c
 
 [![Core CI](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml/badge.svg?branch=main)](https://github.com/cloudboy-jh/compi/actions/workflows/core-ci.yml)
 
-![Compi working on itself: an omp agent reviews Windows terminal resource cleanup beside the live TorchedLeek host Monitor and the corresponding read-only Rust commit diff](assets/compi-workspace.png)
+![Compi building its own website: OMP in Compi's native chat on the left, the local compi.dev preview in a browser pane at the top right, and below it the diff of the page's index.html changing its title to "A workspace for you and your agents"](assets/compi-workspace.png)
 
 ## Agent control
 
