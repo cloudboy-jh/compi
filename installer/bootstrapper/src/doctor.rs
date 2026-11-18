@@ -184,6 +184,13 @@ pub(crate) enum Finding {
         instance: Option<String>,
         shells: Vec<String>,
     },
+    /// The default daemon is compatible but runs another version than the selected one;
+    /// it switches at its next start.
+    DaemonOtherVersion {
+        running: String,
+        selected: String,
+        shells: Vec<String>,
+    },
     DaemonUnsupervised {
         shells: Vec<String>,
     },
@@ -212,6 +219,9 @@ impl Finding {
                 instance: Some(name),
                 ..
             } => format!("Instance \u{201c}{name}\u{201d} is out of date"),
+            Self::DaemonOtherVersion { running, .. } => {
+                format!("Background service still runs {running}")
+            }
             Self::DaemonUnsupervised { .. } => "Background service isn't watched".into(),
             Self::DaemonUninspectable => "Can't check the background service".into(),
             Self::Wsl(WslProblem::NotWsl2 { .. }) => "Your Linux uses WSL 1".into(),
@@ -246,6 +256,9 @@ impl Finding {
             }
             Self::DaemonIncompatible { .. } => {
                 "It runs an older version this Compi can't connect to.".into()
+            }
+            Self::DaemonOtherVersion { selected, .. } => {
+                format!("Restarting it switches it to {selected}.")
             }
             Self::DaemonUnsupervised { .. } => "If it stops, it won't restart on its own.".into(),
             Self::DaemonUninspectable => "Close Compi, wait a moment, then check again.".into(),
@@ -284,7 +297,9 @@ impl Finding {
             Self::DaemonIncompatible { instance, .. } => Some(Fix::RestartDaemon {
                 instance: instance.clone(),
             }),
-            Self::DaemonUnsupervised { .. } => Some(Fix::RestartDaemon { instance: None }),
+            Self::DaemonOtherVersion { .. } | Self::DaemonUnsupervised { .. } => {
+                Some(Fix::RestartDaemon { instance: None })
+            }
             Self::TaskOtherInstallation
             | Self::TaskUnreadable
             | Self::DaemonUninspectable
@@ -298,6 +313,7 @@ impl Finding {
             Self::NotInstalled { shells }
             | Self::PayloadDamaged { shells, .. }
             | Self::DaemonIncompatible { shells, .. }
+            | Self::DaemonOtherVersion { shells, .. }
             | Self::DaemonUnsupervised { shells } => shells,
             Self::SelectionBroken {
                 newest: None,
@@ -395,17 +411,15 @@ pub(crate) fn findings(facts: &Facts) -> Vec<Finding> {
             } => found.push(Finding::TaskOtherInstallation),
             TaskFact::Present { enabled: false, .. } => found.push(Finding::TaskDisabled),
             TaskFact::Present { target, .. } => {
+                // With the service stopped, moving the task ends nothing; a running one
+                // is the daemon finding below, whose restart moves the task too.
                 let wrong = match target {
                     TaskTarget::Version(target) => {
                         target != task_version
                             || !facts.payload(target).is_some_and(|payload| {
                                 !payload.missing.contains(&"compi-daemon.exe")
                             })
-                            || (!default_running
-                                && matches!(
-                                    (facts.protocol_of(target), selected_protocol),
-                                    (Some(a), Some(b)) if a != b
-                                ))
+                            || (!default_running && target != version)
                     }
                     TaskTarget::Unknown | TaskTarget::OtherInstallation => true,
                 };
@@ -425,6 +439,17 @@ pub(crate) fn findings(facts: &Facts) -> Vec<Finding> {
                     if incompatible {
                         found.push(Finding::DaemonIncompatible {
                             instance: daemon.instance.clone(),
+                            shells: daemon.shells.clone(),
+                        });
+                    } else if daemon.instance.is_none()
+                        && let Some(running) = daemon
+                            .version
+                            .as_deref()
+                            .filter(|running| *running != version)
+                    {
+                        found.push(Finding::DaemonOtherVersion {
+                            running: running.to_owned(),
+                            selected: version.to_owned(),
                             shells: daemon.shells.clone(),
                         });
                     } else if daemon.instance.is_none() && !daemon.supervised {
@@ -449,8 +474,6 @@ fn push_wsl(facts: &Facts, found: &mut Vec<Finding>) {
 /// What installing a new version does to the background service.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UpgradePlan {
-    /// Keep the task on this generation: a compatible daemon runs from it.
-    pub keep_task: Option<String>,
     /// Instances to stop first; they cannot serve the new version.
     pub stop: Vec<Option<String>>,
     /// Shells that stopping them ends.
@@ -468,30 +491,15 @@ impl UpgradePlan {
     }
 }
 
-/// Compatible upgrades leave a running daemon (and its task generation) alone. A daemon that
-/// cannot serve the new protocol is stopped, and the task moves to the new version.
-pub(crate) fn upgrade_plan(
-    new_protocol: u32,
-    task_version: Option<&str>,
-    task_registered: bool,
-    daemons: &[RunningDaemon],
-) -> UpgradePlan {
+/// A daemon that cannot serve the new protocol is stopped; a compatible one keeps running
+/// until its next restart. Either way the task moves to the new version, so the next start
+/// runs it.
+pub(crate) fn upgrade_plan(new_protocol: u32, daemons: &[RunningDaemon]) -> UpgradePlan {
     let stopping: Vec<&RunningDaemon> = daemons
         .iter()
         .filter(|daemon| daemon.protocol != new_protocol)
         .collect();
-    let keep_task = task_version
-        .filter(|version| {
-            task_registered
-                && daemons.iter().any(|daemon| {
-                    daemon.instance.is_none()
-                        && daemon.protocol == new_protocol
-                        && daemon.version.as_deref() == Some(*version)
-                })
-        })
-        .map(str::to_owned);
     UpgradePlan {
-        keep_task,
         stop: stopping
             .iter()
             .map(|daemon| daemon.instance.clone())
@@ -506,7 +514,6 @@ pub(crate) fn upgrade_plan(
 /// Reinstalling files replaces executables the daemons run from, so all of them stop.
 pub(crate) fn reinstall_plan(daemons: &[RunningDaemon]) -> UpgradePlan {
     UpgradePlan {
-        keep_task: None,
         stop: daemons
             .iter()
             .map(|daemon| daemon.instance.clone())
@@ -811,7 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn compatible_older_task_generation_is_left_alone() {
+    fn compatible_service_left_on_an_older_version_moves_to_the_selected_one() {
+        // The observed failure: Setup 0.8.1 kept a running 0.8.0 service and its task,
+        // so nothing ever moved the service to 0.8.1.
         let mut facts = healthy();
         facts.selection = SelectionFact::Present {
             version: "0.1.6".into(),
@@ -824,10 +833,32 @@ mod tests {
             mine: true,
             target: TaskTarget::Version("0.1.5".into()),
         };
-        facts.daemons = Ok(vec![daemon(None, 16, "0.1.5")]);
-        assert_eq!(findings(&facts), Vec::new());
+        facts.daemons = Ok(vec![RunningDaemon {
+            shells: vec!["api".into()],
+            ..daemon(None, 16, "0.1.5")
+        }]);
+        let running = findings(&facts);
+        assert_eq!(
+            running,
+            vec![Finding::DaemonOtherVersion {
+                running: "0.1.5".into(),
+                selected: "0.1.6".into(),
+                shells: vec!["api".into()],
+            }]
+        );
+        assert_eq!(
+            running[0].fix(),
+            Some(Fix::RestartDaemon { instance: None })
+        );
+        assert_eq!(running[0].shells(), ["api".to_owned()]);
+
         facts.daemons = Ok(Vec::new());
-        assert_eq!(findings(&facts), Vec::new());
+        assert_eq!(
+            findings(&facts),
+            vec![Finding::TaskWrongVersion {
+                selected: "0.1.6".into()
+            }]
+        );
     }
 
     #[test]
@@ -1027,23 +1058,20 @@ mod tests {
     }
 
     #[test]
-    fn compatible_upgrade_keeps_the_running_task_generation() {
-        let plan = upgrade_plan(16, Some("0.1.4"), true, &[daemon(None, 16, "0.1.4")]);
-        assert_eq!(plan.keep_task.as_deref(), Some("0.1.4"));
+    fn compatible_upgrade_leaves_the_running_daemon_alone() {
+        let plan = upgrade_plan(16, &[daemon(None, 16, "0.1.4")]);
+        assert_eq!(plan, UpgradePlan::default());
         assert!(!plan.restarts_service() && !plan.needs_consent());
     }
 
     #[test]
     fn protocol_bump_restarts_and_needs_consent_only_with_shells() {
-        let idle = upgrade_plan(16, Some("0.1.3"), true, &[daemon(None, 14, "0.1.3")]);
-        assert_eq!(idle.keep_task, None);
+        let idle = upgrade_plan(16, &[daemon(None, 14, "0.1.3")]);
         assert_eq!(idle.stop, vec![None]);
         assert!(idle.restarts_service() && !idle.needs_consent());
 
         let busy = upgrade_plan(
             16,
-            Some("0.1.3"),
-            true,
             &[RunningDaemon {
                 shells: vec!["api".into()],
                 ..daemon(None, 14, "0.1.3")
@@ -1051,17 +1079,6 @@ mod tests {
         );
         assert!(busy.restarts_service() && busy.needs_consent());
         assert_eq!(busy.shells, vec!["api".to_owned()]);
-    }
-
-    #[test]
-    fn idle_or_unregistered_upgrade_moves_the_task_forward_without_a_restart() {
-        let none = upgrade_plan(16, Some("0.1.3"), true, &[]);
-        assert_eq!(none, UpgradePlan::default());
-        let missing_task = upgrade_plan(16, Some("0.1.4"), false, &[daemon(None, 16, "0.1.4")]);
-        assert_eq!(missing_task, UpgradePlan::default());
-        // A compatible daemon from another generation is neither stopped nor pinned.
-        let elsewhere = upgrade_plan(16, Some("0.1.3"), true, &[daemon(None, 16, "0.1.5")]);
-        assert_eq!(elsewhere, UpgradePlan::default());
     }
 
     #[test]

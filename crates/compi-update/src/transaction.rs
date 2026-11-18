@@ -1630,7 +1630,22 @@ pub fn pending_update(target: &InstallTarget) -> Result<Option<PreparedUpdate>> 
     if journal.phase != JournalStage::Prepared {
         return Ok(None);
     }
-    validate_activation_baseline(&journal)?;
+    // Setup or another update changed the installation since this update was staged, so
+    // the stage can never install. Drop it; the next check starts from the installation.
+    if validate_activation_baseline(&journal)
+        .and_then(|_| ensure_newer_than_selected(target, &journal.manifest.version))
+        .is_err()
+    {
+        fs::remove_file(state_dir(&target.root).join("journal.json"))?;
+        update_log(
+            &target.root,
+            &format!(
+                "Dropped the downloaded {}: the installation changed after the download",
+                journal.manifest.version
+            ),
+        );
+        return Ok(None);
+    }
     let config = ReleaseConfig::compiled()?;
     let release = verify_manifest(&serde_json::to_vec(&journal.signed)?, &config)?;
     ensure_newer_than_selected(target, &release.manifest.version)?;
@@ -2397,6 +2412,36 @@ mod tests {
             operation_status(&target).unwrap().unwrap().phase,
             JournalStage::Prepared
         );
+    }
+
+    #[test]
+    fn a_stage_setup_already_installed_is_dropped_instead_of_failing_every_launch() {
+        // The observed failure: in-app 0.8.1 rolled back, Setup then installed 0.8.1, and
+        // every launch after logged "Installation selection changed after staging".
+        let directory = tempdir();
+        let target = InstallTarget {
+            kind: InstallationKind::InstalledWindows,
+            root: directory.path().join("Compi"),
+        };
+        let previous = Selection {
+            schema: 1,
+            version: "1.0.0".into(),
+            task_version: "1.0.0".into(),
+        };
+        fs::create_dir_all(&target.root).unwrap();
+        restore_selection(&target.root, Some(&previous)).unwrap();
+        let staged = journal(target.clone(), Some(previous), JournalStage::Prepared);
+        atomic_json(&state_dir(&target.root).join("journal.json"), &staged).unwrap();
+        let installed = Selection {
+            schema: 1,
+            version: "2.0.0".into(),
+            task_version: "1.0.0".into(),
+        };
+        restore_selection(&target.root, Some(&installed)).unwrap();
+
+        assert!(pending_update(&target).unwrap().is_none());
+        assert!(operation_status(&target).unwrap().is_none());
+        assert_eq!(read_selection(&target.root).unwrap(), Some(installed));
     }
 
     #[test]

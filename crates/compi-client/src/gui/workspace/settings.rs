@@ -1150,6 +1150,21 @@ static ROWS: &[Row] = &[
         ),
     ),
     shown_when(
+        |app| app.updates.snapshot().service_lag.is_some(),
+        grouped(
+            "Version",
+            row(
+                "update-service",
+                SettingsSection::Updates,
+                "Background service",
+                "The service that runs your shells, while it still runs an older version.",
+                "daemon service server restart version update",
+                |app| app.service_lag_action().into_iter().collect(),
+                |app, row, cx| app.render_service_lag_row(row, cx),
+            ),
+        ),
+    ),
+    shown_when(
         |app| app.update_notes().is_some(),
         page_row(
             "update-notes",
@@ -4484,6 +4499,57 @@ impl CompiApp {
             self.settings_control(
                 row,
                 SettingsAction::RestartDaemon,
+                if live_processes > 0 {
+                    button.danger()
+                } else {
+                    button
+                },
+                cx,
+            ),
+            row.compact,
+        )
+    }
+
+    /// Restart when the service's task already starts the installed version; otherwise
+    /// Repair, which moves the task first.
+    fn service_lag_action(&self) -> Option<SettingsAction> {
+        let lag = self.updates.snapshot().service_lag?;
+        Some(if lag.task_behind {
+            SettingsAction::Update(UpdateControl::Repair)
+        } else {
+            SettingsAction::RestartDaemon
+        })
+    }
+
+    fn render_service_lag_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let (Some(lag), Some(action)) = (
+            self.updates.snapshot().service_lag,
+            self.service_lag_action(),
+        ) else {
+            return div().into_any_element();
+        };
+        let live_processes = self.command_context(cx).live_surface_count;
+        let button = controls::text_button(
+            (row.row, 0_usize),
+            if lag.task_behind {
+                "Repair Compi"
+            } else {
+                "Restart service"
+            },
+        )
+        .header();
+        self.settings_row(
+            row.title,
+            format!(
+                "It still runs Compi {}. Restarting it switches to {} and stops {} running terminal{}.",
+                lag.running,
+                lag.selected,
+                live_processes,
+                if live_processes == 1 { "" } else { "s" }
+            ),
+            self.settings_control(
+                row,
+                action,
                 if live_processes > 0 {
                     button.danger()
                 } else {

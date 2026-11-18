@@ -342,9 +342,7 @@ pub(crate) fn action(args: &[String]) -> Result<()> {
                 .into_iter()
                 .map(|daemon| daemon.fact)
                 .collect();
-            if doctor::upgrade_plan(compi_protocol::PROTOCOL_VERSION, None, false, &daemons)
-                .needs_consent()
-            {
+            if doctor::upgrade_plan(compi_protocol::PROTOCOL_VERSION, &daemons).needs_consent() {
                 return Err("Compi has open shells on an older version. Run Compi Setup to update, or close those shells first.".into());
             }
             Ok(())
@@ -389,37 +387,23 @@ pub(crate) fn action(args: &[String]) -> Result<()> {
             if *sid != compi_protocol::identity::current_user_sid_string()? {
                 return Err("Windows Installer is running as a different account. Run Compi Setup from your own account.".into());
             }
-            let snapshot: Snapshot = serde_json::from_slice(&fs::read(snapshot_path(&root))?)?;
+            // Rollback restores from the snapshot; never activate without a readable one.
+            let _: Snapshot = serde_json::from_slice(&fs::read(snapshot_path(&root))?)?;
             transaction::guard_task_ownership(&root)?;
             let daemons = machine::describe(
                 &root,
                 compi_protocol::DaemonClient::local_lifecycle_statuses_for_install(&root)?,
             );
             let facts: Vec<_> = daemons.iter().map(|daemon| daemon.fact.clone()).collect();
-            // A compatible running daemon keeps its registered generation: replacing the
-            // definition of a running task can disturb the scheduler's state. Otherwise the
-            // task moves to this version, so the next start serves this client.
-            let plan = doctor::upgrade_plan(
-                compi_protocol::PROTOCOL_VERSION,
-                snapshot
-                    .selection
-                    .as_ref()
-                    .map(|selection| selection.task_version.as_str()),
-                snapshot.task.is_some(),
-                &facts,
-            );
+            // A compatible running daemon keeps running; the task still moves to this
+            // version so the daemon's next start serves this client.
+            let plan = doctor::upgrade_plan(compi_protocol::PROTOCOL_VERSION, &facts);
             if plan.needs_consent() {
                 return Err("Compi has open shells on an older version. Run Compi Setup to update, or close those shells first.".into());
             }
             machine::stop_instances(&plan.stop, &daemons)?;
-            let task_version = match &plan.keep_task {
-                Some(kept) => kept.clone(),
-                None => {
-                    machine::register_task(&root, version)?;
-                    version.clone()
-                }
-            };
-            compi_update::activate_msi_payload_locked(&root, version, &task_version)?;
+            machine::register_task(&root, version)?;
+            compi_update::activate_msi_payload_locked(&root, version, version)?;
             Ok(())
         }
         "--msi-rollback" => {

@@ -240,14 +240,9 @@ pub(crate) fn preflight(operation: InstallerOperation) -> Result<Readiness> {
     let facts: Vec<_> = daemons.iter().map(|daemon| daemon.fact.clone()).collect();
     let selection = read_selection(&root).ok().flatten();
     let plan = match operation {
-        InstallerOperation::Install => doctor::upgrade_plan(
-            compi_protocol::PROTOCOL_VERSION,
-            selection
-                .as_ref()
-                .map(|selection| selection.task_version.as_str()),
-            task_snapshot()?.is_some(),
-            &facts,
-        ),
+        InstallerOperation::Install => {
+            doctor::upgrade_plan(compi_protocol::PROTOCOL_VERSION, &facts)
+        }
         InstallerOperation::Repair | InstallerOperation::Remove => doctor::reinstall_plan(&facts),
     };
     let readiness = Readiness {

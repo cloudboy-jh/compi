@@ -83,10 +83,38 @@ pub struct UpdateSnapshot {
     pub repair: Option<RepairOutcome>,
     pub preferences: UpdateSettings,
     pub daemons: Vec<DaemonUpdateStatus>,
+    /// The background service runs another version than the installed one, while no
+    /// update is offered; read at startup and when the Updates page opens.
+    pub service_lag: Option<ServiceLag>,
     pub host_process_ids: Vec<u32>,
     pub recovery_available: bool,
     /// The service has read the staged update and last outcome from disk.
     restored: bool,
+}
+
+/// The background service still runs a version other than the installed one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceLag {
+    pub running: String,
+    pub selected: String,
+    /// The service's task still starts the old version; restarting it alone changes
+    /// nothing, and Repair moves it.
+    pub task_behind: bool,
+}
+
+/// The default daemon's version against the installed selection; `None` when they match
+/// or when this is not an installed copy.
+fn service_lag(root: &Path, statuses: &[LifecycleStatus]) -> Option<ServiceLag> {
+    let selection = compi_update::read_selection(root).ok().flatten()?;
+    let running = &statuses
+        .iter()
+        .find(|status| status.instance.is_none())?
+        .product_version;
+    (*running != selection.version).then(|| ServiceLag {
+        running: running.clone(),
+        task_behind: selection.task_version != selection.version,
+        selected: selection.version,
+    })
 }
 
 /// The single primary action of a state.
@@ -1446,13 +1474,11 @@ impl UpdateService {
         self.state.lock().shows_dot(later)
     }
 
-    /// Refreshes which shells a restart would end; called when the page opens.
+    /// Refreshes which shells a restart would end, and whether the background service
+    /// lags behind; called when the page opens and after the service restarts.
     pub fn refresh_review(&self) {
         let snapshot = self.state.lock();
-        if (snapshot.prepared.is_some() || snapshot.available_release.is_some())
-            && snapshot.running.is_none()
-            && !snapshot.installing
-        {
+        if snapshot.running.is_none() && !snapshot.installing {
             drop(snapshot);
             self.request(Request::Review { full: false });
         }
@@ -1471,6 +1497,14 @@ fn review(
     let (prepared, mut registered, remote) = {
         let snapshot = state.lock();
         if snapshot.prepared.is_none() && snapshot.available_release.is_none() {
+            drop(snapshot);
+            // Nothing to install; only whether the service lags behind the installed copy.
+            let Ok(target) = InstallTarget::detect() else {
+                return Ok(());
+            };
+            let statuses = DaemonClient::local_lifecycle_statuses_for_install(&target.root)
+                .map_err(|error| error.to_string())?;
+            state.lock().service_lag = service_lag(&target.root, &statuses);
             return Ok(());
         }
         let remote: Vec<DaemonUpdateStatus> = snapshot
@@ -1548,6 +1582,8 @@ fn review(
     };
     let mut snapshot = state.lock();
     snapshot.daemons = daemons;
+    // Installing the offered update replaces the service anyway.
+    snapshot.service_lag = None;
     if let Some(hosts) = hosts {
         snapshot.host_process_ids = hosts;
     }
@@ -1867,10 +1903,22 @@ fn restore_pending(state: &Mutex<UpdateSnapshot>) -> Result<(), String> {
     restore_journal_status(&mut state.lock(), &journal);
     let prepared = if readiness_receipt().is_none() {
         let prepared = compi_update::pending_update(&target).map_err(|error| error.to_string())?;
-        // Recovery may have changed an interrupted transaction to RolledBack.
-        journal = compi_update::operation_status(&target)
-            .map_err(|error| error.to_string())?
-            .ok_or("Update journal disappeared during recovery")?;
+        // Recovery may have changed an interrupted transaction to RolledBack, and a
+        // download the installation has moved past is dropped with its journal.
+        let Some(current) =
+            compi_update::operation_status(&target).map_err(|error| error.to_string())?
+        else {
+            let mut snapshot = state.lock();
+            snapshot.recovery_available = false;
+            snapshot.installing = false;
+            if snapshot.failure.as_ref().is_some_and(|failure| {
+                failure.version.as_deref() == Some(journal.manifest.version.as_str())
+            }) {
+                snapshot.failure = None;
+            }
+            return Ok(());
+        };
+        journal = current;
         prepared
     } else {
         None

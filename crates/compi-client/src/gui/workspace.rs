@@ -2192,6 +2192,7 @@ impl CompiApp {
                         self.global_error = None;
                         self.connection_error = None;
                         self.accept_workspace(workspace);
+                        self.updates.refresh_review();
                     }
                     Err(error) => {
                         self.connection_error = Some(format!(

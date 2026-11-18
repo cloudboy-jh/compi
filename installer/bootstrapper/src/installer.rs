@@ -1661,7 +1661,6 @@ fn preview_configuration(
                 plan: doctor::UpgradePlan {
                     stop: vec![None],
                     shells: vec!["api · server (2)".into(), "web".into(), "Shell".into()],
-                    ..Default::default()
                 },
                 ..installed("0.1.3")
             },
