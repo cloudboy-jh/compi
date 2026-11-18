@@ -4,9 +4,21 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 ## Release state
 
-- **0.8.1** is Latest: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3` (release prep `15c432e` plus a docs commit), release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Windows and macOS package jobs passed. Signed update and Setup metadata say version 0.8.1, protocol 40 and the 0.8.1 notes, with hashes matching `SHA256SUMS.txt`. Installed 0.8.0 (`compi update --check`) discovers it; it was not activated in the working instance. The daemon changed, so installing ends local shells and chats after consent.
+- **0.8.1** is Latest: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3` (release prep `15c432e` plus a docs commit), release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Windows and macOS package jobs passed. Signed update and Setup metadata say version 0.8.1, protocol 40 and the 0.8.1 notes, with hashes matching `SHA256SUMS.txt`. The working instance's in-app update from 0.8.0 rolled back (see Open bugs); Setup 0.8.1 then installed it, and its service was moved to 0.8.1 by hand on 2026-11-18. The 0.8.1 fixes still need rechecking there.
   - The first tag runs (on `15c432e`) stayed queued with no jobs for over an hour and the API refuses to cancel them ("completed"); a new push to `main` got jobs created, so the unpublished tag was moved to `d5fb6e3` before any draft existed. Those stale runs still show as queued.
 - **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
+
+## Next: chat first
+
+Order and scope: the vault's `feat and bugs.md` → **Chat first** (decided 2026-11-18). T3 Code behaviour it borrows, with source references: [T3 Code research](../research/t3-code/README.md). Compi stays a terminal workspace; nothing here removes a terminal path.
+
+Implementation notes that the vault leaves out:
+
+- **Threads** need a daemon-owned store: the transcript Compi shows, plus per agent `{agent, session id, last delivered turn}` so a switch hands over only what that agent missed ([threads](../research/t3-code/threads.md)). Today a chat reads OMP's session files (`compi-daemon/src/chat/saved.rs`) and ends with its pane.
+- **Agents** get their own drivers for fidelity: Codex `app-server` (JSON-RPC over stdio), OpenCode's HTTP server and event stream, Pi `--mode rpc` (JSON lines). OMP stays on ACP with Compi's OMP extras. Claude Code: try its JSON stream mode from Rust first, else a Node helper running the Agent SDK. Plain ACP loses sub-agents, real rewind, steering and plan cards ([agent fidelity](../research/t3-code/agent-fidelity.md)). `ChatHarness` (`compi-protocol/src/chat.rs`) holds only `Omp` today; drivers report capabilities and the UI hides what an agent can't do.
+- **Handoff budget** as T3: at most 16k tokens, never trimming the user's request; latest user and assistant messages, the first user message, then newest to oldest; omitted items readable through a Compi tool.
+- **Project file search** on the daemon: a gitignore-aware fuzzy index per project folder, refreshed after agent turns; an empty query lists recent files.
+- **Model picker:** today one ACP option list per setting (`chat/composer.rs` `render_chat_picker`), closing on pick. Effort levels come from the agent for its current model only.
 
 ## 0.7.4: not seen yet
 
@@ -45,7 +57,6 @@ Not seen yet: UAC prompts, `winget` installs, why `cmd.exe /c start steam://…`
 - **Chat → OMP's TUI in the same pane** (asked 2026-11-10). Today Ctrl/Cmd+Shift+E shows the plain shell under the chat. The ⋯ menu gets **Open in terminal**: the daemon stops the chat's `omp acp` (two OMP processes must not write one session file), the pane shows its shell, and Compi types `omp --resume <session>` there, in the session's saved folder. Going back loads the session again with `session/load`, turns made in the TUI included (OMP shares sessions between ACP and its TUI both ways). Open: a shell already running a program (ask, or open a new tab as **Jump to project** does), PowerShell panes (`omp.exe`), noticing the TUI's exit to offer the chat again.
 - **Updates that keep shells.** Release metadata qualifies only the release's own daemon (`qualified_daemons = [version]` in the smoke scripts), so every update restarts the daemon, even with the protocol unchanged. Qualify the previous daemon when protocol and workspace format did not change.
 - **Updater upkeep.** A repair from Settings → Apps after Setup removed its run folder is untested. Root `Compi-Setup.exe` still changes only through Setup. Setup and the in-app updater keep two journals and two scheduled-task guards. The 0.1.x–0.3.0 migration paths and `INSTALLER_UPDATES_PLAN.md` (a 0.1.3-era plan) are out of date. macOS activation has never run natively.
-- **Other chat harnesses:** OpenCode, Pi, Codex, Claude Code (vault order).
 
 ## Fixed after 0.8.0, not released
 
