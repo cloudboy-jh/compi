@@ -470,6 +470,25 @@ mod tests {
     use std::time::{Duration, Instant};
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
 
+    /// The runtime loads only from beside the executable, and since Cargo 1.100 a test
+    /// runs from its own unit folder, which the build script can't name.
+    fn stage_runtime_beside_test() {
+        let staged = std::path::Path::new(env!("COMPI_CONPTY_RUNTIME"));
+        let executable = std::env::current_exe().unwrap();
+        let directory = executable.parent().unwrap();
+        for file in ["conpty.dll", "OpenConsole.exe"] {
+            let destination = directory.join(file);
+            if !destination.is_file() {
+                std::fs::copy(staged.join(file), &destination).unwrap_or_else(|error| {
+                    panic!(
+                        "stage {}: {error}; run tools\\prepare-conpty.ps1",
+                        staged.join(file).display()
+                    )
+                });
+            }
+        }
+    }
+
     // Keep this regression with the suspended-before-job backend. A launcher
     // can create a child immediately and exit; owning just the launcher or
     // assigning it after resume cannot establish the same ownership guarantee.
@@ -486,6 +505,7 @@ mod tests {
             metadata: None,
             distribution: None,
         };
+        stage_runtime_beside_test();
         let mut pty = ConptySession::spawn(&launch, 80, 24).unwrap();
         let (input, mut output) = pty.take_io().unwrap();
         let (sender, receiver) = mpsc::channel();

@@ -38,6 +38,8 @@ fn copy_conpty_runtime() {
     for file in files {
         println!("cargo:rerun-if-changed={}", staged.join(file).display());
     }
+    // Tests copy the runtime beside themselves from here (see conpty.rs).
+    println!("cargo:rustc-env=COMPI_CONPTY_RUNTIME={}", staged.display());
     if files.iter().any(|file| !staged.join(file).is_file()) {
         println!(
             "cargo:warning=bundled ConPTY runtime is not staged; run tools/prepare-conpty.ps1 -Architecture {architecture}, then rebuild before launching the daemon"
@@ -45,13 +47,19 @@ fn copy_conpty_runtime() {
         return;
     }
 
-    // OUT_DIR is <target>/<optional triple>/<profile>/build/<package>/out.
-    // Do not reconstruct it from PROFILE: custom profiles and target dirs work too.
+    // OUT_DIR is <profile>/build/<package>-<hash>/out before Cargo 1.100 and
+    // <profile>/build/<package>/<hash>/out since. Do not reconstruct it from PROFILE:
+    // custom profiles and target dirs work too.
     let out = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").expect("Cargo output directory is missing"),
     );
-    let profile = out.ancestors().nth(3).expect("unexpected Cargo OUT_DIR");
-    // Cargo runs test executables from deps; they use the same sibling-only loader.
+    let profile = out
+        .ancestors()
+        .find(|directory| directory.file_name() == Some("build".as_ref()))
+        .and_then(std::path::Path::parent)
+        .expect("unexpected Cargo OUT_DIR");
+    // Binaries are copied up to the profile folder. Before Cargo 1.100 tests ran from
+    // deps; since then each runs from its own unit folder, which tests stage themselves.
     for destination in [profile.to_path_buf(), profile.join("deps")] {
         std::fs::create_dir_all(&destination).expect("failed to create runtime output directory");
         for file in files {
