@@ -950,28 +950,36 @@ mod platform {
         }
     }
 
+    /// `None` when no host listens. The host serves one connection at a time and listens
+    /// again on its next poll, so a busy pipe is a running host: wait for it, as long as
+    /// a request may hold it.
     pub fn connect(name: &str) -> Result<Option<File>> {
         let name = wide(name);
-        let handle = match unsafe {
-            CreateFileW(
-                PCWSTR(name.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
-                FILE_SHARE_MODE(0),
-                None,
-                OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                None,
-            )
-        } {
-            Ok(handle) => handle,
-            Err(error)
-                if [ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY]
-                    .iter()
-                    .any(|code| error.code() == HRESULT::from_win32(code.0)) =>
-            {
-                return Ok(None);
+        let deadline = Instant::now() + REQUEST_TIMEOUT + Duration::from_secs(1);
+        let handle = loop {
+            match unsafe {
+                CreateFileW(
+                    PCWSTR(name.as_ptr()),
+                    GENERIC_READ.0 | GENERIC_WRITE.0,
+                    FILE_SHARE_MODE(0),
+                    None,
+                    OPEN_EXISTING,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    None,
+                )
+            } {
+                Ok(handle) => break handle,
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
+                    return Ok(None);
+                }
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_BUSY.0) => {
+                    if Instant::now() >= deadline {
+                        return Err("The Compi window stayed busy with another request".into());
+                    }
+                    thread::sleep(POLL);
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
         let file = unsafe { File::from_raw_handle(handle.0) };
         check_peer(&file, true, &identity::current_user_sid_string()?)?;

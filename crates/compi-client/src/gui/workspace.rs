@@ -152,9 +152,12 @@ pub(super) fn release_for_update(path: &std::path::Path, cx: &mut App) -> crate:
     {
         return Err("Update release does not match the prepared handoff".into());
     }
+    // Close the windows, as closing the last one by hand does; the app quits when none is
+    // left. Quitting with them still open here left the process stuck in its exit on
+    // Windows, past the update helper's 60 s wait, so the update rolled back.
     for handle in cx.windows() {
         if let Some(typed) = handle.downcast::<CompiApp>() {
-            typed.update(cx, |this, _, _| {
+            typed.update(cx, |this, window, _| {
                 this.update_quiesced.store(true, Ordering::Release);
                 for view in &mut this.surface_views {
                     view.stop.store(true, Ordering::Release);
@@ -163,10 +166,10 @@ pub(super) fn release_for_update(path: &std::path::Path, cx: &mut App) -> crate:
                     }
                 }
                 this.flush_state();
+                window.remove_window();
             })?;
         }
     }
-    cx.quit();
     Ok(())
 }
 
