@@ -12,6 +12,8 @@ mod lists;
 mod metrics;
 mod notes;
 mod palette;
+#[cfg(windows)]
+mod screenshot;
 mod targets;
 #[cfg(any(windows, target_os = "macos"))]
 mod update;
@@ -51,6 +53,7 @@ const COMMANDS: &[&str] = &[
     "theme",
     "update",
     "changes",
+    "screenshot",
     "command",
     "help",
 ];
@@ -565,6 +568,16 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
     }
     if command == "changes" {
         return Ok(changes::run());
+    }
+    if command == "screenshot" {
+        #[cfg(windows)]
+        return screenshot::run(action);
+        #[cfg(not(windows))]
+        return Err(CliError::new(
+            1,
+            "screenshot_unavailable",
+            "compi screenshot captures Windows app windows; it runs on Windows",
+        ));
     }
     config::settle_windows_shell(options.config.as_deref());
     let config = config::load(options.config.as_deref(), config::FontOverrides::default());
@@ -1824,6 +1837,7 @@ fn validate(
         ("theme", Some("install")) => (3, 3, &[], &[]),
         ("update", None) => (1, 1, &[], &["--check"]),
         ("changes", None) => (1, 1, &[], &[]),
+        ("screenshot", _) => (1, 2, &[], &[]),
         _ => {
             return Err(CliError::usage(format!(
                 "unknown or missing {command} action; run compi help {command}"
@@ -1924,6 +1938,11 @@ fn validate(
     if command == "changes" && options.connect.is_some() {
         return Err(CliError::usage(
             "changes reports this computer's Compi; --connect is not supported",
+        ));
+    }
+    if command == "screenshot" && options.connect.is_some() {
+        return Err(CliError::usage(
+            "screenshot captures this computer's windows; --connect is not supported",
         ));
     }
     if matches!((command, action), ("tab" | "group", Some("move"))) {

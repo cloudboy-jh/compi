@@ -31,6 +31,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Palette", &["command"]),
+    ("Other apps", &["screenshot"]),
     ("Compi", &["theme", "update", "changes", "help"]),
 ];
 
@@ -539,6 +540,14 @@ pub(super) const ENTRIES: &[Entry] = &[
         summary: "Print what changed in this version",
         detail: "Print the running version and what changed in it, from the notes What's New shows: the headline, the other highlights, then each section under its title. Needs no running Compi. --connect is rejected.",
         example: "compi --json changes",
+    },
+    Entry {
+        command: "screenshot",
+        action: None,
+        usage: "screenshot [NAME]",
+        summary: "List Windows app windows, or save one as a PNG",
+        detail: "Without NAME, list the app windows open on this Windows PC, frontmost first: ID, app (its .exe), PID, size in pixels (marked minimized) and title. With NAME, capture one window as it draws itself, even when covered, cropped to its frame, and print the PNG's path alone. NAME is an ID from the list, an app name with or without .exe, or text in a title or app name, ignoring case; an ID wins, then an exact app name, then the rest, each taking the frontmost window that is not minimized. Run from WSL through the shell bridge, the PNG goes to /tmp/compi-screenshots in that distribution and the path printed is the Linux one; otherwise to %TEMP%\\compi-screenshots. Needs no running Compi. --json returns {windows: [{id, app, pid, title, width, height, minimized}]}, or {path, window: {id, app, pid, title, width, height}} for a capture. Exits 1 with window_not_found when nothing matches, window_minimized for a minimized window (restore it first), capture_failed when Windows cannot draw it, and screenshot_unavailable on macOS and Linux. --connect is rejected.",
+        example: "compi screenshot explorer",
     },
     Entry {
         command: "help",

@@ -545,8 +545,9 @@ impl Chat {
     }
 
     /// Starts the harness as the chat's approval says. Compi's shell bridge is installed
-    /// where it runs and OMP's own setting, which `omp acp` does not read, is looked up
-    /// first, on a thread of its own, no lock held; the status stays `Starting` meanwhile.
+    /// where it runs, a WSL chat's note is worked out, and OMP's own setting, which
+    /// `omp acp` does not read, is looked up first, on a thread of its own, no lock
+    /// held; the status stays `Starting` meanwhile.
     fn spawn(self: &Arc<Self>, inner: &mut Inner) {
         inner.generation += 1;
         inner.initialized = false;
@@ -556,30 +557,38 @@ impl Chat {
         let preparing = thread::Builder::new()
             .name("compi-chat-start".into())
             .spawn(move || {
-                install_bridge(&chat.content);
+                // The note's extension is a bridge file, so no bridge, no note.
+                let note = install_bridge(&chat.content)
+                    .then(|| agent_note(&chat.content))
+                    .flatten();
                 let mode = chosen.or_else(|| configured_approval(&chat.content));
                 let mut inner = chat.lock();
                 if !inner.closed && inner.generation == generation {
-                    chat.launch(&mut inner, generation, mode);
+                    chat.launch(&mut inner, generation, mode, note);
                 }
             });
         if preparing.is_err() {
-            self.launch(inner, generation, chosen);
+            self.launch(inner, generation, chosen, None);
         }
     }
 
     /// Runs the harness, with `approval_mode` when there is one, and asks it to
     /// initialize; the rest follows its answers. It gets the shell context a terminal in
-    /// its folder gets, so `compi` there acts on this workspace.
+    /// its folder gets, so `compi` there acts on this workspace, and `note`, when there
+    /// is one, at the end of its system prompt.
     fn launch(
         self: &Arc<Self>,
         inner: &mut Inner,
         generation: u64,
         approval_mode: Option<&'static str>,
+        note: Option<String>,
     ) {
         let mut args = vec!["acp"];
         if let Some(mode) = approval_mode {
             args.extend(["--approval-mode", mode]);
+        }
+        if note.is_some() {
+            args.extend(["-e", r#""$HOME/.compi/shell/compi-omp.js""#]);
         }
         let wsl = matches!(self.content.environment, ContentEnvironment::Wsl { .. });
         let mut child = match crate::shell_integration::cli_environment(
@@ -587,6 +596,10 @@ impl Chat {
             self.instance.as_deref(),
             wsl,
         )
+        .map(|mut environment| {
+            environment.extend(note.map(|note| ("COMPI_AGENT_NOTE", note)));
+            environment
+        })
         .map_err(|error| format!("Couldn't prepare Compi's shell context: {error}"))
         .and_then(|environment| command(&self.content, &environment, &args))
         .and_then(|mut command| {
@@ -2838,8 +2851,9 @@ fn configured_approval(content: &ChatContent) -> Option<&'static str> {
 }
 
 /// Installs Compi's shell bridge where the chat's harness runs, as a terminal's launch
-/// does, so `compi` there runs the CLI. A failure is logged; the harness starts anyway.
-fn install_bridge(content: &ChatContent) {
+/// does, so `compi` there runs the CLI; true when it is in place. A failure is logged;
+/// the harness starts anyway.
+fn install_bridge(content: &ChatContent) -> bool {
     let installed = match &content.environment {
         // A Windows harness finds `compi.exe` in the CLI's folder, first on its path.
         #[cfg(windows)]
@@ -2853,12 +2867,64 @@ fn install_bridge(content: &ChatContent) {
         #[cfg(unix)]
         ContentEnvironment::Wsl { .. } => Ok(()),
     };
-    if let Err(error) = installed {
+    if let Err(error) = &installed {
         eprintln!(
             "compi-daemon: could not install the shell bridge for chat {}: {error}",
             content.id
         );
     }
+    installed.is_ok()
+}
+
+/// What a WSL chat's agent is told at start; `None` for other chats, or when the
+/// Windows home folder has no Linux path there (a failure is logged).
+#[cfg(windows)]
+fn agent_note(content: &ChatContent) -> Option<String> {
+    let ContentEnvironment::Wsl { distribution } = &content.environment else {
+        return None;
+    };
+    let home = std::env::var("USERPROFILE")
+        .ok()
+        .filter(|home| !home.is_empty())?;
+    match linux_home(distribution, &home) {
+        Ok(linux) => Some(wsl_note(distribution, &home, &linux)),
+        Err(error) => {
+            eprintln!("compi-daemon: no WSL note for chat {}: {error}", content.id);
+            None
+        }
+    }
+}
+
+/// Only WSL chats, which need a Windows host, get a note.
+#[cfg(unix)]
+fn agent_note(_: &ChatContent) -> Option<String> {
+    None
+}
+
+/// `home`'s Linux path in `distribution`, asked once per distribution and kept.
+#[cfg(windows)]
+fn linux_home(distribution: &str, home: &str) -> compi_protocol::Result<String> {
+    static HOMES: LazyLock<Mutex<HashMap<(String, String), String>>> =
+        LazyLock::new(Mutex::default);
+    let key = (distribution.to_owned(), home.to_owned());
+    if let Some(linux) = lock(&HOMES).get(&key) {
+        return Ok(linux.clone());
+    }
+    let linux = compi_protocol::wsl::wsl_path_for_windows(home, distribution)?;
+    lock(&HOMES).insert(key, linux.clone());
+    Ok(linux)
+}
+
+#[cfg(windows)]
+fn wsl_note(distribution: &str, windows_home: &str, linux_home: &str) -> String {
+    format!(
+        "You are running in WSL ({distribution}) on a Windows PC, inside Compi. \
+         The Windows user folder is {windows_home}, which is {linux_home} here. \
+         Windows programs run from this shell by their .exe names, such as cmd.exe, \
+         powershell.exe, tasklist.exe and winget.exe. To see an open Windows app window, \
+         such as a dialog you caused: `compi screenshot` lists the windows, and \
+         `compi screenshot NAME` saves one as a PNG and prints its path for you to read."
+    )
 }
 
 /// The harness's command with `args` in its environment and folder, and `environment`

@@ -230,6 +230,22 @@ pub fn windows_path_for_wsl(path: &str, distribution: &str) -> Result<PathBuf> {
     )?))
 }
 
+/// The Linux path `distribution` gives the Windows path `path`: `C:\Users\x` is
+/// `/mnt/c/Users/x` there, or under wherever its drives are mounted.
+pub fn wsl_path_for_windows(path: &str, distribution: &str) -> Result<String> {
+    let output = run_wsl([
+        "--distribution",
+        distribution,
+        "--exec",
+        "wslpath",
+        "-a",
+        "-u",
+        "--",
+        path,
+    ])?;
+    checked_output(output, "could not resolve the Windows folder in WSL")
+}
+
 fn selected_wsl2_distribution(name: &str) -> Result<DefaultDistribution> {
     if let Some(Ok(distribution)) = native_default_distribution()
         && distribution.name.eq_ignore_ascii_case(name)

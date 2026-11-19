@@ -294,7 +294,10 @@ pub(crate) fn install_home_bridge() -> Result<()> {
     install_unix(&std::path::Path::new(&home).join(".compi/shell"))
 }
 
-fn shell_files() -> [(&'static str, &'static str); 7] {
+/// How many files `shell_files` installs.
+const SHELL_FILES: usize = 8;
+
+fn shell_files() -> [(&'static str, &'static str); SHELL_FILES] {
     [
         ("compi-shell.sh", BRIDGE),
         (
@@ -371,6 +374,22 @@ fi
             r#"if (( _compi_zdotdir_set )); then ZDOTDIR=$_compi_user_zdotdir; else unset ZDOTDIR; fi
 [[ ! -f $_compi_user_zdotdir/.zlogin ]] || source "$_compi_user_zdotdir/.zlogin"
 unset _compi_shell_dir _compi_user_zdotdir _compi_zdotdir_set
+"#,
+        ),
+        // An OMP extension a WSL chat loads (`omp acp -e`): it ends the system prompt
+        // with `COMPI_AGENT_NOTE`. `--append-system-prompt` would replace the user's
+        // own `APPEND_SYSTEM.md` instead.
+        (
+            "compi-omp.js",
+            r#"export default function (pi) {
+  const note = process.env.COMPI_AGENT_NOTE;
+  if (!note) return;
+  pi.on("before_agent_start", event => {
+    const base = Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt];
+    if (base.includes(note)) return;
+    return { systemPrompt: [...base, note] };
+  });
+}
 "#,
         ),
     ]
@@ -537,14 +556,14 @@ struct WslBridge {
     distribution_wide: Vec<u16>,
     default_home_identity: Option<DefaultHomeIdentity>,
     directory: std::path::PathBuf,
-    stamps: Option<[BridgeStamp; 7]>,
+    stamps: Option<[BridgeStamp; SHELL_FILES]>,
     functions: Option<Vec<OsString>>,
     /// Digest of the installed `~/.compi/wincmd.<digest>` directory.
     commands: Option<String>,
 }
 
 #[cfg(windows)]
-fn bridge_stamps(directory: &std::path::Path) -> Option<[BridgeStamp; 7]> {
+fn bridge_stamps(directory: &std::path::Path) -> Option<[BridgeStamp; SHELL_FILES]> {
     use std::os::windows::fs::MetadataExt;
     let directory_metadata = std::fs::symlink_metadata(directory).ok()?;
     if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
@@ -555,7 +574,7 @@ fn bridge_stamps(directory: &std::path::Path) -> Option<[BridgeStamp; 7]> {
         written: 0,
         created: 0,
         attributes: 0,
-    }; 7];
+    }; SHELL_FILES];
     for ((name, _), stamp) in shell_files().into_iter().zip(&mut stamps) {
         let metadata = std::fs::metadata(directory.join(name)).ok()?;
         if !metadata.is_file() {
@@ -1012,7 +1031,7 @@ mkdir -p "$dir"
 if [ -L "$dir" ]; then echo 'Compi shell directory must not be a symbolic link' >&2; exit 1; fi
 chmod 700 "$dir"
 while IFS='	' read -r name encoded; do
-    case "$name" in compi|compi-shell.sh|bashrc|.zshenv|.zprofile|.zshrc|.zlogin) ;; *) echo 'invalid Compi shell file' >&2; exit 1 ;; esac
+    case "$name" in compi|compi-shell.sh|bashrc|.zshenv|.zprofile|.zshrc|.zlogin|compi-omp.js) ;; *) echo 'invalid Compi shell file' >&2; exit 1 ;; esac
     if [ -f "$dir/$name" ] && [ "$(base64 -w 0 "$dir/$name")" = "$encoded" ]; then
         if [ "$name" = compi ]; then chmod 700 "$dir/$name"; fi
         continue
