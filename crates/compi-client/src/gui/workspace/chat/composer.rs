@@ -215,16 +215,16 @@ fn picker_layout(option: &ChatOption, matches: &[usize], plans: &[ChatPlan]) -> 
     layout
 }
 
-/// What the system picker returned, sorted: files by the path the chat's environment
-/// knows them by, images read, and why any were left out.
+/// What was picked or dropped, sorted: files by the path the chat's environment knows
+/// them by, images read, and why any were left out.
 struct PickedAttachments {
     files: Vec<String>,
     images: Vec<ChatImage>,
     refused: Option<String>,
 }
 
-/// Reads `picked` for a chat in `environment`: images by their bytes, other files by
-/// path, which a remote chat cannot reach.
+/// Reads `picked` for a chat in `environment`: images by their bytes, shrunk to fit a
+/// prompt, other files by path, which a remote chat cannot reach.
 fn read_attachments(
     environment: &ContentEnvironment,
     remote: bool,
@@ -242,17 +242,16 @@ fn read_attachments(
             || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        if let Some(mime) = ChatImage::mime_for(&name) {
-            match std::fs::read(&path) {
-                Ok(bytes) if bytes.len() <= MAX_CHAT_IMAGE_BYTES => read.images.push(ChatImage {
+        if ChatImage::mime_for(&name).is_some() {
+            let image = std::fs::read(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| crate::image_input::chat_image(bytes, MAX_CHAT_IMAGE_BYTES));
+            match image {
+                Ok((bytes, mime)) => read.images.push(ChatImage {
                     name,
                     mime: mime.to_owned(),
                     data: base64::engine::general_purpose::STANDARD.encode(bytes),
                 }),
-                Ok(_) => left_out.push(format!(
-                    "{name} (over {:.1} MB)",
-                    MAX_CHAT_IMAGE_BYTES as f64 / (1024.0 * 1024.0)
-                )),
                 Err(error) => left_out.push(format!("{name} ({error})")),
             }
             continue;
@@ -1285,6 +1284,9 @@ impl CompiApp {
             .border_1()
             .border_color(color(colors.border))
             .in_focus(move |style| style.border_color(color(colors.accent)))
+            .group_drag_over::<gpui::ExternalPaths>(CHAT_DROP_GROUP, move |style| {
+                style.border_color(color(colors.accent))
+            })
             .bg(color(colors.surface))
             .track_focus(&model.card)
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -1678,15 +1680,8 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The card's +: the system's file picker. Images (PNG, JPEG, GIF, WebP) are read here
-    /// and sent with the prompt; other files are attached by the path the chat's
-    /// environment knows them by. A file it cannot reach, or an image too large, is
-    /// named under the card instead.
+    /// The card's +: the system's file picker, attaching what it returns.
     fn pick_chat_attachments(&mut self, chat: &str, cx: &mut Context<Self>) {
-        let Some((_, content)) = self.chat_pane(chat) else {
-            return;
-        };
-        let remote = self.target.is_remote();
         let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -1698,9 +1693,32 @@ impl CompiApp {
             let Ok(Ok(Some(picked))) = picker.await else {
                 return;
             };
+            this.update(cx, |this, cx| this.attach_chat_paths(&chat, picked, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Attaches `paths`, picked or dropped on chat `chat`, to its next prompt. Images
+    /// (PNG, JPEG, GIF, WebP) are read here, shrunk to fit and sent with the prompt;
+    /// other files are attached by the path the chat's environment knows them by. A file
+    /// it cannot reach, an unreadable image, or images past the limit are named under
+    /// the card instead.
+    pub(super) fn attach_chat_paths(
+        &mut self,
+        chat: &str,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, content)) = self.chat_pane(chat) else {
+            return;
+        };
+        let remote = self.target.is_remote();
+        let chat = chat.to_owned();
+        cx.spawn(async move |this, cx| {
             let read = cx
                 .background_executor()
-                .spawn(async move { read_attachments(&content.environment, remote, picked) })
+                .spawn(async move { read_attachments(&content.environment, remote, paths) })
                 .await;
             this.update(cx, |this, cx| {
                 let Some(model) = this.chat.chats.get_mut(&chat) else {
@@ -1711,14 +1729,26 @@ impl CompiApp {
                         model.attachments.push(file);
                     }
                 }
+                let mut over_limit = false;
                 for image in read.images {
-                    if model.images.len() < MAX_CHAT_IMAGES
-                        && !model.images.iter().any(|kept| kept.data == image.data)
-                    {
+                    if model.images.iter().any(|kept| kept.data == image.data) {
+                        continue;
+                    }
+                    if model.images.len() < MAX_CHAT_IMAGES {
                         model.images.push(image);
+                    } else {
+                        over_limit = true;
                     }
                 }
-                model.error = read.refused;
+                model.error = match (over_limit, read.refused) {
+                    (true, Some(refused)) => Some(format!(
+                        "A prompt carries at most {MAX_CHAT_IMAGES} images. {refused}"
+                    )),
+                    (true, None) => {
+                        Some(format!("A prompt carries at most {MAX_CHAT_IMAGES} images"))
+                    }
+                    (false, refused) => refused,
+                };
                 cx.notify();
             })
             .ok();

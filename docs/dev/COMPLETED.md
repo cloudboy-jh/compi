@@ -2,6 +2,10 @@
 
 This is an implementation history with dated verification evidence, not a claim of current cross-platform qualification. The latest recorded Windows handoff is summarized first; unfinished work is tracked in [Next steps](NEXT_STEPS.md).
 
+## Chat first (not released)
+
+- **Drag and drop into chat** (2026-11-18). A chat pane takes `ExternalPaths` drops (`render_chat_pane`): the pane is focused, the keyboard goes to the draft, and the paths go through `attach_chat_paths`, which the **+** picker now uses too. Images are made small enough to send with `image_input::chat_image` (the picker used to refuse one over `MAX_CHAT_IMAGE_BYTES`), images past `MAX_CHAT_IMAGES` are named under the card instead of dropped silently, and the composer card takes the accent border while files are dragged over the pane (`group_drag_over` on `CHAT_DROP_GROUP`). Drops on terminals still type the image path. Seen in `cargo dev` on Windows, a WSL OMP chat, with a real OLE drag (a WinForms source window, `DoDragDrop`, the mouse moved and released by script): the card lit up during the drag; a 4.2 MB noise PNG and `chat.rs` dropped together became an image chip and a file chip relative to the chat's folder, the caret was in the draft, and OMP described the image as random coloured static.
+
 ## 0.8.1 and 0.8.2 (moved from Next steps, 2026-11-18)
 
 PowerShell → WSL routing through File text size shipped in 0.8.1; the rest shipped in 0.8.2.

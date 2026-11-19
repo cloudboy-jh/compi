@@ -50,6 +50,9 @@ const HEADER_HEIGHT: f32 = 34.0;
 /// The composer grows with its text between these many lines.
 const COMPOSER_MIN_ROWS: usize = 1;
 const COMPOSER_MAX_ROWS: usize = 8;
+/// The chat pane's group, so the composer card lights up while files are dragged over
+/// any part of the pane.
+const CHAT_DROP_GROUP: &str = "chat-drop";
 /// The keys that do the other of steering and queueing while a turn runs; see
 /// `ChatModel::delivery`.
 pub(super) const SECONDARY_KEY: &str = if cfg!(target_os = "macos") {
@@ -1564,7 +1567,10 @@ impl CompiApp {
         };
         let colors = *self.colors();
         let key_pane = pane_id.clone();
+        let drop_pane = pane_id.clone();
+        let drop_chat = chat.id.clone();
         let pane = div()
+            .group(CHAT_DROP_GROUP)
             .relative()
             .flex_1()
             .min_h_0()
@@ -1578,6 +1584,19 @@ impl CompiApp {
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 this.chat_key_down(&key_pane, event, window, cx);
             }))
+            // Files dropped anywhere on the chat attach to the next prompt, and the
+            // keyboard goes to the draft to say what they are for.
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.focus_pane(drop_pane.clone());
+                    if let Some(model) = this.chat.chats.get(&drop_chat) {
+                        window.focus(&model.composer.focus_handle(cx), cx);
+                    }
+                    this.attach_chat_paths(&drop_chat, paths.paths().to_vec(), cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
             .child(self.render_chat_header(chat, model, cx))
             .child(self.render_chat_transcript(chat, model, cx))
             .children(self.render_chat_agents(chat, model, cx))
