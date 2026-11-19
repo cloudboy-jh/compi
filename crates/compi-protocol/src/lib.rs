@@ -84,7 +84,10 @@ use std::fmt;
 // `RestartChat` carry how the harness asks before running tools (`ChatApproval`). Settings
 // gains a Chat section. A tool call carries the sub-agents it started (`ChatTool::agents`),
 // and `ChatEntry::AgentsFinished` marks when the last running one finished.
-pub const PROTOCOL_VERSION: u32 = 40;
+// Version 41 starts new chat sessions on the settings last picked in Compi (`ChatPicks` on
+// `WatchChat`, `ResumeChat` and `RestartChat`) and marks a model or thinking change before
+// the next prompt (`ChatEntry::Switch`).
+pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -483,6 +486,9 @@ pub enum ClientMessage {
         chat: chat::ChatContent,
         #[serde(default)]
         approval: chat::ChatApproval,
+        /// What a new session starts on, this one when the watch starts the harness.
+        #[serde(default)]
+        picks: chat::ChatPicks,
     },
     /// Sends `text`, with `files` (absolute paths in the chat's environment) and `images`
     /// attached, as `delivery` says: the next turn, into the running one, or after it.
@@ -535,13 +541,18 @@ pub enum ClientMessage {
         /// Applies from the harness's next start, this one when the resume starts it.
         #[serde(default)]
         approval: chat::ChatApproval,
+        /// What a new session (`session: None`) starts on.
+        #[serde(default)]
+        picks: chat::ChatPicks,
     },
     /// Ends the chat's harness and starts it again, resuming its session if it has one,
-    /// with `approval`.
+    /// with `approval`; a new one starts on `picks`.
     RestartChat {
         chat: String,
         #[serde(default)]
         approval: chat::ChatApproval,
+        #[serde(default)]
+        picks: chat::ChatPicks,
     },
     ShutdownDaemon,
 }

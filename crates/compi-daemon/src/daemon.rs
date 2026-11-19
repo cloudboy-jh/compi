@@ -838,13 +838,18 @@ fn handle_connection(
                         },
                     })?;
                 }
-                ClientMessage::WatchChat { chat, approval } => match chat.validate() {
+                ClientMessage::WatchChat {
+                    chat,
+                    approval,
+                    picks,
+                } => match chat.validate() {
                     Ok(()) => {
                         let surface = manager
                             .snapshot()
                             .ok()
                             .and_then(|workspace| crate::chat::chat_surface(&workspace, &chat.id));
-                        let (state, events) = crate::chat::hub().watch(&chat, approval, surface);
+                        let (state, events) =
+                            crate::chat::hub().watch(&chat, approval, picks, surface);
                         sink.send_control(&ServerControl {
                             request_id: Some(request_id),
                             message: ServerMessage::ChatWatching { state },
@@ -918,15 +923,20 @@ fn handle_connection(
                     chat,
                     session,
                     approval,
+                    picks,
                 } => answer_chat(
                     &sink,
                     request_id,
-                    crate::chat::hub().resume(&chat, session, approval),
+                    crate::chat::hub().resume(&chat, session, approval, picks),
                 )?,
-                ClientMessage::RestartChat { chat, approval } => answer_chat(
+                ClientMessage::RestartChat {
+                    chat,
+                    approval,
+                    picks,
+                } => answer_chat(
                     &sink,
                     request_id,
-                    crate::chat::hub().restart(&chat, approval),
+                    crate::chat::hub().restart(&chat, approval, picks),
                 )?,
                 ClientMessage::WatchSystemTotals { source } => match Source::resolve(&source) {
                     Ok(source) => {

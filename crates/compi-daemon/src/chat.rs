@@ -8,13 +8,13 @@
 //! resumes it (`session/load`) when it starts again, after a restart of the daemon too.
 use crate::program_status::ChatStatusHub;
 use compi_protocol::chat::{
-    ChatAgent, ChatAgentsFinished, ChatAnswer, ChatAnswers, ChatApproval, ChatChoice, ChatCommand,
-    ChatContent, ChatDelivery, ChatDiff, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatImage,
-    ChatOption, ChatPermission, ChatPermissionOption, ChatPlan, ChatPlanLimit, ChatQuestion,
-    ChatQueued, ChatSessionInfo, ChatState, ChatStatus, ChatTool, ChatToolStatus, ChatUsage,
-    MAX_CHAT_AGENT_RESULT_BYTES, MAX_CHAT_ATTACHMENTS, MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES,
-    MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES, MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES,
-    MAX_CHAT_TOOL_OUTPUT_BYTES,
+    ChatAgent, ChatAgentsFinished, ChatAnswer, ChatAnswers, ChatApproval, ChatChange, ChatChoice,
+    ChatCommand, ChatContent, ChatDelivery, ChatDiff, ChatEntry, ChatEvent, ChatField, ChatHarness,
+    ChatImage, ChatOption, ChatPermission, ChatPermissionOption, ChatPicks, ChatPlan,
+    ChatPlanLimit, ChatQuestion, ChatQueued, ChatSessionInfo, ChatState, ChatStatus, ChatTool,
+    ChatToolStatus, ChatUsage, MAX_CHAT_AGENT_RESULT_BYTES, MAX_CHAT_ATTACHMENTS,
+    MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES,
+    MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
 };
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
 use compi_protocol::{ContentEnvironment, LayoutNode, SurfaceId, WorkspaceSnapshot};
@@ -83,10 +83,12 @@ impl ChatHub {
     /// The chat's whole state and a receiver of its later changes, starting the chat if it
     /// is not running. `approval` applies from the harness's next start, this one when it
     /// starts it; so does `surface`, the terminal whose view shows the chat, if one does.
+    /// `picks` apply to the next new session, this one when it starts one.
     pub fn watch(
         &self,
         content: &ChatContent,
         approval: ChatApproval,
+        picks: ChatPicks,
         surface: Option<SurfaceId>,
     ) -> (ChatState, mpsc::Receiver<ChatEvent>) {
         let chat = {
@@ -95,12 +97,19 @@ impl ChatHub {
                 .entry(content.id.clone())
                 .or_insert_with(|| {
                     let instance = self.instance.get().cloned().flatten();
-                    Chat::start(content.clone(), instance, approval, surface.clone())
+                    Chat::start(
+                        content.clone(),
+                        instance,
+                        approval,
+                        picks.clone(),
+                        surface.clone(),
+                    )
                 })
                 .clone()
         };
         let mut inner = chat.lock();
         inner.approval = approval;
+        inner.picks = picks;
         inner.surface = surface;
         let (sender, receiver) = mpsc::channel();
         inner.watchers.push(sender);
@@ -181,15 +190,29 @@ impl ChatHub {
         id: &str,
         session: Option<String>,
         approval: ChatApproval,
+        picks: ChatPicks,
     ) -> Result<(), String> {
         let chat = self.get(id)?;
-        chat.lock().approval = approval;
+        {
+            let mut inner = chat.lock();
+            inner.approval = approval;
+            inner.picks = picks;
+        }
         chat.resume(session)
     }
 
-    pub fn restart(&self, id: &str, approval: ChatApproval) -> Result<(), String> {
+    pub fn restart(
+        &self,
+        id: &str,
+        approval: ChatApproval,
+        picks: ChatPicks,
+    ) -> Result<(), String> {
         let chat = self.get(id)?;
-        chat.lock().approval = approval;
+        {
+            let mut inner = chat.lock();
+            inner.approval = approval;
+            inner.picks = picks;
+        }
         chat.restart();
         Ok(())
     }
@@ -310,6 +333,13 @@ enum Pending {
     NewSession,
     LoadSession,
     Prompt,
+    /// One of the user's picks set on the new `session`; `rest` follow, in order.
+    Pick {
+        session: String,
+        option: String,
+        value: String,
+        rest: VecDeque<(&'static str, String)>,
+    },
     /// A prompt into the running turn; it waits its turn when the harness declines.
     Steer(Prompt),
     /// OMP's subscription plans and what is left of them (`_omp/usage`).
@@ -397,6 +427,13 @@ impl Prompt {
     }
 }
 
+/// The names of the model and thinking level a session has, when it has them.
+#[derive(Clone)]
+struct PromptSettings {
+    model: Option<String>,
+    thought_level: Option<String>,
+}
+
 struct FinishedAgentWave {
     entry: usize,
     tools: Vec<usize>,
@@ -409,6 +446,11 @@ struct Inner {
     state: ChatState,
     /// How the harness asks before running tools, from its next start.
     approval: ChatApproval,
+    /// The settings a new session starts on, from its next one.
+    picks: ChatPicks,
+    /// The names of the model and thinking level in effect at the session's previous
+    /// prompt; `None` before its first.
+    prompted_with: Option<PromptSettings>,
     /// How the last turn or the harness ended, until the user has seen it.
     unseen: Option<Unseen>,
     /// The program status record last published.
@@ -519,6 +561,7 @@ impl Chat {
         content: ChatContent,
         instance: Option<String>,
         approval: ChatApproval,
+        picks: ChatPicks,
         surface: Option<SurfaceId>,
     ) -> Arc<Self> {
         let chat = Arc::new(Self {
@@ -530,6 +573,7 @@ impl Chat {
                     ..ChatState::default()
                 },
                 approval,
+                picks,
                 surface,
                 ..Inner::default()
             }),
@@ -850,18 +894,24 @@ impl Chat {
                     message: format!("{harness} didn't start: {error}"),
                 },
             }),
-            (Pending::NewSession | Pending::LoadSession, Ok(result)) => {
-                inner.end_thought();
-                if let Some(session) = result["sessionId"].as_str() {
-                    inner.emit(ChatEvent::Session {
-                        session: Some(session.to_owned()),
-                    });
-                }
-                inner.options(&result["configOptions"]);
-                inner.emit(ChatEvent::Status {
-                    status: ChatStatus::Ready,
-                });
-                inner.send_queued();
+            (Pending::NewSession, Ok(result)) => {
+                inner.session_opened(&result);
+                let ChatPicks {
+                    model,
+                    thought_level,
+                } = inner.picks.clone();
+                // The model first: the thinking levels on offer may depend on it.
+                let picks = [("model", model), ("thought_level", thought_level)]
+                    .into_iter()
+                    .filter_map(|(category, value)| Some((category, value?)))
+                    .collect();
+                inner.apply_picks(picks);
+                self.read_plans(inner);
+            }
+            // A resumed session keeps its own settings.
+            (Pending::LoadSession, Ok(result)) => {
+                inner.session_opened(&result);
+                inner.apply_picks(VecDeque::new());
                 self.read_plans(inner);
             }
             (Pending::LoadSession, Err(error)) => {
@@ -879,6 +929,28 @@ impl Chat {
                 },
             }),
             (Pending::SetOption, Ok(result)) => inner.options(&result["configOptions"]),
+            (
+                Pending::Pick {
+                    session,
+                    option,
+                    value,
+                    rest,
+                },
+                result,
+            ) => {
+                // A session that replaced this one got picks of its own.
+                if inner.state.session.as_deref() != Some(session.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(result) => inner.options(&result["configOptions"]),
+                    Err(error) => eprintln!(
+                        "compi-daemon: chat {} kept its {option} setting, not {value}: {error}",
+                        inner.chat_id
+                    ),
+                }
+                inner.apply_picks(rest);
+            }
             (Pending::SetOption, Err(message)) => inner.emit(ChatEvent::Entry {
                 entry: ChatEntry::Error {
                     message: format!("{harness} didn't change the setting: {message}"),
@@ -933,9 +1005,7 @@ impl Chat {
             (Pending::Steer(prompt), Ok(result)) if result["outcome"] == "injected" => {
                 inner.end_thought();
                 inner.activity_ms = now_ms();
-                inner.emit(ChatEvent::Entry {
-                    entry: prompt.entry(),
-                });
+                inner.push_prompt(&prompt);
                 // A steer turns down the permission the harness was waiting on.
                 inner.permission_request = None;
                 if inner.state.permission.is_some() {
@@ -1245,6 +1315,7 @@ impl Inner {
                 self.queue.clear();
                 self.queue_held = false;
                 self.unseen = None;
+                self.prompted_with = None;
             }
             ChatEvent::Status {
                 status: ChatStatus::Failed { message },
@@ -1309,13 +1380,90 @@ impl Inner {
         self.published = record;
     }
 
+    /// The harness opened a session, new or resumed: its ID and settings. Its prompts
+    /// start over, so the first one shows no switch.
+    fn session_opened(&mut self, result: &Value) {
+        self.end_thought();
+        self.prompted_with = None;
+        if let Some(session) = result["sessionId"].as_str() {
+            self.emit(ChatEvent::Session {
+                session: Some(session.to_owned()),
+            });
+        }
+        self.options(&result["configOptions"]);
+    }
+
+    /// Sets the first of `picks` (category, value) the session offers and does not have
+    /// yet, the rest once the harness answers, as one may change the choices of the
+    /// next. A setting the session lacks, or a value it does not list, is passed over.
+    /// The chat stays `Starting`, prompts queued, until none is left.
+    fn apply_picks(&mut self, mut picks: VecDeque<(&'static str, String)>) {
+        while let Some((category, value)) = picks.pop_front() {
+            let Some(option) = self.state.option(category).filter(|option| {
+                option.current != value && option.choices.iter().any(|c| c.value == value)
+            }) else {
+                continue;
+            };
+            let option = option.id.clone();
+            let Some(session) = self.state.session.clone() else {
+                break;
+            };
+            self.request(
+                "session/set_config_option",
+                json!({ "sessionId": session, "configId": option, "value": value }),
+                Pending::Pick {
+                    session,
+                    option,
+                    value,
+                    rest: picks,
+                },
+            );
+            return;
+        }
+        self.emit(ChatEvent::Status {
+            status: ChatStatus::Ready,
+        });
+        self.send_queued();
+    }
+
+    /// Shows a prompt the harness has, after a `Switch` when the model or thinking level
+    /// changed since the session's previous prompt.
+    fn push_prompt(&mut self, prompt: &Prompt) {
+        let name = |category| {
+            self.state
+                .option(category)
+                .map(|option| option.current_name().to_owned())
+        };
+        let settings = PromptSettings {
+            model: name("model"),
+            thought_level: name("thought_level"),
+        };
+        if let Some(previous) = self.prompted_with.replace(settings.clone()) {
+            let change = |from: Option<String>, to: Option<String>| match (from, to) {
+                (Some(from), Some(to)) if from != to => Some(ChatChange { from, to }),
+                _ => None,
+            };
+            let model = change(previous.model, settings.model);
+            let thought_level = change(previous.thought_level, settings.thought_level);
+            if model.is_some() || thought_level.is_some() {
+                self.emit(ChatEvent::Entry {
+                    entry: ChatEntry::Switch {
+                        model,
+                        thought_level,
+                    },
+                });
+            }
+        }
+        self.emit(ChatEvent::Entry {
+            entry: prompt.entry(),
+        });
+    }
+
     /// Starts a turn on `prompt`.
     fn start_prompt(&mut self, session: String, prompt: Prompt) {
         let blocks = prompt.blocks();
         self.unseen = None;
-        self.emit(ChatEvent::Entry {
-            entry: prompt.entry(),
-        });
+        self.push_prompt(&prompt);
         let since_ms = now_ms();
         self.activity_ms = since_ms;
         self.queue_held = false;
@@ -3877,5 +4025,166 @@ mod tests {
         inner.closed = true;
         inner.publish_status();
         assert_eq!(inner.published, None, "a closed chat reports nothing");
+    }
+
+    fn text_prompt(text: &str) -> Prompt {
+        Prompt {
+            text: text.into(),
+            files: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    /// A session's `configOptions`: a model and a thinking level.
+    fn config_options(model: &str, thinking: &str) -> Value {
+        json!([
+            { "type": "select", "id": "model", "name": "Model", "category": "model",
+              "currentValue": model,
+              "options": [{ "value": "sonnet", "name": "Claude Sonnet 5" },
+                          { "value": "opus", "name": "Claude Opus 5.5" }] },
+            { "type": "select", "id": "effort", "name": "Thinking", "category": "thought_level",
+              "currentValue": thinking,
+              "options": [{ "value": "low", "name": "low" }, { "value": "high", "name": "high" }] },
+        ])
+    }
+
+    #[test]
+    fn a_new_session_starts_on_the_listed_picks_before_any_prompt_and_a_resumed_one_keeps_its_own()
+    {
+        let picks_sent = |inner: &Inner| -> Vec<(String, String)> {
+            inner
+                .pending
+                .values()
+                .filter_map(|pending| match pending {
+                    Pending::Pick { option, value, .. } => Some((option.clone(), value.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let chat = Chat {
+            content: ChatContent {
+                id: "picks-test".into(),
+                harness: ChatHarness::Omp,
+                environment: ContentEnvironment::Host,
+                folder: "/w".into(),
+                session: None,
+            },
+            instance: None,
+            inner: Mutex::new(Inner {
+                chat_id: "picks-test".into(),
+                picks: ChatPicks {
+                    model: Some("opus".into()),
+                    thought_level: Some("max".into()),
+                },
+                ..Inner::default()
+            }),
+        };
+        {
+            let mut inner = chat.lock();
+            chat.answered(
+                &mut inner,
+                Pending::NewSession,
+                Ok(json!({ "sessionId": "s1", "configOptions": config_options("sonnet", "low") })),
+            );
+            assert_eq!(picks_sent(&inner), [("model".into(), "opus".into())]);
+            assert_eq!(inner.state.status, ChatStatus::Starting);
+        }
+        // A prompt waits for the picks.
+        assert!(chat.send(text_prompt("hi"), ChatDelivery::Prompt).is_err());
+        chat.send(text_prompt("hi"), ChatDelivery::Queue).unwrap();
+        let mut inner = chat.lock();
+        assert!(inner.state.entries.is_empty());
+        let id = *inner
+            .pending
+            .iter()
+            .find(|(_, pending)| matches!(pending, Pending::Pick { .. }))
+            .unwrap()
+            .0;
+        let pick = inner.pending.remove(&id).unwrap();
+        chat.answered(
+            &mut inner,
+            pick,
+            Ok(json!({ "configOptions": config_options("opus", "low") })),
+        );
+        // The session lists no thinking level "max": it keeps its own.
+        assert!(picks_sent(&inner).is_empty());
+        let current = |inner: &Inner, category| {
+            inner
+                .state
+                .option(category)
+                .map(|option| option.current.clone())
+        };
+        assert_eq!(current(&inner, "model").as_deref(), Some("opus"));
+        assert_eq!(current(&inner, "thought_level").as_deref(), Some("low"));
+        assert!(inner.state.working(), "the queued prompt went once set");
+        assert!(
+            matches!(inner.state.entries.as_slice(), [ChatEntry::User { text, .. }] if text == "hi")
+        );
+
+        // A resumed session keeps its settings.
+        inner.emit(ChatEvent::Reset {
+            state: Box::new(ChatState {
+                session: Some("s0".into()),
+                ..ChatState::default()
+            }),
+        });
+        inner.pending.clear();
+        chat.answered(
+            &mut inner,
+            Pending::LoadSession,
+            Ok(json!({ "sessionId": "s0", "configOptions": config_options("sonnet", "low") })),
+        );
+        assert!(picks_sent(&inner).is_empty());
+        assert_eq!(current(&inner, "model").as_deref(), Some("sonnet"));
+        assert_eq!(inner.state.status, ChatStatus::Ready);
+    }
+
+    #[test]
+    fn a_prompt_after_a_model_change_follows_a_switch_naming_only_that_change() {
+        let user = |text: &str| ChatEntry::User {
+            text: text.into(),
+            files: Vec::new(),
+            images: Vec::new(),
+        };
+        let turn = |inner: &mut Inner, text: &str| {
+            inner.start_prompt("s".into(), text_prompt(text));
+            inner.prompt_ended(Ok(json!({ "stopReason": "end_turn" })));
+        };
+        let mut inner = Inner::default();
+        inner.session_opened(
+            &json!({ "sessionId": "s", "configOptions": config_options("sonnet", "high") }),
+        );
+        turn(&mut inner, "one");
+        inner.options(&config_options("opus", "high"));
+        turn(&mut inner, "two");
+        turn(&mut inner, "three");
+        let switch = ChatEntry::Switch {
+            model: Some(ChatChange {
+                from: "Claude Sonnet 5".into(),
+                to: "Claude Opus 5.5".into(),
+            }),
+            thought_level: None,
+        };
+        assert_eq!(
+            inner.state.entries,
+            [user("one"), switch, user("two"), user("three")]
+        );
+
+        // A resumed session's replayed prompts and its first prompt show none.
+        inner.emit(ChatEvent::Reset {
+            state: Box::new(ChatState {
+                session: Some("s".into()),
+                ..ChatState::default()
+            }),
+        });
+        inner.update(&json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": { "type": "text", "text": "earlier" },
+        }));
+        inner.session_opened(
+            &json!({ "sessionId": "s", "configOptions": config_options("opus", "low") }),
+        );
+        turn(&mut inner, "four");
+        assert_eq!(inner.state.entries, [user("earlier"), user("four")]);
     }
 }

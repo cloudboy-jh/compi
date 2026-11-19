@@ -821,9 +821,14 @@ impl DaemonClient {
         &mut self,
         chat: crate::chat::ChatContent,
         approval: crate::chat::ChatApproval,
+        picks: crate::chat::ChatPicks,
     ) -> Result<crate::chat::ChatState> {
         match self.request_bounded(
-            ClientMessage::WatchChat { chat, approval },
+            ClientMessage::WatchChat {
+                chat,
+                approval,
+                picks,
+            },
             Duration::from_secs(10),
         )? {
             ServerMessage::ChatWatching { state } => Ok(state),

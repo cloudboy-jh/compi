@@ -83,6 +83,25 @@ impl ChatApproval {
     }
 }
 
+/// The settings a new session of the harness starts on, by `ChatOption::category`: the
+/// choice values you last picked for this harness in Compi. A setting the harness does
+/// not offer, or a value it does not list, keeps the harness's own. Resumed sessions keep
+/// theirs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ChatPicks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_level: Option<String>,
+}
+
+/// One setting's change between two prompts, by its choices' names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatChange {
+    pub from: String,
+    pub to: String,
+}
+
 /// A content pane chatting with `harness` in `folder`. The transcript lives in the
 /// daemon under `id`; `session` is the harness's own session, kept so the chat can be
 /// resumed once the daemon restarts.
@@ -255,6 +274,14 @@ pub enum ChatEntry {
     Error { message: String },
     /// The turn was stopped.
     Cancelled,
+    /// Just before a prompt: the model or thinking level changed since the session's
+    /// previous prompt (only the settings that did).
+    Switch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ChatChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_level: Option<ChatChange>,
+    },
 }
 
 /// A tool call and what it reported.
