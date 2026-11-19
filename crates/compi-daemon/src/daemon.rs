@@ -685,7 +685,8 @@ fn handle_connection(
         while !stopping.load(Ordering::Acquire) && sink.is_alive() {
             let changed = send_workspace_events(&sink, &mut workspace_events, &manager)?;
             if changed {
-                // A chat whose pane closed ends with it.
+                // Chats note which panes hold them; one no pane holds stops its harness
+                // once nothing runs in it.
                 if let Ok(workspace) = manager.snapshot() {
                     crate::chat::hub().retain(&workspace);
                 }
@@ -924,6 +925,23 @@ fn handle_connection(
                         }
                     }
                 }
+                ClientMessage::ListThreads => match manager.snapshot() {
+                    Ok(workspace) => sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::Threads {
+                            threads: crate::chat::hub().threads(&workspace),
+                        },
+                    })?,
+                    Err(error) => send_actor_error(&sink, request_id, &error),
+                },
+                ClientMessage::DeleteThread { chat } => match manager.snapshot() {
+                    Ok(workspace) => answer_chat(
+                        &sink,
+                        request_id,
+                        crate::chat::hub().delete_thread(&chat, &workspace),
+                    )?,
+                    Err(error) => send_actor_error(&sink, request_id, &error),
+                },
                 ClientMessage::ResumeChat {
                     chat,
                     session,

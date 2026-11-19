@@ -626,6 +626,38 @@ pub struct ChatSessionInfo {
     pub last_reply: Option<String>,
 }
 
+/// What a thread is doing, for the threads list.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadActivity {
+    /// A turn runs.
+    Working,
+    /// A permission or question waits on the user.
+    Waiting,
+    Idle,
+}
+
+/// A thread the daemon keeps: a chat, its agent session and its transcript, kept after
+/// its pane closes until it is deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadInfo {
+    /// The chat as a pane holds it: id, agent, environment, folder and session.
+    pub chat: ChatContent,
+    /// The session's title, else its first prompt's first line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub created_ms: u64,
+    /// When its transcript last changed.
+    pub updated_ms: u64,
+    pub activity: ThreadActivity,
+    /// The terminal it was shown on, while the daemon keeps it: in a tab, or kept
+    /// running since the thread's pane closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<crate::SurfaceId>,
+    /// A pane or view holds it now.
+    pub open: bool,
+}
+
 /// How much of a session's first prompt and last reply its listing carries.
 pub const MAX_CHAT_SESSION_PREVIEW_CHARS: usize = 1200;
 

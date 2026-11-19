@@ -1,6 +1,7 @@
 use super::settings::settings_group_label;
 use super::*;
 use crate::gui::controls::IconName;
+use compi_protocol::chat::ThreadActivity;
 use gpui::{Animation, AnimationExt, ease_out_quint};
 use gpui_component::ThemeStyled as _;
 
@@ -98,7 +99,20 @@ impl CompiApp {
             } else {
                 None
             };
-            let icon = palette.then_some(match &choice.action {
+            // A thread row leads with its harness's mark and ends with a dot while it
+            // works or waits, then × to delete it.
+            let thread = match &choice.action {
+                ChoiceAction::Thread(chat) if palette => self.palette_thread(chat),
+                _ => None,
+            };
+            let mark = thread.map(|thread| super::chat::harness_mark(thread.chat.harness));
+            let dot = thread.and_then(|thread| match thread.activity {
+                ThreadActivity::Working => Some(colors.accent),
+                ThreadActivity::Waiting => Some(colors.modified),
+                ThreadActivity::Idle => None,
+            });
+            let delete = thread.map(|thread| thread.chat.id.clone());
+            let icon = (palette && mark.is_none()).then_some(match &choice.action {
                 ChoiceAction::Command(_) => IconName::Command,
                 ChoiceAction::Project(_) => IconName::Folder,
                 ChoiceAction::File(_) => IconName::File,
@@ -180,6 +194,16 @@ impl CompiApp {
                             .child(controls::glyph(icon, muted)),
                     )
                 })
+                .when_some(mark, |row, mark| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .h(px(UI_SMALL_LINE_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .child(gpui::img(mark).size(px(12.0))),
+                    )
+                })
                 .child(
                     div()
                         .flex_1()
@@ -210,6 +234,51 @@ impl CompiApp {
                                             .font_weight(FontWeight::NORMAL)
                                             .text_color(muted)
                                             .child(shortcut),
+                                    )
+                                })
+                                .when(dot.is_some() || delete.is_some(), |line| {
+                                    line.child(
+                                        div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .when_some(dot, |trailing, dot| {
+                                                trailing.child(
+                                                    div()
+                                                        .size(px(6.0))
+                                                        .rounded_full()
+                                                        .bg(color(dot)),
+                                                )
+                                            })
+                                            .when_some(delete, |trailing, chat| {
+                                                trailing.child(
+                                                    div()
+                                                        .id(("thread-delete", index))
+                                                        .p_0p5()
+                                                        .rounded_sm()
+                                                        .cursor_pointer()
+                                                        .hover(move |style| {
+                                                            style.bg(color(colors.surface_hover))
+                                                        })
+                                                        .tooltip(controls::tooltip(
+                                                            "Delete thread",
+                                                            None,
+                                                            Some("delete"),
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.delete_thread(
+                                                                    chat.clone(),
+                                                                    cx,
+                                                                );
+                                                                cx.stop_propagation();
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                        .child(controls::glyph(IconName::X, muted)),
+                                                )
+                                            }),
                                     )
                                 }),
                         )
@@ -906,9 +975,10 @@ impl CompiApp {
         let (placeholder, chip) = match &self.overlay {
             Some(Overlay::Palette) => (
                 match scope {
-                    None => "Search commands, tabs, projects and files",
+                    None => "Search commands, tabs, threads, projects and files",
                     Some(palette::Scope::Projects) => "Search visited folders",
                     Some(palette::Scope::Files) => "Search this folder's files",
+                    Some(palette::Scope::Threads) => "Search threads",
                 },
                 scope.map(|scope| (scope.label(), true)),
             ),

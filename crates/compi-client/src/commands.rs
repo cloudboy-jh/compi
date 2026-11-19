@@ -172,6 +172,7 @@ registry! {
     OpenMonitor, "open_monitor", "Monitor", None, None;
     OpenBrowser, "open_browser", "Open browser", None, None;
     OpenChat, "open_chat", "OMP chat", None, None;
+    Threads, "threads", "Threads", None, None;
     BrowserBack, "browser_back", "Back", None, None;
     BrowserForward, "browser_forward", "Forward", None, None;
     BrowserReload, "browser_reload", "Reload page", None, None;
@@ -341,8 +342,8 @@ impl Command {
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
-            | SwapPaneDown | RemovePane | OpenBrowser | OpenChat | BrowserBack | BrowserForward
-            | BrowserReload | FocusAddressBar => CommandCategory::Panes,
+            | SwapPaneDown | RemovePane | OpenBrowser | OpenChat | Threads | BrowserBack
+            | BrowserForward | BrowserReload | FocusAddressBar => CommandCategory::Panes,
             ShowFiles | ShowChanges | DiffThisFile | ToggleMarkdownRead | NextChange
             | PreviousChange | GitFetch | GitPull | GitPush | SwitchBranch | CreateBranch
             | OpenFile | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
@@ -475,6 +476,9 @@ impl Command {
             OpenChat => Some(
                 "Starts a chat with OMP in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
             ),
+            Threads => Some(
+                "Lists your chats with OMP, open or closed; one reopens in a pane, × deletes it.",
+            ),
             SendSelectionToChat => Some(
                 "Puts the selected terminal text at the end of a chat's message box: the terminal's own chat, else the tab's, else a new one.",
             ),
@@ -540,6 +544,7 @@ impl Command {
             }
             OpenBrowser => "web page url localhost preview site dev server http",
             OpenChat => "agent ai assistant omp chat prompt llm acp",
+            Threads => "chat history sessions conversations agent omp ai reopen resume delete",
             SendSelectionToChat => "agent ai omp chat quote output prompt",
             BrowserBack | BrowserForward => "browser web page history navigate",
             BrowserReload => "browser web page refresh stop",
@@ -658,6 +663,7 @@ impl Command {
                         | GitPush
                         | SwitchBranch
                         | CreateBranch
+                        | Threads
                 ))
         {
             return Some("Reconnect to the server first");

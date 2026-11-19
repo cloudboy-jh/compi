@@ -3676,6 +3676,11 @@ impl CompiApp {
                 {
                     self.clear_palette_scope();
                 }
+                "delete" if self.selected_palette_thread(cx).is_some() => {
+                    if let Some(chat) = self.selected_palette_thread(cx) {
+                        self.delete_thread(chat, cx);
+                    }
+                }
                 "backspace" | "delete"
                     if !matches!(
                         self.overlay,
@@ -3824,7 +3829,7 @@ impl CompiApp {
             .and_then(|view| self.workspace.as_ref()?.surface(&view.surface_id))
             .cloned();
         match command {
-            Command::OpenPalette => self.open_palette(None),
+            Command::OpenPalette => self.open_palette(None, cx),
             Command::CreateWorkspace => self.open_overlay(
                 Overlay::Text {
                     purpose: TextPurpose::CreateWorkspace,
@@ -4186,7 +4191,7 @@ impl CompiApp {
                 self.save_state();
             }
             Command::BrowseFiles => self.toggle_pane_view(window, cx),
-            Command::JumpProject => self.open_palette(Some(palette::Scope::Projects)),
+            Command::JumpProject => self.open_palette(Some(palette::Scope::Projects), cx),
             Command::ShowFiles => self.show_files(false, window, cx),
             Command::NewEditor => self.show_files(true, window, cx),
             Command::ShowChanges => self.show_changes(window, cx),
@@ -4194,7 +4199,7 @@ impl CompiApp {
             Command::ToggleMarkdownRead => self.toggle_markdown_read(window, cx),
             Command::NextChange => self.step_editor_change(true, window, cx),
             Command::PreviousChange => self.step_editor_change(false, window, cx),
-            Command::OpenFile => self.open_palette(Some(palette::Scope::Files)),
+            Command::OpenFile => self.open_palette(Some(palette::Scope::Files), cx),
             Command::GitFetch | Command::GitPull | Command::GitPush => {
                 let remote = match command {
                     Command::GitFetch => remote::RemoteCommand::Fetch,
@@ -4261,6 +4266,7 @@ impl CompiApp {
             Command::OpenChat => {
                 self.open_chat(window, cx);
             }
+            Command::Threads => self.open_palette(Some(palette::Scope::Threads), cx),
             Command::SendSelectionToChat => self.send_selection_to_chat(window, cx),
             Command::BrowserBack => self.browser_navigate(browser::Navigation::Back),
             Command::BrowserForward => self.browser_navigate(browser::Navigation::Forward),
@@ -4543,6 +4549,11 @@ impl CompiApp {
                         }
                         ChoiceAction::Project(path) => self.create_terminal(Some(path)),
                         ChoiceAction::File(path) => self.open_palette_file(path, window, cx),
+                        ChoiceAction::Thread(chat) => {
+                            if let Some(thread) = self.palette_thread(&chat).cloned() {
+                                self.open_thread(thread.chat, thread.terminal, window, cx);
+                            }
+                        }
                         ChoiceAction::Window(handle) => {
                             if let Some(tab) = self.selected_tab().map(|tab| tab.id.clone()) {
                                 self.transfer_tabs(vec![tab], Some(handle), window, cx);
@@ -4595,6 +4606,8 @@ enum ChoiceAction {
     Project(String),
     /// A found file, from the palette, opened in the editor.
     File(String),
+    /// A thread, from the palette, by its chat's id: opened, or its pane focused.
+    Thread(String),
     Window(AnyWindowHandle),
     Arrangement(arrangements::ArrangementChoice),
     /// Toggles whether another tab is merged by the arrangement picker.

@@ -14,7 +14,6 @@ Order and scope: the vault's `feat and bugs.md` → **Chat first** (decided 2026
 
 Implementation notes that the vault leaves out:
 
-- **Threads** need a daemon-owned store: the transcript Compi shows plus `{agent, session id}`; a thread's agent is fixed, so there is no handoff ([threads](../research/t3-code/threads.md)). Today a chat reads OMP's session files (`compi-daemon/src/chat/saved.rs`) and ends with its pane.
 - **Agents** get their own drivers for fidelity: Codex `app-server` (JSON-RPC over stdio), OpenCode's HTTP server and event stream, Pi `--mode rpc` (JSON lines). OMP stays on ACP with Compi's OMP extras. Claude Code: try its JSON stream mode from Rust first, else a Node helper running the Agent SDK. Plain ACP loses sub-agents, real rewind, steering and plan cards ([agent fidelity](../research/t3-code/agent-fidelity.md)). `ChatHarness` (`compi-protocol/src/chat.rs`) holds only `Omp` today; drivers report capabilities and the UI hides what an agent can't do. The agent is a setting (Default agent), with **New thread with…** for exceptions.
 - **Project file search** on the daemon: a gitignore-aware fuzzy index per project folder, refreshed after agent turns; an empty query lists recent files.
 - **Project icons** ([project icons](../research/t3-code/project-icons.md)): the daemon runs T3's lookup order in the project folder (WSL or Windows) and sends image bytes; fallback is T3's monogram algorithm copied exactly. Pickers come with Settings → Projects ([settings UI](../research/t3-code/settings-ui.md)).

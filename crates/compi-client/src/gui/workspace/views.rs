@@ -78,7 +78,7 @@ pub(super) const fn view_label(content: &PaneContent) -> &'static str {
 }
 
 impl CompiApp {
-    fn pane_view(&self, pane_id: &PaneId) -> Option<&PaneView> {
+    pub(super) fn pane_view(&self, pane_id: &PaneId) -> Option<&PaneView> {
         content::find_leaf(self.workspace.as_ref()?, pane_id)?.view()
     }
 

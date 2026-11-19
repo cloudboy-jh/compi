@@ -87,7 +87,9 @@ use std::fmt;
 // Version 41 starts new chat sessions on the settings last picked in Compi (`ChatPicks` on
 // `WatchChat`, `ResumeChat` and `RestartChat`), marks a model or thinking change before
 // the next prompt (`ChatEntry::Switch`), times each prompt's turn (`ChatEntry::User`'s
-// `sent_ms` and `ended_ms`) and rewrites a queued prompt's text (`EditQueuedChat`).
+// `sent_ms` and `ended_ms`), rewrites a queued prompt's text (`EditQueuedChat`) and keeps
+// chats as threads after their panes close: `ListThreads` (`Threads`, `ThreadInfo`),
+// `DeleteThread`, and the mutations `OpenThread` and `ForgetThreadTerminal`.
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -540,6 +542,13 @@ pub enum ClientMessage {
     ListChatSessions {
         chat: String,
     },
+    /// Every thread the daemon keeps, newest change first, answered by `Threads`.
+    ListThreads,
+    /// Deletes thread `chat`: its transcript, and its harness if it runs. Refused while a
+    /// pane or view holds it. Answered by `ChatAccepted`.
+    DeleteThread {
+        chat: String,
+    },
     /// Starts the chat over in `session`, its history replayed, or in a new session
     /// (`None`).
     ResumeChat {
@@ -727,6 +736,9 @@ pub enum ServerMessage {
     ChatAccepted,
     ChatSessions {
         sessions: Vec<chat::ChatSessionInfo>,
+    },
+    Threads {
+        threads: Vec<chat::ThreadInfo>,
     },
     Error {
         code: ErrorCode,
@@ -2154,9 +2166,22 @@ pub struct WorkspaceSnapshot {
     pub revision: u64,
     pub initialized: bool,
     pub sessions: Vec<WorkspaceSession>,
+    /// Every surface the daemon runs: those in tabs, and those kept for threads.
     pub surfaces: Vec<SurfaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_message: Option<String>,
+    /// Terminals kept running for threads whose panes closed, until the thread opens
+    /// again or is deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_terminals: Vec<KeptTerminal>,
+}
+
+/// A terminal kept for thread `chat` (its `ChatContent::id`) since the thread's pane
+/// closed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeptTerminal {
+    pub chat: String,
+    pub surface_id: SurfaceId,
 }
 
 impl WorkspaceSnapshot {
@@ -2233,6 +2258,17 @@ pub enum WorkspaceMutation {
         session_id: SessionId,
         label: String,
         content: PaneContent,
+    },
+    /// Opens thread `chat` in a new tab of `session_id`: the terminal it was shown on,
+    /// kept running since its pane closed, with the chat as its view; a thread without a
+    /// kept terminal opens as a content tab.
+    OpenThread {
+        session_id: SessionId,
+        chat: chat::ChatContent,
+    },
+    /// Ends the terminal kept for thread `chat` since its pane closed, if there is one.
+    ForgetThreadTerminal {
+        chat: String,
     },
     RenameTab {
         tab_id: TabId,
@@ -2663,6 +2699,7 @@ mod tests {
             }],
             surfaces: vec![surface.clone()],
             recovery_message: None,
+            kept_terminals: Vec::new(),
         };
         assert_eq!(workspace.first_surface(), Some(&surface));
     }

@@ -1,14 +1,18 @@
-//! The palette: one drop-down list of open tabs and their panes, commands, visited
-//! projects and the focused pane's files. [`choices`] matches and groups them; the
-//! window fills it from its workspace, command registry, project history and a file
-//! search that runs off the UI thread once typing pauses.
+//! The palette: one drop-down list of open tabs and their panes, threads, commands,
+//! visited projects and the focused pane's files. [`choices`] matches and groups them;
+//! the window fills it from its workspace, the daemon's threads (listed off the UI
+//! thread as the palette opens), command registry, project history and a file search
+//! that runs off the UI thread once typing pauses.
 //!
-//! Open file… and Jump to project open the palette scoped to Files or Projects: a chip
-//! beside the query that its × or Backspace in an empty query removes.
+//! Open file…, Jump to project and Threads open the palette scoped to Files, Projects
+//! or Threads: a chip beside the query that its × or Backspace in an empty query
+//! removes. A thread row's × or Delete (with nothing typed) deletes the thread.
 
 use super::*;
+use crate::chat::{age_label, thread_status, thread_title};
 use crate::project_history::ProjectHistory;
 use compi_protocol::ContentEnvironment;
+use compi_protocol::chat::ThreadInfo;
 
 /// Open tabs listed before anything is typed.
 const RECENT_TABS: usize = 8;
@@ -19,16 +23,20 @@ const MATCHED_PROJECTS: usize = 8;
 const SCOPED_PROJECTS: usize = 50;
 const MATCHED_FILES: usize = 20;
 const SCOPED_FILES: usize = 50;
+const MATCHED_THREADS: usize = 8;
+const SCOPED_THREADS: usize = 100;
 /// How long typing must pause before the folder is searched.
 const FILE_SEARCH_DELAY: Duration = Duration::from_millis(120);
 
 static NEXT_FILE_SEARCH: AtomicU64 = AtomicU64::new(1);
+static NEXT_THREAD_LISTING: AtomicU64 = AtomicU64::new(1);
 
 /// What the palette lists: everything, or only one kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Scope {
     Projects,
     Files,
+    Threads,
 }
 
 impl Scope {
@@ -36,6 +44,7 @@ impl Scope {
         match self {
             Self::Projects => "Projects",
             Self::Files => "Files",
+            Self::Threads => "Threads",
         }
     }
 }
@@ -43,6 +52,7 @@ impl Scope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GroupKind {
     Tabs,
+    Threads,
     Commands,
     Projects,
     Files,
@@ -59,6 +69,8 @@ pub(super) enum Target {
     Project(String),
     /// An absolute path in the searched folder's environment, opened in the editor.
     File(String),
+    /// A thread, by its chat's id: opened in a pane, or its pane focused.
+    Thread(String),
 }
 
 /// An open tab, or one pane of a tab with several.
@@ -99,6 +111,14 @@ pub(super) enum Files<'a> {
     Failed(&'a str),
 }
 
+/// Where the daemon's threads list stands.
+#[derive(Clone, Copy)]
+pub(super) enum Threads<'a> {
+    Listing,
+    Listed(&'a [ThreadInfo]),
+    Failed(&'a str),
+}
+
 pub(super) struct Sources<'a> {
     pub tabs: &'a [TabEntry],
     /// Every command the palette offers, in registry order.
@@ -107,6 +127,10 @@ pub(super) struct Sources<'a> {
     /// Why a new tab cannot open now, which disables project rows.
     pub project_reason: Option<&'a str>,
     pub files: Files<'a>,
+    /// Newest first, as the daemon lists them.
+    pub threads: Threads<'a>,
+    /// Now, in milliseconds since the epoch, for the threads' ages.
+    pub now_ms: u64,
 }
 
 #[derive(Debug)]
@@ -125,8 +149,9 @@ pub(super) struct Group {
     pub note: Option<String>,
 }
 
-/// The palette's groups for `query`, in order Tabs, Commands, Projects, Files; only
-/// non-empty ones. A scope lists its one kind, with a note when it has no rows.
+/// The palette's groups for `query`, in order Tabs, Threads, Commands, Projects, Files;
+/// only non-empty ones. Threads and Files wait for a query unless scoped. A scope lists
+/// its one kind, with a note when it has no rows.
 pub(super) fn choices(query: &str, scope: Option<Scope>, sources: &Sources) -> Vec<Group> {
     let query = query.trim();
     let mut groups = Vec::new();
@@ -157,6 +182,12 @@ pub(super) fn choices(query: &str, scope: Option<Scope>, sources: &Sources) -> V
             })
             .collect();
         push_group(&mut groups, GroupKind::Tabs, "Tabs", tabs, None);
+    }
+    if scope.is_none_or(|scope| scope == Scope::Threads) && (scope.is_some() || !query.is_empty()) {
+        let (rows, note) = thread_rows(query, scope.is_some(), sources);
+        push_group(&mut groups, GroupKind::Threads, "Threads", rows, note);
+    }
+    if scope.is_none() {
         for category in commands::CommandCategory::ALL {
             let rows: Vec<Row> = sources
                 .commands
@@ -253,6 +284,55 @@ pub(super) fn choices(query: &str, scope: Option<Scope>, sources: &Sources) -> V
     groups
 }
 
+/// The Threads group's rows for `query` and, when `scoped`, the note in place of rows
+/// still to come or none matching.
+fn thread_rows(query: &str, scoped: bool, sources: &Sources) -> (Vec<Row>, Option<String>) {
+    let threads = match sources.threads {
+        Threads::Listing => return (Vec::new(), scoped.then(|| "Listing threads…".to_owned())),
+        Threads::Failed(error) => {
+            return (
+                Vec::new(),
+                scoped.then(|| format!("Cannot list threads: {error}")),
+            );
+        }
+        Threads::Listed(threads) => threads,
+    };
+    let rows: Vec<Row> = threads
+        .iter()
+        .filter(|thread| {
+            query.is_empty()
+                || words_match(
+                    &format!("{} {}", thread_title(thread), thread.chat.folder),
+                    query,
+                )
+        })
+        .take(if scoped {
+            SCOPED_THREADS
+        } else {
+            MATCHED_THREADS
+        })
+        .map(|thread| Row {
+            title: thread_title(thread).to_owned(),
+            detail: format!(
+                "{} · {} · {}",
+                super::chat::folder_label(&thread.chat.folder),
+                age_label(thread.updated_ms, sources.now_ms),
+                thread_status(thread)
+            ),
+            reason: None,
+            target: Target::Thread(thread.chat.id.clone()),
+        })
+        .collect();
+    let note = (scoped && rows.is_empty()).then(|| {
+        if query.is_empty() {
+            "No threads yet; OMP chat starts one".to_owned()
+        } else {
+            format!("No thread matches “{query}”")
+        }
+    });
+    (rows, note)
+}
+
 fn push_group(
     groups: &mut Vec<Group>,
     kind: GroupKind,
@@ -303,12 +383,24 @@ fn relative_path(path: &str, folder: &str) -> String {
         .to_owned()
 }
 
-/// The palette's state beyond its query: the scope chip and the file search.
+/// The palette's state beyond its query: the scope chip, the file search and the
+/// threads.
 #[derive(Default)]
 pub(in crate::gui) struct PaletteState {
     scope: Option<Scope>,
     /// The focused pane's folder when the palette opened, if it can be searched.
     files: Option<FileSearch>,
+    threads: ThreadList,
+    /// The listing a reply must answer to be shown; earlier ones are stale.
+    threads_request: u64,
+}
+
+#[derive(Default)]
+enum ThreadList {
+    #[default]
+    Listing,
+    Listed(Vec<ThreadInfo>),
+    Failed(String),
 }
 
 struct FileSearch {
@@ -331,8 +423,9 @@ enum FileState {
 }
 
 impl CompiApp {
-    /// Opens the palette, scoped to one kind or listing everything.
-    pub(super) fn open_palette(&mut self, scope: Option<Scope>) {
+    /// Opens the palette, scoped to one kind or listing everything, and lists the
+    /// daemon's threads.
+    pub(super) fn open_palette(&mut self, scope: Option<Scope>, cx: &mut Context<Self>) {
         self.open_overlay(Overlay::Palette, "");
         let files = self.file_scope().ok().and_then(|scope| {
             Some(FileSearch {
@@ -345,7 +438,117 @@ impl CompiApp {
                 state: FileState::Idle,
             })
         });
-        self.palette = PaletteState { scope, files };
+        self.palette = PaletteState {
+            scope,
+            files,
+            ..PaletteState::default()
+        };
+        self.list_palette_threads(cx);
+    }
+
+    /// Lists the daemon's threads off the UI thread; what is listed stays shown until
+    /// the reply replaces it, and a reply to an older listing is dropped.
+    fn list_palette_threads(&mut self, cx: &mut Context<Self>) {
+        let request = NEXT_THREAD_LISTING.fetch_add(1, Ordering::Relaxed);
+        self.palette.threads_request = request;
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let listed = cx
+                .background_executor()
+                .spawn(async move {
+                    (|| -> crate::Result<_> { target.connect()?.list_threads() })()
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if !matches!(this.overlay, Some(Overlay::Palette))
+                    || this.palette.threads_request != request
+                {
+                    return;
+                }
+                this.palette.threads = match listed {
+                    Ok(threads) => ThreadList::Listed(threads),
+                    Err(error) => ThreadList::Failed(error),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The listed thread whose chat is `chat`.
+    pub(super) fn palette_thread(&self, chat: &str) -> Option<&ThreadInfo> {
+        match &self.palette.threads {
+            ThreadList::Listed(threads) => threads.iter().find(|thread| thread.chat.id == chat),
+            _ => None,
+        }
+    }
+
+    /// The thread of the palette's selected row, with nothing typed: what Delete deletes.
+    pub(super) fn selected_palette_thread(&self, cx: &App) -> Option<String> {
+        if !matches!(self.overlay, Some(Overlay::Palette)) || !self.ime_text.is_empty() {
+            return None;
+        }
+        match self
+            .palette_choices(cx)
+            .0
+            .into_iter()
+            .nth(self.overlay_index)?
+            .action
+        {
+            ChoiceAction::Thread(chat) => Some(chat),
+            _ => None,
+        }
+    }
+
+    /// Deletes thread `chat` off the UI thread, then ends the terminal kept for it and
+    /// lists the threads again. The daemon refuses while a pane or view holds the
+    /// thread; its reason shows.
+    pub(super) fn delete_thread(&mut self, chat: String, cx: &mut Context<Self>) {
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let asked = chat.clone();
+            let deleted = cx
+                .background_executor()
+                .spawn(async move {
+                    (|| -> crate::Result<()> { target.connect()?.delete_thread(&asked) })()
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match deleted {
+                    Ok(()) => {
+                        let kept = this.workspace.as_ref().is_some_and(|workspace| {
+                            workspace
+                                .kept_terminals
+                                .iter()
+                                .any(|kept| kept.chat == chat)
+                        });
+                        if kept {
+                            this.mutate(
+                                WorkspaceMutation::ForgetThreadTerminal { chat: chat.clone() },
+                                false,
+                            );
+                        }
+                        if let ThreadList::Listed(threads) = &mut this.palette.threads {
+                            threads.retain(|thread| thread.chat.id != chat);
+                        }
+                        if matches!(this.overlay, Some(Overlay::Palette)) {
+                            let count = this.palette_choices(cx).0.len();
+                            this.overlay_index = this.overlay_index.min(count.saturating_sub(1));
+                            this.list_palette_threads(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.global_error = Some(format!("Cannot delete the thread: {error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(super) fn palette_scope(&self) -> Option<Scope> {
@@ -364,7 +567,7 @@ impl CompiApp {
     /// Searches the folder for the new query once typing pauses; a reply to an older
     /// query is dropped.
     pub(super) fn palette_query_changed(&mut self) {
-        let wants_files = self.palette.scope != Some(Scope::Projects);
+        let wants_files = self.palette.scope.is_none_or(|scope| scope == Scope::Files);
         let query = self.ime_text.trim().to_owned();
         let Some(search) = self.palette.files.as_mut() else {
             return;
@@ -457,6 +660,7 @@ impl CompiApp {
                         Target::Command(command) => ChoiceAction::Command(command),
                         Target::Project(path) => ChoiceAction::Project(path),
                         Target::File(path) => ChoiceAction::File(path),
+                        Target::Thread(chat) => ChoiceAction::Thread(chat),
                     },
                 })
             })
@@ -485,6 +689,11 @@ impl CompiApp {
             Some(FileState::Found(hits)) => Files::Found(hits),
             Some(FileState::Failed(error)) => Files::Failed(error),
         };
+        let threads = match &self.palette.threads {
+            ThreadList::Listing => Threads::Listing,
+            ThreadList::Listed(threads) => Threads::Listed(threads),
+            ThreadList::Failed(error) => Threads::Failed(error),
+        };
         choices(
             &self.ime_text,
             self.palette.scope,
@@ -494,6 +703,8 @@ impl CompiApp {
                 projects: &self.state.project_history,
                 project_reason: Command::NewTab.disabled_reason(&context),
                 files,
+                threads,
+                now_ms: crate::chat::now_ms(),
             },
         )
     }
@@ -696,6 +907,8 @@ mod tests {
             projects: &projects,
             project_reason: None,
             files: Files::Found(&hits),
+            threads: Threads::Listing,
+            now_ms: 0,
         };
         // "compi" names a tab, Quit Compi, a project and (in this search) a file.
         let groups = choices("compi", None, &sources);
@@ -748,6 +961,8 @@ mod tests {
                 projects: &projects,
                 project_reason: Some("Select a workspace first"),
                 files: Files::Searching,
+                threads: Threads::Listing,
+                now_ms: 0,
             },
         );
         assert_eq!(
@@ -805,6 +1020,8 @@ mod tests {
                 projects: &projects,
                 project_reason: None,
                 files: Files::Unavailable,
+                threads: Threads::Listing,
+                now_ms: 0,
             },
         );
         assert_eq!(kinds(&groups), [GroupKind::Tabs]);
@@ -825,6 +1042,8 @@ mod tests {
                 projects: &projects,
                 project_reason: None,
                 files: Files::Unavailable,
+                threads: Threads::Listing,
+                now_ms: 0,
             },
         );
         assert_eq!(groups[0].rows[0].target, Target::Tab(TabId::new("t1")));
@@ -842,6 +1061,8 @@ mod tests {
             projects: &projects,
             project_reason: None,
             files,
+            threads: Threads::Listing,
+            now_ms: 0,
         };
         let groups = choices("", Some(Scope::Projects), &sources(Files::Found(&hits)));
         assert_eq!(kinds(&groups), [GroupKind::Projects]);
@@ -876,6 +1097,8 @@ mod tests {
             projects: &projects,
             project_reason: None,
             files,
+            threads: Threads::Listing,
+            now_ms: 0,
         };
         // Nothing typed: no file group, even with a pending or finished search.
         for files in [Files::Idle, Files::Searching, Files::Found(&[])] {
@@ -905,6 +1128,8 @@ mod tests {
                         projects: &projects,
                         project_reason: None,
                         files: Files::Unavailable,
+                        threads: Threads::Listing,
+                        now_ms: 0,
                     },
                 );
                 assert_eq!(groups[0].rows.len(), 2, "{query:?} {scope:?}");
@@ -927,5 +1152,112 @@ mod tests {
             "/work/compiler/a.rs"
         );
         assert_eq!(relative_path("/a.rs", "/"), "a.rs");
+    }
+
+    fn thread(
+        id: &str,
+        title: Option<&str>,
+        folder: &str,
+        updated_ms: u64,
+        activity: compi_protocol::chat::ThreadActivity,
+        open: bool,
+    ) -> ThreadInfo {
+        let mut chat = crate::chat::new_chat(ContentEnvironment::Host, folder.into());
+        chat.id = id.into();
+        ThreadInfo {
+            chat,
+            title: title.map(str::to_owned),
+            created_ms: 0,
+            updated_ms,
+            activity,
+            terminal: None,
+            open,
+        }
+    }
+
+    #[test]
+    fn threads_match_a_query_or_fill_their_scope() {
+        use compi_protocol::chat::ThreadActivity;
+        let now = 100 * 3_600_000;
+        let threads = [
+            thread(
+                "c1",
+                Some("Fix the build"),
+                "/home/me/proj/compi",
+                now - 5 * 60_000,
+                ThreadActivity::Working,
+                false,
+            ),
+            thread(
+                "c2",
+                None,
+                "/work/api",
+                now - 2 * 3_600_000,
+                ThreadActivity::Idle,
+                true,
+            ),
+        ];
+        let tabs = [tab("t1", "api server", false)];
+        let projects = ProjectHistory::default();
+        let sources = |threads| Sources {
+            tabs: &tabs,
+            commands: &[],
+            projects: &projects,
+            project_reason: None,
+            files: Files::Unavailable,
+            threads,
+            now_ms: now,
+        };
+        let listed = sources(Threads::Listed(&threads));
+        // Unscoped, threads wait for a query and follow the tabs.
+        assert!(!kinds(&choices("", None, &listed)).contains(&GroupKind::Threads));
+        let groups = choices("build", None, &listed);
+        assert_eq!(kinds(&groups), [GroupKind::Threads]);
+        assert_eq!(groups[0].rows[0].target, Target::Thread("c1".into()));
+        assert_eq!(groups[0].rows[0].title, "Fix the build");
+        assert_eq!(groups[0].rows[0].detail, "…/proj/compi · 5m · Working");
+        let groups = choices("api", None, &listed);
+        assert_eq!(kinds(&groups), [GroupKind::Tabs, GroupKind::Threads]);
+        assert!(groups[1].note.is_none());
+        // Still listing, an unscoped query shows no threads and no note.
+        assert_eq!(
+            kinds(&choices("api", None, &sources(Threads::Listing))),
+            [GroupKind::Tabs]
+        );
+
+        // The scope lists every thread, newest first, with nothing typed.
+        let groups = choices("", Some(Scope::Threads), &listed);
+        assert_eq!(kinds(&groups), [GroupKind::Threads]);
+        assert_eq!(
+            groups[0]
+                .rows
+                .iter()
+                .map(|row| (row.title.as_str(), row.detail.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Fix the build", "…/proj/compi · 5m · Working"),
+                ("New thread", "/work/api · 2h · Open"),
+            ]
+        );
+        assert!(groups[0].note.is_none());
+        let note = |query, threads| {
+            let groups = choices(query, Some(Scope::Threads), &sources(threads));
+            assert_eq!(kinds(&groups), [GroupKind::Threads]);
+            assert!(groups[0].rows.is_empty());
+            groups[0].note.clone().unwrap()
+        };
+        assert_eq!(
+            note("zzz", Threads::Listed(&threads)),
+            "No thread matches “zzz”"
+        );
+        assert_eq!(
+            note("", Threads::Listed(&[])),
+            "No threads yet; OMP chat starts one"
+        );
+        assert_eq!(note("", Threads::Listing), "Listing threads…");
+        assert_eq!(
+            note("", Threads::Failed("daemon gone")),
+            "Cannot list threads: daemon gone"
+        );
     }
 }

@@ -977,6 +977,7 @@ mod tests {
             ],
             surfaces: Vec::new(),
             recovery_message: None,
+            kept_terminals: Vec::new(),
         };
         let dirty = [
             ("left", "/work/a.rs"),

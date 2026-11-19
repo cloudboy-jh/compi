@@ -3,9 +3,13 @@
 //! standard input and output. The transcript lives here, so a chat keeps going with no
 //! window open; windows watch it (`WatchChat`) and get its state, then every change.
 //!
-//! A chat is keyed by its pane's chat ID and ends when no pane or view holds it any more
-//! (`ChatHub::retain`). The harness keeps its own session; a chat that knows its session
-//! resumes it (`session/load`) when it starts again, after a restart of the daemon too.
+//! A chat is keyed by its pane's chat ID and is kept as a thread: Compi saves its
+//! transcript (`threads`), and the chat outlives its pane until the thread is deleted
+//! (`ChatHub::delete_thread`). A chat no pane or view holds runs on while something runs
+//! in it, then stops its harness (`ChatHub::retain`); watching it again starts the
+//! harness on the same session. The harness keeps its own session; a chat that knows its
+//! session resumes it (`session/load`) when it starts again, after a restart of the
+//! daemon too, and the transcript Compi saved stands in for the harness's replay of it.
 use crate::program_status::ChatStatusHub;
 use compi_protocol::chat::{
     ChatAgent, ChatAgentsFinished, ChatAnswer, ChatAnswers, ChatApproval, ChatChange, ChatChoice,
@@ -14,7 +18,8 @@ use compi_protocol::chat::{
     ChatPlanLimit, ChatQuestion, ChatQueued, ChatSessionInfo, ChatState, ChatStatus, ChatTool,
     ChatToolStatus, ChatUsage, MAX_CHAT_AGENT_RESULT_BYTES, MAX_CHAT_ATTACHMENTS,
     MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES,
-    MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES,
+    MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES, ThreadActivity,
+    ThreadInfo,
 };
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
 use compi_protocol::{ContentEnvironment, LayoutNode, SurfaceId, WorkspaceSnapshot};
@@ -28,6 +33,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod saved;
+mod threads;
+
+use threads::{ThreadRecord, ThreadStore};
 
 /// The ACP version Compi speaks.
 const ACP_VERSION: u64 = 1;
@@ -66,6 +74,7 @@ pub struct ChatHub {
     status: ChatStatusHub,
     /// The daemon's instance, which harnesses get as a terminal's shell does.
     instance: OnceLock<Option<String>>,
+    threads: Arc<ThreadStore>,
 }
 
 /// The daemon's chats.
@@ -75,15 +84,19 @@ pub fn hub() -> &'static ChatHub {
 }
 
 impl ChatHub {
-    /// Names the daemon's instance for the harnesses started from now on.
+    /// Names the daemon's instance for the harnesses started from now on, and keeps its
+    /// threads apart from other instances'.
     pub fn set_instance(&self, instance: Option<&str>) {
         let _ = self.instance.set(instance.map(str::to_owned));
+        self.threads.open(instance);
     }
 
     /// The chat's whole state and a receiver of its later changes, starting the chat if it
-    /// is not running. `approval` applies from the harness's next start, this one when it
-    /// starts it; so does `surface`, the terminal whose view shows the chat, if one does.
-    /// `picks` apply to the next new session, this one when it starts one.
+    /// is not running: on its saved thread when there is one, or again on its session when
+    /// its harness stopped once no pane held it. `approval` applies from the harness's
+    /// next start, this one when it starts it; so does `surface`, the terminal whose view
+    /// shows the chat, if one does. `picks` apply to the next new session, this one when
+    /// it starts one.
     pub fn watch(
         &self,
         content: &ChatContent,
@@ -91,26 +104,35 @@ impl ChatHub {
         picks: ChatPicks,
         surface: Option<SurfaceId>,
     ) -> (ChatState, mpsc::Receiver<ChatEvent>) {
-        let chat = {
-            let mut chats = lock(&self.chats);
-            chats
-                .entry(content.id.clone())
-                .or_insert_with(|| {
-                    let instance = self.instance.get().cloned().flatten();
-                    Chat::start(
-                        content.clone(),
-                        instance,
-                        approval,
-                        picks.clone(),
-                        surface.clone(),
-                    )
-                })
-                .clone()
+        let running = lock(&self.chats).get(&content.id).cloned();
+        let chat = match running {
+            Some(chat) => chat,
+            None => {
+                let thread = self.threads.load(&content.id);
+                lock(&self.chats)
+                    .entry(content.id.clone())
+                    .or_insert_with(|| {
+                        let instance = self.instance.get().cloned().flatten();
+                        Chat::start(
+                            content.clone(),
+                            instance,
+                            approval,
+                            picks.clone(),
+                            surface.clone(),
+                            thread,
+                        )
+                    })
+                    .clone()
+            }
         };
         let mut inner = chat.lock();
         inner.approval = approval;
         inner.picks = picks;
-        inner.surface = surface;
+        inner.held = true;
+        inner.show_on(surface);
+        if inner.dormant {
+            chat.wake(&mut inner);
+        }
         let (sender, receiver) = mpsc::channel();
         inner.watchers.push(sender);
         (fit(inner.state.clone(), WATCH_STATE_BYTES), receiver)
@@ -221,24 +243,108 @@ impl ChatHub {
         Ok(())
     }
 
-    /// Ends every chat no pane or view of `workspace` holds any more, and notes the
-    /// terminal each other one shows in for its harness's next start.
+    /// Notes which chats a pane or view of `workspace` holds, and the terminal each shows
+    /// in for its harness's next start. A chat none holds stays, its thread saved; its
+    /// harness stops once nothing runs in it. One that never became a thread ends.
     pub fn retain(&self, workspace: &WorkspaceSnapshot) {
-        let mut chats = lock(&self.chats);
+        let chats: Vec<(String, Arc<Chat>)> = lock(&self.chats)
+            .iter()
+            .map(|(id, chat)| (id.clone(), chat.clone()))
+            .collect();
         if chats.is_empty() {
             return;
         }
         let mut held = held_chats(workspace);
-        chats.retain(|id, chat| match held.remove(id) {
-            Some(surface) => {
-                lock(&chat.inner).surface = surface;
-                true
+        let mut ended = Vec::new();
+        for (id, chat) in chats {
+            let mut inner = chat.lock();
+            match held.remove(&id) {
+                Some(surface) => {
+                    inner.held = true;
+                    inner.show_on(surface);
+                }
+                None if inner.thread.is_none() => {
+                    drop(inner);
+                    ended.push((id, chat));
+                }
+                None if inner.held => {
+                    inner.held = false;
+                    inner.save_thread(false);
+                }
+                None => {}
             }
-            None => {
+        }
+        if ended.is_empty() {
+            return;
+        }
+        let mut chats = lock(&self.chats);
+        for (id, chat) in ended {
+            if chats.get(&id).is_some_and(|kept| Arc::ptr_eq(kept, &chat)) {
+                chats.remove(&id);
                 chat.close();
-                false
             }
-        });
+        }
+    }
+
+    /// Every thread kept, newest change first, with what runs in it and where `workspace`
+    /// shows it.
+    pub fn threads(&self, workspace: &WorkspaceSnapshot) -> Vec<ThreadInfo> {
+        let held = held_chats(workspace);
+        let mut threads: Vec<ThreadInfo> = self
+            .threads
+            .list()
+            .into_iter()
+            .map(|mut stored| {
+                let id = stored.chat.id.clone();
+                let mut activity = ThreadActivity::Idle;
+                let running = lock(&self.chats).get(&id).cloned();
+                if let Some(chat) = running {
+                    let inner = lock(&chat.inner);
+                    activity = inner.activity();
+                    stored.chat.session = inner.state.session.clone();
+                    stored.title =
+                        threads::thread_title(inner.state.title.as_deref(), &inner.state.entries);
+                    if let Some(times) = inner.thread {
+                        stored.updated_ms = times.updated_ms;
+                    }
+                }
+                let terminal = held.get(&id).cloned().flatten().or_else(|| {
+                    workspace
+                        .kept_terminals
+                        .iter()
+                        .find(|kept| kept.chat == id)
+                        .map(|kept| kept.surface_id.clone())
+                });
+                ThreadInfo {
+                    open: held.contains_key(&id),
+                    chat: stored.chat,
+                    title: stored.title,
+                    created_ms: stored.created_ms,
+                    updated_ms: stored.updated_ms,
+                    activity,
+                    terminal,
+                }
+            })
+            .collect();
+        threads.sort_by_key(|thread| std::cmp::Reverse(thread.updated_ms));
+        threads
+    }
+
+    /// Deletes thread `id`: its harness stops and its transcript goes. A thread a pane or
+    /// view of `workspace` holds is kept.
+    pub fn delete_thread(&self, id: &str, workspace: &WorkspaceSnapshot) -> Result<(), String> {
+        if held_chats(workspace).contains_key(id) {
+            return Err("Close its pane first".into());
+        }
+        let running = lock(&self.chats).remove(id);
+        if running.is_none() && !self.threads.contains(id) {
+            return Err(format!("there is no thread {id}"));
+        }
+        if let Some(chat) = running {
+            chat.close();
+        }
+        self.threads.delete(id);
+        Ok(())
     }
 
     fn get(&self, id: &str) -> Result<Arc<Chat>, String> {
@@ -510,6 +616,27 @@ struct Inner {
     activity_ms: u64,
     /// The terminal whose view shows the chat, which the harness's shell context names.
     surface: Option<SurfaceId>,
+    /// The chat's thread, once it has one: when it began and when its transcript last
+    /// changed.
+    thread: Option<ThreadTimes>,
+    /// The thread changed since it was last saved.
+    save_due: bool,
+    /// The terminal whose view last showed the chat, which its thread keeps.
+    last_surface: Option<SurfaceId>,
+    /// A pane or view holds the chat.
+    held: bool,
+    /// The harness was stopped because no pane held the chat and nothing ran in it; a
+    /// watch starts it again.
+    dormant: bool,
+    /// The transcript is Compi's own, so the session's replay while it loads is left out.
+    skip_replay: bool,
+}
+
+/// When a thread began, and when its transcript last changed.
+#[derive(Clone, Copy)]
+struct ThreadTimes {
+    created_ms: u64,
+    updated_ms: u64,
 }
 
 /// What the user has not seen yet of a chat that waits.
@@ -520,27 +647,36 @@ enum Unseen {
     Error(String),
 }
 
-/// A chat's locked state. Letting go of it publishes the chat's program status, so
-/// watchers see where the changes made under the lock ended, never a step on the way.
-struct Locked<'a>(MutexGuard<'a, Inner>);
+/// A chat's locked state. Letting go of it stops the harness of a chat that is done
+/// with it, publishes the chat's program status, so watchers see where the changes made
+/// under the lock ended, never a step on the way, and hands its thread to the store
+/// when it changed.
+struct Locked<'a> {
+    inner: MutexGuard<'a, Inner>,
+    content: &'a ChatContent,
+}
 
 impl Deref for Locked<'_> {
     type Target = Inner;
 
     fn deref(&self) -> &Inner {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for Locked<'_> {
     fn deref_mut(&mut self) -> &mut Inner {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
-        self.0.publish_status();
+        self.inner.rest_if_idle();
+        self.inner.publish_status();
+        if let Some(record) = self.inner.thread_to_save(self.content) {
+            hub().threads.save(record);
+        }
     }
 }
 
@@ -569,20 +705,26 @@ impl Chat {
         approval: ChatApproval,
         picks: ChatPicks,
         surface: Option<SurfaceId>,
+        thread: Option<ThreadRecord>,
     ) -> Arc<Self> {
+        let mut inner = Inner {
+            chat_id: content.id.clone(),
+            state: ChatState {
+                harness: content.harness,
+                session: content.session.clone(),
+                ..ChatState::default()
+            },
+            approval,
+            picks,
+            surface,
+            held: true,
+            ..Inner::default()
+        };
+        if let Some(thread) = thread {
+            inner.seed(thread);
+        }
         let chat = Arc::new(Self {
-            inner: Mutex::new(Inner {
-                chat_id: content.id.clone(),
-                state: ChatState {
-                    harness: content.harness,
-                    session: content.session.clone(),
-                    ..ChatState::default()
-                },
-                approval,
-                picks,
-                surface,
-                ..Inner::default()
-            }),
+            inner: Mutex::new(inner),
             content,
             instance,
         });
@@ -591,7 +733,10 @@ impl Chat {
     }
 
     fn lock(&self) -> Locked<'_> {
-        Locked(lock(&self.inner))
+        Locked {
+            inner: lock(&self.inner),
+            content: &self.content,
+        }
     }
 
     /// Starts the harness as the chat's approval says. Compi's shell bridge is installed
@@ -601,6 +746,7 @@ impl Chat {
     fn spawn(self: &Arc<Self>, inner: &mut Inner) {
         inner.generation += 1;
         inner.initialized = false;
+        inner.dormant = false;
         let generation = inner.generation;
         let chosen = inner.approval.omp_mode();
         let chat = self.clone();
@@ -914,19 +1060,27 @@ impl Chat {
                 inner.apply_picks(picks);
                 self.read_plans(inner);
             }
-            // A resumed session keeps its own settings.
+            // A resumed session keeps its own settings. A chat that had no thread gets
+            // one once the session it resumed shows.
             (Pending::LoadSession, Ok(result)) => {
+                inner.skip_replay = false;
                 inner.session_opened(&result);
+                if inner.thread.is_none() && !inner.state.entries.is_empty() {
+                    inner.start_thread();
+                }
                 inner.apply_picks(VecDeque::new());
                 self.read_plans(inner);
             }
+            // The transcript so far stays, above the error and the new session.
             (Pending::LoadSession, Err(error)) => {
+                inner.skip_replay = false;
                 inner.emit(ChatEvent::Session { session: None });
                 inner.emit(ChatEvent::Entry {
                     entry: ChatEntry::Error {
                         message: format!("Couldn't resume the earlier session: {error}"),
                     },
                 });
+                inner.save_thread(true);
                 self.open_session(inner, None);
             }
             (Pending::NewSession, Err(error)) => inner.emit(ChatEvent::Status {
@@ -1101,11 +1255,16 @@ impl Chat {
             .ok_or_else(|| format!("{harness} has no session yet"))
     }
 
-    /// Hands `prompt` to the harness as `delivery` says.
-    fn send(&self, prompt: Prompt, delivery: ChatDelivery) -> Result<(), String> {
+    /// Hands `prompt` to the harness as `delivery` says. A chat whose harness stopped for
+    /// want of a pane starts it again, the prompt queued until it is ready.
+    fn send(self: &Arc<Self>, prompt: Prompt, delivery: ChatDelivery) -> Result<(), String> {
         prompt.check()?;
         let harness = self.content.harness.name();
         let mut inner = self.lock();
+        let woke = inner.dormant;
+        if woke {
+            self.wake(&mut inner);
+        }
         let steer = delivery == ChatDelivery::Steer;
         if steer && inner.state.working() && inner.can_steer {
             let session = inner
@@ -1119,7 +1278,7 @@ impl Chat {
                 json!({ "sessionId": session, "prompt": blocks }),
                 Pending::Steer(prompt),
             );
-        } else if delivery == ChatDelivery::Prompt
+        } else if !woke && delivery == ChatDelivery::Prompt
             || (steer && matches!(inner.state.status, ChatStatus::Ready))
         {
             let session = self.ready_session(&inner)?;
@@ -1283,22 +1442,43 @@ impl Chat {
         Ok(())
     }
 
-    /// Ends the harness and starts it again; a chat with a session resumes it, its
-    /// history replayed.
+    /// Starts the harness again on the chat's session after it stopped for want of a
+    /// pane; the transcript stays, the session's replay left out.
+    fn wake(self: &Arc<Self>, inner: &mut Inner) {
+        inner.skip_replay = true;
+        inner.emit(ChatEvent::Status {
+            status: ChatStatus::Starting,
+        });
+        self.spawn(inner);
+    }
+
+    /// Ends the harness and starts it again; a chat with a session resumes it. The
+    /// transcript stays as it is, the session's replay left out: what the harness left
+    /// open ends as at a turn's end, and the queue empties.
     fn restart(self: &Arc<Self>) {
         let mut inner = self.lock();
         inner.stop();
-        let state = ChatState {
-            harness: self.content.harness,
-            session: inner.state.session.clone(),
-            ..ChatState::default()
-        };
-        inner.emit(ChatEvent::Reset {
-            state: Box::new(state),
+        inner.stop_agents();
+        inner.end_turn();
+        inner.agents_summarized.clear();
+        inner.agents_revision += 1;
+        inner.agents_watched = None;
+        inner.unseen = None;
+        inner.prompted_with = None;
+        inner.queue_held = false;
+        if !inner.queue.is_empty() {
+            inner.queue.clear();
+            inner.publish_queue();
+        }
+        inner.skip_replay = true;
+        inner.emit(ChatEvent::Status {
+            status: ChatStatus::Starting,
         });
         self.spawn(&mut inner);
     }
 
+    /// Ends the chat for good: its harness stops and its status goes. Its thread is
+    /// saved no more.
     fn close(&self) {
         let mut inner = self.lock();
         inner.closed = true;
@@ -1308,6 +1488,134 @@ impl Chat {
 }
 
 impl Inner {
+    /// Starts the chat on its saved thread: its transcript, title and session, with the
+    /// entries a crash left open ended as a turn's end would, as of the thread's last
+    /// change. The session's replay is left out when it loads.
+    fn seed(&mut self, thread: ThreadRecord) {
+        let ended = thread.updated_ms;
+        let mut entries = thread.entries;
+        for entry in &mut entries {
+            settle_saved(entry, ended);
+        }
+        self.tools = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                ChatEntry::Tool(tool) => Some((tool.id.clone(), index)),
+                _ => None,
+            })
+            .collect();
+        self.state.entries = entries;
+        self.state.title = thread.title;
+        if thread.chat.session.is_some() {
+            self.state.session = thread.chat.session;
+        }
+        self.thread = Some(ThreadTimes {
+            created_ms: thread.created_ms,
+            updated_ms: thread.updated_ms,
+        });
+        self.last_surface = thread.last_surface;
+        self.skip_replay = true;
+    }
+
+    /// Gives the chat its thread when it has none, its transcript changed.
+    fn start_thread(&mut self) {
+        if self.thread.is_none() {
+            let now = now_ms();
+            self.thread = Some(ThreadTimes {
+                created_ms: now,
+                updated_ms: now,
+            });
+        }
+        self.save_thread(true);
+    }
+
+    /// Has the chat's thread, when it has one, saved once the lock is let go; `changed`
+    /// says its transcript changed.
+    fn save_thread(&mut self, changed: bool) {
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        if changed {
+            thread.updated_ms = now_ms();
+        }
+        self.save_due = true;
+    }
+
+    /// The thread to save, when it changed since it was last saved and the chat goes on.
+    fn thread_to_save(&mut self, content: &ChatContent) -> Option<ThreadRecord> {
+        if !std::mem::take(&mut self.save_due) || self.closed {
+            return None;
+        }
+        let times = self.thread?;
+        Some(ThreadRecord::new(
+            ChatContent {
+                session: self.state.session.clone(),
+                ..content.clone()
+            },
+            self.state.title.clone(),
+            times.created_ms,
+            times.updated_ms,
+            self.last_surface.clone(),
+            self.state.entries.clone(),
+        ))
+    }
+
+    /// Notes `surface`, the terminal whose view shows the chat now, if one does.
+    fn show_on(&mut self, surface: Option<SurfaceId>) {
+        if let Some(shown) = &surface
+            && self.last_surface.as_ref() != Some(shown)
+        {
+            self.last_surface = Some(shown.clone());
+            self.save_thread(false);
+        }
+        self.surface = surface;
+    }
+
+    /// What the chat is doing, for the threads list.
+    fn activity(&self) -> ThreadActivity {
+        if self.state.permission.is_some() || self.state.question.is_some() {
+            ThreadActivity::Waiting
+        } else if self.state.working() {
+            ThreadActivity::Working
+        } else {
+            ThreadActivity::Idle
+        }
+    }
+
+    /// A session is loading.
+    fn loading(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::LoadSession))
+    }
+
+    /// Stops the harness of a chat no pane holds once nothing runs in it: no turn, no
+    /// permission or question waiting, no sub-agent running, no prompt waiting to go, no
+    /// session loading.
+    /// The chat stays, its status showing; a watch starts the harness again. A harness
+    /// that already ended stays ended.
+    fn rest_if_idle(&mut self) {
+        if self.held
+            || self.dormant
+            || self.closed
+            || matches!(self.state.status, ChatStatus::Failed { .. })
+            || self.state.working()
+            || self.state.permission.is_some()
+            || self.state.question.is_some()
+            || (!self.queue.is_empty() && !self.queue_held)
+            || self.loading()
+            || self.state.entries.iter().any(|entry| {
+                matches!(entry, ChatEntry::Tool(tool)
+                    if tool.agents.iter().any(|agent| agent.status.is_open()))
+            })
+        {
+            return;
+        }
+        self.stop();
+        self.dormant = true;
+    }
+
     /// Applies `event` and sends it to every watcher still listening.
     fn emit(&mut self, event: ChatEvent) {
         match &event {
@@ -1322,6 +1630,7 @@ impl Inner {
                 self.queue_held = false;
                 self.unseen = None;
                 self.prompted_with = None;
+                self.skip_replay = false;
             }
             ChatEvent::Status {
                 status: ChatStatus::Failed { message },
@@ -1397,6 +1706,7 @@ impl Inner {
             });
         }
         self.options(&result["configOptions"]);
+        self.save_thread(false);
     }
 
     /// Sets the first of `picks` (category, value) the session offers and does not have
@@ -1463,6 +1773,7 @@ impl Inner {
         self.emit(ChatEvent::Entry {
             entry: prompt.entry(now_ms()),
         });
+        self.start_thread();
     }
 
     /// Starts a turn on `prompt`.
@@ -1721,6 +2032,7 @@ impl Inner {
         if self.state.question.is_some() {
             self.emit(ChatEvent::Question { question: None });
         }
+        self.save_thread(true);
     }
 
     /// The harness ended: sub-agents still open will not report again. They get no
@@ -1893,6 +2205,18 @@ impl Inner {
     /// One `session/update` notification.
     fn update(&mut self, update: &Value) {
         let kind = update["sessionUpdate"].as_str().unwrap_or_default();
+        let entry_kind = matches!(
+            kind,
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "user_message_chunk"
+                | "tool_call"
+                | "tool_call_update"
+        );
+        // The transcript Compi saved already holds what the session replays as it loads.
+        if entry_kind && self.skip_replay && self.loading() {
+            return;
+        }
         if kind != "agent_thought_chunk" && kind.ends_with("_chunk")
             || kind.starts_with("tool_call")
         {
@@ -1975,6 +2299,7 @@ impl Inner {
                         .map(str::to_owned);
                     if title != self.state.title {
                         self.emit(ChatEvent::Title { title });
+                        self.save_thread(false);
                     }
                 }
             }
@@ -2366,6 +2691,37 @@ impl Inner {
         if self.state.entries[index] != entry {
             self.emit(ChatEvent::Replace { index, entry });
         }
+    }
+}
+
+/// An entry of a saved thread whose harness ended before it did: a running tool call
+/// and its sub-agents stop, an unanswered prompt's turn and an unfinished thought end, at
+/// `ended`.
+fn settle_saved(entry: &mut ChatEntry, ended: u64) {
+    match entry {
+        ChatEntry::Tool(tool) => {
+            for agent in tool
+                .agents
+                .iter_mut()
+                .filter(|agent| agent.status.is_open())
+            {
+                agent.status = ChatToolStatus::Stopped;
+            }
+            if tool.status.is_open() {
+                tool.status = ChatToolStatus::Stopped;
+                tool.ended_ms.get_or_insert(ended);
+            }
+        }
+        ChatEntry::User {
+            sent_ms: Some(_),
+            ended_ms: ended_ms @ None,
+            ..
+        }
+        | ChatEntry::Thought {
+            ended_ms: ended_ms @ None,
+            ..
+        } => *ended_ms = Some(ended),
+        _ => {}
     }
 }
 
@@ -4131,7 +4487,7 @@ mod tests {
                 })
                 .collect()
         };
-        let chat = Chat {
+        let chat = Arc::new(Chat {
             content: ChatContent {
                 id: "picks-test".into(),
                 harness: ChatHarness::Omp,
@@ -4146,9 +4502,10 @@ mod tests {
                     model: Some("opus".into()),
                     thought_level: Some("max".into()),
                 },
+                held: true,
                 ..Inner::default()
             }),
-        };
+        });
         {
             let mut inner = chat.lock();
             chat.answered(
@@ -4293,5 +4650,216 @@ mod tests {
             inner.state.entries[0],
             ChatEntry::User { sent_ms: None, .. }
         ));
+    }
+
+    fn thread_chat(id: &str) -> ChatContent {
+        ChatContent {
+            id: id.into(),
+            harness: ChatHarness::Omp,
+            environment: ContentEnvironment::Host,
+            folder: "/work".into(),
+            session: Some("s1".into()),
+        }
+    }
+
+    fn running_tool(id: &str) -> ChatEntry {
+        ChatEntry::Tool(Box::new(ChatTool {
+            id: id.into(),
+            name: Some("bash".into()),
+            title: "$ make".into(),
+            kind: "execute".into(),
+            status: ChatToolStatus::Running,
+            input: None,
+            output: None,
+            diffs: Vec::new(),
+            locations: Vec::new(),
+            started_ms: 5,
+            ended_ms: None,
+            agents: Vec::new(),
+            waits_on_agents: false,
+        }))
+    }
+
+    #[test]
+    fn a_thread_round_trips_through_its_file_and_lists_by_its_first_prompt() {
+        let folder = std::env::temp_dir().join(format!("compi-threads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let store = Arc::new(ThreadStore::at(folder.clone()));
+        let record = ThreadRecord::new(
+            thread_chat("chat-1"),
+            None,
+            10,
+            20,
+            Some(SurfaceId::new("surface-1")),
+            vec![
+                ChatEntry::User {
+                    text: "\n  Fix the build\nthen test".into(),
+                    files: Vec::new(),
+                    images: Vec::new(),
+                    sent_ms: Some(10),
+                    ended_ms: Some(20),
+                },
+                ChatEntry::Agent {
+                    text: "Done".into(),
+                },
+            ],
+        );
+        store.save(record.clone());
+        store.flush();
+        assert!(folder.join("chat-1.json").is_file());
+        assert!(!folder.join("chat-1.json.tmp").exists());
+
+        let reopened = Arc::new(ThreadStore::at(folder.clone()));
+        assert_eq!(reopened.load("chat-1"), Some(record.clone()));
+        let listed = reopened.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title.as_deref(), Some("Fix the build"));
+        assert_eq!((listed[0].created_ms, listed[0].updated_ms), (10, 20));
+        assert_eq!(listed[0].chat.session.as_deref(), Some("s1"));
+
+        // The latest save wins, and the index follows it before the disk does.
+        let mut renamed = record.clone();
+        renamed.title = Some("Build fix".into());
+        renamed.updated_ms = 30;
+        reopened.save(renamed.clone());
+        assert_eq!(reopened.list()[0].title.as_deref(), Some("Build fix"));
+        reopened.flush();
+        assert_eq!(
+            ThreadStore::at(folder.clone()).load("chat-1"),
+            Some(renamed)
+        );
+
+        reopened.delete("chat-1");
+        assert!(reopened.list().is_empty());
+        reopened.flush();
+        assert_eq!(ThreadStore::at(folder.clone()).load("chat-1"), None);
+        assert!(!ThreadStore::at(folder.clone()).contains("chat-1"));
+        // A name that is not a chat ID never becomes a path.
+        assert_eq!(reopened.load("../chat-1"), None);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_seeded_chat_settles_what_a_crash_left_open_and_skips_the_sessions_replay() {
+        let mut inner = Inner::default();
+        inner.seed(ThreadRecord::new(
+            thread_chat("chat-seed"),
+            Some("Make it".into()),
+            5,
+            50,
+            None,
+            vec![
+                ChatEntry::User {
+                    text: "make".into(),
+                    files: Vec::new(),
+                    images: Vec::new(),
+                    sent_ms: Some(5),
+                    ended_ms: None,
+                },
+                running_tool("t1"),
+            ],
+        ));
+        assert_eq!(inner.state.session.as_deref(), Some("s1"));
+        assert_eq!(inner.state.title.as_deref(), Some("Make it"));
+        assert!(matches!(
+            inner.state.entries[0],
+            ChatEntry::User {
+                ended_ms: Some(50),
+                ..
+            }
+        ));
+        let tool = tool_entry(&inner, 1);
+        assert_eq!(
+            (tool.status, tool.ended_ms),
+            (ChatToolStatus::Stopped, Some(50))
+        );
+        assert_eq!(inner.tools.get("t1"), Some(&1));
+
+        let seeded = inner.state.entries.clone();
+        inner.pending.insert(1, Pending::LoadSession);
+        inner.update(&json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "make" } }));
+        inner.update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "ok" } }));
+        inner.update(&json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "$ make", "status": "completed",
+        }));
+        inner.update(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t2", "status": "in_progress" }));
+        assert_eq!(inner.state.entries, seeded, "the replay adds nothing");
+        inner.update(&json!({ "sessionUpdate": "session_info_update", "title": "Made it" }));
+        inner.update(&json!({ "sessionUpdate": "usage_update", "used": 10, "size": 100 }));
+        assert_eq!(inner.state.title.as_deref(), Some("Made it"));
+        assert!(inner.state.usage.is_some());
+
+        // Once the session has loaded, what the harness reports is new.
+        inner.pending.clear();
+        inner.update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "next" } }));
+        assert_eq!(inner.state.entries.len(), seeded.len() + 1);
+
+        // A session resumed in its place shows its replay.
+        inner.emit(ChatEvent::Reset {
+            state: Box::default(),
+        });
+        inner.pending.insert(2, Pending::LoadSession);
+        inner.update(&json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "other" } }));
+        assert_eq!(inner.state.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_chat_no_pane_holds_stays_and_stops_its_harness_only_once_idle() {
+        let shown = |inner: &Inner| inner.status_shown().map(|(state, ..)| state);
+        let mut inner = Inner {
+            chat_id: "chat-rest-test".into(),
+            state: ChatState {
+                session: Some("s".into()),
+                status: ChatStatus::Ready,
+                ..ChatState::default()
+            },
+            held: true,
+            ..Inner::default()
+        };
+        inner.rest_if_idle();
+        assert!(!inner.dormant, "a held chat keeps its harness");
+
+        inner.start_prompt("s".into(), text_prompt("go"));
+        assert!(inner.thread.is_some(), "the first prompt starts its thread");
+        assert!(inner.save_due);
+        // Its pane closes while the turn runs.
+        inner.held = false;
+        inner.rest_if_idle();
+        assert!(!inner.dormant, "a running turn goes on");
+        inner.permission(
+            json!(1),
+            &json!({
+                "toolCall": { "toolCallId": "t1", "title": "rm x", "kind": "execute" },
+                "options": [{ "optionId": "a", "name": "Allow once", "kind": "allow_once" }],
+            }),
+        );
+        inner.rest_if_idle();
+        assert!(!inner.dormant, "a waiting permission keeps it");
+
+        inner.prompt_ended(Ok(json!({ "stopReason": "end_turn" })));
+        inner.rest_if_idle();
+        assert!(
+            inner.dormant,
+            "an idle chat no pane holds stops its harness"
+        );
+        assert!(!inner.closed);
+        assert_eq!(
+            shown(&inner),
+            Some(ProgramState::Done),
+            "it still reports its result"
+        );
+
+        // A chat whose harness failed is not started again by a watch.
+        let mut failed = Inner {
+            state: ChatState {
+                status: ChatStatus::Failed {
+                    message: "OMP stopped".into(),
+                },
+                ..ChatState::default()
+            },
+            ..Inner::default()
+        };
+        failed.rest_if_idle();
+        assert!(!failed.dormant);
     }
 }

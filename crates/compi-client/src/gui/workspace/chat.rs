@@ -3,6 +3,10 @@
 //! harness, its folder and environment, and once the harness made one, its session, which
 //! the pane keeps so a restarted daemon resumes it.
 //!
+//! Each chat is a thread the daemon keeps: closing its pane or view leaves it (and the
+//! terminal it was a view of) running, the palette's Threads opens it again
+//! (`open_thread`), and only deleting it ends it.
+//!
 //! The transcript lives in the daemon. While a pane shows a chat, a watcher of its own
 //! (`watch_chat`, on Monitor's watching loop) keeps a connection that watches it:
 //! `WatchChat` brings the whole state, then each change arrives in order. A failed
@@ -15,9 +19,10 @@
 //! (`rows`: Markdown views, tool cards with their diffs, what the reader unfolded), the
 //! transcript's scroll position, the composer's draft, attachments and completion, and
 //! an open question's answers. It stays while the chat's pane or view is in the
-//! workspace, shown or not.
+//! workspace, shown or not; once neither is, the thread lives on in the daemon alone.
 use super::monitor::watch::{self, LINGER, SlotChange, WatchEnd, WatchLink, WatchSlot};
 use super::*;
+use crate::chat::now_ms;
 use crate::gui::controls::{self, IconName, icon_button, text_button};
 use compi_protocol::chat::{
     ChatAnswer, ChatAnswers, ChatApproval, ChatContent, ChatDelivery, ChatEntry, ChatEvent,
@@ -35,7 +40,6 @@ use gpui_component::spinner::Spinner;
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{RopeExt as _, Sizable as _, Size};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod composer;
 mod models;
@@ -273,14 +277,14 @@ fn chat_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<(&'a PaneId, &'a ChatC
 }
 
 /// The harness's own mark, in its colours.
-fn harness_mark(harness: ChatHarness) -> &'static str {
+pub(super) fn harness_mark(harness: ChatHarness) -> &'static str {
     match harness {
         ChatHarness::Omp => controls::OMP_MARK,
     }
 }
 
 /// `folder` shortened to its last two names.
-fn folder_label(folder: &str) -> SharedString {
+pub(super) fn folder_label(folder: &str) -> SharedString {
     let names: Vec<&str> = folder
         .split(['/', '\\'])
         .filter(|name| !name.is_empty())
@@ -289,15 +293,6 @@ fn folder_label(folder: &str) -> SharedString {
         [.., parent, name] if names.len() > 2 => format!("…/{parent}/{name}").into(),
         _ => folder.to_owned().into(),
     }
-}
-
-/// Milliseconds since the Unix epoch.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 /// A span of `ms` milliseconds as the transcript shows it: `0.4s`, `12s`, `1m 05s`.
@@ -657,7 +652,7 @@ impl CompiApp {
         let chat = crate::chat::new_chat(environment, folder);
         let id = chat.id.clone();
         let content = PaneContent::Chat(chat);
-        // A chat ends when its view goes, so one a terminal carries is not replaced.
+        // A terminal already carrying a chat keeps it as its view; the new one goes beside.
         let in_place = self.focused_terminal().filter(|terminal| {
             self.config.chat_open == crate::config::ChatOpen::InPlace
                 && self.pane_chat_content(terminal).is_none()
@@ -670,6 +665,96 @@ impl CompiApp {
             false
         };
         opened.then_some(id)
+    }
+
+    /// Opens thread `chat`: the pane or view holding it is revealed and focused. A thread
+    /// whose view was closed while its terminal, `terminal`, stays in a tab shows as that
+    /// terminal's view again, unless the terminal carries another view now. Any other
+    /// opens in a new tab of the selected workspace, on the terminal the daemon kept for
+    /// it when there is one.
+    pub(super) fn open_thread(
+        &mut self,
+        chat: ChatContent,
+        terminal: Option<SurfaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
+        if let Some((session, tab, pane_id)) = program_status::chat_place(workspace, &chat.id) {
+            self.reveal_pane(
+                session,
+                tab,
+                pane_id,
+                compi_protocol::PaneSide::View,
+                window,
+                cx,
+            );
+            return;
+        }
+        let carrier = terminal
+            .and_then(|surface| monitor::surface_pane(workspace, &surface))
+            .filter(|(_, _, pane_id)| self.pane_view(pane_id).is_none());
+        if let Some((session, tab, pane_id)) = carrier {
+            if !self.show_view(&pane_id, PaneContent::Chat(chat), window, cx) {
+                return;
+            }
+            if self.selected_tab().map(|selected| &selected.id) != Some(&tab) {
+                if let Some(workspace) = &self.workspace {
+                    self.state.select_session(workspace, &session);
+                }
+                let hidden = self.state.hidden_tabs.contains(&tab);
+                self.select_terminal(tab, hidden);
+            }
+            self.focus_pane(pane_id);
+            self.rebuild_layout(window, true);
+            cx.notify();
+            return;
+        }
+        let Some(session_id) = self
+            .state
+            .selected_session(workspace)
+            .map(|session| session.id.clone())
+        else {
+            self.global_error = Some("Select a workspace first".into());
+            return;
+        };
+        self.mutate(WorkspaceMutation::OpenThread { session_id, chat }, true);
+    }
+
+    /// Opens thread `chat` by its id, as a notification about a thread no pane holds
+    /// does: the daemon's threads are listed off the UI thread first.
+    pub(super) fn open_thread_id(
+        &mut self,
+        chat: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.target.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let listed = cx
+                .background_executor()
+                .spawn(async move {
+                    (|| -> crate::Result<_> { target.connect()?.list_threads() })()
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                match listed
+                    .map(|threads| threads.into_iter().find(|thread| thread.chat.id == chat))
+                {
+                    Ok(Some(thread)) => this.open_thread(thread.chat, thread.terminal, window, cx),
+                    Ok(None) => this.global_error = Some("That thread was deleted".into()),
+                    Err(error) => {
+                        this.global_error = Some(format!("Cannot open the thread: {error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Send selection to chat: the focused terminal's selected text goes to the end of a
@@ -729,7 +814,7 @@ impl CompiApp {
     }
 
     /// The chat `pane_id` holds, shown or not.
-    fn pane_chat_content(&self, pane_id: &PaneId) -> Option<&ChatContent> {
+    pub(super) fn pane_chat_content(&self, pane_id: &PaneId) -> Option<&ChatContent> {
         content::find_pane_content(self.workspace.as_ref()?, pane_id)?.chat()
     }
 

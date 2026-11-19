@@ -859,6 +859,21 @@ impl DaemonClient {
         }
     }
 
+    /// Every thread the daemon keeps, newest change first.
+    pub fn list_threads(&mut self) -> Result<Vec<crate::chat::ThreadInfo>> {
+        match self.request_bounded(ClientMessage::ListThreads, Duration::from_secs(10))? {
+            ServerMessage::Threads { threads } => Ok(threads),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Deletes thread `chat`; refused while a pane or view holds it.
+    pub fn delete_thread(&mut self, chat: &str) -> Result<()> {
+        self.chat_request(ClientMessage::DeleteThread {
+            chat: chat.to_owned(),
+        })
+    }
+
     pub fn attach_console_surface(
         &mut self,
         surface: &SurfaceInfo,
