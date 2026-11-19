@@ -1,83 +1,35 @@
 //! Project icons: a project's own image (a favicon or logo the daemon finds in its
-//! folder), else a coloured two-letter monogram of its name, and for anything without a
-//! project a gray dashed speech bubble (Lucide `message-square-dashed`).
-//!
-//! The monogram is T3 Code's (`projectIdentity.ts`), so a project looks the same in both:
-//! compi is a purple "CI". Each window keeps the images it was given ([`ProjectIcons`]),
-//! asking the daemon off the UI thread once per project every [`ICON_TTL`].
+//! folder), else a tile holding the first letter of its name in a colour of the theme's
+//! terminal palette, and for anything without a project the muted folder glyph. Each
+//! window keeps the images it was given ([`ProjectIcons`]), asking the daemon off the UI
+//! thread once per project every [`ICON_TTL`].
 
 use super::*;
 use compi_protocol::{Project, ProjectIconImage};
 use std::cell::RefCell;
-use unicode_normalization::UnicodeNormalization as _;
 
 /// How long a project's image, or its having none, stands before the daemon is asked
 /// again.
 const ICON_TTL: Duration = Duration::from_secs(10 * 60);
 /// The most projects a window keeps an answer for; the longest unused go first.
 const MAX_ICONS: usize = 64;
+/// The terminal palette's colours a letter tile takes: red, green, yellow, blue, magenta
+/// and cyan, then their bright forms.
+const TILE_COLORS: [usize; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
 
-/// Tailwind v4's colours, in T3 Code's order: name, `<c>-600` (light themes) and
-/// `<c>-400` (dark themes).
-const COLORS: [(&str, u32, u32); 18] = [
-    ("gray", 0x4a5565, 0x99a1af),
-    ("red", 0xe7000b, 0xff6467),
-    ("orange", 0xf54900, 0xff8904),
-    ("amber", 0xe17100, 0xffb900),
-    ("yellow", 0xd08700, 0xfdc700),
-    ("lime", 0x5ea500, 0x9ae600),
-    ("green", 0x00a63e, 0x05df72),
-    ("emerald", 0x009966, 0x00d492),
-    ("teal", 0x009689, 0x00d5be),
-    ("cyan", 0x0092b8, 0x00d3f2),
-    ("sky", 0x0084d1, 0x00bcff),
-    ("blue", 0x155dfc, 0x51a2ff),
-    ("indigo", 0x4f39f6, 0x7c86ff),
-    ("violet", 0x7f22fe, 0xa684ff),
-    ("purple", 0x9810fa, 0xc27aff),
-    ("fuchsia", 0xc800de, 0xed6aff),
-    ("pink", 0xe60076, 0xfb64b6),
-    ("rose", 0xec003f, 0xff637e),
-];
-
-/// The monogram's letters for a project called `name`: the first letter or digit of its
-/// first word, then the first digit after it in that word, else the first of its last
-/// word, else the last of its first word; uppercase. "PR" for an empty name.
-pub(super) fn monogram_letters(name: &str) -> String {
-    let name: String = name.nfkc().collect();
-    let words: Vec<Vec<char>> = name
-        .trim()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(|word| word.chars().collect())
-        .collect();
-    let Some(first) = words.first() else {
-        return "PR".to_owned();
-    };
-    let second = first[1..]
-        .iter()
-        .find(|c| c.is_numeric())
-        .or_else(|| (words.len() > 1).then(|| &words[words.len() - 1][0]))
-        .or_else(|| first[1..].last());
-    [Some(&first[0]), second]
-        .into_iter()
-        .flatten()
-        .flat_map(|c| c.to_uppercase())
-        .take(2)
-        .collect()
+/// The letter a project called `name` shows: the first letter or digit of its name,
+/// uppercase; `None` when it has none.
+fn tile_letter(name: &str) -> Option<String> {
+    let first = name.chars().find(|c| c.is_alphanumeric())?;
+    Some(first.to_uppercase().collect())
 }
 
-/// The index into [`COLORS`] of a project called `name`.
-fn monogram_color(name: &str) -> usize {
-    name.to_lowercase()
-        .chars()
-        .fold(0, |index, c| (index * 31 + c as usize) % COLORS.len())
-}
-
-/// The monogram's text colour for a project called `name`, as `0xRRGGBB`.
-fn monogram_rgb(name: &str, dark: bool) -> u32 {
-    let (_, light, dark_shade) = COLORS[monogram_color(name)];
-    if dark { dark_shade } else { light }
+/// The ANSI colour index a project called `name` takes, the same for the same name.
+fn tile_color(name: &str) -> usize {
+    let hash = name.to_lowercase().chars().fold(0usize, |hash, c| {
+        hash.wrapping_mul(31).wrapping_add(c as usize)
+    });
+    TILE_COLORS[hash % TILE_COLORS.len()]
 }
 
 /// The images projects were found to have, with when each was asked for.
@@ -173,45 +125,49 @@ fn image_format(format: compi_protocol::ImageFormat) -> gpui::ImageFormat {
     }
 }
 
-/// A `size` px tile holding `letters` in bold monospace, in `text` on a 14 % tint of
-/// it, with corners a quarter of its side.
-fn monogram(letters: SharedString, text: u32, size: f32, font: SharedString) -> gpui::AnyElement {
+/// A `size` px tile holding `letter` in `text`, on a tint of it, with the corners of
+/// Compi's chips.
+fn tile(letter: SharedString, text: u32, size: f32) -> gpui::AnyElement {
     div()
         .flex_none()
         .size(px(size))
-        .rounded(px(size * 0.25))
-        .bg(gpui::rgba((text << 8) | 0x24))
+        .rounded(px(4.0))
+        .bg(gpui::rgba((text << 8) | 0x2e))
         .flex()
         .items_center()
         .justify_center()
         .overflow_hidden()
         .text_color(rgb(text))
-        .font_family(font)
-        .font_weight(FontWeight::BOLD)
-        .text_size(px(size * 8.25 / 16.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(size * 0.62))
         .line_height(px(size))
-        .child(letters)
+        .child(letter)
         .into_any_element()
 }
 
 impl CompiApp {
     /// `project`'s icon, `size` px square: its image once the daemon found one and it
-    /// decodes, else its monogram; for no project, the dashed speech bubble.
+    /// decodes, else its letter tile; for no project, or a name without a letter, the
+    /// folder glyph.
     pub(super) fn project_icon(&self, project: Option<&Project>, size: f32) -> gpui::AnyElement {
-        let dark = self.theme.is_dark();
-        let Some(project) = project else {
-            let (_, light, dark_shade) = COLORS[0];
-            return gpui::svg()
+        let colors = self.theme.colors();
+        let folder = || {
+            gpui::svg()
                 .flex_none()
                 .size(px(size))
-                .path(controls::IconName::MessageSquareDashed.path())
-                .text_color(rgb(if dark { dark_shade } else { light }))
-                .into_any_element();
+                .path(controls::IconName::Folder.path())
+                .text_color(rgb(modal_text_color(colors.muted, colors)))
+                .into_any_element()
+        };
+        let Some(project) = project else {
+            return folder();
         };
         let name = project.name();
-        let letters: SharedString = monogram_letters(name).into();
-        let text = monogram_rgb(name, dark);
-        let font = self.typography.font.family.clone();
+        let Some(letter) = tile_letter(name) else {
+            return folder();
+        };
+        let letter: SharedString = letter.into();
+        let text = modal_text_color(self.theme.terminal().ansi[tile_color(name)], colors);
         let image = self.project_icons.image(project, || {
             let (target, sender, project) =
                 (self.target.clone(), self.event_tx.clone(), project.clone());
@@ -225,17 +181,17 @@ impl CompiApp {
         });
         match image {
             Some(image) => {
-                let tile = move || monogram(letters.clone(), text, size, font.clone());
+                let fallback = move || tile(letter.clone(), text, size);
                 gpui::img(gpui::ImageSource::Image(image))
                     .flex_none()
                     .size(px(size))
-                    .rounded(px(size * 0.25))
+                    .rounded(px(4.0))
                     .object_fit(gpui::ObjectFit::Contain)
-                    .with_loading(tile.clone())
-                    .with_fallback(tile)
+                    .with_loading(fallback.clone())
+                    .with_fallback(fallback)
                     .into_any_element()
             }
-            None => monogram(letters, text, size, font),
+            None => tile(letter, text, size),
         }
     }
 }
@@ -245,24 +201,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn monograms_take_t3_codes_letters_and_colours() {
-        for (name, letters, colour) in [
-            ("compi", "CI", "purple"),
-            ("Nebula", "NA", "red"),
-            ("t3code", "T3", "teal"),
-        ] {
-            assert_eq!(monogram_letters(name), letters, "{name}");
-            assert_eq!(COLORS[monogram_color(name)].0, colour, "{name}");
-        }
-        assert_eq!(monogram_letters("Silver Orchard"), "SO");
-        assert_eq!(monogram_letters("M7 Forge"), "M7");
-        assert_eq!(monogram_letters("  my-app_v2 "), "MV");
-        assert_eq!(monogram_letters("x"), "X");
-        assert_eq!(monogram_letters(""), "PR");
-        assert_eq!(monogram_letters(" -- "), "PR");
-        // NFKC: a fullwidth name reads as its plain letters.
-        assert_eq!(monogram_letters("ｃｏｍｐｉ"), "CI");
-        assert_eq!(monogram_rgb("compi", false), 0x9810fa);
-        assert_eq!(monogram_rgb("compi", true), 0xc27aff);
+    fn a_project_shows_its_first_letter_in_a_steady_palette_colour() {
+        assert_eq!(tile_letter("compi").as_deref(), Some("C"));
+        assert_eq!(tile_letter("  -my-app").as_deref(), Some("M"));
+        assert_eq!(tile_letter("3productdemo").as_deref(), Some("3"));
+        assert_eq!(tile_letter(" -- "), None);
+        assert_eq!(tile_color("compi"), tile_color("Compi"));
+        assert!(TILE_COLORS.contains(&tile_color("glib-code")));
     }
 }

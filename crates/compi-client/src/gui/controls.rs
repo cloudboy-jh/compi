@@ -112,7 +112,6 @@ gpui_kit_assets::icon_assets!(
         Image,
         RotateCcwClock,
         MessageSquare,
-        MessageSquareDashed,
     ]
 );
 
