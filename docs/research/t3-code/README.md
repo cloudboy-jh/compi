@@ -12,3 +12,5 @@ Cited paths are inside the T3 Code repository. Unless a report says otherwise th
 - [Threads](threads.md): thread data, agent sessions over time, persistence, forks, restart recovery, handoff selection.
 - [Agent fidelity](agent-fidelity.md): what each agent's protocol shows (Claude, Codex, OpenCode, Pi, ACP) and what plain ACP loses.
 - [Files and settings](files-settings.md): file picker, file tree, chat, thread and project settings with defaults.
+- [Settings screens](settings-ui.md): the settings modal, section list and search, row and card look, controls and saving, project overrides, the Projects page.
+- [Project icons](project-icons.md): automatic favicon lookup, monogram fallback, icon and file pickers, caching, sizes and colours.
