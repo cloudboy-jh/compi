@@ -15,6 +15,7 @@
 //! this one menu is drawn with Compi rows in the menu's look (`controls::menu_surface`).
 use super::*;
 use crate::gui::controls::{IconName, MenuEntry, menu_item};
+use compi_protocol::{ContentTab, PaneContent};
 use gpui::{Anchor, Hsla, Keystroke, anchored, deferred};
 use gpui_component::ActiveTheme as _;
 
@@ -251,8 +252,9 @@ impl CompiApp {
         controls::submenu("Pane", self.pane_action_entries(pane_id, cx))
     }
 
-    /// The pane action set for `pane_id` as menu entries; shortcut hints show when
-    /// the pane is the focused one, which is what a shortcut acts on.
+    /// The pane action set for `pane_id` as menu entries, after its paths to copy;
+    /// shortcut hints show when the pane is the focused one, which is what a shortcut
+    /// acts on.
     pub(super) fn pane_action_entries(
         &self,
         pane_id: &PaneId,
@@ -262,25 +264,69 @@ impl CompiApp {
             return Vec::new();
         };
         let focused = self.focused_pane() == Some(pane_id);
-        pane_actions(&facts, focused)
-            .map(|(action, reason)| {
-                let pane_id = pane_id.clone();
-                menu_item(
-                    action.label(&facts),
-                    cx.listener(move |this, _, window, cx| {
-                        this.run_pane_action(&pane_id, action, window, cx);
-                    }),
-                )
-                .key(
-                    action
-                        .command()
-                        .filter(|_| focused)
-                        .and_then(|command| self.configured_shortcut(command)),
-                )
-                .disabled_because(reason)
+        let copies = self.pane_paths(pane_id, &facts);
+        let mut entries: Vec<MenuEntry> = copies
+            .iter()
+            .map(|(label, path)| {
+                let path = path.clone();
+                menu_item(*label, move |_, _, cx: &mut App| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
+                })
                 .into()
             })
-            .collect()
+            .collect();
+        if !entries.is_empty() {
+            entries.push(MenuEntry::Separator);
+        }
+        entries.extend(pane_actions(&facts, focused).map(|(action, reason)| {
+            let pane_id = pane_id.clone();
+            menu_item(
+                action.label(&facts),
+                cx.listener(move |this, _, window, cx| {
+                    this.run_pane_action(&pane_id, action, window, cx);
+                }),
+            )
+            .key(
+                action
+                    .command()
+                    .filter(|_| focused)
+                    .and_then(|command| self.configured_shortcut(command)),
+            )
+            .disabled_because(reason)
+            .into()
+        }));
+        entries
+    }
+
+    /// The paths a pane's menu copies: a terminal's current folder, and what its view or
+    /// a content pane shows (the open file, else the folder; a chat's folder).
+    fn pane_paths(&self, pane_id: &PaneId, facts: &PaneFacts) -> Vec<(&'static str, String)> {
+        let mut paths = Vec::new();
+        if facts.running.is_some()
+            && let Ok((_, folder)) = self.shell_folder(pane_id)
+        {
+            paths.push(("Copy terminal path", folder));
+        }
+        let shown = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| content::find_pane_content(workspace, pane_id))
+            .and_then(|content| match content {
+                PaneContent::Files(folder) => Some(match &folder.active {
+                    Some(ContentTab::File { path, .. }) => path.clone(),
+                    None => folder.root.clone(),
+                }),
+                PaneContent::Chat(chat) => Some(chat.folder.clone()),
+                PaneContent::Settings(_) | PaneContent::Monitor(_) | PaneContent::Browser(_) => {
+                    None
+                }
+            });
+        if let Some(path) = shown
+            && paths.iter().all(|(_, copied)| *copied != path)
+        {
+            paths.push(("Copy pane path", path));
+        }
+        paths
     }
 
     /// Does `action` to `pane_id`, wherever the pane is.

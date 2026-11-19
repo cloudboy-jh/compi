@@ -23,6 +23,7 @@ mod lifecycle;
 mod model_icons;
 mod open_with;
 mod os_notifications;
+mod project_icon;
 use lifecycle::PaneError;
 mod workspace;
 use crate::typography::TerminalTypography;
@@ -630,6 +631,17 @@ enum UiEvent {
         request: u64,
         result: Result<Vec<compi_protocol::SearchEntry>, String>,
     },
+    /// The daemon's answer for a project's image; `None` also when it could not be asked.
+    ProjectIconFound {
+        project: compi_protocol::Project,
+        icon: Option<compi_protocol::ProjectIconImage>,
+    },
+    /// Files of the palette's project matching its query, and whether the project's
+    /// file list is still being read.
+    PaletteProjectFilesSearched {
+        request: u64,
+        result: Result<(Vec<String>, bool), String>,
+    },
     ContentListed {
         pane_id: PaneId,
         root: String,
@@ -1006,6 +1018,8 @@ struct CompiApp {
     overlay_closing_since: Option<Instant>,
     /// The palette's scope chip and file search; see `workspace::palette`.
     palette: workspace::palette::PaletteState,
+    /// Projects' images, asked of the daemon as their icons show; see `project_icon`.
+    project_icons: project_icon::ProjectIcons,
     /// Settings panes, Quick Appearance and their keyboard highlight; see `settings`.
     settings: workspace::settings::SettingsUi,
     /// Monitor panes and the window's process samples; see `monitor`.

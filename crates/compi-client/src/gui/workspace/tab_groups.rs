@@ -1098,6 +1098,7 @@ mod tests {
                 previous_layout: None,
                 merge: None,
                 group: group.map(TabGroupId::from),
+                project: None,
             })
             .collect(),
             groups: vec![group("g", false), group("f", true)],

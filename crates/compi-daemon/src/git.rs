@@ -47,6 +47,8 @@ const GIT_WRITE_ENV: [(&str, &str); 3] = [
 ];
 
 const TOP_LEVEL: &[&str] = &["rev-parse", "--show-toplevel"];
+/// The work tree's top level and the folder's path below it (`a/b/`), one per line.
+const WORK_TREE: &[&str] = &["rev-parse", "--show-toplevel", "--show-prefix"];
 const STATUS: &[&str] = &[
     "status",
     "--porcelain=v2",
@@ -91,6 +93,15 @@ const BRANCHES: &[&str] = &[
     "--format=%(HEAD)%00%(refname)%00%(upstream:short)%00%(committerdate:unix)",
     "refs/heads",
     "refs/remotes",
+];
+
+/// Files Git tracks or would add, NUL-separated: what `.gitignore` leaves out is left out.
+const LIST_FILES: &[&str] = &[
+    "ls-files",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+    "-z",
 ];
 
 /// Errors of `cat-file` for a path that does not exist at the revision.
@@ -256,6 +267,59 @@ fn top_level(
     #[cfg(unix)]
     let paths = (top.clone(), top);
     Ok(Some(paths))
+}
+
+/// The top level of the work tree holding `folder`, as Git in `environment` names it (links
+/// resolved), and `folder`'s path below it (`a/b/`, empty at the top level); `None` when
+/// `folder` is not inside a work tree.
+pub(crate) fn work_tree_of(
+    environment: &ContentEnvironment,
+    folder: &str,
+) -> Result<Option<(String, String)>, Failure> {
+    let run = git(environment, folder, WORK_TREE, MAX_TOP_LEVEL_BYTES)?;
+    if !run.success {
+        if run.stderr.contains("not a git repository")
+            || run.stderr.contains("must be run in a work tree")
+        {
+            return Ok(None);
+        }
+        return Err(run.failure("could not find the repository"));
+    }
+    let output = String::from_utf8_lossy(&run.stdout);
+    let mut lines = output.lines();
+    let Some(top) = lines.next().filter(|top| !top.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        top.to_owned(),
+        lines.next().unwrap_or("").to_owned(),
+    )))
+}
+
+/// The files of the work tree whose top level is `top` that Git tracks or would add, as
+/// paths relative to it, `/`-separated, each once. A listing cut at its size limit keeps
+/// its complete records.
+pub(crate) fn list_files(
+    environment: &ContentEnvironment,
+    top: &str,
+) -> Result<Vec<String>, Failure> {
+    let site = Site::of(environment, top);
+    let run = listing(
+        git(
+            &site.environment,
+            &site.folder,
+            LIST_FILES,
+            MAX_LISTING_BYTES,
+        )?,
+        "could not list the repository's files",
+    )?;
+    let mut files: Vec<String> = records(&run.stdout)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // An unmerged file is listed once per stage, one after another.
+    files.dedup();
+    Ok(files)
 }
 
 /// The local and remote-tracking branches of the repository whose top level is `repo`.

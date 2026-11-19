@@ -1186,6 +1186,26 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, message),
                     }
                 }
+                ClientMessage::ProjectIcon { project } => match without_target(target.as_ref()) {
+                    Ok(()) => sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::ProjectIconFound {
+                            icon: crate::project::icon(&project),
+                        },
+                    })?,
+                    Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                },
+                ClientMessage::SearchProjectFiles { project, query } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| crate::project::search_files(&project, &query))
+                    {
+                        Ok((paths, indexing)) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ProjectFilesSearched { paths, indexing },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::ListContentDirectory { environment, path } => {
                     match without_target(target.as_ref())
                         .and_then(|()| content_files::list_directory(&environment, &path))

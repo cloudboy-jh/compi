@@ -6,9 +6,9 @@ use crate::{
     ErrorCode, FileContent, FileState, FileVersion, GitAction, GitBranches, GitChanges,
     GitCommitLookup, GitFileContent, GitRevision, GitWriteResult, IMAGE_UPLOAD_CHUNK_BYTES,
     MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION,
-    RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId, SurfaceInfo,
-    SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot, decode_server,
-    decode_terminal_frame, encode_client,
+    Project, ProjectIconImage, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId,
+    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
+    decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
@@ -931,6 +931,33 @@ impl DaemonClient {
             query,
         })? {
             ServerMessage::DirectorySearched { entries } => Ok(entries),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// The icon image `project`'s folder holds, if it holds one.
+    pub fn project_icon(&mut self, project: Project) -> Result<Option<ProjectIconImage>> {
+        match self.request_bounded(
+            ClientMessage::ProjectIcon { project },
+            Duration::from_secs(10),
+        )? {
+            ServerMessage::ProjectIconFound { icon } => Ok(icon),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Files of `project` matching `query`, best first, and whether its file list is still
+    /// being read.
+    pub fn search_project_files(
+        &mut self,
+        project: Project,
+        query: String,
+    ) -> Result<(Vec<String>, bool)> {
+        match self.request_bounded(
+            ClientMessage::SearchProjectFiles { project, query },
+            Duration::from_secs(15),
+        )? {
+            ServerMessage::ProjectFilesSearched { paths, indexing } => Ok((paths, indexing)),
             message => Err(unexpected_response(message)),
         }
     }

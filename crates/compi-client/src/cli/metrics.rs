@@ -1130,6 +1130,7 @@ mod tests {
                     previous_layout: None,
                     merge: None,
                     group: None,
+                    project: None,
                 }],
                 groups: Vec::new(),
             }],

@@ -4,15 +4,17 @@
 //! thread as the palette opens), command registry, project history and a file search
 //! that runs off the UI thread once typing pauses.
 //!
-//! Open file…, Jump to project and Threads open the palette scoped to Files, Projects
-//! or Threads: a chip beside the query that its × or Backspace in an empty query
-//! removes. A thread row's × or Delete (with nothing typed) deletes the thread.
+//! Open file…, Find file in project, Jump to project and Threads open the palette scoped
+//! to Files, Project files, Projects or Threads: a chip beside the query that its × or
+//! Backspace in an empty query removes. A thread row's × or Delete (with nothing typed)
+//! deletes the thread. Project files searches every file of the selected tab's project
+//! in the daemon and, with nothing typed, lists the project's files opened last.
 
 use super::*;
 use crate::chat::{age_label, thread_status, thread_title};
 use crate::project_history::ProjectHistory;
-use compi_protocol::ContentEnvironment;
 use compi_protocol::chat::ThreadInfo;
+use compi_protocol::{ContentEnvironment, Project};
 
 /// Open tabs listed before anything is typed.
 const RECENT_TABS: usize = 8;
@@ -25,17 +27,22 @@ const MATCHED_FILES: usize = 20;
 const SCOPED_FILES: usize = 50;
 const MATCHED_THREADS: usize = 8;
 const SCOPED_THREADS: usize = 100;
+/// How long to wait before asking again while the daemon still reads a project's files.
+const INDEXING_RETRY: Duration = Duration::from_millis(700);
 /// How long typing must pause before the folder is searched.
 const FILE_SEARCH_DELAY: Duration = Duration::from_millis(120);
 
 static NEXT_FILE_SEARCH: AtomicU64 = AtomicU64::new(1);
 static NEXT_THREAD_LISTING: AtomicU64 = AtomicU64::new(1);
+static NEXT_PROJECT_SEARCH: AtomicU64 = AtomicU64::new(1);
 
 /// What the palette lists: everything, or only one kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Scope {
     Projects,
     Files,
+    /// Every file of the selected tab's project.
+    ProjectFiles,
     Threads,
 }
 
@@ -44,6 +51,7 @@ impl Scope {
         match self {
             Self::Projects => "Projects",
             Self::Files => "Files",
+            Self::ProjectFiles => "Project files",
             Self::Threads => "Threads",
         }
     }
@@ -119,6 +127,22 @@ pub(super) enum Threads<'a> {
     Failed(&'a str),
 }
 
+/// Where the project's file search for the current query stands.
+#[derive(Clone, Copy)]
+pub(super) enum ProjectFiles<'a> {
+    /// The selected tab has no project.
+    NoProject,
+    /// Nothing typed: the project's files opened last, most recent first.
+    Recent(&'a [FileHit]),
+    Searching,
+    /// `indexing`: the daemon is still reading the project's files, so more may match.
+    Found {
+        hits: &'a [FileHit],
+        indexing: bool,
+    },
+    Failed(&'a str),
+}
+
 pub(super) struct Sources<'a> {
     pub tabs: &'a [TabEntry],
     /// Every command the palette offers, in registry order.
@@ -127,6 +151,8 @@ pub(super) struct Sources<'a> {
     /// Why a new tab cannot open now, which disables project rows.
     pub project_reason: Option<&'a str>,
     pub files: Files<'a>,
+    /// The Project files scope's rows.
+    pub project_files: ProjectFiles<'a>,
     /// Newest first, as the daemon lists them.
     pub threads: Threads<'a>,
     /// Now, in milliseconds since the epoch, for the threads' ages.
@@ -281,7 +307,54 @@ pub(super) fn choices(query: &str, scope: Option<Scope>, sources: &Sources) -> V
         };
         push_group(&mut groups, GroupKind::Files, "Files", rows, note);
     }
+    if scope == Some(Scope::ProjectFiles) {
+        let (rows, note) = project_file_rows(query, sources.project_files);
+        push_group(&mut groups, GroupKind::Files, "Project files", rows, note);
+    }
     groups
+}
+
+/// The Project files group's rows: the file's name, then its folder within the project;
+/// and the note in place of rows still to come or none matching, or while the daemon
+/// still reads the project's files.
+fn project_file_rows(query: &str, files: ProjectFiles) -> (Vec<Row>, Option<String>) {
+    let rows = |hits: &[FileHit]| -> Vec<Row> {
+        hits.iter()
+            .take(SCOPED_FILES)
+            .map(|hit| Row {
+                title: content::file_name(&hit.path).to_owned(),
+                detail: hit
+                    .relative
+                    .rsplit_once(['/', '\\'])
+                    .map_or("", |(folder, _)| folder)
+                    .to_owned(),
+                reason: None,
+                target: Target::File(hit.path.clone()),
+            })
+            .collect()
+    };
+    match files {
+        ProjectFiles::NoProject => (Vec::new(), Some("This tab has no project yet".to_owned())),
+        ProjectFiles::Recent(hits) => {
+            let rows = rows(hits);
+            let note = rows
+                .is_empty()
+                .then(|| "No files opened in this project yet; type to search it".to_owned());
+            (rows, note)
+        }
+        ProjectFiles::Searching => (Vec::new(), Some("Searching files…".to_owned())),
+        ProjectFiles::Failed(error) => (Vec::new(), Some(format!("Cannot search files: {error}"))),
+        ProjectFiles::Found { hits, indexing } => {
+            let rows = rows(hits);
+            let note = if indexing {
+                Some("Still reading this project's files; more may match".to_owned())
+            } else {
+                rows.is_empty()
+                    .then(|| format!("No file matches “{query}”"))
+            };
+            (rows, note)
+        }
+    }
 }
 
 /// The Threads group's rows for `query` and, when `scoped`, the note in place of rows
@@ -383,13 +456,15 @@ fn relative_path(path: &str, folder: &str) -> String {
         .to_owned()
 }
 
-/// The palette's state beyond its query: the scope chip, the file search and the
+/// The palette's state beyond its query: the scope chip, the file searches and the
 /// threads.
 #[derive(Default)]
 pub(in crate::gui) struct PaletteState {
     scope: Option<Scope>,
     /// The focused pane's folder when the palette opened, if it can be searched.
     files: Option<FileSearch>,
+    /// The selected tab's project when the palette opened, if it has one.
+    project: Option<ProjectSearch>,
     threads: ThreadList,
     /// The listing a reply must answer to be shown; earlier ones are stale.
     threads_request: u64,
@@ -422,6 +497,24 @@ enum FileState {
     Failed(String),
 }
 
+struct ProjectSearch {
+    project: Project,
+    /// The pane files open beside: the selected tab's focused pane.
+    pane_id: Option<PaneId>,
+    /// The query `state` answers.
+    query: String,
+    /// The search a reply must carry to be shown; earlier ones are stale.
+    request: Arc<AtomicU64>,
+    state: ProjectFileState,
+}
+
+enum ProjectFileState {
+    Idle,
+    Searching,
+    Found { hits: Vec<FileHit>, indexing: bool },
+    Failed(String),
+}
+
 impl CompiApp {
     /// Opens the palette, scoped to one kind or listing everything, and lists the
     /// daemon's threads.
@@ -438,9 +531,20 @@ impl CompiApp {
                 state: FileState::Idle,
             })
         });
+        let project = self
+            .selected_tab()
+            .and_then(|tab| tab.project.clone())
+            .map(|project| ProjectSearch {
+                project,
+                pane_id: self.focused_pane().cloned(),
+                query: String::new(),
+                request: Arc::new(AtomicU64::new(0)),
+                state: ProjectFileState::Idle,
+            });
         self.palette = PaletteState {
             scope,
             files,
+            project,
             ..PaletteState::default()
         };
         self.list_palette_threads(cx);
@@ -564,9 +668,10 @@ impl CompiApp {
         }
     }
 
-    /// Searches the folder for the new query once typing pauses; a reply to an older
-    /// query is dropped.
+    /// Searches the folder, or in the Project files scope the project, for the new query
+    /// once typing pauses; a reply to an older query is dropped.
     pub(super) fn palette_query_changed(&mut self) {
+        self.search_palette_project();
         let wants_files = self.palette.scope.is_none_or(|scope| scope == Scope::Files);
         let query = self.ime_text.trim().to_owned();
         let Some(search) = self.palette.files.as_mut() else {
@@ -602,6 +707,87 @@ impl CompiApp {
             .map_err(|error| error.to_string());
             sender.send(UiEvent::PaletteFilesSearched { request, result });
         });
+    }
+
+    /// The Project files scope's search: once typing pauses, then again every
+    /// [`INDEXING_RETRY`] while the daemon still reads the project's files, until the
+    /// query changes or the palette closes.
+    fn search_palette_project(&mut self) {
+        let wanted = self.palette.scope == Some(Scope::ProjectFiles);
+        let query = self.ime_text.trim().to_owned();
+        let Some(search) = self.palette.project.as_mut() else {
+            return;
+        };
+        if query.is_empty() || !wanted {
+            search.request.store(0, Ordering::Relaxed);
+            search.query.clear();
+            search.state = ProjectFileState::Idle;
+            return;
+        }
+        if search.query == query && !matches!(search.state, ProjectFileState::Idle) {
+            return;
+        }
+        let request = NEXT_PROJECT_SEARCH.fetch_add(1, Ordering::Relaxed);
+        search.request.store(request, Ordering::Relaxed);
+        search.query = query.clone();
+        search.state = ProjectFileState::Searching;
+        let latest = search.request.clone();
+        let project = search.project.clone();
+        let target = self.target.clone();
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            thread::sleep(FILE_SEARCH_DELAY);
+            // Only the palette still holding this search wants its answers.
+            while latest.load(Ordering::Relaxed) == request && Arc::strong_count(&latest) > 1 {
+                let result = (|| -> crate::Result<_> {
+                    target
+                        .connect()?
+                        .search_project_files(project.clone(), query.clone())
+                })()
+                .map_err(|error| error.to_string());
+                let indexing = matches!(result, Ok((_, true)));
+                if !sender.send(UiEvent::PaletteProjectFilesSearched { request, result })
+                    || !indexing
+                {
+                    return;
+                }
+                thread::sleep(INDEXING_RETRY);
+            }
+        });
+    }
+
+    pub(super) fn palette_project_files_searched(
+        &mut self,
+        request: u64,
+        result: Result<(Vec<String>, bool), String>,
+    ) {
+        let open = matches!(self.overlay, Some(Overlay::Palette));
+        let Some(search) = self
+            .palette
+            .project
+            .as_mut()
+            .filter(|search| search.request.load(Ordering::Relaxed) == request)
+        else {
+            return;
+        };
+        if !open {
+            // Stops asking again while the daemon reads the project.
+            search.request.store(0, Ordering::Relaxed);
+            return;
+        }
+        search.state = match result {
+            Ok((paths, indexing)) => ProjectFileState::Found {
+                hits: paths
+                    .into_iter()
+                    .map(|path| FileHit {
+                        relative: relative_path(&path, &search.project.root),
+                        path,
+                    })
+                    .collect(),
+                indexing,
+            },
+            Err(error) => ProjectFileState::Failed(error),
+        };
     }
 
     pub(super) fn palette_files_searched(
@@ -694,6 +880,28 @@ impl CompiApp {
             ThreadList::Listed(threads) => Threads::Listed(threads),
             ThreadList::Failed(error) => Threads::Failed(error),
         };
+        let recent: Vec<FileHit> = match &self.palette.project {
+            Some(search) if matches!(search.state, ProjectFileState::Idle) => self
+                .state
+                .recent_project_files(&search.project)
+                .iter()
+                .map(|path| FileHit {
+                    relative: relative_path(path, &search.project.root),
+                    path: path.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let project_files = match self.palette.project.as_ref().map(|search| &search.state) {
+            None => ProjectFiles::NoProject,
+            Some(ProjectFileState::Idle) => ProjectFiles::Recent(&recent),
+            Some(ProjectFileState::Searching) => ProjectFiles::Searching,
+            Some(ProjectFileState::Found { hits, indexing }) => ProjectFiles::Found {
+                hits,
+                indexing: *indexing,
+            },
+            Some(ProjectFileState::Failed(error)) => ProjectFiles::Failed(error),
+        };
         choices(
             &self.ime_text,
             self.palette.scope,
@@ -703,6 +911,7 @@ impl CompiApp {
                 projects: &self.state.project_history,
                 project_reason: Command::NewTab.disabled_reason(&context),
                 files,
+                project_files,
                 threads,
                 now_ms: crate::chat::now_ms(),
             },
@@ -807,13 +1016,35 @@ impl CompiApp {
         self.focus_pane(pane_id);
     }
 
-    /// Opens a found file in the editor beside the pane the palette searched from.
+    /// Opens a found file in the editor beside the pane the palette searched from; a
+    /// project's file beside the selected tab's focused pane, rooted at the project.
     pub(super) fn open_palette_file(
         &mut self,
         path: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.palette.scope == Some(Scope::ProjectFiles) {
+            let Some(search) = self.palette.project.as_ref() else {
+                return;
+            };
+            let Some(pane_id) = search.pane_id.clone() else {
+                self.global_error = Some("Select a pane first".into());
+                return;
+            };
+            let project = search.project.clone();
+            self.open_content_file(
+                &pane_id,
+                project.environment,
+                Some(project.root),
+                Some(path),
+                None,
+                false,
+                window,
+                cx,
+            );
+            return;
+        }
         let Some(search) = self.palette.files.as_ref() else {
             return;
         };
@@ -832,6 +1063,58 @@ impl CompiApp {
             window,
             cx,
         );
+    }
+
+    /// The project whose icon leads a palette row: a tab's (and its panes'), a thread's,
+    /// or a visited folder taken as a project's root. `None` for rows without one.
+    pub(super) fn palette_row_project(&self, action: &ChoiceAction) -> Option<Option<Project>> {
+        match action {
+            ChoiceAction::Tab(tab_id) | ChoiceAction::Pane(tab_id, _) => Some(
+                self.workspace
+                    .as_ref()?
+                    .sessions
+                    .iter()
+                    .flat_map(|session| &session.tabs)
+                    .find(|tab| &tab.id == tab_id)?
+                    .project
+                    .clone(),
+            ),
+            ChoiceAction::Thread(chat) => Some(self.palette_thread(chat)?.project.clone()),
+            ChoiceAction::Project(path) => Some(Some(self.visited_project(path))),
+            _ => None,
+        }
+    }
+
+    /// A visited folder as a project: the tabs' project rooted there, else one in the
+    /// environment the folder's syntax names. A Linux folder on a local Windows host is
+    /// in WSL, in the distribution of the window's WSL terminals.
+    fn visited_project(&self, path: &str) -> Project {
+        let workspace = self.workspace.as_ref();
+        if let Some(project) = workspace
+            .into_iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.tabs)
+            .filter_map(|tab| tab.project.as_ref())
+            .find(|project| project.root == path)
+        {
+            return project.clone();
+        }
+        let distribution = (path.starts_with('/') && self.windows_paths(&ContentEnvironment::Host))
+            .then(|| {
+                workspace?
+                    .surfaces
+                    .iter()
+                    .find_map(|surface| surface.wsl_distribution())
+            })
+            .flatten();
+        Project {
+            environment: distribution.map_or(ContentEnvironment::Host, |distribution| {
+                ContentEnvironment::Wsl {
+                    distribution: distribution.to_owned(),
+                }
+            }),
+            root: path.to_owned(),
+        }
     }
 }
 
@@ -908,6 +1191,7 @@ mod tests {
             project_reason: None,
             files: Files::Found(&hits),
             threads: Threads::Listing,
+            project_files: ProjectFiles::NoProject,
             now_ms: 0,
         };
         // "compi" names a tab, Quit Compi, a project and (in this search) a file.
@@ -962,6 +1246,7 @@ mod tests {
                 project_reason: Some("Select a workspace first"),
                 files: Files::Searching,
                 threads: Threads::Listing,
+                project_files: ProjectFiles::NoProject,
                 now_ms: 0,
             },
         );
@@ -1021,6 +1306,7 @@ mod tests {
                 project_reason: None,
                 files: Files::Unavailable,
                 threads: Threads::Listing,
+                project_files: ProjectFiles::NoProject,
                 now_ms: 0,
             },
         );
@@ -1043,6 +1329,7 @@ mod tests {
                 project_reason: None,
                 files: Files::Unavailable,
                 threads: Threads::Listing,
+                project_files: ProjectFiles::NoProject,
                 now_ms: 0,
             },
         );
@@ -1062,6 +1349,7 @@ mod tests {
             project_reason: None,
             files,
             threads: Threads::Listing,
+            project_files: ProjectFiles::NoProject,
             now_ms: 0,
         };
         let groups = choices("", Some(Scope::Projects), &sources(Files::Found(&hits)));
@@ -1098,6 +1386,7 @@ mod tests {
             project_reason: None,
             files,
             threads: Threads::Listing,
+            project_files: ProjectFiles::NoProject,
             now_ms: 0,
         };
         // Nothing typed: no file group, even with a pending or finished search.
@@ -1129,6 +1418,7 @@ mod tests {
                         project_reason: None,
                         files: Files::Unavailable,
                         threads: Threads::Listing,
+                        project_files: ProjectFiles::NoProject,
                         now_ms: 0,
                     },
                 );
@@ -1171,6 +1461,7 @@ mod tests {
             updated_ms,
             activity,
             terminal: None,
+            project: None,
             open,
         }
     }
@@ -1206,6 +1497,7 @@ mod tests {
             project_reason: None,
             files: Files::Unavailable,
             threads,
+            project_files: ProjectFiles::NoProject,
             now_ms: now,
         };
         let listed = sources(Threads::Listed(&threads));
@@ -1259,5 +1551,113 @@ mod tests {
             note("", Threads::Failed("daemon gone")),
             "Cannot list threads: daemon gone"
         );
+    }
+
+    #[test]
+    fn project_files_list_recent_files_then_matches_with_notes() {
+        let tabs = [tab("t1", "compi build", false)];
+        let commands = commands();
+        let projects = history(&["/work/compi"]);
+        let sources = |project_files| Sources {
+            tabs: &tabs,
+            commands: &commands,
+            projects: &projects,
+            project_reason: None,
+            files: Files::Unavailable,
+            project_files,
+            threads: Threads::Listing,
+            now_ms: 0,
+        };
+        let scoped = |query, project_files| {
+            let groups = choices(query, Some(Scope::ProjectFiles), &sources(project_files));
+            assert_eq!(kinds(&groups), [GroupKind::Files]);
+            let rows = groups[0]
+                .rows
+                .iter()
+                .map(|row| (row.title.clone(), row.detail.clone()))
+                .collect::<Vec<_>>();
+            (rows, groups[0].note.clone())
+        };
+        let recent = [
+            FileHit {
+                path: "/work/compi/crates/client/src/gui.rs".into(),
+                relative: "crates/client/src/gui.rs".into(),
+            },
+            FileHit {
+                path: "/work/compi/README.md".into(),
+                relative: "README.md".into(),
+            },
+        ];
+        // Nothing typed: the project's files opened last, by name then folder.
+        assert_eq!(
+            scoped("", ProjectFiles::Recent(&recent)),
+            (
+                vec![
+                    ("gui.rs".to_owned(), "crates/client/src".to_owned()),
+                    ("README.md".to_owned(), String::new()),
+                ],
+                None
+            )
+        );
+        assert_eq!(
+            scoped("", ProjectFiles::Recent(&[])).1.as_deref(),
+            Some("No files opened in this project yet; type to search it")
+        );
+        assert_eq!(
+            scoped("", ProjectFiles::NoProject),
+            (Vec::new(), Some("This tab has no project yet".to_owned()))
+        );
+        assert_eq!(
+            scoped("gui", ProjectFiles::Searching).1.as_deref(),
+            Some("Searching files…")
+        );
+        // While the daemon still reads the project, matches so far show with a note.
+        let (rows, note) = scoped(
+            "gui",
+            ProjectFiles::Found {
+                hits: &recent[..1],
+                indexing: true,
+            },
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            note.as_deref(),
+            Some("Still reading this project's files; more may match")
+        );
+        assert_eq!(
+            scoped(
+                "zzz",
+                ProjectFiles::Found {
+                    hits: &[],
+                    indexing: false
+                }
+            )
+            .1
+            .as_deref(),
+            Some("No file matches “zzz”")
+        );
+        assert_eq!(
+            scoped("gui", ProjectFiles::Failed("gone")).1.as_deref(),
+            Some("Cannot search files: gone")
+        );
+        // A file hit opens the file; other scopes and the full list leave project files out.
+        let groups = choices(
+            "gui",
+            Some(Scope::ProjectFiles),
+            &sources(ProjectFiles::Recent(&recent)),
+        );
+        assert_eq!(
+            groups[0].rows[0].target,
+            Target::File("/work/compi/crates/client/src/gui.rs".into())
+        );
+        let groups = choices(
+            "gui",
+            None,
+            &sources(ProjectFiles::Found {
+                hits: &recent,
+                indexing: false,
+            }),
+        );
+        assert!(groups.iter().all(|group| group.label != "Project files"));
     }
 }

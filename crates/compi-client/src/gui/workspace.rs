@@ -979,6 +979,7 @@ impl CompiApp {
             overlay_generation: 0,
             overlay_closing_since: None,
             palette: palette::PaletteState::default(),
+            project_icons: Default::default(),
             settings: settings::SettingsUi::default(),
             monitor: monitor::MonitorUi::default(),
             browser: browser::BrowserUi::default(),
@@ -2125,6 +2126,12 @@ impl CompiApp {
             }
             UiEvent::PaletteFilesSearched { request, result } => {
                 self.palette_files_searched(request, result);
+            }
+            UiEvent::ProjectIconFound { project, icon } => {
+                self.project_icons.found(project, icon, cx);
+            }
+            UiEvent::PaletteProjectFilesSearched { request, result } => {
+                self.palette_project_files_searched(request, result);
             }
             UiEvent::ContentListed {
                 pane_id,
@@ -4200,6 +4207,9 @@ impl CompiApp {
             Command::NextChange => self.step_editor_change(true, window, cx),
             Command::PreviousChange => self.step_editor_change(false, window, cx),
             Command::OpenFile => self.open_palette(Some(palette::Scope::Files), cx),
+            Command::FindProjectFile => {
+                self.open_palette(Some(palette::Scope::ProjectFiles), cx);
+            }
             Command::GitFetch | Command::GitPull | Command::GitPush => {
                 let remote = match command {
                     Command::GitFetch => remote::RemoteCommand::Fetch,
@@ -4744,6 +4754,18 @@ struct TabPane {
 }
 
 impl CompiApp {
+    /// The project of the tab holding pane `pane_id`.
+    fn pane_project(&self, pane_id: &PaneId) -> Option<&compi_protocol::Project> {
+        self.workspace
+            .as_ref()?
+            .sessions
+            .iter()
+            .flat_map(|session| &session.tabs)
+            .find(|tab| layout_contains_pane(&tab.layout, pane_id))?
+            .project
+            .as_ref()
+    }
+
     fn tab_panes(&self, tab: &WorkspaceTab) -> Vec<TabPane> {
         crate::arrangement::leaves(&tab.layout)
             .into_iter()
@@ -5514,13 +5536,21 @@ impl CompiApp {
             };
             let (tooltip_title, tooltip_detail) =
                 self.tab_tooltip(tab, &full_title, headline.is_some());
-            let tooltip_detail = match self.tab_group(&tab.id).map(tab_groups::group_title) {
-                Some(group) => Some(match tooltip_detail {
-                    Some(detail) => format!("In {group}\n{detail}").into(),
-                    None => format!("In {group}").into(),
-                }),
-                None => tooltip_detail,
-            };
+            // The tab's project, then its group, above what its panes report.
+            let context = [
+                tab.project
+                    .as_ref()
+                    .map(|project| format!("{} · {}", project.name(), project.root)),
+                self.tab_group(&tab.id)
+                    .map(|group| format!("In {}", tab_groups::group_title(group))),
+            ];
+            let tooltip_detail = context
+                .into_iter()
+                .flatten()
+                .chain(tooltip_detail.map(|detail| detail.to_string()))
+                .reduce(|lines, line| format!("{lines}\n{line}"))
+                .map(SharedString::from);
+            let project_icon = self.project_icon(tab.project.as_ref(), 14.0);
             // Not over its own menu or while the tab is dragged.
             let tooltip = self.tab_menu.is_none()
                 && self.context_menu.is_none()
@@ -5603,6 +5633,7 @@ impl CompiApp {
                         .flex()
                         .items_center()
                         .gap_2()
+                        .child(project_icon)
                         .children(program_status)
                         .child(
                             div()

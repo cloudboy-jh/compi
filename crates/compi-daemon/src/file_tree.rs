@@ -189,6 +189,52 @@ fn search_root(root: Root, query: &str) -> Result<Vec<SearchEntry>> {
     Ok(matches)
 }
 
+/// The files below `root` as root-relative, `/`-separated paths, leaving out folders named
+/// in `skip`, within the search limits: `MAX_SEARCH_ENTRIES` entries read, folders up to
+/// `MAX_SEARCH_DEPTH` deep and `MAX_SCAN_TIME`. A limit stops the walk with what it read;
+/// unreadable folders are passed over. `found` gets each file as it is read.
+pub(crate) fn walk_files(root: Root, skip: &[&str], found: &mut dyn FnMut(String)) {
+    let started = Instant::now();
+    let mut count = 0;
+    let mut pending = vec![(root.host, root.shell, String::new(), 0_usize)];
+    while let Some((host, shell, relative, depth)) = pending.pop() {
+        #[cfg(windows)]
+        let mut host = host;
+        let entries = match scan_directory(
+            #[cfg(windows)]
+            &mut host,
+            #[cfg(not(windows))]
+            host.as_path(),
+            &shell,
+            #[cfg(windows)]
+            root.distribution.as_deref(),
+            started,
+            &mut count,
+            MAX_SEARCH_ENTRIES,
+            depth > 0,
+        ) {
+            Ok(entries) => entries,
+            Err(_) if count > MAX_SEARCH_ENTRIES || started.elapsed() >= MAX_SCAN_TIME => return,
+            Err(_) => continue,
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            let relative_path = if relative.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{relative}/{}", entry.name)
+            };
+            if !entry.is_directory {
+                found(relative_path);
+            } else if depth < MAX_SEARCH_DEPTH && !skip.contains(&entry.name.as_str()) {
+                let shell_path = format!("{}/{}", shell.trim_end_matches('/'), entry.name);
+                children.push((host.join(&entry.name), shell_path, relative_path, depth + 1));
+            }
+        }
+        pending.extend(children.into_iter().rev());
+    }
+}
+
 fn scan_directory(
     #[cfg(windows)] host: &mut PathBuf,
     #[cfg(not(windows))] host: &std::path::Path,

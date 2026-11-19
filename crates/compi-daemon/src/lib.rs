@@ -8,6 +8,7 @@ mod git;
 pub mod launch;
 pub mod metadata;
 mod program_status;
+mod project;
 mod prompt;
 pub mod pty;
 pub mod screen;

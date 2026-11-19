@@ -1922,6 +1922,17 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A file opened in its tab's project counts among the project's recent files.
+        if let Some(file) = &file
+            && let Some(project) = self
+                .pane_project(beside)
+                .filter(|project| project.environment == environment)
+                .filter(|project| root_contains(&project.root, file))
+                .cloned()
+        {
+            self.state.remember_project_file(&project, file);
+            self.save_state();
+        }
         let Some(tab) = self.workspace.as_ref().and_then(|workspace| {
             workspace
                 .sessions

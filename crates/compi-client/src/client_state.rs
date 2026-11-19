@@ -13,7 +13,7 @@ use crate::{
     theme::{BackgroundEffect, ThemeId},
 };
 use compi_protocol::{
-    ContentEnvironment, LayoutNode, PaneId, ServerId, SessionId, TabId, TerminalIdentity,
+    ContentEnvironment, LayoutNode, PaneId, Project, ServerId, SessionId, TabId, TerminalIdentity,
     WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,19 @@ pub struct ReadFile {
 /// The most addresses a window remembers for a blank Browser pane's Recent list.
 pub const MAX_RECENT_ADDRESSES: usize = 5;
 
+/// The most files a window remembers opening per project, for Find file in project.
+pub const MAX_PROJECT_FILES: usize = 20;
+/// The most projects a window remembers files of.
+pub const MAX_FILE_PROJECTS: usize = 32;
+
+/// Files opened in a project's editor, most recent first: absolute paths in the
+/// project's environment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentProjectFiles {
+    pub project: Project,
+    pub paths: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientState {
     pub version: u32,
@@ -209,6 +222,10 @@ pub struct ClientState {
     /// host and port; a `file:` URL is its own). Additive; at most `MAX_RECENT_ADDRESSES`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_addresses: Vec<String>,
+    /// Projects' files opened last, the project used most recently first. Additive; at
+    /// most `MAX_FILE_PROJECTS` projects of `MAX_PROJECT_FILES` files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_files: Vec<RecentProjectFiles>,
 }
 
 impl Default for ClientState {
@@ -231,6 +248,7 @@ impl Default for ClientState {
             monitor_columns: ColumnLayout::default(),
             read_files: Vec::new(),
             recent_addresses: Vec::new(),
+            project_files: Vec::new(),
         }
     }
 }
@@ -266,6 +284,36 @@ impl ClientState {
             .retain(|recent| !address_site(recent).eq_ignore_ascii_case(site));
         self.recent_addresses.insert(0, url.to_owned());
         self.recent_addresses.truncate(MAX_RECENT_ADDRESSES);
+    }
+
+    /// Remembers `path` as the file opened last in `project`, dropping the oldest past
+    /// `MAX_PROJECT_FILES`, and the project as the one used last, dropping the oldest
+    /// past `MAX_FILE_PROJECTS`.
+    pub fn remember_project_file(&mut self, project: &Project, path: &str) {
+        let mut files = match self
+            .project_files
+            .iter()
+            .position(|files| files.project == *project)
+        {
+            Some(index) => self.project_files.remove(index),
+            None => RecentProjectFiles {
+                project: project.clone(),
+                paths: Vec::new(),
+            },
+        };
+        files.paths.retain(|known| known != path);
+        files.paths.insert(0, path.to_owned());
+        files.paths.truncate(MAX_PROJECT_FILES);
+        self.project_files.insert(0, files);
+        self.project_files.truncate(MAX_FILE_PROJECTS);
+    }
+
+    /// The files opened last in `project`, most recent first.
+    pub fn recent_project_files(&self, project: &Project) -> &[String] {
+        self.project_files
+            .iter()
+            .find(|files| files.project == *project)
+            .map_or(&[], |files| &files.paths)
     }
 
     pub fn selected_session<'a>(
@@ -687,6 +735,7 @@ impl ClientState {
         self.monitor_columns = source.monitor_columns.clone();
         self.read_files = source.read_files.clone();
         self.recent_addresses = source.recent_addresses.clone();
+        self.project_files = source.project_files.clone();
         self.selected_session = None;
         self.selected_tabs.clear();
         self.focused_panes.clear();
@@ -808,6 +857,13 @@ impl ClientState {
                 + self.hidden_tabs.len()
                 + self.viewports.len();
         changed |= self.project_history.sanitize();
+        let project_files = self.project_files.len();
+        self.project_files.truncate(MAX_FILE_PROJECTS);
+        for files in &mut self.project_files {
+            changed |= files.paths.len() > MAX_PROJECT_FILES;
+            files.paths.truncate(MAX_PROJECT_FILES);
+        }
+        changed |= project_files != self.project_files.len();
         let floating = self.floating.clone();
         let mut floated = HashSet::new();
         self.floating.retain(|float| {
@@ -1430,6 +1486,7 @@ mod tests {
                                 previous_layout: None,
                                 merge: None,
                                 group: None,
+                                project: None,
                             }
                         })
                         .collect(),
@@ -1990,6 +2047,7 @@ mod tests {
             previous_layout: None,
             merge: None,
             group: None,
+            project: None,
         });
         state.reconcile(Some(&previous), &workspace);
         assert_eq!(state.focused_pane(&workspace), Some(&agent));
@@ -2118,6 +2176,53 @@ mod tests {
         assert!(!slot.state.reads_file(&host, "/n/2.md"));
         assert!(slot.state.reads_file(&host, "/n/1.md"));
         assert!(slot.state.reads_file(&host, "/n/extra.md"));
+        let expected = slot.state.clone();
+        slot.save().unwrap();
+        drop(slot);
+        let slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        assert_eq!(slot.state, expected);
+    }
+
+    #[test]
+    fn project_files_keep_the_latest_per_project_and_survive_restart() {
+        let directory = Directory::new();
+        let mut slot = StateSlot::claim_in(&directory.0, &ClientState::default()).unwrap();
+        let project = |root: &str| Project {
+            environment: ContentEnvironment::Host,
+            root: root.into(),
+        };
+        let (compi, other) = (project("/work/compi"), project("/work/other"));
+        slot.state.remember_project_file(&compi, "/work/compi/a.rs");
+        slot.state.remember_project_file(&other, "/work/other/x.rs");
+        slot.state.remember_project_file(&compi, "/work/compi/b.rs");
+        // Opening a file again moves it to the front.
+        slot.state.remember_project_file(&compi, "/work/compi/a.rs");
+        assert_eq!(
+            slot.state.recent_project_files(&compi),
+            ["/work/compi/a.rs", "/work/compi/b.rs"]
+        );
+        assert_eq!(
+            slot.state.recent_project_files(&other),
+            ["/work/other/x.rs"]
+        );
+        assert!(
+            slot.state
+                .recent_project_files(&project("/work/none"))
+                .is_empty()
+        );
+        for index in 0..=MAX_PROJECT_FILES {
+            slot.state
+                .remember_project_file(&compi, &format!("/work/compi/{index}.rs"));
+        }
+        assert_eq!(
+            slot.state.recent_project_files(&compi).len(),
+            MAX_PROJECT_FILES
+        );
+        for index in 0..=MAX_FILE_PROJECTS {
+            slot.state
+                .remember_project_file(&project(&format!("/p/{index}")), "/p/f.rs");
+        }
+        assert_eq!(slot.state.project_files.len(), MAX_FILE_PROJECTS);
         let expected = slot.state.clone();
         slot.save().unwrap();
         drop(slot);

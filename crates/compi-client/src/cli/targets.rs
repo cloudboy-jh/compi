@@ -357,6 +357,7 @@ mod tests {
                     previous_layout: None,
                     merge: None,
                     group: Some(TabGroupId::new(format!("group-{id}"))),
+                    project: None,
                 }],
                 groups: vec![TabGroup {
                     id: TabGroupId::new(format!("group-{id}")),

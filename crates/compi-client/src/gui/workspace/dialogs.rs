@@ -59,10 +59,11 @@ impl CompiApp {
     }
 
     /// The overlay's choices under their group headings, at most `max_height` tall.
-    /// Palette rows lead with their kind's icon; a note (Searching files…) follows the
-    /// last group's rows.
+    /// Palette rows lead with their project's icon, their file's language icon or their
+    /// kind's; a note (Searching files…) follows the last group's rows.
     pub(super) fn render_choice_rows(&self, max_height: f32, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
+        let dark = self.theme.is_dark();
         let palette = matches!(self.overlay, Some(Overlay::Palette));
         let (choices, note) = if palette {
             self.palette_choices(cx)
@@ -99,25 +100,36 @@ impl CompiApp {
             } else {
                 None
             };
-            // A thread row leads with its harness's mark and ends with a dot while it
-            // works or waits, then × to delete it.
+            // A thread row ends with a dot while it works or waits, then × to delete it.
             let thread = match &choice.action {
                 ChoiceAction::Thread(chat) if palette => self.palette_thread(chat),
                 _ => None,
             };
-            let mark = thread.map(|thread| super::chat::harness_mark(thread.chat.harness));
             let dot = thread.and_then(|thread| match thread.activity {
                 ThreadActivity::Working => Some(colors.accent),
                 ThreadActivity::Waiting => Some(colors.modified),
                 ThreadActivity::Idle => None,
             });
             let delete = thread.map(|thread| thread.chat.id.clone());
-            let icon = (palette && mark.is_none()).then_some(match &choice.action {
-                ChoiceAction::Command(_) => IconName::Command,
-                ChoiceAction::Project(_) => IconName::Folder,
-                ChoiceAction::File(_) => IconName::File,
-                _ => IconName::SquareTerminal,
-            });
+            // Tab, pane, thread and project rows lead with their project's icon, a file
+            // with its language's, the rest with their kind's.
+            let leading: Option<AnyElement> = if !palette {
+                None
+            } else if let Some(project) = self.palette_row_project(&choice.action) {
+                Some(self.project_icon(project.as_ref(), 14.0))
+            } else {
+                let glyph = |icon| controls::glyph(icon, muted).into_any_element();
+                Some(match &choice.action {
+                    ChoiceAction::Command(_) => glyph(IconName::Command),
+                    ChoiceAction::File(path) => {
+                        match content::language_icon(content::LanguageHint::Path(path)) {
+                            Some(icon) => icon.image(dark).into_any_element(),
+                            None => glyph(IconName::File),
+                        }
+                    }
+                    _ => glyph(IconName::SquareTerminal),
+                })
+            };
             let (shortcut, detail) = if matches!(&choice.action, ChoiceAction::Command(_)) {
                 ((!choice.detail.is_empty()).then_some(choice.detail), None)
             } else {
@@ -184,24 +196,14 @@ impl CompiApp {
                         cx.notify();
                     }),
                 )
-                .when_some(icon, |row, icon| {
+                .when_some(leading, |row, leading| {
                     row.child(
                         div()
                             .flex_none()
                             .h(px(UI_SMALL_LINE_HEIGHT))
                             .flex()
                             .items_center()
-                            .child(controls::glyph(icon, muted)),
-                    )
-                })
-                .when_some(mark, |row, mark| {
-                    row.child(
-                        div()
-                            .flex_none()
-                            .h(px(UI_SMALL_LINE_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .child(gpui::img(mark).size(px(12.0))),
+                            .child(leading),
                     )
                 })
                 .child(
@@ -978,6 +980,7 @@ impl CompiApp {
                     None => "Search commands, tabs, threads, projects and files",
                     Some(palette::Scope::Projects) => "Search visited folders",
                     Some(palette::Scope::Files) => "Search this folder's files",
+                    Some(palette::Scope::ProjectFiles) => "Search this project's files",
                     Some(palette::Scope::Threads) => "Search threads",
                 },
                 scope.map(|scope| (scope.label(), true)),

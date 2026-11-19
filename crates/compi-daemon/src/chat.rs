@@ -316,6 +316,10 @@ impl ChatHub {
                         .map(|kept| kept.surface_id.clone())
                 });
                 ThreadInfo {
+                    project: crate::project::project_of(
+                        &stored.chat.environment,
+                        &stored.chat.folder,
+                    ),
                     open: held.contains_key(&id),
                     chat: stored.chat,
                     title: stored.title,
@@ -630,6 +634,8 @@ struct Inner {
     dormant: bool,
     /// The transcript is Compi's own, so the session's replay while it loads is left out.
     skip_replay: bool,
+    /// The chat's environment and folder; a turn's end marks its project's files changed.
+    folder: Option<(ContentEnvironment, String)>,
 }
 
 /// When a thread began, and when its transcript last changed.
@@ -718,6 +724,7 @@ impl Chat {
             picks,
             surface,
             held: true,
+            folder: Some((content.environment.clone(), content.folder.clone())),
             ..Inner::default()
         };
         if let Some(thread) = thread {
@@ -1963,6 +1970,9 @@ impl Inner {
     /// permission or question any more.
     fn end_turn(&mut self) {
         self.end_thought();
+        if let Some((environment, folder)) = &self.folder {
+            crate::project::files_changed(environment, folder);
+        }
         let now = now_ms();
         let open: Vec<usize> = self
             .state

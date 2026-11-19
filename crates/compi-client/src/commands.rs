@@ -141,7 +141,8 @@ registry! {
     BrowseFiles, "browse_files", "Toggle view", Some("cmd-shift-e"), Some("ctrl-shift-e");
     JumpProject, "jump_project", "Jump to project…", None, None;
     ShowFiles, "show_files", "Files", None, None;
-    OpenFile, "open_file", "Open file…", Some("cmd-p"), Some("ctrl-shift-o");
+    OpenFile, "open_file", "Open file…", None, Some("ctrl-shift-o");
+    FindProjectFile, "find_project_file", "Find file in project", Some("cmd-p"), Some("ctrl-p");
     NewEditor, "new_editor", "New editor", None, None;
     ShowChanges, "show_changes", "Changes", None, None;
     DiffThisFile, "diff_this_file", "Diff this file", Some("ctrl-shift-d"), Some("ctrl-shift-d");
@@ -346,7 +347,9 @@ impl Command {
             | BrowserForward | BrowserReload | FocusAddressBar => CommandCategory::Panes,
             ShowFiles | ShowChanges | DiffThisFile | ToggleMarkdownRead | NextChange
             | PreviousChange | GitFetch | GitPull | GitPush | SwitchBranch | CreateBranch
-            | OpenFile | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
+            | OpenFile | FindProjectFile | NewEditor | RecoverUnsavedEdits => {
+                CommandCategory::Files
+            }
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
             Copy | SendSelectionToChat | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut
@@ -431,6 +434,9 @@ impl Command {
             ),
             OpenFile => Some(
                 "Searches this pane's folder in the palette and opens a file in the editor; your terminal gets no input.",
+            ),
+            FindProjectFile => Some(
+                "Searches every file of this tab's project, skipping ones Git ignores; with nothing typed, lists the files you opened in it last. In a terminal on Windows and Linux, Ctrl+P stays the shell's.",
             ),
             NewEditor => Some(
                 "Opens this pane's folder in its place, or in a new file pane beside it when the pane already shows something.",
@@ -525,6 +531,7 @@ impl Command {
             SwapPaneLeft | SwapPaneRight | SwapPaneUp | SwapPaneDown => "move exchange layout",
             ShowFiles => "folder browse explorer editor content",
             OpenFile => "quick open find search fuzzy goto editor",
+            FindProjectFile => "quick open find search fuzzy goto project repository files recent",
             JumpProject => "recent folders directories cd z new tab",
             NewEditor => "file folder pane content split",
             ShowChanges => "git diff review status staged unstaged uncommitted",
@@ -657,6 +664,7 @@ impl Command {
                         | ShowChanges
                         | DiffThisFile
                         | OpenFile
+                        | FindProjectFile
                         | RecoverUnsavedEdits
                         | GitFetch
                         | GitPull
@@ -995,7 +1003,8 @@ pub fn resolve_key(
 ) -> KeyRoute {
     match owner {
         // Change navigation and Edit / Read / Diff are the editor's; a terminal keeps those
-        // keys (Ctrl+E is the shell's end of line).
+        // keys (Ctrl+E is the shell's end of line). On Windows and Linux it keeps Ctrl+P
+        // too (the shell's previous command) unless Find file in project was rebound.
         InputOwner::Terminal => match resolve_terminal_key(platform, key, context, overrides) {
             KeyRoute::Command(
                 Command::NextChange
@@ -1010,6 +1019,12 @@ pub fn resolve_key(
                 | Command::ToggleMarkdownRead,
                 _,
             ) => KeyRoute::Terminal,
+            KeyRoute::Command(Command::FindProjectFile)
+            | KeyRoute::Disabled(Command::FindProjectFile, _)
+                if platform != Platform::Mac && !overrides.contains_key("find_project_file") =>
+            {
+                KeyRoute::Terminal
+            }
             route => route,
         },
         InputOwner::Content => resolve_terminal_key(platform, key, context, overrides),
@@ -2032,6 +2047,86 @@ mod tests {
             Some(Command::OpenFile)
         );
         assert!(search("quick open").any(|spec| spec.command == Command::OpenFile));
+    }
+
+    #[test]
+    fn ctrl_p_finds_project_files_except_in_a_terminal_on_windows_and_linux() {
+        let context = ready();
+        let bindings = HashMap::new();
+        let route = |platform, key, owner, bindings: &HashMap<String, String>| {
+            resolve_key(platform, key, owner, &context, bindings)
+        };
+        let find = KeyRoute::Command(Command::FindProjectFile);
+        for platform in [Platform::Windows, Platform::Linux] {
+            // A terminal keeps Ctrl+P, the shell's previous command.
+            assert_eq!(
+                route(platform, ctrl("p"), InputOwner::Terminal, &bindings),
+                KeyRoute::Terminal
+            );
+            for owner in [InputOwner::Content, InputOwner::Editor] {
+                assert_eq!(route(platform, ctrl("p"), owner, &bindings), find);
+            }
+            // Ctrl+Shift+O still opens a file from a terminal.
+            assert_eq!(
+                route(
+                    platform,
+                    ShortcutKey {
+                        shift: true,
+                        ..ctrl("o")
+                    },
+                    InputOwner::Terminal,
+                    &bindings
+                ),
+                KeyRoute::Command(Command::OpenFile)
+            );
+        }
+        // Cmd+P works everywhere on macOS.
+        let cmd_p = ShortcutKey {
+            key: "p",
+            command: true,
+            ..ShortcutKey::default()
+        };
+        for owner in [
+            InputOwner::Terminal,
+            InputOwner::Content,
+            InputOwner::Editor,
+        ] {
+            assert_eq!(route(Platform::Mac, cmd_p, owner, &bindings), find);
+        }
+        // A binding of the user's own reaches the command in a terminal too.
+        let rebound = HashMap::from([("find_project_file".to_owned(), "ctrl-alt-p".to_owned())]);
+        let ctrl_alt_p = ShortcutKey {
+            alt: true,
+            ..ctrl("p")
+        };
+        assert_eq!(
+            route(
+                Platform::Windows,
+                ctrl_alt_p,
+                InputOwner::Terminal,
+                &rebound
+            ),
+            find
+        );
+        assert_eq!(
+            route(Platform::Windows, ctrl("p"), InputOwner::Terminal, &rebound),
+            KeyRoute::Terminal
+        );
+        // Disconnected, Ctrl+P is the terminal's still.
+        let offline = CommandContext {
+            connected: false,
+            ..ready()
+        };
+        assert_eq!(
+            resolve_key(
+                Platform::Windows,
+                ctrl("p"),
+                InputOwner::Terminal,
+                &offline,
+                &bindings
+            ),
+            KeyRoute::Terminal
+        );
     }
 
     #[test]

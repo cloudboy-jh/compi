@@ -335,6 +335,8 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
             previous_layout: None,
             merge: None,
             group: None,
+            // The actor finds its project from the shell's last folder.
+            project: None,
         });
         surfaces.push(SurfaceInfo {
             id: surface_id,
@@ -1140,6 +1142,7 @@ mod tests {
                 previous_layout: None,
                 merge: None,
                 group: None,
+                project: None,
             }],
             groups: Vec::new(),
         });
@@ -1277,6 +1280,7 @@ mod tests {
                 previous_layout: None,
                 merge: None,
                 group: None,
+                project: None,
             }],
             groups: Vec::new(),
         });
@@ -1333,6 +1337,10 @@ mod tests {
                 previous_layout: Some(Box::new(split(&content, &terminal))),
                 merge: None,
                 group: None,
+                project: Some(compi_protocol::Project {
+                    environment: compi_protocol::ContentEnvironment::Host,
+                    root: "/home/user/project".into(),
+                }),
             }],
             groups: Vec::new(),
         });

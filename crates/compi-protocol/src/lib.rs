@@ -89,7 +89,9 @@ use std::fmt;
 // the next prompt (`ChatEntry::Switch`), times each prompt's turn (`ChatEntry::User`'s
 // `sent_ms` and `ended_ms`), rewrites a queued prompt's text (`EditQueuedChat`) and keeps
 // chats as threads after their panes close: `ListThreads` (`Threads`, `ThreadInfo`),
-// `DeleteThread`, and the mutations `OpenThread` and `ForgetThreadTerminal`.
+// `DeleteThread`, and the mutations `OpenThread` and `ForgetThreadTerminal`. Tabs and
+// threads belong to a project (`Project`, `WorkspaceTab::project`, `ThreadInfo::project`),
+// with `ProjectIcon` and `SearchProjectFiles`.
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -314,6 +316,18 @@ pub enum ClientMessage {
     SearchDirectory {
         surface_id: SurfaceId,
         root: String,
+        query: String,
+    },
+    /// The image a project's folder holds for its icon (a favicon or logo), answered by
+    /// `ProjectIconFound`.
+    ProjectIcon {
+        project: Project,
+    },
+    /// Files of `project` whose path relative to its root matches `query` (letters in
+    /// order, not necessarily together), best first, leaving out what Git ignores;
+    /// answered by `ProjectFilesSearched`.
+    SearchProjectFiles {
+        project: Project,
         query: String,
     },
     /// Immediate children of an absolute folder in a content environment.
@@ -608,6 +622,17 @@ pub enum ServerMessage {
     },
     DirectorySearched {
         entries: Vec<SearchEntry>,
+    },
+    ProjectIconFound {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<ProjectIconImage>,
+    },
+    ProjectFilesSearched {
+        /// Absolute paths in the project's environment, best match first.
+        paths: Vec<String>,
+        /// The project's file list is still being read; the answer covers what was read.
+        #[serde(default)]
+        indexing: bool,
     },
     ContentDirectoryListed {
         entries: Vec<DirectoryEntry>,
@@ -1497,6 +1522,34 @@ pub enum ContentEnvironment {
     Wsl { distribution: String },
 }
 
+/// A project: a fixed folder, usually a Git repository's top level, that tabs and threads
+/// belong to wherever their shells `cd`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Project {
+    pub environment: ContentEnvironment,
+    /// Absolute folder in `environment`.
+    pub root: String,
+}
+
+impl Project {
+    /// The name the project goes by: its folder's name.
+    pub fn name(&self) -> &str {
+        self.root
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.root)
+    }
+}
+
+/// A project's icon image: its bytes and their format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectIconImage {
+    pub format: ImageFormat,
+    pub bytes: Vec<u8>,
+}
+
 impl ContentEnvironment {
     /// The environment a terminal runs in, so content opened beside it shows the same files.
     pub fn of_surface(surface: &SurfaceInfo) -> Self {
@@ -2026,6 +2079,10 @@ pub struct WorkspaceTab {
     /// each other in the session's order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<TabGroupId>,
+    /// The project the tab belongs to: where it started, at its Git top level when it
+    /// is in a repository. `None` until the daemon knows where the tab started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
 }
 
 /// A named, coloured run of tabs in a session. A group always holds at least one tab;
@@ -2694,6 +2751,7 @@ mod tests {
                     previous_layout: None,
                     merge: None,
                     group: None,
+                    project: None,
                 }],
                 groups: Vec::new(),
             }],

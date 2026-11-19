@@ -102,6 +102,7 @@ mod tests {
             updated_ms: 0,
             activity: ThreadActivity::Idle,
             terminal: None,
+            project: None,
             open: false,
         };
         assert_eq!(thread_title(&thread), "New thread");

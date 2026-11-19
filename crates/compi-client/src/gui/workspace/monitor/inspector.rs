@@ -967,6 +967,7 @@ mod tests {
             previous_layout: None,
             merge: None,
             group: None,
+            project: None,
         };
         let workspace = WorkspaceSnapshot {
             server_id: ServerId::new("server"),

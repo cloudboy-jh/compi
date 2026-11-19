@@ -86,6 +86,7 @@ mod tests {
             updated_ms: now - 3 * 3_600_000,
             activity: ThreadActivity::Idle,
             terminal: None,
+            project: None,
             open: false,
         }];
         assert_eq!(

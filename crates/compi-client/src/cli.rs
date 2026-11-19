@@ -2585,6 +2585,7 @@ mod tests {
             previous_layout: None,
             merge: None,
             group: None,
+            project: None,
         };
         let session = WorkspaceSession {
             id: SessionId::new("session-1"),
