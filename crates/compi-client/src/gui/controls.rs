@@ -356,6 +356,8 @@ pub(super) struct Control {
     /// The menu this button opened is showing: its tooltip would cover the menu.
     menu_open: bool,
     on_click: Option<ClickHandler>,
+    /// A second icon and label after the label, with the same text.
+    trailing: Option<(Icon, SharedString)>,
 }
 
 /// An icon-only ghost button with `tooltip` as its title and accessible name.
@@ -394,12 +396,23 @@ impl Control {
             tab_stop: true,
             menu_open: false,
             on_click: None,
+            trailing: None,
         }
     }
 
     /// An icon before the label, or the whole face of an icon button.
     pub(super) fn icon(mut self, icon: impl Into<Icon>) -> Self {
         self.icon = Some(icon.into());
+        self
+    }
+
+    /// A second icon and label after the label: the thinking level after the model.
+    pub(super) fn trailing(
+        mut self,
+        icon: impl Into<Icon>,
+        label: impl Into<SharedString>,
+    ) -> Self {
+        self.trailing = Some((icon.into(), label.into()));
         self
     }
 
@@ -524,20 +537,36 @@ impl RenderOnce for Control {
             (None, false) => {}
         }
         if let Some(label) = &self.label {
+            let text_size = ui_rems(size.text_size());
+            let primary = self.variant == Variant::Primary;
+            let accessible = match &self.trailing {
+                Some((_, trailing)) => SharedString::from(format!("{label} {trailing}")),
+                None => label.clone(),
+            };
             button = button
-                .accessibility_label(label.clone())
+                .accessibility_label(accessible)
                 .when(size == ControlSize::Row, |button| button.px_2())
                 .child(
                     div()
                         .min_w_0()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .text_size(ui_rems(size.text_size()))
-                        .when(self.variant == Variant::Primary, |label| {
-                            label.font_weight(FontWeight::MEDIUM)
-                        })
+                        .text_size(text_size)
+                        .when(primary, |label| label.font_weight(FontWeight::MEDIUM))
                         .child(label.clone()),
-                );
+                )
+                .when_some(self.trailing, |button, (icon, trailing)| {
+                    button.child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_size(text_size)
+                            .child(icon.with_size(Size::XSmall))
+                            .child(trailing),
+                    )
+                });
         } else if let Some(tooltip) = &self.tooltip {
             button = button.accessibility_label(tooltip.clone());
         }

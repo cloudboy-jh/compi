@@ -3,7 +3,9 @@
 //! composer with its attachments and its `/` command and `@` file lists, and a row of the
 //! harness's settings, context use and Send or Stop.
 use super::*;
-use compi_protocol::chat::{ChatCommand, ChatOption, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES};
+use compi_protocol::chat::{
+    ChatCommand, ChatOption, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES,
+};
 use controls::MenuEntry;
 
 /// Typing pauses this long before a file search.
@@ -16,12 +18,98 @@ const PICKER_SETTINGS: [&str; 3] = ["model", "thought_level", "mode"];
 const CARD_RADIUS: f32 = 10.0;
 /// The harness's mark in the empty draft.
 const MARK_SIZE: f32 = 14.0;
+/// A paste this long, or one that would make the draft too long to send, is attached as
+/// a text file instead.
+const LARGE_PASTE_BYTES: usize = 32 * 1024;
+/// The side of an attached image's thumbnail.
+const THUMB_SIZE: f32 = 48.0;
+
+/// An image attached to the draft, with its thumbnail.
+pub(super) struct DraftImage {
+    pub(super) image: ChatImage,
+    thumb: Arc<gpui::Image>,
+}
+
+impl DraftImage {
+    /// `bytes` of type `mime`, already small enough to send, named `name`.
+    fn new(name: String, mime: &str, bytes: Vec<u8>) -> Self {
+        use base64::Engine as _;
+        let format = match mime {
+            "image/jpeg" => gpui::ImageFormat::Jpeg,
+            "image/gif" => gpui::ImageFormat::Gif,
+            "image/webp" => gpui::ImageFormat::Webp,
+            _ => gpui::ImageFormat::Png,
+        };
+        Self {
+            image: ChatImage {
+                name,
+                mime: mime.to_owned(),
+                data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            },
+            thumb: Arc::new(gpui::Image::from_bytes(format, bytes)),
+        }
+    }
+
+    /// Frees the thumbnail's decoded frames.
+    pub(super) fn release(&self, cx: &mut App) {
+        gpui::ImageSource::Image(self.thumb.clone()).remove_asset(cx);
+    }
+}
+
+/// Up and Down walking the chat's earlier prompts.
+pub(super) struct Recall {
+    /// How far back from the newest prompt: 0 is the newest.
+    back: usize,
+    /// The prompt shown; editing it ends the walk.
+    text: SharedString,
+}
+
+/// A queued prompt open in the composer for editing, and the draft it set aside.
+pub(super) struct QueuedEdit {
+    pub(super) id: u64,
+    pub(super) draft: SharedString,
+    pub(super) attachments: Vec<String>,
+    pub(super) images: Vec<DraftImage>,
+}
+
+/// The chat's prompts, newest first, a prompt sent twice in a row once.
+fn earlier_prompts(entries: &[ChatEntry]) -> Vec<&str> {
+    let mut prompts: Vec<&str> = Vec::new();
+    for entry in entries.iter().rev() {
+        if let ChatEntry::User { text, .. } = entry {
+            let text = text.trim();
+            if !text.is_empty() && prompts.last() != Some(&text) {
+                prompts.push(text);
+            }
+        }
+    }
+    prompts
+}
+
+/// Keeps pasted `text` as `pasted-text.txt`, in a folder of its own under the system's
+/// temporary folder, for the chat to read.
+fn write_paste(text: &str) -> std::io::Result<std::path::PathBuf> {
+    let folder = std::env::temp_dir()
+        .join("compi-paste")
+        .join(now_ms().to_string());
+    std::fs::create_dir_all(&folder)?;
+    let path = folder.join("pasted-text.txt");
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// `text` as a Markdown code block, fenced with more backticks than any run in it.
+pub(super) fn fenced(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}\n{}\n{fence}", text.trim_end_matches(['\n', '\r']))
+}
 
 /// What was picked or dropped, sorted: files by the path the chat's environment knows
 /// them by, images read, and why any were left out.
 struct PickedAttachments {
     files: Vec<String>,
-    images: Vec<ChatImage>,
+    images: Vec<DraftImage>,
     refused: Option<String>,
 }
 
@@ -32,7 +120,6 @@ fn read_attachments(
     remote: bool,
     picked: Vec<std::path::PathBuf>,
 ) -> PickedAttachments {
-    use base64::Engine as _;
     let mut read = PickedAttachments {
         files: Vec::new(),
         images: Vec::new(),
@@ -49,11 +136,7 @@ fn read_attachments(
                 .map_err(|error| error.to_string())
                 .and_then(|bytes| crate::image_input::chat_image(bytes, MAX_CHAT_IMAGE_BYTES));
             match image {
-                Ok((bytes, mime)) => read.images.push(ChatImage {
-                    name,
-                    mime: mime.to_owned(),
-                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
-                }),
+                Ok((bytes, mime)) => read.images.push(DraftImage::new(name, mime, bytes)),
                 Err(error) => left_out.push(format!("{name} ({error})")),
             }
             continue;
@@ -146,28 +229,31 @@ fn wanted(text: &str, cursor: usize) -> Option<Wanted<'_>> {
 }
 
 /// A `/` command Compi runs itself, whatever the harness; offered unless the harness has
-/// a command of the same name, which then wins.
+/// a command of the same name, which then wins. `/model` always opens Compi's picker,
+/// and a harness command of that name is not listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CompiCommand {
     New,
     Resume,
     Sessions,
+    Model,
 }
 
 impl CompiCommand {
-    const ALL: [Self; 3] = [Self::New, Self::Resume, Self::Sessions];
+    const ALL: [Self; 4] = [Self::New, Self::Resume, Self::Sessions, Self::Model];
 
     fn name(self) -> &'static str {
         match self {
             Self::New => "new",
             Self::Resume => "resume",
             Self::Sessions => "sessions",
+            Self::Model => "model",
         }
     }
 
     fn hint(self) -> Option<&'static str> {
         match self {
-            Self::New => None,
+            Self::New | Self::Model => None,
             Self::Resume | Self::Sessions => Some("[title or id]"),
         }
     }
@@ -177,17 +263,21 @@ impl CompiCommand {
             Self::New => "Start a new session",
             Self::Resume => "Pick an earlier session in this folder to continue",
             Self::Sessions => "List the sessions in this folder",
+            Self::Model => "Pick the model and thinking level",
         }
     }
 
-    /// Whether the harness offers a command of this name.
+    /// Whether the harness offers a command of this name that replaces Compi's.
     fn shadowed(self, harness: &[ChatCommand]) -> bool {
-        harness.iter().any(|command| {
-            command
-                .name
-                .trim_start_matches('/')
-                .eq_ignore_ascii_case(self.name())
-        })
+        self != Self::Model && harness.iter().any(|command| self.named(command))
+    }
+
+    /// Whether `command` has this command's name.
+    fn named(self, command: &ChatCommand) -> bool {
+        command
+            .name
+            .trim_start_matches('/')
+            .eq_ignore_ascii_case(self.name())
     }
 }
 
@@ -243,7 +333,12 @@ fn matching_commands<'a>(harness: &'a [ChatCommand], query: &str) -> Vec<ListedC
         .into_iter()
         .filter(|command| !command.shadowed(harness))
         .map(ListedCommand::Compi)
-        .chain(harness.iter().map(ListedCommand::Harness))
+        .chain(
+            harness
+                .iter()
+                .filter(|command| !CompiCommand::Model.named(command))
+                .map(ListedCommand::Harness),
+        )
         .filter(|command| command.name().to_lowercase().starts_with(&query))
         .take(MAX_COMPLETIONS)
         .collect()
@@ -512,8 +607,9 @@ impl CompiApp {
         }
     }
 
-    /// Completes the highlighted item: a command fills in `/name `, a file becomes an
-    /// attachment and its `@` text goes. Whether there was one.
+    /// Completes the highlighted item: a command fills in `/name ` (`/model`, which takes
+    /// nothing more, runs at once), a file becomes an attachment and its `@` text goes.
+    /// Whether there was one.
     pub(super) fn accept_chat_completion(
         &mut self,
         chat: &str,
@@ -526,6 +622,20 @@ impl CompiApp {
         let Some(completion) = &model.completion else {
             return false;
         };
+        if let CompletionKind::Commands { query } = &completion.kind {
+            let harness = model
+                .state
+                .as_ref()
+                .map(|state| state.commands.as_slice())
+                .unwrap_or_default();
+            if matches!(
+                matching_commands(harness, query).get(completion.highlight),
+                Some(ListedCommand::Compi(CompiCommand::Model))
+            ) {
+                self.run_compi_command(chat, CompiCommand::Model, String::new(), window, cx);
+                return true;
+            }
+        }
         let composer = model.composer.read(cx);
         let (value, cursor) = (composer.value(), composer.cursor());
         let Some(rest) = value.get(cursor..) else {
@@ -842,26 +952,33 @@ impl CompiApp {
             })
             .when_some(
                 state.filter(|state| !state.queued.is_empty()),
-                |footer, state| footer.child(self.render_chat_queue(chat, state, cx)),
+                |footer, state| {
+                    let editing = model.editing.as_ref().map(|edit| edit.id);
+                    footer.child(self.render_chat_queue(chat, state, editing, cx))
+                },
             )
             .child(self.render_chat_card(chat, model, &frame, cx))
             .child(self.render_chat_context(chat, model))
             .into_any_element()
     }
 
-    /// Prompts waiting for the running turn, oldest first, each with × to drop it. A
-    /// queue left after a stopped turn waits for the next prompt.
+    /// Prompts waiting for the running turn, oldest first, each with a pencil to edit it
+    /// in the composer (the one being edited marked) and × to drop it. A queue left after
+    /// a stopped turn waits for the next prompt.
     fn render_chat_queue(
         &self,
         chat: &ChatContent,
         state: &ChatState,
+        editing: Option<u64>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         let held = matches!(state.status, ChatStatus::Ready);
         let rows = state.queued.iter().enumerate().map(|(index, queued)| {
-            let (id, queued_id) = (chat.id.clone(), queued.id);
+            let queued_id = queued.id;
+            let (edit_id, remove_id) = (chat.id.clone(), chat.id.clone());
+            let edited = editing == Some(queued_id);
             let attached = queued.files.len() + queued.images.len();
             let text = queued.text.lines().find(|line| !line.trim().is_empty());
             div()
@@ -870,6 +987,12 @@ impl CompiApp {
                 .gap_2()
                 .pl_2()
                 .rounded(ui_rems(6.0))
+                .border_1()
+                .border_color(color(if edited {
+                    colors.accent
+                } else {
+                    colors.surface
+                }))
                 .bg(color(colors.surface))
                 .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                 .child(
@@ -877,7 +1000,11 @@ impl CompiApp {
                         .flex_none()
                         .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(muted)
-                        .child("Queued"),
+                        .child(if edited {
+                            "Editing · Esc cancels"
+                        } else {
+                            "Queued"
+                        }),
                 )
                 .child(
                     div()
@@ -897,10 +1024,19 @@ impl CompiApp {
                             .child(format!("+{attached} attached")),
                     )
                 })
+                .when(!edited, |row| {
+                    row.child(
+                        icon_button(("chat-queued-edit", index), IconName::SquarePen, "Edit")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.edit_queued_chat(&edit_id, queued_id, window, cx);
+                                cx.notify();
+                            })),
+                    )
+                })
                 .child(
                     icon_button(("chat-queued", index), IconName::Close, "Remove from queue")
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.remove_queued_chat(&id, queued_id, window, cx);
+                            this.remove_queued_chat(&remove_id, queued_id, window, cx);
                             cx.notify();
                         })),
                 )
@@ -1060,7 +1196,7 @@ impl CompiApp {
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 if let Some(model) = this.chat.chats.get_mut(&id) {
                     if image && index < model.images.len() {
-                        model.images.remove(index);
+                        model.images.remove(index).release(cx);
                     } else if !image && index < model.attachments.len() {
                         model.attachments.remove(index);
                     }
@@ -1068,15 +1204,43 @@ impl CompiApp {
                 cx.notify();
             }))
         };
+        // A file outside the chat's folder (a long paste, say) goes by its name.
         let files = model.attachments.iter().enumerate().map(|(index, file)| {
-            rows::file_chip(rows::relative_to(file, &model.folder).into(), &frame.colors)
+            let label = rows::relative_to(file, &model.folder);
+            let label = if label == *file {
+                file.rsplit(['/', '\\']).next().unwrap_or(file).to_owned()
+            } else {
+                label
+            };
+            rows::file_chip(label.into(), &frame.colors)
                 .pr_0()
                 .child(remove(index, false))
         });
-        let images = model.images.iter().enumerate().map(|(index, image)| {
-            rows::image_chip(image.name.clone().into(), &frame.colors)
-                .pr_0()
-                .child(remove(index, true))
+        let images = model.images.iter().enumerate().map(|(index, draft)| {
+            div()
+                .id(("chat-thumb", index))
+                .relative()
+                .flex_none()
+                .size(ui_rems(THUMB_SIZE))
+                .rounded(ui_rems(6.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(color(colors.border))
+                .child(
+                    img(gpui::ImageSource::Image(draft.thumb.clone()))
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .rounded(ui_rems(4.0))
+                        .bg(color(colors.surface))
+                        .child(remove(index, true)),
+                )
+                .tooltip(controls::tooltip(draft.image.name.clone(), None, None))
         });
         div()
             .relative()
@@ -1114,9 +1278,10 @@ impl CompiApp {
                             .pt_2()
                             .flex()
                             .flex_wrap()
+                            .items_end()
                             .gap_1()
-                            .children(files)
-                            .children(images),
+                            .children(images)
+                            .children(files),
                     )
                 },
             )
@@ -1493,7 +1658,17 @@ impl CompiApp {
         });
         let working = state.is_some_and(ChatState::working);
         let id = chat.id.clone();
-        let action = if working {
+        let action = if model.editing.is_some() {
+            icon_button("chat-save-queued", IconName::Check, "Save queued message")
+                .primary()
+                .header()
+                .key("enter")
+                .loading(model.requests > 0)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.send_chat(&id, false, window, cx);
+                    cx.notify();
+                }))
+        } else if working {
             icon_button("chat-stop", IconName::Square, "Stop")
                 .primary()
                 .header()
@@ -1589,7 +1764,11 @@ impl CompiApp {
                 }
                 let mut over_limit = false;
                 for image in read.images {
-                    if model.images.iter().any(|kept| kept.data == image.data) {
+                    if model
+                        .images
+                        .iter()
+                        .any(|kept| kept.image.data == image.image.data)
+                    {
                         continue;
                     }
                     if model.images.len() < MAX_CHAT_IMAGES {
@@ -1675,18 +1854,15 @@ impl CompiApp {
                 };
                 match image {
                     Ok((bytes, mime)) if model.images.len() < MAX_CHAT_IMAGES => {
-                        use base64::Engine as _;
                         let extension = mime.trim_start_matches("image/").replace("jpeg", "jpg");
-                        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-                        if !model.images.iter().any(|kept| kept.data == data) {
-                            model.images.push(ChatImage {
-                                name: format!(
-                                    "Pasted image {}.{extension}",
-                                    model.images.len() + 1
-                                ),
-                                mime: mime.to_owned(),
-                                data,
-                            });
+                        let name = format!("Pasted image {}.{extension}", model.images.len() + 1);
+                        let image = DraftImage::new(name, mime, bytes);
+                        if !model
+                            .images
+                            .iter()
+                            .any(|kept| kept.image.data == image.image.data)
+                        {
+                            model.images.push(image);
                         }
                         model.error = None;
                     }
@@ -1702,6 +1878,250 @@ impl CompiApp {
         })
         .detach();
         true
+    }
+
+    /// Ctrl+V (Cmd+V) with text on the clipboard in chat `chat`'s composer: a paste of
+    /// [`LARGE_PASTE_BYTES`] or more, or one that would make the draft too long to send,
+    /// is attached as a text file instead; with `inline` (Ctrl+Shift+V) it is typed in
+    /// whatever its length. Whether it was handled here; else the field pastes.
+    pub(super) fn paste_chat_text(
+        &mut self,
+        chat: &str,
+        inline: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return false;
+        };
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return false;
+        };
+        if inline {
+            model.composer.update(cx, |composer, cx| {
+                composer.insert(text, window, cx);
+            });
+            self.chat_composer_changed(chat, cx);
+            return true;
+        }
+        let draft = model.composer.read(cx).value().len();
+        if text.len() < LARGE_PASTE_BYTES && draft + text.len() <= MAX_CHAT_PROMPT_BYTES {
+            return false;
+        }
+        match write_paste(&text) {
+            Ok(path) => self.attach_chat_paths(chat, vec![path], cx),
+            Err(error) => {
+                model.error = Some(format!("Could not keep the paste as a file: {error}"))
+            }
+        }
+        true
+    }
+
+    /// Up or Down (`older`) in chat `chat`'s composer walks its earlier prompts: Up in an
+    /// empty draft brings the newest back, Up on a recalled prompt's first line the one
+    /// before it, Down on its last line the one after, and past the newest an empty draft.
+    /// Editing a recalled prompt ends the walk. Whether the key was taken.
+    pub(super) fn recall_chat_prompt(
+        &mut self,
+        chat: &str,
+        older: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return false;
+        };
+        if model.editing.is_some() {
+            return false;
+        }
+        let composer = model.composer.read(cx);
+        let (value, cursor) = (composer.value(), composer.cursor());
+        let walking = model
+            .recall
+            .as_ref()
+            .filter(|recall| recall.text == value)
+            .map(|recall| recall.back);
+        let back = match walking {
+            Some(back) => {
+                let beyond = if older {
+                    value.get(..cursor)
+                } else {
+                    value.get(cursor..)
+                };
+                if beyond.is_none_or(|beyond| beyond.contains('\n')) {
+                    return false;
+                }
+                if older {
+                    back + 1
+                } else if let Some(back) = back.checked_sub(1) {
+                    back
+                } else {
+                    model.recall = None;
+                    model.composer.update(cx, |composer, cx| {
+                        composer.set_value(String::new(), window, cx);
+                    });
+                    return true;
+                }
+            }
+            None if older
+                && value.is_empty()
+                && model.attachments.is_empty()
+                && model.images.is_empty() =>
+            {
+                0
+            }
+            None => return false,
+        };
+        let entries = model
+            .state
+            .as_ref()
+            .map_or(&[][..], |state| state.entries.as_slice());
+        let Some(text) = earlier_prompts(entries)
+            .get(back)
+            .map(|text| SharedString::from(text.to_string()))
+        else {
+            // Up on the oldest stays on it.
+            return walking.is_some();
+        };
+        model.composer.update(cx, |composer, cx| {
+            composer.set_value(text.clone(), window, cx);
+        });
+        model.recall = Some(Recall { back, text });
+        model.completion = None;
+        true
+    }
+
+    /// Opens queued prompt `queued` of chat `chat` in its composer for editing, setting
+    /// the draft and its attachments aside until the edit is saved or dropped.
+    pub(super) fn edit_queued_chat(
+        &mut self,
+        chat: &str,
+        queued: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        let Some(text) = model
+            .state
+            .as_ref()
+            .and_then(|state| state.queued.iter().find(|item| item.id == queued))
+            .map(|item| item.text.clone())
+        else {
+            return;
+        };
+        if model.requests > 0 {
+            return;
+        }
+        model.end_queued_edit(window, cx);
+        let draft = model.composer.read(cx).value();
+        model.editing = Some(QueuedEdit {
+            id: queued,
+            draft,
+            attachments: std::mem::take(&mut model.attachments),
+            images: std::mem::take(&mut model.images),
+        });
+        model.recall = None;
+        model.completion = None;
+        model.composer.update(cx, |composer, cx| {
+            composer.set_value(text.clone(), window, cx);
+            let end = composer.text().offset_to_position(text.len());
+            composer.set_cursor_position(end, window, cx);
+        });
+        window.focus(&model.composer.focus_handle(cx), cx);
+    }
+
+    /// Alt+Up with the caret at the draft's start edits the last queued prompt; whether
+    /// there was one.
+    pub(super) fn edit_last_queued_chat(
+        &mut self,
+        chat: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(model) = self.chat.chats.get(chat) else {
+            return false;
+        };
+        if model.editing.is_some() || model.composer.read(cx).cursor() != 0 {
+            return false;
+        }
+        let Some(last) = model
+            .state
+            .as_ref()
+            .and_then(|state| state.queued.last())
+            .map(|item| item.id)
+        else {
+            return false;
+        };
+        self.edit_queued_chat(chat, last, window, cx);
+        true
+    }
+
+    /// The queued prompt being edited in chat `chat` went to the harness first: the edit
+    /// stays as the draft when nothing was set aside, else the set-aside draft comes back.
+    pub(super) fn settle_queued_edit(
+        &mut self,
+        chat: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        let (Some(edit), Some(state)) = (&model.editing, &model.state) else {
+            return;
+        };
+        if model.requests > 0 || state.queued.iter().any(|item| item.id == edit.id) {
+            return;
+        }
+        if edit.draft.is_empty() && edit.attachments.is_empty() && edit.images.is_empty() {
+            model.editing = None;
+            model.error = Some(
+                "That message went before your edit was saved; the edit is in the message box"
+                    .into(),
+            );
+        } else {
+            model.end_queued_edit(window, cx);
+            model.error = Some("That message went before your edit was saved".into());
+        }
+    }
+
+    /// Adds the text waiting for each chat with client state (terminal text sent to it)
+    /// to the end of its draft, or of the draft a queued edit set aside.
+    pub(super) fn take_pending_chat_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ready: Vec<String> = self
+            .chat
+            .pending
+            .keys()
+            .filter(|id| self.chat.chats.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in ready {
+            let (Some(text), Some(model)) =
+                (self.chat.pending.remove(&id), self.chat.chats.get_mut(&id))
+            else {
+                continue;
+            };
+            let join = |draft: &str| {
+                if draft.trim().is_empty() {
+                    text.clone()
+                } else {
+                    format!("{}\n\n{text}", draft.trim_end())
+                }
+            };
+            if let Some(edit) = &mut model.editing {
+                edit.draft = join(&edit.draft).into();
+                continue;
+            }
+            let joined = join(&model.composer.read(cx).value());
+            model.recall = None;
+            model.composer.update(cx, |composer, cx| {
+                composer.set_value(joined.clone(), window, cx);
+                let end = composer.text().offset_to_position(joined.len());
+                composer.set_cursor_position(end, window, cx);
+            });
+        }
     }
 
     /// The settings without a picker of their own, each a submenu.
@@ -1796,6 +2216,52 @@ mod tests {
         let listed = matching_commands(std::slice::from_ref(&resume), "res");
         assert_eq!(listed.len(), 1);
         assert!(matches!(listed[0], ListedCommand::Harness(_)));
+    }
+
+    #[test]
+    fn model_always_opens_compis_picker() {
+        let model = ChatCommand {
+            name: "/model".into(),
+            description: String::new(),
+            hint: None,
+        };
+        let harness = std::slice::from_ref(&model);
+        assert_eq!(
+            compi_command("/model", harness),
+            Some((CompiCommand::Model, ""))
+        );
+        let listed = matching_commands(harness, "mod");
+        assert_eq!(listed.len(), 1);
+        assert!(matches!(
+            listed[0],
+            ListedCommand::Compi(CompiCommand::Model)
+        ));
+    }
+
+    #[test]
+    fn recall_walks_typed_prompts_newest_first_without_repeats_in_a_row() {
+        let user = |text: &str| ChatEntry::User {
+            text: text.into(),
+            files: Vec::new(),
+            images: Vec::new(),
+            sent_ms: None,
+            ended_ms: None,
+        };
+        let entries = [
+            user("first"),
+            ChatEntry::Agent { text: "ok".into() },
+            user("again\n"),
+            user("again"),
+            user("  "),
+            user("first"),
+        ];
+        assert_eq!(earlier_prompts(&entries), ["first", "again", "first"]);
+    }
+
+    #[test]
+    fn a_fence_outlasts_the_backticks_inside() {
+        assert_eq!(fenced("ls\n"), "```\nls\n```");
+        assert_eq!(fenced("a ```` b"), "`````\na ```` b\n`````");
     }
 
     #[test]

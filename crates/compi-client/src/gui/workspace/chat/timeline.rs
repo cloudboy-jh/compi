@@ -153,7 +153,7 @@ fn plan_turn(
                 .iter()
                 .any(|entry| matches!(entry, ChatEntry::Cancelled));
             shown[work.start].fold = Some(FoldLine {
-                label: fold_label(&entries[work.clone()], stopped, prompt_span(entries, &turn)),
+                label: fold_label(stopped, prompt_span(entries, &turn)),
                 open,
             });
             if !open {
@@ -242,36 +242,17 @@ fn prompt_span(entries: &[ChatEntry], turn: &Range<usize>) -> Option<(u64, u64)>
 }
 
 /// "Worked for 2m 10s", or "Stopped after 40s" when the reader stopped the turn: from
-/// its prompt to its end (`prompt`), else across its calls' and thoughts' own times.
-fn fold_label(work: &[ChatEntry], stopped: bool, prompt: Option<(u64, u64)>) -> String {
-    let (start, end) = prompt.unwrap_or_else(|| {
-        let spans = work.iter().filter_map(|entry| match entry {
-            ChatEntry::Tool(tool) => Some((tool.started_ms, tool.ended_ms)),
-            ChatEntry::Thought {
-                started_ms,
-                ended_ms,
-                ..
-            } => Some((*started_ms, *ended_ms)),
-            _ => None,
-        });
-        let (mut start, mut end) = (u64::MAX, 0);
-        for (started, ended) in spans {
-            start = start.min(started);
-            end = end.max(ended.unwrap_or(started));
-        }
-        (start, end)
-    });
-    let lead = if stopped {
-        "Stopped after"
-    } else {
-        "Worked for"
-    };
-    if end > start {
-        format!("{lead} {}", duration_label(end - start))
-    } else if stopped {
-        "Stopped".to_owned()
-    } else {
-        "Worked".to_owned()
+/// its prompt to its end. A turn a resumed session replays has no times, so it reads
+/// "Worked" (or "Stopped").
+fn fold_label(stopped: bool, prompt: Option<(u64, u64)>) -> String {
+    match (
+        prompt.map(|(start, end)| end.saturating_sub(start)),
+        stopped,
+    ) {
+        (Some(ms), true) => format!("Stopped after {}", duration_label(ms)),
+        (Some(ms), false) => format!("Worked for {}", duration_label(ms)),
+        (None, true) => "Stopped".to_owned(),
+        (None, false) => "Worked".to_owned(),
     }
 }
 
@@ -467,7 +448,7 @@ mod tests {
         assert_eq!(
             plan[1].fold,
             Some(FoldLine {
-                label: "Worked for 1m 00s".into(),
+                label: "Worked".into(),
                 open: false
             })
         );

@@ -134,6 +134,7 @@ registry! {
     ToggleSidebar, "toggle_sidebar", "Toggle workspace sidebar", Some("cmd-b"), Some("ctrl-shift-b");
     ResetSidebarWidth, "reset_sidebar_width", "Reset sidebar width", None, None;
     Copy, "copy", "Copy selection", Some("cmd-c"), Some("ctrl-shift-c");
+    SendSelectionToChat, "send_selection_to_chat", "Send selection to chat", None, None;
     Paste, "paste", "Paste", Some("cmd-v"), Some("ctrl-v");
     SelectAll, "select_all", "Select all terminal text", Some("cmd-a"), Some("ctrl-shift-a");
     ClearScrollback, "clear_scrollback", "Clear scrollback", Some("cmd-k"), Some("ctrl-shift-k");
@@ -347,8 +348,10 @@ impl Command {
             | OpenFile | NewEditor | RecoverUnsavedEdits => CommandCategory::Files,
             CreateWorkspace | SwitchWorkspace | RenameWorkspace | RemoveWorkspace
             | ToggleSidebar | ResetSidebarWidth => CommandCategory::Workspaces,
-            Copy | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut | ZoomReset
-            | BrowseFiles | JumpProject | RestartSurface | EndSurface => CommandCategory::Terminal,
+            Copy | SendSelectionToChat | Paste | SelectAll | ClearScrollback | ZoomIn | ZoomOut
+            | ZoomReset | BrowseFiles | JumpProject | RestartSurface | EndSurface => {
+                CommandCategory::Terminal
+            }
             NewWindow | MoveTabToNewWindow | MoveTabToWindow | ResetClientLayout | Reconnect => {
                 CommandCategory::Window
             }
@@ -472,6 +475,9 @@ impl Command {
             OpenChat => Some(
                 "Starts a chat with OMP in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
             ),
+            SendSelectionToChat => Some(
+                "Puts the selected terminal text at the end of a chat's message box: the terminal's own chat, else the tab's, else a new one.",
+            ),
             TestNotification => Some(
                 "Sends a notification the way your Notifications settings deliver one, with its sound.",
             ),
@@ -534,6 +540,7 @@ impl Command {
             }
             OpenBrowser => "web page url localhost preview site dev server http",
             OpenChat => "agent ai assistant omp chat prompt llm acp",
+            SendSelectionToChat => "agent ai omp chat quote output prompt",
             BrowserBack | BrowserForward => "browser web page history navigate",
             BrowserReload => "browser web page refresh stop",
             FocusAddressBar => "browser web page url location navigate go",
@@ -906,6 +913,7 @@ impl Command {
                 }
             }
             Copy => (!c.has_selection).then_some("Select terminal text to copy"),
+            SendSelectionToChat => (!c.has_selection).then_some("Select terminal text to send"),
             Paste | SelectAll | ClearScrollback if c.content_pane => Some(CONTENT_PANE_REASON),
             Paste => {
                 if !c.has_pane

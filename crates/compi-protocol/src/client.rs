@@ -837,8 +837,8 @@ impl DaemonClient {
     }
 
     /// Sends a chat request answered by `ChatAccepted`: `SendChat`, `RemoveQueuedChat`,
-    /// `CancelChat`, `AnswerChatPermission`, `AnswerChatQuestion`, `SetChatOption`,
-    /// `ResumeChat` or `RestartChat`.
+    /// `EditQueuedChat`, `CancelChat`, `AnswerChatPermission`, `AnswerChatQuestion`,
+    /// `SetChatOption`, `ResumeChat` or `RestartChat`.
     pub fn chat_request(&mut self, message: ClientMessage) -> Result<()> {
         match self.request_bounded(message, Duration::from_secs(10))? {
             ServerMessage::ChatAccepted => Ok(()),

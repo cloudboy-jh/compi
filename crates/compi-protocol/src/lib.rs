@@ -86,8 +86,8 @@ use std::fmt;
 // and `ChatEntry::AgentsFinished` marks when the last running one finished.
 // Version 41 starts new chat sessions on the settings last picked in Compi (`ChatPicks` on
 // `WatchChat`, `ResumeChat` and `RestartChat`), marks a model or thinking change before
-// the next prompt (`ChatEntry::Switch`) and times each prompt's turn (`ChatEntry::User`'s
-// `sent_ms` and `ended_ms`).
+// the next prompt (`ChatEntry::Switch`), times each prompt's turn (`ChatEntry::User`'s
+// `sent_ms` and `ended_ms`) and rewrites a queued prompt's text (`EditQueuedChat`).
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -507,6 +507,12 @@ pub enum ClientMessage {
     RemoveQueuedChat {
         chat: String,
         queued: u64,
+    },
+    /// Replaces the text of the queued prompt `queued`, keeping its place and attachments.
+    EditQueuedChat {
+        chat: String,
+        queued: u64,
+        text: String,
     },
     /// Stops the chat's running turn.
     CancelChat {

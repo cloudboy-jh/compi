@@ -463,6 +463,7 @@ impl CompiApp {
         let context = self.command_context(cx);
         let mut entries = vec![
             self.command_entry(Command::Copy, "Copy", &context, cx),
+            self.command_entry(Command::SendSelectionToChat, "Send to chat", &context, cx),
             self.command_entry(Command::Paste, "Paste", &context, cx),
             MenuEntry::Separator,
             self.command_entry(Command::SplitRight, "Split right", &context, cx),

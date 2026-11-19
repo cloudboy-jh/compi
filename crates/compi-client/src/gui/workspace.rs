@@ -4258,7 +4258,10 @@ impl CompiApp {
             Command::OpenSettings => self.open_settings(None, None, window, cx),
             Command::OpenMonitor => self.open_monitor(window, cx),
             Command::OpenBrowser => self.open_browser(compi_protocol::BrowserContent::BLANK.into()),
-            Command::OpenChat => self.open_chat(window, cx),
+            Command::OpenChat => {
+                self.open_chat(window, cx);
+            }
+            Command::SendSelectionToChat => self.send_selection_to_chat(window, cx),
             Command::BrowserBack => self.browser_navigate(browser::Navigation::Back),
             Command::BrowserForward => self.browser_navigate(browser::Navigation::Forward),
             Command::BrowserReload => self.browser_navigate(browser::Navigation::Reload),

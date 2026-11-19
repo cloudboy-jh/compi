@@ -148,6 +148,10 @@ impl ChatHub {
         self.get(id)?.remove_queued(queued)
     }
 
+    pub fn edit_queued(&self, id: &str, queued: u64, text: String) -> Result<(), String> {
+        self.get(id)?.lock().edit_queued(queued, text)
+    }
+
     pub fn cancel(&self, id: &str) -> Result<(), String> {
         self.get(id)?.cancel();
         Ok(())
@@ -1534,6 +1538,20 @@ impl Inner {
             self.queue.push_back(queued);
         }
         self.publish_queue();
+    }
+
+    /// Replaces the text of queued prompt `queued`, which keeps its place.
+    fn edit_queued(&mut self, queued: u64, text: String) -> Result<(), String> {
+        let Some((_, prompt)) = self.queue.iter_mut().find(|(id, _)| *id == queued) else {
+            return Err("that prompt was already sent".into());
+        };
+        let was = std::mem::replace(&mut prompt.text, text);
+        if let Err(error) = prompt.check() {
+            prompt.text = was;
+            return Err(error);
+        }
+        self.publish_queue();
+        Ok(())
     }
 
     fn publish_queue(&mut self) {
@@ -3961,6 +3979,14 @@ mod tests {
         // A declined steer waits first in line.
         inner.enqueue(prompt("steer"), true);
         assert_eq!(inner.state.queued[0].text, "steer");
+
+        // An edit keeps the prompt's place; an empty one, or one already sent, is refused.
+        let steer = inner.state.queued[0].id;
+        inner.edit_queued(steer, "steer harder".into()).unwrap();
+        assert_eq!(inner.state.queued[0].text, "steer harder");
+        assert_eq!(inner.state.queued[1].text, "two");
+        assert!(inner.edit_queued(steer, " ".into()).is_err());
+        assert!(inner.edit_queued(steer + 100, "gone".into()).is_err());
     }
 
     #[test]

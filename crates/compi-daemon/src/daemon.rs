@@ -876,6 +876,11 @@ fn handle_connection(
                     request_id,
                     crate::chat::hub().remove_queued(&chat, queued),
                 )?,
+                ClientMessage::EditQueuedChat { chat, queued, text } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().edit_queued(&chat, queued, text),
+                )?,
                 ClientMessage::CancelChat { chat } => {
                     answer_chat(&sink, request_id, crate::chat::hub().cancel(&chat))?
                 }

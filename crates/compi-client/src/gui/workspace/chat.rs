@@ -44,7 +44,9 @@ mod scroller;
 mod sessions;
 mod timeline;
 
-use composer::{CompiCommand, Completion, QuestionForm, cost_label};
+use composer::{
+    CompiCommand, Completion, DraftImage, QuestionForm, QueuedEdit, Recall, cost_label, fenced,
+};
 use models::{ModelPicker, PickerAnchor, PickerColumn};
 use rows::{ChatRow, RowFrame};
 use scroller::TranscriptScroll;
@@ -207,7 +209,11 @@ struct ChatModel {
     /// Files to attach to the next prompt: absolute paths in the chat's environment.
     attachments: Vec<String>,
     /// Images to send with the next prompt, read where they were picked.
-    images: Vec<ChatImage>,
+    images: Vec<DraftImage>,
+    /// Up and Down walking earlier prompts.
+    recall: Option<Recall>,
+    /// The queued prompt open in the composer for editing.
+    editing: Option<QueuedEdit>,
     /// The `/` command or `@` file list over the composer.
     completion: Option<Completion>,
     /// The draft Escape closed the completion on: it stays closed until the draft changes.
@@ -244,6 +250,9 @@ pub(in crate::gui) struct ChatUi {
     /// from the configuration since `picks_synced`.
     picks: Arc<Mutex<HashMap<ChatHarness, ChatPicks>>>,
     picks_synced: bool,
+    /// Text for each chat's draft (terminal text sent to it), until the chat has client
+    /// state.
+    pending: HashMap<String, String>,
 }
 
 /// Every chat in `node` with its pane: content panes, and terminal views on either side.
@@ -523,17 +532,40 @@ impl ChatModel {
     }
 
     /// Clears the composer and its attachments after `draft` was sent, unless the reader
-    /// typed on meanwhile.
+    /// typed on meanwhile; a saved queued edit brings back the draft it set aside.
     fn clear_sent(&mut self, draft: &SharedString, window: &mut Window, cx: &mut App) {
         if self.composer.read(cx).value() != *draft {
             return;
         }
-        self.composer.update(cx, |composer, cx| {
-            composer.set_value(String::new(), window, cx);
-        });
+        for image in self.images.drain(..) {
+            image.release(cx);
+        }
         self.attachments.clear();
-        self.images.clear();
+        if !self.end_queued_edit(window, cx) {
+            self.composer.update(cx, |composer, cx| {
+                composer.set_value(String::new(), window, cx);
+            });
+        }
+        self.recall = None;
         self.completion = None;
+    }
+
+    /// Ends the queued edit, if one is open: the draft and attachments it set aside come
+    /// back. Whether one was open.
+    fn end_queued_edit(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        let Some(edit) = self.editing.take() else {
+            return false;
+        };
+        self.composer.update(cx, |composer, cx| {
+            composer.set_value(edit.draft, window, cx);
+        });
+        for image in self.images.drain(..) {
+            image.release(cx);
+        }
+        self.attachments = edit.attachments;
+        self.images = edit.images;
+        self.completion = None;
+        true
     }
 }
 
@@ -604,8 +636,13 @@ fn watch_chat(
 impl CompiApp {
     /// OMP chat: a new chat in the focused terminal's folder, shown in its place or, as
     /// Settings → Chat → Opening a chat says, beside it; from another pane, or a terminal
-    /// already carrying a chat, in that pane's folder, beside it.
-    pub(super) fn open_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// already carrying a chat, in that pane's folder, beside it. The new chat's id, when
+    /// one was asked for.
+    pub(super) fn open_chat(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         if self.overlay.is_some() {
             self.dismiss_overlay();
         }
@@ -614,20 +651,71 @@ impl CompiApp {
             Ok(scope) => scope,
             Err(reason) => {
                 self.global_error = Some(reason.into());
-                return;
+                return None;
             }
         };
-        let content = PaneContent::Chat(crate::chat::new_chat(environment, folder));
+        let chat = crate::chat::new_chat(environment, folder);
+        let id = chat.id.clone();
+        let content = PaneContent::Chat(chat);
         // A chat ends when its view goes, so one a terminal carries is not replaced.
         let in_place = self.focused_terminal().filter(|terminal| {
             self.config.chat_open == crate::config::ChatOpen::InPlace
                 && self.pane_chat_content(terminal).is_none()
         });
-        if let Some(terminal) = in_place {
-            self.show_view(&terminal, content, window, cx);
+        let opened = if let Some(terminal) = in_place {
+            self.show_view(&terminal, content, window, cx)
         } else if let Some(beside) = self.focused_pane().cloned() {
-            self.open_content_beside(&beside, content);
+            self.open_content_beside(&beside, content)
+        } else {
+            false
+        };
+        opened.then_some(id)
+    }
+
+    /// Send selection to chat: the focused terminal's selected text goes to the end of a
+    /// chat's draft as a fenced block: the chat the terminal carries as its view (shown),
+    /// else the first chat of the tab (focused), else a new chat.
+    pub(super) fn send_selection_to_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .focused_view()
+            .filter(|_| !self.focused_shell_hidden())
+            .and_then(|view| selected_text(view.mirror.snapshot(), view.selection))
+        else {
+            return;
+        };
+        let Some(terminal) = self.focused_terminal() else {
+            return;
+        };
+        let own = self
+            .pane_chat_content(&terminal)
+            .map(|chat| chat.id.clone());
+        let chat = if let Some(chat) = own {
+            self.reveal_view(&terminal);
+            Some(chat)
+        } else if let Some((pane, chat)) = self.tab_chat() {
+            self.focus_pane(pane);
+            Some(chat)
+        } else {
+            self.open_chat(window, cx)
+        };
+        let Some(chat) = chat else {
+            return;
+        };
+        let block = fenced(&text);
+        let pending = self.chat.pending.entry(chat).or_default();
+        if !pending.is_empty() {
+            pending.push_str("\n\n");
         }
+        pending.push_str(&block);
+    }
+
+    /// The first chat in the selected tab, and its pane.
+    fn tab_chat(&self) -> Option<(PaneId, String)> {
+        let mut chats = Vec::new();
+        chat_leaves(&self.selected_tab()?.layout, &mut chats);
+        chats
+            .first()
+            .map(|(pane, chat)| ((*pane).clone(), chat.id.clone()))
     }
 
     /// Where a new chat works: the focused terminal's shell folder, else the focused
@@ -732,6 +820,12 @@ impl CompiApp {
         self.chat
             .chats
             .retain(|id, _| present.iter().any(|(_, chat)| chat.id == *id));
+        // Text for a chat that went away goes too; a chat still being opened keeps it.
+        if !self.mutation_pending {
+            self.chat
+                .pending
+                .retain(|id, _| present.iter().any(|(_, chat)| chat.id == *id));
+        }
         let shown: Vec<String> = self
             .shown_content_panes()
             .filter_map(|pane| {
@@ -790,7 +884,9 @@ impl CompiApp {
         for id in &shown {
             self.prepare_chat_question(id, window, cx);
             self.prepare_model_picker(id, window, cx);
+            self.settle_queued_edit(id, window, cx);
         }
+        self.take_pending_chat_text(window, cx);
         if let Ok(mut approval) = self.chat.approval.lock() {
             *approval = self.config.chat_approval;
         }
@@ -905,6 +1001,8 @@ impl CompiApp {
             folder_label: folder_label(&chat.folder),
             attachments: Vec::new(),
             images: Vec::new(),
+            recall: None,
+            editing: None,
             completion: None,
             dismissed: None,
             file_request: 0,
@@ -1083,6 +1181,18 @@ impl CompiApp {
         };
         let draft = model.composer.read(cx).value();
         let text = draft.trim();
+        if let Some(edit) = &model.editing {
+            if model.requests > 0 {
+                return;
+            }
+            let message = ClientMessage::EditQueuedChat {
+                chat: chat.to_owned(),
+                queued: edit.id,
+                text: text.to_owned(),
+            };
+            self.chat_request(chat, message, Some(draft), window, cx);
+            return;
+        }
         let harness_commands = model
             .state
             .as_ref()
@@ -1104,7 +1214,11 @@ impl CompiApp {
             chat: chat.to_owned(),
             text: text.to_owned(),
             files: model.attachments.clone(),
-            images: model.images.clone(),
+            images: model
+                .images
+                .iter()
+                .map(|draft| draft.image.clone())
+                .collect(),
             delivery,
         };
         self.chat_request(chat, message, Some(draft), window, cx);
@@ -1146,6 +1260,9 @@ impl CompiApp {
             CompiCommand::New => self.resume_chat(chat, None, window, cx),
             CompiCommand::Resume | CompiCommand::Sessions => {
                 self.open_chat_sessions(chat, &argument, window, cx);
+            }
+            CompiCommand::Model => {
+                self.open_model_picker(chat, PickerColumn::Models, window, cx);
             }
         }
     }
@@ -1533,10 +1650,12 @@ impl CompiApp {
     }
 
     /// Keys in the focused chat's composer, before the field's own: Ctrl+V (Cmd+V) with an
-    /// image on the clipboard attaches it; the transcript's paging keys; the completion
-    /// list's arrows, Tab and Escape; with the draft empty, Enter and Escape answer a
-    /// waiting permission (its first allow or reject option); else Escape leaves the
-    /// draft and hands the keyboard to the pane, where Escape again shows the shell.
+    /// image on the clipboard attaches it, and long text becomes a file (Ctrl+Shift+V types
+    /// it in); the transcript's paging keys; Alt+Up edits the last queued prompt; the
+    /// completion list's arrows, Tab and Escape; Up and Down walk earlier prompts; with
+    /// the draft empty, Enter and Escape answer a waiting permission (its first allow or
+    /// reject option); Escape drops a queued edit, else leaves the draft and hands the
+    /// keyboard to the pane, where Escape again shows the shell.
     pub(super) fn chat_composer_key(
         &mut self,
         key: &Keystroke,
@@ -1559,8 +1678,11 @@ impl CompiApp {
         } else {
             modifiers.control && !modifiers.platform
         };
-        if key.key == "v" && paste_modifier && !modifiers.alt && !modifiers.shift {
-            return self.paste_chat_image(cx);
+        if key.key == "v" && paste_modifier && !modifiers.alt {
+            if modifiers.shift {
+                return self.paste_chat_text(&chat, true, window, cx);
+            }
+            return self.paste_chat_image(cx) || self.paste_chat_text(&chat, false, window, cx);
         }
         if models::opens_picker(key) {
             self.open_model_picker(&chat, PickerColumn::Models, window, cx);
@@ -1570,24 +1692,40 @@ impl CompiApp {
         if self.chat_scroll_key(&chat, key) {
             return true;
         }
+        let alt_only =
+            modifiers.alt && !modifiers.control && !modifiers.platform && !modifiers.shift;
+        if key.key == "up" && alt_only && self.edit_last_queued_chat(&chat, window, cx) {
+            return true;
+        }
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift {
             return false;
         }
         if self.chat_completion_key(&chat, &key.key, window, cx) {
             return true;
         }
+        if matches!(key.key.as_str(), "up" | "down")
+            && self.recall_chat_prompt(&chat, key.key == "up", window, cx)
+        {
+            return true;
+        }
         let Some(model) = self.chat.chats.get(&chat) else {
             return false;
         };
         let empty = model.composer.read(cx).value().trim().is_empty();
+        let editing = model.editing.is_some();
         match key.key.as_str() {
-            "enter" if empty => self.answer_chat_permission_by_kind(
+            "enter" if empty && !editing => self.answer_chat_permission_by_kind(
                 &chat,
                 &["allow_once", "allow_always"],
                 window,
                 cx,
             ),
             "escape" => {
+                if let Some(model) = self.chat.chats.get_mut(&chat)
+                    && model.end_queued_edit(window, cx)
+                {
+                    return true;
+                }
                 if empty
                     && self.answer_chat_permission_by_kind(
                         &chat,

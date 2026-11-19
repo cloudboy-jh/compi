@@ -454,9 +454,9 @@ impl CompiApp {
         self.sync_chat_picks();
     }
 
-    /// The composer row's model button: the model's mark, its name and the thinking
-    /// level, opening the picker above the composer; and the mode when it is not the
-    /// first (Plan, say).
+    /// The composer row's model button: the model's mark and name, then a brain and the
+    /// thinking level, opening the picker above the composer; and the mode when it is not
+    /// the first (Plan, say).
     pub(super) fn render_chat_models(
         &self,
         chat: &ChatContent,
@@ -468,13 +468,10 @@ impl CompiApp {
             return Vec::new();
         }
         let open = model.menu == Some(ChatMenu::Models);
-        let label = [models, thinking]
-            .into_iter()
-            .flatten()
-            .map(|option| option.current_name())
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let mut button = text_button("chat-models", label)
+        let label = models
+            .or(thinking)
+            .map_or("", |option| option.current_name());
+        let mut button = text_button("chat-models", label.to_owned())
             .ghost()
             .tooltip(format!("Model and thinking ({})", picker_key_label()))
             .menu_open(open);
@@ -486,8 +483,11 @@ impl CompiApp {
         });
         if let Some(path) = current_model.and_then(model_mark) {
             button = button.icon(Icon::empty().path(path));
-        } else if models.is_none() {
+        } else if models.is_none() && thinking.is_some() {
             button = button.icon(IconName::Brain);
+        }
+        if let (Some(_), Some(thinking)) = (models, thinking) {
+            button = button.trailing(IconName::Brain, thinking.current_name().to_owned());
         }
         let anchor = model.picker_anchor.clone();
         let measured = anchor.clone();
@@ -1100,6 +1100,7 @@ impl CompiApp {
                         .flex()
                         .items_center()
                         .gap_2()
+                        .child(controls::glyph(IconName::Brain, muted))
                         .child(
                             div()
                                 .flex_none()
