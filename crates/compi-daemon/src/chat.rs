@@ -417,12 +417,14 @@ impl Prompt {
         self.images.iter().map(|image| image.name.clone()).collect()
     }
 
-    /// As the transcript shows it, once the harness has it.
-    fn entry(&self) -> ChatEntry {
+    /// As the transcript shows it, once the harness has it at `sent_ms`.
+    fn entry(&self, sent_ms: u64) -> ChatEntry {
         ChatEntry::User {
             text: self.text.clone(),
             files: self.files.clone(),
             images: self.image_names(),
+            sent_ms: Some(sent_ms),
+            ended_ms: None,
         }
     }
 }
@@ -1455,7 +1457,7 @@ impl Inner {
             }
         }
         self.emit(ChatEvent::Entry {
-            entry: prompt.entry(),
+            entry: prompt.entry(now_ms()),
         });
     }
 
@@ -1657,6 +1659,40 @@ impl Inner {
                     index,
                     entry: ChatEntry::Tool(tool),
                 });
+            }
+        }
+        // The prompts that went into the turn end with it.
+        let timed: Vec<usize> = self
+            .state
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                ChatEntry::User {
+                    sent_ms: Some(_),
+                    ended_ms: None,
+                    ..
+                } => Some(index),
+                _ => None,
+            })
+            .collect();
+        for index in timed {
+            if let Some(ChatEntry::User {
+                text,
+                files,
+                images,
+                sent_ms,
+                ..
+            }) = self.state.entries.get(index)
+            {
+                let entry = ChatEntry::User {
+                    text: text.clone(),
+                    files: files.clone(),
+                    images: images.clone(),
+                    sent_ms: *sent_ms,
+                    ended_ms: Some(now),
+                };
+                self.emit(ChatEvent::Replace { index, entry });
             }
         }
         self.permission_request = None;
@@ -1939,6 +1975,8 @@ impl Inner {
                             text,
                             files: Vec::new(),
                             images: Vec::new(),
+                            sent_ms: None,
+                            ended_ms: None,
                         },
                         |entry| matches!(entry, ChatEntry::User { .. }),
                     );
@@ -1969,6 +2007,8 @@ impl Inner {
                     text,
                     files,
                     images,
+                    sent_ms,
+                    ended_ms,
                 },
             )) => {
                 let (mut files, mut images) = (files.clone(), images.clone());
@@ -1977,6 +2017,8 @@ impl Inner {
                     text: text.clone(),
                     files,
                     images,
+                    sent_ms: *sent_ms,
+                    ended_ms: *ended_ms,
                 };
                 self.emit(ChatEvent::Replace { index, entry });
             }
@@ -1988,6 +2030,8 @@ impl Inner {
                         text: String::new(),
                         files,
                         images,
+                        sent_ms: None,
+                        ended_ms: None,
                     },
                 });
             }
@@ -4145,6 +4189,31 @@ mod tests {
             text: text.into(),
             files: Vec::new(),
             images: Vec::new(),
+            sent_ms: None,
+            ended_ms: None,
+        };
+        // Sent prompts are timed from sending to their turn's end; replayed ones are not.
+        // The times are checked, then left out of the comparison.
+        let untimed = |inner: &Inner| -> Vec<ChatEntry> {
+            inner
+                .state
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    ChatEntry::User {
+                        text,
+                        sent_ms,
+                        ended_ms,
+                        ..
+                    } => {
+                        if let Some(sent) = sent_ms {
+                            assert!(ended_ms.is_some_and(|ended| ended >= *sent));
+                        }
+                        user(text)
+                    }
+                    entry => entry.clone(),
+                })
+                .collect()
         };
         let turn = |inner: &mut Inner, text: &str| {
             inner.start_prompt("s".into(), text_prompt(text));
@@ -4166,9 +4235,17 @@ mod tests {
             thought_level: None,
         };
         assert_eq!(
-            inner.state.entries,
+            untimed(&inner),
             [user("one"), switch, user("two"), user("three")]
         );
+        assert!(matches!(
+            inner.state.entries[0],
+            ChatEntry::User {
+                sent_ms: Some(_),
+                ended_ms: Some(_),
+                ..
+            }
+        ));
 
         // A resumed session's replayed prompts and its first prompt show none.
         inner.emit(ChatEvent::Reset {
@@ -4185,6 +4262,10 @@ mod tests {
             &json!({ "sessionId": "s", "configOptions": config_options("opus", "low") }),
         );
         turn(&mut inner, "four");
-        assert_eq!(inner.state.entries, [user("earlier"), user("four")]);
+        assert_eq!(untimed(&inner), [user("earlier"), user("four")]);
+        assert!(matches!(
+            inner.state.entries[0],
+            ChatEntry::User { sent_ms: None, .. }
+        ));
     }
 }

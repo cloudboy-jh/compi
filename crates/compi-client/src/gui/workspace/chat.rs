@@ -472,11 +472,14 @@ impl ChatModel {
         self.plan = Rc::new(plan);
     }
 
-    /// Unfolds the turn and run of calls that fold entry `index` away.
+    /// Unfolds the turn, run of calls and sub-agent card that fold entry `index` away.
     fn reveal(&mut self, index: usize) {
-        let (turn, run) = timeline::holders(&self.plan, index);
-        self.unfolded.turns.extend(turn);
-        self.unfolded.runs.extend(run);
+        let holders = timeline::holders(&self.plan, index);
+        self.unfolded.turns.extend(holders.turn);
+        self.unfolded.runs.extend(holders.run);
+        if let Some(card) = holders.card {
+            self.unfolded.cards.insert(card, true);
+        }
         self.replan();
     }
 
@@ -1353,6 +1356,20 @@ impl CompiApp {
         if !model.unfolded.runs.remove(&index) {
             model.unfolded.runs.insert(index);
         }
+        model.replan();
+    }
+
+    /// Opens or closes the sub-agent card on entry `index`.
+    fn toggle_chat_card(&mut self, chat: &str, index: usize) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        let open = model
+            .plan
+            .get(index)
+            .and_then(|shown| shown.card.as_ref())
+            .is_some_and(|card| card.open);
+        model.unfolded.cards.insert(index, !open);
         model.replan();
     }
 

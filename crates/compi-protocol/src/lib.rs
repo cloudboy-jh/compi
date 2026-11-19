@@ -85,8 +85,9 @@ use std::fmt;
 // gains a Chat section. A tool call carries the sub-agents it started (`ChatTool::agents`),
 // and `ChatEntry::AgentsFinished` marks when the last running one finished.
 // Version 41 starts new chat sessions on the settings last picked in Compi (`ChatPicks` on
-// `WatchChat`, `ResumeChat` and `RestartChat`) and marks a model or thinking change before
-// the next prompt (`ChatEntry::Switch`).
+// `WatchChat`, `ResumeChat` and `RestartChat`), marks a model or thinking change before
+// the next prompt (`ChatEntry::Switch`) and times each prompt's turn (`ChatEntry::User`'s
+// `sent_ms` and `ended_ms`).
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;

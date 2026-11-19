@@ -2,11 +2,12 @@
 //! Compi's look). A settled turn's work before its last reply folds into one "Worked
 //! for 2m" line; two or more calls in a row fold under one line naming what they did
 //! ("Ran 2 commands, edited 3 files"). While a turn runs, its runs of calls show only
-//! their latest. Nothing that failed, waits on the reader or has sub-agents running
-//! folds away. The reader's unfoldings are kept by the entry each line sits on.
+//! their latest. A turn's calls that started sub-agents show as one card, unfolded
+//! while any agent runs. Nothing that failed, waits on the reader or has sub-agents
+//! running folds away. The reader's choices are kept by the entry each line sits on.
 use super::*;
 use compi_protocol::chat::{ChatTool, ChatToolStatus};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// How one transcript entry shows.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -15,6 +16,9 @@ pub(super) struct Shown {
     pub(super) fold: Option<FoldLine>,
     /// A run of calls' line, drawn over this entry, the run's first.
     pub(super) group: Option<GroupLine>,
+    /// The card of the turn's sub-agents, drawn in place of this entry, the turn's first
+    /// call that started any.
+    pub(super) card: Option<AgentCard>,
     pub(super) body: Body,
 }
 
@@ -45,11 +49,27 @@ pub(super) struct GroupLine {
     pub(super) failed: bool,
 }
 
-/// What the reader unfolded: folded turns and runs, by the entry their line sits on.
+/// A turn's sub-agents as one card: the calls that started them, and whether it shows
+/// them.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct AgentCard {
+    pub(super) calls: Vec<usize>,
+    pub(super) open: bool,
+}
+
+/// What the reader unfolded: folded turns and runs, by the entry their line sits on;
+/// and sub-agent cards they opened or closed (`true` open), which otherwise show while
+/// an agent runs.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Unfolded {
     pub(super) turns: HashSet<usize>,
     pub(super) runs: HashSet<usize>,
+    pub(super) cards: HashMap<usize, bool>,
+}
+
+/// Whether `entry` is a call that started sub-agents.
+fn starts_agents(entry: &ChatEntry) -> bool {
+    matches!(entry, ChatEntry::Tool(tool) if !tool.agents.is_empty())
 }
 
 /// The transcript's `entries` as they show: `working` while the last turn runs, with
@@ -133,7 +153,7 @@ fn plan_turn(
                 .iter()
                 .any(|entry| matches!(entry, ChatEntry::Cancelled));
             shown[work.start].fold = Some(FoldLine {
-                label: fold_label(&entries[work.clone()], stopped),
+                label: fold_label(&entries[work.clone()], stopped, prompt_span(entries, &turn)),
                 open,
             });
             if !open {
@@ -144,8 +164,25 @@ fn plan_turn(
             }
         }
     }
-    let member =
-        |entry: &ChatEntry| matches!(entry, ChatEntry::Tool(_) | ChatEntry::Thought { .. });
+    let cards: Vec<usize> = turn
+        .clone()
+        .filter(|&index| starts_agents(&entries[index]))
+        .collect();
+    if let Some(&first) = cards.first() {
+        let running = cards.iter().any(|&index| live(&entries[index], None));
+        for &index in &cards[1..] {
+            shown[index].body = Body::Hidden;
+        }
+        shown[first].card = Some(AgentCard {
+            open: unfolded.cards.get(&first).copied().unwrap_or(running),
+            calls: cards,
+        });
+    }
+    // A run is calls (but those that started sub-agents, which are the card) and the
+    // thoughts between them.
+    let member = |entry: &ChatEntry| {
+        matches!(entry, ChatEntry::Tool(_) | ChatEntry::Thought { .. }) && !starts_agents(entry)
+    };
     let mut index = turn.start;
     while index < turn.end {
         if !member(&entries[index]) {
@@ -191,22 +228,39 @@ fn plan_turn(
     }
 }
 
-/// "Worked for 2m 10s", or "Stopped after 40s" when the reader stopped the turn.
-fn fold_label(work: &[ChatEntry], stopped: bool) -> String {
-    let spans = work.iter().filter_map(|entry| match entry {
-        ChatEntry::Tool(tool) => Some((tool.started_ms, tool.ended_ms)),
-        ChatEntry::Thought {
-            started_ms,
-            ended_ms,
+/// When the prompt that began `turn` was sent and when its turn ended, when the daemon
+/// timed it (prompts a resumed session replays are not).
+fn prompt_span(entries: &[ChatEntry], turn: &Range<usize>) -> Option<(u64, u64)> {
+    match entries.get(turn.start.checked_sub(1)?)? {
+        ChatEntry::User {
+            sent_ms: Some(sent),
+            ended_ms: Some(ended),
             ..
-        } => Some((*started_ms, *ended_ms)),
+        } => Some((*sent, *ended)),
         _ => None,
-    });
-    let (mut start, mut end) = (u64::MAX, 0);
-    for (started, ended) in spans {
-        start = start.min(started);
-        end = end.max(ended.unwrap_or(started));
     }
+}
+
+/// "Worked for 2m 10s", or "Stopped after 40s" when the reader stopped the turn: from
+/// its prompt to its end (`prompt`), else across its calls' and thoughts' own times.
+fn fold_label(work: &[ChatEntry], stopped: bool, prompt: Option<(u64, u64)>) -> String {
+    let (start, end) = prompt.unwrap_or_else(|| {
+        let spans = work.iter().filter_map(|entry| match entry {
+            ChatEntry::Tool(tool) => Some((tool.started_ms, tool.ended_ms)),
+            ChatEntry::Thought {
+                started_ms,
+                ended_ms,
+                ..
+            } => Some((*started_ms, *ended_ms)),
+            _ => None,
+        });
+        let (mut start, mut end) = (u64::MAX, 0);
+        for (started, ended) in spans {
+            start = start.min(started);
+            end = end.max(ended.unwrap_or(started));
+        }
+        (start, end)
+    });
     let lead = if stopped {
         "Stopped after"
     } else {
@@ -317,20 +371,36 @@ fn tool_path(tool: &ChatTool) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The entries whose line folds entry `index` away: its turn's and its run's.
-pub(super) fn holders(plan: &[Shown], index: usize) -> (Option<usize>, Option<usize>) {
-    let mut turn = None;
-    let mut run = None;
+/// What holds entry `index` out of view, by the entry it sits on.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct Holders {
+    pub(super) turn: Option<usize>,
+    pub(super) run: Option<usize>,
+    pub(super) card: Option<usize>,
+}
+
+/// The lines that fold entry `index` away: its turn's, its run's, and the sub-agent card
+/// it is part of.
+pub(super) fn holders(plan: &[Shown], index: usize) -> Holders {
+    let mut holders = Holders::default();
     for at in (0..=index.min(plan.len().saturating_sub(1))).rev() {
-        if run.is_none() && plan[at].group.is_some() {
-            run = Some(at);
+        if holders.run.is_none() && plan[at].group.is_some() {
+            holders.run = Some(at);
+        }
+        if holders.card.is_none()
+            && plan[at]
+                .card
+                .as_ref()
+                .is_some_and(|card| card.calls.contains(&index))
+        {
+            holders.card = Some(at);
         }
         if plan[at].fold.is_some() {
-            turn = Some(at);
+            holders.turn = Some(at);
             break;
         }
     }
-    (turn, run)
+    holders
 }
 
 #[cfg(test)]
@@ -343,6 +413,8 @@ mod tests {
             text: "go".into(),
             files: Vec::new(),
             images: Vec::new(),
+            sent_ms: None,
+            ended_ms: None,
         }
     }
 
@@ -411,6 +483,23 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_prompt_counts_the_whole_turn() {
+        let timed = ChatEntry::User {
+            text: "go".into(),
+            files: Vec::new(),
+            images: Vec::new(),
+            sent_ms: Some(10_000),
+            ended_ms: Some(25_000),
+        };
+        let entries = [timed, call("read", "a.rs", 12_000, 12_100), reply()];
+        let plan = plan(&entries, false, None, &Unfolded::default());
+        assert_eq!(
+            plan[1].fold.as_ref().map(|fold| fold.label.as_str()),
+            Some("Worked for 15s")
+        );
+    }
+
+    #[test]
     fn a_running_turn_shows_its_runs_latest_call_and_never_folds() {
         let entries = [
             user(),
@@ -442,33 +531,57 @@ mod tests {
                 .fold
                 .is_none()
         );
-        let mut task = call("other", "", 0, 1);
-        if let ChatEntry::Tool(tool) = &mut task {
-            tool.agents.push(ChatAgent {
-                id: "A".into(),
-                agent: "task".into(),
-                status: ChatToolStatus::Running,
-                activity: None,
-                tool_count: 0,
-                started_ms: None,
-                duration_ms: 0,
-                cost: None,
-                model: None,
-                assignment: None,
-                result: None,
-                steps: Vec::new(),
-            });
-        }
-        let entries = [
+        let task = |status: ChatToolStatus| {
+            let mut task = call("other", "", 0, 1);
+            if let ChatEntry::Tool(tool) = &mut task {
+                tool.id = format!("task-{status:?}");
+                tool.agents.push(ChatAgent {
+                    id: "A".into(),
+                    agent: "task".into(),
+                    status,
+                    activity: None,
+                    tool_count: 0,
+                    started_ms: None,
+                    duration_ms: 0,
+                    cost: None,
+                    model: None,
+                    assignment: None,
+                    result: None,
+                    steps: Vec::new(),
+                });
+            }
+            task
+        };
+        let mut entries = vec![
             user(),
             call("read", "a.rs", 0, 1),
-            task,
+            task(ChatToolStatus::Running),
             call("read", "b", 1, 2),
+            task(ChatToolStatus::Completed),
             reply(),
         ];
-        let plan = plan(&entries, false, None, &Unfolded::default());
-        assert!(plan[1].fold.is_none());
-        assert_eq!(bodies(&plan), ['s', '-', 'm', '-', 's']);
+        // The turn's sub-agents are one card, on its first call that started any, open
+        // while one runs; the turn does not fold, and the card splits the reads' run.
+        let shown = plan(&entries, false, None, &Unfolded::default());
+        assert!(shown[1].fold.is_none());
+        assert_eq!(bodies(&shown), ['s', 's', 's', 's', '-', 's']);
+        assert_eq!(
+            shown[2].card,
+            Some(AgentCard {
+                calls: vec![2, 4],
+                open: true
+            })
+        );
+        assert_eq!(holders(&shown, 4).card, Some(2));
+        // Once all finished, the turn folds; unfolded, the card is closed until opened.
+        entries[2] = task(ChatToolStatus::Completed);
+        let mut unfolded = Unfolded::default();
+        unfolded.turns.insert(1);
+        let shown = plan(&entries, false, None, &unfolded);
+        assert_eq!(shown[2].card.as_ref().map(|card| card.open), Some(false));
+        unfolded.cards.insert(2, true);
+        let shown = plan(&entries, false, None, &unfolded);
+        assert_eq!(shown[2].card.as_ref().map(|card| card.open), Some(true));
     }
 
     #[test]

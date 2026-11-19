@@ -248,13 +248,18 @@ pub enum ChatStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEntry {
     /// What was sent, as Markdown, with the files it attached and the names of the
-    /// images it carried.
+    /// images it carried; when it was sent and when the turn it went into ended
+    /// (milliseconds since the Unix epoch), absent for prompts a resumed session replays.
     User {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended_ms: Option<u64>,
     },
     /// The harness's reply, as Markdown.
     Agent { text: String },
