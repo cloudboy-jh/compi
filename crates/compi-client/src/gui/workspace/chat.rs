@@ -21,7 +21,8 @@ use super::*;
 use crate::gui::controls::{self, IconName, icon_button, text_button};
 use compi_protocol::chat::{
     ChatAnswer, ChatAnswers, ChatApproval, ChatContent, ChatDelivery, ChatEntry, ChatEvent,
-    ChatHarness, ChatImage, ChatPermission, ChatQuestion, ChatSessionInfo, ChatState, ChatStatus,
+    ChatHarness, ChatImage, ChatPermission, ChatPicks, ChatQuestion, ChatSessionInfo, ChatState,
+    ChatStatus,
 };
 use compi_protocol::{ContentEnvironment, ContentTab, FolderContent, GitScope, PaneContent};
 use gpui::{
@@ -37,11 +38,14 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod composer;
+mod models;
 mod rows;
 mod scroller;
 mod sessions;
+mod timeline;
 
-use composer::{CompiCommand, Completion, OptionPicker, QuestionForm, cost_label};
+use composer::{CompiCommand, Completion, QuestionForm, cost_label};
+use models::{ModelPicker, PickerAnchor, PickerColumn};
 use rows::{ChatRow, RowFrame};
 use scroller::TranscriptScroll;
 use sessions::SessionSheet;
@@ -159,8 +163,8 @@ enum Link {
 enum ChatMenu {
     /// The header's ⋯ menu.
     Header,
-    /// The picker of the harness setting with this id.
-    Option(String),
+    /// The model picker.
+    Models,
     /// The other settings.
     More,
 }
@@ -186,6 +190,10 @@ struct ChatModel {
     state: Option<ChatState>,
     /// One per entry of `state`.
     rows: Rc<Vec<ChatRow>>,
+    /// How each entry shows: folded into its turn's or run's line, or as itself.
+    plan: Rc<Vec<timeline::Shown>>,
+    /// The turns and runs of calls the reader unfolded.
+    unfolded: timeline::Unfolded,
     scroller: TranscriptScroll,
     composer: Entity<TextareaState>,
     _composer_events: Subscription,
@@ -207,8 +215,8 @@ struct ChatModel {
     /// The latest file search; earlier replies are dropped.
     file_request: u64,
     menu: Option<ChatMenu>,
-    /// The search of an open setting picker with many choices.
-    picker: Option<OptionPicker>,
+    /// The model picker's search and highlights, while it is open.
+    picker: Option<ModelPicker>,
     /// The session picker over the pane, while open.
     sessions: Option<SessionSheet>,
     repo: Repo,
@@ -220,6 +228,8 @@ struct ChatModel {
     error: Option<String>,
     /// The session last sent to the daemon as the pane's.
     session_sent: Option<String>,
+    /// Where the composer card and the model button were drawn, for the model picker.
+    picker_anchor: Rc<PickerAnchor>,
 }
 
 /// The chats of this window.
@@ -230,6 +240,10 @@ pub(in crate::gui) struct ChatUi {
     ticking: bool,
     /// Settings → Chat → Approvals, which each watcher's next `WatchChat` passes on.
     approval: Arc<Mutex<ChatApproval>>,
+    /// What each harness's new sessions start on, which `WatchChat` passes on; kept
+    /// from the configuration since `picks_synced`.
+    picks: Arc<Mutex<HashMap<ChatHarness, ChatPicks>>>,
+    picks_synced: bool,
 }
 
 /// Every chat in `node` with its pane: content panes, and terminal views on either side.
@@ -326,6 +340,19 @@ fn token_label(tokens: u64) -> String {
 }
 
 impl ChatModel {
+    /// The harness the chat talks to.
+    fn harness(&self) -> ChatHarness {
+        self.state.as_ref().map_or_else(
+            || {
+                self.watched
+                    .lock()
+                    .map(|chat| chat.harness)
+                    .unwrap_or_default()
+            },
+            |state| state.harness,
+        )
+    }
+
     /// How Enter, or with `secondary` Ctrl/Cmd+Enter, hands the draft over. While a turn
     /// runs, Enter steers it or queues after it as `enter` says and the secondary key does
     /// the other; otherwise Enter starts the next turn and the secondary key queues.
@@ -420,8 +447,37 @@ impl ChatModel {
                 .map(|entry| rows::chat_row(entry, &self.folder, cx))
                 .collect();
             self.scroller.reset(rows.len());
+            self.unfolded = timeline::Unfolded::default();
         }
         self.state = Some(state);
+        self.replan();
+    }
+
+    /// Works out again how entries show (a turn settled, a call came in, the reader
+    /// unfolded something), laying out again each row that changed.
+    fn replan(&mut self) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let permission = state
+            .permission
+            .as_ref()
+            .and_then(|permission| permission.tool.as_deref());
+        let plan = timeline::plan(&state.entries, state.working(), permission, &self.unfolded);
+        for (index, (was, now)) in self.plan.iter().zip(&plan).enumerate() {
+            if was != now {
+                self.scroller.remeasure_row(index);
+            }
+        }
+        self.plan = Rc::new(plan);
+    }
+
+    /// Unfolds the turn and run of calls that fold entry `index` away.
+    fn reveal(&mut self, index: usize) {
+        let (turn, run) = timeline::holders(&self.plan, index);
+        self.unfolded.turns.extend(turn);
+        self.unfolded.runs.extend(run);
+        self.replan();
     }
 
     /// Applies one change, as the daemon did before sending it.
@@ -445,6 +501,8 @@ impl ChatModel {
                     self.scroller.remeasure_row(index);
                 }
                 state.apply(ChatEvent::Text { index, text });
+                // Text that streams in changes no entry's place in a fold.
+                return;
             }
             ChatEvent::Replace { index, entry } => {
                 if let (Some(was), Some(row)) = (
@@ -458,6 +516,7 @@ impl ChatModel {
             }
             event => state.apply(event),
         }
+        self.replan();
     }
 
     /// Clears the composer and its attachments after `draft` was sent, unless the reader
@@ -476,12 +535,14 @@ impl ChatModel {
 }
 
 /// Starts the watcher of chat `id`: each connection watches `chat` as it is then, so a
-/// session the pane learned resumes after a daemon restart, with `approval` as it is then.
+/// session the pane learned resumes after a daemon restart, with `approval` and the
+/// harness's `picks` as they are then.
 fn watch_chat(
     link: WatchLink,
     id: Arc<str>,
     chat: Arc<Mutex<ChatContent>>,
     approval: Arc<Mutex<ChatApproval>>,
+    picks: Arc<Mutex<HashMap<ChatHarness, ChatPicks>>>,
     generation: u64,
     stop: mpsc::Receiver<()>,
 ) {
@@ -504,7 +565,13 @@ fn watch_chat(
                 let Ok(approval) = approval.lock().map(|approval| *approval) else {
                     return WatchEnd::Stopped;
                 };
-                let state = match client.watch_chat(content, approval) {
+                let Ok(picks) = picks
+                    .lock()
+                    .map(|picks| picks.get(&content.harness).cloned().unwrap_or_default())
+                else {
+                    return WatchEnd::Stopped;
+                };
+                let state = match client.watch_chat(content, approval, picks) {
                     Ok(state) => state,
                     Err(error) => {
                         return WatchEnd::Failed(format!("The daemon can't run the chat: {error}"));
@@ -719,10 +786,13 @@ impl CompiApp {
         }
         for id in &shown {
             self.prepare_chat_question(id, window, cx);
-            self.prepare_chat_picker(id, window, cx);
+            self.prepare_model_picker(id, window, cx);
         }
         if let Ok(mut approval) = self.chat.approval.lock() {
             *approval = self.config.chat_approval;
+        }
+        if !self.chat.picks_synced {
+            self.sync_chat_picks();
         }
         let link = self.watch_link();
         let mut linger = false;
@@ -735,6 +805,7 @@ impl CompiApp {
                         id.as_str().into(),
                         model.watched.clone(),
                         self.chat.approval.clone(),
+                        self.chat.picks.clone(),
                         generation,
                         stop,
                     );
@@ -820,6 +891,8 @@ impl CompiApp {
             link: Link::Connecting,
             state: None,
             rows: Rc::default(),
+            plan: Rc::default(),
+            unfolded: timeline::Unfolded::default(),
             scroller: TranscriptScroll::new(cx.entity().downgrade()),
             composer,
             _composer_events: events,
@@ -840,6 +913,7 @@ impl CompiApp {
             requests: 0,
             error: None,
             session_sent: None,
+            picker_anchor: Rc::default(),
         }
     }
 
@@ -885,6 +959,30 @@ impl CompiApp {
             stopped |= model.slot.expire();
         }
         stopped
+    }
+
+    /// Passes what each harness's new sessions start on to the chat watchers, from the
+    /// configuration.
+    pub(super) fn sync_chat_picks(&mut self) {
+        if let Ok(mut picks) = self.chat.picks.lock() {
+            *picks = self
+                .config
+                .chat_models
+                .iter()
+                .map(|(harness, models)| (*harness, models.picks.clone()))
+                .collect();
+            self.chat.picks_synced = true;
+        }
+    }
+
+    /// What chat `chat`'s harness's new sessions start on.
+    fn chat_start_picks(&self, chat: &str) -> ChatPicks {
+        self.chat
+            .chats
+            .get(chat)
+            .and_then(|model| self.config.chat_models.get(&model.harness()))
+            .map(|models| models.picks.clone())
+            .unwrap_or_default()
     }
 
     pub(super) fn chat_event(&mut self, update: ChatUpdate, cx: &mut Context<Self>) {
@@ -1081,6 +1179,7 @@ impl CompiApp {
         let message = ClientMessage::RestartChat {
             chat: chat.to_owned(),
             approval: self.config.chat_approval,
+            picks: self.chat_start_picks(chat),
         };
         self.chat_action(chat, message, window, cx);
     }
@@ -1100,6 +1199,7 @@ impl CompiApp {
             chat: chat.to_owned(),
             session,
             approval: self.config.chat_approval,
+            picks: self.chat_start_picks(chat),
         };
         self.chat_action(chat, message, window, cx);
     }
@@ -1115,6 +1215,18 @@ impl CompiApp {
         if let Some(model) = self.chat.chats.get_mut(chat) {
             model.menu = None;
         }
+        self.send_chat_option(chat, option, value, window, cx);
+    }
+
+    /// Sets the harness setting `option` to `value`, leaving open menus as they are.
+    fn send_chat_option(
+        &mut self,
+        chat: &str,
+        option: String,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let message = ClientMessage::SetChatOption {
             chat: chat.to_owned(),
             option,
@@ -1222,6 +1334,28 @@ impl CompiApp {
         }
     }
 
+    /// Unfolds or folds the turn whose "Worked for" line sits on entry `index`.
+    fn toggle_chat_turn(&mut self, chat: &str, index: usize) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        if !model.unfolded.turns.remove(&index) {
+            model.unfolded.turns.insert(index);
+        }
+        model.replan();
+    }
+
+    /// Unfolds or folds the run of calls whose line sits on entry `index`.
+    fn toggle_chat_run(&mut self, chat: &str, index: usize) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        if !model.unfolded.runs.remove(&index) {
+            model.unfolded.runs.insert(index);
+        }
+        model.replan();
+    }
+
     /// Folds or unfolds `part` of sub-agent `agent` of the tool call at row `index`: its
     /// line, the rest of its task or its earlier steps.
     fn toggle_chat_agent(&mut self, chat: &str, index: usize, agent: &str, part: rows::AgentPart) {
@@ -1245,11 +1379,13 @@ impl CompiApp {
         }
     }
 
-    /// Scrolls to a call, unfolding its named agent or all of its agents.
+    /// Scrolls to a call, unfolding its turn and run, and its named agent or all of
+    /// its agents.
     fn reveal_chat_tool(&mut self, chat: &str, index: usize, agent: Option<&str>) {
         let Some(model) = self.chat.chats.get_mut(chat) else {
             return;
         };
+        model.reveal(index);
         if let Some(row) = Rc::make_mut(&mut model.rows).get_mut(index) {
             row.unfold(agent);
             model.scroller.remeasure_row(index);
@@ -1409,6 +1545,11 @@ impl CompiApp {
         if key.key == "v" && paste_modifier && !modifiers.alt && !modifiers.shift {
             return self.paste_chat_image(cx);
         }
+        if models::opens_picker(key) {
+            self.open_model_picker(&chat, PickerColumn::Models, window, cx);
+            cx.notify();
+            return true;
+        }
         if self.chat_scroll_key(&chat, key) {
             return true;
         }
@@ -1513,6 +1654,12 @@ impl CompiApp {
             return;
         }
         if self.chat_scroll_key(&chat, key) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if models::opens_picker(key) {
+            self.open_model_picker(&chat, PickerColumn::Models, window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1801,11 +1948,13 @@ impl CompiApp {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .child(
-                model
-                    .scroller
-                    .render(move |index| rows::render_row(&rows, index, &frame), cx),
-            )
+            .child({
+                let plan = model.plan.clone();
+                model.scroller.render(
+                    move |index| rows::render_row(&rows, &plan, index, &frame),
+                    cx,
+                )
+            })
             .into_any_element()
     }
 

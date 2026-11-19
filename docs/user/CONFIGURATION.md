@@ -47,13 +47,15 @@ text_size = 15 # 8 through 32; unset follows font.size
 
 ## Chat
 
-**Settings → Chat** holds what Compi controls about agent chats; the model, thinking level and mode stay in each chat's own pickers, since OMP keeps them. A change made in Settings applies to every open window.
+**Settings → Chat** holds what Compi controls about agent chats; the model, thinking level and mode are picked in each chat's model picker. A change made in Settings applies to every open window.
 
 - **Text size** sizes agent chats with −, + and **Reset**. The messages and everything around them (header, tool cards, menus, the message box) grow together; the rest of the window keeps its size. With a chat focused, Ctrl+=, Ctrl+- and Ctrl+0 (Cmd on macOS) change the chat text size instead of the terminal font. Reset removes the key, returning to the default of 14.
 - **Approvals** chooses how OMP asks before it runs tools. **Same as OMP** (the default) uses OMP's own `tools.approvalMode`, the setting OMP follows in a terminal; Compi reads it when the chat starts and hands it to OMP, which its chat mode would otherwise ignore. **Always ask** asks before anything but reading, **Allow edits** runs reads and edits and asks before commands, and **Allow everything** never asks. A change applies to new chats and to chats that start again (Restart in the ⋯ menu, or after the daemon restarts); a running chat keeps the mode it started with.
 - **Enter while OMP works**: **Steer** (the default) sends the message into the running turn and Ctrl+Enter (Cmd+Enter on macOS) queues it for after; **Queue** swaps the two.
 - **Opening a chat**: **In place of the shell** (the default) shows the chat over the terminal it starts from; **Beside it** opens it in a new pane next to that terminal.
 - **Agents bar** (on) lists OMP's running sub-agents above the message box.
+
+The model picker remembers, per agent, the model and thinking level you last picked, which new sessions start on, your favorite models and your five latest picks, under `[chat.omp]`. Values are the agent's own names for its choices; one it no longer lists is skipped.
 
 ```toml
 [chat]
@@ -62,6 +64,12 @@ approval = "harness" # harness (Same as OMP), always_ask, write or yolo
 enter_while_working = "steer" # steer or queue
 open = "in_place" # in_place or beside
 agents_bar = true
+
+[chat.omp]
+model = "anthropic/claude-opus-5-5" # new sessions start on it; unset uses OMP's own
+thinking = "high"
+favorites = ["anthropic/claude-opus-5-5", "openai-codex/gpt-5.5"]
+recent = ["anthropic/claude-opus-5-5"] # newest first, at most five
 ```
 
 ## Pane density

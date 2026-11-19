@@ -16,7 +16,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use compi_protocol::chat::ChatApproval;
+use compi_protocol::chat::{ChatApproval, ChatHarness, ChatPicks};
 use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES, SplitAxis, WindowsShell};
 use serde::{Deserialize, Serialize};
 
@@ -270,6 +270,44 @@ impl ChatOpen {
 
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|open| open.id() == value)
+    }
+}
+
+/// Recent models a harness's model picker lists.
+pub const MAX_RECENT_CHAT_MODELS: usize = 5;
+
+/// What Compi remembers of one chat harness's models, `[chat.<program>]` (`[chat.omp]`):
+/// the model and thinking level its new sessions start on (`model`, `thinking`), the
+/// favorite models (`favorites`) and the models picked last, newest first (`recent`).
+/// Values are the harness's own (`anthropic/claude-opus-5-5`); Compi never writes the
+/// harness's settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatModels {
+    #[serde(default)]
+    pub picks: ChatPicks,
+    #[serde(default)]
+    pub favorites: Vec<String>,
+    #[serde(default)]
+    pub recents: Vec<String>,
+}
+
+impl ChatModels {
+    /// After picking model `value`: new sessions start on it and it leads the recent.
+    pub fn picked_model(&mut self, value: &str) {
+        self.picks.model = Some(value.to_owned());
+        self.recents.retain(|recent| recent != value);
+        self.recents.insert(0, value.to_owned());
+        self.recents.truncate(MAX_RECENT_CHAT_MODELS);
+    }
+
+    /// Adds model `value` to the favorites, or takes it out.
+    pub fn toggle_favorite(&mut self, value: &str) {
+        match self.favorites.iter().position(|kept| kept == value) {
+            Some(index) => {
+                self.favorites.remove(index);
+            }
+            None => self.favorites.push(value.to_owned()),
+        }
     }
 }
 
@@ -655,6 +693,9 @@ pub struct LoadedConfig {
     /// The bar listing a chat's running sub-agents above its composer, `[chat] agents_bar`.
     #[serde(default = "default_chat_agents_bar")]
     pub chat_agents_bar: bool,
+    /// Each chat harness's remembered models; see [`ChatModels`].
+    #[serde(default)]
+    pub chat_models: HashMap<ChatHarness, ChatModels>,
     /// What a terminal does when a dev server starts in it; see [`DevServer`].
     #[serde(default)]
     pub dev_server: DevServer,
@@ -694,6 +735,7 @@ impl Default for LoadedConfig {
             chat_enter: ChatEnter::Steer,
             chat_open: ChatOpen::InPlace,
             chat_agents_bar: true,
+            chat_models: HashMap::new(),
             dev_server: DevServer::Offer,
             provenance: ConfigProvenance::default(),
             layout_presets: BTreeMap::new(),
@@ -1100,6 +1142,57 @@ impl LoadedConfig {
             }
         })?;
         self.chat_agents_bar = shown;
+        Ok(())
+    }
+
+    /// Persist what Compi remembers of `harness`'s models; nothing removes its table.
+    pub fn save_chat_models(
+        &mut self,
+        harness: ChatHarness,
+        models: ChatModels,
+    ) -> Result<(), String> {
+        update_table(&self.path, "chat", |table| {
+            if models == ChatModels::default() {
+                table.remove(harness.program());
+                return;
+            }
+            let item = table
+                .entry(harness.program())
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+            if !item.is_table() {
+                *item = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let Some(models_table) = item.as_table_mut() else {
+                return;
+            };
+            let text = |key: &str, value: &Option<String>, table: &mut toml_edit::Table| match value
+            {
+                Some(value) => set_table_value(table, key, value.as_str().into()),
+                None => {
+                    table.remove(key);
+                }
+            };
+            let list = |key: &str, values: &[String], table: &mut toml_edit::Table| {
+                if values.is_empty() {
+                    table.remove(key);
+                } else {
+                    let array = values
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<toml_edit::Array>();
+                    set_table_value(table, key, toml_edit::Value::Array(array));
+                }
+            };
+            text("model", &models.picks.model, models_table);
+            text("thinking", &models.picks.thought_level, models_table);
+            list("favorites", &models.favorites, models_table);
+            list("recent", &models.recents, models_table);
+        })?;
+        if models == ChatModels::default() {
+            self.chat_models.remove(&harness);
+        } else {
+            self.chat_models.insert(harness, models);
+        }
         Ok(())
     }
 
@@ -2173,6 +2266,17 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                 None => invalid(loaded, "chat.agents_bar", "true or false", "configuration"),
             }
         }
+        let harness = ChatHarness::Omp;
+        if let Some(item) = chat.get(harness.program()) {
+            let key = format!("chat.{}", harness.program());
+            match item.as_table() {
+                Some(table) => {
+                    let models = load_chat_models(table, &key, loaded);
+                    loaded.chat_models.insert(harness, models);
+                }
+                None => invalid(loaded, &key, "a table", "configuration"),
+            }
+        }
     }
     if let Some(notifications) = table(&document, "notifications", loaded) {
         if let Some(value) = notifications.get("delivery") {
@@ -2445,6 +2549,55 @@ fn valid_family(family: &str) -> bool {
     !family.trim().is_empty()
         && family.chars().count() <= 256
         && !family.chars().any(char::is_control)
+}
+
+/// One harness's `[chat.<program>]` table, `key` naming it in diagnostics.
+fn load_chat_models(table: &toml::Table, key: &str, loaded: &mut LoadedConfig) -> ChatModels {
+    let mut models = ChatModels::default();
+    for (field, pick) in [
+        ("model", &mut models.picks.model),
+        ("thinking", &mut models.picks.thought_level),
+    ] {
+        if let Some(value) = table.get(field) {
+            match value.as_str().filter(|value| !value.is_empty()) {
+                Some(value) => *pick = Some(value.to_owned()),
+                None => invalid(loaded, &format!("{key}.{field}"), "a name", "configuration"),
+            }
+        }
+    }
+    for (field, values) in [
+        ("favorites", &mut models.favorites),
+        ("recent", &mut models.recents),
+    ] {
+        let Some(value) = table.get(field) else {
+            continue;
+        };
+        let Some(array) = value.as_array() else {
+            invalid(
+                loaded,
+                &format!("{key}.{field}"),
+                "a list of names",
+                "configuration",
+            );
+            continue;
+        };
+        for (index, value) in array.iter().enumerate() {
+            match value.as_str().filter(|value| !value.is_empty()) {
+                Some(value) if !values.iter().any(|kept| kept == value) => {
+                    values.push(value.to_owned());
+                }
+                Some(_) => {}
+                None => invalid(
+                    loaded,
+                    &format!("{key}.{field}[{index}]"),
+                    "a name",
+                    "configuration",
+                ),
+            }
+        }
+    }
+    models.recents.truncate(MAX_RECENT_CHAT_MODELS);
+    models
 }
 
 fn invalid(loaded: &mut LoadedConfig, field: &str, expected: &str, origin: &str) {
@@ -3295,6 +3448,55 @@ mod tests {
                 .any(|message| message.contains("workspace.dev_server"))
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_models_round_trip_under_their_harness_and_keep_other_chat_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-chat-models-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[chat]\ntext_size = 16\n").unwrap();
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert!(loaded.chat_models.is_empty());
+        let mut models = ChatModels::default();
+        models.picked_model("anthropic/claude-opus-5-5");
+        models.picks.thought_level = Some("high".into());
+        models.toggle_favorite("openai-codex/gpt-5.5");
+        loaded
+            .save_chat_models(ChatHarness::Omp, models.clone())
+            .unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.chat_models.get(&ChatHarness::Omp), Some(&models));
+        assert_eq!(reloaded.chat_text_size, 16.0);
+        assert!(
+            reloaded.diagnostics.is_empty(),
+            "{:?}",
+            reloaded.diagnostics
+        );
+
+        fs::write(
+            &path,
+            "version = 1\n[chat.omp]\nmodel = ''\nrecent = ['a', 3, 'a', 'b']\n",
+        )
+        .unwrap();
+        let invalid = load(Some(&path), FontOverrides::default());
+        let kept = invalid.chat_models.get(&ChatHarness::Omp).unwrap();
+        assert_eq!(kept.picks.model, None);
+        assert_eq!(kept.recents, ["a", "b"]);
+        assert_eq!(invalid.diagnostics.len(), 2);
+
+        loaded
+            .save_chat_models(ChatHarness::Omp, ChatModels::default())
+            .unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("[chat.omp]"));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

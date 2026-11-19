@@ -4,7 +4,7 @@
 
 - Before working on Compi, read the `jacksmainvault/Compi` notes, on Windows and macOS alike. Start with `feat and bugs.md` (scope, order, open items) and `References/` (UI references, scope rules). Then read `docs/dev/NEXT_STEPS.md` here.
 - Windows: `C:\Users\johns\OneDrive\Documents\jacksmainvault\Compi`. macOS: the same `Documents/jacksmainvault/Compi` folder inside the synced OneDrive directory.
-- The vault sets product scope and order; this repo's `docs/dev` holds the implementation detail. Borrow behaviour from references (Tern, Rex, T3 Code), never their layouts or look. One exception (decided 2026-11-18): the sidebar takes T3 Code's rounded thread cards, project icons and search bar.
+- The vault sets product scope and order; this repo's `docs/dev` holds the implementation detail. Borrow behaviour from references (Tern, Rex, T3 Code), never their layouts or look. Two exceptions: the sidebar takes T3 Code's rounded thread cards, project icons and search bar (decided 2026-11-18), and the chat's model picker takes T3 Code's provider strip, spacing and footer (decided 2026-11-19).
 
 ## README scope
 

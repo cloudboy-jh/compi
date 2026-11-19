@@ -129,7 +129,9 @@ impl AssetSource for Assets {
                 "../../assets/brands/omp.svg"
             ))));
         }
-        if let Some(bytes) = super::language_icons::file(path) {
+        if let Some(bytes) =
+            super::language_icons::file(path).or_else(|| super::model_icons::file(path))
+        {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
         if let Some(bytes) = ExtraIcons.load(path)? {
@@ -1088,6 +1090,7 @@ pub(super) struct PopoverControl {
     on_key: Option<KeyHandler>,
     content: Option<AnyElement>,
     full_width: bool,
+    offset: Pixels,
 }
 
 /// A popover attached to `trigger`, open while `open`. The caller owns the state:
@@ -1107,6 +1110,7 @@ pub(super) fn popover(
         on_key: None,
         content: None,
         full_width: false,
+        offset: px(0.),
     }
 }
 
@@ -1115,6 +1119,12 @@ impl PopoverControl {
     /// below the trigger.
     pub(super) fn anchor(mut self, anchor: Anchor) -> Self {
         self.anchor = anchor;
+        self
+    }
+
+    /// Gap between the trigger and the popover, along the anchor's side.
+    pub(super) fn offset(mut self, offset: Pixels) -> Self {
+        self.offset = offset;
         self
     }
 
@@ -1159,6 +1169,7 @@ impl RenderOnce for PopoverControl {
             self.anchor,
             self.on_open_change,
         )
+        .offset(self.offset)
         .track_focus(&focus)
         .when(self.full_width, |popover| {
             popover.trigger_style(StyleRefinement::default().w_full())

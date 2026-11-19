@@ -7,7 +7,9 @@ use crate::diff::{self, FileDiff, LineKind, Side, Whitespace};
 use crate::gui::language_icons::LanguageIcon;
 use crate::gui::workspace::content::{LanguageHint, language_for, language_icon};
 use crate::gui::workspace::diff_view::line_styles;
-use compi_protocol::chat::{ChatAgent, ChatAgentsFinished, ChatDiff, ChatTool, ChatToolStatus};
+use compi_protocol::chat::{
+    ChatAgent, ChatAgentsFinished, ChatChange, ChatDiff, ChatTool, ChatToolStatus,
+};
 use gpui::{HighlightStyle, StyledText};
 use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
 use gpui_component::input::Rope;
@@ -72,6 +74,8 @@ pub(super) enum ChatRow {
     },
     Error(SharedString),
     Cancelled,
+    /// The model or thinking level changed before the next prompt: `old → new`.
+    Switch(SharedString),
 }
 
 impl ChatRow {
@@ -79,9 +83,11 @@ impl ChatRow {
     pub(super) fn text_view(&self) -> Option<&Entity<TextViewState>> {
         match self {
             Self::User { text, .. } | Self::Agent(text) | Self::Thought { text, .. } => Some(text),
-            Self::Tool { .. } | Self::AgentsFinished { .. } | Self::Error(_) | Self::Cancelled => {
-                None
-            }
+            Self::Tool { .. }
+            | Self::AgentsFinished { .. }
+            | Self::Error(_)
+            | Self::Cancelled
+            | Self::Switch(_) => None,
         }
     }
 
@@ -94,7 +100,8 @@ impl ChatRow {
             | Self::Agent(_)
             | Self::AgentsFinished { .. }
             | Self::Error(_)
-            | Self::Cancelled => {}
+            | Self::Cancelled
+            | Self::Switch(_) => {}
         }
     }
 
@@ -199,12 +206,12 @@ pub(super) struct ToolRow {
     command: Option<SharedString>,
     /// What went wrong, when it failed: the first line of its error output.
     failure: Option<SharedString>,
-    /// Its input (unless it shows a command, edits or sub-agents) and output as
-    /// selectable code blocks; the output's last lines only, unless `all_output`.
+    /// Its input (only a call of a kind Compi has no view for) and output as selectable
+    /// code blocks; the output's last lines only, unless `all_output`.
     input: Option<Entity<TextViewState>>,
     output: Option<Entity<TextViewState>>,
-    /// The language its output's block is highlighted in: a Read's file's.
-    output_language: Option<&'static str>,
+    /// The file a finished edit that reported no diff changed, for Open in diff.
+    open_diff: Option<String>,
     /// The reader asked for all of its output.
     all_output: bool,
     /// Lines its whole output has.
@@ -280,34 +287,43 @@ impl ToolRow {
         };
         let added = diffs.iter().map(|block| block.added).sum();
         let removed = diffs.iter().map(|block| block.removed).sum();
-        // A card with edits shows them in place of its input, and in place of its output
-        // unless the edit failed or changed nothing, when the output says why. A card with
-        // sub-agents shows them in place of both, unless it failed. A command shows in
-        // place of the input it came in.
+        // Calls show by kind, never as their raw input unless Compi has no view for the
+        // kind. An edit is a file change: its diffs, or Open in diff; its output only
+        // when it failed or changed nothing, which the output says why. A read shows its
+        // file in its head, and its output only when it failed. A command shows in place
+        // of its input. A card with sub-agents shows them in place of both, unless it
+        // failed.
         let agents = !tool.agents.is_empty();
-        let shows_input = diffs.is_empty() && !agents;
-        let command = tool_command(tool).filter(|_| shows_input);
+        let failed = tool.status == ChatToolStatus::Failed;
+        let edits = matches!(verb, "Edit" | "Delete" | "Move");
+        let command = tool_command(tool).filter(|_| !agents && !edits && diffs.is_empty());
+        let typed = edits || matches!(verb, "Read" | "Search" | "Fetch" | "Agents");
         let input = tool
             .input
             .as_ref()
-            .filter(|_| shows_input && command.is_none());
-        let failed = tool.status == ChatToolStatus::Failed;
+            .filter(|_| !typed && !agents && diffs.is_empty() && command.is_none());
         let target = tool_target(tool, folder);
-        // What a Read returns is the file it read: its block takes the file's language,
-        // so it is coloured as the file is in an editor. A failed Read returns an error.
-        let output_language = match (verb, target.as_deref()) {
-            ("Read", Some(path)) if !failed => {
-                Some(language_for(path)).filter(|language| *language != "text")
-            }
-            _ => None,
-        };
-        let output = tool
-            .output
-            .as_deref()
-            .filter(|_| failed || !agents && (diffs.is_empty() || added + removed == 0));
+        let output = tool.output.as_deref().filter(|_| {
+            failed
+                || !agents
+                    && match verb {
+                        "Read" => false,
+                        _ if edits => !diffs.is_empty() && added + removed == 0,
+                        _ => diffs.is_empty() || added + removed == 0,
+                    }
+        });
+        let open_diff = edits
+            .then(|| {
+                tool.locations
+                    .first()
+                    .cloned()
+                    .or_else(|| tool_input_path(tool))
+            })
+            .flatten()
+            .filter(|_| diffs.is_empty() && tool.status == ChatToolStatus::Completed);
         let (output, output_lines) = match output {
             Some(text) => {
-                let (view, lines) = output_view(text, output_language, all_output, before, cx);
+                let (view, lines) = output_view(text, all_output, before, cx);
                 (Some(view), lines)
             }
             None => (None, 0),
@@ -329,7 +345,7 @@ impl ToolRow {
                 cx,
             ),
             output,
-            output_language,
+            open_diff,
             all_output,
             output_lines,
             agents: tool
@@ -360,11 +376,21 @@ impl ToolRow {
         }
     }
 
-    /// Unfolded until the reader folds it: a small edit, or a call that started
-    /// sub-agents. A failed call stays one line, which says what went wrong.
+    /// Unfolded until the reader folds it: a small edit, or a call whose sub-agents
+    /// still run. A failed call stays one line, which says what went wrong.
     fn opens(&self) -> bool {
-        !self.agents.is_empty()
+        self.agents.iter().any(|agent| agent.agent.status.is_open())
             || (!self.diffs.is_empty() && self.added + self.removed <= SMALL_EDIT_LINES)
+    }
+
+    /// Whether unfolding shows anything.
+    fn has_body(&self) -> bool {
+        !self.diffs.is_empty()
+            || !self.agents.is_empty()
+            || self.command.is_some()
+            || self.input.is_some()
+            || self.output.is_some()
+            || self.open_diff.is_some()
     }
 }
 
@@ -510,7 +536,7 @@ pub(super) fn relative_to(path: &str, folder: &str) -> String {
 }
 
 /// The verb and icon of a tool call, by its ACP kind (or its name, for `other`).
-fn tool_kind(tool: &ChatTool) -> (&'static str, IconName) {
+pub(super) fn tool_kind(tool: &ChatTool) -> (&'static str, IconName) {
     match tool.kind.as_str() {
         "read" => ("Read", IconName::FileText),
         "edit" => ("Edit", IconName::FilePen),
@@ -569,6 +595,15 @@ fn tool_target(tool: &ChatTool, folder: &str) -> Option<SharedString> {
     .map(|value| relative_to(value, folder).into())
 }
 
+/// The path in a call's input, as the harness gave it.
+fn tool_input_path(tool: &ChatTool) -> Option<String> {
+    let input: serde_json::Value = serde_json::from_str(tool.input.as_deref()?).ok()?;
+    ["path", "file_path", "filePath"]
+        .iter()
+        .find_map(|key| input.get(*key)?.as_str())
+        .map(str::to_owned)
+}
+
 /// The view of a tool's input or output, or an agent's result, `text` as `source` makes it
 /// Markdown: `before`'s view when it showed the same text, or that view given the new
 /// text, else a new one.
@@ -590,13 +625,11 @@ fn tool_view(
     }
 }
 
-/// The view of a tool's output `text`, in `language` when it is code in a known one: all
-/// of it, or its last `TOOL_OUTPUT_TAIL_LINES` lines; `before`'s view when it showed the
-/// same, or that view given the new text, else a new one. With it, how many lines the
-/// whole output has.
+/// The view of a tool's output `text`: all of it, or its last `TOOL_OUTPUT_TAIL_LINES`
+/// lines; `before`'s view when it showed the same, or that view given the new text, else
+/// a new one. With it, how many lines the whole output has.
 fn output_view(
     text: &str,
-    language: Option<&'static str>,
     all: bool,
     before: Option<&ToolRow>,
     cx: &mut App,
@@ -604,15 +637,11 @@ fn output_view(
     let shown = before.and_then(|before| Some((before, before.output.as_ref()?)));
     if let Some((before, view)) = shown
         && before.all_output == all
-        && before.output_language == language
         && before.tool.output.as_deref() == Some(text)
     {
         return (view.clone(), before.output_lines);
     }
-    let (language, body) = match language {
-        Some(language) => (language, text.trim_end().to_owned()),
-        None => tool_body(text),
-    };
+    let (language, body) = tool_body(text);
     let lines = body.lines().count();
     let source = fenced(
         language,
@@ -855,7 +884,8 @@ pub(super) fn continues(was: &ChatEntry, now: &ChatEntry) -> bool {
         (ChatEntry::Tool(was), ChatEntry::Tool(now)) => was.id == now.id,
         (ChatEntry::AgentsFinished(_), ChatEntry::AgentsFinished(_))
         | (ChatEntry::Error { .. }, ChatEntry::Error { .. })
-        | (ChatEntry::Cancelled, ChatEntry::Cancelled) => was == now,
+        | (ChatEntry::Cancelled, ChatEntry::Cancelled)
+        | (ChatEntry::Switch { .. }, ChatEntry::Switch { .. }) => was == now,
         _ => false,
     }
 }
@@ -903,7 +933,24 @@ pub(super) fn chat_row(entry: &ChatEntry, folder: &str, cx: &mut App) -> ChatRow
         },
         ChatEntry::Error { message } => ChatRow::Error(message.clone().into()),
         ChatEntry::Cancelled => ChatRow::Cancelled,
+        ChatEntry::Switch {
+            model,
+            thought_level,
+        } => ChatRow::Switch(switch_label(model.as_ref(), thought_level.as_ref())),
     }
+}
+
+/// A switch's line: `Claude Opus 5.5 → Claude Sonnet 4.5 · Thinking high → low`, with
+/// only the settings that changed.
+fn switch_label(model: Option<&ChatChange>, thinking: Option<&ChatChange>) -> SharedString {
+    let parts: Vec<String> = [
+        model.map(|change| format!("{} → {}", change.from, change.to)),
+        thinking.map(|change| format!("Thinking {} → {}", change.from, change.to)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    parts.join(" · ").into()
 }
 
 /// A summary entry's line: `2 agents finished · 15s · $0.20`.
@@ -1083,18 +1130,34 @@ fn hidden(row: &ChatRow) -> bool {
         if tool.tool.waits_on_agents && tool.tool.status != ChatToolStatus::Failed)
 }
 
-/// Row `index` of `rows`, with the gap under it: tool cards in a run pack tightly.
-pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> AnyElement {
+/// Row `index` of `rows` as `plan` shows it: the "Worked for" line of a folded turn and
+/// the line of a run of calls when they sit on it, then the entry itself unless folded
+/// away (indented under its run's line); with the gap under it: work in a row (calls
+/// and those lines) packs tightly.
+pub(super) fn render_row(
+    rows: &[ChatRow],
+    plan: &[timeline::Shown],
+    index: usize,
+    frame: &RowFrame,
+) -> AnyElement {
     let Some(row) = rows.get(index) else {
         return div().into_any_element();
     };
-    if hidden(row) {
+    let unplanned = timeline::Shown::default();
+    let shown_at = |at: usize| plan.get(at).unwrap_or(&unplanned);
+    let body_at = |at: usize| shown_at(at).body != timeline::Body::Hidden && !hidden(&rows[at]);
+    let line_at = |at: usize| shown_at(at).fold.is_some() || shown_at(at).group.is_some();
+    let shown = shown_at(index);
+    let body_shown = body_at(index);
+    if !body_shown && !line_at(index) {
         return div().into_any_element();
     }
-    let next = rows[index + 1..].iter().find(|row| !hidden(row));
-    let packed = matches!(row, ChatRow::Tool { .. }) && matches!(next, Some(ChatRow::Tool { .. }));
+    let next = (index + 1..rows.len()).find(|&at| body_at(at) || line_at(at));
+    let work_starts = |at: usize| line_at(at) || matches!(rows[at], ChatRow::Tool { .. });
+    let work_ends = !body_shown || matches!(row, ChatRow::Tool { .. });
+    let packed = work_ends && next.is_some_and(work_starts);
     let last = next.is_none();
-    let body = match row {
+    let body = body_shown.then(|| match row {
         ChatRow::User {
             text,
             files,
@@ -1127,11 +1190,125 @@ pub(super) fn render_row(rows: &[ChatRow], index: usize, frame: &RowFrame) -> An
             .text_color(frame.muted())
             .child("Stopped")
             .into_any_element(),
-    };
+        ChatRow::Switch(label) => render_switch(label, frame),
+    });
+    // A member of a run hangs off its line, a rule down its left.
+    let body = body.map(|body| match shown.body {
+        timeline::Body::Member => div()
+            .ml(ui_rems(7.0))
+            .pl(ui_rems(10.0))
+            .border_l_1()
+            .border_color(color(frame.colors.border))
+            .child(body)
+            .into_any_element(),
+        _ => body,
+    });
     div()
         .w_full()
         .pb(ui_rems(if packed { PACKED_GAP } else { ROW_GAP }))
-        .child(body)
+        .flex()
+        .flex_col()
+        .gap(ui_rems(PACKED_GAP))
+        .when_some(shown.fold.as_ref(), |row, fold| {
+            row.child(render_fold_line(index, fold, frame))
+        })
+        .when_some(shown.group.as_ref(), |row, group| {
+            row.child(render_group_line(index, group, frame))
+        })
+        .children(body)
+        .into_any_element()
+}
+
+/// A folded turn's line: "Worked for 2m 10s", unfolding the work under it.
+fn render_fold_line(index: usize, fold: &timeline::FoldLine, frame: &RowFrame) -> AnyElement {
+    let muted = frame.muted();
+    div()
+        .id(("chat-fold", index))
+        .h(ui_rems(24.0))
+        .px_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(ui_rems(4.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(color(frame.colors.surface_hover)))
+        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+        .text_color(muted)
+        .child(controls::glyph(
+            if fold.open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            },
+            muted,
+        ))
+        .child(div().whitespace_nowrap().child(fold.label.clone()))
+        .on_click(frame.act(move |this, chat, _, _| this.toggle_chat_turn(chat, index)))
+        .into_any_element()
+}
+
+/// A run of calls' line: what they did ("Ran 2 commands, edited 3 files"), marked when
+/// the latest failed, unfolding the calls under it.
+fn render_group_line(index: usize, group: &timeline::GroupLine, frame: &RowFrame) -> AnyElement {
+    let muted = frame.muted();
+    let icon = match group.verb {
+        "Run" => IconName::Terminal,
+        "Edit" => IconName::FilePen,
+        "Delete" => IconName::Delete,
+        "Move" => IconName::MoveRight,
+        "Agents" => IconName::Bot,
+        "Fetch" => IconName::Globe,
+        "Search" => IconName::FileSearch,
+        "Read" => IconName::FileText,
+        _ => IconName::Wrench,
+    };
+    div()
+        .id(("chat-run", index))
+        .h(ui_rems(24.0))
+        .px_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(ui_rems(4.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(color(frame.colors.surface_hover)))
+        .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+        .child(controls::glyph(
+            if group.open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            },
+            muted,
+        ))
+        .child(controls::glyph(icon, muted))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .child(group.label.clone()),
+        )
+        .when(group.failed, |line| {
+            line.child(controls::glyph(IconName::Close, color(frame.colors.error)))
+        })
+        .on_click(frame.act(move |this, chat, _, _| this.toggle_chat_run(chat, index)))
+        .into_any_element()
+}
+
+/// A switch between prompts: its line centred between two rules.
+fn render_switch(label: &SharedString, frame: &RowFrame) -> AnyElement {
+    let rule = || div().flex_1().h(px(1.0)).bg(color(frame.colors.border));
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+        .text_color(frame.muted())
+        .child(rule())
+        .child(div().flex_none().child(label.clone()))
+        .child(rule())
         .into_any_element()
 }
 
@@ -1459,10 +1636,17 @@ fn render_tool(
         .filter(|permission| permission.tool.as_deref() == Some(tool.id.as_str()));
     // The head is one line high: a title or target with line breaks (OMP's `eval` title
     // carries its code) shows its first line, or it draws over the rows below.
-    let (verb, target) = match &row.target {
-        Some(target) => (SharedString::from(row.verb), Some(first_line(target))),
-        None => (first_line(&tool.title), None),
+    // A call that started sub-agents is named by them; what it ran on is its title.
+    let (verb, target) = match row.agents.len() {
+        0 => match &row.target {
+            Some(target) => (SharedString::from(row.verb), Some(first_line(target))),
+            None => (first_line(&tool.title), None),
+        },
+        1 => (SharedString::from("1 sub-agent"), None),
+        count => (SharedString::from(format!("{count} sub-agents")), None),
     };
+    // A call with nothing more to show does not unfold.
+    let unfolds = row.has_body();
     let head = div()
         .id(("chat-tool", index))
         .h(ui_rems(24.0))
@@ -1471,8 +1655,10 @@ fn render_tool(
         .items_center()
         .gap_2()
         .rounded(ui_rems(4.0))
-        .cursor_pointer()
-        .hover(|style| style.bg(color(frame.colors.surface_hover)))
+        .when(unfolds, |head| {
+            head.cursor_pointer()
+                .hover(|style| style.bg(color(frame.colors.surface_hover)))
+        })
         .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
         .map(|head| {
             if !row.agents.is_empty() {
@@ -1561,7 +1747,9 @@ fn render_tool(
             )
         })
         .child(div().flex_none().child(tool_status(tool.status, frame)))
-        .on_click(frame.act(move |this, chat, _, _| this.toggle_chat_row(chat, index)));
+        .when(unfolds, |head| {
+            head.on_click(frame.act(move |this, chat, _, _| this.toggle_chat_row(chat, index)))
+        });
     div()
         .flex()
         .flex_col()
@@ -1791,6 +1979,18 @@ fn render_tool_body(
         })
         .when_some(row.output.as_ref(), |body, output| {
             body.child(tool_output(index, row, output, frame))
+        })
+        .when_some(row.open_diff.clone(), |body, path| {
+            body.child(
+                div().child(
+                    text_button(("chat-open-edit", index), "Open in diff")
+                        .ghost()
+                        .disabled_because(frame.diff_refusal)
+                        .on_click(frame.act(move |this, chat, window, cx| {
+                            this.open_chat_diff(chat, &path, window, cx);
+                        })),
+                ),
+            )
         })
         .into_any_element()
 }
@@ -2448,7 +2648,7 @@ mod tests {
                     failure: None,
                     input: None,
                     output: None,
-                    output_language: None,
+                    open_diff: None,
                     all_output: false,
                     output_lines: 0,
                     cost: None,
