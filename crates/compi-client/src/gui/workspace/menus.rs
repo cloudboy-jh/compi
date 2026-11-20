@@ -543,13 +543,29 @@ impl CompiApp {
     ) {
         let context = self.command_context(cx);
         let entries = vec![
-            self.command_entry(Command::NewTab, "New tab", &context, cx),
+            self.command_entry(Command::NewThreadTab, "New thread tab", &context, cx),
+            self.command_entry(Command::NewTerminalTab, "New terminal tab", &context, cx),
             self.command_entry(Command::CreateWorkspace, "New workspace", &context, cx),
             MenuEntry::Separator,
             self.command_entry(Command::SplitRight, "Split right", &context, cx),
             self.command_entry(Command::SplitDown, "Split down", &context, cx),
             MenuEntry::Separator,
             self.command_entry(Command::ToggleSidebar, "Toggle sidebar", &context, cx),
+        ];
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
+    /// Right-click on the tab strip's +: a thread or a terminal, whichever New tabs says.
+    pub(super) fn open_new_tab_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let context = self.command_context(cx);
+        let entries = vec![
+            self.command_entry(Command::NewThreadTab, "New thread tab", &context, cx),
+            self.command_entry(Command::NewTerminalTab, "New terminal tab", &context, cx),
         ];
         self.open_menu(position, Anchor::TopLeft, entries, window, cx);
     }

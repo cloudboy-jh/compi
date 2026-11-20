@@ -273,6 +273,39 @@ impl ChatOpen {
     }
 }
 
+/// What a new tab (the tab strip's +, Ctrl+T) opens with, `[chat] new_tab`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewTab {
+    /// A new thread draft.
+    Chat,
+    /// A shell.
+    #[default]
+    Terminal,
+}
+
+impl NewTab {
+    pub const ALL: [Self; 2] = [Self::Chat, Self::Terminal];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat first",
+            Self::Terminal => "Terminal first",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|new_tab| new_tab.id() == value)
+    }
+}
+
 /// Recent models a harness's model picker lists.
 pub const MAX_RECENT_CHAT_MODELS: usize = 5;
 
@@ -690,6 +723,9 @@ pub struct LoadedConfig {
     /// Where a new chat opens; see [`ChatOpen`].
     #[serde(default)]
     pub chat_open: ChatOpen,
+    /// What a new tab opens with, `[chat] new_tab`; unset until chosen on first launch.
+    #[serde(default)]
+    pub new_tab: Option<NewTab>,
     /// The bar listing a chat's running sub-agents above its composer, `[chat] agents_bar`.
     #[serde(default = "default_chat_agents_bar")]
     pub chat_agents_bar: bool,
@@ -734,6 +770,7 @@ impl Default for LoadedConfig {
             chat_approval: ChatApproval::Harness,
             chat_enter: ChatEnter::Steer,
             chat_open: ChatOpen::InPlace,
+            new_tab: None,
             chat_agents_bar: true,
             chat_models: HashMap::new(),
             dev_server: DevServer::Offer,
@@ -1117,6 +1154,16 @@ impl LoadedConfig {
             enter => set_table_value(table, "enter_while_working", enter.id().into()),
         })?;
         self.chat_enter = enter;
+        Ok(())
+    }
+
+    /// Persist what a new tab opens with. Always written: an unset value is what makes
+    /// Compi ask on first launch.
+    pub fn save_new_tab(&mut self, new_tab: NewTab) -> Result<(), String> {
+        update_table(&self.path, "chat", |table| {
+            set_table_value(table, "new_tab", new_tab.id().into());
+        })?;
+        self.new_tab = Some(new_tab);
         Ok(())
     }
 
@@ -2256,6 +2303,17 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                     loaded,
                     "chat.open",
                     "\"in_place\" or \"beside\"",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = chat.get("new_tab") {
+            match value.as_str().and_then(NewTab::parse) {
+                Some(new_tab) => loaded.new_tab = Some(new_tab),
+                None => invalid(
+                    loaded,
+                    "chat.new_tab",
+                    "\"chat\" or \"terminal\"",
                     "configuration",
                 ),
             }
@@ -3593,6 +3651,46 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("files.text_size"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_tab_stays_unset_until_saved_so_first_launch_asks() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-new-tab-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.new_tab, None);
+        // Terminal first is the default, yet saving it still records the answer.
+        loaded.save_new_tab(NewTab::Terminal).unwrap();
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).new_tab,
+            Some(NewTab::Terminal)
+        );
+        loaded.save_new_tab(NewTab::Chat).unwrap();
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).new_tab,
+            Some(NewTab::Chat)
+        );
+
+        fs::write(&path, "version = 1\n[chat]\nnew_tab = \"sideways\"\n").unwrap();
+        let invalid = load(Some(&path), FontOverrides::default());
+        assert_eq!(invalid.new_tab, None);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("chat.new_tab"))
         );
         fs::remove_dir_all(root).unwrap();
     }

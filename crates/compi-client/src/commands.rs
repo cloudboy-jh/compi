@@ -84,7 +84,9 @@ registry! {
     SwitchWorkspace, "switch_workspace", "Switch workspace", None, None;
     RenameWorkspace, "rename_workspace", "Rename workspace", None, None;
     RemoveWorkspace, "remove_workspace", "Remove workspace", None, None;
-    NewTab, "new_tab", "New terminal tab", Some("cmd-t"), Some("ctrl-t");
+    NewTab, "new_tab", "New tab", Some("cmd-t"), Some("ctrl-t");
+    NewTerminalTab, "new_terminal_tab", "New terminal tab", None, None;
+    NewThreadTab, "new_thread_tab", "New thread tab", None, None;
     SwitchTab, "switch_tab", "Switch terminal tab", None, None;
     PreviousTab, "previous_tab", "Previous terminal tab", Some("cmd-shift-left"), Some("ctrl-shift-tab");
     NextTab, "next_tab", "Next terminal tab", Some("cmd-shift-right"), Some("ctrl-tab");
@@ -334,6 +336,8 @@ impl Command {
         use Command::*;
         match self {
             NewTab
+            | NewTerminalTab
+            | NewThreadTab
             | SwitchTab
             | PreviousTab
             | NextTab
@@ -670,6 +674,8 @@ impl Command {
                 | RenameWorkspace
                 | RemoveWorkspace
                 | NewTab
+                | NewTerminalTab
+                | NewThreadTab
                 | RenameTab
                 | MoveTabLeft
                 | MoveTabRight
@@ -735,7 +741,7 @@ impl Command {
         match self {
             CreateWorkspace => None,
             SwitchWorkspace => (c.workspace_count == 0).then_some("No workspaces are available"),
-            RenameWorkspace | RemoveWorkspace | NewTab => {
+            RenameWorkspace | RemoveWorkspace | NewTab | NewTerminalTab | NewThreadTab => {
                 (!c.has_workspace).then_some("Select a workspace first")
             }
             RestoreHiddenTab => {

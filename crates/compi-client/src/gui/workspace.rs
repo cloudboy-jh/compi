@@ -413,6 +413,9 @@ pub(super) enum Overlay {
         tab_id: TabId,
     },
     Diagnostics,
+    /// First launch: what a new tab opens with, Chat first or Terminal first. Asked
+    /// once; closing it keeps Terminal first.
+    ChooseNewTab,
     /// Save / Don't save / Cancel before `then` drops these dirty editors; `saving`
     /// while Save waits for every save.
     Unsaved {
@@ -1277,6 +1280,10 @@ impl CompiApp {
         {
             this.create_terminal(Some(cwd));
         }
+        // First launch (or the first since New tabs came): ask what a new tab opens with.
+        if this.restore_session.is_none() && this.config.new_tab.is_none() {
+            this.open_overlay(Overlay::ChooseNewTab, "");
+        }
         this
     }
     fn acknowledge_update_restore(&mut self) {
@@ -1835,6 +1842,35 @@ impl CompiApp {
             }
         }
         Err("Workspace kept changing while committing the divider".into())
+    }
+
+    /// A terminal tab in the focused terminal's folder.
+    fn create_terminal_tab(&mut self) {
+        self.create_terminal(inherited_working_directory(
+            self.focused_view().and_then(|view| view.mirror.snapshot()),
+        ));
+    }
+
+    /// A new thread draft in a tab of its own, in the focused pane's folder. With no
+    /// folder to start it in (nothing focused), a terminal tab instead.
+    fn create_thread_tab(&mut self) {
+        let (Some(session_id), Ok((environment, folder))) =
+            (self.state.selected_session.clone(), self.chat_scope())
+        else {
+            self.create_terminal_tab();
+            return;
+        };
+        self.mutate(
+            WorkspaceMutation::CreateContentTab {
+                session_id,
+                label: String::new(),
+                content: compi_protocol::PaneContent::Chat(crate::chat::new_chat(
+                    environment,
+                    folder,
+                )),
+            },
+            true,
+        );
     }
 
     fn create_terminal(&mut self, working_directory: Option<String>) {
@@ -3574,9 +3610,28 @@ impl CompiApp {
             // Selects and menus inside the overlay go with it.
             self.popup = None;
         }
+        // Closing the first-launch question keeps Terminal first, and it is not asked
+        // again.
+        if matches!(self.overlay, Some(Overlay::ChooseNewTab))
+            && self.config.new_tab.is_none()
+            && let Err(error) = self.config.save_new_tab(crate::config::NewTab::Terminal)
+        {
+            self.global_error = Some(error);
+        }
         if self.overlay.is_some() && self.overlay_closing_since.is_none() {
             self.overlay_closing_since = Some(Instant::now());
         }
+    }
+
+    /// The first-launch answer, saved for every window; Chat first opens a new thread
+    /// right away.
+    fn choose_new_tab(&mut self, new_tab: crate::config::NewTab, cx: &mut Context<Self>) {
+        self.set_new_tab(new_tab, cx);
+        self.dismiss_overlay();
+        if new_tab == crate::config::NewTab::Chat {
+            self.create_thread_tab();
+        }
+        cx.notify();
     }
 
     fn finish_dismiss_overlay(&mut self) {
@@ -3803,6 +3858,7 @@ impl CompiApp {
                     | Overlay::ConfirmQuitProcess { .. }
                     | Overlay::Unsaved { .. }
                     | Overlay::Diagnostics
+                    | Overlay::ChooseNewTab
                     | Overlay::Arrangements { .. }
             )
         ) {
@@ -3884,9 +3940,12 @@ impl CompiApp {
                     self.remove_workspace(session_id);
                 }
             }
-            Command::NewTab => self.create_terminal(inherited_working_directory(
-                self.focused_view().and_then(|view| view.mirror.snapshot()),
-            )),
+            Command::NewTab => match self.config.new_tab.unwrap_or_default() {
+                crate::config::NewTab::Chat => self.create_thread_tab(),
+                crate::config::NewTab::Terminal => self.create_terminal_tab(),
+            },
+            Command::NewTerminalTab => self.create_terminal_tab(),
+            Command::NewThreadTab => self.create_thread_tab(),
             Command::SwitchTab => self.open_overlay(Overlay::Tabs { hidden_only: false }, ""),
             Command::RestoreHiddenTab => self.open_overlay(Overlay::Tabs { hidden_only: true }, ""),
             Command::PreviousTab | Command::NextTab => {
@@ -4566,6 +4625,9 @@ impl CompiApp {
             }
             Overlay::Unsaved { .. } => self.answer_unsaved(self.overlay_focus, window, cx),
             Overlay::Diagnostics => self.dismiss_overlay(),
+            Overlay::ChooseNewTab => {
+                self.choose_new_tab(crate::config::NewTab::ALL[self.overlay_focus.min(1)], cx)
+            }
             other => {
                 let choices = self.overlay_choices(cx);
                 if let Some(choice) = choices.get(self.overlay_index).cloned() {
@@ -5926,6 +5988,14 @@ impl CompiApp {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.open_new_tab_menu(event.position, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .child(self.command_icon_button(
                         "new-terminal",
                         ChromeIcon::Add,

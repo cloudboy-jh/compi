@@ -1291,7 +1291,7 @@ impl CompiApp {
                         }
                         WorkspaceAction::NewTerminal => {
                             this.select_workspace(&session, window);
-                            this.execute(Command::NewTab, window, cx);
+                            this.execute(Command::NewTerminalTab, window, cx);
                         }
                         WorkspaceAction::NewThread => {
                             this.select_workspace(&session, window);
@@ -1544,8 +1544,8 @@ impl CompiApp {
             .child(self.sidebar_command(
                 "sidebar-new-tab",
                 IconName::SquareTerminal,
-                "New tab",
-                Command::NewTab,
+                "New terminal tab",
+                Command::NewTerminalTab,
                 false,
                 context,
                 cx,

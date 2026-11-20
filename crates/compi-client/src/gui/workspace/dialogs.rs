@@ -414,6 +414,95 @@ impl CompiApp {
         )
     }
 
+    /// First launch: Chat first or Terminal first, as two choices side by side; the
+    /// highlighted one (`overlay_focus`) is what Enter picks.
+    fn render_new_tab_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let choices = crate::config::NewTab::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, new_tab)| {
+                let (icon, detail) = match new_tab {
+                    crate::config::NewTab::Chat => (
+                        IconName::MessageSquarePlus,
+                        "A new tab starts a thread with OMP. Right-click + for a terminal.",
+                    ),
+                    crate::config::NewTab::Terminal => (
+                        IconName::SquareTerminal,
+                        "A new tab starts a shell. Right-click + for a new thread.",
+                    ),
+                };
+                let selected = self.overlay_focus == index;
+                div()
+                    .id(("new-tab-choice", index))
+                    .flex_1()
+                    .min_w_0()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color(if selected {
+                        colors.accent
+                    } else {
+                        colors.border
+                    }))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(color(colors.surface_hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.choose_new_tab(new_tab, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(UI_BODY_TEXT_SIZE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(controls::glyph(icon, color(colors.foreground)))
+                            .child(new_tab.label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(detail),
+                    )
+            });
+        self.render_centered_scrim(
+            div()
+                .w_full()
+                .max_w(px(500.0))
+                .flex()
+                .flex_col()
+                .rounded_md()
+                .border_1()
+                .border_color(color(colors.border))
+                .bg(color(colors.surface))
+                .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(self.render_dialog_header("How should new tabs open?", cx))
+                .child(
+                    div()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(div().flex().gap_3().children(choices))
+                        .child(
+                            div()
+                                .text_size(px(UI_SMALL_TEXT_SIZE))
+                                .text_color(muted)
+                                .child("Change it any time in Settings → Chat → New tabs."),
+                        ),
+                ),
+            window,
+            cx,
+        )
+    }
+
     /// Save / Don't save / Cancel for the dirty files an action would drop: each file's
     /// name over its folder and environment.
     fn render_unsaved_dialog(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
@@ -1184,6 +1273,18 @@ impl CompiApp {
             }
             return true;
         }
+        if matches!(self.overlay, Some(Overlay::ChooseNewTab)) {
+            match key.key.as_str() {
+                "escape" => self.dismiss_overlay(),
+                "tab" | "left" | "right" => {
+                    self.overlay_focus = usize::from(self.overlay_focus == 0)
+                }
+                "enter" | "space" => self.activate_overlay(window, cx),
+                _ => return true,
+            }
+            cx.notify();
+            return true;
+        }
         false
     }
 
@@ -1208,6 +1309,8 @@ impl CompiApp {
             self.render_text_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Diagnostics)) {
             self.render_diagnostics_dialog(window, cx)
+        } else if matches!(self.overlay, Some(Overlay::ChooseNewTab)) {
+            self.render_new_tab_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Arrangements { .. })) {
             self.render_arrangement_overlay(window, cx)
         } else {

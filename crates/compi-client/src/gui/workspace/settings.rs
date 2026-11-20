@@ -18,7 +18,7 @@
 use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
 use super::*;
-use crate::config::{ChatEnter, ChatOpen, DevServer};
+use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
 use crate::gui::controls::IconName;
 use compi_protocol::chat::ChatApproval;
 use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
@@ -115,6 +115,8 @@ pub(super) enum SettingsAction {
     ChatEnter,
     /// Opening a chat: Left and Right pick in place or beside, Enter flips it.
     ChatOpen,
+    /// New tabs: Left and Right pick Chat first or Terminal first, Enter flips it.
+    NewTab,
     /// When a dev server starts: Left and Right step through the choices, Enter moves
     /// to the next.
     DevServer,
@@ -1054,6 +1056,18 @@ static ROWS: &[Row] = &[
             "steer queue send key ctrl cmd turn message composer agent omp",
             |_| vec![SettingsAction::ChatEnter],
             |app, row, cx| app.render_chat_enter_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Opening",
+        row(
+            "new-tab",
+            SettingsSection::Chat,
+            "New tabs",
+            "What the tab strip's + and Ctrl+T open: a new thread or a shell.",
+            "chat first terminal first new tab plus ctrl+t thread shell default",
+            |_| vec![SettingsAction::NewTab],
+            |app, row, cx| app.render_new_tab_row(row, cx),
         ),
     ),
     grouped(
@@ -2645,6 +2659,16 @@ impl CompiApp {
             (
                 "left" | "right",
                 Some(Stop::Control {
+                    action: SettingsAction::NewTab,
+                    ..
+                }),
+            ) => {
+                self.set_new_tab(NewTab::ALL[usize::from(key.key == "right")], cx);
+                current
+            }
+            (
+                "left" | "right",
+                Some(Stop::Control {
                     action: SettingsAction::DevServer,
                     ..
                 }),
@@ -2780,6 +2804,13 @@ impl CompiApp {
                 match self.config.chat_open {
                     ChatOpen::InPlace => ChatOpen::Beside,
                     ChatOpen::Beside => ChatOpen::InPlace,
+                },
+                cx,
+            ),
+            SettingsAction::NewTab => self.set_new_tab(
+                match self.config.new_tab.unwrap_or_default() {
+                    NewTab::Chat => NewTab::Terminal,
+                    NewTab::Terminal => NewTab::Chat,
                 },
                 cx,
             ),
@@ -3943,6 +3974,37 @@ impl CompiApp {
         )
     }
 
+    /// New tabs: Chat first or Terminal first, as a switch. Unset reads as Terminal
+    /// first, what + opens until it is chosen.
+    fn render_new_tab_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let current = self.config.new_tab.unwrap_or_default();
+        let detail = match current {
+            NewTab::Chat => {
+                "The tab strip's + and Ctrl+T open a new thread; right-click + for a terminal."
+            }
+            NewTab::Terminal => {
+                "The tab strip's + and Ctrl+T open a shell; right-click + for a new thread."
+            }
+        };
+        self.render_choice_row(
+            row,
+            SettingsAction::NewTab,
+            NewTab::ALL.map(|new_tab| {
+                (
+                    new_tab.label(),
+                    match new_tab {
+                        NewTab::Chat => "New tabs start a thread",
+                        NewTab::Terminal => "New tabs start a shell",
+                    },
+                    new_tab == current,
+                )
+            }),
+            |app, index, cx| app.set_new_tab(NewTab::ALL[index], cx),
+            detail.into(),
+            cx,
+        )
+    }
+
     /// Opening a chat: in place of the shell or beside it, as a switch.
     fn render_chat_open_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let current = self.config.chat_open;
@@ -4057,6 +4119,15 @@ impl CompiApp {
             return;
         }
         share_config_change(cx, move |config| config.chat_open = open);
+    }
+
+    /// Saves what a new tab opens with and gives it to every window.
+    pub(super) fn set_new_tab(&mut self, new_tab: NewTab, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_new_tab(new_tab) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_config_change(cx, move |config| config.new_tab = Some(new_tab));
     }
 
     /// Saves what a terminal does when a dev server starts and gives it to every
