@@ -16,10 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How long "Draft discarded · Undo" stays.
 const UNDO_LIFETIME: Duration = Duration::from_secs(5);
-/// The widest the draft's column grows.
-const DRAFT_WIDTH: f32 = 680.0;
-/// The width of the list of what else the pane can be.
-const SURFACES_WIDTH: f32 = 320.0;
+/// The widest the draft's column grows: the message box and the list under it share
+/// this width, less the footer's 12 px each side.
+const DRAFT_WIDTH: f32 = 544.0;
 
 static NEXT_NOTICE: AtomicU64 = AtomicU64::new(0);
 
@@ -242,13 +241,13 @@ impl CompiApp {
                     .flex()
                     .items_center()
                     .gap_2p5()
-                    .child(self.project_icon(project, 24.0))
+                    .child(self.project_icon(project, 28.0))
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(ui_rems(22.0))
-                            .line_height(ui_rems(28.0))
+                            .text_size(ui_rems(26.0))
+                            .line_height(ui_rems(32.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color(colors.foreground))
                             .child(name),
@@ -290,15 +289,17 @@ impl CompiApp {
                     )
                     .child(
                         div()
-                            .mt_8()
+                            .mt_4()
+                            .w_full()
+                            .px_3()
                             .child(self.render_open_instead(chat, model, cx)),
                     ),
             )
             .into_any_element()
     }
 
-    /// What else the pane can be, as a short list centred under the message box: a
-    /// heading with the Alt it takes, then one row each with its icon, name and letter.
+    /// What else the pane can be, as a list under the message box and as wide: a muted
+    /// heading, then one row each with its icon, name and key (Alt and its letter).
     /// Changes is dimmed outside a Git repository.
     fn render_open_instead(
         &self,
@@ -327,10 +328,10 @@ impl CompiApp {
                 .text_color(muted)
                 .child(text)
         };
-        let modifier: SharedString = if cfg!(target_os = "macos") {
-            "⌥".into()
+        let modifier = if cfg!(target_os = "macos") {
+            "⌥"
         } else {
-            "Alt".into()
+            "Alt "
         };
         let rows = OpenInstead::ALL
             .into_iter()
@@ -348,7 +349,7 @@ impl CompiApp {
                     .gap(ui_rems(10.0))
                     .rounded(ui_rems(8.0))
                     .text_size(ui_rems(UI_BODY_TEXT_SIZE))
-                    .text_color(foreground)
+                    .text_color(muted)
                     .when(unavailable, |row| {
                         row.opacity(0.5).tooltip(controls::tooltip(
                             "Changes",
@@ -358,36 +359,34 @@ impl CompiApp {
                     })
                     .when(!unavailable, |row| {
                         row.cursor_pointer()
-                            .hover(|style| style.bg(hover))
+                            .hover(|style| style.bg(hover).text_color(foreground))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 this.open_instead(&id, choice, window, cx);
                                 cx.notify();
                             }))
                     })
                     .child(
-                        controls::glyph(choice.icon(), foreground)
+                        controls::glyph(choice.icon(), muted)
                             .with_size(gpui_component::Size::Small),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(choice.label()))
-                    .child(key(choice.letter().to_uppercase().into()))
+                    .child(key(
+                        format!("{modifier}{}", choice.letter().to_uppercase()).into()
+                    ))
             });
         div()
-            .w(ui_rems(SURFACES_WIDTH))
+            .w_full()
             .flex()
             .flex_col()
             .gap_0p5()
             .child(
                 div()
-                    .mb_2()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1p5()
+                    .mb_1()
+                    .px(ui_rems(10.0))
                     .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(muted)
-                    .child("Open here")
-                    .child(key(format!("{modifier} +").into())),
+                    .child("Open here"),
             )
             .children(rows)
             .into_any_element()

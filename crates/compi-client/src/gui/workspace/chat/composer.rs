@@ -16,6 +16,9 @@ const MAX_COMPLETIONS: usize = 50;
 const PICKER_SETTINGS: [&str; 3] = ["model", "thought_level", "mode"];
 /// The composer card's corner radius.
 const CARD_RADIUS: f32 = 10.0;
+/// A draft pane's composer card: rounder, and its field two lines tall.
+const DRAFT_CARD_RADIUS: f32 = 14.0;
+const DRAFT_FIELD_HEIGHT: f32 = 60.0;
 /// The harness's mark in the empty draft.
 const MARK_SIZE: f32 = 14.0;
 /// A paste this long, or one that would make the draft too long to send, is attached as
@@ -960,7 +963,7 @@ impl CompiApp {
                     footer.child(self.render_chat_queue(chat, state, editing, cx))
                 },
             )
-            .child(self.render_chat_card(chat, model, &frame, cx))
+            .child(self.render_chat_card(chat, model, &frame, draft, cx))
             .when(!draft, |footer| {
                 footer.child(self.render_chat_context(chat, model))
             })
@@ -1178,12 +1181,14 @@ impl CompiApp {
     /// The composer: one card holding the attached files, the draft (with the harness's
     /// mark and hints while it is empty), and a row of attach, the harness's settings,
     /// usage and Send or Stop; the completion list opens over it. A click anywhere on the
-    /// card puts the keyboard in the draft.
+    /// card puts the keyboard in the draft. A `draft` pane's card is rounder and two
+    /// lines tall.
     fn render_chat_card(
         &self,
         chat: &ChatContent,
         model: &ChatModel,
         frame: &RowFrame,
+        draft: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = frame.colors;
@@ -1251,7 +1256,7 @@ impl CompiApp {
             .relative()
             .flex()
             .flex_col()
-            .rounded(ui_rems(CARD_RADIUS))
+            .rounded(ui_rems(if draft { DRAFT_CARD_RADIUS } else { CARD_RADIUS }))
             .border_1()
             .border_color(color(colors.border))
             .in_focus(move |style| style.border_color(color(colors.accent)))
@@ -1295,6 +1300,7 @@ impl CompiApp {
                     .relative()
                     .px_0p5()
                     .pt_1()
+                    .when(draft, |field| field.min_h(ui_rems(DRAFT_FIELD_HEIGHT)))
                     // The field pads its text 10 px across and 8 px down; the hint sits
                     // where typing starts, 12 px in from the card and 12 px down.
                     .child(
