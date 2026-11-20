@@ -239,6 +239,14 @@ impl SidebarGroup {
             .map(|section| section.cards.len())
             .sum()
     }
+
+    /// What its programs most need the user for, shown on its label while folded.
+    fn state(&self) -> Option<ProgramState> {
+        self.sections
+            .iter()
+            .filter_map(ProjectSection::state)
+            .max_by_key(|state| crate::program_status::urgency(*state))
+    }
 }
 
 /// A workspace's cards in order: pinned tabs in the order pinned, the other tabs in
@@ -1912,9 +1920,33 @@ impl CompiApp {
                             .text_ellipsis()
                             .child(group.label.clone()),
                     )
+                    // Folded, a dot for what its cards most need and how many there are.
+                    .when_some(group.state().filter(|_| !open), |label, state| {
+                        label.child(
+                            div()
+                                .flex_none()
+                                .size(px(7.0))
+                                .rounded_full()
+                                .bg(color(self.program_state_color(state))),
+                        )
+                    })
                     .when(!open && count > 0, |label| {
-                        label.child(div().flex_none().child(count.to_string()))
-                    }),
+                        label.child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::NORMAL)
+                                .child(count.to_string()),
+                        )
+                    })
+                    // Down while open, right while folded, at the row's end.
+                    .child(controls::glyph(
+                        if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        },
+                        color(muted),
+                    )),
             });
         self.drop_zone(label, &group.session, row, cx)
             .into_any_element()
@@ -1933,11 +1965,11 @@ impl CompiApp {
                 .child(rename.input.read(cx).value())
                 .into_any_element();
         }
+        // The window keeps typing here from the shell (`sidebar_has_keyboard`); a key
+        // listener stopping keys would keep them from the field too.
         div()
             .flex_1()
             .min_w_0()
-            // Typing here never reaches a shell.
-            .on_key_down(|_, _, cx| cx.stop_propagation())
             .child(
                 Input::new(&rename.input)
                     .appearance(true)
@@ -2029,14 +2061,24 @@ impl CompiApp {
                     .child(name),
             )
             .children(dot)
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(px(UI_MICRO_TEXT_SIZE))
-                    .font_weight(FontWeight::NORMAL)
-                    .text_color(color(muted))
-                    .child(section.cards.len().to_string()),
-            )
+            .when(section.folded, |header| {
+                header.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(color(muted))
+                        .child(section.cards.len().to_string()),
+                )
+            })
+            .child(controls::glyph(
+                if section.folded {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                },
+                color(muted),
+            ))
     }
 
     fn render_card(
