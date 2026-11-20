@@ -961,11 +961,17 @@ impl CompiApp {
                 },
             )
             .child(self.render_chat_card(chat, model, &frame, cx))
-            .child(self.render_chat_context(
-                chat,
-                model,
-                draft.then(|| self.render_chat_approval(chat, model, cx)),
-            ))
+            // A draft shows only its permissions under the message box; a thread, where
+            // it works.
+            .child(if draft {
+                div()
+                    .flex()
+                    .justify_end()
+                    .child(self.render_chat_approval(chat, model, cx))
+                    .into_any_element()
+            } else {
+                self.render_chat_context(chat, model)
+            })
             .into_any_element()
     }
 
@@ -1405,14 +1411,8 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Under the composer, quietly: the folder, where it lives, and its Git branch; then
-    /// `trailing` at the row's end.
-    fn render_chat_context(
-        &self,
-        chat: &ChatContent,
-        model: &ChatModel,
-        trailing: Option<AnyElement>,
-    ) -> AnyElement {
+    /// Under the composer, quietly: the folder, where it lives, and its Git branch.
+    fn render_chat_context(&self, chat: &ChatContent, model: &ChatModel) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         let place: SharedString = match &chat.environment {
@@ -1465,9 +1465,6 @@ impl CompiApp {
                         .child(controls::glyph(IconName::GitBranch, muted))
                         .child(div().truncate().child(branch)),
                 )
-            })
-            .when_some(trailing, |line, trailing| {
-                line.child(div().flex_1()).child(trailing)
             })
             .into_any_element()
     }

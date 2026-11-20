@@ -1,9 +1,10 @@
-//! New thread drafts. Every new chat starts as one: its message box in the middle of the
-//! pane, the project above it, the folder and the permissions the agent starts with
-//! below, and a quiet "Open instead" row that puts a terminal, Files, Changes, a browser
-//! or Monitor in the draft's place. The daemon keeps no thread of a draft until its first
-//! prompt (`ChatState::thread`), so closing an untouched one leaves nothing; closing one
-//! with typed text offers Undo for a few seconds.
+//! New thread drafts. Every new chat starts as one: a question over its message box in
+//! the middle of the pane, the project under the question, the permissions the agent
+//! starts with under the message box, and a list of what else the pane can be (a
+//! terminal, Files, Changes, a browser or Monitor), each with its letter. The daemon
+//! keeps no thread of a draft until its first prompt (`ChatState::thread`), so closing
+//! an untouched one leaves nothing; closing one with typed text offers Undo for a few
+//! seconds.
 use super::*;
 use compi_protocol::{
     BrowserContent, MonitorContent, MutationId, MutationReceipt, PaneReplacement, SessionId,
@@ -15,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const UNDO_LIFETIME: Duration = Duration::from_secs(5);
 /// The widest the draft's column grows.
 const DRAFT_WIDTH: f32 = 680.0;
+/// The width of the list of what else the pane can be.
+const SURFACES_WIDTH: f32 = 300.0;
 
 static NEXT_NOTICE: AtomicU64 = AtomicU64::new(0);
 
@@ -158,6 +161,26 @@ fn edge_leaf(node: &LayoutNode, first: bool) -> Option<PaneId> {
     }
 }
 
+/// The icon and name of a permissions choice Compi makes.
+fn approval_face(approval: ChatApproval) -> (IconName, &'static str) {
+    match approval {
+        ChatApproval::Harness => (IconName::Shield, "OMP's own setting"),
+        ChatApproval::AlwaysAsk => (IconName::ShieldCheck, "Ask before anything"),
+        ChatApproval::Write => (IconName::ShieldHalf, "Edits allowed"),
+        ChatApproval::Yolo => (IconName::ShieldOff, "Full access"),
+    }
+}
+
+/// The icon and name of an OMP approval mode the agent runs with.
+fn approval_mode_face(mode: &str) -> (IconName, &'static str) {
+    match mode {
+        "always-ask" => (IconName::ShieldCheck, "Ask before anything"),
+        "always-ask-cached" => (IconName::ShieldCheck, "Ask once per tool"),
+        "write" => (IconName::ShieldHalf, "Edits allowed"),
+        "yolo" => (IconName::ShieldOff, "Full access"),
+        _ => (IconName::Shield, "OMP's own setting"),
+    }
+}
 impl CompiApp {
     /// Split right or down from `beside`, which shows `source`: a new thread draft in
     /// `source`'s folder, in a pane of its own.
@@ -171,8 +194,8 @@ impl CompiApp {
         self.open_content_split(beside, axis, PaneContent::Chat(draft));
     }
 
-    /// A draft pane: the project, the message box and under it the folder and the
-    /// permissions, then the "Open instead" row, in the middle of the pane.
+    /// A draft pane: the question and the project, the message box with its
+    /// permissions, then what else the pane can be, in the middle of the pane.
     pub(super) fn render_chat_draft(
         &self,
         pane_id: &PaneId,
@@ -180,6 +203,8 @@ impl CompiApp {
         model: &ChatModel,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
         let project = self.pane_project(pane_id);
         let name: SharedString = match project {
             Some(project) => project.name().to_owned().into(),
@@ -195,95 +220,140 @@ impl CompiApp {
             .items_center()
             .justify_center()
             .px_4()
-            .py_6()
+            .py_8()
             .child(
                 div()
                     .w_full()
                     .max_w(ui_rems(DRAFT_WIDTH))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .items_center()
                     .child(
                         div()
-                            .px_3()
+                            .text_center()
+                            .text_size(ui_rems(30.0))
+                            .line_height(ui_rems(36.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(colors.foreground))
+                            .child("What should we work on?"),
+                    )
+                    .child(
+                        div()
+                            .id("chat-draft-project")
+                            .mt_2()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .child(self.project_icon(project, 20.0))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui_rems(UI_BODY_TEXT_SIZE + 2.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(name),
-                            ),
+                            .gap_1p5()
+                            .text_size(ui_rems(UI_BODY_TEXT_SIZE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child(self.project_icon(project, 16.0))
+                            .child(name)
+                            .tooltip(controls::tooltip(model.folder.clone(), None, None)),
                     )
-                    .child(self.render_chat_footer(chat, model, true, cx))
-                    .child(self.render_open_instead(chat, cx)),
+                    .child(
+                        div()
+                            .mt_6()
+                            .w_full()
+                            .child(self.render_chat_footer(chat, model, true, cx)),
+                    )
+                    .child(
+                        div()
+                            .mt_10()
+                            .child(self.render_open_instead(chat, model, cx)),
+                    ),
             )
             .into_any_element()
     }
 
-    /// "Open instead:" and its choices, each with its letter.
-    fn render_open_instead(&self, chat: &ChatContent, cx: &Context<Self>) -> AnyElement {
+    /// What else the pane can be, one row each: its icon, name and letter. Changes is
+    /// dimmed outside a Git repository.
+    fn render_open_instead(
+        &self,
+        chat: &ChatContent,
+        model: &ChatModel,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let hover = color(colors.surface_hover);
         let foreground = color(colors.foreground);
-        let border = color(colors.border);
-        let choices = OpenInstead::ALL
+        let hover = color(colors.surface_hover);
+        let badge = color(colors.surface_hover);
+        let rows = OpenInstead::ALL
             .into_iter()
             .enumerate()
             .map(|(index, choice)| {
+                let unavailable =
+                    choice == OpenInstead::Changes && matches!(model.repo, Repo::None);
+                let tint = if unavailable { muted } else { foreground };
                 let id = chat.id.clone();
                 div()
                     .id(("chat-open-instead", index))
-                    .flex_none()
-                    .h(ui_rems(22.0))
-                    .px_1p5()
+                    .h(ui_rems(34.0))
+                    .px_2()
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .rounded(ui_rems(4.0))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(hover).text_color(foreground))
-                    .child(controls::glyph(choice.icon(), muted))
-                    .child(choice.label())
+                    .gap_3()
+                    .rounded(ui_rems(8.0))
+                    .text_size(ui_rems(UI_BODY_TEXT_SIZE))
+                    .text_color(tint)
+                    .when(unavailable, |row| row.opacity(0.55))
+                    .when(!unavailable, |row| {
+                        row.cursor_pointer()
+                            .hover(|style| style.bg(hover))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.open_instead(&id, choice, window, cx);
+                                cx.notify();
+                            }))
+                    })
+                    .when(unavailable, |row| {
+                        row.tooltip(controls::tooltip(
+                            "Changes",
+                            Some("This folder is not in a Git repository".into()),
+                            None,
+                        ))
+                    })
+                    .child(
+                        controls::glyph(choice.icon(), tint).with_size(gpui_component::Size::Small),
+                    )
+                    .child(div().flex_1().child(choice.label()))
                     .child(
                         div()
-                            .px_1()
-                            .rounded(ui_rems(3.0))
-                            .border_1()
-                            .border_color(border)
+                            .flex_none()
+                            .min_w(ui_rems(22.0))
+                            .h(ui_rems(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(ui_rems(5.0))
+                            .bg(badge)
+                            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted)
                             .child(choice.key().to_uppercase()),
                     )
-                    .tooltip(controls::tooltip(
-                        format!("Open {} here instead", choice.label()),
-                        Some("Or press its letter while the draft is empty".into()),
-                        Some(choice.key()),
-                    ))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.open_instead(&id, choice, window, cx);
-                        cx.notify();
-                    }))
             });
         div()
-            .px_3()
+            .w(ui_rems(SURFACES_WIDTH))
             .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-            .text_color(muted)
-            .child(div().mr_1().child("Open instead:"))
-            .children(choices)
+            .flex_col()
+            .gap_0p5()
+            .child(
+                div()
+                    .pb_2()
+                    .text_center()
+                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(muted)
+                    .child("Or open here"),
+            )
+            .children(rows)
             .into_any_element()
     }
 
-    /// The draft's permissions: Settings → Chat → Approvals' choices, for this chat only.
+    /// The draft's permissions as one chip: the mode the agent runs with (what Compi
+    /// chose for this chat, else OMP's own setting as the daemon reports it), with a
+    /// shield; its menu picks another for this chat only.
     pub(super) fn render_chat_approval(
         &self,
         chat: &ChatContent,
@@ -292,9 +362,19 @@ impl CompiApp {
     ) -> AnyElement {
         let open = model.menu == Some(ChatMenu::Approval);
         let current = model.approval(self.config.chat_approval);
-        let label = super::super::settings::chat_approval_label;
-        let trigger = text_button("chat-approval", label(current))
+        let running = model
+            .state
+            .as_ref()
+            .and_then(|state| state.approval_mode.as_deref());
+        let (icon, label) = match current {
+            ChatApproval::Harness => {
+                running.map_or((IconName::Shield, "OMP's own setting"), approval_mode_face)
+            }
+            chosen => approval_face(chosen),
+        };
+        let trigger = text_button("chat-approval", label)
             .ghost()
+            .icon(icon)
             .menu_open(open)
             .tooltip("Permissions")
             .detail(format!(
@@ -307,8 +387,12 @@ impl CompiApp {
             .filter(|_| open)
             .map(|approval| {
                 let id = chat.id.clone();
+                let label = match approval {
+                    ChatApproval::Harness => "OMP's own setting",
+                    chosen => approval_face(chosen).1,
+                };
                 controls::menu_item(
-                    label(approval),
+                    label,
                     cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.pick_draft_approval(&id, approval, window, cx);
                         cx.notify();

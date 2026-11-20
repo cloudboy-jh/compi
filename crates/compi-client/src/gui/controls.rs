@@ -114,7 +114,10 @@ gpui_kit_assets::icon_assets!(
         MessageSquare,
         MessageSquarePlus,
         FolderPlus,
-        ChevronsDownUp,
+        Shield,
+        ShieldCheck,
+        ShieldHalf,
+        ShieldOff,
     ]
 );
 

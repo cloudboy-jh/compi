@@ -185,6 +185,11 @@ pub struct ChatState {
     /// from whole states.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread: bool,
+    /// How the running harness asks before it runs tools: OMP's `--approval-mode`
+    /// (`always-ask`, `always-ask-cached`, `write`, `yolo`), whether Compi chose it or
+    /// OMP's own setting did; `None` while unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 impl ChatState {
@@ -212,6 +217,7 @@ impl ChatState {
             ChatEvent::Session { session } => self.session = session,
             ChatEvent::Title { title } => self.title = title,
             ChatEvent::Options { options } => self.options = options,
+            ChatEvent::ApprovalMode { mode } => self.approval_mode = mode,
             ChatEvent::Commands { commands } => self.commands = commands,
             ChatEvent::Usage { usage } => self.usage = usage,
             ChatEvent::Permission { permission } => self.permission = permission,
@@ -697,6 +703,10 @@ pub enum ChatEvent {
     },
     Title {
         title: Option<String>,
+    },
+    /// The harness started with approval mode `mode` (see `ChatState::approval_mode`).
+    ApprovalMode {
+        mode: Option<String>,
     },
     Options {
         options: Vec<ChatOption>,

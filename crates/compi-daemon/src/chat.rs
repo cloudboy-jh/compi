@@ -751,6 +751,9 @@ impl Chat {
         approval_mode: Option<&'static str>,
         note: Option<String>,
     ) {
+        inner.emit(ChatEvent::ApprovalMode {
+            mode: approval_mode.map(str::to_owned),
+        });
         let mut args = vec!["acp"];
         if let Some(mode) = approval_mode {
             args.extend(["--approval-mode", mode]);
