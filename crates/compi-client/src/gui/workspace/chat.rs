@@ -3,9 +3,10 @@
 //! harness, its folder and environment, and once the harness made one, its session, which
 //! the pane keeps so a restarted daemon resumes it.
 //!
-//! Each chat is a thread the daemon keeps: closing its pane or view leaves it (and the
-//! terminal it was a view of) running, the palette's Threads opens it again
-//! (`open_thread`), and only deleting it ends it.
+//! A new chat starts as a draft (`draft`): its message box centred, nothing kept by the
+//! daemon until its first prompt. From then on it is a thread the daemon keeps: closing
+//! its pane or view ends its agent, and the palette's Threads opens it again
+//! (`open_thread`) until it is deleted.
 //!
 //! The transcript lives in the daemon. While a pane shows a chat, a watcher of its own
 //! (`watch_chat`, on Monitor's watching loop) keeps a connection that watches it:
@@ -42,6 +43,7 @@ use gpui_component::{RopeExt as _, Sizable as _, Size};
 use std::rc::Rc;
 
 mod composer;
+mod draft;
 mod models;
 mod rows;
 mod scroller;
@@ -51,6 +53,8 @@ mod timeline;
 use composer::{
     CompiCommand, Completion, DraftImage, QuestionForm, QueuedEdit, Recall, cost_label, fenced,
 };
+pub(in crate::gui) use draft::split_draft;
+use draft::{DiscardNotice, Discarded};
 use models::{ModelPicker, PickerAnchor, PickerColumn};
 use rows::{ChatRow, RowFrame};
 use scroller::TranscriptScroll;
@@ -173,6 +177,8 @@ enum ChatMenu {
     Models,
     /// The other settings.
     More,
+    /// A draft's permissions.
+    Approval,
 }
 
 /// Whether the chat's folder is in a Git repository, read once: Open in diff needs one.
@@ -240,6 +246,9 @@ struct ChatModel {
     session_sent: Option<String>,
     /// Where the composer card and the model button were drawn, for the model picker.
     picker_anchor: Rc<PickerAnchor>,
+    /// The permissions this chat's harness starts with, set from its draft; `None`
+    /// follows Settings → Chat → Approvals. The watcher passes it on.
+    approval: Arc<Mutex<Option<ChatApproval>>>,
 }
 
 /// The chats of this window.
@@ -257,6 +266,10 @@ pub(in crate::gui) struct ChatUi {
     /// Text for each chat's draft (terminal text sent to it), until the chat has client
     /// state.
     pending: HashMap<String, String>,
+    /// A draft with typed text that a close on its way to the daemon throws away.
+    discarding: Option<(MutationId, Discarded)>,
+    /// "Draft discarded · Undo", while it shows.
+    discarded: Option<DiscardNotice>,
 }
 
 /// Every chat in `node` with its pane: content panes, and terminal views on either side.
@@ -380,6 +393,21 @@ impl ChatModel {
             },
             |state| state.harness,
         )
+    }
+
+    /// Whether the chat `chat` (this model's) is still a draft: nothing sent yet.
+    fn draft(&self, chat: &ChatContent) -> bool {
+        draft::is_draft(self.state.as_ref(), chat.session.as_deref())
+    }
+
+    /// The permissions the harness starts with: the draft's pick, else `default`
+    /// (Settings → Chat → Approvals).
+    fn approval(&self, default: ChatApproval) -> ChatApproval {
+        self.approval
+            .lock()
+            .ok()
+            .and_then(|approval| *approval)
+            .unwrap_or(default)
     }
 
     /// How Enter, or with `secondary` Ctrl/Cmd+Enter, hands the draft over. While a turn
@@ -589,6 +617,21 @@ impl ChatModel {
     }
 }
 
+/// The permissions a watcher's `WatchChat` starts the harness with: the chat's own, when
+/// its draft set them, else Settings → Chat → Approvals.
+struct WatchApproval {
+    chosen: Arc<Mutex<Option<ChatApproval>>>,
+    default: Arc<Mutex<ChatApproval>>,
+}
+
+impl WatchApproval {
+    /// The permissions as they are now; `None` once a lock is poisoned.
+    fn get(&self) -> Option<ChatApproval> {
+        let chosen = *self.chosen.lock().ok()?;
+        chosen.or_else(|| self.default.lock().ok().map(|approval| *approval))
+    }
+}
+
 /// Starts the watcher of chat `id`: each connection watches `chat` as it is then, so a
 /// session the pane learned resumes after a daemon restart, with `approval` and the
 /// harness's `picks` as they are then.
@@ -596,7 +639,7 @@ fn watch_chat(
     link: WatchLink,
     id: Arc<str>,
     chat: Arc<Mutex<ChatContent>>,
-    approval: Arc<Mutex<ChatApproval>>,
+    approval: WatchApproval,
     picks: Arc<Mutex<HashMap<ChatHarness, ChatPicks>>>,
     generation: u64,
     stop: mpsc::Receiver<()>,
@@ -617,7 +660,7 @@ fn watch_chat(
                 let Ok(content) = chat.lock().map(|chat| chat.clone()) else {
                     return WatchEnd::Stopped;
                 };
-                let Ok(approval) = approval.lock().map(|approval| *approval) else {
+                let Some(approval) = approval.get() else {
                     return WatchEnd::Stopped;
                 };
                 let Ok(picks) = picks
@@ -797,6 +840,11 @@ impl CompiApp {
         content::find_pane_content(self.workspace.as_ref()?, pane_id)?.chat()
     }
 
+    /// Whether `chat` is a draft, when this window has its client state.
+    pub(super) fn chat_draft(&self, chat: &ChatContent) -> Option<bool> {
+        Some(self.chat.chats.get(&chat.id)?.draft(chat))
+    }
+
     /// The client state of the chat `pane_id` holds, shown or not.
     fn pane_chat(&self, pane_id: &PaneId) -> Option<&ChatModel> {
         self.chat.chats.get(&self.pane_chat_content(pane_id)?.id)
@@ -967,7 +1015,10 @@ impl CompiApp {
                         link.clone(),
                         id.as_str().into(),
                         model.watched.clone(),
-                        self.chat.approval.clone(),
+                        WatchApproval {
+                            chosen: model.approval.clone(),
+                            default: self.chat.approval.clone(),
+                        },
                         self.chat.picks.clone(),
                         generation,
                         stop,
@@ -1079,6 +1130,7 @@ impl CompiApp {
             error: None,
             session_sent: None,
             picker_anchor: Rc::default(),
+            approval: Arc::default(),
         }
     }
 
@@ -1362,10 +1414,20 @@ impl CompiApp {
     fn restart_chat(&mut self, chat: &str, window: &mut Window, cx: &mut Context<Self>) {
         let message = ClientMessage::RestartChat {
             chat: chat.to_owned(),
-            approval: self.config.chat_approval,
+            approval: self.chat_approval(chat),
             picks: self.chat_start_picks(chat),
         };
         self.chat_action(chat, message, window, cx);
+    }
+
+    /// The permissions chat `chat`'s harness starts with: its draft's pick, else
+    /// Settings → Chat → Approvals.
+    fn chat_approval(&self, chat: &str) -> ChatApproval {
+        let default = self.config.chat_approval;
+        self.chat
+            .chats
+            .get(chat)
+            .map_or(default, |model| model.approval(default))
     }
 
     /// Starts the chat over in `session`, or in a new session.
@@ -1382,7 +1444,7 @@ impl CompiApp {
         let message = ClientMessage::ResumeChat {
             chat: chat.to_owned(),
             session,
-            approval: self.config.chat_approval,
+            approval: self.chat_approval(chat),
             picks: self.chat_start_picks(chat),
         };
         self.chat_action(chat, message, window, cx);
@@ -1776,6 +1838,18 @@ impl CompiApp {
         };
         let empty = model.composer.read(cx).value().trim().is_empty();
         let editing = model.editing.is_some();
+        // An empty draft's letters open something else in its place; any other text types.
+        let untouched = model.composer.read(cx).value().is_empty()
+            && model.attachments.is_empty()
+            && model.images.is_empty()
+            && !editing
+            && self
+                .chat_pane(&chat)
+                .is_some_and(|(_, content)| model.draft(&content));
+        if let Some(choice) = draft::open_instead_key(&key.key, untouched) {
+            self.open_instead(&chat, choice, window, cx);
+            return true;
+        }
         match key.key.as_str() {
             "enter" if empty && !editing => self.answer_chat_permission_by_kind(
                 &chat,
@@ -1923,7 +1997,8 @@ impl CompiApp {
     }
 
     /// Chat pane `pane_id`, showing `chat`: a header, the transcript, and the composer
-    /// under whatever waits on the reader; the session picker over them while open.
+    /// under whatever waits on the reader, or while it is a draft, its message box in the
+    /// middle; the session picker over them while open.
     pub(super) fn render_chat_pane(
         &self,
         pane_id: &PaneId,
@@ -1966,9 +2041,15 @@ impl CompiApp {
                 }),
             )
             .child(self.render_chat_header(pane_id, chat, model, cx))
-            .child(self.render_chat_transcript(chat, model, cx))
-            .children(self.render_chat_agents(chat, model, cx))
-            .child(self.render_chat_footer(chat, model, cx))
+            .map(|pane| {
+                if model.draft(chat) {
+                    pane.child(self.render_chat_draft(pane_id, chat, model, cx))
+                } else {
+                    pane.child(self.render_chat_transcript(chat, model, cx))
+                        .children(self.render_chat_agents(chat, model, cx))
+                        .child(self.render_chat_footer(chat, model, false, cx))
+                }
+            })
             .when_some(model.sessions.as_ref(), |pane, sheet| {
                 pane.child(self.render_chat_sessions(chat, model, sheet, cx))
             });
@@ -1987,8 +2068,8 @@ impl CompiApp {
         px(UI_BODY_TEXT_SIZE * self.config.chat_text_size / crate::config::DEFAULT_CHAT_TEXT_SIZE)
     }
 
-    /// The harness, the chat's title, its tab's project and folder, whether it is
-    /// reachable, and its menu.
+    /// The harness, the chat's title ("New thread" while it is a draft), its tab's
+    /// project and folder, whether it is reachable, and its menu.
     fn render_chat_header(
         &self,
         pane_id: &PaneId,
@@ -1998,7 +2079,11 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let title = model.state.as_ref().and_then(chat_title);
+        let title = if model.draft(chat) {
+            Some("New thread".to_owned())
+        } else {
+            model.state.as_ref().and_then(chat_title)
+        };
         let reconnecting = match &model.link {
             Link::Reconnecting(error) => Some(error.clone()),
             Link::Connecting | Link::Live => None,

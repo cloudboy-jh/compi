@@ -167,6 +167,8 @@ struct SidebarCard {
     project: Option<Project>,
     /// A chat is in it, rather than a terminal.
     chat: bool,
+    /// Its chat is a draft: nothing sent yet, so no thread is kept.
+    draft: bool,
     /// What its programs most need the user for; nothing while idle.
     state: Option<ProgramState>,
     /// When its program status last changed, else its thread's transcript.
@@ -184,6 +186,15 @@ impl SidebarCard {
             &[&self.title, self.folder.as_deref().unwrap_or(""), project],
         )
     }
+}
+
+/// The quiet note at a card's top right: "Draft" for a thread not sent yet, else how
+/// long before `now` it last changed.
+fn card_note(card: &SidebarCard, now: u64) -> Option<String> {
+    if card.draft {
+        return Some("Draft".to_owned());
+    }
+    card.changed_ms.map(|then| age_label(then, now))
 }
 
 /// One project's cards in a workspace.
@@ -653,7 +664,11 @@ impl CompiApp {
                 .iter()
                 .find(|thread| thread.chat.id == chat.id)
         });
+        // A chat this window has not drawn is a draft when the daemon lists no thread of
+        // it.
+        let draft = chat.is_some_and(|chat| self.chat_draft(chat).unwrap_or(listed.is_none()));
         let title = match chat {
+            Some(_) if draft => "New thread".to_owned(),
             Some(chat) => self
                 .watched_chat_title(&chat.id)
                 .or_else(|| listed.map(|thread| thread_title(thread).to_owned()))
@@ -678,6 +693,7 @@ impl CompiApp {
             folder,
             project: tab.project.clone(),
             chat: chat.is_some(),
+            draft,
             state,
             changed_ms: self
                 .tab_status_changed_ms(tab)
@@ -2229,10 +2245,12 @@ impl CompiApp {
                                     .text_ellipsis()
                                     .child(card.folder.clone().unwrap_or_default()),
                             )
-                            .children(
-                                card.changed_ms
-                                    .map(|then| div().flex_none().child(age_label(then, now))),
-                            ),
+                            .children(card_note(&card, now).map(|note| {
+                                div()
+                                    .flex_none()
+                                    .when(card.draft, |shown| shown.italic())
+                                    .child(note)
+                            })),
                     )
                     .child(
                         div()
@@ -2291,12 +2309,30 @@ mod tests {
             folder: None,
             project: project.cloned(),
             chat: false,
+            draft: false,
             state: None,
             changed_ms: None,
             hidden: false,
             pinned: false,
             selected: false,
         }
+    }
+
+    #[test]
+    fn a_draft_card_says_draft_where_a_thread_says_its_age() {
+        let now = 10 * 3_600_000;
+        let mut card = SidebarCard {
+            chat: true,
+            changed_ms: Some(now - 2 * 3_600_000),
+            ..tab_card("t1", None)
+        };
+        assert_eq!(card_note(&card, now).as_deref(), Some("2h"));
+        card.draft = true;
+        assert_eq!(card_note(&card, now).as_deref(), Some("Draft"));
+        card.changed_ms = None;
+        assert_eq!(card_note(&card, now).as_deref(), Some("Draft"));
+        card.draft = false;
+        assert_eq!(card_note(&card, now), None);
     }
 
     /// A workspace whose cards are `ids`, all without a project.

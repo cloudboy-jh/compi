@@ -1391,6 +1391,7 @@ impl Chat {
         let state = ChatState {
             harness: self.content.harness,
             session: session.clone(),
+            thread: inner.thread.is_some(),
             ..ChatState::default()
         };
         if inner.initialized && inner.agent.is_some() {
@@ -1409,11 +1410,16 @@ impl Chat {
         Ok(())
     }
 
-    /// Ends the harness and starts it again; a chat with a session resumes it. The
-    /// transcript stays as it is, the session's replay left out: what the harness left
-    /// open ends as at a turn's end, and the queue empties.
+    /// Ends the harness and starts it again; a chat with a session resumes it, except a
+    /// draft, which has nothing to resume and starts on a new session. The transcript
+    /// stays as it is, the session's replay left out: what the harness left open ends as
+    /// at a turn's end, and the queue empties.
     fn restart(self: &Arc<Self>) {
         let mut inner = self.lock();
+        if inner.thread.is_none() && inner.state.entries.is_empty() && inner.state.session.is_some()
+        {
+            inner.emit(ChatEvent::Session { session: None });
+        }
         inner.stop();
         inner.stop_agents();
         inner.end_turn();
@@ -1496,6 +1502,7 @@ impl Inner {
             created_ms: thread.created_ms,
             updated_ms: thread.updated_ms,
         });
+        self.state.thread = true;
         self.skip_replay = true;
     }
 
@@ -1507,6 +1514,7 @@ impl Inner {
                 created_ms: now,
                 updated_ms: now,
             });
+            self.state.thread = true;
         }
         self.save_thread(true);
     }
@@ -4842,6 +4850,98 @@ mod tests {
             }
         ));
         assert_eq!(saved.chat.session.as_deref(), Some("s1"));
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A workspace whose one tab holds a content pane for each chat of `ids`.
+    fn holding(ids: &[&str]) -> WorkspaceSnapshot {
+        use compi_protocol::{PaneContent, PaneId, ServerGeneration, ServerId, TabId};
+        use compi_protocol::{WorkspaceSession, WorkspaceTab};
+        let tabs = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| WorkspaceTab {
+                id: TabId::new(format!("tab-{index}")),
+                label: "Chat".into(),
+                layout: LayoutNode::Content {
+                    pane_id: PaneId::new(format!("pane-{index}")),
+                    content: PaneContent::Chat(thread_chat(id)),
+                },
+                previous_layout: None,
+                merge: None,
+                group: None,
+                project: None,
+            })
+            .collect();
+        WorkspaceSnapshot {
+            server_id: ServerId::new("server"),
+            server_generation: ServerGeneration::new("1"),
+            revision: 1,
+            initialized: true,
+            sessions: vec![WorkspaceSession {
+                id: compi_protocol::SessionId::new("session-1"),
+                label: "Default".into(),
+                tabs,
+                groups: Vec::new(),
+            }],
+            surfaces: Vec::new(),
+            recovery_message: None,
+        }
+    }
+
+    #[test]
+    fn a_draft_is_no_thread_until_its_first_prompt_and_closing_it_leaves_nothing() {
+        let folder =
+            std::env::temp_dir().join(format!("compi-threads-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let hub = ChatHub {
+            threads: Arc::new(ThreadStore::at(folder.clone())),
+            ..ChatHub::default()
+        };
+        let draft = |id: &str| {
+            let content = thread_chat(id);
+            let inner = Inner {
+                chat_id: content.id.clone(),
+                state: ChatState {
+                    session: content.session.clone(),
+                    status: ChatStatus::Ready,
+                    ..ChatState::default()
+                },
+                ..Inner::default()
+            };
+            let chat = Arc::new(Chat {
+                content,
+                instance: None,
+                inner: Mutex::new(inner),
+            });
+            lock(&hub.chats).insert(id.to_owned(), chat.clone());
+            chat
+        };
+        let sent = draft("chat-sent");
+        let untouched = draft("chat-untouched");
+        let workspace = holding(&["chat-sent", "chat-untouched"]);
+        assert!(
+            hub.threads(&workspace).is_empty(),
+            "an open draft is not listed"
+        );
+        assert!(!lock(&untouched.inner).state.thread);
+
+        // Closing an untouched draft ends its chat and saves nothing.
+        hub.retain(&holding(&["chat-sent"]));
+        hub.threads.flush();
+        assert!(lock(&untouched.inner).closed);
+        assert!(hub.threads.load("chat-untouched").is_none());
+        assert!(hub.threads(&workspace).is_empty());
+
+        // The first prompt makes the draft a thread, which whole states then say.
+        lock(&sent.inner).start_prompt("s1".into(), text_prompt("go"));
+        assert!(lock(&sent.inner).state.thread);
+        hub.retain(&holding(&[]));
+        hub.threads.flush();
+        let listed = hub.threads(&holding(&[]));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chat.id, "chat-sent");
+        assert_eq!(listed[0].title.as_deref(), Some("go"));
         let _ = std::fs::remove_dir_all(&folder);
     }
 }

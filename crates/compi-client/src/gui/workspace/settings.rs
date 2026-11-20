@@ -5604,7 +5604,7 @@ pub(super) fn settings_card(colors: &ThemeColors) -> Div {
 }
 
 /// What Approvals calls `approval`.
-fn chat_approval_label(approval: ChatApproval) -> &'static str {
+pub(super) fn chat_approval_label(approval: ChatApproval) -> &'static str {
     match approval {
         ChatApproval::Harness => "Same as OMP",
         ChatApproval::AlwaysAsk => "Always ask",

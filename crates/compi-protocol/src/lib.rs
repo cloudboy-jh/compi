@@ -2452,6 +2452,45 @@ pub enum WorkspaceMutation {
         axis: SplitAxis,
         geometry: SplitGeometry,
     },
+    /// Put `with` in place of the content pane `pane_id`, in the same spot of the layout
+    /// and the same size, under a new pane ID that the receipt names. What the pane
+    /// showed goes; a terminal replacement starts its shell.
+    ReplacePane {
+        pane_id: PaneId,
+        with: PaneReplacement,
+    },
+}
+
+/// What `ReplacePane` puts in a content pane's place.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneReplacement {
+    /// A new terminal pane whose shell starts in `working_directory`.
+    Terminal {
+        cols: i16,
+        rows: i16,
+        working_directory: Option<String>,
+    },
+    /// A new content pane showing `content`.
+    Content { content: PaneContent },
+}
+
+impl WorkspaceMutation {
+    /// Whether the change starts a shell, so its request may carry a launch context.
+    pub fn launches(&self) -> bool {
+        matches!(
+            self,
+            Self::Initialize { .. }
+                | Self::CreateTab { .. }
+                | Self::SplitPane { .. }
+                | Self::GrowTab { .. }
+                | Self::RestartSurface { .. }
+                | Self::ReplacePane {
+                    with: PaneReplacement::Terminal { .. },
+                    ..
+                }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2829,6 +2868,43 @@ mod content_tests {
             assert_eq!(folder.environment.to_string(), "WSL: Ubuntu");
             assert!(content.settings().is_none());
         }
+    }
+
+    #[test]
+    fn a_pane_replacement_roundtrips_and_only_a_terminal_launches() {
+        let terminal = WorkspaceMutation::ReplacePane {
+            pane_id: PaneId::new("pane-2"),
+            with: PaneReplacement::Terminal {
+                cols: 80,
+                rows: 24,
+                working_directory: Some("/home/user/project".into()),
+            },
+        };
+        let json = serde_json::to_value(&terminal).unwrap();
+        assert_eq!(json["type"], "replace_pane");
+        assert_eq!(json["with"]["type"], "terminal");
+        assert_eq!(
+            serde_json::from_value::<WorkspaceMutation>(json).unwrap(),
+            terminal
+        );
+        assert!(terminal.launches());
+
+        let browser = WorkspaceMutation::ReplacePane {
+            pane_id: PaneId::new("pane-2"),
+            with: PaneReplacement::Content {
+                content: PaneContent::Browser(BrowserContent {
+                    url: BrowserContent::BLANK.into(),
+                }),
+            },
+        };
+        let json = serde_json::to_value(&browser).unwrap();
+        assert_eq!(json["with"]["type"], "content");
+        assert_eq!(json["with"]["content"]["kind"], "browser");
+        assert_eq!(
+            serde_json::from_value::<WorkspaceMutation>(json).unwrap(),
+            browser
+        );
+        assert!(!browser.launches());
     }
 
     #[test]

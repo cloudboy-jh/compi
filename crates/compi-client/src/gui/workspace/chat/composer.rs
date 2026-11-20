@@ -836,10 +836,13 @@ impl CompiApp {
     }
 
     /// Under the transcript: notices, what waits on the reader, the composer and its row.
+    /// A `draft`'s row holds its permissions too, and a failed harness shows here, as it
+    /// has no transcript to show it in.
     pub(super) fn render_chat_footer(
         &self,
         chat: &ChatContent,
         model: &ChatModel,
+        draft: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
@@ -849,7 +852,7 @@ impl CompiApp {
         let transcript = state.is_some_and(|state| !state.entries.is_empty());
         let status = state.map(|state| &state.status);
         let failed = match status {
-            Some(ChatStatus::Failed { message }) if transcript => Some(message.clone()),
+            Some(ChatStatus::Failed { message }) if transcript || draft => Some(message.clone()),
             _ => None,
         };
         let starting = transcript && matches!(status, Some(ChatStatus::Starting));
@@ -958,7 +961,11 @@ impl CompiApp {
                 },
             )
             .child(self.render_chat_card(chat, model, &frame, cx))
-            .child(self.render_chat_context(chat, model))
+            .child(self.render_chat_context(
+                chat,
+                model,
+                draft.then(|| self.render_chat_approval(chat, model, cx)),
+            ))
             .into_any_element()
     }
 
@@ -1398,8 +1405,14 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Under the composer, quietly: the folder, where it lives, and its Git branch.
-    fn render_chat_context(&self, chat: &ChatContent, model: &ChatModel) -> AnyElement {
+    /// Under the composer, quietly: the folder, where it lives, and its Git branch; then
+    /// `trailing` at the row's end.
+    fn render_chat_context(
+        &self,
+        chat: &ChatContent,
+        model: &ChatModel,
+        trailing: Option<AnyElement>,
+    ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         let place: SharedString = match &chat.environment {
@@ -1452,6 +1465,9 @@ impl CompiApp {
                         .child(controls::glyph(IconName::GitBranch, muted))
                         .child(div().truncate().child(branch)),
                 )
+            })
+            .when_some(trailing, |line, trailing| {
+                line.child(div().flex_1()).child(trailing)
             })
             .into_any_element()
     }

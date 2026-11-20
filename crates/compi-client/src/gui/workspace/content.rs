@@ -2072,10 +2072,21 @@ impl CompiApp {
     /// Splits `beside` for a new content pane showing `content`; `false` with a global
     /// error when there is no room.
     pub(super) fn open_content_beside(&mut self, beside: &PaneId, content: PaneContent) -> bool {
+        self.open_content_split(beside, SplitAxis::Horizontal, content)
+    }
+
+    /// `open_content_beside`, splitting `beside` along `axis`: side by side or one above
+    /// the other.
+    pub(super) fn open_content_split(
+        &mut self,
+        beside: &PaneId,
+        axis: SplitAxis,
+        content: PaneContent,
+    ) -> bool {
         if self.layout.is_none() {
             return false;
         }
-        let geometry = match self.content_split(beside) {
+        let geometry = match self.content_split(beside, axis) {
             Ok(geometry) => geometry,
             Err(reason) => {
                 self.global_error = Some(reason.into());
@@ -2085,7 +2096,7 @@ impl CompiApp {
         self.mutate(
             WorkspaceMutation::OpenContent {
                 pane_id: beside.clone(),
-                axis: SplitAxis::Horizontal,
+                axis,
                 geometry,
                 content,
             },
@@ -2094,17 +2105,18 @@ impl CompiApp {
         true
     }
 
-    /// Where a content pane split side by side with `beside` goes, or why it does not fit.
+    /// Where a content pane split off `beside` along `axis` goes, or why it does not fit.
     pub(super) fn content_split(
         &self,
         beside: &PaneId,
+        axis: SplitAxis,
     ) -> Result<compi_protocol::SplitGeometry, &'static str> {
         let layout = self
             .layout
             .as_ref()
             .ok_or("The pane to open files beside no longer exists")?;
         let kind = layout::PaneKind::Content;
-        let rect = layout.split_feasibility(beside, SplitAxis::Horizontal, kind)?;
+        let rect = layout.split_feasibility(beside, axis, kind)?;
         let minimum = layout
             .split_minimum(beside, kind)
             .ok_or("The pane to open files beside no longer exists")?;

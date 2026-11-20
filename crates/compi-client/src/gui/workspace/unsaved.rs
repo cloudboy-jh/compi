@@ -614,7 +614,12 @@ impl CompiApp {
     ) {
         match then {
             AfterUnsaved::CloseFile { pane_id, path } => self.drop_content_tab(&pane_id, &path),
-            AfterUnsaved::Mutate(operation) => self.mutate(operation, false),
+            AfterUnsaved::Mutate(operation) => {
+                // A draft with typed text that the change closes can come back with Undo.
+                let discarded = self.discarded_draft(&operation, cx);
+                let mutation = self.mutate_in(operation, false, None);
+                self.note_discarding(mutation, discarded);
+            }
             AfterUnsaved::Transfer {
                 tab_ids,
                 destination,

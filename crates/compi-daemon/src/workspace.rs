@@ -1,8 +1,8 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
     ContentEnvironment, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES,
-    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId, PaneSide,
-    PaneView, PlannedLayoutNode, ProcessLifetimeId, Project, ServerGeneration, SessionId,
+    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId, PaneReplacement,
+    PaneSide, PaneView, PlannedLayoutNode, ProcessLifetimeId, Project, ServerGeneration, SessionId,
     SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabGroup, TabGroupId, TabId, TabMerge,
     TabPlacement, WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
@@ -764,14 +764,7 @@ fn prepare_mutation(
                 Some(state.workspace.revision),
             )
         })?;
-        if !matches!(
-            request.operation,
-            WorkspaceMutation::Initialize { .. }
-                | WorkspaceMutation::CreateTab { .. }
-                | WorkspaceMutation::SplitPane { .. }
-                | WorkspaceMutation::GrowTab { .. }
-                | WorkspaceMutation::RestartSurface { .. }
-        ) {
+        if !request.operation.launches() {
             return Err(ActorError::new(
                 ErrorCode::InvalidRequest,
                 "launch context requires a launch operation",
@@ -1422,6 +1415,64 @@ fn apply_mutation(
             affected_tabs.push(tab_id);
             affected_panes.extend([pane_id.clone(), new_pane]);
             Ok("committed".into())
+        }
+        WorkspaceMutation::ReplacePane { pane_id, with } => {
+            let (session_id, tab) = workspace
+                .sessions
+                .iter_mut()
+                .find_map(|session| {
+                    let id = session.id.clone();
+                    session
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| contains_pane(&tab.layout, pane_id))
+                        .map(|tab| (id, tab))
+                })
+                .ok_or_else(|| invalid(format!("pane {pane_id} was not found")))?;
+            if !matches!(
+                leaf_mut(&mut tab.layout, pane_id),
+                Some(LayoutNode::Content { .. })
+            ) {
+                return Err(invalid(format!(
+                    "pane {pane_id} is a terminal; only a content pane is replaced"
+                )));
+            }
+            let new_pane = PaneId::new(allocate("pane", ordinal));
+            let (leaf, surface) = match with {
+                PaneReplacement::Terminal {
+                    cols,
+                    rows,
+                    working_directory,
+                } => {
+                    dimensions(*cols, *rows).map_err(invalid)?;
+                    let surface = new_surface(*cols, *rows, working_directory.clone(), ordinal);
+                    (
+                        LayoutNode::terminal(new_pane.clone(), surface.id.clone()),
+                        Some(surface),
+                    )
+                }
+                PaneReplacement::Content { content } => {
+                    validate_content(content).map_err(invalid)?;
+                    let leaf = LayoutNode::Content {
+                        pane_id: new_pane.clone(),
+                        content: content.clone(),
+                    };
+                    (leaf, None)
+                }
+            };
+            swap_leaf(tab, pane_id, &leaf);
+            affected_sessions.push(session_id);
+            affected_tabs.push(tab.id.clone());
+            affected_panes.push(new_pane);
+            match surface {
+                Some(surface) => {
+                    affected_surfaces.push(surface.id.clone());
+                    effects.push(WorkspaceEffect::Launch(Box::new(surface.clone()), None));
+                    workspace.surfaces.push(surface);
+                    Ok("starting".into())
+                }
+                None => Ok("committed".into()),
+            }
         }
         WorkspaceMutation::GrowTab {
             tab_id,
@@ -2310,6 +2361,12 @@ fn terminal_view(leaf: &mut LayoutNode) -> Result<&mut Option<PaneView>, String>
 /// the pane showed before.
 fn replace_leaf(tab: &mut WorkspaceTab, leaf: LayoutNode) {
     let pane_id = leaf.leaf_pane().expect("a leaf has a pane").clone();
+    swap_leaf(tab, &pane_id, &leaf);
+}
+
+/// Put `leaf` in place of pane `pane_id`'s leaf in `tab`, its restorable and split-back
+/// trees included, so they keep the new leaf where the old one was.
+fn swap_leaf(tab: &mut WorkspaceTab, pane_id: &PaneId, leaf: &LayoutNode) {
     let merge = tab.merge.as_deref_mut().into_iter().flat_map(|merge| {
         merge
             .own_layout
@@ -2320,7 +2377,7 @@ fn replace_leaf(tab: &mut WorkspaceTab, leaf: LayoutNode) {
         .chain(tab.previous_layout.as_deref_mut())
         .chain(merge)
     {
-        if let Some(recorded) = leaf_mut(tree, &pane_id) {
+        if let Some(recorded) = leaf_mut(tree, pane_id) {
             *recorded = leaf.clone();
         }
     }
@@ -5262,6 +5319,119 @@ mod tests {
                 )),
             }
         );
+    }
+
+    #[test]
+    fn a_content_pane_is_replaced_in_its_place_by_content_or_a_terminal() {
+        let (actor, effects, _, terminal) = running_terminal();
+        let opened = mutate_current(
+            &actor,
+            "open-draft",
+            open_content(&terminal, host_content(&[])),
+        )
+        .unwrap();
+        let draft = opened.affected_panes[1].clone();
+        let before = actor.snapshot().unwrap();
+        let tab_id = before.sessions[0].tabs[0].id.clone();
+        let LayoutNode::Split { first: shell, .. } = &before.sessions[0].tabs[0].layout else {
+            unreachable!()
+        };
+        let shell = (**shell).clone();
+        let split = |second: LayoutNode| LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(shell.clone()),
+            second: Box::new(second),
+        };
+
+        // Content replaces content under a new pane ID, in the same place; nothing starts.
+        let browser = PaneContent::Browser(compi_protocol::BrowserContent {
+            url: compi_protocol::BrowserContent::BLANK.into(),
+        });
+        let receipt = mutate_current(
+            &actor,
+            "replace-with-browser",
+            WorkspaceMutation::ReplacePane {
+                pane_id: draft.clone(),
+                with: PaneReplacement::Content {
+                    content: browser.clone(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "committed");
+        assert_eq!(receipt.affected_tabs, vec![tab_id.clone()]);
+        assert!(receipt.affected_surfaces.is_empty());
+        let [browser_pane] = receipt.affected_panes.as_slice() else {
+            panic!(
+                "the receipt names the new pane: {:?}",
+                receipt.affected_panes
+            );
+        };
+        assert_ne!(*browser_pane, draft);
+        assert_eq!(
+            actor.snapshot().unwrap().sessions[0].tabs[0].layout,
+            split(LayoutNode::Content {
+                pane_id: browser_pane.clone(),
+                content: browser,
+            })
+        );
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+
+        // A terminal takes its place with a shell started in the folder given.
+        let folder = std::env::temp_dir().to_string_lossy().into_owned();
+        let receipt = mutate_current(
+            &actor,
+            "replace-with-terminal",
+            WorkspaceMutation::ReplacePane {
+                pane_id: browser_pane.clone(),
+                with: PaneReplacement::Terminal {
+                    cols: 80,
+                    rows: 24,
+                    working_directory: Some(folder.clone()),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.operation_state, "starting");
+        let WorkspaceEffect::Launch(launched, _) = effects.recv().unwrap() else {
+            panic!("a terminal replacement launches its shell");
+        };
+        assert_eq!(
+            launched.launch.working_directory.as_deref(),
+            Some(folder.as_str())
+        );
+        assert_eq!(receipt.affected_surfaces, vec![launched.id.clone()]);
+        let [terminal_pane] = receipt.affected_panes.as_slice() else {
+            panic!(
+                "the receipt names the new pane: {:?}",
+                receipt.affected_panes
+            );
+        };
+        let replaced = actor.snapshot().unwrap();
+        assert_eq!(
+            replaced.sessions[0].tabs[0].layout,
+            split(LayoutNode::terminal(
+                terminal_pane.clone(),
+                launched.id.clone()
+            ))
+        );
+        assert!(replaced.surface(&launched.id).is_some());
+
+        // A terminal pane is never replaced: its process would end unasked.
+        let error = mutate_current(
+            &actor,
+            "replace-a-terminal",
+            WorkspaceMutation::ReplacePane {
+                pane_id: terminal.clone(),
+                with: PaneReplacement::Content {
+                    content: host_content(&[]),
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("only a content pane"), "{error}");
     }
 
     #[test]

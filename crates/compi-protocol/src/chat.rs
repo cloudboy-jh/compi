@@ -179,6 +179,12 @@ pub struct ChatState {
     /// The model providers signed in with a subscription plan, with what is left of it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plans: Vec<ChatPlan>,
+    /// The daemon keeps the chat as a thread: it was sent its first prompt, or opened
+    /// from a saved thread. A chat without one is a draft, which closing leaves nothing
+    /// of. A chat gets its thread with its first transcript entry, so watchers learn it
+    /// from whole states.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread: bool,
 }
 
 impl ChatState {

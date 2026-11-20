@@ -174,7 +174,7 @@ impl CompiApp {
     pub(super) fn move_view_to_own_pane(&mut self, pane_id: &PaneId) {
         let geometry = match self
             .content_busy(pane_id)
-            .map_or_else(|| self.content_split(pane_id), Err)
+            .map_or_else(|| self.content_split(pane_id, SplitAxis::Horizontal), Err)
         {
             Ok(geometry) => geometry,
             Err(reason) => {

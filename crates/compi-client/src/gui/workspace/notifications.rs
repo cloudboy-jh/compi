@@ -1022,10 +1022,11 @@ impl CompiApp {
         cx.activate(true);
     }
 
-    /// The toasts, bottom right, newest last, above the pasted image cards; web pages
-    /// are cut around them.
+    /// The toasts, bottom right, newest last, above the pasted image cards, then
+    /// "Draft discarded · Undo" while it shows; web pages are cut around them.
     pub(super) fn render_toasts(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.notifications.toasts.is_empty() {
+        let discarded = self.render_discard_notice(cx);
+        if self.notifications.toasts.is_empty() && discarded.is_none() {
             return None;
         }
         let colors = *self.colors();
@@ -1125,6 +1126,7 @@ impl CompiApp {
                 .gap_2()
                 .children(self.record_browser_float(usize::MAX))
                 .children(toasts)
+                .children(discarded)
                 .into_any_element(),
         )
     }

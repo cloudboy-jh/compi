@@ -1725,15 +1725,7 @@ impl CompiApp {
             return None;
         }
         let workspace = self.workspace.as_ref()?;
-        let launches = matches!(
-            operation,
-            WorkspaceMutation::Initialize { .. }
-                | WorkspaceMutation::CreateTab { .. }
-                | WorkspaceMutation::SplitPane { .. }
-                | WorkspaceMutation::GrowTab { .. }
-                | WorkspaceMutation::RestartSurface { .. }
-        );
-        let launch = if launches {
+        let launch = if operation.launches() {
             match &self.config.launch {
                 Ok(launch) => {
                     let mut launch = launch.clone();
@@ -2244,6 +2236,7 @@ impl CompiApp {
                             }
                         }
                         self.sidebar_mutation_finished(Some(&receipt), cx);
+                        self.draft_mutation_finished(Some(&receipt), cx);
                     }
                     Err(error) => {
                         self.global_error = Some(format!(
@@ -2253,6 +2246,7 @@ impl CompiApp {
                         self.refresh_surfaces(false);
                         self.remote_split_finished(None);
                         self.sidebar_mutation_finished(None, cx);
+                        self.draft_mutation_finished(None, cx);
                     }
                 }
                 self.open_pending();
@@ -3395,15 +3389,22 @@ impl CompiApp {
             .focused_view()
             .and_then(|view| workspace?.surface(&view.surface_id))
             .map(|surface| surface.status);
+        // A chat splits off a draft in a content pane, anything else a terminal.
+        let split_kind = if workspace
+            .zip(pane)
+            .and_then(|(workspace, pane)| content::find_leaf(workspace, pane))
+            .and_then(chat::split_draft)
+            .is_some()
+        {
+            layout::PaneKind::Content
+        } else {
+            layout::PaneKind::Terminal
+        };
         let split_reason = |axis| {
             self.layout
                 .as_ref()
                 .and_then(|layout| {
-                    pane.map(|pane| {
-                        layout
-                            .split_feasibility(pane, axis, layout::PaneKind::Terminal)
-                            .err()
-                    })
+                    pane.map(|pane| layout.split_feasibility(pane, axis, split_kind).err())
                 })
                 .flatten()
         };
@@ -4028,7 +4029,17 @@ impl CompiApp {
                     } else {
                         SplitAxis::Vertical
                     };
-                    if let Some(layout) = &self.layout {
+                    // A chat splits off a new thread draft in its folder; anything else
+                    // a terminal.
+                    let draft = self
+                        .workspace
+                        .as_ref()
+                        .and_then(|workspace| content::find_leaf(workspace, &pane_id))
+                        .and_then(chat::split_draft)
+                        .cloned();
+                    if let Some(source) = draft {
+                        self.open_draft_split(&pane_id, axis, &source);
+                    } else if let Some(layout) = &self.layout {
                         let new_pane = layout::PaneKind::Terminal;
                         match layout
                             .split_feasibility(&pane_id, axis, new_pane)
