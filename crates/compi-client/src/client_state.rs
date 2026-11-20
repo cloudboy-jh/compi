@@ -183,6 +183,14 @@ pub struct RecentProjectFiles {
     pub paths: Vec<String>,
 }
 
+/// A project header folded in a workspace of the sidebar; `project` `None` is the
+/// workspace's cards without a project.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FoldedProject {
+    pub session: SessionId,
+    pub project: Option<Project>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientState {
     pub version: u32,
@@ -230,6 +238,13 @@ pub struct ClientState {
     /// Additive; tabs that close are dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_tabs: Vec<TabId>,
+    /// Workspaces folded to their label in the sidebar. Additive; workspaces that close
+    /// are dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folded_workspaces: Vec<SessionId>,
+    /// Project headers folded in the sidebar. Additive; dropped with their workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folded_projects: Vec<FoldedProject>,
 }
 
 impl Default for ClientState {
@@ -254,6 +269,8 @@ impl Default for ClientState {
             recent_addresses: Vec::new(),
             project_files: Vec::new(),
             pinned_tabs: Vec::new(),
+            folded_workspaces: Vec::new(),
+            folded_projects: Vec::new(),
         }
     }
 }
@@ -326,6 +343,40 @@ impl ClientState {
         self.pinned_tabs.retain(|known| known != id);
         if pinned {
             self.pinned_tabs.push(id.clone());
+        }
+    }
+
+    /// Whether workspace `session` is folded to its label in the sidebar.
+    pub fn workspace_folded(&self, session: &SessionId) -> bool {
+        self.folded_workspaces.contains(session)
+    }
+
+    /// Folds workspace `session` in the sidebar, or unfolds it when it is folded.
+    pub fn toggle_workspace_folded(&mut self, session: &SessionId) {
+        if self.workspace_folded(session) {
+            self.folded_workspaces.retain(|known| known != session);
+        } else {
+            self.folded_workspaces.push(session.clone());
+        }
+    }
+
+    /// Whether `project`'s header in workspace `session` is folded in the sidebar.
+    pub fn project_folded(&self, session: &SessionId, project: Option<&Project>) -> bool {
+        self.folded_projects
+            .iter()
+            .any(|fold| &fold.session == session && fold.project.as_ref() == project)
+    }
+
+    /// Folds `project`'s header in workspace `session`, or unfolds it when it is folded.
+    pub fn toggle_project_folded(&mut self, session: &SessionId, project: Option<&Project>) {
+        if self.project_folded(session, project) {
+            self.folded_projects
+                .retain(|fold| !(&fold.session == session && fold.project.as_ref() == project));
+        } else {
+            self.folded_projects.push(FoldedProject {
+                session: session.clone(),
+                project: project.cloned(),
+            });
         }
     }
 
@@ -492,6 +543,10 @@ impl ClientState {
             .collect();
         self.hidden_tabs.retain(|id| tabs.contains_key(id.as_str()));
         self.pinned_tabs.retain(|id| tabs.contains_key(id.as_str()));
+        self.folded_workspaces
+            .retain(|id| session_ids.contains(id.as_str()));
+        self.folded_projects
+            .retain(|fold| session_ids.contains(fold.session.as_str()));
         self.selected_tabs
             .retain(|id, _| session_ids.contains(id.as_str()));
         self.focused_panes
@@ -866,7 +921,9 @@ impl ClientState {
             + self.focused_panes.len()
             + self.hidden_tabs.len()
             + self.pinned_tabs.len()
-            + self.viewports.len();
+            + self.viewports.len()
+            + self.folded_workspaces.len()
+            + self.folded_projects.len();
         self.selected_tabs
             .retain(|key, id| valid_id(key) && valid_id(id.as_str()));
         self.focused_panes
@@ -876,12 +933,22 @@ impl ClientState {
         self.pinned_tabs
             .retain(|id| valid_id(id.as_str()) && pinned.insert(id.clone()));
         self.viewports.retain(|id, viewport| viewport.valid(id));
+        let mut folded = HashSet::new();
+        self.folded_workspaces
+            .retain(|id| valid_id(id.as_str()) && folded.insert(id.clone()));
+        self.folded_workspaces.truncate(MAX_REFERENCES);
+        let mut folded = HashSet::new();
+        self.folded_projects
+            .retain(|fold| valid_id(fold.session.as_str()) && folded.insert(fold.clone()));
+        self.folded_projects.truncate(MAX_REFERENCES);
         changed |= before
             != self.selected_tabs.len()
                 + self.focused_panes.len()
                 + self.hidden_tabs.len()
                 + self.pinned_tabs.len()
-                + self.viewports.len();
+                + self.viewports.len()
+                + self.folded_workspaces.len()
+                + self.folded_projects.len();
         changed |= self.project_history.sanitize();
         let project_files = self.project_files.len();
         self.project_files.truncate(MAX_FILE_PROJECTS);
@@ -1331,6 +1398,8 @@ impl StateSlot {
             || state.hidden_tabs.len() > MAX_REFERENCES
             || state.pinned_tabs.len() > MAX_REFERENCES
             || state.viewports.len() > MAX_REFERENCES
+            || state.folded_workspaces.len() > MAX_REFERENCES
+            || state.folded_projects.len() > MAX_REFERENCES
             || state.floating.len() > MAX_FLOATING
             || state.floating.iter().any(|float| {
                 !valid_id(float.pane_id.as_str()) || float.rect.sanitized() != float.rect
@@ -1349,6 +1418,14 @@ impl StateSlot {
                 .any(|(key, id)| !valid_id(key) || !valid_id(id.as_str()))
             || state.hidden_tabs.iter().any(|id| !valid_id(id.as_str()))
             || state.pinned_tabs.iter().any(|id| !valid_id(id.as_str()))
+            || state
+                .folded_workspaces
+                .iter()
+                .any(|id| !valid_id(id.as_str()))
+            || state
+                .folded_projects
+                .iter()
+                .any(|fold| !valid_id(fold.session.as_str()))
             || state
                 .viewports
                 .iter()

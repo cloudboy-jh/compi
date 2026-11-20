@@ -5497,17 +5497,19 @@ impl CompiApp {
     }
 
     /// Quick Appearance: the Appearance rows in a popover on `trigger`, with a way on
-    /// to all settings. It holds the keyboard while open; see `quick_appearance_key`.
+    /// to all settings; a `full_width` trigger fills its slot. It holds the keyboard
+    /// while open; see `quick_appearance_key`.
     pub(super) fn render_quick_appearance(
         &self,
         id: &'static str,
         trigger: AnyElement,
         anchor: Anchor,
+        full_width: bool,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let open = self.popup == Some(Popup::QuickAppearance);
-        let popover = controls::popover(id, trigger, open)
+        let mut popover = controls::popover(id, trigger, open)
             .anchor(anchor)
             .on_open_change(cx.listener(|this, open: &bool, _, cx| {
                 if *open {
@@ -5520,6 +5522,9 @@ impl CompiApp {
             .on_key(cx.listener(|this, key: &Keystroke, window, cx| {
                 this.quick_appearance_key(key, window, cx);
             }));
+        if full_width {
+            popover = popover.full_width();
+        }
         if !open {
             return popover.into_any_element();
         }

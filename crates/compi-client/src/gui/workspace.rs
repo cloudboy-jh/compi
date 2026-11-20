@@ -2243,6 +2243,7 @@ impl CompiApp {
                                 self.focus_pane(pane.clone());
                             }
                         }
+                        self.sidebar_mutation_finished(Some(&receipt), cx);
                     }
                     Err(error) => {
                         self.global_error = Some(format!(
@@ -2251,6 +2252,7 @@ impl CompiApp {
                         self.view_mutation_finished(None, cx);
                         self.refresh_surfaces(false);
                         self.remote_split_finished(None);
+                        self.sidebar_mutation_finished(None, cx);
                     }
                 }
                 self.open_pending();
@@ -3878,11 +3880,7 @@ impl CompiApp {
             }
             Command::RemoveWorkspace => {
                 if let Some(session_id) = self.state.selected_session.clone() {
-                    self.confirm_removal(
-                        WorkspaceMutation::RemoveSession { session_id },
-                        "Remove workspace and end all its processes?",
-                        "Remove workspace",
-                    );
+                    self.remove_workspace(session_id);
                 }
             }
             Command::NewTab => self.create_terminal(inherited_working_directory(
@@ -4398,6 +4396,15 @@ impl CompiApp {
                     .map_or(0, |workspace| workspace.revision),
             },
             "",
+        );
+    }
+
+    /// Remove workspace: asks first, as it ends every process in it.
+    fn remove_workspace(&mut self, session_id: SessionId) {
+        self.confirm_removal(
+            WorkspaceMutation::RemoveSession { session_id },
+            "Remove workspace and end all its processes?",
+            "Remove workspace",
         );
     }
 
@@ -5818,6 +5825,7 @@ impl CompiApp {
                                 "quick-appearance-header",
                                 toggle,
                                 Anchor::TopLeft,
+                                false,
                                 window,
                                 cx,
                             )

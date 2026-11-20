@@ -1828,15 +1828,15 @@ impl CompiApp {
         })
     }
 
-    /// The focused content pane's editor or a search field in it, or the sidebar's
-    /// search, has the keyboard.
+    /// The focused content pane's editor or a search field in it, or a field of the
+    /// sidebar (its search, a workspace label renamed in place), has the keyboard.
     pub(super) fn editor_has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.overlay.is_none()
             && (self.settings_search_has_keyboard(window, cx)
                 || self.monitor_search_has_keyboard(window, cx)
                 || self.chat_composer_has_keyboard(window, cx)
                 || self.chat_sessions_search_has_keyboard(window, cx)
-                || self.sidebar_search_has_keyboard(window, cx)
+                || self.sidebar_has_keyboard(window, cx)
                 || self
                     .focused_pane()
                     .and_then(|pane| self.content.panes.get(pane))
@@ -1861,7 +1861,7 @@ impl CompiApp {
             || self.monitor_search_key(key, window, cx)
             || self.chat_composer_key(key, window, cx)
             || self.chat_sessions_search_key(key, window, cx)
-            || self.sidebar_search_key(key, window, cx)
+            || self.sidebar_key(key, window, cx)
         {
             cx.stop_propagation();
             cx.notify();

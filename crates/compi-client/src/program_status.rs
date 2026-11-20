@@ -18,7 +18,7 @@ pub struct Headline {
 }
 
 /// Blocked work needs the user now, a failure next; finished results wait.
-fn urgency(state: ProgramState) -> u8 {
+pub fn urgency(state: ProgramState) -> u8 {
     match state {
         ProgramState::Blocked => 4,
         ProgramState::Error => 3,

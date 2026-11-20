@@ -851,6 +851,45 @@ impl CompiApp {
         cx.notify();
     }
 
+    /// Add to group's rows as entries of another menu: New group…, then the groups
+    /// `tab_id` can join, each with its colour.
+    pub(super) fn tab_group_entries(&self, tab_id: &TabId, cx: &Context<Self>) -> Vec<MenuEntry> {
+        self.tab_menu_group_picks(tab_id)
+            .into_iter()
+            .map(|pick| {
+                let (label, tint) = self.group_pick_label(&pick);
+                let tab_id = tab_id.clone();
+                let item = menu_item(
+                    label,
+                    cx.listener(move |this, _, window, cx| {
+                        this.pick_tab_menu_group(&tab_id, pick.clone(), window, cx);
+                    }),
+                );
+                match tint {
+                    Some(tint) => item.swatch(tint),
+                    None => item,
+                }
+                .into()
+            })
+            .collect()
+    }
+
+    /// An Add to group row's label, and its group's colour.
+    fn group_pick_label(&self, pick: &GroupPick) -> (String, Option<Hsla>) {
+        match pick {
+            GroupPick::New => ("New group…".to_owned(), None),
+            GroupPick::Join(id) => self.group_by_id(id).map_or_else(
+                || (String::new(), None),
+                |(_, group)| {
+                    (
+                        super::tab_groups::group_title(group),
+                        Some(color(self.group_color(group.color))),
+                    )
+                },
+            ),
+        }
+    }
+
     /// An Add to group row: name a new group holding the menu's tab, or move it into
     /// a group.
     fn pick_tab_menu_group(
@@ -1272,18 +1311,7 @@ impl CompiApp {
             .into_iter()
             .enumerate()
             .map(|(index, pick)| {
-                let (label, tint) = match &pick {
-                    GroupPick::New => ("New group…".to_owned(), None),
-                    GroupPick::Join(id) => self.group_by_id(id).map_or_else(
-                        || (String::new(), None),
-                        |(_, group)| {
-                            (
-                                super::tab_groups::group_title(group),
-                                Some(color(self.group_color(group.color))),
-                            )
-                        },
-                    ),
-                };
+                let (label, tint) = self.group_pick_label(&pick);
                 let (hover_pick, run_pick, tab_id) = (pick.clone(), pick.clone(), tab_id.clone());
                 controls::menu_row(
                     ("tab-menu-group", index),

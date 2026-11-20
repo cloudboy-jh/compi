@@ -1077,25 +1077,43 @@ fn apply_mutation(
             index,
             group,
         } => {
-            let session = workspace
+            let target = workspace
                 .sessions
-                .iter_mut()
-                .find(|session| &session.id == session_id)
-                .ok_or_else(|| invalid(format!("session {session_id} was not found")))?;
-            let old = session
-                .tabs
                 .iter()
-                .position(|tab| &tab.id == tab_id)
-                .ok_or_else(|| invalid(format!("tab {tab_id} was not found in session")))?;
+                .position(|session| &session.id == session_id)
+                .ok_or_else(|| invalid(format!("session {session_id} was not found")))?;
+            let source = workspace
+                .sessions
+                .iter()
+                .position(|session| session.tabs.iter().any(|tab| &tab.id == tab_id))
+                .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
             if let TabPlacement::Join { group_id } = group
-                && session.group(group_id).is_none()
+                && workspace.sessions[target].group(group_id).is_none()
             {
                 return Err(invalid(format!(
-                    "group {group_id} is not in the tab's workspace"
+                    "group {group_id} is not in workspace {session_id}"
                 )));
             }
-            let before = group_order(session);
-            let tab = session.tabs.remove(old);
+            let before = group_order(&workspace.sessions[target]);
+            // A tab leaving its workspace leaves its group there.
+            let tab = {
+                let from = &mut workspace.sessions[source];
+                let source_before = group_order(from);
+                let old = from
+                    .tabs
+                    .iter()
+                    .position(|tab| &tab.id == tab_id)
+                    .expect("the session contains the tab");
+                let mut tab = from.tabs.remove(old);
+                if source != target {
+                    tab.group = None;
+                    settle_groups(from);
+                    affected_sessions.push(from.id.clone());
+                    regrouped(&source_before, from, affected_tabs);
+                }
+                tab
+            };
+            let session = &mut workspace.sessions[target];
             let index = (*index).min(session.tabs.len());
             session.tabs.insert(index, tab);
             let group_of = |index: Option<usize>| {
@@ -6863,6 +6881,109 @@ mod tests {
                 group: TabPlacement::Join {
                     group_id: TabGroupId::new("group-missing"),
                 },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn tabs_move_to_another_workspace_leaving_their_group_behind() {
+        let (actor, _effects, _, tabs) = tabs_fixture(3);
+        let a = create_group(&actor, &[&tabs[1], &tabs[2]], "A");
+        mutate_current(
+            &actor,
+            "other-session",
+            WorkspaceMutation::CreateSession {
+                label: "Other".into(),
+            },
+        )
+        .unwrap();
+        let source = actor.snapshot().unwrap().sessions[0].id.clone();
+        let other = actor.snapshot().unwrap().sessions[1].id.clone();
+        let mut foreign = Vec::new();
+        for index in 0..2 {
+            foreign.push(
+                mutate_current(
+                    &actor,
+                    &format!("other-tab-{index}"),
+                    WorkspaceMutation::CreateContentTab {
+                        session_id: other.clone(),
+                        label: format!("o{index}"),
+                        content: settings_content(SettingsSection::Interface),
+                    },
+                )
+                .unwrap()
+                .affected_tabs[0]
+                    .clone(),
+            );
+        }
+        let b = create_group(&actor, &[&foreign[0]], "B");
+        let other_shape = || -> Vec<(TabId, Option<TabGroupId>)> {
+            actor.snapshot().unwrap().sessions[1]
+                .tabs
+                .iter()
+                .map(|tab| (tab.id.clone(), tab.group.clone()))
+                .collect()
+        };
+        let move_to_other = |tab: &TabId, index: usize, group: TabPlacement| {
+            mutate_current(
+                &actor,
+                &format!("move-away-{tab}"),
+                WorkspaceMutation::MoveTab {
+                    session_id: other.clone(),
+                    tab_id: tab.clone(),
+                    index,
+                    group,
+                },
+            )
+            .unwrap()
+        };
+
+        // Appended past the end, it leaves group A, which keeps its other tab.
+        let receipt = move_to_other(&tabs[2], usize::MAX, TabPlacement::Infer);
+        assert_eq!(receipt.affected_sessions, [source.clone(), other.clone()]);
+        assert!(receipt.affected_tabs.contains(&tabs[2]));
+        assert_eq!(shape(&actor, &tabs), ["0", "1A", "3"]);
+        assert_eq!(
+            other_shape(),
+            [
+                (foreign[0].clone(), Some(b.clone())),
+                (foreign[1].clone(), None),
+                (tabs[2].clone(), None),
+            ]
+        );
+
+        // Joining a group of the target; group A goes with its last tab.
+        move_to_other(
+            &tabs[1],
+            0,
+            TabPlacement::Join {
+                group_id: b.clone(),
+            },
+        );
+        assert_eq!(shape(&actor, &tabs), ["0", "3"]);
+        assert!(actor.snapshot().unwrap().sessions[0].group(&a).is_none());
+        assert_eq!(
+            other_shape(),
+            [
+                (tabs[1].clone(), Some(b.clone())),
+                (foreign[0].clone(), Some(b.clone())),
+                (foreign[1].clone(), None),
+                (tabs[2].clone(), None),
+            ]
+        );
+
+        // A group of the source workspace cannot be joined from the target.
+        let c = create_group(&actor, &[&tabs[3]], "C");
+        let error = mutate_current(
+            &actor,
+            "join-source-group",
+            WorkspaceMutation::MoveTab {
+                session_id: other.clone(),
+                tab_id: tabs[0].clone(),
+                index: 0,
+                group: TabPlacement::Join { group_id: c },
             },
         )
         .unwrap_err();
