@@ -123,6 +123,8 @@ gpui_kit_assets::icon_assets!(
 
 /// Harnesses' own marks, drawn in their colours with `img`.
 pub(super) const OMP_MARK: &str = "brands/omp.svg";
+/// Claude Code's mark: the Claude model mark, in Claude's orange.
+pub(super) const CLAUDE_MARK: &str = "brands/claude.svg";
 
 /// The application's assets: GPUI Kit's default icons, the extra Lucide icons Compi
 /// uses (`ExtraIcons`), harness marks and language icons.
@@ -134,6 +136,15 @@ impl AssetSource for Assets {
             return Ok(Some(Cow::Borrowed(include_bytes!(
                 "../../assets/brands/omp.svg"
             ))));
+        }
+        if path == CLAUDE_MARK {
+            // The model mark draws in `currentColor`, which `img` has none of.
+            let mark = include_str!("../../assets/models/claude.svg").replacen(
+                "currentColor",
+                "#D97757",
+                1,
+            );
+            return Ok(Some(Cow::Owned(mark.into_bytes())));
         }
         if let Some(bytes) =
             super::language_icons::file(path).or_else(|| super::model_icons::file(path))

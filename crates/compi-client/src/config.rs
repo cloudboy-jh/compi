@@ -239,7 +239,7 @@ impl ChatEnter {
     }
 }
 
-/// Where the palette's OMP chat and `compi chat` open a chat started from a terminal,
+/// Where the palette's New chat and `compi chat` open a chat started from a terminal,
 /// `[chat] open`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -726,6 +726,9 @@ pub struct LoadedConfig {
     /// What a new tab opens with, `[chat] new_tab`; unset until chosen on first launch.
     #[serde(default)]
     pub new_tab: Option<NewTab>,
+    /// The agent every new thread starts with, `[chat] agent`.
+    #[serde(default)]
+    pub chat_agent: ChatHarness,
     /// The bar listing a chat's running sub-agents above its composer, `[chat] agents_bar`.
     #[serde(default = "default_chat_agents_bar")]
     pub chat_agents_bar: bool,
@@ -771,6 +774,7 @@ impl Default for LoadedConfig {
             chat_enter: ChatEnter::Steer,
             chat_open: ChatOpen::InPlace,
             new_tab: None,
+            chat_agent: ChatHarness::Omp,
             chat_agents_bar: true,
             chat_models: HashMap::new(),
             dev_server: DevServer::Offer,
@@ -1176,6 +1180,18 @@ impl LoadedConfig {
             open => set_table_value(table, "open", open.id().into()),
         })?;
         self.chat_open = open;
+        Ok(())
+    }
+
+    /// Persist the agent new threads start with; OMP, the default, removes it.
+    pub fn save_chat_agent(&mut self, agent: ChatHarness) -> Result<(), String> {
+        update_table(&self.path, "chat", |table| match agent {
+            ChatHarness::Omp => {
+                table.remove("agent");
+            }
+            agent => set_table_value(table, "agent", agent.program().into()),
+        })?;
+        self.chat_agent = agent;
         Ok(())
     }
 
@@ -2318,21 +2334,33 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                 ),
             }
         }
+        if let Some(value) = chat.get("agent") {
+            match value.as_str().and_then(ChatHarness::parse) {
+                Some(agent) => loaded.chat_agent = agent,
+                None => invalid(
+                    loaded,
+                    "chat.agent",
+                    "\"omp\" or \"claude\"",
+                    "configuration",
+                ),
+            }
+        }
         if let Some(value) = chat.get("agents_bar") {
             match value.as_bool() {
                 Some(shown) => loaded.chat_agents_bar = shown,
                 None => invalid(loaded, "chat.agents_bar", "true or false", "configuration"),
             }
         }
-        let harness = ChatHarness::Omp;
-        if let Some(item) = chat.get(harness.program()) {
-            let key = format!("chat.{}", harness.program());
-            match item.as_table() {
-                Some(table) => {
-                    let models = load_chat_models(table, &key, loaded);
-                    loaded.chat_models.insert(harness, models);
+        for harness in ChatHarness::ALL {
+            if let Some(item) = chat.get(harness.program()) {
+                let key = format!("chat.{}", harness.program());
+                match item.as_table() {
+                    Some(table) => {
+                        let models = load_chat_models(table, &key, loaded);
+                        loaded.chat_models.insert(harness, models);
+                    }
+                    None => invalid(loaded, &key, "a table", "configuration"),
                 }
-                None => invalid(loaded, &key, "a table", "configuration"),
             }
         }
     }
@@ -3691,6 +3719,52 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("chat.new_tab"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_agent_defaults_to_omp_round_trips_and_rejects_invalid_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-chat-agent-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n").unwrap();
+
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.chat_agent, ChatHarness::Omp);
+        loaded.save_chat_agent(ChatHarness::Claude).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("agent = \"claude\"")
+        );
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).chat_agent,
+            ChatHarness::Claude
+        );
+        // OMP, the default, leaves no key behind.
+        loaded.save_chat_agent(ChatHarness::Omp).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("agent ="));
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).chat_agent,
+            ChatHarness::Omp
+        );
+
+        fs::write(&path, "version = 1\n[chat]\nagent = \"codex\"\n").unwrap();
+        let invalid = load(Some(&path), FontOverrides::default());
+        assert_eq!(invalid.chat_agent, ChatHarness::Omp);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("chat.agent"))
         );
         fs::remove_dir_all(root).unwrap();
     }

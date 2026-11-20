@@ -426,7 +426,7 @@ impl CompiApp {
                 let (icon, detail) = match new_tab {
                     crate::config::NewTab::Chat => (
                         IconName::MessageSquarePlus,
-                        "A new tab starts a thread with OMP. Right-click + for a terminal.",
+                        "A new tab starts a thread with an agent. Right-click + for a terminal.",
                     ),
                     crate::config::NewTab::Terminal => (
                         IconName::SquareTerminal,

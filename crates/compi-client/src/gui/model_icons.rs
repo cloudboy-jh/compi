@@ -120,6 +120,14 @@ pub(super) fn for_provider(provider: &str) -> Option<&'static str> {
     path(icon)
 }
 
+/// The mark of a harness's own models, which name no provider: Claude Code's are Claude.
+pub(super) fn for_harness(harness: compi_protocol::chat::ChatHarness) -> Option<&'static str> {
+    match harness {
+        compi_protocol::chat::ChatHarness::Omp => None,
+        compi_protocol::chat::ChatHarness::Claude => path("claude"),
+    }
+}
+
 fn path(icon: &str) -> Option<&'static str> {
     FILES.iter().map(|(path, _)| *path).find(|path| {
         path.strip_prefix("models/")

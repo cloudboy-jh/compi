@@ -218,6 +218,25 @@ fn provider_name(provider: &str) -> String {
         .join(" ")
 }
 
+/// Whether the models naming no provider are the harness's own: Claude Code's model IDs
+/// (`opus`, `sonnet`) name none, while OMP's name theirs (`anthropic/claude-opus-5-5`).
+fn own_models(harness: ChatHarness) -> bool {
+    match harness {
+        ChatHarness::Omp => false,
+        ChatHarness::Claude => true,
+    }
+}
+
+/// What the strip and list call `provider`; models naming none are the harness's own,
+/// else Other.
+fn provider_title(provider: Option<&str>, harness: ChatHarness) -> String {
+    match provider {
+        Some(provider) => provider_name(provider),
+        None if own_models(harness) => harness.name().to_owned(),
+        None => "Other".to_owned(),
+    }
+}
+
 /// The providers in the strip's order: those with a subscription plan first, then
 /// those paid per use; in each, the current model's provider first, then by name.
 fn providers<'a>(option: &'a ChatOption, plans: &[ChatPlan]) -> Vec<Option<&'a str>> {
@@ -319,6 +338,7 @@ fn picker_layout(
     plans: &[ChatPlan],
     remembered: &ChatModels,
     tab: &PickerTab,
+    harness: ChatHarness,
 ) -> PickerLayout {
     let mut layout = PickerLayout::default();
     if !query.trim().is_empty() {
@@ -347,7 +367,7 @@ fn picker_layout(
             PickerTab::Provider(provider) => {
                 let provider = provider.as_deref();
                 layout.push_label(
-                    provider.map_or_else(|| "Other".to_owned(), provider_name),
+                    provider_title(provider, harness),
                     plan_detail(plans, provider),
                 );
                 let models: Vec<usize> = (0..option.choices.len())
@@ -386,10 +406,14 @@ fn strip_tabs(option: &ChatOption, plans: &[ChatPlan]) -> Vec<PickerTab> {
         .collect()
 }
 
-/// The mark drawn for model `choice`: its family's, else its provider's.
-fn model_mark(choice: &ChatChoice) -> Option<&'static str> {
-    model_icons::for_model(&choice.value, &choice.name)
-        .or_else(|| choice_provider(choice).and_then(model_icons::for_provider))
+/// The mark drawn for model `choice`: its family's, else its provider's, else for a
+/// harness's own model the harness's family's.
+fn model_mark(choice: &ChatChoice, harness: ChatHarness) -> Option<&'static str> {
+    model_icons::for_model(&choice.value, &choice.name).or_else(|| match choice_provider(choice) {
+        Some(provider) => model_icons::for_provider(provider),
+        None if own_models(harness) => model_icons::for_harness(harness),
+        None => None,
+    })
 }
 
 fn mark(path: Option<&'static str>, size: f32, tint: Hsla) -> AnyElement {
@@ -434,33 +458,52 @@ impl ChatModel {
     }
 }
 
-/// The icon and name of a permissions choice Compi makes.
-fn approval_face(approval: ChatApproval) -> (IconName, &'static str) {
+/// The icon and name of a permissions choice Compi makes, for a chat with `harness`.
+fn approval_face(approval: ChatApproval, harness: ChatHarness) -> (IconName, &'static str) {
     match approval {
-        ChatApproval::Harness => (IconName::Shield, "OMP's own setting"),
+        ChatApproval::Harness => harness_setting_face(harness),
         ChatApproval::AlwaysAsk => (IconName::ShieldCheck, "Ask before anything"),
         ChatApproval::Write => (IconName::ShieldHalf, "Edits allowed"),
         ChatApproval::Yolo => (IconName::ShieldOff, "Full access"),
     }
 }
 
-/// The icon and name of an OMP approval mode the agent runs with.
-fn approval_mode_face(mode: &str) -> (IconName, &'static str) {
-    match mode {
-        "always-ask" => (IconName::ShieldCheck, "Ask before anything"),
-        "always-ask-cached" => (IconName::ShieldCheck, "Ask once per tool"),
-        "write" => (IconName::ShieldHalf, "Edits allowed"),
-        "yolo" => (IconName::ShieldOff, "Full access"),
-        _ => (IconName::Shield, "OMP's own setting"),
+/// The icon and name of the harness's own approval setting.
+fn harness_setting_face(harness: ChatHarness) -> (IconName, &'static str) {
+    match harness {
+        ChatHarness::Omp => (IconName::Shield, "OMP's own setting"),
+        ChatHarness::Claude => (IconName::Shield, "Same as Claude Code"),
     }
 }
 
-/// How permissions `approval` show: for OMP's own setting, the mode the agent runs with
-/// (`running`, as the daemon reports it) when known.
-fn approval_shown(approval: ChatApproval, running: Option<&str>) -> (IconName, &'static str) {
-    match approval {
-        ChatApproval::Harness => running.map_or(approval_face(approval), approval_mode_face),
-        chosen => approval_face(chosen),
+/// The icon and name of an approval mode `harness` runs with, by its own name for it.
+fn approval_mode_face(harness: ChatHarness, mode: &str) -> (IconName, &'static str) {
+    match (harness, mode) {
+        (ChatHarness::Omp, "always-ask") | (ChatHarness::Claude, "default") => {
+            (IconName::ShieldCheck, "Ask before anything")
+        }
+        (ChatHarness::Omp, "always-ask-cached") => (IconName::ShieldCheck, "Ask once per tool"),
+        (ChatHarness::Omp, "write") | (ChatHarness::Claude, "acceptEdits") => {
+            (IconName::ShieldHalf, "Edits allowed")
+        }
+        (ChatHarness::Claude, "plan") => (IconName::Shield, "Plan"),
+        (ChatHarness::Omp, "yolo") | (ChatHarness::Claude, "bypassPermissions") => {
+            (IconName::ShieldOff, "Full access")
+        }
+        _ => harness_setting_face(harness),
+    }
+}
+
+/// How permissions `approval` show in a chat with `harness`: for the harness's own
+/// setting, the mode it runs with (`running`, as the daemon reports it) when known.
+fn approval_shown(
+    approval: ChatApproval,
+    harness: ChatHarness,
+    running: Option<&str>,
+) -> (IconName, &'static str) {
+    match (approval, running) {
+        (ChatApproval::Harness, Some(mode)) => approval_mode_face(harness, mode),
+        (chosen, _) => approval_face(chosen, harness),
     }
 }
 
@@ -547,7 +590,7 @@ impl CompiApp {
                 .iter()
                 .find(|choice| choice.value == option.current)
         });
-        if let Some(path) = current_model.and_then(model_mark) {
+        if let Some(path) = current_model.and_then(|choice| model_mark(choice, chat.harness)) {
             button = button.icon(Icon::empty().path(path));
         } else if models.is_none() && thinking.is_some() {
             button = button.icon(IconName::Brain);
@@ -640,7 +683,7 @@ impl CompiApp {
             .state
             .as_ref()
             .and_then(|state| state.approval_mode.as_deref());
-        let (icon, label) = approval_shown(model.approval(default), running);
+        let (icon, label) = approval_shown(model.approval(default), chat.harness, running);
         let id = chat.id.clone();
         Some(
             text_button("chat-approval", label)
@@ -791,6 +834,7 @@ impl CompiApp {
             &state.plans,
             &self.remembered_models(state.harness),
             &picker.tab,
+            state.harness,
         );
         Some((layout, current_index(Some(option))))
     }
@@ -1195,7 +1239,14 @@ impl CompiApp {
             .filter(|_| !searching)
             .map(|option| self.render_model_strip(chat, option, plans, picker, cx));
         let list = models.map(|option| {
-            let layout = picker_layout(option, &query, plans, &remembered, &picker.tab);
+            let layout = picker_layout(
+                option,
+                &query,
+                plans,
+                &remembered,
+                &picker.tab,
+                chat.harness,
+            );
             div()
                 .flex_1()
                 .min_w_0()
@@ -1430,16 +1481,23 @@ impl CompiApp {
                 .into_iter()
                 .enumerate()
                 .map(|(index, approval)| {
-                    let (icon, name) = approval_face(approval);
+                    let (icon, name) = approval_face(approval, chat.harness);
                     let lit = approval == current;
                     let highlighted =
                         picker.column == PickerColumn::Approval && picker.approval == index;
-                    let mut detail =
-                        super::super::settings::chat_approval_detail(approval).to_owned();
+                    let mut detail = match approval {
+                        ChatApproval::Harness => {
+                            format!("{}'s own approval setting", chat.harness.name())
+                        }
+                        approval => {
+                            super::super::settings::chat_approval_detail(approval).to_owned()
+                        }
+                    };
                     if approval == ChatApproval::Harness
                         && let Some(mode) = running
                     {
-                        detail = format!("{detail}; now {}", approval_mode_face(mode).1);
+                        detail =
+                            format!("{detail}; now {}", approval_mode_face(chat.harness, mode).1);
                     }
                     if let Some(refusal) = &refusal {
                         detail = refusal.clone();
@@ -1575,10 +1633,15 @@ impl CompiApp {
                 .into_iter()
                 .enumerate()
                 .map(|(index, provider)| {
-                    let name = provider.map_or_else(|| "Other".to_owned(), provider_name);
-                    let icon = match provider.and_then(model_icons::for_provider) {
-                        Some(path) => mark(Some(path), 18.0, muted),
-                        None => div()
+                    let name = provider_title(provider, chat.harness);
+                    let icon = match (provider.and_then(model_icons::for_provider), provider) {
+                        (Some(path), _) => mark(Some(path), 18.0, muted),
+                        // The harness's own models: its mark, in its colours.
+                        (None, None) if own_models(chat.harness) => img(harness_mark(chat.harness))
+                            .flex_none()
+                            .size(ui_rems(18.0))
+                            .into_any_element(),
+                        (None, _) => div()
                             .size(ui_rems(20.0))
                             .flex()
                             .items_center()
@@ -1659,7 +1722,7 @@ impl CompiApp {
         let favorites: Rc<[String]> = remembered.favorites.clone().into();
         let saved_tab = picker.tab == PickerTab::Saved;
         let current = option.current.clone();
-        let (id, setting) = (chat.id.clone(), option.id.clone());
+        let (id, setting, harness) = (chat.id.clone(), option.id.clone(), chat.harness);
         let list = uniform_list(
             "chat-model-list",
             count,
@@ -1715,7 +1778,7 @@ impl CompiApp {
                                     .w_full()
                                     .h(ui_rems(ROW_HEIGHT))
                                     .gap_x_2()
-                                    .child(mark(model_mark(choice), ICON_SIZE, muted))
+                                    .child(mark(model_mark(choice, harness), ICON_SIZE, muted))
                                     .child(div().flex_none().child(choice.name.clone()))
                                     .when(choice.value == current, |row| {
                                         row.child(controls::glyph(IconName::Check, muted))
@@ -1939,6 +2002,7 @@ mod tests {
             &plans(),
             &ChatModels::default(),
             &PickerTab::Provider(Some("anthropic".into())),
+            ChatHarness::Omp,
         );
         assert_eq!(
             shown(&option, &layout),
@@ -1966,7 +2030,14 @@ mod tests {
             ..ChatModels::default()
         };
         assert_eq!(opening_tab(&option, &remembered), PickerTab::Saved);
-        let layout = picker_layout(&option, "", &[], &remembered, &PickerTab::Saved);
+        let layout = picker_layout(
+            &option,
+            "",
+            &[],
+            &remembered,
+            &PickerTab::Saved,
+            ChatHarness::Omp,
+        );
         assert_eq!(
             shown(&option, &layout),
             [
@@ -1979,7 +2050,14 @@ mod tests {
         );
         // A search ignores the tab and lists matches in the strip's order, unlabelled
         // ("o" is in every provider's name).
-        let layout = picker_layout(&option, "o", &plans(), &remembered, &PickerTab::Saved);
+        let layout = picker_layout(
+            &option,
+            "o",
+            &plans(),
+            &remembered,
+            &PickerTab::Saved,
+            ChatHarness::Omp,
+        );
         assert_eq!(
             shown(&option, &layout),
             [
@@ -2010,6 +2088,7 @@ mod tests {
             &[],
             &ChatModels::default(),
             &PickerTab::Provider(Some("anthropic".into())),
+            ChatHarness::Omp,
         );
         assert_eq!(
             shown(&option, &layout),
@@ -2035,6 +2114,108 @@ mod tests {
         models.toggle_favorite("c");
         models.toggle_favorite("a");
         assert_eq!(models.favorites, ["c"]);
+    }
+
+    #[test]
+    fn claude_codes_models_name_no_provider_and_list_under_it() {
+        let named = |value: &str, name: &str| ChatChoice {
+            name: name.into(),
+            ..choice(value)
+        };
+        let option = ChatOption {
+            current: "default".into(),
+            choices: vec![
+                named("default", "Default (recommended)"),
+                named("opus", "Opus"),
+                named("haiku", "Haiku"),
+            ],
+            ..option()
+        };
+        let claude = ChatHarness::Claude;
+        // One provider, the harness's own, with no plan to hover.
+        assert_eq!(
+            strip_tabs(&option, &[]),
+            [PickerTab::Saved, PickerTab::Provider(None)]
+        );
+        assert_eq!(
+            opening_tab(&option, &ChatModels::default()),
+            PickerTab::Provider(None)
+        );
+        let layout = picker_layout(
+            &option,
+            "",
+            &[],
+            &ChatModels::default(),
+            &PickerTab::Provider(None),
+            claude,
+        );
+        assert_eq!(
+            shown(&option, &layout),
+            ["# Claude Code ()", "default", "opus", "haiku"]
+        );
+        // OMP's models without a provider stay Other.
+        assert_eq!(provider_title(None, ChatHarness::Omp), "Other");
+        // Search, favorites and recents work on the bare IDs.
+        let layout = picker_layout(
+            &option,
+            "opus",
+            &[],
+            &ChatModels::default(),
+            &PickerTab::Saved,
+            claude,
+        );
+        assert_eq!(shown(&option, &layout), ["opus"]);
+        let mut remembered = ChatModels::default();
+        remembered.picked_model("haiku");
+        remembered.toggle_favorite("opus");
+        let layout = picker_layout(&option, "", &[], &remembered, &PickerTab::Saved, claude);
+        assert_eq!(
+            shown(&option, &layout),
+            ["# Favorites ()", "opus", "# Recent ()", "haiku"]
+        );
+        // Every model wears Claude's mark, named or not.
+        assert!(
+            option
+                .choices
+                .iter()
+                .all(|choice| model_mark(choice, claude) == Some("models/claude.svg"))
+        );
+        assert_eq!(model_mark(&option.choices[0], ChatHarness::Omp), None);
+    }
+
+    #[test]
+    fn permissions_name_each_harness_own_modes() {
+        let (omp, claude) = (ChatHarness::Omp, ChatHarness::Claude);
+        assert_eq!(
+            approval_face(ChatApproval::Harness, omp).1,
+            "OMP's own setting"
+        );
+        assert_eq!(
+            approval_face(ChatApproval::Harness, claude).1,
+            "Same as Claude Code"
+        );
+        for (mode, name) in [
+            ("default", "Ask before anything"),
+            ("acceptEdits", "Edits allowed"),
+            ("plan", "Plan"),
+            ("bypassPermissions", "Full access"),
+            ("dontAsk", "Same as Claude Code"),
+        ] {
+            assert_eq!(approval_mode_face(claude, mode).1, name, "{mode}");
+        }
+        assert_eq!(approval_mode_face(omp, "write").1, "Edits allowed");
+        assert_eq!(
+            approval_mode_face(omp, "acceptEdits").1,
+            "OMP's own setting"
+        );
+        assert_eq!(
+            approval_shown(ChatApproval::Harness, claude, Some("plan")).1,
+            "Plan"
+        );
+        assert_eq!(
+            approval_shown(ChatApproval::Yolo, claude, Some("plan")).1,
+            "Full access"
+        );
     }
 
     #[test]

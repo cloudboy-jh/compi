@@ -1,4 +1,4 @@
-//! Chat panes: a conversation with an agent harness (OMP) that the daemon runs, shown in
+//! Chat panes: a conversation with an agent harness that the daemon runs, shown in
 //! a content pane or as a terminal's view. The chat (`PaneContent::Chat`) names the
 //! harness, its folder and environment, and once the harness made one, its session, which
 //! the pane keeps so a restarted daemon resumes it.
@@ -309,6 +309,7 @@ fn chat_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<(&'a PaneId, &'a ChatC
 pub(super) fn harness_mark(harness: ChatHarness) -> &'static str {
     match harness {
         ChatHarness::Omp => controls::OMP_MARK,
+        ChatHarness::Claude => controls::CLAUDE_MARK,
     }
 }
 
@@ -714,10 +715,10 @@ fn watch_chat(
 }
 
 impl CompiApp {
-    /// OMP chat: a new chat in the focused terminal's folder, shown in its place or, as
-    /// Settings → Chat → Opening a chat says, beside it; from another pane, or a terminal
-    /// already carrying a chat, in that pane's folder, beside it. The new chat's id, when
-    /// one was asked for.
+    /// New chat: a chat with the default agent in the focused terminal's folder, shown in
+    /// its place or, as Settings → Chat → Opening a chat says, beside it; from another
+    /// pane, or a terminal already carrying a chat, in that pane's folder, beside it. The
+    /// new chat's id, when one was asked for.
     pub(super) fn open_chat(
         &mut self,
         window: &mut Window,
@@ -734,7 +735,7 @@ impl CompiApp {
                 return None;
             }
         };
-        let chat = crate::chat::new_chat(environment, folder);
+        let chat = crate::chat::new_chat(self.config.chat_agent, environment, folder);
         let id = chat.id.clone();
         let content = PaneContent::Chat(chat);
         // A terminal already carrying a chat keeps it as its view; the new one goes beside.

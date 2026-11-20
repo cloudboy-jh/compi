@@ -859,6 +859,22 @@ impl DaemonClient {
         }
     }
 
+    /// The agents installed in `environment`, in `ChatHarness::ALL` order.
+    pub fn chat_agents(
+        &mut self,
+        environment: &crate::ContentEnvironment,
+    ) -> Result<Vec<crate::chat::ChatHarness>> {
+        match self.request_bounded(
+            ClientMessage::ListChatAgents {
+                environment: environment.clone(),
+            },
+            Duration::from_secs(15),
+        )? {
+            ServerMessage::ChatAgents { agents } => Ok(agents),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     /// Every thread the daemon keeps, newest change first.
     pub fn list_threads(&mut self) -> Result<Vec<crate::chat::ThreadInfo>> {
         match self.request_bounded(ClientMessage::ListThreads, Duration::from_secs(10))? {

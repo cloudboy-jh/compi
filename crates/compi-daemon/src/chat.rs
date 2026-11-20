@@ -1,68 +1,55 @@
-//! Native agent chats: the daemon runs each chat's harness (`omp acp`) like a shell and
-//! speaks the Agent Client Protocol (JSON-RPC 2.0, one message per line) to it over its
-//! standard input and output. The transcript lives here; windows watch a chat
-//! (`WatchChat`) and get its state, then every change.
+//! Native agent chats: the daemon runs each chat's harness like a shell and talks to it
+//! over its standard input and output, one JSON message per line, through the harness's
+//! driver: OMP speaks the Agent Client Protocol (`acp`), Claude Code its headless JSON
+//! stream (`claude`). The transcript lives here; windows watch a chat (`WatchChat`) and
+//! get its state, then every change.
 //!
 //! A chat is keyed by its pane's chat ID and lives as long as a pane or view holds it:
 //! once none does, its turn and harness stop (`ChatHub::retain`). Compi saves its
 //! transcript as a thread (`threads`) until the thread is deleted
 //! (`ChatHub::delete_thread`). The harness keeps its own session; watching a saved
-//! thread again starts the harness on that session (`session/load`), after a restart of
-//! the daemon too, and the transcript Compi saved stands in for the harness's replay.
+//! thread again starts the harness on that session, after a restart of the daemon too,
+//! and the transcript Compi saved stands in for the harness's replay.
 use crate::program_status::ChatStatusHub;
 use compi_protocol::chat::{
-    ChatAgent, ChatAgentsFinished, ChatAnswer, ChatAnswers, ChatApproval, ChatChange, ChatChoice,
-    ChatCommand, ChatContent, ChatDelivery, ChatDiff, ChatEntry, ChatEvent, ChatField, ChatHarness,
-    ChatImage, ChatOption, ChatPermission, ChatPermissionOption, ChatPicks, ChatPlan,
-    ChatPlanLimit, ChatQuestion, ChatQueued, ChatSessionInfo, ChatState, ChatStatus, ChatTool,
-    ChatToolStatus, ChatUsage, MAX_CHAT_AGENT_RESULT_BYTES, MAX_CHAT_ATTACHMENTS,
-    MAX_CHAT_DIFF_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES,
-    MAX_CHAT_QUEUED, MAX_CHAT_TOOL_INPUT_BYTES, MAX_CHAT_TOOL_OUTPUT_BYTES, ThreadActivity,
+    ChatAgent, ChatAgentsFinished, ChatAnswers, ChatApproval, ChatChange, ChatContent,
+    ChatDelivery, ChatEntry, ChatEvent, ChatHarness, ChatImage, ChatPicks, ChatQueued,
+    ChatSessionInfo, ChatState, ChatStatus, ChatTool, ChatToolStatus, MAX_CHAT_ATTACHMENTS,
+    MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES, MAX_CHAT_QUEUED, ThreadActivity,
     ThreadInfo,
 };
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
 use compi_protocol::{ContentEnvironment, LayoutNode, SurfaceId, WorkspaceSnapshot};
-use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::{Deref, DerefMut};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod acp;
+mod claude;
+mod launch;
 mod saved;
 mod threads;
 
+use acp::Acp;
+use claude::Claude;
 use threads::{ThreadRecord, ThreadStore};
 
-/// The ACP version Compi speaks.
-const ACP_VERSION: u64 = 1;
 /// Standard error kept to explain an exit.
 const STDERR_TAIL_BYTES: usize = 2048;
 /// How long a stopping harness may take to exit on its own once its input closes.
 const STOP_GRACE: Duration = Duration::from_millis(500);
 /// How long a window waits for the harness to list its sessions.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Pages of a session listing read at most (OMP's are 50 sessions long).
-const MAX_LIST_PAGES: usize = 40;
 /// A whole state sent to a window stays this small; tool output and diffs of the oldest
 /// calls are left out beyond it, so a long session still fits one control frame.
 const WATCH_STATE_BYTES: usize = 6 * 1024 * 1024;
-/// How long the lookup of OMP's own approval setting may take; the harness starts without
-/// it after that.
-const APPROVAL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// The modes `omp acp --approval-mode` takes.
-const OMP_APPROVAL_MODES: [&str; 4] = ["always-ask", "always-ask-cached", "write", "yolo"];
-/// `omp` in a login shell, its arguments to follow. The shell bridge's folder comes first
-/// on its search path, so `compi` runs the CLI as in a terminal. Where `omp` is installed
-/// when a login shell's search path lacks it: its install script's and Bun's folders.
-const UNIX_COMMAND: &str =
-    r#"PATH="$HOME/.compi/shell:$PATH:$HOME/.local/bin:$HOME/.bun/bin" exec omp"#;
 /// The longest line a sub-agent's activity keeps, in characters.
 const AGENT_ACTIVITY_CHARS: usize = 160;
-/// How often a chat with sub-agents running looks in the session's file for their ends.
-const AGENT_POLL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 
@@ -199,9 +186,12 @@ impl ChatHub {
             Ok(result) => result?,
             Err(_) => return Err("the harness did not list its sessions in time".into()),
         };
-        // RFC 3339 times in UTC, as OMP writes them, sort as text.
+        // RFC 3339 times in UTC, as both harnesses' listings give them, sort as text.
         sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
-        saved::fill(&chat.content, &mut sessions);
+        // Claude Code's listing comes from its files, previews and all; OMP's from ACP.
+        if chat.content.harness == ChatHarness::Omp {
+            saved::fill(&chat.content, &mut sessions);
+        }
         Ok(sessions)
     }
 
@@ -341,6 +331,25 @@ pub fn chat_surface(workspace: &WorkspaceSnapshot, id: &str) -> Option<SurfaceId
     held_chats(workspace).remove(id).flatten()
 }
 
+/// The harnesses installed in `environment`, in `ChatHarness::ALL` order, as their
+/// launch finds them. They are looked for at once, each for a few seconds at most.
+pub fn installed_agents(environment: &ContentEnvironment) -> Vec<ChatHarness> {
+    let lookups: Vec<_> = ChatHarness::ALL
+        .into_iter()
+        .map(|harness| {
+            let environment = environment.clone();
+            let lookup = thread::Builder::new()
+                .name("compi-chat-lookup".into())
+                .spawn(move || launch::installed(&environment, harness));
+            (harness, lookup)
+        })
+        .collect();
+    lookups
+        .into_iter()
+        .filter_map(|(harness, lookup)| lookup.ok()?.join().ok()?.then_some(harness))
+        .collect()
+}
+
 /// Every chat a pane or view of `workspace` holds, with the terminal whose view shows
 /// it, when a terminal's view does.
 fn held_chats(workspace: &WorkspaceSnapshot) -> HashMap<String, Option<SurfaceId>> {
@@ -417,38 +426,6 @@ struct Chat {
     inner: Mutex<Inner>,
 }
 
-/// What a request Compi sent the harness was for.
-enum Pending {
-    Initialize,
-    NewSession,
-    LoadSession,
-    Prompt,
-    /// One of the user's picks set on the new `session`; `rest` follow, in order.
-    Pick {
-        session: String,
-        option: String,
-        value: String,
-        rest: VecDeque<(&'static str, String)>,
-    },
-    /// A prompt into the running turn; it waits its turn when the harness declines.
-    Steer(Prompt),
-    /// OMP's subscription plans and what is left of them (`_omp/usage`).
-    Plans,
-    SetOption,
-    /// The harness's sessions for a window, page by page (`nextCursor`).
-    List {
-        reply: mpsc::Sender<Result<Vec<ChatSessionInfo>, String>>,
-        listed: Vec<ChatSessionInfo>,
-        pages: usize,
-    },
-    /// Pages of the listing searched for the folder `session` was saved under, to load
-    /// it there.
-    Locate {
-        session: String,
-        pages: usize,
-    },
-}
-
 /// A prompt on its way to the harness: its text, attached files and images.
 struct Prompt {
     text: String,
@@ -485,24 +462,6 @@ impl Prompt {
         Ok(())
     }
 
-    /// As ACP content blocks: the text, a link per file, the images.
-    fn blocks(&self) -> Vec<Value> {
-        let mut blocks = vec![json!({ "type": "text", "text": self.text })];
-        blocks.extend(self.files.iter().map(|path| {
-            json!({
-                "type": "resource_link",
-                "uri": file_uri(path),
-                "name": file_name(path),
-            })
-        }));
-        blocks.extend(
-            self.images.iter().map(
-                |image| json!({ "type": "image", "mimeType": image.mime, "data": image.data }),
-            ),
-        );
-        blocks
-    }
-
     fn image_names(&self) -> Vec<String> {
         self.images.iter().map(|image| image.name.clone()).collect()
     }
@@ -531,6 +490,30 @@ struct FinishedAgentWave {
     tools: Vec<usize>,
 }
 
+/// The wire code of the chat's harness and what it keeps of it, chosen by
+/// `ChatContent::harness`.
+enum Driver {
+    /// OMP: the Agent Client Protocol.
+    Acp(Box<Acp>),
+    /// Claude Code: its headless JSON stream.
+    Claude(Box<Claude>),
+}
+
+impl Default for Driver {
+    fn default() -> Self {
+        Self::Acp(Box::default())
+    }
+}
+
+impl Driver {
+    fn new(harness: ChatHarness) -> Self {
+        match harness {
+            ChatHarness::Omp => Self::default(),
+            ChatHarness::Claude => Self::Claude(Box::default()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// The chat's ID, which its program status goes under.
@@ -554,24 +537,13 @@ struct Inner {
     closed: bool,
     /// The harness answered `initialize`.
     initialized: bool,
-    can_load: bool,
-    can_list: bool,
-    /// The folder each listed session was saved under. OMP lists a folder's sessions
-    /// under every name of it (a link and its target) but loads one only under the name
-    /// it was saved with.
-    session_folders: HashMap<String, String>,
-    /// The harness takes prompts into a running turn (`_session/steering`).
-    can_steer: bool,
+    driver: Driver,
     /// Prompts for after the running turn, in order, by ID; `state.queued` shows them.
     queue: VecDeque<(u64, Prompt)>,
     next_queued: u64,
     /// A turn that did not end on its own holds the queue until a prompt is sent or
     /// queued.
     queue_held: bool,
-    /// A plans request is out; another waits for it.
-    reading_plans: bool,
-    next_request: u64,
-    pending: HashMap<u64, Pending>,
     /// Tool call IDs to their transcript entries.
     tools: HashMap<String, usize>,
     /// Entries of the tool calls whose sub-agents ran since none did; once none of them
@@ -585,11 +557,7 @@ struct Inner {
     agents_offset: u64,
     /// The harness generation and transcript revision watched by the file reader.
     agents_watched: Option<(u64, u64)>,
-    /// The JSON-RPC ID of the permission request `state.permission` shows.
-    permission_request: Option<Value>,
     next_permission: u64,
-    /// The JSON-RPC ID of the form `state.question` shows, and how to send its answers.
-    question_request: Option<(Value, Vec<FieldShape>)>,
     next_question: u64,
     /// When the transcript last moved (a prompt, a reply chunk, a tool report): a thought
     /// that follows began then, since the harness sends its text only once it is done.
@@ -653,16 +621,6 @@ impl Drop for Locked<'_> {
     }
 }
 
-/// How a question field's answer goes back to the harness.
-#[derive(Clone)]
-struct FieldShape {
-    key: String,
-    /// The schema's value type: `string`, `array`, `boolean`, `number` or `integer`.
-    kind: String,
-    /// The companion free-text key, when the field has one.
-    other: Option<String>,
-}
-
 struct Agent {
     child: Child,
     input: ChildStdin,
@@ -691,6 +649,7 @@ impl Chat {
             picks,
             surface,
             folder: Some((content.environment.clone(), content.folder.clone())),
+            driver: Driver::new(content.harness),
             ..Inner::default()
         };
         if let Some(thread) = thread {
@@ -720,16 +679,33 @@ impl Chat {
         inner.generation += 1;
         inner.initialized = false;
         let generation = inner.generation;
-        let chosen = inner.approval.omp_mode();
+        let harness = self.content.harness;
+        let chosen = match harness {
+            ChatHarness::Omp => inner.approval.omp_mode(),
+            ChatHarness::Claude => inner.approval.claude_mode(),
+        };
         let chat = self.clone();
         let preparing = thread::Builder::new()
             .name("compi-chat-start".into())
             .spawn(move || {
-                // The note's extension is a bridge file, so no bridge, no note.
+                // OMP's note's extension is a bridge file, so no bridge, no note.
                 let note = install_bridge(&chat.content)
                     .then(|| agent_note(&chat.content))
                     .flatten();
-                let mode = chosen.or_else(|| configured_approval(&chat.content));
+                let mode = match harness {
+                    ChatHarness::Omp => chosen.or_else(|| acp::configured_approval(&chat.content)),
+                    // Claude Code reads its own setting.
+                    ChatHarness::Claude => {
+                        // Where a Windows `claude` is, asked of WSL now rather than
+                        // under the lock.
+                        #[cfg(windows)]
+                        if let ContentEnvironment::Wsl { distribution } = &chat.content.environment
+                        {
+                            launch::windows_home(distribution);
+                        }
+                        chosen
+                    }
+                };
                 let mut inner = chat.lock();
                 if !inner.closed && inner.generation == generation {
                     chat.launch(&mut inner, generation, mode, note);
@@ -754,13 +730,10 @@ impl Chat {
         inner.emit(ChatEvent::ApprovalMode {
             mode: approval_mode.map(str::to_owned),
         });
-        let mut args = vec!["acp"];
-        if let Some(mode) = approval_mode {
-            args.extend(["--approval-mode", mode]);
-        }
-        if note.is_some() {
-            args.extend(["-e", r#""$HOME/.compi/shell/compi-omp.js""#]);
-        }
+        let args = match inner.driver {
+            Driver::Acp(_) => acp::launch_args(approval_mode, note.is_some()),
+            Driver::Claude(_) => claude::launch_args(inner, approval_mode),
+        };
         let wsl = matches!(self.content.environment, ContentEnvironment::Wsl { .. });
         let mut child = match crate::shell_integration::cli_environment(
             inner.surface.as_ref().map(SurfaceId::as_str),
@@ -772,7 +745,7 @@ impl Chat {
             environment
         })
         .map_err(|error| format!("Couldn't prepare Compi's shell context: {error}"))
-        .and_then(|environment| command(&self.content, &environment, &args))
+        .and_then(|environment| launch::command(&self.content, &environment, &args))
         .and_then(|mut command| {
             command
                 .stdin(Stdio::piped())
@@ -814,19 +787,10 @@ impl Chat {
             #[cfg(windows)]
             _job: job,
         });
-        inner.request(
-            "initialize",
-            json!({
-                "protocolVersion": ACP_VERSION,
-                "clientInfo": { "name": "compi", "version": env!("CARGO_PKG_VERSION") },
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false,
-                    "elicitation": { "form": {} },
-                },
-            }),
-            Pending::Initialize,
-        );
+        match inner.driver {
+            Driver::Acp(_) => acp::start(inner),
+            Driver::Claude(_) => claude::start(inner),
+        }
     }
 
     fn spawn_error(&self, error: &std::io::Error) -> String {
@@ -859,7 +823,10 @@ impl Chat {
             if inner.closed || inner.generation != generation {
                 return;
             }
-            self.handle(&mut inner, message);
+            match inner.driver {
+                Driver::Acp(_) => self.handle(&mut inner, message),
+                Driver::Claude(_) => claude::handle(&self, &mut inner, message),
+            }
         }
         let mut inner = self.lock();
         if inner.closed || inner.generation != generation {
@@ -891,331 +858,9 @@ impl Chat {
         });
     }
 
-    fn handle(self: &Arc<Self>, inner: &mut Inner, message: Value) {
-        let method = message.get("method").and_then(Value::as_str);
-        let id = message.get("id").cloned();
-        match (method, id) {
-            (Some(method), Some(id)) => inner.agent_request(method, id, &message["params"]),
-            (Some("session/update"), None) => {
-                inner.update(&message["params"]["update"]);
-            }
-            (Some(_), None) => {}
-            (None, Some(id)) => {
-                let Some(pending) = id.as_u64().and_then(|id| inner.pending.remove(&id)) else {
-                    return;
-                };
-                let result = match message.get("error") {
-                    Some(error) => Err(error_text(error)),
-                    None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
-                };
-                self.answered(inner, pending, result);
-            }
-            (None, None) => {}
-        }
-        self.watch_agents(inner);
-    }
-
-    /// While sub-agents run, reads OMP's session files for what ACP leaves out: the ones
-    /// that finished, and each one's tool calls. OMP reports a sub-agent over ACP only
-    /// while a turn runs: one that ends after its turn would show as running for good.
-    fn watch_agents(self: &Arc<Self>, inner: &mut Inner) {
-        let generation = inner.generation;
-        let revision = inner.agents_revision;
-        let watch = (generation, revision);
-        // Replayed calls must all exist before saved completions are consumed.
-        if inner
-            .pending
-            .values()
-            .any(|pending| matches!(pending, Pending::LoadSession))
-            || inner.agents_watched == Some(watch)
-            || inner.open_agents().is_empty()
-        {
-            return;
-        }
-        let offset = inner.agents_offset;
-        let chat = self.clone();
-        let watching = thread::Builder::new()
-            .name("compi-chat-agents".into())
-            .spawn(move || {
-                // Replay existing completions too: they may predate this process.
-                let mut file = None;
-                // Each open agent's own file, read from its start.
-                let mut steps: HashMap<String, saved::AgentSteps> = HashMap::new();
-                loop {
-                    let (session, open) = {
-                        let mut inner = chat.lock();
-                        let open = inner.open_agents();
-                        if inner.closed
-                            || inner.generation != generation
-                            || inner.agents_revision != revision
-                            || open.is_empty()
-                        {
-                            if inner.agents_watched == Some(watch) {
-                                inner.agents_watched = None;
-                            }
-                            return;
-                        }
-                        (inner.state.session.clone(), open)
-                    };
-                    match &mut file {
-                        None => {
-                            file = session
-                                .and_then(|session| saved::session_file(&chat.content, &session))
-                                .map(|path| (path, offset));
-                        }
-                        Some((path, offset)) => {
-                            // Their calls first, so one that ended shows its last ones.
-                            steps.retain(|id, _| open.contains(id));
-                            let folder = path.with_extension("");
-                            for id in &open {
-                                // An agent's name is a file's name here, never a path.
-                                if id.contains(['/', '\\']) || id.starts_with('.') {
-                                    continue;
-                                }
-                                let read = steps.entry(id.clone()).or_default();
-                                if read.read(&folder.join(format!("{id}.jsonl"))) {
-                                    let mut inner = chat.lock();
-                                    if !inner.closed
-                                        && inner.generation == generation
-                                        && inner.agents_revision == revision
-                                    {
-                                        inner.agent_steps(id, read);
-                                    }
-                                }
-                            }
-                            let jobs = saved::finished_agents(path, offset);
-                            let mut inner = chat.lock();
-                            if !inner.closed
-                                && inner.generation == generation
-                                && inner.agents_revision == revision
-                            {
-                                inner.agents_offset = *offset;
-                                inner.fill_results(&jobs, now_ms());
-                            }
-                        }
-                    }
-                    thread::sleep(AGENT_POLL);
-                }
-            });
-        if watching.is_ok() {
-            inner.agents_watched = Some(watch);
-        }
-    }
-
-    fn answered(&self, inner: &mut Inner, pending: Pending, result: Result<Value, String>) {
-        let harness = self.content.harness.name();
-        match (pending, result) {
-            (Pending::Initialize, Ok(result)) => {
-                let capabilities = &result["agentCapabilities"];
-                inner.initialized = true;
-                inner.can_load = capabilities["loadSession"].as_bool().unwrap_or(false);
-                inner.can_list = capabilities["sessionCapabilities"]["list"].is_object();
-                inner.can_steer = result["_meta"]["steering"]["supported"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let session = inner.state.session.clone();
-                self.open_session(inner, session);
-            }
-            (Pending::Initialize, Err(error)) => inner.emit(ChatEvent::Status {
-                status: ChatStatus::Failed {
-                    message: format!("{harness} didn't start: {error}"),
-                },
-            }),
-            (Pending::NewSession, Ok(result)) => {
-                inner.session_opened(&result);
-                let ChatPicks {
-                    model,
-                    thought_level,
-                } = inner.picks.clone();
-                // The model first: the thinking levels on offer may depend on it.
-                let picks = [("model", model), ("thought_level", thought_level)]
-                    .into_iter()
-                    .filter_map(|(category, value)| Some((category, value?)))
-                    .collect();
-                inner.apply_picks(picks);
-                self.read_plans(inner);
-            }
-            // A resumed session keeps its own settings. A chat that had no thread gets
-            // one once the session it resumed shows.
-            (Pending::LoadSession, Ok(result)) => {
-                inner.skip_replay = false;
-                inner.session_opened(&result);
-                if inner.thread.is_none() && !inner.state.entries.is_empty() {
-                    inner.start_thread();
-                }
-                inner.apply_picks(VecDeque::new());
-                self.read_plans(inner);
-            }
-            // The transcript so far stays, above the error and the new session.
-            (Pending::LoadSession, Err(error)) => {
-                inner.skip_replay = false;
-                inner.emit(ChatEvent::Session { session: None });
-                inner.emit(ChatEvent::Entry {
-                    entry: ChatEntry::Error {
-                        message: format!("Couldn't resume the earlier session: {error}"),
-                    },
-                });
-                inner.save_thread(true);
-                self.open_session(inner, None);
-            }
-            (Pending::NewSession, Err(error)) => inner.emit(ChatEvent::Status {
-                status: ChatStatus::Failed {
-                    message: format!("{harness} couldn't start a session: {error}"),
-                },
-            }),
-            (Pending::SetOption, Ok(result)) => inner.options(&result["configOptions"]),
-            (
-                Pending::Pick {
-                    session,
-                    option,
-                    value,
-                    rest,
-                },
-                result,
-            ) => {
-                // A session that replaced this one got picks of its own.
-                if inner.state.session.as_deref() != Some(session.as_str()) {
-                    return;
-                }
-                match result {
-                    Ok(result) => inner.options(&result["configOptions"]),
-                    Err(error) => eprintln!(
-                        "compi-daemon: chat {} kept its {option} setting, not {value}: {error}",
-                        inner.chat_id
-                    ),
-                }
-                inner.apply_picks(rest);
-            }
-            (Pending::SetOption, Err(message)) => inner.emit(ChatEvent::Entry {
-                entry: ChatEntry::Error {
-                    message: format!("{harness} didn't change the setting: {message}"),
-                },
-            }),
-            (
-                Pending::List {
-                    reply,
-                    mut listed,
-                    pages,
-                },
-                Ok(result),
-            ) => {
-                inner.note_folders(&result);
-                listed.extend(sessions(&result));
-                match next_cursor(&result, pages) {
-                    Some(cursor) => self.list_page(
-                        inner,
-                        Some(cursor),
-                        Pending::List {
-                            reply,
-                            listed,
-                            pages: pages + 1,
-                        },
-                    ),
-                    None => {
-                        let _ = reply.send(Ok(listed));
-                    }
-                }
-            }
-            (Pending::List { reply, .. }, Err(error)) => {
-                let _ = reply.send(Err(error));
-            }
-            (Pending::Locate { session, pages }, result) => {
-                let cursor = result.ok().and_then(|result| {
-                    inner.note_folders(&result);
-                    next_cursor(&result, pages)
-                });
-                match (inner.session_folders.get(&session).cloned(), cursor) {
-                    (Some(folder), _) => self.load_session(inner, session, &folder),
-                    (None, Some(cursor)) => self.list_page(
-                        inner,
-                        Some(cursor),
-                        Pending::Locate {
-                            session,
-                            pages: pages + 1,
-                        },
-                    ),
-                    (None, None) => self.load_session(inner, session, &self.content.folder),
-                }
-            }
-            (Pending::Steer(prompt), Ok(result)) if result["outcome"] == "injected" => {
-                inner.end_thought();
-                inner.activity_ms = now_ms();
-                inner.push_prompt(&prompt);
-                // A steer turns down the permission the harness was waiting on.
-                inner.permission_request = None;
-                if inner.state.permission.is_some() {
-                    inner.emit(ChatEvent::Permission { permission: None });
-                }
-            }
-            // The turn ended first, or the harness declined: the prompt waits its turn,
-            // first in line.
-            (Pending::Steer(prompt), _) => {
-                inner.enqueue(prompt, true);
-                inner.send_queued();
-            }
-            (Pending::Plans, result) => {
-                inner.reading_plans = false;
-                // A harness without the method, or one that failed, keeps what it had.
-                if let Ok(result) = result {
-                    let plans = plans(&result);
-                    if plans != inner.state.plans {
-                        inner.emit(ChatEvent::Plans { plans });
-                    }
-                }
-            }
-            (Pending::Prompt, result) => {
-                inner.prompt_ended(result);
-                self.read_plans(inner);
-            }
-        }
-    }
-
-    /// Asks OMP for its subscription plans, unless a request is out already.
-    fn read_plans(&self, inner: &mut Inner) {
-        if self.content.harness != ChatHarness::Omp || inner.reading_plans {
-            return;
-        }
-        inner.reading_plans = true;
-        inner.request("_omp/usage", json!({}), Pending::Plans);
-    }
-
-    /// Loads `session`, whose history the harness replays, in the folder it was saved
-    /// under (looked up in the listing first when not known yet), or starts a new one.
-    fn open_session(&self, inner: &mut Inner, session: Option<String>) {
-        match session.filter(|_| inner.can_load) {
-            Some(session) => match inner.session_folders.get(&session).cloned() {
-                Some(folder) => self.load_session(inner, session, &folder),
-                None if inner.can_list => {
-                    self.list_page(inner, None, Pending::Locate { session, pages: 1 });
-                }
-                None => self.load_session(inner, session, &self.content.folder),
-            },
-            None => inner.request(
-                "session/new",
-                json!({ "cwd": self.content.folder, "mcpServers": [] }),
-                Pending::NewSession,
-            ),
-        }
-    }
-
-    fn load_session(&self, inner: &mut Inner, session: String, folder: &str) {
-        inner.request(
-            "session/load",
-            json!({ "sessionId": session, "cwd": folder, "mcpServers": [] }),
-            Pending::LoadSession,
-        );
-    }
-
-    /// Asks for a page of the sessions in the chat's folder; `None` is the first.
-    fn list_page(&self, inner: &mut Inner, cursor: Option<String>, pending: Pending) {
-        let mut params = json!({ "cwd": self.content.folder });
-        if let Some(cursor) = cursor {
-            params["cursor"] = cursor.into();
-        }
-        inner.request("session/list", params, pending);
-    }
-
-    fn ready_session(&self, inner: &Inner) -> Result<String, String> {
+    /// Whether the harness takes a prompt now: it waits for one, and has a session to
+    /// take it to when its prompts go to one.
+    fn ready(&self, inner: &Inner) -> Result<(), String> {
         let harness = self.content.harness.name();
         match &inner.state.status {
             ChatStatus::Ready => {}
@@ -1223,11 +868,10 @@ impl Chat {
             ChatStatus::Working { .. } => return Err(format!("{harness} is still working")),
             ChatStatus::Failed { .. } => return Err(format!("{harness} isn't running")),
         }
-        inner
-            .state
-            .session
-            .clone()
-            .ok_or_else(|| format!("{harness} has no session yet"))
+        if !inner.has_session() {
+            return Err(format!("{harness} has no session yet"));
+        }
+        Ok(())
     }
 
     /// Hands `prompt` to the harness as `delivery` says.
@@ -1236,23 +880,18 @@ impl Chat {
         let harness = self.content.harness.name();
         let mut inner = self.lock();
         let steer = delivery == ChatDelivery::Steer;
-        if steer && inner.state.working() && inner.can_steer {
-            let session = inner
-                .state
-                .session
-                .clone()
-                .ok_or_else(|| format!("{harness} has no session yet"))?;
-            let blocks = prompt.blocks();
-            inner.request(
-                "_session/steering",
-                json!({ "sessionId": session, "prompt": blocks }),
-                Pending::Steer(prompt),
-            );
+        let steer_now = match inner.driver {
+            Driver::Acp(_) => acp::can_steer(&inner),
+            // Claude Code takes a prompt only as a turn of its own: steering queues.
+            Driver::Claude(_) => false,
+        };
+        if steer && inner.state.working() && steer_now {
+            acp::steer(&mut inner, harness, prompt)?;
         } else if delivery == ChatDelivery::Prompt
             || (steer && matches!(inner.state.status, ChatStatus::Ready))
         {
-            let session = self.ready_session(&inner)?;
-            inner.start_prompt(session, prompt);
+            self.ready(&inner)?;
+            inner.start_prompt(prompt);
         } else {
             if let ChatStatus::Failed { .. } = inner.state.status {
                 return Err(format!("{harness} isn't running"));
@@ -1282,13 +921,9 @@ impl Chat {
         if !inner.state.working() {
             return;
         }
-        inner.cancel_requests();
-        if let Some(session) = inner.state.session.clone() {
-            inner.write(&json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": { "sessionId": session },
-            }));
+        match inner.driver {
+            Driver::Acp(_) => acp::cancel(&mut inner),
+            Driver::Claude(_) => claude::cancel(&mut inner),
         }
     }
 
@@ -1302,15 +937,14 @@ impl Chat {
         {
             return Err("that permission was already answered".into());
         }
-        let Some(request) = inner.permission_request.take() else {
-            return Err("that permission was already answered".into());
-        };
-        let outcome = match option {
-            Some(option) => json!({ "outcome": "selected", "optionId": option }),
-            None => json!({ "outcome": "cancelled" }),
-        };
-        inner.respond(request, json!({ "outcome": outcome }));
-        inner.emit(ChatEvent::Permission { permission: None });
+        match inner.driver {
+            Driver::Acp(_) => {
+                acp::answer(&mut inner, option)?;
+                inner.emit(ChatEvent::Permission { permission: None });
+            }
+            // It shows the permission or question waiting next, if one does.
+            Driver::Claude(_) => claude::answer(&mut inner, option)?,
+        }
         Ok(())
     }
 
@@ -1324,21 +958,17 @@ impl Chat {
         {
             return Err("that question was already answered".into());
         }
-        let Some((request, shapes)) = inner.question_request.take() else {
-            return Err("that question was already answered".into());
-        };
-        let result = match answers {
-            Some(answers) => {
-                json!({ "action": "accept", "content": form_content(&shapes, answers) })
+        match inner.driver {
+            Driver::Acp(_) => {
+                acp::answer_question(&mut inner, answers)?;
+                inner.emit(ChatEvent::Question { question: None });
             }
-            None => json!({ "action": "decline" }),
-        };
-        inner.respond(request, result);
-        inner.emit(ChatEvent::Question { question: None });
+            Driver::Claude(_) => claude::answer_question(&mut inner, answers)?,
+        }
         Ok(())
     }
 
-    fn set_option(&self, option: String, value: String) -> Result<(), String> {
+    fn set_option(self: &Arc<Self>, option: String, value: String) -> Result<(), String> {
         let mut inner = self.lock();
         let Some(shown) = inner.state.options.iter().find(|shown| shown.id == option) else {
             return Err(format!("the harness has no setting {option}"));
@@ -1346,15 +976,10 @@ impl Chat {
         if !shown.choices.iter().any(|choice| choice.value == value) {
             return Err(format!("{value} is not a choice of {}", shown.name));
         }
-        let Some(session) = inner.state.session.clone() else {
-            return Err("the harness has no session yet".into());
-        };
-        inner.request(
-            "session/set_config_option",
-            json!({ "sessionId": session, "configId": option, "value": value }),
-            Pending::SetOption,
-        );
-        Ok(())
+        match inner.driver {
+            Driver::Acp(_) => acp::set_option(&mut inner, option, value),
+            Driver::Claude(_) => claude::set_option(self, &mut inner, option, value),
+        }
     }
 
     fn list_sessions(
@@ -1364,27 +989,15 @@ impl Chat {
         if !inner.initialized || inner.agent.is_none() {
             return Err(format!("{} isn't running", self.content.harness.name()));
         }
-        if !inner.can_list {
-            return Err(format!(
-                "{} doesn't list its sessions",
-                self.content.harness.name()
-            ));
+        match inner.driver {
+            Driver::Acp(_) => acp::list_sessions(self, &mut inner),
+            Driver::Claude(_) => claude::list_sessions(self, &inner),
         }
-        let (reply, receiver) = mpsc::channel();
-        self.list_page(
-            &mut inner,
-            None,
-            Pending::List {
-                reply,
-                listed: Vec::new(),
-                pages: 1,
-            },
-        );
-        Ok(receiver)
     }
 
-    /// Shows `session`, its history replayed, or a new session, in the running harness;
-    /// a harness that isn't running starts again on it.
+    /// Shows `session`, its history replayed, or a new session, in the running harness
+    /// when it can switch sessions (OMP); a harness that isn't running, or can't, starts
+    /// again on it.
     fn resume(self: &Arc<Self>, session: Option<String>) -> Result<(), String> {
         compi_protocol::chat::validate_session(session.as_deref())?;
         let mut inner = self.lock();
@@ -1397,7 +1010,7 @@ impl Chat {
             thread: inner.thread.is_some(),
             ..ChatState::default()
         };
-        if inner.initialized && inner.agent.is_some() {
+        if inner.initialized && inner.agent.is_some() && matches!(inner.driver, Driver::Acp(_)) {
             inner.cancel_requests();
             inner.emit(ChatEvent::Reset {
                 state: Box::new(state),
@@ -1458,12 +1071,11 @@ impl Chat {
     fn end(&self) -> Option<ThreadRecord> {
         let mut inner = self.lock();
         let working = inner.state.working();
-        if working && let Some(session) = inner.state.session.clone() {
-            inner.write(&json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": { "sessionId": session },
-            }));
+        if working {
+            match inner.driver {
+                Driver::Acp(_) => acp::interrupt(&mut inner),
+                Driver::Claude(_) => claude::interrupt(&mut inner),
+            }
         }
         inner.stop();
         inner.stop_agents();
@@ -1568,13 +1180,6 @@ impl Inner {
         }
     }
 
-    /// A session is loading.
-    fn loading(&self) -> bool {
-        self.pending
-            .values()
-            .any(|pending| matches!(pending, Pending::LoadSession))
-    }
-
     /// Applies `event` and sends it to every watcher still listening.
     fn emit(&mut self, event: ChatEvent) {
         match &event {
@@ -1590,6 +1195,9 @@ impl Inner {
                 self.unseen = None;
                 self.prompted_with = None;
                 self.skip_replay = false;
+                if let Driver::Claude(claude) = &mut self.driver {
+                    claude.forget_transcript();
+                }
             }
             ChatEvent::Status {
                 status: ChatStatus::Failed { message },
@@ -1654,53 +1262,6 @@ impl Inner {
         self.published = record;
     }
 
-    /// The harness opened a session, new or resumed: its ID and settings. Its prompts
-    /// start over, so the first one shows no switch.
-    fn session_opened(&mut self, result: &Value) {
-        self.end_thought();
-        self.prompted_with = None;
-        if let Some(session) = result["sessionId"].as_str() {
-            self.emit(ChatEvent::Session {
-                session: Some(session.to_owned()),
-            });
-        }
-        self.options(&result["configOptions"]);
-        self.save_thread(false);
-    }
-
-    /// Sets the first of `picks` (category, value) the session offers and does not have
-    /// yet, the rest once the harness answers, as one may change the choices of the
-    /// next. A setting the session lacks, or a value it does not list, is passed over.
-    /// The chat stays `Starting`, prompts queued, until none is left.
-    fn apply_picks(&mut self, mut picks: VecDeque<(&'static str, String)>) {
-        while let Some((category, value)) = picks.pop_front() {
-            let Some(option) = self.state.option(category).filter(|option| {
-                option.current != value && option.choices.iter().any(|c| c.value == value)
-            }) else {
-                continue;
-            };
-            let option = option.id.clone();
-            let Some(session) = self.state.session.clone() else {
-                break;
-            };
-            self.request(
-                "session/set_config_option",
-                json!({ "sessionId": session, "configId": option, "value": value }),
-                Pending::Pick {
-                    session,
-                    option,
-                    value,
-                    rest: picks,
-                },
-            );
-            return;
-        }
-        self.emit(ChatEvent::Status {
-            status: ChatStatus::Ready,
-        });
-        self.send_queued();
-    }
-
     /// Shows a prompt the harness has, after a `Switch` when the model or thinking level
     /// changed since the session's previous prompt.
     fn push_prompt(&mut self, prompt: &Prompt) {
@@ -1735,9 +1296,14 @@ impl Inner {
         self.start_thread();
     }
 
-    /// Starts a turn on `prompt`.
-    fn start_prompt(&mut self, session: String, prompt: Prompt) {
-        let blocks = prompt.blocks();
+    /// Whether prompts have a session to go to: OMP's go to the session it opened;
+    /// Claude Code opens its session with the first prompt.
+    fn has_session(&self) -> bool {
+        self.state.session.is_some() || matches!(self.driver, Driver::Claude(_))
+    }
+
+    /// Starts a turn on `prompt`, the harness having a session for it (`has_session`).
+    fn start_prompt(&mut self, prompt: Prompt) {
         self.unseen = None;
         self.push_prompt(&prompt);
         let since_ms = now_ms();
@@ -1746,11 +1312,10 @@ impl Inner {
         self.emit(ChatEvent::Status {
             status: ChatStatus::Working { since_ms },
         });
-        self.request(
-            "session/prompt",
-            json!({ "sessionId": session, "prompt": blocks }),
-            Pending::Prompt,
-        );
+        match self.driver {
+            Driver::Acp(_) => acp::prompt(self, &prompt),
+            Driver::Claude(_) => claude::prompt(self, &prompt),
+        }
     }
 
     /// The running turn ended with `result`. How it ended stays unseen until the user
@@ -1844,14 +1409,14 @@ impl Inner {
         if self.queue_held || !matches!(self.state.status, ChatStatus::Ready) {
             return;
         }
-        let Some(session) = self.state.session.clone() else {
+        if !self.has_session() {
             return;
-        };
+        }
         let Some((_, prompt)) = self.queue.pop_front() else {
             return;
         };
         self.publish_queue();
-        self.start_prompt(session, prompt);
+        self.start_prompt(prompt);
     }
 
     fn write(&mut self, message: &Value) {
@@ -1867,24 +1432,11 @@ impl Inner {
             .and_then(|()| agent.input.flush());
     }
 
-    fn request(&mut self, method: &str, params: Value, pending: Pending) {
-        self.next_request += 1;
-        let id = self.next_request;
-        self.pending.insert(id, pending);
-        self.write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
-    }
-
-    fn respond(&mut self, id: Value, result: Value) {
-        self.write(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-    }
-
     /// Tells the harness nobody will answer its open permission or question.
     fn cancel_requests(&mut self) {
-        if let Some(request) = self.permission_request.take() {
-            self.respond(request, json!({ "outcome": { "outcome": "cancelled" } }));
-        }
-        if let Some((request, _)) = self.question_request.take() {
-            self.respond(request, json!({ "action": "cancel" }));
+        match self.driver {
+            Driver::Acp(_) => acp::cancel_asks(self),
+            Driver::Claude(_) => claude::cancel_asks(self),
         }
         if self.state.permission.is_some() {
             self.emit(ChatEvent::Permission { permission: None });
@@ -1894,26 +1446,20 @@ impl Inner {
         }
     }
 
-    /// Windows waiting on a session listing hear the harness is gone; nothing it was
-    /// asked is out any more.
-    fn fail_pending(&mut self) {
-        for (_, pending) in self.pending.drain() {
-            if let Pending::List { reply, .. } = pending {
-                let _ = reply.send(Err("the harness stopped".into()));
-            }
+    /// The harness's open permission and question need no answer any more.
+    fn forget_requests(&mut self) {
+        match self.driver {
+            Driver::Acp(_) => acp::forget_asks(self),
+            Driver::Claude(_) => claude::forget_asks(self),
         }
-        self.reading_plans = false;
     }
 
-    /// Remembers the folder each session in a listing page was saved under.
-    fn note_folders(&mut self, result: &Value) {
-        for session in result["sessions"].as_array().into_iter().flatten() {
-            if let (Some(id), Some(folder)) =
-                (session["sessionId"].as_str(), session["cwd"].as_str())
-            {
-                self.session_folders
-                    .insert(id.to_owned(), folder.to_owned());
-            }
+    /// Windows waiting on the harness hear it is gone; nothing it was asked is out any
+    /// more.
+    fn fail_pending(&mut self) {
+        match self.driver {
+            Driver::Acp(_) => acp::fail_pending(self),
+            Driver::Claude(_) => claude::fail_pending(self),
         }
     }
 
@@ -1986,8 +1532,7 @@ impl Inner {
                 self.emit(ChatEvent::Replace { index, entry });
             }
         }
-        self.permission_request = None;
-        self.question_request = None;
+        self.forget_requests();
         if self.state.permission.is_some() {
             self.emit(ChatEvent::Permission { permission: None });
         }
@@ -2052,8 +1597,7 @@ impl Inner {
         self.generation += 1;
         self.initialized = false;
         self.fail_pending();
-        self.permission_request = None;
-        self.question_request = None;
+        self.forget_requests();
         if let Some(Agent {
             mut child,
             input,
@@ -2081,268 +1625,6 @@ impl Inner {
         }
     }
 
-    /// The harness's settings, from `configOptions`; only select settings are offered.
-    fn options(&mut self, value: &Value) {
-        let Some(list) = value.as_array() else {
-            return;
-        };
-        let options: Vec<ChatOption> = list.iter().filter_map(option).collect();
-        if options != self.state.options {
-            self.emit(ChatEvent::Options { options });
-        }
-    }
-
-    /// A request from the harness: a permission or a question waits for a window; Compi
-    /// offers no other client methods.
-    fn agent_request(&mut self, method: &str, id: Value, params: &Value) {
-        match method {
-            "session/request_permission" => self.permission(id, params),
-            "elicitation/create" if params["mode"].as_str().unwrap_or("form") == "form" => {
-                self.question(id, params)
-            }
-            _ => self.write(&json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("Compi does not offer {method}") },
-            })),
-        }
-    }
-
-    fn permission(&mut self, id: Value, params: &Value) {
-        // A newer request replaces one nobody answered.
-        if let Some(previous) = self.permission_request.take() {
-            self.respond(previous, json!({ "outcome": { "outcome": "cancelled" } }));
-        }
-        let call = &params["toolCall"];
-        // The card sits on its tool call, which the harness may not have reported yet.
-        self.tool(call);
-        let title = call["title"]
-            .as_str()
-            .filter(|title| !title.is_empty())
-            .or_else(|| call["rawInput"]["command"].as_str())
-            .unwrap_or("Run a tool")
-            .to_owned();
-        let options = params["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|option| {
-                Some(ChatPermissionOption {
-                    id: option["optionId"].as_str()?.to_owned(),
-                    name: option["name"].as_str()?.to_owned(),
-                    kind: option["kind"].as_str().unwrap_or_default().to_owned(),
-                })
-            })
-            .collect();
-        self.next_permission += 1;
-        self.permission_request = Some(id);
-        let permission = ChatPermission {
-            id: self.next_permission,
-            tool: call["toolCallId"].as_str().map(str::to_owned),
-            title,
-            options,
-        };
-        self.emit(ChatEvent::Permission {
-            permission: Some(permission),
-        });
-    }
-
-    fn question(&mut self, id: Value, params: &Value) {
-        if let Some((previous, _)) = self.question_request.take() {
-            self.respond(previous, json!({ "action": "cancel" }));
-        }
-        let (fields, shapes) = form_fields(&params["requestedSchema"]);
-        self.next_question += 1;
-        self.question_request = Some((id, shapes));
-        let question = ChatQuestion {
-            id: self.next_question,
-            message: params["message"].as_str().unwrap_or_default().to_owned(),
-            fields,
-        };
-        self.emit(ChatEvent::Question {
-            question: Some(question),
-        });
-    }
-
-    /// One `session/update` notification.
-    fn update(&mut self, update: &Value) {
-        let kind = update["sessionUpdate"].as_str().unwrap_or_default();
-        let entry_kind = matches!(
-            kind,
-            "agent_message_chunk"
-                | "agent_thought_chunk"
-                | "user_message_chunk"
-                | "tool_call"
-                | "tool_call_update"
-        );
-        // The transcript Compi saved already holds what the session replays as it loads.
-        if entry_kind && self.skip_replay && self.loading() {
-            return;
-        }
-        if kind != "agent_thought_chunk" && kind.ends_with("_chunk")
-            || kind.starts_with("tool_call")
-        {
-            self.end_thought();
-        }
-        let text = || {
-            update["content"]["text"]
-                .as_str()
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-        };
-        match kind {
-            "agent_message_chunk" => {
-                if let Some(text) = text() {
-                    self.append(
-                        text,
-                        |text| ChatEntry::Agent { text },
-                        |entry| matches!(entry, ChatEntry::Agent { .. }),
-                    );
-                    self.activity_ms = now_ms();
-                }
-            }
-            "agent_thought_chunk" => {
-                if let Some(text) = text() {
-                    let started_ms = match self.activity_ms {
-                        0 => now_ms(),
-                        since => since,
-                    };
-                    self.append(
-                        text,
-                        |text| ChatEntry::Thought {
-                            text,
-                            started_ms,
-                            ended_ms: None,
-                        },
-                        |entry| matches!(entry, ChatEntry::Thought { ended_ms: None, .. }),
-                    );
-                }
-            }
-            "user_message_chunk" => self.user_chunk(&update["content"]),
-            "tool_call" | "tool_call_update" => {
-                self.tool(update);
-                self.activity_ms = now_ms();
-            }
-            "config_option_update" => self.options(&update["configOptions"]),
-            "available_commands_update" => {
-                let commands: Vec<ChatCommand> = update["availableCommands"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|command| {
-                        Some(ChatCommand {
-                            name: command["name"].as_str()?.to_owned(),
-                            description: command["description"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_owned(),
-                            hint: command["input"]["hint"].as_str().map(str::to_owned),
-                        })
-                    })
-                    .collect();
-                if commands != self.state.commands {
-                    self.emit(ChatEvent::Commands { commands });
-                }
-            }
-            "usage_update" => {
-                let usage = ChatUsage {
-                    used: update["used"].as_u64().unwrap_or_default(),
-                    size: update["size"].as_u64().unwrap_or_default(),
-                    cost: update["cost"]["amount"].as_f64(),
-                    currency: update["cost"]["currency"].as_str().map(str::to_owned),
-                };
-                self.emit(ChatEvent::Usage { usage: Some(usage) });
-            }
-            "session_info_update" => {
-                if let Some(title) = update.get("title") {
-                    let title = title
-                        .as_str()
-                        .filter(|title| !title.is_empty())
-                        .map(str::to_owned);
-                    if title != self.state.title {
-                        self.emit(ChatEvent::Title { title });
-                        self.save_thread(false);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// A piece of a sent prompt, as a resumed session replays it.
-    fn user_chunk(&mut self, content: &Value) {
-        match content["type"].as_str() {
-            Some("text") => {
-                if let Some(text) = content["text"].as_str().filter(|text| !text.is_empty()) {
-                    self.append(
-                        text.to_owned(),
-                        |text| ChatEntry::User {
-                            text,
-                            files: Vec::new(),
-                            images: Vec::new(),
-                            sent_ms: None,
-                            ended_ms: None,
-                        },
-                        |entry| matches!(entry, ChatEntry::User { .. }),
-                    );
-                }
-            }
-            Some("resource_link" | "resource") => {
-                let uri = content["uri"]
-                    .as_str()
-                    .or_else(|| content["resource"]["uri"].as_str())
-                    .unwrap_or_default();
-                let path = path_of_uri(uri);
-                self.attach_replayed(|files, _| files.push(path));
-            }
-            // A replayed image has no name; it is counted, not shown.
-            Some("image") => self.attach_replayed(|_, images| images.push("image".into())),
-            _ => {}
-        }
-    }
-
-    /// Adds a replayed attachment to the prompt it belongs to: the last entry when it is
-    /// a prompt, else a prompt of its own.
-    fn attach_replayed(&mut self, add: impl FnOnce(&mut Vec<String>, &mut Vec<String>)) {
-        let last = self.state.entries.len().checked_sub(1);
-        match last.and_then(|index| self.state.entries.get(index).map(|entry| (index, entry))) {
-            Some((
-                index,
-                ChatEntry::User {
-                    text,
-                    files,
-                    images,
-                    sent_ms,
-                    ended_ms,
-                },
-            )) => {
-                let (mut files, mut images) = (files.clone(), images.clone());
-                add(&mut files, &mut images);
-                let entry = ChatEntry::User {
-                    text: text.clone(),
-                    files,
-                    images,
-                    sent_ms: *sent_ms,
-                    ended_ms: *ended_ms,
-                };
-                self.emit(ChatEvent::Replace { index, entry });
-            }
-            _ => {
-                let (mut files, mut images) = (Vec::new(), Vec::new());
-                add(&mut files, &mut images);
-                self.emit(ChatEvent::Entry {
-                    entry: ChatEntry::User {
-                        text: String::new(),
-                        files,
-                        images,
-                        sent_ms: None,
-                        ended_ms: None,
-                    },
-                });
-            }
-        }
-    }
-
     /// Adds streamed text to the last entry when `same` says it continues it, else starts
     /// one.
     fn append(
@@ -2360,13 +1642,13 @@ impl Inner {
         }
     }
 
-    /// A tool call or an update to one: fields present replace what was reported.
-    fn tool(&mut self, update: &Value) {
-        let Some(id) = update["toolCallId"].as_str() else {
-            return;
-        };
-        let known = self.tools.get(id).copied();
-        let mut tool = match known.and_then(|index| self.state.entries.get(index)) {
+    /// Tool call `id` as the transcript shows it, else a new one, pending since now.
+    fn tool_call(&self, id: &str) -> ChatTool {
+        match self
+            .tools
+            .get(id)
+            .and_then(|index| self.state.entries.get(*index))
+        {
             Some(ChatEntry::Tool(tool)) => (**tool).clone(),
             _ => ChatTool {
                 id: id.to_owned(),
@@ -2383,94 +1665,13 @@ impl Inner {
                 agents: Vec::new(),
                 waits_on_agents: false,
             },
-        };
-        if let Some(name) = update["name"].as_str() {
-            tool.name = Some(name.to_owned());
         }
-        if let Some(title) = update["title"].as_str().filter(|title| !title.is_empty()) {
-            tool.title = title.to_owned();
-        }
-        if tool.title.is_empty() {
-            tool.title = tool.name.clone().unwrap_or_else(|| "Tool".into());
-        }
-        if let Some(kind) = update["kind"].as_str() {
-            tool.kind = kind.to_owned();
-        }
-        let was = tool.status;
-        if let Some(status) = update["status"].as_str() {
-            tool.status = match status {
-                "in_progress" => ChatToolStatus::Running,
-                "completed" => ChatToolStatus::Completed,
-                "failed" => ChatToolStatus::Failed,
-                _ => ChatToolStatus::Pending,
-            };
-            if !tool.status.is_open() && tool.ended_ms.is_none() {
-                tool.ended_ms = Some(now_ms());
-            }
-        }
-        if let Some(input) = update.get("rawInput").filter(|input| !input.is_null()) {
-            let text = match input {
-                Value::String(text) => text.clone(),
-                other => serde_json::to_string_pretty(other).unwrap_or_default(),
-            };
-            tool.input = Some(head(text, MAX_CHAT_TOOL_INPUT_BYTES));
-        }
-        if let Some(locations) = update["locations"].as_array() {
-            tool.locations = locations
-                .iter()
-                .filter_map(|location| location["path"].as_str().map(str::to_owned))
-                .collect();
-        }
-        let raw_output = update.get("rawOutput").and_then(|output| {
-            text_of(&output["content"]).or_else(|| output.as_str().map(str::to_owned))
-        });
-        if let Some(content) = update["content"].as_array() {
-            let diffs: Vec<ChatDiff> = content
-                .iter()
-                .filter(|item| item["type"] == "diff")
-                .filter_map(|item| {
-                    let side = |key: &str| {
-                        item[key]
-                            .as_str()
-                            .filter(|text| text.len() <= MAX_CHAT_DIFF_BYTES)
-                            .map(str::to_owned)
-                    };
-                    Some(ChatDiff {
-                        path: item["path"].as_str()?.to_owned(),
-                        old_text: side("oldText"),
-                        new_text: side("newText"),
-                    })
-                })
-                .collect();
-            if !diffs.is_empty() {
-                tool.diffs = diffs;
-            }
-            if raw_output.is_none() {
-                let texts: Vec<&str> = content
-                    .iter()
-                    .filter(|item| item["type"] == "content")
-                    .filter_map(|item| item["content"]["text"].as_str())
-                    .collect();
-                if !texts.is_empty() {
-                    tool.output = Some(tail(texts.join("\n"), MAX_CHAT_TOOL_OUTPUT_BYTES));
-                }
-            }
-        }
-        if let Some(output) = raw_output {
-            tool.output = Some(tail(output, MAX_CHAT_TOOL_OUTPUT_BYTES));
-        }
-        let details = &update["rawOutput"]["details"];
-        let now = now_ms();
-        for item in details["progress"].as_array().into_iter().flatten() {
-            agent_progress(&mut tool.agents, item, now);
-        }
-        for item in details["results"].as_array().into_iter().flatten() {
-            agent_result(&mut tool.agents, item);
-        }
-        if let Some(jobs) = details["jobs"].as_array().filter(|jobs| !jobs.is_empty()) {
-            tool.waits_on_agents = jobs.iter().all(|job| job["type"] == "task");
-        }
-        settle(&mut tool, was, now);
+    }
+
+    /// Shows `tool`: the entry of its call changes, when it differs, or the call gets one.
+    fn put_tool(&mut self, tool: ChatTool) {
+        let known = self.tools.get(&tool.id).copied();
+        let id = tool.id.clone();
         let entry = ChatEntry::Tool(Box::new(tool));
         match known {
             Some(index) => {
@@ -2481,47 +1682,8 @@ impl Inner {
             }
             None => {
                 let index = self.state.entries.len();
-                self.tools.insert(id.to_owned(), index);
+                self.tools.insert(id, index);
                 self.emit(ChatEvent::Entry { entry });
-                self.note_agents(index);
-            }
-        }
-        if let Some(jobs) = details["jobs"].as_array() {
-            self.fill_results(jobs, now);
-        }
-    }
-
-    /// A `wait`'s jobs: what each finished sub-agent answered goes to it, on the latest
-    /// call that started one of its name.
-    fn fill_results(&mut self, jobs: &[Value], now: u64) {
-        for job in jobs {
-            if job["type"].as_str().is_some_and(|kind| kind != "task") {
-                continue;
-            }
-            let Some(id) = job["agentUrlId"].as_str().or_else(|| job["id"].as_str()) else {
-                continue;
-            };
-            let found =
-                self.state.entries.iter().enumerate().rev().find_map(
-                    |(index, entry)| match entry {
-                        ChatEntry::Tool(tool) => tool
-                            .agents
-                            .iter()
-                            .position(|agent| agent.id == id)
-                            .map(|agent| (index, agent, tool)),
-                        _ => None,
-                    },
-                );
-            let Some((index, agent, tool)) = found else {
-                continue;
-            };
-            let mut tool = tool.clone();
-            job_result(&mut tool.agents[agent], job);
-            let was = tool.status;
-            settle(&mut tool, was, now);
-            let entry = ChatEntry::Tool(tool);
-            if self.state.entries[index] != entry {
-                self.emit(ChatEvent::Replace { index, entry });
                 self.note_agents(index);
             }
         }
@@ -2618,42 +1780,6 @@ impl Inner {
             .map(|agent| agent.id.clone())
             .collect()
     }
-
-    /// The tool calls the sub-agent `id` made, as its own session file tells them, on
-    /// the latest call that started one of its name: they replace the ones shown, and
-    /// the latest says what it does now.
-    fn agent_steps(&mut self, id: &str, read: &saved::AgentSteps) {
-        let found = self
-            .state
-            .entries
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, entry)| match entry {
-                ChatEntry::Tool(tool) => tool
-                    .agents
-                    .iter()
-                    .position(|agent| agent.id == id)
-                    .map(|agent| (index, agent, tool)),
-                _ => None,
-            });
-        let Some((index, agent, tool)) = found else {
-            return;
-        };
-        let mut tool = tool.clone();
-        let agent = &mut tool.agents[agent];
-        agent.steps = read.steps.iter().cloned().collect();
-        agent.tool_count = agent.tool_count.max(read.count);
-        if agent.status.is_open()
-            && let Some(step) = read.steps.back()
-        {
-            agent.activity = Some(step.text.clone());
-        }
-        let entry = ChatEntry::Tool(tool);
-        if self.state.entries[index] != entry {
-            self.emit(ChatEvent::Replace { index, entry });
-        }
-    }
 }
 
 /// An entry of a saved thread whose harness ended before it did: a running tool call
@@ -2718,17 +1844,6 @@ fn settle(tool: &mut ChatTool, was: ChatToolStatus, now: u64) {
     }
 }
 
-/// A sub-agent's status as OMP names it.
-fn agent_status(status: Option<&str>) -> ChatToolStatus {
-    match status {
-        Some("running") => ChatToolStatus::Running,
-        Some("completed") => ChatToolStatus::Completed,
-        Some("failed" | "error") => ChatToolStatus::Failed,
-        Some("aborted" | "cancelled") => ChatToolStatus::Stopped,
-        _ => ChatToolStatus::Pending,
-    }
-}
-
 fn new_agent(id: &str) -> ChatAgent {
     ChatAgent {
         id: id.to_owned(),
@@ -2746,181 +1861,6 @@ fn new_agent(id: &str) -> ChatAgent {
     }
 }
 
-/// One item of a `task` call's `details.progress` into its sub-agent in `agents`. A
-/// finished agent stays finished: a later report of it running is stale.
-fn agent_progress(agents: &mut Vec<ChatAgent>, item: &Value, now: u64) {
-    let Some(id) = item["id"].as_str() else {
-        return;
-    };
-    let agent = match agents.iter().position(|agent| agent.id == id) {
-        Some(index) => &mut agents[index],
-        None => {
-            agents.push(new_agent(id));
-            agents.last_mut().expect("just pushed")
-        }
-    };
-    let status = agent_status(item["status"].as_str());
-    if !agent.status.is_open() && status.is_open() {
-        return;
-    }
-    agent.status = status;
-    if let Some(kind) = item["agent"].as_str() {
-        kind.clone_into(&mut agent.agent);
-    }
-    if let Some(activity) = activity(item) {
-        agent.activity = Some(activity);
-    }
-    agent.tool_count = item["toolCount"].as_u64().unwrap_or(agent.tool_count);
-    agent.duration_ms = item["durationMs"].as_u64().unwrap_or(agent.duration_ms);
-    if status == ChatToolStatus::Running && agent.started_ms.is_none() {
-        agent.started_ms = Some(now.saturating_sub(agent.duration_ms));
-    }
-    if let Some(cost) = item["cost"].as_f64().filter(|cost| *cost >= 0.0) {
-        agent.cost = Some(cost);
-    }
-    if let Some(model) = item["resolvedModel"].as_str() {
-        agent.model = Some(model.to_owned());
-    }
-    if let Some(task) = item["assignment"]
-        .as_str()
-        .or_else(|| item["task"].as_str())
-        .map(str::trim)
-        .filter(|task| !task.is_empty())
-    {
-        agent.assignment = Some(head(task.to_owned(), MAX_CHAT_TOOL_INPUT_BYTES));
-    }
-}
-
-/// One item of a `task` call's `details.results`, as a call that waited for its
-/// sub-agents ends: the agent finished, with its output.
-fn agent_result(agents: &mut Vec<ChatAgent>, item: &Value) {
-    let Some(id) = item["id"].as_str() else {
-        return;
-    };
-    let agent = match agents.iter().position(|agent| agent.id == id) {
-        Some(index) => &mut agents[index],
-        None => {
-            agents.push(new_agent(id));
-            agents.last_mut().expect("just pushed")
-        }
-    };
-    if agent.status.is_open() {
-        agent.status = if item["aborted"].as_bool() == Some(true) {
-            ChatToolStatus::Stopped
-        } else if item["exitCode"].as_i64() == Some(0) {
-            ChatToolStatus::Completed
-        } else {
-            ChatToolStatus::Failed
-        };
-    }
-    agent.duration_ms = item["durationMs"].as_u64().unwrap_or(agent.duration_ms);
-    if let Some(kind) = item["agent"].as_str() {
-        kind.clone_into(&mut agent.agent);
-    }
-    if let Some(model) = item["resolvedModel"].as_str() {
-        agent.model = Some(model.to_owned());
-    }
-    if let Some(cost) = item["usage"]["cost"]["total"]
-        .as_f64()
-        .filter(|cost| *cost >= 0.0)
-    {
-        agent.cost = Some(cost);
-    }
-    let output = [&item["output"], &item["error"]]
-        .into_iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .find(|text| !text.is_empty());
-    if let Some(output) = output {
-        agent.result = Some(head(output.to_owned(), MAX_CHAT_AGENT_RESULT_BYTES));
-    }
-}
-
-/// A `wait` job of a sub-agent: once finished, how it ended, how long it ran and what it
-/// answered.
-fn job_result(agent: &mut ChatAgent, job: &Value) {
-    let status = agent_status(job["status"].as_str());
-    if status.is_open() {
-        return;
-    }
-    if agent.status.is_open() {
-        agent.status = status;
-    }
-    agent.duration_ms = job["durationMs"].as_u64().unwrap_or(agent.duration_ms);
-    let output = job["resultText"]
-        .as_str()
-        .map(task_output)
-        .into_iter()
-        .chain(job["errorText"].as_str())
-        .map(str::trim)
-        .find(|text| !text.is_empty());
-    if let Some(output) = output {
-        agent.result = Some(head(output.to_owned(), MAX_CHAT_AGENT_RESULT_BYTES));
-    } else if agent.result.is_none() {
-        // A finished job can have no text; it is still no longer awaiting its answer.
-        agent.result = Some(String::new());
-    }
-}
-
-/// The output in a `<task-result …><output>…</output></task-result>` block (or its
-/// `<preview>`); other text as it is.
-fn task_output(text: &str) -> &str {
-    if !text.trim_start().starts_with("<task-result") {
-        return text;
-    }
-    for tag in ["output", "preview"] {
-        let open = format!("<{tag}");
-        let Some(start) = text.find(&open) else {
-            continue;
-        };
-        let rest = &text[start + open.len()..];
-        if !rest.starts_with(['>', ' ', '\t', '\n']) {
-            continue;
-        }
-        let Some(body) = rest.find('>').map(|end| &rest[end + 1..]) else {
-            continue;
-        };
-        if let Some(end) = body.rfind(&format!("</{tag}>")) {
-            return &body[..end];
-        }
-    }
-    text
-}
-
-/// What a sub-agent does now: its current tool, else its latest (OMP lists them newest
-/// first), else its last stated intent; a tool as its intent, else its name and
-/// arguments. One line, at most `AGENT_ACTIVITY_CHARS`.
-fn activity(item: &Value) -> Option<String> {
-    let describe = |tool: &str, intent: &Value, args: &Value| {
-        if let Some(intent) = intent
-            .as_str()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            return intent.to_owned();
-        }
-        let args = match args {
-            Value::String(text) => text.trim().to_owned(),
-            Value::Null => String::new(),
-            other => other.to_string(),
-        };
-        if args.is_empty() {
-            tool.to_owned()
-        } else {
-            format!("{tool} {args}")
-        }
-    };
-    let recent = &item["recentTools"][0];
-    let text = if let Some(tool) = item["currentTool"].as_str() {
-        describe(tool, &item["currentToolIntent"], &item["currentToolArgs"])
-    } else if let Some(tool) = recent["tool"].as_str() {
-        describe(tool, &recent["intent"], &recent["args"])
-    } else {
-        item["lastIntent"].as_str()?.to_owned()
-    };
-    short_line(&text)
-}
-
 /// `text` on one line, at most `AGENT_ACTIVITY_CHARS`; nothing of a blank one.
 fn short_line(text: &str) -> Option<String> {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2931,16 +1871,6 @@ fn short_line(text: &str) -> Option<String> {
         Some((end, _)) => format!("{}…", &line[..end]),
         None => line,
     })
-}
-
-/// The text blocks of an ACP content list, joined.
-fn text_of(content: &Value) -> Option<String> {
-    let texts: Vec<&str> = content
-        .as_array()?
-        .iter()
-        .filter_map(|block| block["text"].as_str())
-        .collect();
-    (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
 /// The first `limit` bytes of `text`, on a character boundary.
@@ -2966,339 +1896,6 @@ fn tail(text: String, limit: usize) -> String {
         cut += 1;
     }
     format!("…{}", &text[cut..])
-}
-
-/// One ACP config option, when it is a select.
-fn option(value: &Value) -> Option<ChatOption> {
-    if value["type"].as_str() != Some("select") {
-        return None;
-    }
-    let mut choices = Vec::new();
-    for item in value["options"].as_array()? {
-        match item["options"].as_array() {
-            Some(group) => choices.extend(group.iter().filter_map(|choice| {
-                self::choice(choice, item["name"].as_str().map(str::to_owned))
-            })),
-            None => choices.extend(self::choice(item, None)),
-        }
-    }
-    Some(ChatOption {
-        id: value["id"].as_str()?.to_owned(),
-        name: value["name"].as_str().unwrap_or_default().to_owned(),
-        category: value["category"].as_str().map(str::to_owned),
-        current: value["currentValue"].as_str()?.to_owned(),
-        choices,
-    })
-}
-
-fn choice(value: &Value, group: Option<String>) -> Option<ChatChoice> {
-    Some(ChatChoice {
-        value: value["value"].as_str()?.to_owned(),
-        name: value["name"].as_str()?.to_owned(),
-        description: value["description"]
-            .as_str()
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned),
-        group,
-    })
-}
-
-/// The subscription plans in OMP's usage reports: each provider, and per window the
-/// share left.
-fn plans(result: &Value) -> Vec<ChatPlan> {
-    result["reports"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|report| {
-            let provider = report["provider"].as_str()?.to_owned();
-            let limits = report["limits"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|limit| {
-                    let amount = &limit["amount"];
-                    let left = amount["remainingFraction"].as_f64().or_else(|| {
-                        Some(amount["remaining"].as_f64()? / amount["limit"].as_f64()?)
-                    })?;
-                    Some(ChatPlanLimit {
-                        label: limit["label"].as_str()?.to_owned(),
-                        left_percent: (left.clamp(0.0, 1.0) * 100.0).round() as u8,
-                    })
-                })
-                .collect();
-            Some(ChatPlan { provider, limits })
-        })
-        .collect()
-}
-
-/// A listing page's sessions that hold a message.
-fn sessions(result: &Value) -> Vec<ChatSessionInfo> {
-    result["sessions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|session| session["_meta"]["messageCount"].as_u64() != Some(0))
-        .filter_map(|session| {
-            Some(ChatSessionInfo {
-                id: session["sessionId"].as_str()?.to_owned(),
-                title: session["title"]
-                    .as_str()
-                    .filter(|title| !title.is_empty())
-                    .map(str::to_owned),
-                updated: session["updatedAt"].as_str().map(str::to_owned),
-                folder: session["cwd"].as_str().map(str::to_owned),
-                size: session["_meta"]["size"].as_u64(),
-                first_prompt: None,
-                last_reply: None,
-            })
-        })
-        .collect()
-}
-
-/// The cursor of a listing's next page, unless `pages` were read already.
-fn next_cursor(result: &Value, pages: usize) -> Option<String> {
-    result["nextCursor"]
-        .as_str()
-        .filter(|cursor| !cursor.is_empty() && pages < MAX_LIST_PAGES)
-        .map(str::to_owned)
-}
-
-/// A JSON-RPC error as people read it: its message, then the harness's details (OMP
-/// says only "Internal error" in the message).
-fn error_text(error: &Value) -> String {
-    let message = error["message"].as_str().unwrap_or("unknown error");
-    match error["data"]["details"]
-        .as_str()
-        .filter(|details| !details.is_empty())
-    {
-        Some(details) => format!("{message}: {details}"),
-        None => message.to_owned(),
-    }
-}
-
-/// A form's fields in the order the form lists them, and how to send each answer back.
-/// A choice field's free-text companion (see `companion`) becomes its Other.
-fn form_fields(schema: &Value) -> (Vec<ChatField>, Vec<FieldShape>) {
-    let empty = Map::new();
-    let properties = schema["properties"].as_object().unwrap_or(&empty);
-    let required: HashSet<&str> = schema["required"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    let listed: Vec<(&String, &Value, String, Vec<ChatChoice>, bool)> = properties
-        .iter()
-        .map(|(key, property)| {
-            let kind = property["type"].as_str().unwrap_or("string").to_owned();
-            let (choices, multi) = field_choices(&kind, property);
-            (key, property, kind, choices, multi)
-        })
-        .collect();
-    // Each choice field's companion; one whose choice field is missing stands alone.
-    let companions: Vec<(&str, String)> = listed
-        .iter()
-        .filter(|(_, _, _, choices, _)| !choices.is_empty())
-        .filter_map(|(key, ..)| Some((key.as_str(), companion(properties, key)?)))
-        .collect();
-    let mut fields = Vec::new();
-    let mut shapes = Vec::new();
-    for (key, property, kind, choices, multi) in listed {
-        if companions.iter().any(|(_, other)| other == key) {
-            continue;
-        }
-        let other_key = companions
-            .iter()
-            .find(|(base, _)| base == key)
-            .map(|(_, other)| other.clone());
-        fields.push(ChatField {
-            key: key.clone(),
-            title: property["title"]
-                .as_str()
-                .or_else(|| property["description"].as_str())
-                .unwrap_or(key)
-                .to_owned(),
-            choices,
-            multi,
-            other: other_key.is_some(),
-            required: required.contains(key.as_str()),
-        });
-        shapes.push(FieldShape {
-            key: key.clone(),
-            kind,
-            other: other_key,
-        });
-    }
-    (fields, shapes)
-}
-
-/// A field's choices, from its `oneOf`, `anyOf` or `enum` (its items' for an array, which
-/// takes several), or Yes and No for a boolean; none for a text field.
-fn field_choices(kind: &str, property: &Value) -> (Vec<ChatChoice>, bool) {
-    let listed = |value: &Value| -> Vec<ChatChoice> {
-        let from_one_of = value["oneOf"]
-            .as_array()
-            .or_else(|| value["anyOf"].as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|item| {
-                let value = item["const"].as_str()?.to_owned();
-                Some(ChatChoice {
-                    name: item["title"].as_str().unwrap_or(&value).to_owned(),
-                    value,
-                    description: None,
-                    group: None,
-                })
-            });
-        let from_enum = value["enum"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| {
-                let value = item.as_str()?.to_owned();
-                Some(ChatChoice {
-                    name: value.clone(),
-                    value,
-                    description: None,
-                    group: None,
-                })
-            });
-        from_one_of.chain(from_enum).collect()
-    };
-    match kind {
-        "array" => (listed(&property["items"]), true),
-        "boolean" => (
-            vec![
-                ChatChoice {
-                    value: "true".into(),
-                    name: "Yes".into(),
-                    description: None,
-                    group: None,
-                },
-                ChatChoice {
-                    value: "false".into(),
-                    name: "No".into(),
-                    description: None,
-                    group: None,
-                },
-            ],
-            false,
-        ),
-        _ => (listed(property), false),
-    }
-}
-
-/// The key of choice field `key`'s free-text companion, if the form has one: `{key}__other`
-/// (OMP's `ask`), or `{key}_other` with a `_` added for each name the form already used
-/// (OMP's HTML forms).
-fn companion(properties: &Map<String, Value>, key: &str) -> Option<String> {
-    let ask = format!("{key}__other");
-    if properties.contains_key(&ask) {
-        return Some(ask);
-    }
-    let mut other = format!("{key}_other");
-    if !properties.contains_key(&other) {
-        return None;
-    }
-    while properties.contains_key(&format!("{other}_")) {
-        other.push('_');
-    }
-    Some(other)
-}
-
-/// The form's `content`: each answer in its field's type; typed text for a choice field
-/// goes to its free-text companion, which the harness takes over the choice.
-fn form_content(shapes: &[FieldShape], mut answers: ChatAnswers) -> Value {
-    let mut content = Map::new();
-    for shape in shapes {
-        let Some(answer) = answers.remove(&shape.key) else {
-            continue;
-        };
-        let (key, value) = match (answer, &shape.other) {
-            (ChatAnswer::Text { text }, Some(other)) => (other.clone(), Value::String(text)),
-            (ChatAnswer::Text { text }, None) => (
-                shape.key.clone(),
-                match shape.kind.as_str() {
-                    "number" | "integer" => text
-                        .trim()
-                        .parse::<f64>()
-                        .ok()
-                        .and_then(serde_json::Number::from_f64)
-                        .map_or(Value::String(text), Value::Number),
-                    _ => Value::String(text),
-                },
-            ),
-            (ChatAnswer::Choices { values }, _) => (
-                shape.key.clone(),
-                match shape.kind.as_str() {
-                    "array" => Value::from(values),
-                    "boolean" => Value::Bool(values.first().is_some_and(|value| value == "true")),
-                    _ => values.into_iter().next().map_or(Value::Null, Value::String),
-                },
-            ),
-        };
-        if !value.is_null() {
-            content.insert(key, value);
-        }
-    }
-    Value::Object(content)
-}
-
-/// A `file://` URI for an absolute path: `/a b` → `file:///a%20b`, `C:\x` →
-/// `file:///C:/x`.
-fn file_uri(path: &str) -> String {
-    let path = path.replace('\\', "/");
-    let path = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{path}")
-    };
-    let mut uri = String::from("file://");
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
-            uri.push(byte as char);
-        } else {
-            uri.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    uri
-}
-
-/// The path a `file://` URI names, as `file_uri` wrote it; other URIs stay as they are.
-fn path_of_uri(uri: &str) -> String {
-    let Some(path) = uri.strip_prefix("file://") else {
-        return uri.to_owned();
-    };
-    let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && let Some(byte) = path
-                .get(index + 1..index + 3)
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            decoded.push(byte);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    let path = String::from_utf8_lossy(&decoded).into_owned();
-    // `/C:/x` is a Windows path.
-    match path.as_bytes() {
-        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => path[1..].replace('/', "\\"),
-        _ => path,
-    }
-}
-
-fn file_name(path: &str) -> String {
-    path.rsplit(['/', '\\'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(path)
-        .to_owned()
 }
 
 fn not_installed(content: &ChatContent) -> String {
@@ -3346,36 +1943,6 @@ fn last_lines(text: &str, count: usize) -> &str {
         .nth(count - 1)
         .map_or(0, |(index, _)| index + 1);
     &text[start..]
-}
-
-/// OMP's own `tools.approvalMode` in the chat's environment and folder, when it is a mode
-/// `omp acp` takes; `None` when the lookup fails or takes longer than
-/// `APPROVAL_LOOKUP_TIMEOUT`. The value is the last line: a login shell's profile may
-/// print before it.
-fn configured_approval(content: &ChatContent) -> Option<&'static str> {
-    let mut child = command(content, &[], &["config", "get", "tools.approvalMode"])
-        .ok()?
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let output = child.stdout.take().expect("stdout is piped");
-    let (sender, receiver) = mpsc::channel();
-    // Read on a thread of its own, so a lookup that hangs is given up on time.
-    let _ = thread::Builder::new()
-        .name("compi-chat-config".into())
-        .spawn(move || {
-            let mut text = String::new();
-            let _ = output.take(16 * 1024).read_to_string(&mut text);
-            let _ = sender.send(text);
-        });
-    let text = receiver.recv_timeout(APPROVAL_LOOKUP_TIMEOUT);
-    let _ = child.kill();
-    let _ = child.wait();
-    let text = text.ok()?;
-    let value = text.lines().map(str::trim).rfind(|line| !line.is_empty())?;
-    OMP_APPROVAL_MODES.into_iter().find(|mode| *mode == value)
 }
 
 /// Installs Compi's shell bridge where the chat's harness runs, as a terminal's launch
@@ -3455,109 +2022,12 @@ fn wsl_note(distribution: &str, windows_home: &str, linux_home: &str) -> String 
     )
 }
 
-/// The harness's command with `args` in its environment and folder, and `environment`
-/// (Compi's shell context, from `shell_integration::cli_environment`) in its own. The
-/// arguments go into a shell script unquoted, so they are fixed words.
-fn command(
-    content: &ChatContent,
-    environment: &[(&'static str, String)],
-    args: &[&'static str],
-) -> Result<Command, String> {
-    if matches!(content.environment, ContentEnvironment::Host)
-        && !std::path::Path::new(&content.folder).is_dir()
-    {
-        return Err(format!("The folder {} doesn't exist.", content.folder));
-    }
-    match &content.environment {
-        #[cfg(windows)]
-        ContentEnvironment::Host => {
-            use std::os::windows::process::CommandExt as _;
-            let program =
-                windows_program(content.harness.program()).ok_or_else(|| not_installed(content))?;
-            let mut command = Command::new(program);
-            command
-                .args(args)
-                .current_dir(&content.folder)
-                .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
-                .envs(environment.iter().map(|(key, value)| (*key, value)));
-            // The CLI's folder comes first on the search path, as in a PowerShell pane.
-            if let Some((_, cli)) = environment.iter().find(|(key, _)| *key == "COMPI_CLI")
-                && let Some(folder) = std::path::Path::new(cli).parent()
-            {
-                let mut path = folder.as_os_str().to_owned();
-                if let Some(inherited) = std::env::var_os("PATH") {
-                    path.push(";");
-                    path.push(inherited);
-                }
-                command.env("PATH", path);
-            }
-            Ok(command)
-        }
-        #[cfg(windows)]
-        ContentEnvironment::Wsl { distribution } => {
-            use std::os::windows::process::CommandExt as _;
-            let mut command = Command::new(WSL_EXE);
-            command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-            if let Some(path) = compi_protocol::wsl::launch_path() {
-                command.env("PATH", path);
-            }
-            // The user's login shell, for the search path their profile sets.
-            let script = format!(
-                r#"shell=$(getent passwd "$(id -u)" | cut -d: -f7); exec "${{shell:-/bin/sh}}" -lc '{UNIX_COMMAND} {}'"#,
-                args.join(" ")
-            );
-            command.args([
-                "--distribution",
-                distribution,
-                "--cd",
-                &content.folder,
-                "--exec",
-            ]);
-            // Set in Linux, as a WSL terminal's are: Windows variables reach it only
-            // through `WSLENV`.
-            if !environment.is_empty() {
-                command.arg("/usr/bin/env").args(
-                    environment
-                        .iter()
-                        .map(|(key, value)| format!("{key}={value}")),
-                );
-            }
-            command.args(["/bin/sh", "-c", &script]);
-            Ok(command)
-        }
-        #[cfg(unix)]
-        ContentEnvironment::Host => {
-            let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-            let mut command = Command::new(shell);
-            command
-                .args(["-lc", &format!("{UNIX_COMMAND} {}", args.join(" "))])
-                .current_dir(&content.folder)
-                .envs(environment.iter().map(|(key, value)| (*key, value)));
-            Ok(command)
-        }
-        #[cfg(unix)]
-        ContentEnvironment::Wsl { .. } => Err("WSL chats need a Windows host".into()),
-    }
-}
-
-/// `<program>.exe` on the search path, else where Bun installs it.
-#[cfg(windows)]
-fn windows_program(program: &str) -> Option<std::path::PathBuf> {
-    let file = format!("{program}.exe");
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .chain(
-            std::env::var_os("USERPROFILE")
-                .map(|home| std::path::PathBuf::from(home).join(".bun").join("bin")),
-        )
-        .map(|folder| folder.join(&file))
-        .find(|candidate| candidate.is_file())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acp::{Pending, activity, file_uri, form_content, form_fields, path_of_uri, task_output};
+    use compi_protocol::chat::{ChatAnswer, ChatDiff};
+    use serde_json::json;
 
     fn tool_entry(inner: &Inner, index: usize) -> &ChatTool {
         match &inner.state.entries[index] {
@@ -4280,7 +2750,7 @@ mod tests {
         assert_eq!(inner.state.queued.len(), 2);
 
         // The next prompt goes first; the queue follows it, oldest first.
-        inner.start_prompt("s".into(), prompt("next"));
+        inner.start_prompt(prompt("next"));
         assert_eq!(last_user(&inner).as_deref(), Some("next"));
         ready(&mut inner);
         inner.send_queued();
@@ -4332,7 +2802,7 @@ mod tests {
         };
         assert_eq!(shown(&inner), None, "an idle chat reports nothing");
 
-        inner.start_prompt("s".into(), prompt());
+        inner.start_prompt(prompt());
         assert_eq!(
             shown(&inner),
             Some((ProgramState::Working, None, title.clone()))
@@ -4381,16 +2851,16 @@ mod tests {
             Some((ProgramState::Done, Some("OMP")))
         );
         // Sending clears it.
-        inner.start_prompt("s".into(), prompt());
+        inner.start_prompt(prompt());
         inner.prompt_ended(Ok(json!({ "stopReason": "cancelled" })));
         assert_eq!(shown(&inner), None, "a cancelled turn leaves no result");
 
-        inner.start_prompt("s".into(), prompt());
+        inner.start_prompt(prompt());
         inner.prompt_ended(Ok(json!({ "stopReason": "end_turn" })));
         inner.unseen = None;
         assert_eq!(shown(&inner), None, "acknowledged");
 
-        inner.start_prompt("s".into(), prompt());
+        inner.start_prompt(prompt());
         inner.prompt_ended(Err("boom".into()));
         assert_eq!(
             shown(&inner),
@@ -4441,6 +2911,7 @@ mod tests {
     {
         let picks_sent = |inner: &Inner| -> Vec<(String, String)> {
             inner
+                .acp_state()
                 .pending
                 .values()
                 .filter_map(|pending| match pending {
@@ -4483,12 +2954,13 @@ mod tests {
         let mut inner = chat.lock();
         assert!(inner.state.entries.is_empty());
         let id = *inner
+            .acp()
             .pending
             .iter()
             .find(|(_, pending)| matches!(pending, Pending::Pick { .. }))
             .unwrap()
             .0;
-        let pick = inner.pending.remove(&id).unwrap();
+        let pick = inner.acp().pending.remove(&id).unwrap();
         chat.answered(
             &mut inner,
             pick,
@@ -4516,7 +2988,7 @@ mod tests {
                 ..ChatState::default()
             }),
         });
-        inner.pending.clear();
+        inner.acp().pending.clear();
         chat.answered(
             &mut inner,
             Pending::LoadSession,
@@ -4560,7 +3032,7 @@ mod tests {
                 .collect()
         };
         let turn = |inner: &mut Inner, text: &str| {
-            inner.start_prompt("s".into(), text_prompt(text));
+            inner.start_prompt(text_prompt(text));
             inner.prompt_ended(Ok(json!({ "stopReason": "end_turn" })));
         };
         let mut inner = Inner::default();
@@ -4735,7 +3207,7 @@ mod tests {
         assert_eq!(inner.tools.get("t1"), Some(&1));
 
         let seeded = inner.state.entries.clone();
-        inner.pending.insert(1, Pending::LoadSession);
+        inner.acp().pending.insert(1, Pending::LoadSession);
         inner.update(&json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "make" } }));
         inner.update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "ok" } }));
         inner.update(&json!({
@@ -4749,7 +3221,7 @@ mod tests {
         assert!(inner.state.usage.is_some());
 
         // Once the session has loaded, what the harness reports is new.
-        inner.pending.clear();
+        inner.acp().pending.clear();
         inner.update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "next" } }));
         assert_eq!(inner.state.entries.len(), seeded.len() + 1);
 
@@ -4757,7 +3229,7 @@ mod tests {
         inner.emit(ChatEvent::Reset {
             state: Box::default(),
         });
-        inner.pending.insert(2, Pending::LoadSession);
+        inner.acp().pending.insert(2, Pending::LoadSession);
         inner.update(&json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "other" } }));
         assert_eq!(inner.state.entries.len(), 1);
     }
@@ -4783,7 +3255,7 @@ mod tests {
                 },
                 ..Inner::default()
             };
-            inner.start_prompt("s1".into(), text_prompt("go"));
+            inner.start_prompt(text_prompt("go"));
             let chat = Arc::new(Chat {
                 content,
                 instance: None,
@@ -4937,7 +3409,7 @@ mod tests {
         assert!(hub.threads(&workspace).is_empty());
 
         // The first prompt makes the draft a thread, which whole states then say.
-        lock(&sent.inner).start_prompt("s1".into(), text_prompt("go"));
+        lock(&sent.inner).start_prompt(text_prompt("go"));
         assert!(lock(&sent.inner).state.thread);
         hub.retain(&holding(&[]));
         hub.threads.flush();

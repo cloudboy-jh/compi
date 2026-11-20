@@ -62,11 +62,15 @@ fn table(threads: &[ThreadInfo], now_ms: u64, width: usize) -> String {
 mod tests {
     use super::*;
     use compi_protocol::ContentEnvironment;
-    use compi_protocol::chat::ThreadActivity;
+    use compi_protocol::chat::{ChatHarness, ThreadActivity};
 
     #[test]
     fn the_table_names_each_thread_with_its_id() {
-        let mut chat = crate::chat::new_chat(ContentEnvironment::Host, "/work/compi".into());
+        let mut chat = crate::chat::new_chat(
+            ChatHarness::Omp,
+            ContentEnvironment::Host,
+            "/work/compi".into(),
+        );
         chat.id = "chat-1".into();
         let now = 10 * 3_600_000;
         let threads = [ThreadInfo {

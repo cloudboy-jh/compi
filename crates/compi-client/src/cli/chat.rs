@@ -1,11 +1,13 @@
-//! `compi chat`: a new chat with OMP in the terminal it runs from, in the shell's current
-//! directory. As `[chat] open` says, the terminal shows it as its view, in place of its
-//! shell, which keeps running underneath (Cmd/Ctrl+Shift+E or Esc returns to the shell),
-//! or a new pane beside the terminal shows it.
+//! `compi chat`: a new chat in the terminal it runs from, in the shell's current
+//! directory, with `--agent` or else `[chat] agent`. As `[chat] open` says, the terminal
+//! shows it as its view, in place of its shell, which keeps running underneath
+//! (Cmd/Ctrl+Shift+E or Esc returns to the shell), or a new pane beside the terminal
+//! shows it.
 use super::content::{self, Placed};
 use super::{CliError, Options, Output, submit, targets};
 use crate::config::ChatOpen;
 use crate::{DaemonClient, cli_window::Action, connection::ConnectionTarget};
+use compi_protocol::chat::ChatHarness;
 use compi_protocol::{
     LayoutNode, PaneContent, SplitAxis, SplitGeometry, WorkspaceMutation, WorkspaceSnapshot,
 };
@@ -17,6 +19,7 @@ pub(super) fn run(
     target: &ConnectionTarget,
     options: &Options,
     open: ChatOpen,
+    agent: ChatHarness,
 ) -> Result<Output, CliError> {
     let (_, _, leaf) = targets::pane(state, options)?;
     if let LayoutNode::Content { pane_id, content } = &leaf {
@@ -35,7 +38,12 @@ pub(super) fn run(
             "the shell has not reported its current directory; enable OSC 7 shell integration",
         )
     })?;
-    let chat = crate::chat::new_chat(caller.environment.clone(), folder);
+    let agent = match options.values.get("--agent") {
+        Some(program) => ChatHarness::parse(program)
+            .ok_or_else(|| CliError::usage("--agent must be omp or claude"))?,
+        None => agent,
+    };
+    let chat = crate::chat::new_chat(agent, caller.environment.clone(), folder);
     chat.validate().map_err(CliError::usage)?;
     let content = PaneContent::Chat(chat.clone());
     let placed = match (open, caller.surface) {

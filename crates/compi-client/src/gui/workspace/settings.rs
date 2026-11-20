@@ -20,7 +20,7 @@ use super::chat::SECONDARY_KEY;
 use super::*;
 use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
 use crate::gui::controls::IconName;
-use compi_protocol::chat::ChatApproval;
+use compi_protocol::chat::{ChatApproval, ChatHarness};
 use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
 use gpui::Entity;
 use gpui_component::Sizable as _;
@@ -111,10 +111,13 @@ pub(super) enum SettingsAction {
     FileTextSize(Command),
     /// Zoom in, out or reset of the chat text size.
     ChatTextSize(Command),
-    /// Enter while OMP works: Left and Right pick Steer or Queue, Enter flips it.
+    /// Enter while the agent works: Left and Right pick Steer or Queue, Enter flips it.
     ChatEnter,
     /// Opening a chat: Left and Right pick in place or beside, Enter flips it.
     ChatOpen,
+    /// Default agent: Left and Right step through the installed agents, Enter moves to
+    /// the next.
+    ChatAgent,
     /// New tabs: Left and Right pick Chat first or Terminal first, Enter flips it.
     NewTab,
     /// When a dev server starts: Left and Right step through the choices, Enter moves
@@ -246,6 +249,12 @@ pub(in crate::gui) struct SettingsUi {
     /// What the last shortcut change did, under that command: a key that was taken
     /// from another command, or why a key was refused.
     shortcut_notice: Option<(usize, String)>,
+    /// The agents installed where new chats open, for Default agent: asked when
+    /// Settings opens; `None` while asking, when asking failed or where is unknown, and
+    /// Default agent then offers every agent.
+    chat_agents: Option<Vec<ChatHarness>>,
+    /// The last such question asked; a reply to an earlier one is dropped.
+    chat_agents_asked: u64,
 }
 
 /// What a row's renderer needs: where it is drawn and how.
@@ -1022,6 +1031,30 @@ static ROWS: &[Row] = &[
     ),
     // Chat.
     grouped(
+        "Agent",
+        row(
+            "chat-agent",
+            SettingsSection::Chat,
+            "Default agent",
+            "Every new thread starts with it.",
+            "default agent harness omp claude code new thread chat",
+            |_| vec![SettingsAction::ChatAgent],
+            |app, row, cx| app.render_chat_agent_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Agent",
+        row(
+            "chat-approval",
+            SettingsSection::Chat,
+            "Approvals",
+            "How the agent asks before it runs tools. Applies to new chats and chats that start again.",
+            "approval permission ask allow edits everything yolo tools agent omp claude",
+            |_| vec![SettingsAction::Select(Popup::ChatApproval)],
+            |app, row, cx| app.render_chat_approval_row(row, cx),
+        ),
+    ),
+    grouped(
         "Messages",
         row(
             "chat-text-size",
@@ -1051,7 +1084,7 @@ static ROWS: &[Row] = &[
         row(
             "chat-enter",
             SettingsSection::Chat,
-            "Enter while OMP works",
+            "Enter while the agent works",
             "Whether Enter steers the running turn or queues the message for after it.",
             "steer queue send key ctrl cmd turn message composer agent omp",
             |_| vec![SettingsAction::ChatEnter],
@@ -1076,22 +1109,10 @@ static ROWS: &[Row] = &[
             "chat-open",
             SettingsSection::Chat,
             "Opening a chat",
-            "Where OMP chat and compi chat open a chat from a terminal: in place of its shell or beside it.",
-            "split pane beside in place shell view palette agent omp",
+            "Where New chat and compi chat open a chat from a terminal: in place of its shell or beside it.",
+            "split pane beside in place shell view palette agent omp claude",
             |_| vec![SettingsAction::ChatOpen],
             |app, row, cx| app.render_chat_open_row(row, cx),
-        ),
-    ),
-    grouped(
-        "OMP",
-        row(
-            "chat-approval",
-            SettingsSection::Chat,
-            "Approvals",
-            "How OMP asks before it runs tools. Applies to new chats and chats that start again.",
-            "approval permission ask allow edits everything yolo tools agent omp",
-            |_| vec![SettingsAction::Select(Popup::ChatApproval)],
-            |app, row, cx| app.render_chat_approval_row(row, cx),
         ),
     ),
     grouped(
@@ -1909,6 +1930,8 @@ impl CompiApp {
             self.dismiss_overlay();
         }
         self.popup = None;
+        // Asked while the pane Settings opens from still has the keyboard.
+        self.read_chat_agents(cx);
         if let Some(pane) = self.focused_pane()
             && self.focused_view().is_some()
         {
@@ -2106,6 +2129,10 @@ impl CompiApp {
                     }
                     if let Some(target) = self.settings.pending_themes.take() {
                         self.start_theme_session(pane_id.clone(), target, true);
+                    }
+                    // Settings opened another way (`compi settings`, a restored pane).
+                    if self.settings.chat_agents_asked == 0 {
+                        self.read_chat_agents(cx);
                     }
                 }
                 Some(pane) => {
@@ -2659,6 +2686,16 @@ impl CompiApp {
             (
                 "left" | "right",
                 Some(Stop::Control {
+                    action: SettingsAction::ChatAgent,
+                    ..
+                }),
+            ) => {
+                self.step_chat_agent(key.key == "right", false, cx);
+                current
+            }
+            (
+                "left" | "right",
+                Some(Stop::Control {
                     action: SettingsAction::NewTab,
                     ..
                 }),
@@ -2807,6 +2844,7 @@ impl CompiApp {
                 },
                 cx,
             ),
+            SettingsAction::ChatAgent => self.step_chat_agent(true, true, cx),
             SettingsAction::NewTab => self.set_new_tab(
                 match self.config.new_tab.unwrap_or_default() {
                     NewTab::Chat => NewTab::Terminal,
@@ -4010,10 +4048,10 @@ impl CompiApp {
         let current = self.config.chat_open;
         let detail = match current {
             ChatOpen::InPlace => {
-                "OMP chat and compi chat show the chat over the terminal's shell, which keeps running."
+                "New chat and compi chat show the chat over the terminal's shell, which keeps running."
             }
             ChatOpen::Beside => {
-                "OMP chat and compi chat open the chat in a new pane beside the terminal."
+                "New chat and compi chat open the chat in a new pane beside the terminal."
             }
         };
         self.render_choice_row(
@@ -4033,6 +4071,115 @@ impl CompiApp {
             detail.into(),
             cx,
         )
+    }
+
+    /// Default agent: the agents as a switch, each one not installed where new chats
+    /// open dimmed, with why, and not picked.
+    fn render_chat_agent_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let action = SettingsAction::ChatAgent;
+        let current = self.config.chat_agent;
+        let focused = self.settings_focused(row, action);
+        let buttons = ChatHarness::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, agent)| {
+                let row = row.clone();
+                controls::text_button((row.row, index), agent.name())
+                    .selected(agent == current)
+                    .detail(format!("New threads start with {}", agent.name()))
+                    .disabled_because(
+                        (!self.chat_agent_installed(agent)).then_some("Not installed"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.focus_settings_control(&row, action);
+                        this.set_chat_agent(agent, cx);
+                        cx.notify();
+                    }))
+            });
+        let switch = controls::highlight(
+            focused,
+            controls::segmented((row.row, 9_usize), buttons),
+            cx,
+        )
+        .child(self.settings_focus_anchor(focused, cx))
+        .into_any_element();
+        let missing: Vec<&str> = ChatHarness::ALL
+            .into_iter()
+            .filter(|agent| !self.chat_agent_installed(*agent))
+            .map(ChatHarness::name)
+            .collect();
+        let mut detail = row_description(row.row).to_owned();
+        if !missing.is_empty() {
+            detail.push_str(&format!(
+                " Not installed where new chats open: {}.",
+                missing.join(", ")
+            ));
+        }
+        self.settings_row(row.title, detail, switch, row.compact)
+    }
+
+    /// Whether `agent` is installed where new chats open, as far as Settings knows: an
+    /// agent counts as installed until the daemon says otherwise.
+    fn chat_agent_installed(&self, agent: ChatHarness) -> bool {
+        self.settings
+            .chat_agents
+            .as_ref()
+            .is_none_or(|installed| installed.contains(&agent))
+    }
+
+    /// Asks the daemon, off the UI thread, which agents are installed where new chats
+    /// open (the focused pane's environment), for Default agent. Nowhere known, every
+    /// agent stays on offer.
+    pub(super) fn read_chat_agents(&mut self, cx: &mut Context<Self>) {
+        self.settings.chat_agents = None;
+        self.settings.chat_agents_asked += 1;
+        let Ok((environment, _)) = self.chat_scope() else {
+            return;
+        };
+        let asked = self.settings.chat_agents_asked;
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let listed = cx
+                .background_executor()
+                .spawn(async move { target.connect()?.chat_agents(&environment) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.settings.chat_agents_asked == asked {
+                    this.settings.chat_agents = listed.ok();
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Default agent from the keyboard: the next installed agent after the current one,
+    /// `forward` or back; Enter (`wrap`) goes round from the last to the first, Left and
+    /// Right stop at the ends.
+    fn step_chat_agent(&mut self, forward: bool, wrap: bool, cx: &mut Context<Self>) {
+        let agents = ChatHarness::ALL;
+        let start = agents
+            .iter()
+            .position(|agent| *agent == self.config.chat_agent)
+            .unwrap_or(0);
+        let order: Vec<usize> = if forward {
+            (start + 1..agents.len())
+                .chain((0..start).filter(|_| wrap))
+                .collect()
+        } else {
+            (0..start)
+                .rev()
+                .chain((start + 1..agents.len()).rev().filter(|_| wrap))
+                .collect()
+        };
+        if let Some(agent) = order
+            .into_iter()
+            .map(|index| agents[index])
+            .find(|agent| self.chat_agent_installed(*agent))
+        {
+            self.set_chat_agent(agent, cx);
+        }
     }
 
     /// When a dev server starts: the card, the page by itself, or nothing, as a switch.
@@ -4103,7 +4250,7 @@ impl CompiApp {
         self.settings_row(row.title, detail, switch, row.compact)
     }
 
-    /// Saves what Enter does while OMP works and gives it to every window.
+    /// Saves what Enter does while the agent works and gives it to every window.
     fn set_chat_enter(&mut self, enter: ChatEnter, cx: &mut Context<Self>) {
         if let Err(error) = self.config.save_chat_enter(enter) {
             self.global_error = Some(error);
@@ -4119,6 +4266,15 @@ impl CompiApp {
             return;
         }
         share_config_change(cx, move |config| config.chat_open = open);
+    }
+
+    /// Saves the agent new threads start with and gives it to every window.
+    fn set_chat_agent(&mut self, agent: ChatHarness, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_chat_agent(agent) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_config_change(cx, move |config| config.chat_agent = agent);
     }
 
     /// Saves what a new tab opens with and gives it to every window.
@@ -5673,7 +5829,7 @@ pub(super) fn settings_card(colors: &ThemeColors) -> Div {
 /// What Approvals calls `approval`.
 pub(super) fn chat_approval_label(approval: ChatApproval) -> &'static str {
     match approval {
-        ChatApproval::Harness => "Same as OMP",
+        ChatApproval::Harness => "Same as the agent",
         ChatApproval::AlwaysAsk => "Always ask",
         ChatApproval::Write => "Allow edits",
         ChatApproval::Yolo => "Allow everything",
@@ -5683,7 +5839,7 @@ pub(super) fn chat_approval_label(approval: ChatApproval) -> &'static str {
 /// What `approval` lets the agent do, as Approvals and a chat's picker describe it.
 pub(super) fn chat_approval_detail(approval: ChatApproval) -> &'static str {
     match approval {
-        ChatApproval::Harness => "OMP's own approval setting",
+        ChatApproval::Harness => "The agent's own approval setting",
         ChatApproval::AlwaysAsk => "Ask before anything but reading",
         ChatApproval::Write => "Read and edit; ask before commands",
         ChatApproval::Yolo => "Run every tool without asking",
@@ -6066,7 +6222,7 @@ mod tests {
         );
         assert_eq!(
             groups(SettingsSection::Chat),
-            ["Messages", "Opening", "OMP"]
+            ["Agent", "Messages", "Opening", "OMP"]
         );
         assert_eq!(groups(SettingsSection::Keyboard), ["Commands"]);
         assert_eq!(groups(SettingsSection::Monitor), ["Monitor"]);

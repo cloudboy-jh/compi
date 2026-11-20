@@ -183,7 +183,7 @@ registry! {
     OpenDiagnostics, "open_diagnostics", "Open diagnostics", None, None;
     OpenMonitor, "open_monitor", "Monitor", None, None;
     OpenBrowser, "open_browser", "Open browser", None, None;
-    OpenChat, "open_chat", "OMP chat", None, None;
+    OpenChat, "open_chat", "New chat", None, None;
     Threads, "threads", "Threads", None, None;
     BrowserBack, "browser_back", "Back", None, None;
     BrowserForward, "browser_forward", "Forward", None, None;
@@ -526,10 +526,10 @@ impl Command {
             ),
             OpenBrowser => Some("Opens a web page in a pane beside the focused one."),
             OpenChat => Some(
-                "Starts a chat with OMP in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
+                "Starts a chat with the default agent (Settings → Chat) in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
             ),
             Threads => Some(
-                "Lists your chats with OMP, open or ended; an ended one reopens in a pane on its session, × deletes it.",
+                "Lists your chats with agents, open or ended; an ended one reopens in a pane on its session, × deletes it.",
             ),
             SendSelectionToChat => Some(
                 "Puts the selected terminal text at the end of a chat's message box: the terminal's own chat, else the tab's, else a new one.",
@@ -600,9 +600,11 @@ impl Command {
                 "task manager processes activity monitor resources top htop cpu memory threads pid kill end usage"
             }
             OpenBrowser => "web page url localhost preview site dev server http",
-            OpenChat => "agent ai assistant omp chat prompt llm acp",
-            Threads => "chat history sessions conversations agent omp ai reopen resume delete",
-            SendSelectionToChat => "agent ai omp chat quote output prompt",
+            OpenChat => "new agent ai assistant omp claude code chat prompt llm acp",
+            Threads => {
+                "chat history sessions conversations agent omp claude ai reopen resume delete"
+            }
+            SendSelectionToChat => "agent ai omp claude chat quote output prompt",
             BrowserBack | BrowserForward => "browser web page history navigate",
             BrowserReload => "browser web page refresh stop",
             FocusAddressBar => "browser web page url location navigate go",
@@ -2052,12 +2054,14 @@ mod tests {
     }
 
     #[test]
-    fn omp_chat_needs_a_pane_with_a_known_folder() {
+    fn new_chat_needs_a_pane_with_a_known_folder() {
         let mut context = ready();
         assert!(Command::OpenChat.disabled_reason(&context).is_none());
         assert_eq!(Command::OpenChat.spec().id, "open_chat");
         assert_eq!(Command::OpenChat.spec().category(), CommandCategory::Panes);
         assert!(search("agent").any(|spec| spec.command == Command::OpenChat));
+        assert!(search("claude").any(|spec| spec.command == Command::OpenChat));
+        assert!(search("omp").any(|spec| spec.command == Command::OpenChat));
         context.chat_reason = Some("no folder");
         assert_eq!(
             Command::OpenChat.disabled_reason(&context),

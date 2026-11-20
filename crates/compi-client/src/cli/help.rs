@@ -440,17 +440,17 @@ pub(super) const ENTRIES: &[Entry] = &[
     Entry {
         command: "chat",
         action: None,
-        usage: "chat",
-        summary: "Chat with OMP in or beside the terminal's pane",
-        detail: "Start a new chat with OMP (the omp agent harness) in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. OMP works in the shell's current directory, in the terminal's environment (a WSL distribution runs omp there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
-        example: "compi chat",
+        usage: "chat [--agent omp|claude]",
+        summary: "Chat with an agent in or beside the terminal's pane",
+        detail: "Start a new chat in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). The chat's agent is --agent, omp (OMP) or claude (Claude Code), else the Default agent ([chat] agent, Settings → Chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. The agent works in the shell's current directory, in the terminal's environment (a WSL distribution runs it there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
+        example: "compi chat --agent claude",
     },
     Entry {
         command: "threads",
         action: None,
         usage: "threads",
-        summary: "List chats with OMP, open or ended",
-        detail: "List the threads the daemon keeps, newest first: every chat with OMP, whether a pane shows it or it has ended, with its title, folder, how long ago it last changed, what it is doing (Working, Waiting, Open in a pane, else Ended) and its id. Threads in the palette opens an ended one in a pane again, its agent starting again on the same session. --json returns each thread's chat, title, created_ms, updated_ms, activity, open and project.",
+        summary: "List chats with agents, open or ended",
+        detail: "List the threads the daemon keeps, newest first: every chat with an agent, whether a pane shows it or it has ended, with its title, folder, how long ago it last changed, what it is doing (Working, Waiting, Open in a pane, else Ended) and its id. Threads in the palette opens an ended one in a pane again, its agent starting again on the same session. --json returns each thread's chat, title, created_ms, updated_ms, activity, open and project.",
         example: "compi threads",
     },
     Entry {

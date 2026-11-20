@@ -556,6 +556,10 @@ pub enum ClientMessage {
     ListChatSessions {
         chat: String,
     },
+    /// The agents installed in `environment`, answered by `ChatAgents`.
+    ListChatAgents {
+        environment: ContentEnvironment,
+    },
     /// Every thread the daemon keeps, newest change first, answered by `Threads`.
     ListThreads,
     /// Deletes thread `chat`: its transcript, and its harness if it runs. Refused while a
@@ -761,6 +765,9 @@ pub enum ServerMessage {
     ChatAccepted,
     ChatSessions {
         sessions: Vec<chat::ChatSessionInfo>,
+    },
+    ChatAgents {
+        agents: Vec<chat::ChatHarness>,
     },
     Threads {
         threads: Vec<chat::ThreadInfo>,

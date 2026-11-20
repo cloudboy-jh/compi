@@ -405,7 +405,7 @@ fn thread_rows(query: &str, scoped: bool, sources: &Sources) -> (Vec<Row>, Optio
         .collect();
     let note = (scoped && rows.is_empty()).then(|| {
         if query.is_empty() {
-            "No threads yet; OMP chat starts one".to_owned()
+            "No threads yet; New chat starts one".to_owned()
         } else {
             format!("No thread matches “{query}”")
         }
@@ -1448,7 +1448,11 @@ mod tests {
         activity: compi_protocol::chat::ThreadActivity,
         open: bool,
     ) -> ThreadInfo {
-        let mut chat = crate::chat::new_chat(ContentEnvironment::Host, folder.into());
+        let mut chat = crate::chat::new_chat(
+            compi_protocol::chat::ChatHarness::Omp,
+            ContentEnvironment::Host,
+            folder.into(),
+        );
         chat.id = id.into();
         ThreadInfo {
             chat,
@@ -1539,7 +1543,7 @@ mod tests {
         );
         assert_eq!(
             note("", Threads::Listed(&[])),
-            "No threads yet; OMP chat starts one"
+            "No threads yet; New chat starts one"
         );
         assert_eq!(note("", Threads::Listing), "Listing threads…");
         assert_eq!(

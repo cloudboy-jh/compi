@@ -1865,6 +1865,7 @@ impl CompiApp {
                 session_id,
                 label: String::new(),
                 content: compi_protocol::PaneContent::Chat(crate::chat::new_chat(
+                    self.config.chat_agent,
                     environment,
                     folder,
                 )),

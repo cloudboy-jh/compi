@@ -247,6 +247,7 @@ fn wants_json(raw: &[String]) -> bool {
                 | "--with"
                 | "--color"
                 | "--into"
+                | "--agent"
         ) {
             args.next();
         }
@@ -460,7 +461,7 @@ fn parse(raw: &[String]) -> std::result::Result<Options, CliError> {
             }
             "--cwd" | "--name" | "--panes" | "--layout" | "--index" | "--cols" | "--rows"
             | "--text" | "--key" | "--scope" | "--format" | "--history" | "--search"
-            | "--source" | "--color" | "--into" => {
+            | "--source" | "--color" | "--into" | "--agent" => {
                 let value = iterator
                     .next()
                     .ok_or_else(|| CliError::usage(format!("{arg} requires a value")))?
@@ -1127,7 +1128,16 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         "diff" => return diff::run(&mut client, &state, &target, options),
         "settings" | "monitor" => return view::run(&mut client, &state, &target, options),
         "browse" => return browse::run(&mut client, &state, &target, options),
-        "chat" => return chat::run(&mut client, &state, &target, options, config.chat_open),
+        "chat" => {
+            return chat::run(
+                &mut client,
+                &state,
+                &target,
+                options,
+                config.chat_open,
+                config.chat_agent,
+            );
+        }
         "command" => return palette::run(&state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;
@@ -1828,7 +1838,7 @@ fn validate(
         ("monitor", _) => (1, 2, &["--source"], &[]),
         ("files" | "edit" | "settings", _) => (1, 2, &[], &[]),
         ("browse", _) => (1, 2, &[], &["--down"]),
-        ("chat", _) => (1, 1, &[], &[]),
+        ("chat", _) => (1, 1, &["--agent"], &[]),
         ("threads", None) => (1, 1, &[], &[]),
         ("threads", Some("delete")) => (3, 3, &[], &[]),
         ("notes", Some("search" | "backlinks")) => (3, 4, &[], &[]),
@@ -1888,6 +1898,13 @@ fn validate(
         return Err(CliError::usage(
             "pane swap requires exactly one --with target",
         ));
+    }
+    if options
+        .values
+        .get("--agent")
+        .is_some_and(|agent| compi_protocol::chat::ChatHarness::parse(agent).is_none())
+    {
+        return Err(CliError::usage("--agent must be omp or claude"));
     }
     if command == "pane" && action == Some("capture") {
         if options
@@ -2253,15 +2270,22 @@ mod tests {
         }
     }
     #[test]
-    fn chat_takes_no_arguments() {
+    fn chat_takes_only_an_agent() {
         for accepted in [
             &["chat"][..],
             &["--json", "chat"],
             &["--pane", "pane-1", "chat"],
+            &["chat", "--agent", "claude"],
+            &["chat", "--agent", "omp"],
         ] {
             assert!(validated(accepted).is_ok(), "{accepted:?}");
         }
-        for rejected in [&["chat", "hello"][..], &["chat", "--down"]] {
+        for rejected in [
+            &["chat", "hello"][..],
+            &["chat", "--down"],
+            &["chat", "--agent", "codex"],
+            &["chat", "--agent"],
+        ] {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");
         }
     }

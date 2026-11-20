@@ -163,14 +163,18 @@ fn draft_facts(repo: &Repo, folder: &str) -> String {
 
 impl CompiApp {
     /// Split right or down from `beside`, which shows `source`: a new thread draft in
-    /// `source`'s folder, in a pane of its own.
+    /// `source`'s folder, with `source`'s agent, in a pane of its own.
     pub(in crate::gui) fn open_draft_split(
         &mut self,
         beside: &PaneId,
         axis: SplitAxis,
         source: &ChatContent,
     ) {
-        let draft = crate::chat::new_chat(source.environment.clone(), source.folder.clone());
+        let draft = crate::chat::new_chat(
+            source.harness,
+            source.environment.clone(),
+            source.folder.clone(),
+        );
         self.open_content_split(beside, axis, PaneContent::Chat(draft));
     }
 
@@ -628,7 +632,7 @@ impl CompiApp {
                 None => return,
             },
         };
-        let chat = crate::chat::new_chat(chat.environment, chat.folder);
+        let chat = crate::chat::new_chat(chat.harness, chat.environment, chat.folder);
         let id = chat.id.clone();
         let content = PaneContent::Chat(chat);
         let opened = match place {

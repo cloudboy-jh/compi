@@ -1,7 +1,8 @@
-//! Native agent chat: a content pane talking to an installed agent harness over the
-//! Agent Client Protocol (ACP). The daemon runs the harness, like a shell, and keeps the
-//! transcript; windows watch it (`WatchChat`) and send prompts, cancels and answers.
-//! The harness owns its sessions, models, tools and credentials.
+//! Native agent chat: a content pane talking to an installed agent harness (OMP over the
+//! Agent Client Protocol, Claude Code over its headless JSON stream). The daemon runs the
+//! harness, like a shell, and keeps the transcript; windows watch it (`WatchChat`) and
+//! send prompts, cancels and answers. The harness owns its sessions, models, tools and
+//! credentials.
 use crate::ContentEnvironment;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -37,13 +38,18 @@ pub const MAX_CHAT_AGENT_STEPS: usize = 200;
 pub enum ChatHarness {
     #[default]
     Omp,
+    /// Claude Code, driven by its headless JSON stream mode.
+    Claude,
 }
 
 impl ChatHarness {
+    pub const ALL: [Self; 2] = [Self::Omp, Self::Claude];
+
     /// The harness's own name.
     pub fn name(self) -> &'static str {
         match self {
             Self::Omp => "OMP",
+            Self::Claude => "Claude Code",
         }
     }
 
@@ -51,13 +57,22 @@ impl ChatHarness {
     pub fn program(self) -> &'static str {
         match self {
             Self::Omp => "omp",
+            Self::Claude => "claude",
         }
+    }
+
+    /// The harness named `program` (`ChatHarness::program`).
+    pub fn parse(program: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|harness| harness.program() == program)
     }
 }
 
 /// How the harness asks before running tools, as Compi starts it. `Harness` keeps the
 /// harness's own setting (OMP's `tools.approvalMode`, which `omp acp` does not read by
-/// itself, so the daemon looks it up and passes it on).
+/// itself, so the daemon looks it up and passes it on; Claude Code's `permissions`
+/// settings, which it reads itself).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatApproval {
@@ -79,6 +94,16 @@ impl ChatApproval {
             Self::AlwaysAsk => Some("always-ask"),
             Self::Write => Some("write"),
             Self::Yolo => Some("yolo"),
+        }
+    }
+
+    /// Claude Code's `--permission-mode` value; `None` keeps the harness's own setting.
+    pub fn claude_mode(self) -> Option<&'static str> {
+        match self {
+            Self::Harness => None,
+            Self::AlwaysAsk => Some("default"),
+            Self::Write => Some("acceptEdits"),
+            Self::Yolo => Some("bypassPermissions"),
         }
     }
 }
@@ -185,9 +210,11 @@ pub struct ChatState {
     /// from whole states.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread: bool,
-    /// How the running harness asks before it runs tools: OMP's `--approval-mode`
-    /// (`always-ask`, `always-ask-cached`, `write`, `yolo`), whether Compi chose it or
-    /// OMP's own setting did; `None` while unknown.
+    /// How the running harness asks before it runs tools, whether Compi chose it or the
+    /// harness's own setting did: OMP's `--approval-mode` (`always-ask`,
+    /// `always-ask-cached`, `write`, `yolo`), or Claude Code's permission mode (`default`,
+    /// `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`), which follows the
+    /// session's `mode` setting as it changes; `None` while unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
 }
@@ -327,8 +354,8 @@ pub struct ChatTool {
     pub started_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_ms: Option<u64>,
-    /// The sub-agents it started (OMP's `task`), in its order. The call runs while one
-    /// of them does.
+    /// The sub-agents it started (OMP's `task`, Claude Code's `Agent`), in its order. The
+    /// call runs while one of them does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<ChatAgent>,
     /// It only waits for sub-agents (OMP's `wait` on `task` jobs): their call and the

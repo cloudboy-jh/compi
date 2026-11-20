@@ -925,6 +925,15 @@ fn handle_connection(
                         }
                     }
                 }
+                // Looks for each harness in the environment, a few seconds at most.
+                ClientMessage::ListChatAgents { environment } => {
+                    sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::ChatAgents {
+                            agents: crate::chat::installed_agents(&environment),
+                        },
+                    })?
+                }
                 ClientMessage::ListThreads => match manager.snapshot() {
                     Ok(workspace) => sink.send_control(&ServerControl {
                         request_id: Some(request_id),

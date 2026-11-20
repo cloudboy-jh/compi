@@ -32,7 +32,7 @@
 use super::*;
 use crate::chat::{age_label, now_ms, thread_title};
 use crate::gui::controls::{IconName, MenuEntry, menu_item};
-use compi_protocol::chat::{ChatContent, ThreadInfo};
+use compi_protocol::chat::{ChatContent, ChatHarness, ThreadInfo};
 use compi_protocol::program_status::ProgramState;
 use compi_protocol::{MutationReceipt, PaneContent, Project, TabPlacement, WorkspaceSession};
 use gpui::{DragMoveEvent, Entity, Render, img};
@@ -165,8 +165,8 @@ struct SidebarCard {
     /// The project's name, else the folder's.
     folder: Option<String>,
     project: Option<Project>,
-    /// A chat is in it, rather than a terminal.
-    chat: bool,
+    /// The agent of the chat in it, rather than a terminal.
+    chat: Option<ChatHarness>,
     /// Its chat is a draft: nothing sent yet, so no thread is kept.
     draft: bool,
     /// What its programs most need the user for; nothing while idle.
@@ -692,7 +692,7 @@ impl CompiApp {
             title,
             folder,
             project: tab.project.clone(),
-            chat: chat.is_some(),
+            chat: chat.map(|chat| chat.harness),
             draft,
             state,
             changed_ms: self
@@ -1370,10 +1370,14 @@ impl CompiApp {
         );
     }
 
-    /// New thread here: an OMP chat at the project's root, in a new tab of workspace
-    /// `session`.
+    /// New thread here: a chat with the default agent at the project's root, in a new
+    /// tab of workspace `session`.
     fn new_project_thread(&mut self, session: SessionId, project: &Project) {
-        let chat = crate::chat::new_chat(project.environment.clone(), project.root.clone());
+        let chat = crate::chat::new_chat(
+            self.config.chat_agent,
+            project.environment.clone(),
+            project.root.clone(),
+        );
         self.mutate(
             WorkspaceMutation::CreateContentTab {
                 session_id: session,
@@ -2131,8 +2135,8 @@ impl CompiApp {
         let session = card.session.clone();
         let (open, rename) = (card.tab.clone(), card.tab.clone());
         let (menu_tab, menu_session) = (card.tab.clone(), card.session.clone());
-        let kind = if card.chat {
-            img(controls::OMP_MARK)
+        let kind = if let Some(harness) = card.chat {
+            img(super::chat::harness_mark(harness))
                 .flex_none()
                 .size(px(12.0))
                 .into_any_element()
@@ -2308,7 +2312,7 @@ mod tests {
             title: String::new(),
             folder: None,
             project: project.cloned(),
-            chat: false,
+            chat: None,
             draft: false,
             state: None,
             changed_ms: None,
@@ -2322,7 +2326,7 @@ mod tests {
     fn a_draft_card_says_draft_where_a_thread_says_its_age() {
         let now = 10 * 3_600_000;
         let mut card = SidebarCard {
-            chat: true,
+            chat: Some(ChatHarness::Omp),
             changed_ms: Some(now - 2 * 3_600_000),
             ..tab_card("t1", None)
         };
