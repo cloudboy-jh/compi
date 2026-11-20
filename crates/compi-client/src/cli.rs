@@ -1128,16 +1128,7 @@ fn execute(options: &Options) -> std::result::Result<Output, CliError> {
         "diff" => return diff::run(&mut client, &state, &target, options),
         "settings" | "monitor" => return view::run(&mut client, &state, &target, options),
         "browse" => return browse::run(&mut client, &state, &target, options),
-        "chat" => {
-            return chat::run(
-                &mut client,
-                &state,
-                &target,
-                options,
-                config.chat_open,
-                config.chat_agent,
-            );
-        }
+        "chat" => return chat::run(&mut client, &state, &target, options, &config),
         "command" => return palette::run(&state, &target, options),
         "attach" | "detach" | "run" => {
             let (_, _, pane_id, surface_id) = targets::terminal_pane(&state, options, command)?;

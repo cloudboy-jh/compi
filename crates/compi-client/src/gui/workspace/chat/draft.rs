@@ -200,7 +200,7 @@ impl CompiApp {
         };
         let project = self.pane_project(pane_id).or(repo_project.as_ref());
         let name: SharedString = match project {
-            Some(project) => project.name().to_owned().into(),
+            Some(project) => self.project_name(project).into(),
             None => model.folder_label.clone(),
         };
         let header = div()

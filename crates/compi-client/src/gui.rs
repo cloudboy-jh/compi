@@ -20,6 +20,7 @@ pub mod brand;
 mod controls;
 mod language_icons;
 mod lifecycle;
+mod lucide_icons;
 mod model_icons;
 mod open_with;
 mod os_notifications;

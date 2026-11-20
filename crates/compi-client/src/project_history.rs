@@ -61,6 +61,12 @@ impl ProjectHistory {
     /// Rank fuzzy path matches by match quality, then frequency and recency.
     /// An empty query ranks all previously visited directories by frecency.
     pub fn search(&self, query: &str) -> Vec<&str> {
+        self.search_named(query, |_| None)
+    }
+
+    /// [`Self::search`], where a folder also matches by the `name` it goes by (a renamed
+    /// project's), as well as its basename does.
+    pub fn search_named(&self, query: &str, name: impl Fn(&str) -> Option<String>) -> Vec<&str> {
         if query.len() > MAX_QUERY_BYTES {
             return Vec::new();
         }
@@ -74,7 +80,11 @@ impl ProjectHistory {
                 } else {
                     let full = fuzzy_score(entry.path.as_bytes(), query);
                     let basename = entry.path.rsplit('/').next().unwrap_or("");
-                    full.max(fuzzy_score(basename.as_bytes(), query).map(|score| score + 32))?
+                    let named = name(&entry.path)
+                        .and_then(|name| fuzzy_score(name.as_bytes(), query))
+                        .map(|score| score + 32);
+                    full.max(fuzzy_score(basename.as_bytes(), query).map(|score| score + 32))
+                        .max(named)?
                 };
                 let age = self.tick.saturating_sub(entry.last_visit).min(32);
                 let frecency = entry.visits.min(100) * 4 + (32 - age) * 8;

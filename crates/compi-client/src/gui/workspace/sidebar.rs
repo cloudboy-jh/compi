@@ -7,8 +7,10 @@
 //! Cards keep their workspace's tab order, pinned tabs first in the order they were
 //! pinned; nothing reorders them on its own. When a workspace's cards belong to two or
 //! more projects (cards without a project count as one more), they gather under a
-//! one-line header per project, in the order each project's first card comes. A header
-//! folds its project's cards and, folded, shows one dot for the most urgent of them.
+//! one-line header per project: pinned projects (Settings → Projects) first, then in the
+//! order each project's first card comes. A header shows the project's name (the one
+//! set in Settings → Projects, else its folder's), folds its project's cards and,
+//! folded, shows one dot for the most urgent of them.
 //! Headers and cards sit at one indent: this is a list of cards, never a file tree.
 //! The window's state keeps what is folded.
 //!
@@ -180,6 +182,7 @@ struct SidebarCard {
 
 impl SidebarCard {
     fn matches(&self, query: &str) -> bool {
+        // Its folder's name too, when the project goes by another.
         let project = self.project.as_ref().map_or("", Project::name);
         matches_query(
             query,
@@ -258,11 +261,13 @@ fn card_order(tabs: &[TabId], pinned: &[TabId]) -> Vec<TabId> {
         .collect()
 }
 
-/// `cards` by project, in the order each project's first card comes, each keeping the
-/// order the cards came in; the cards without a project make one more.
+/// `cards` by project: `pinned` projects first, then in the order each project's first
+/// card comes, each keeping the order the cards came in; the cards without a project
+/// make one more.
 fn project_sections<T>(
     cards: impl IntoIterator<Item = T>,
     project: impl Fn(&T) -> Option<&Project>,
+    pinned: impl Fn(&Project) -> bool,
 ) -> Vec<(Option<Project>, Vec<T>)> {
     let mut sections: Vec<(Option<Project>, Vec<T>)> = Vec::new();
     for card in cards {
@@ -275,13 +280,15 @@ fn project_sections<T>(
             }
         }
     }
+    // Stable: the pinned keep their order, as do the others.
+    sections.sort_by_key(|(project, _)| !project.as_ref().is_some_and(&pinned));
     sections
 }
 
 /// How many cards a workspace shows of those whose `projects` are given, one per
 /// card: all of them, or under project headers, those of the projects not `folded`.
 fn shown_count(projects: &[Option<&Project>], folded: impl Fn(Option<&Project>) -> bool) -> usize {
-    let sections = project_sections(projects.iter().copied(), |project| *project);
+    let sections = project_sections(projects.iter().copied(), |project| *project, |_| false);
     if sections.len() < 2 {
         return projects.len();
     }
@@ -460,6 +467,7 @@ enum ProjectAction {
     NewTerminal,
     NewThread,
     CopyPath,
+    Settings,
 }
 
 impl ProjectAction {
@@ -468,6 +476,7 @@ impl ProjectAction {
             Self::NewTerminal => "New terminal here",
             Self::NewThread => "New thread here",
             Self::CopyPath => "Copy path",
+            Self::Settings => "Project settings…",
         }
     }
 }
@@ -544,8 +553,8 @@ fn card_menu_rows(
 }
 
 /// A project header's menu, as T3 Code's folder header has it: New terminal here, New
-/// thread here and Copy path, all at the project's root; unavailable for the cards
-/// without a project.
+/// thread here and Copy path, all at the project's root, then Project settings…; all
+/// unavailable for the cards without a project.
 fn project_menu_rows(project: Option<&Project>) -> MenuRows<ProjectAction> {
     let reason = project
         .is_none()
@@ -555,6 +564,8 @@ fn project_menu_rows(project: Option<&Project>) -> MenuRows<ProjectAction> {
         Some((ProjectAction::NewThread, reason)),
         None,
         Some((ProjectAction::CopyPath, reason)),
+        None,
+        Some((ProjectAction::Settings, reason)),
     ]
 }
 
@@ -631,14 +642,18 @@ impl CompiApp {
                         cards,
                     }]
                 } else {
-                    project_sections(cards, |card| card.project.as_ref())
-                        .into_iter()
-                        .map(|(project, cards)| ProjectSection {
-                            folded: self.state.project_folded(&session.id, project.as_ref()),
-                            project,
-                            cards,
-                        })
-                        .collect()
+                    project_sections(
+                        cards,
+                        |card| card.project.as_ref(),
+                        |project| self.project_pinned(project),
+                    )
+                    .into_iter()
+                    .map(|(project, cards)| ProjectSection {
+                        folded: self.state.project_folded(&session.id, project.as_ref()),
+                        project,
+                        cards,
+                    })
+                    .collect()
                 };
                 Some(SidebarGroup {
                     session: session.id.clone(),
@@ -676,7 +691,7 @@ impl CompiApp {
             None => self.tab_label(tab),
         };
         let folder = match &tab.project {
-            Some(project) => Some(project.name().to_owned()),
+            Some(project) => Some(self.project_name(project)),
             None => self
                 .tab_folder(tab)
                 .map(|folder| folder_name(&folder).to_owned()),
@@ -974,6 +989,14 @@ impl CompiApp {
             }
         }
         self.apply_label_rename(cx);
+    }
+
+    /// The projects of the threads last listed, newest first, repeats included.
+    pub(super) fn thread_projects(&self) -> impl Iterator<Item = &Project> {
+        self.sidebar
+            .threads
+            .iter()
+            .filter_map(|thread| thread.project.as_ref())
     }
 
     /// Takes the daemon's thread list; a chat's title may now match the search.
@@ -1329,7 +1352,7 @@ impl CompiApp {
             let (session, project) = (session.clone(), project.clone());
             menu_item(
                 action.label(),
-                cx.listener(move |this, _, _, cx| {
+                cx.listener(move |this, _, window, cx| {
                     if let Some(project) = &project {
                         match action {
                             ProjectAction::NewTerminal => {
@@ -1337,6 +1360,9 @@ impl CompiApp {
                             }
                             ProjectAction::NewThread => {
                                 this.new_project_thread(session.clone(), project);
+                            }
+                            ProjectAction::Settings => {
+                                this.open_project_settings(project, window, cx);
                             }
                             ProjectAction::CopyPath => {}
                         }
@@ -1370,11 +1396,11 @@ impl CompiApp {
         );
     }
 
-    /// New thread here: a chat with the default agent at the project's root, in a new
-    /// tab of workspace `session`.
+    /// New thread here: a chat at the project's root with the agent its new threads
+    /// start with, in a new tab of workspace `session`.
     fn new_project_thread(&mut self, session: SessionId, project: &Project) {
         let chat = crate::chat::new_chat(
-            self.config.chat_agent,
+            self.new_thread_agent(Some(project)),
             project.environment.clone(),
             project.root.clone(),
         );
@@ -2018,11 +2044,10 @@ impl CompiApp {
                 .border_color(color(muted).opacity(0.6))
                 .into_any_element(),
         };
-        let name = section
-            .project
-            .as_ref()
-            .map_or("No project", Project::name)
-            .to_owned();
+        let name = section.project.as_ref().map_or_else(
+            || "No project".to_owned(),
+            |project| self.project_name(project),
+        );
         let tooltip = section.project.as_ref().map(|project| {
             controls::tooltip(name.clone(), Some(project.root.clone().into()), None)
         });
@@ -2158,7 +2183,7 @@ impl CompiApp {
         });
         let mut detail = Vec::new();
         if let Some(project) = &card.project {
-            detail.push(format!("{} · {}", project.name(), project.root));
+            detail.push(format!("{} · {}", self.project_name(project), project.root));
         }
         if card.pinned {
             detail.push("Pinned".to_owned());
@@ -2357,7 +2382,7 @@ mod tests {
             label: String::new(),
             selected: false,
             folded,
-            sections: project_sections(cards, |card| card.project.as_ref())
+            sections: project_sections(cards, |card| card.project.as_ref(), |_| false)
                 .into_iter()
                 .map(|(project, cards)| ProjectSection {
                     folded: folded_projects.contains(&project.as_ref()),
@@ -2469,6 +2494,8 @@ mod tests {
                 Some((ProjectAction::NewThread, None)),
                 None,
                 Some((ProjectAction::CopyPath, None)),
+                None,
+                Some((ProjectAction::Settings, None)),
             ]
         );
         assert_eq!(
@@ -2476,7 +2503,12 @@ mod tests {
                 .flatten()
                 .map(|(action, _)| action.label())
                 .collect::<Vec<_>>(),
-            ["New terminal here", "New thread here", "Copy path"]
+            [
+                "New terminal here",
+                "New thread here",
+                "Copy path",
+                "Project settings…"
+            ]
         );
         // The cards without a project have no root to start at.
         assert!(
@@ -2621,6 +2653,31 @@ mod tests {
             targets(shown_cards(&[group], false)),
             tab_targets(&["a", "d", "b", "f", "c", "e"])
         );
+    }
+
+    #[test]
+    fn pinned_projects_head_the_list_and_keep_their_order() {
+        let (compi, site, docs) = (
+            project("/work/compi"),
+            project("/work/site"),
+            project("/work/docs"),
+        );
+        let cards = vec![
+            tab_card("a", Some(&site)),
+            tab_card("b", None),
+            tab_card("c", Some(&compi)),
+            tab_card("d", Some(&docs)),
+        ];
+        let sections = project_sections(
+            cards,
+            |card| card.project.as_ref(),
+            |project| project.root != "/work/site",
+        );
+        let order: Vec<Option<&str>> = sections
+            .iter()
+            .map(|(project, _)| project.as_ref().map(Project::name))
+            .collect();
+        assert_eq!(order, [Some("compi"), Some("docs"), Some("site"), None]);
     }
 
     #[test]

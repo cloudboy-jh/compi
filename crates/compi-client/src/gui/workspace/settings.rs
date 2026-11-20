@@ -17,6 +17,7 @@
 //! cards, drawn on the page itself.
 use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
+use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectPart};
 use super::*;
 use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
 use crate::gui::controls::IconName;
@@ -155,6 +156,8 @@ pub(super) enum SettingsAction {
     PlayNotificationSound,
     OpenNotificationSystemSettings,
     TestNotification,
+    /// A control of a project's card on the Projects page.
+    Project(ProjectControl),
 }
 
 /// Where Settings controls are drawn: a Settings pane, or Quick Appearance.
@@ -255,6 +258,8 @@ pub(in crate::gui) struct SettingsUi {
     chat_agents: Option<Vec<ChatHarness>>,
     /// The last such question asked; a reply to an earlier one is dropped.
     chat_agents_asked: u64,
+    /// The project whose card is open on the Projects page, by `project_key`.
+    pub(super) project_open: Option<String>,
 }
 
 /// What a row's renderer needs: where it is drawn and how.
@@ -1135,6 +1140,16 @@ static ROWS: &[Row] = &[
             },
         ),
     ),
+    // Projects.
+    page_row(
+        PROJECTS_ROW,
+        SettingsSection::Projects,
+        "Projects",
+        "Each project's name, icon and pin, and the agent and model its new threads start with.",
+        "project projects folder repository rename name icon emoji monogram logo favicon pin pinned agent model new thread",
+        |app| app.project_stops(),
+        |app, row, _, cx| app.render_projects_page(row, cx),
+    ),
     // Keyboard.
     page_row(
         COMMANDS_ROW,
@@ -1553,6 +1568,9 @@ fn section_summary(section: SettingsSection) -> &'static str {
         SettingsSection::Notifications => "When and where Compi tells you a program needs you.",
         SettingsSection::Terminal => "Shell, starting folder, font, dev servers and prompt.",
         SettingsSection::Chat => "How agent chats look and behave.",
+        SettingsSection::Projects => {
+            "Each project's name, icon and pin, and what its new threads start with."
+        }
         SettingsSection::Keyboard => {
             "Click a shortcut, then press the new keys. Escape cancels; Backspace leaves the \
              command without one."
@@ -2696,6 +2714,22 @@ impl CompiApp {
             (
                 "left" | "right",
                 Some(Stop::Control {
+                    action:
+                        SettingsAction::Project(
+                            control @ ProjectControl {
+                                part: ProjectPart::Agent,
+                                ..
+                            },
+                        ),
+                    ..
+                }),
+            ) => {
+                self.step_project_agent(control, key.key == "right", false, cx);
+                current
+            }
+            (
+                "left" | "right",
+                Some(Stop::Control {
                     action: SettingsAction::NewTab,
                     ..
                 }),
@@ -3009,6 +3043,7 @@ impl CompiApp {
             SettingsAction::Density(density) => self.apply_density(density, window, cx),
             SettingsAction::ChooseStartingFolder => self.choose_starting_folder(cx),
             SettingsAction::StartAtHome => self.set_starting_folder(None, cx),
+            SettingsAction::Project(control) => self.activate_project_control(control, window, cx),
             SettingsAction::OpenSettings => {
                 self.open_settings(Some(SettingsSection::Appearance), None, window, cx)
             }
@@ -5858,6 +5893,7 @@ fn section_icon(section: SettingsSection) -> IconName {
         SettingsSection::Advanced => IconName::SlidersHorizontal,
         SettingsSection::Notifications => IconName::Bell,
         SettingsSection::Chat => IconName::MessageSquare,
+        SettingsSection::Projects => IconName::FolderCog,
     }
 }
 
@@ -5914,7 +5950,7 @@ fn share_launch_change(
 
 /// Gives every window a setting this one saved, since each keeps its own copy of the
 /// configuration.
-fn share_config_change(
+pub(super) fn share_config_change(
     cx: &mut Context<CompiApp>,
     change: impl Fn(&mut crate::config::LoadedConfig) + 'static,
 ) {
@@ -6176,14 +6212,17 @@ mod tests {
 
     #[test]
     fn every_row_sits_under_a_group_label_in_a_fixed_order() {
-        // Only page rows that draw their own labels have no group: the command list,
-        // Overview and the release notes.
+        // Only page rows that draw their own labels have no group: the project list,
+        // the command list, Overview and the release notes.
         let ungrouped: Vec<_> = ROWS
             .iter()
             .filter(|row| !row.header && row.group.is_none())
             .map(|row| row.id)
             .collect();
-        assert_eq!(ungrouped, [COMMANDS_ROW, MONITOR_ROW, "update-notes"]);
+        assert_eq!(
+            ungrouped,
+            [PROJECTS_ROW, COMMANDS_ROW, MONITOR_ROW, "update-notes"]
+        );
         assert!(
             ROWS.iter()
                 .filter(|row| ungrouped.contains(&row.id))
@@ -6224,6 +6263,7 @@ mod tests {
             groups(SettingsSection::Chat),
             ["Agent", "Messages", "Opening", "OMP"]
         );
+        assert_eq!(groups(SettingsSection::Projects), ["Projects"]);
         assert_eq!(groups(SettingsSection::Keyboard), ["Commands"]);
         assert_eq!(groups(SettingsSection::Monitor), ["Monitor"]);
         assert_eq!(

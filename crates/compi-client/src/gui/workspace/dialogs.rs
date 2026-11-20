@@ -1019,7 +1019,7 @@ impl CompiApp {
             .into_any_element()
     }
 
-    fn render_centered_scrim(
+    pub(super) fn render_centered_scrim(
         &self,
         panel: impl IntoElement,
         window: &Window,
@@ -1203,6 +1203,9 @@ impl CompiApp {
         if matches!(self.overlay, Some(Overlay::Arrangements { .. })) {
             return self.handle_arrangement_key(key, cx);
         }
+        if matches!(self.overlay, Some(Overlay::ProjectIcon(_))) {
+            return self.handle_icon_picker_key(key, window, cx);
+        }
         if matches!(
             self.overlay,
             Some(
@@ -1313,6 +1316,8 @@ impl CompiApp {
             self.render_new_tab_dialog(window, cx)
         } else if matches!(self.overlay, Some(Overlay::Arrangements { .. })) {
             self.render_arrangement_overlay(window, cx)
+        } else if matches!(self.overlay, Some(Overlay::ProjectIcon(_))) {
+            self.render_icon_picker(window, cx)
         } else {
             drop_down = true;
             self.render_list_overlay(window, cx)

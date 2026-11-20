@@ -56,6 +56,8 @@ typst-assets = { version = "=0.14.2", features = ["fonts"] }
 roxmltree = "0.20"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"] }
 raw-window-handle = "0.6"
+# Grapheme clusters: a project's emoji and its monogram's one or two letters.
+unicode-segmentation = "1"
 # Browser panes: the system webview (WebView2, WKWebView) as a child of the window.
 wry = { version = "0.57.1", default-features = false }
 

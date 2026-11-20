@@ -1,10 +1,12 @@
-//! Project icons: a project's own image (a favicon or logo the daemon finds in its
-//! folder), else a tile holding the first letter of its name in a colour of the theme's
-//! terminal palette, and for anything without a project the muted folder glyph. Each
-//! window keeps the images it was given ([`ProjectIcons`]), asking the daemon off the UI
-//! thread once per project every [`ICON_TTL`].
+//! Project icons: the icon you chose for a project in Settings → Projects (a Lucide
+//! icon, an emoji, a monogram or an image file), else its own image (a favicon or logo
+//! the daemon finds in its folder), else a tile holding the first letter of its name in
+//! a colour of the theme's terminal palette, and for anything without a project the
+//! muted folder glyph. Each window keeps the images it was given ([`ProjectIcons`]),
+//! asking the daemon off the UI thread once per project every [`ICON_TTL`].
 
 use super::*;
+use crate::config::ProjectIcon;
 use compi_protocol::{Project, ProjectIconImage};
 use std::cell::RefCell;
 
@@ -19,13 +21,13 @@ const TILE_COLORS: [usize; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
 
 /// The letter a project called `name` shows: the first letter or digit of its name,
 /// uppercase; `None` when it has none.
-fn tile_letter(name: &str) -> Option<String> {
+pub(super) fn tile_letter(name: &str) -> Option<String> {
     let first = name.chars().find(|c| c.is_alphanumeric())?;
     Some(first.to_uppercase().collect())
 }
 
 /// The ANSI colour index a project called `name` takes, the same for the same name.
-fn tile_color(name: &str) -> usize {
+pub(super) fn tile_color(name: &str) -> usize {
     let hash = name.to_lowercase().chars().fold(0usize, |hash, c| {
         hash.wrapping_mul(31).wrapping_add(c as usize)
     });
@@ -125,49 +127,117 @@ fn image_format(format: compi_protocol::ImageFormat) -> gpui::ImageFormat {
     }
 }
 
-/// A `size` px tile holding `letter` in `text`, on a tint of it, with the corners of
-/// Compi's chips.
-fn tile(letter: SharedString, text: u32, size: f32) -> gpui::AnyElement {
+/// A `size` px tile holding `text` (a letter, or a monogram's one or two) in `color`, on
+/// a tint of it, with the corners of Compi's chips.
+fn tile(text: SharedString, color: u32, size: f32) -> gpui::AnyElement {
+    let scale = if text.chars().count() > 1 { 0.46 } else { 0.62 };
     div()
         .flex_none()
         .size(px(size))
         .rounded(px(4.0))
-        .bg(gpui::rgba((text << 8) | 0x2e))
+        .bg(gpui::rgba((color << 8) | 0x2e))
         .flex()
         .items_center()
         .justify_center()
         .overflow_hidden()
-        .text_color(rgb(text))
+        .text_color(rgb(color))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(size * 0.62))
+        .text_size(px(size * scale))
         .line_height(px(size))
-        .child(letter)
+        .child(text)
         .into_any_element()
 }
 
 impl CompiApp {
-    /// `project`'s icon, `size` px square: its image once the daemon found one and it
-    /// decodes, else its letter tile; for no project, or a name without a letter, the
-    /// folder glyph.
+    /// The terminal palette's colour `index` (0–15), made legible on the theme's
+    /// surfaces; `None` past the palette.
+    pub(super) fn icon_color(&self, index: usize) -> Option<u32> {
+        let ansi = self.theme.terminal().ansi.get(index).copied()?;
+        Some(modal_text_color(ansi, self.theme.colors()))
+    }
+
+    /// `icon` drawn `size` px square; `None` for a Lucide icon Compi does not have or
+    /// a colour past the palette. An image file that fails to load shows `fallback`.
+    pub(super) fn chosen_icon(
+        &self,
+        icon: &ProjectIcon,
+        size: f32,
+        fallback: impl Fn() -> gpui::AnyElement + Clone + 'static,
+    ) -> Option<gpui::AnyElement> {
+        Some(match icon {
+            ProjectIcon::Lucide { name, color } => gpui::svg()
+                .flex_none()
+                .size(px(size))
+                .path(lucide_icons::path(name)?)
+                .text_color(rgb(self.icon_color(usize::from(*color))?))
+                .into_any_element(),
+            ProjectIcon::Emoji { emoji } => div()
+                .flex_none()
+                .size(px(size))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .text_size(px(size * 0.8))
+                .line_height(px(size))
+                .child(SharedString::from(emoji.clone()))
+                .into_any_element(),
+            ProjectIcon::Monogram { text, color } => tile(
+                text.clone().into(),
+                self.icon_color(usize::from(*color))?,
+                size,
+            ),
+            ProjectIcon::File { path } => gpui::img(std::path::PathBuf::from(path))
+                .flex_none()
+                .size(px(size))
+                .rounded(px(4.0))
+                .object_fit(gpui::ObjectFit::Contain)
+                .with_loading(fallback.clone())
+                .with_fallback(fallback)
+                .into_any_element(),
+        })
+    }
+
+    /// `project`'s icon, `size` px square: the one you chose for it, else its image once
+    /// the daemon found one and it decodes, else its letter tile; for no project, or a
+    /// name without a letter, the folder glyph.
     pub(super) fn project_icon(&self, project: Option<&Project>, size: f32) -> gpui::AnyElement {
         let colors = self.theme.colors();
-        let folder = || {
+        let folder_color = modal_text_color(colors.muted, colors);
+        let folder = move || {
             gpui::svg()
                 .flex_none()
                 .size(px(size))
                 .path(controls::IconName::Folder.path())
-                .text_color(rgb(modal_text_color(colors.muted, colors)))
+                .text_color(rgb(folder_color))
                 .into_any_element()
         };
         let Some(project) = project else {
             return folder();
         };
-        let name = project.name();
-        let Some(letter) = tile_letter(name) else {
-            return folder();
+        let name = self.project_name(project);
+        let letter = tile_letter(&name).map(|letter| {
+            let letter: SharedString = letter.into();
+            let text = modal_text_color(self.theme.terminal().ansi[tile_color(&name)], colors);
+            (letter, text)
+        });
+        let automatic = {
+            let letter = letter.clone();
+            move || match &letter {
+                Some((letter, text)) => tile(letter.clone(), *text, size),
+                None => folder(),
+            }
         };
-        let letter: SharedString = letter.into();
-        let text = modal_text_color(self.theme.terminal().ansi[tile_color(name)], colors);
+        if let Some(icon) = self
+            .project_settings(project)
+            .and_then(|settings| settings.icon.as_ref())
+            && let Some(icon) = self.chosen_icon(icon, size, automatic.clone())
+        {
+            return icon;
+        }
+        if letter.is_none() {
+            return folder();
+        }
         let image = self.project_icons.image(project, || {
             let (target, sender, project) =
                 (self.target.clone(), self.event_tx.clone(), project.clone());
@@ -180,18 +250,15 @@ impl CompiApp {
             });
         });
         match image {
-            Some(image) => {
-                let fallback = move || tile(letter.clone(), text, size);
-                gpui::img(gpui::ImageSource::Image(image))
-                    .flex_none()
-                    .size(px(size))
-                    .rounded(px(4.0))
-                    .object_fit(gpui::ObjectFit::Contain)
-                    .with_loading(fallback.clone())
-                    .with_fallback(fallback)
-                    .into_any_element()
-            }
-            None => tile(letter, text, size),
+            Some(image) => gpui::img(gpui::ImageSource::Image(image))
+                .flex_none()
+                .size(px(size))
+                .rounded(px(4.0))
+                .object_fit(gpui::ObjectFit::Contain)
+                .with_loading(automatic.clone())
+                .with_fallback(automatic)
+                .into_any_element(),
+            None => automatic(),
         }
     }
 }

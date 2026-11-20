@@ -1257,6 +1257,7 @@ dependencies = [
  "typst",
  "typst-assets",
  "typst-svg",
+ "unicode-segmentation",
  "webview2-com",
  "windows 0.62.2",
  "winresource",

@@ -306,6 +306,57 @@ impl NewTab {
     }
 }
 
+/// What you set for one project in Settings → Projects, `[projects."<key>"]`; every
+/// field unset keeps the project's own (its folder's name, its favicon or letter, the
+/// default agent and that agent's model).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSettings {
+    /// The name it goes by instead of its folder's.
+    pub name: Option<String>,
+    pub icon: Option<ProjectIcon>,
+    /// Pinned projects come first in the sidebar's project headers and the palette.
+    pub pinned: bool,
+    /// The agent new threads in the project start with.
+    pub agent: Option<ChatHarness>,
+    /// The model new threads in the project start on (the agent's own model id).
+    pub model: Option<String>,
+}
+
+/// A project's chosen icon. `color` is an index into the theme's terminal palette
+/// (0–15), as the automatic letter tiles use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectIcon {
+    /// A Lucide icon by its name (`rocket`, `square-terminal`).
+    Lucide {
+        name: String,
+        color: u8,
+    },
+    Emoji {
+        emoji: String,
+    },
+    /// One or two letters or digits.
+    Monogram {
+        text: String,
+        color: u8,
+    },
+    /// An image file (PNG, SVG or ICO) Compi copied into its data folder.
+    File {
+        path: String,
+    },
+}
+
+/// The key `project` is kept under in `[projects]`: `host:<root>` or
+/// `wsl:<distribution>:<root>`.
+pub fn project_key(project: &compi_protocol::Project) -> String {
+    match &project.environment {
+        compi_protocol::ContentEnvironment::Host => format!("host:{}", project.root),
+        compi_protocol::ContentEnvironment::Wsl { distribution } => {
+            format!("wsl:{distribution}:{}", project.root)
+        }
+    }
+}
+
 /// Recent models a harness's model picker lists.
 pub const MAX_RECENT_CHAT_MODELS: usize = 5;
 
@@ -729,6 +780,10 @@ pub struct LoadedConfig {
     /// The agent every new thread starts with, `[chat] agent`.
     #[serde(default)]
     pub chat_agent: ChatHarness,
+    /// What you set for each project in Settings → Projects, by `project_key`,
+    /// `[projects."<key>"]`.
+    #[serde(default)]
+    pub projects: HashMap<String, ProjectSettings>,
     /// The bar listing a chat's running sub-agents above its composer, `[chat] agents_bar`.
     #[serde(default = "default_chat_agents_bar")]
     pub chat_agents_bar: bool,
@@ -775,6 +830,7 @@ impl Default for LoadedConfig {
             chat_open: ChatOpen::InPlace,
             new_tab: None,
             chat_agent: ChatHarness::Omp,
+            projects: HashMap::new(),
             chat_agents_bar: true,
             chat_models: HashMap::new(),
             dev_server: DevServer::Offer,
@@ -1255,6 +1311,57 @@ impl LoadedConfig {
             self.chat_models.remove(&harness);
         } else {
             self.chat_models.insert(harness, models);
+        }
+        Ok(())
+    }
+
+    /// The agent a new thread in `project` starts with: the project's
+    /// (`[projects."<key>"] agent`), else `[chat] agent`.
+    pub fn new_thread_agent(&self, project: Option<&compi_protocol::Project>) -> ChatHarness {
+        project
+            .and_then(|project| self.projects.get(&project_key(project)))
+            .and_then(|settings| settings.agent)
+            .unwrap_or(self.chat_agent)
+    }
+
+    /// Persist what you set for the project under `key` (`project_key`) in Settings →
+    /// Projects; nothing set removes its table.
+    pub fn save_project_settings(
+        &mut self,
+        key: &str,
+        settings: ProjectSettings,
+    ) -> Result<(), String> {
+        update_table(&self.path, "projects", |projects| {
+            projects.set_implicit(true);
+            if settings == ProjectSettings::default() {
+                projects.remove(key);
+                return;
+            }
+            let item = projects
+                .entry(key)
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+            if !item.is_table() {
+                *item = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let Some(table) = item.as_table_mut() else {
+                return;
+            };
+            let mut set = |field: &str, value: Option<toml_edit::Value>| match value {
+                Some(value) => set_table_value(table, field, value),
+                None => {
+                    table.remove(field);
+                }
+            };
+            set("name", settings.name.as_deref().map(Into::into));
+            set("icon", settings.icon.as_ref().map(project_icon_to_toml));
+            set("pinned", settings.pinned.then(|| true.into()));
+            set("agent", settings.agent.map(|agent| agent.program().into()));
+            set("model", settings.model.as_deref().map(Into::into));
+        })?;
+        if settings == ProjectSettings::default() {
+            self.projects.remove(key);
+        } else {
+            self.projects.insert(key.to_owned(), settings);
         }
         Ok(())
     }
@@ -2220,6 +2327,7 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
     apply_presentation(&document, loaded);
     apply_layout_presets(&document, loaded);
     apply_launch(&document, loaded);
+    apply_projects(&document, loaded);
     if let Some(metadata) = table(&document, "metadata", loaded) {
         for key in ["directory", "process", "git", "dimensions"] {
             if let Some(value) = metadata.get(key) {
@@ -2684,6 +2792,121 @@ fn load_chat_models(table: &toml::Table, key: &str, loaded: &mut LoadedConfig) -
     }
     models.recents.truncate(MAX_RECENT_CHAT_MODELS);
     models
+}
+
+fn project_icon_to_toml(icon: &ProjectIcon) -> toml_edit::Value {
+    let mut table = toml_edit::InlineTable::new();
+    let mut put = |key: &str, value: toml_edit::Value| {
+        table.insert(key, value);
+    };
+    match icon {
+        ProjectIcon::Lucide { name, color } => {
+            put("kind", "lucide".into());
+            put("name", name.as_str().into());
+            put("color", i64::from(*color).into());
+        }
+        ProjectIcon::Emoji { emoji } => {
+            put("kind", "emoji".into());
+            put("emoji", emoji.as_str().into());
+        }
+        ProjectIcon::Monogram { text, color } => {
+            put("kind", "monogram".into());
+            put("text", text.as_str().into());
+            put("color", i64::from(*color).into());
+        }
+        ProjectIcon::File { path } => {
+            put("kind", "file".into());
+            put("path", path.as_str().into());
+        }
+    }
+    toml_edit::Value::InlineTable(table)
+}
+
+/// Whether a project icon read from the configuration can be drawn: a palette colour
+/// (0–15), and a monogram of one or two letters or digits.
+fn valid_project_icon(icon: &ProjectIcon) -> bool {
+    match icon {
+        ProjectIcon::Lucide { name, color } => !name.is_empty() && *color < 16,
+        ProjectIcon::Emoji { emoji } => !emoji.is_empty(),
+        ProjectIcon::Monogram { text, color } => {
+            (1..=2).contains(&text.chars().count())
+                && text.chars().all(char::is_alphanumeric)
+                && *color < 16
+        }
+        ProjectIcon::File { path } => !path.is_empty(),
+    }
+}
+
+fn apply_projects(document: &toml::Table, loaded: &mut LoadedConfig) {
+    let Some(projects) = table(document, "projects", loaded) else {
+        return;
+    };
+    for (key, value) in projects {
+        let field = format!("projects.\"{key}\"");
+        let Some(table) = value.as_table() else {
+            invalid(loaded, &field, "a table", "configuration");
+            continue;
+        };
+        let mut settings = ProjectSettings::default();
+        for (name, slot) in [("name", &mut settings.name), ("model", &mut settings.model)] {
+            if let Some(value) = table.get(name) {
+                match value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(value) => *slot = Some(value.to_owned()),
+                    None => invalid(
+                        loaded,
+                        &format!("{field}.{name}"),
+                        "a name",
+                        "configuration",
+                    ),
+                }
+            }
+        }
+        if let Some(value) = table.get("icon") {
+            match value
+                .clone()
+                .try_into::<ProjectIcon>()
+                .ok()
+                .filter(valid_project_icon)
+            {
+                Some(icon) => settings.icon = Some(icon),
+                None => invalid(
+                    loaded,
+                    &format!("{field}.icon"),
+                    "a lucide, emoji, monogram or file icon",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = table.get("pinned") {
+            match value.as_bool() {
+                Some(pinned) => settings.pinned = pinned,
+                None => invalid(
+                    loaded,
+                    &format!("{field}.pinned"),
+                    "true or false",
+                    "configuration",
+                ),
+            }
+        }
+        if let Some(value) = table.get("agent") {
+            match value.as_str().and_then(ChatHarness::parse) {
+                Some(agent) => settings.agent = Some(agent),
+                None => invalid(
+                    loaded,
+                    &format!("{field}.agent"),
+                    "\"omp\" or \"claude\"",
+                    "configuration",
+                ),
+            }
+        }
+        if settings != ProjectSettings::default() {
+            loaded.projects.insert(key.clone(), settings);
+        }
+    }
 }
 
 fn invalid(loaded: &mut LoadedConfig, field: &str, expected: &str, origin: &str) {
@@ -3582,6 +3805,127 @@ mod tests {
             .save_chat_models(ChatHarness::Omp, ChatModels::default())
             .unwrap();
         assert!(!fs::read_to_string(&path).unwrap().contains("[chat.omp]"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn project_settings_round_trip_under_their_key_and_unset_removes_the_table() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-project-settings-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[chat]\nagent = 'claude'\n").unwrap();
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert!(loaded.projects.is_empty());
+        let project = compi_protocol::Project {
+            environment: compi_protocol::ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+            },
+            root: "/home/me/compi".into(),
+        };
+        let key = project_key(&project);
+        assert_eq!(key, "wsl:Ubuntu:/home/me/compi");
+        let windows = compi_protocol::Project {
+            environment: compi_protocol::ContentEnvironment::Host,
+            root: r"C:\Users\me\site".into(),
+        };
+        let settings = ProjectSettings {
+            name: Some("Compi".into()),
+            icon: Some(ProjectIcon::Lucide {
+                name: "rocket".into(),
+                color: 4,
+            }),
+            pinned: true,
+            agent: Some(ChatHarness::Omp),
+            model: Some("anthropic/claude-opus-5-5".into()),
+        };
+        loaded
+            .save_project_settings(&key, settings.clone())
+            .unwrap();
+        let monogram = ProjectSettings {
+            icon: Some(ProjectIcon::Monogram {
+                text: "S1".into(),
+                color: 15,
+            }),
+            ..ProjectSettings::default()
+        };
+        loaded
+            .save_project_settings(&project_key(&windows), monogram.clone())
+            .unwrap();
+        let reloaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(reloaded.projects.get(&key), Some(&settings));
+        assert_eq!(
+            reloaded.projects.get(r"host:C:\Users\me\site"),
+            Some(&monogram)
+        );
+        assert_eq!(reloaded.chat_agent, ChatHarness::Claude);
+        // New threads start with the project's agent, else `[chat] agent`.
+        assert_eq!(reloaded.new_thread_agent(Some(&project)), ChatHarness::Omp);
+        assert_eq!(
+            reloaded.new_thread_agent(Some(&windows)),
+            ChatHarness::Claude
+        );
+        assert_eq!(reloaded.new_thread_agent(None), ChatHarness::Claude);
+        assert!(
+            reloaded.diagnostics.is_empty(),
+            "{:?}",
+            reloaded.diagnostics
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("[projects.\"wsl:Ubuntu:/home/me/compi\"]"),
+            "{text}"
+        );
+        assert!(!text.contains("[projects]\n"), "{text}");
+
+        // Clearing a field removes only that key; clearing everything removes the table.
+        loaded
+            .save_project_settings(
+                &key,
+                ProjectSettings {
+                    name: None,
+                    ..settings.clone()
+                },
+            )
+            .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("name = \"Compi\""), "{text}");
+        assert!(text.contains("pinned = true"), "{text}");
+        loaded
+            .save_project_settings(&key, ProjectSettings::default())
+            .unwrap();
+        loaded
+            .save_project_settings(&project_key(&windows), ProjectSettings::default())
+            .unwrap();
+        assert!(loaded.projects.is_empty());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("projects"), "{text}");
+
+        fs::write(
+            &path,
+            "version = 1\n[projects.'host:/a']\nname = ''\npinned = 'yes'\nagent = 'codex'\n\
+             icon = { kind = 'monogram', text = 'ABC', color = 3 }\nmodel = 'm'\n\
+             [projects.'host:/b']\nicon = { kind = 'lucide', name = 'rocket', color = 16 }\n\
+             [projects.'host:/c']\nicon = { kind = 'sticker' }\n",
+        )
+        .unwrap();
+        let invalid = load(Some(&path), FontOverrides::default());
+        assert_eq!(
+            invalid.projects.get("host:/a"),
+            Some(&ProjectSettings {
+                model: Some("m".into()),
+                ..ProjectSettings::default()
+            })
+        );
+        assert!(!invalid.projects.contains_key("host:/b"));
+        assert!(!invalid.projects.contains_key("host:/c"));
+        assert_eq!(invalid.diagnostics.len(), 6, "{:?}", invalid.diagnostics);
         fs::remove_dir_all(root).ok();
     }
 

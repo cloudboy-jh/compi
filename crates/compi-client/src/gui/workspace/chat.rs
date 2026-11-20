@@ -265,6 +265,10 @@ struct ChatModel {
     /// The permissions this chat's harness starts with, picked in its model picker;
     /// `None` follows Settings → Chat → Approvals. The watcher passes it on.
     approval: Arc<Mutex<Option<ChatApproval>>>,
+    /// What its new sessions start on, which the watcher's next `WatchChat` passes on:
+    /// what Compi remembers of its harness, on its project's model (see
+    /// `CompiApp::new_session_picks`); kept current before each frame.
+    start: Arc<Mutex<ChatPicks>>,
 }
 
 /// The chats of this window.
@@ -275,10 +279,6 @@ pub(in crate::gui) struct ChatUi {
     ticking: bool,
     /// Settings → Chat → Approvals, which each watcher's next `WatchChat` passes on.
     approval: Arc<Mutex<ChatApproval>>,
-    /// What each harness's new sessions start on, which `WatchChat` passes on; kept
-    /// from the configuration since `picks_synced`.
-    picks: Arc<Mutex<HashMap<ChatHarness, ChatPicks>>>,
-    picks_synced: bool,
     /// Text for each chat's draft (terminal text sent to it), until the chat has client
     /// state.
     pending: HashMap<String, String>,
@@ -654,14 +654,14 @@ impl WatchApproval {
 }
 
 /// Starts the watcher of chat `id`: each connection watches `chat` as it is then, so a
-/// session the pane learned resumes after a daemon restart, with `approval` and the
-/// harness's `picks` as they are then.
+/// session the pane learned resumes after a daemon restart, with `approval` and what a
+/// new session starts on (`picks`) as they are then.
 fn watch_chat(
     link: WatchLink,
     id: Arc<str>,
     chat: Arc<Mutex<ChatContent>>,
     approval: WatchApproval,
-    picks: Arc<Mutex<HashMap<ChatHarness, ChatPicks>>>,
+    picks: Arc<Mutex<ChatPicks>>,
     generation: u64,
     stop: mpsc::Receiver<()>,
 ) {
@@ -684,10 +684,7 @@ fn watch_chat(
                 let Some(approval) = approval.get() else {
                     return WatchEnd::Stopped;
                 };
-                let Ok(picks) = picks
-                    .lock()
-                    .map(|picks| picks.get(&content.harness).cloned().unwrap_or_default())
-                else {
+                let Ok(picks) = picks.lock().map(|picks| picks.clone()) else {
                     return WatchEnd::Stopped;
                 };
                 let state = match client.watch_chat(content, approval, picks) {
@@ -825,7 +822,7 @@ impl CompiApp {
             self.focus_pane(pane);
             Some(chat)
         } else {
-            self.open_chat(self.config.chat_agent, window, cx)
+            self.open_chat(self.new_thread_agent(self.selected_project()), window, cx)
         };
         let Some(chat) = chat else {
             return;
@@ -975,7 +972,13 @@ impl CompiApp {
         }
         let mutation_pending = self.mutation_pending;
         let mut update = None;
-        for &(pane_id, chat) in &present {
+        let starts: Vec<ChatPicks> = present
+            .iter()
+            .map(|&(pane_id, chat)| {
+                self.new_session_picks(chat.harness, self.pane_project(pane_id))
+            })
+            .collect();
+        for (&(pane_id, chat), start) in present.iter().zip(starts) {
             let Some(model) = self.chat.chats.get_mut(&chat.id) else {
                 continue;
             };
@@ -983,6 +986,11 @@ impl CompiApp {
                 && *watched != *chat
             {
                 *watched = chat.clone();
+            }
+            if let Ok(mut picks) = model.start.lock()
+                && *picks != start
+            {
+                *picks = start;
             }
             let Some(session) = model
                 .state
@@ -1024,9 +1032,6 @@ impl CompiApp {
         if let Ok(mut approval) = self.chat.approval.lock() {
             *approval = self.config.chat_approval;
         }
-        if !self.chat.picks_synced {
-            self.sync_chat_picks();
-        }
         let link = self.watch_link();
         let mut linger = false;
         for (id, model) in &mut self.chat.chats {
@@ -1041,7 +1046,7 @@ impl CompiApp {
                             chosen: model.approval.clone(),
                             default: self.chat.approval.clone(),
                         },
-                        self.chat.picks.clone(),
+                        model.start.clone(),
                         generation,
                         stop,
                     );
@@ -1153,6 +1158,7 @@ impl CompiApp {
             session_sent: None,
             picker_anchor: Rc::default(),
             approval: Arc::default(),
+            start: Arc::default(),
         }
     }
 
@@ -1202,27 +1208,12 @@ impl CompiApp {
         stopped
     }
 
-    /// Passes what each harness's new sessions start on to the chat watchers, from the
-    /// configuration.
-    pub(super) fn sync_chat_picks(&mut self) {
-        if let Ok(mut picks) = self.chat.picks.lock() {
-            *picks = self
-                .config
-                .chat_models
-                .iter()
-                .map(|(harness, models)| (*harness, models.picks.clone()))
-                .collect();
-            self.chat.picks_synced = true;
-        }
-    }
-
-    /// What chat `chat`'s harness's new sessions start on.
+    /// What a new session of chat `chat` starts on: see `CompiApp::new_session_picks`.
     fn chat_start_picks(&self, chat: &str) -> ChatPicks {
-        self.chat
-            .chats
-            .get(chat)
-            .and_then(|model| self.config.chat_models.get(&model.harness()))
-            .map(|models| models.picks.clone())
+        self.chat_pane(chat)
+            .map(|(pane_id, content)| {
+                self.new_session_picks(content.harness, self.pane_project(&pane_id))
+            })
             .unwrap_or_default()
     }
 

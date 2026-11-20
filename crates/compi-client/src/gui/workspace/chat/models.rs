@@ -557,7 +557,6 @@ impl CompiApp {
         if let Err(error) = self.config.save_chat_models(harness, models) {
             self.global_error = Some(error);
         }
-        self.sync_chat_picks();
     }
 
     /// The composer row's model button: the model's mark and name, then a brain and the

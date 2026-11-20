@@ -719,7 +719,7 @@ Baseline commands cover:
 - Show/hide workspace sidebar and reset sidebar width.
 - Copy, paste, select all where appropriate, and clear scrollback.
 - Font size larger/smaller/reset (`zoom_in`, `zoom_out`, `zoom_reset`): one step is 1 px on whole sizes, from 6 to 72; reset removes `[font] size`. Every window follows, and **Settings → Terminal → Font size** shows the size with the same three controls.
-- Open compact Quick Appearance and responsive two-pane Settings for appearance, interface, notifications, terminal, keyboard, monitor, updates and advanced controls.
+- Open compact Quick Appearance and responsive two-pane Settings for appearance, interface, notifications, terminal, chat, projects, keyboard, monitor, updates and advanced controls.
 - Open the TOML configuration file, reset client layout, rebuild client rendering caches without touching terminal processes, reconnect the current window, safely restart the daemon, and open diagnostics.
 - Quit client, explicitly separate from stopping the server.
 

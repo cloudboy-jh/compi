@@ -80,6 +80,32 @@ model = "opus" # unset uses Claude Code's own
 favorites = ["opus", "sonnet"]
 ```
 
+## Projects
+
+A project is the folder a tab or thread works in: its Git repository's top folder, else the folder itself. **Settings → Projects** lists the projects of open tabs under **Open**, then those of recent threads and any other project you set something for under **Recent**, pinned ones first in each. Click a project's card (or press Enter on it) to open its settings; one card is open at a time. Right-clicking a project header in the sidebar and choosing **Project settings…** opens its card here. Every change saves at once and applies in every window.
+
+- **Name** is what tabs' tooltips, the sidebar's project headers and cards, the palette's project list and a new thread's draft call the project; typing it in the palette finds the project, as its folder does. **Rename…** gives it a name; **Reset** (or renaming it to its folder's name) goes back to the folder's.
+- **Icon** shows the icon every place uses. **Automatic** is the project's favicon or logo, else its first letter on a coloured tile. **Choose icon…** picks a Lucide icon (search them all by name) or a monogram of one or two letters or numbers, each in a colour of the terminal palette, or an emoji; **Choose file…** takes a PNG, SVG or ICO, which Compi copies into its data folder (`project-icons/`). **Reset** goes back to Automatic.
+- **Pin** puts the project first among the sidebar's project headers and in the palette's project list.
+- **New threads' agent** is the agent new threads in the project start with (New thread here, New thread, a new tab, New chat, `compi chat` without `--agent`): **Default** follows **Settings → Chat → Default agent**, or pick **OMP** or **Claude Code**. Changing it clears the model.
+- **New threads' model** is the model those threads start on: the agent's default (what it starts on elsewhere, see the model picker under [Chat](#chat)), or one of that agent's favorite and recent models. Picking a model while the agent is Default keeps the agent it belongs to as the project's.
+
+Projects are kept under `[projects]`, each under its key: `host:<folder>`, or `wsl:<distribution>:<folder>` for a project in WSL. A project with nothing set has no table.
+
+```toml
+[projects."wsl:Ubuntu:/home/me/compi"]
+name = "Compi"
+icon = { kind = "lucide", name = "rocket", color = 4 } # color: terminal palette index, 0 through 15
+pinned = true
+agent = "claude" # omp or claude; unset follows [chat] agent
+model = "opus" # the agent's own name for the model; unset starts on the agent's default
+
+[projects.'host:C:\Users\me\site']
+icon = { kind = "monogram", text = "S", color = 2 } # one or two letters or numbers
+# icon = { kind = "emoji", emoji = "🚀" }
+# icon = { kind = "file", path = "C:\\Users\\me\\AppData\\…\\project-icons\\….png" }
+```
+
 ## Pane density
 
 **Settings → Interface → Pane density** chooses how terminal panes sit in every window, independent of themes, prompts and transparency:

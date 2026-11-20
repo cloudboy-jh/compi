@@ -28,6 +28,8 @@ pub(in crate::gui) mod pane_drag;
 pub(in crate::gui) mod performance;
 pub(in crate::gui) mod presentation;
 pub(in crate::gui) mod program_status;
+pub(in crate::gui) mod project_icon_picker;
+pub(in crate::gui) mod project_settings;
 pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod remote;
 pub(in crate::gui) mod settings;
@@ -354,6 +356,8 @@ pub(super) enum TextPurpose {
     /// A new group holding the tab; the name may be empty.
     NewTabGroup(TabId),
     RenameTabGroup(compi_protocol::TabGroupId),
+    /// The name a project goes by; its folder's name, or nothing, resets it.
+    RenameProject(compi_protocol::Project),
 }
 
 impl TextPurpose {
@@ -435,6 +439,8 @@ pub(super) enum Overlay {
         /// Other tabs in this workspace to merge into `tab_id`, in tab order.
         merge: Vec<TabId>,
     },
+    /// Choose project icon, from Settings → Projects.
+    ProjectIcon(Box<project_icon_picker::IconPicker>),
 }
 
 /// The popup open on a control, at most one: a select's list, a menu or a popover
@@ -461,6 +467,8 @@ pub(super) enum Popup {
     CatalogMenu,
     /// The Appearance controls under the sidebar's Appearance button.
     QuickAppearance,
+    /// Settings → Projects → New threads' model, of the card open.
+    ProjectModel,
 }
 
 pub(super) const MODAL_SCRIM_OPACITY: f32 = 0.72;
@@ -3630,7 +3638,7 @@ impl CompiApp {
         self.set_new_tab(new_tab, cx);
         self.dismiss_overlay();
         if new_tab == crate::config::NewTab::Chat {
-            self.create_thread_tab(self.config.chat_agent);
+            self.create_thread_tab(self.new_thread_agent(self.selected_project()));
         }
         cx.notify();
     }
@@ -3879,8 +3887,10 @@ impl CompiApp {
         self.ime_selected_range = cursor..cursor;
         self.ime_marked_range = None;
         self.overlay_index = 0;
-        if matches!(self.overlay, Some(Overlay::Palette)) {
-            self.palette_query_changed();
+        match self.overlay {
+            Some(Overlay::Palette) => self.palette_query_changed(),
+            Some(Overlay::ProjectIcon(_)) => self.icon_picker_text_changed(),
+            _ => {}
         }
     }
 
@@ -3942,11 +3952,15 @@ impl CompiApp {
                 }
             }
             Command::NewTab => match self.config.new_tab.unwrap_or_default() {
-                crate::config::NewTab::Chat => self.create_thread_tab(self.config.chat_agent),
+                crate::config::NewTab::Chat => {
+                    self.create_thread_tab(self.new_thread_agent(self.selected_project()))
+                }
                 crate::config::NewTab::Terminal => self.create_terminal_tab(),
             },
             Command::NewTerminalTab => self.create_terminal_tab(),
-            Command::NewThreadTab => self.create_thread_tab(self.config.chat_agent),
+            Command::NewThreadTab => {
+                self.create_thread_tab(self.new_thread_agent(self.selected_project()))
+            }
             Command::SwitchTab => self.open_overlay(Overlay::Tabs { hidden_only: false }, ""),
             Command::RestoreHiddenTab => self.open_overlay(Overlay::Tabs { hidden_only: true }, ""),
             Command::PreviousTab | Command::NextTab => {
@@ -4357,7 +4371,7 @@ impl CompiApp {
             Command::OpenMonitor => self.open_monitor(window, cx),
             Command::OpenBrowser => self.open_browser(compi_protocol::BrowserContent::BLANK.into()),
             Command::OpenChat => {
-                self.open_chat(self.config.chat_agent, window, cx);
+                self.open_chat(self.new_thread_agent(self.selected_project()), window, cx);
             }
             Command::OpenChatOmp => {
                 self.open_chat(compi_protocol::chat::ChatHarness::Omp, window, cx);
@@ -4553,6 +4567,12 @@ impl CompiApp {
                     }
                     TextPurpose::NewTabGroup(tab_id) => {
                         self.create_group(tab_id, label);
+                        window.focus(&self.focus_handle, cx);
+                        cx.notify();
+                        return;
+                    }
+                    TextPurpose::RenameProject(project) => {
+                        self.rename_project(&project, &label, cx);
                         window.focus(&self.focus_handle, cx);
                         cx.notify();
                         return;
@@ -5627,7 +5647,7 @@ impl CompiApp {
             let context = [
                 tab.project
                     .as_ref()
-                    .map(|project| format!("{} · {}", project.name(), project.root)),
+                    .map(|project| format!("{} · {}", self.project_name(project), project.root)),
                 self.tab_group(&tab.id)
                     .map(|group| format!("In {}", tab_groups::group_title(group))),
             ];

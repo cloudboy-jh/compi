@@ -549,9 +549,36 @@ fn generate_font_catalog() {
     fs::write(destination.join("font_catalog.rs"), output).expect("write generated font catalog");
 }
 
+/// Every Lucide icon in `assets/lucide`, by name in order, with its path in the
+/// application's assets and its SVG.
+fn generate_lucide_icons() {
+    const SOURCE: &str = "assets/lucide";
+    println!("cargo:rerun-if-changed={SOURCE}");
+    let mut names: Vec<String> = fs::read_dir(SOURCE)
+        .expect("read bundled Lucide icons")
+        .map(|entry| entry.expect("read bundled Lucide icon").file_name())
+        .filter_map(|file| file.to_str()?.strip_suffix(".svg").map(str::to_owned))
+        .collect();
+    names.sort_unstable();
+    let mut output = String::from(
+        "// Generated from assets/lucide; do not edit.\nconst ICONS: &[(&str, &str, &[u8])] = &[\n",
+    );
+    for name in &names {
+        writeln!(
+            output,
+            "    ({name:?}, \"lucide/{name}.svg\", include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/{SOURCE}/{name}.svg\")).as_slice()),"
+        )
+        .unwrap();
+    }
+    output.push_str("];\n");
+    let destination = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+    fs::write(destination.join("lucide_icons.rs"), output).expect("write generated Lucide icons");
+}
+
 fn main() {
     generate_catalog();
     generate_font_catalog();
+    generate_lucide_icons();
     println!("cargo:rerun-if-changed=../../assets/Compi-desktopappicon-v4.ico");
 
     #[cfg(windows)]

@@ -157,6 +157,8 @@ pub(super) struct Sources<'a> {
     pub projects: &'a ProjectHistory,
     /// Why a new tab cannot open now, which disables project rows.
     pub project_reason: Option<&'a str>,
+    /// What Settings → Projects set for a visited folder taken as a project.
+    pub project_look: &'a dyn Fn(&str) -> ProjectLook,
     pub files: Files<'a>,
     /// The Project files scope's rows.
     pub project_files: ProjectFiles<'a>,
@@ -164,6 +166,14 @@ pub(super) struct Sources<'a> {
     pub threads: Threads<'a>,
     /// Now, in milliseconds since the epoch, for the threads' ages.
     pub now_ms: u64,
+}
+
+/// What Settings → Projects set for a project the palette lists: the name it goes by,
+/// else its folder's, and whether it is pinned, which lists it first.
+#[derive(Default)]
+pub(super) struct ProjectLook {
+    pub name: Option<String>,
+    pub pinned: bool,
 }
 
 #[derive(Debug)]
@@ -258,14 +268,21 @@ pub(super) fn choices(query: &str, scope: Option<Scope>, sources: &Sources) -> V
             (None, true) => RECENT_PROJECTS,
             (None, false) => MATCHED_PROJECTS,
         };
-        // An empty query ranks by frecency alone; only typed text is fuzzy-matched.
-        let rows: Vec<Row> = sources
+        // An empty query ranks by frecency alone; only typed text is fuzzy-matched, to the
+        // folder or the name its project goes by. Pinned projects come first, before the
+        // limit.
+        let mut found: Vec<(&str, ProjectLook)> = sources
             .projects
-            .search(query)
+            .search_named(query, |path| (sources.project_look)(path).name)
+            .into_iter()
+            .map(|path| (path, (sources.project_look)(path)))
+            .collect();
+        found.sort_by_key(|(_, look)| !look.pinned);
+        let rows: Vec<Row> = found
             .into_iter()
             .take(limit)
-            .map(|path| Row {
-                title: concise_path_title(path),
+            .map(|(path, look)| Row {
+                title: look.name.unwrap_or_else(|| concise_path_title(path)),
                 detail: path.to_owned(),
                 reason: sources.project_reason.map(str::to_owned),
                 target: Target::Project(path.to_owned()),
@@ -906,6 +923,15 @@ impl CompiApp {
                 commands: &commands,
                 projects: &self.state.project_history,
                 project_reason: Command::NewTab.disabled_reason(&context),
+                project_look: &|path| {
+                    let project = self.visited_project(path);
+                    ProjectLook {
+                        name: self
+                            .project_settings(&project)
+                            .and_then(|settings| settings.name.clone()),
+                        pinned: self.project_pinned(&project),
+                    }
+                },
                 files,
                 project_files,
                 threads,
@@ -1185,6 +1211,7 @@ mod tests {
             commands: &commands,
             projects: &projects,
             project_reason: None,
+            project_look: &|_| ProjectLook::default(),
             files: Files::Found(&hits),
             threads: Threads::Listing,
             project_files: ProjectFiles::NoProject,
@@ -1240,6 +1267,7 @@ mod tests {
                 commands: &commands,
                 projects: &projects,
                 project_reason: Some("Select a workspace first"),
+                project_look: &|_| ProjectLook::default(),
                 files: Files::Searching,
                 threads: Threads::Listing,
                 project_files: ProjectFiles::NoProject,
@@ -1285,6 +1313,47 @@ mod tests {
     }
 
     #[test]
+    fn pinned_projects_lead_the_list_under_the_name_they_go_by() {
+        let projects = history(&["/a", "/b", "/c", "/d", "/e", "/f", "/g"]);
+        let look = |path: &str| ProjectLook {
+            name: (path == "/a").then(|| "Alpha".to_owned()),
+            pinned: path == "/a" || path == "/c",
+        };
+        let list = |query: &str| -> Vec<(String, String)> {
+            let groups = choices(
+                query,
+                Some(Scope::Projects),
+                &Sources {
+                    tabs: &[],
+                    commands: &[],
+                    projects: &projects,
+                    project_reason: None,
+                    project_look: &look,
+                    files: Files::Unavailable,
+                    threads: Threads::Listing,
+                    project_files: ProjectFiles::NoProject,
+                    now_ms: 0,
+                },
+            );
+            groups[0]
+                .rows
+                .iter()
+                .map(|row| (row.title.clone(), row.detail.clone()))
+                .take(3)
+                .collect()
+        };
+        let row = |title: &str, path: &str| (title.to_owned(), path.to_owned());
+        // The pinned first, the least recent one too, in the search's order.
+        assert_eq!(
+            list(""),
+            [row("c", "/c"), row("Alpha", "/a"), row("g", "/g")]
+        );
+        // A renamed project matches by its name as well as its folder.
+        assert_eq!(list("alph"), [row("Alpha", "/a")]);
+        assert_eq!(list("/a"), [row("Alpha", "/a")]);
+    }
+
+    #[test]
     fn a_query_matches_panes_and_hidden_tabs() {
         let tabs = [
             tab("t1", "editor", true),
@@ -1300,6 +1369,7 @@ mod tests {
                 commands: &[],
                 projects: &projects,
                 project_reason: None,
+                project_look: &|_| ProjectLook::default(),
                 files: Files::Unavailable,
                 threads: Threads::Listing,
                 project_files: ProjectFiles::NoProject,
@@ -1323,6 +1393,7 @@ mod tests {
                 commands: &[],
                 projects: &projects,
                 project_reason: None,
+                project_look: &|_| ProjectLook::default(),
                 files: Files::Unavailable,
                 threads: Threads::Listing,
                 project_files: ProjectFiles::NoProject,
@@ -1343,6 +1414,7 @@ mod tests {
             commands: &commands,
             projects: &projects,
             project_reason: None,
+            project_look: &|_| ProjectLook::default(),
             files,
             threads: Threads::Listing,
             project_files: ProjectFiles::NoProject,
@@ -1380,6 +1452,7 @@ mod tests {
             commands: &commands,
             projects: &projects,
             project_reason: None,
+            project_look: &|_| ProjectLook::default(),
             files,
             threads: Threads::Listing,
             project_files: ProjectFiles::NoProject,
@@ -1412,6 +1485,7 @@ mod tests {
                         commands: &[],
                         projects: &projects,
                         project_reason: None,
+                        project_look: &|_| ProjectLook::default(),
                         files: Files::Unavailable,
                         threads: Threads::Listing,
                         project_files: ProjectFiles::NoProject,
@@ -1494,6 +1568,7 @@ mod tests {
             commands: &[],
             projects: &projects,
             project_reason: None,
+            project_look: &|_| ProjectLook::default(),
             files: Files::Unavailable,
             threads,
             project_files: ProjectFiles::NoProject,
@@ -1562,6 +1637,7 @@ mod tests {
             commands: &commands,
             projects: &projects,
             project_reason: None,
+            project_look: &|_| ProjectLook::default(),
             files: Files::Unavailable,
             project_files,
             threads: Threads::Listing,

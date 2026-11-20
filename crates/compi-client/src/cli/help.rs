@@ -442,7 +442,7 @@ pub(super) const ENTRIES: &[Entry] = &[
         action: None,
         usage: "chat [--agent omp|claude]",
         summary: "Chat with an agent in or beside the terminal's pane",
-        detail: "Start a new chat in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). The chat's agent is --agent, omp (OMP) or claude (Claude Code), else the Default agent ([chat] agent, Settings → Chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. The agent works in the shell's current directory, in the terminal's environment (a WSL distribution runs it there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
+        detail: "Start a new chat in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). The chat's agent is --agent, omp (OMP) or claude (Claude Code), else the agent of the terminal's project (Settings → Projects), else the Default agent ([chat] agent, Settings → Chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. The agent works in the shell's current directory, in the terminal's environment (a WSL distribution runs it there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
         example: "compi chat --agent claude",
     },
     Entry {
@@ -466,7 +466,7 @@ pub(super) const ENTRIES: &[Entry] = &[
         action: None,
         usage: "settings [SECTION]",
         summary: "Show Settings in the terminal's pane",
-        detail: "Show Settings in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. SECTION is appearance, interface, notifications, terminal, chat, keyboard, monitor, updates or advanced; without it the pane keeps the section it shows, else Appearance. From a Settings pane (--pane), that pane changes section.",
+        detail: "Show Settings in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. SECTION is appearance, interface, notifications, terminal, chat, projects, keyboard, monitor, updates or advanced; without it the pane keeps the section it shows, else Appearance. From a Settings pane (--pane), that pane changes section.",
         example: "compi settings terminal",
     },
     Entry {

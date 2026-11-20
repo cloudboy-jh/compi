@@ -91,7 +91,8 @@ use std::fmt;
 // each chat's transcript as a thread once its pane closes and its agent stops:
 // `ListThreads` (`Threads`, `ThreadInfo`), `DeleteThread`, and the mutation `OpenThread`.
 // Tabs and threads belong to a project (`Project`, `WorkspaceTab::project`,
-// `ThreadInfo::project`), with `ProjectIcon` and `SearchProjectFiles`.
+// `ThreadInfo::project`), with `ProjectIcon` and `SearchProjectFiles`. Settings gains a
+// Projects section.
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -1868,6 +1869,7 @@ pub enum SettingsSection {
     Notifications,
     Terminal,
     Chat,
+    Projects,
     Keyboard,
     /// Monitor's Overview. Saved as "performance", the section's name before it
     /// became Monitor, so older workspace files still load.
@@ -1878,12 +1880,13 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Appearance,
         Self::Interface,
         Self::Notifications,
         Self::Terminal,
         Self::Chat,
+        Self::Projects,
         Self::Keyboard,
         Self::Monitor,
         Self::Updates,
@@ -1897,6 +1900,7 @@ impl SettingsSection {
             Self::Notifications => "Notifications",
             Self::Terminal => "Terminal",
             Self::Chat => "Chat",
+            Self::Projects => "Projects",
             Self::Keyboard => "Keyboard",
             Self::Monitor => "Monitor",
             Self::Updates => "Updates",

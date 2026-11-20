@@ -1234,6 +1234,7 @@ impl CompiApp {
                 .child(settings_group_label("Bundled icon licenses"))
                 .child(crate::gui::language_icons::ATTRIBUTION)
                 .child(crate::gui::model_icons::ATTRIBUTION)
+                .child(crate::gui::lucide_icons::ATTRIBUTION)
                 .into_any_element()
         } else {
             let groups = self.catalog_groups();

@@ -1,11 +1,12 @@
 //! `compi chat`: a new chat in the terminal it runs from, in the shell's current
-//! directory, with `--agent` or else `[chat] agent`. As `[chat] open` says, the terminal
+//! directory, with `--agent`, else the agent of the terminal's project
+//! (`[projects."<key>"] agent`), else `[chat] agent`. As `[chat] open` says, the terminal
 //! shows it as its view, in place of its shell, which keeps running underneath
 //! (Cmd/Ctrl+Shift+E or Esc returns to the shell), or a new pane beside the terminal
 //! shows it.
 use super::content::{self, Placed};
 use super::{CliError, Options, Output, submit, targets};
-use crate::config::ChatOpen;
+use crate::config::{ChatOpen, LoadedConfig};
 use crate::{DaemonClient, cli_window::Action, connection::ConnectionTarget};
 use compi_protocol::chat::ChatHarness;
 use compi_protocol::{
@@ -18,10 +19,9 @@ pub(super) fn run(
     state: &WorkspaceSnapshot,
     target: &ConnectionTarget,
     options: &Options,
-    open: ChatOpen,
-    agent: ChatHarness,
+    config: &LoadedConfig,
 ) -> Result<Output, CliError> {
-    let (_, _, leaf) = targets::pane(state, options)?;
+    let (_, tab, leaf) = targets::pane(state, options)?;
     if let LayoutNode::Content { pane_id, content } = &leaf {
         return Err(CliError::new(
             3,
@@ -41,12 +41,13 @@ pub(super) fn run(
     let agent = match options.values.get("--agent") {
         Some(program) => ChatHarness::parse(program)
             .ok_or_else(|| CliError::usage("--agent must be omp or claude"))?,
-        None => agent,
+        // The chat shows in the caller's tab, so it is in that tab's project.
+        None => config.new_thread_agent(tab.project.as_ref()),
     };
     let chat = crate::chat::new_chat(agent, caller.environment.clone(), folder);
     chat.validate().map_err(CliError::usage)?;
     let content = PaneContent::Chat(chat.clone());
-    let placed = match (open, caller.surface) {
+    let placed = match (config.chat_open, caller.surface) {
         (ChatOpen::Beside, Some(surface)) => {
             let receipt = submit(
                 client,

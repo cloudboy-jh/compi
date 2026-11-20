@@ -118,6 +118,7 @@ gpui_kit_assets::icon_assets!(
         ShieldCheck,
         ShieldHalf,
         ShieldOff,
+        FolderCog,
     ]
 );
 
@@ -127,7 +128,8 @@ pub(super) const OMP_MARK: &str = "brands/omp.svg";
 pub(super) const CLAUDE_MARK: &str = "brands/claude.svg";
 
 /// The application's assets: GPUI Kit's default icons, the extra Lucide icons Compi
-/// uses (`ExtraIcons`), harness marks and language icons.
+/// uses (`ExtraIcons`), every Lucide icon for project icons, harness marks and language
+/// icons.
 pub(super) struct Assets;
 
 impl AssetSource for Assets {
@@ -146,8 +148,9 @@ impl AssetSource for Assets {
             );
             return Ok(Some(Cow::Owned(mark.into_bytes())));
         }
-        if let Some(bytes) =
-            super::language_icons::file(path).or_else(|| super::model_icons::file(path))
+        if let Some(bytes) = super::language_icons::file(path)
+            .or_else(|| super::model_icons::file(path))
+            .or_else(|| super::lucide_icons::file(path))
         {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
