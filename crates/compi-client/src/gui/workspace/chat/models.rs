@@ -1,10 +1,11 @@
 //! The model picker: one popover, opening above the composer, for the harness's model,
-//! thinking level and mode. A strip of tabs on the left picks what the model list shows:
-//! your favorites and recent picks, or one provider's models; typing searches every
-//! model instead. The thinking levels sit beside the list and the modes in the footer.
-//! Picking a model moves the keyboard to the thinking levels; picking a level or a mode
-//! closes it. Picks are remembered per harness for its new sessions (`ChatModels`).
-//! Behaviour, strip and spacing follow T3 Code's picker (decided 2026-11-19).
+//! thinking level and mode, and the chat's permissions. A strip of tabs on the left
+//! picks what the model list shows: your favorites and recent picks, or one provider's
+//! models; typing searches every model instead. The thinking levels sit beside the list,
+//! the modes and permissions in the footer. Picking a model moves the keyboard to the
+//! thinking levels; picking a level, a mode or permissions closes it. Model picks are
+//! remembered per harness for its new sessions (`ChatModels`); permissions apply to this
+//! chat only. Behaviour, strip and spacing follow T3 Code's picker (decided 2026-11-19).
 use super::*;
 use crate::config::ChatModels;
 use crate::gui::model_icons;
@@ -48,6 +49,8 @@ pub(super) enum PickerColumn {
     Models,
     Thinking,
     Mode,
+    /// The chat's permissions, in the footer beside the modes.
+    Approval,
 }
 
 /// The open model picker: its search and tab, the column with the keyboard, and each
@@ -63,6 +66,8 @@ pub(super) struct ModelPicker {
     thinking: usize,
     /// Index into the mode setting's choices.
     mode: usize,
+    /// Index into `CHAT_APPROVALS`.
+    approval: usize,
     scroll: UniformListScrollHandle,
     /// Frames left in which the search takes the keyboard back: the popover takes it
     /// for itself a frame or two after opening.
@@ -405,6 +410,64 @@ impl ChatModel {
         let option = |category| self.state.as_ref().and_then(|state| state.option(category));
         [option("model"), option("thought_level"), option("mode")]
     }
+
+    /// Why this chat's permissions cannot change now: they restart its harness, and a
+    /// started thread's restart would end the running reply or drop its queued prompts.
+    /// A draft's can always change.
+    fn approval_refusal(&self, chat: &ChatContent) -> Option<String> {
+        if self.draft(chat) {
+            return None;
+        }
+        let state = self.state.as_ref()?;
+        let harness = chat.harness.name();
+        if state.working() {
+            Some(format!(
+                "Changing permissions restarts {harness}: wait for the reply, or stop it"
+            ))
+        } else if !state.queued.is_empty() {
+            Some(format!(
+                "Changing permissions restarts {harness}, which drops the queued messages"
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// The icon and name of a permissions choice Compi makes.
+fn approval_face(approval: ChatApproval) -> (IconName, &'static str) {
+    match approval {
+        ChatApproval::Harness => (IconName::Shield, "OMP's own setting"),
+        ChatApproval::AlwaysAsk => (IconName::ShieldCheck, "Ask before anything"),
+        ChatApproval::Write => (IconName::ShieldHalf, "Edits allowed"),
+        ChatApproval::Yolo => (IconName::ShieldOff, "Full access"),
+    }
+}
+
+/// The icon and name of an OMP approval mode the agent runs with.
+fn approval_mode_face(mode: &str) -> (IconName, &'static str) {
+    match mode {
+        "always-ask" => (IconName::ShieldCheck, "Ask before anything"),
+        "always-ask-cached" => (IconName::ShieldCheck, "Ask once per tool"),
+        "write" => (IconName::ShieldHalf, "Edits allowed"),
+        "yolo" => (IconName::ShieldOff, "Full access"),
+        _ => (IconName::Shield, "OMP's own setting"),
+    }
+}
+
+/// How permissions `approval` show: for OMP's own setting, the mode the agent runs with
+/// (`running`, as the daemon reports it) when known.
+fn approval_shown(approval: ChatApproval, running: Option<&str>) -> (IconName, &'static str) {
+    match approval {
+        ChatApproval::Harness => running.map_or(approval_face(approval), approval_mode_face),
+        chosen => approval_face(chosen),
+    }
+}
+
+/// Whether the composer row shows the shield: a chat's own permissions (`chosen`) that
+/// differ from `default` (Settings → Chat → Approvals).
+fn approval_differs(chosen: Option<ChatApproval>, default: ChatApproval) -> bool {
+    chosen.is_some_and(|chosen| chosen != default)
 }
 
 /// The index of `option`'s current choice.
@@ -455,8 +518,9 @@ impl CompiApp {
     }
 
     /// The composer row's model button: the model's mark and name, then a brain and the
-    /// thinking level, opening the picker above the composer; and the mode when it is not
-    /// the first (Plan, say).
+    /// thinking level, opening the picker above the composer; the mode when it is not
+    /// the first (Plan, say); and a shield when the chat's permissions are not the
+    /// normal ones.
     pub(super) fn render_chat_models(
         &self,
         chat: &ChatContent,
@@ -464,8 +528,10 @@ impl CompiApp {
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         let [models, thinking, mode] = model.picker_options();
-        if models.is_none() && thinking.is_none() && mode.is_none() {
-            return Vec::new();
+        let picker = models.is_some() || thinking.is_some() || mode.is_some();
+        let shield = self.render_chat_approval_chip(chat, model, picker, cx);
+        if !picker {
+            return shield.into_iter().collect();
         }
         let open = model.menu == Some(ChatMenu::Models);
         let label = models
@@ -550,7 +616,50 @@ impl CompiApp {
                     .into_any_element(),
             );
         }
+        shown.extend(shield);
         shown
+    }
+
+    /// The composer row's shield, only while this chat's permissions differ from
+    /// Settings → Chat → Approvals, as the mode shows only when it is not the first. It
+    /// opens the picker on the permissions; until the harness reports its settings
+    /// (`picker`) there is no picker to open.
+    fn render_chat_approval_chip(
+        &self,
+        chat: &ChatContent,
+        model: &ChatModel,
+        picker: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let default = self.config.chat_approval;
+        let chosen = model.chosen_approval();
+        if !approval_differs(chosen, default) {
+            return None;
+        }
+        let running = model
+            .state
+            .as_ref()
+            .and_then(|state| state.approval_mode.as_deref());
+        let (icon, label) = approval_shown(model.approval(default), running);
+        let id = chat.id.clone();
+        Some(
+            text_button("chat-approval", label)
+                .ghost()
+                .icon(icon)
+                .tooltip("Permissions for this chat")
+                .detail(format!(
+                    "Settings → Chat → Approvals: {}",
+                    super::super::settings::chat_approval_label(default)
+                ))
+                .disabled_because(
+                    (!picker).then(|| format!("Waiting for {} to start", chat.harness.name())),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_model_picker(&id, PickerColumn::Approval, window, cx);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Opens chat `chat`'s model picker with the keyboard in `column`, on the tab of
@@ -569,6 +678,7 @@ impl CompiApp {
             .get(chat)
             .map(|model| self.remembered_models(model.harness()))
             .unwrap_or_default();
+        let default = self.config.chat_approval;
         let Some(model) = self.chat.chats.get_mut(chat) else {
             return;
         };
@@ -590,6 +700,10 @@ impl CompiApp {
         };
         let tab = models.map_or(PickerTab::Saved, |option| opening_tab(option, &remembered));
         let (thinking, mode) = (current_index(thinking), current_index(mode));
+        let approval = crate::config::CHAT_APPROVALS
+            .iter()
+            .position(|approval| *approval == model.approval(default))
+            .unwrap_or(0);
         model.menu = Some(ChatMenu::Models);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
         let id = chat.to_owned();
@@ -617,6 +731,7 @@ impl CompiApp {
             highlight: 0,
             thinking,
             mode,
+            approval,
             scroll: UniformListScrollHandle::new(),
             claim_keyboard: CLAIM_FRAMES,
         });
@@ -709,8 +824,8 @@ impl CompiApp {
 
     /// Keys in the open picker: Up, Down, Page Up and Page Down move in the column (in
     /// the strip, between tabs); Left, Right, Tab and Shift+Tab change columns (on the
-    /// modes, Left and Right pick between them); Enter picks; Ctrl+D (Cmd+D) stars the
-    /// highlighted model.
+    /// modes and permissions, Left and Right pick between them); Enter picks; Ctrl+D
+    /// (Cmd+D) stars the highlighted model.
     fn model_picker_key(
         &mut self,
         chat: &str,
@@ -780,13 +895,15 @@ impl CompiApp {
             models.map(|_| PickerColumn::Models),
             thinking.map(|_| PickerColumn::Thinking),
             mode.map(|_| PickerColumn::Mode),
+            Some(PickerColumn::Approval),
         ]
         .into_iter()
         .flatten()
         .collect();
-        let (thinking_count, mode_count) = (
+        let (thinking_count, mode_count, approval_count) = (
             thinking.map_or(0, |option| option.choices.len()),
             mode.map_or(0, |option| option.choices.len()),
+            crate::config::CHAT_APPROVALS.len(),
         );
         let (column, tab) = (picker.column, picker.tab.clone());
         let at = columns
@@ -834,7 +951,15 @@ impl CompiApp {
             (_, "tab", _) => picker.column = step_column(!modifiers.shift),
             (PickerColumn::Mode, "left", _) => picker.mode = step(picker.mode, mode_count, -1),
             (PickerColumn::Mode, "right", _) => picker.mode = step(picker.mode, mode_count, 1),
-            (PickerColumn::Mode, "up", _) => picker.column = step_column(false),
+            (PickerColumn::Mode | PickerColumn::Approval, "up", _) => {
+                picker.column = step_column(false);
+            }
+            (PickerColumn::Approval, "left", _) => {
+                picker.approval = step(picker.approval, approval_count, -1);
+            }
+            (PickerColumn::Approval, "right", _) => {
+                picker.approval = step(picker.approval, approval_count, 1);
+            }
             (_, "right", _) => picker.column = step_column(true),
             (_, "left", _) => picker.column = step_column(false),
             (PickerColumn::Thinking, _, Some(by)) => {
@@ -859,7 +984,7 @@ impl CompiApp {
     }
 
     /// Enter in the picker: in the strip, moves to the models; on a model, picks it and
-    /// moves to the thinking levels; on a level or mode, picks it and closes.
+    /// moves to the thinking levels; on a level, mode or permissions, picks it and closes.
     fn model_picker_enter(&mut self, chat: &str, window: &mut Window, cx: &mut Context<Self>) {
         let layout = self.model_layout(chat, cx);
         let Some(model) = self.chat.chats.get_mut(chat) else {
@@ -907,6 +1032,12 @@ impl CompiApp {
                 self.set_chat_menu(chat, ChatMenu::Models, false);
                 self.send_chat_option(chat, option, value, window, cx);
             }
+            PickerColumn::Approval => {
+                let Some(&approval) = crate::config::CHAT_APPROVALS.get(picker.approval) else {
+                    return;
+                };
+                self.pick_chat_approval(chat, approval, window, cx);
+            }
         }
     }
 
@@ -953,6 +1084,35 @@ impl CompiApp {
         model.menu = None;
         self.send_chat_option(chat, option, value.clone(), window, cx);
         self.remember_models(harness, |models| models.picks.thought_level = Some(value));
+    }
+
+    /// Gives chat `chat` the permissions `approval` and closes the picker: its watcher
+    /// passes them on, and a harness already running starts again with them, a draft on
+    /// a new session as it has nothing to resume, a thread on its own session. Nothing
+    /// changes while `approval_refusal` says why not.
+    fn pick_chat_approval(
+        &mut self,
+        chat: &str,
+        approval: ChatApproval,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let default = self.config.chat_approval;
+        let content = self.chat_pane(chat).map(|(_, content)| content);
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        if content.is_some_and(|content| model.approval_refusal(&content).is_some()) {
+            return;
+        }
+        model.menu = None;
+        let changed = model.approval(default) != approval;
+        if let Ok(mut chosen) = model.approval.lock() {
+            *chosen = Some(approval);
+        }
+        if changed && model.state.is_some() {
+            self.restart_chat(chat, window, cx);
+        }
     }
 
     /// Stars or unstars the highlighted model.
@@ -1009,7 +1169,8 @@ impl CompiApp {
     }
 
     /// The picker's popover: the strip, the search over the model list and the
-    /// thinking levels beside it, then a footer with the keys and the modes.
+    /// thinking levels beside it, then a footer with the keys, the modes and the
+    /// chat's permissions.
     fn render_model_picker(
         &self,
         chat: &ChatContent,
@@ -1215,7 +1376,8 @@ impl CompiApp {
                         }
                     )),
             )
-            .children(modes);
+            .children(modes)
+            .child(self.render_picker_approval(chat, model, picker, shade, cx));
         let width = if models.is_some() {
             STRIP_WIDTH + LIST_WIDTH + THINKING_WIDTH
         } else {
@@ -1240,6 +1402,93 @@ impl CompiApp {
                     .children(thinking_column),
             )
             .child(footer)
+            .into_any_element()
+    }
+
+    /// The footer's permissions for this chat alone: a shield per choice, the current
+    /// one lit, each named in its tooltip. Dimmed, with why, while a thread cannot
+    /// restart for them (`approval_refusal`).
+    fn render_picker_approval(
+        &self,
+        chat: &ChatContent,
+        model: &ChatModel,
+        picker: &ModelPicker,
+        shade: Hsla,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let foreground = color(modal_text_color(colors.foreground, &colors));
+        let current = model.approval(self.config.chat_approval);
+        let running = model
+            .state
+            .as_ref()
+            .and_then(|state| state.approval_mode.as_deref());
+        let refusal = model.approval_refusal(chat);
+        let segments =
+            crate::config::CHAT_APPROVALS
+                .into_iter()
+                .enumerate()
+                .map(|(index, approval)| {
+                    let (icon, name) = approval_face(approval);
+                    let lit = approval == current;
+                    let highlighted =
+                        picker.column == PickerColumn::Approval && picker.approval == index;
+                    let mut detail =
+                        super::super::settings::chat_approval_detail(approval).to_owned();
+                    if approval == ChatApproval::Harness
+                        && let Some(mode) = running
+                    {
+                        detail = format!("{detail}; now {}", approval_mode_face(mode).1);
+                    }
+                    if let Some(refusal) = &refusal {
+                        detail = refusal.clone();
+                    }
+                    let id = chat.id.clone();
+                    div()
+                        .id(("chat-approval-choice", index))
+                        .h(ui_rems(24.0))
+                        .px_1p5()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if highlighted {
+                            color(colors.accent)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .when(lit, |segment| segment.bg(cx.theme().muted))
+                        .child(controls::glyph(icon, if lit { foreground } else { muted }))
+                        .tooltip(controls::tooltip(name, Some(detail.into()), None))
+                        .when(refusal.is_none(), |segment| {
+                            segment.cursor_pointer().on_click(cx.listener(
+                                move |this, _: &ClickEvent, window, cx| {
+                                    this.pick_chat_approval(&id, approval, window, cx);
+                                    cx.notify();
+                                },
+                            ))
+                        })
+                });
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .child("Permissions"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .rounded_lg()
+                    .p(px(2.0))
+                    .bg(shade)
+                    .when(refusal.is_some(), |group| group.opacity(0.55))
+                    .children(segments),
+            )
             .into_any_element()
     }
 
@@ -1786,5 +2035,16 @@ mod tests {
         models.toggle_favorite("c");
         models.toggle_favorite("a");
         assert_eq!(models.favorites, ["c"]);
+    }
+
+    #[test]
+    fn the_shield_shows_only_for_permissions_other_than_the_normal_ones() {
+        for default in crate::config::CHAT_APPROVALS {
+            // A chat that never picked follows the normal setting: no shield.
+            assert!(!approval_differs(None, default));
+            for chosen in crate::config::CHAT_APPROVALS {
+                assert_eq!(approval_differs(Some(chosen), default), chosen != default);
+            }
+        }
     }
 }

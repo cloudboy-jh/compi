@@ -173,23 +173,39 @@ enum Link {
 enum ChatMenu {
     /// The header's ⋯ menu.
     Header,
-    /// The model picker.
+    /// The model picker, which holds the chat's permissions too.
     Models,
     /// The other settings.
     More,
-    /// A draft's permissions.
-    Approval,
 }
 
-/// Whether the chat's folder is in a Git repository, read once: Open in diff needs one.
+/// Whether the chat's folder is in a Git repository, read once: Open in diff needs one,
+/// and a draft's header names its branch and changes.
 enum Repo {
     Reading,
-    /// Its top level, and the branch checked out (`None` when detached or unborn).
+    /// Its top level, the branch checked out (`None` when detached or unborn), and how
+    /// many files have changes (`truncated`: more than the listing holds).
     At {
         top: String,
         branch: Option<String>,
+        changes: usize,
+        truncated: bool,
     },
     None,
+}
+
+/// How many files `listing` has changes in: each path once, staged or not, leaving out
+/// changes to line endings alone.
+fn changed_files(listing: &compi_protocol::GitChanges) -> usize {
+    let mut paths: Vec<&str> = listing
+        .changes
+        .iter()
+        .filter(|change| !change.line_endings_only)
+        .map(|change| change.path.as_str())
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths.len()
 }
 
 /// One chat's client state.
@@ -246,8 +262,8 @@ struct ChatModel {
     session_sent: Option<String>,
     /// Where the composer card and the model button were drawn, for the model picker.
     picker_anchor: Rc<PickerAnchor>,
-    /// The permissions this chat's harness starts with, set from its draft; `None`
-    /// follows Settings → Chat → Approvals. The watcher passes it on.
+    /// The permissions this chat's harness starts with, picked in its model picker;
+    /// `None` follows Settings → Chat → Approvals. The watcher passes it on.
     approval: Arc<Mutex<Option<ChatApproval>>>,
 }
 
@@ -400,14 +416,15 @@ impl ChatModel {
         draft::is_draft(self.state.as_ref(), chat.session.as_deref())
     }
 
-    /// The permissions the harness starts with: the draft's pick, else `default`
+    /// The permissions picked for this chat; `None` follows Settings → Chat → Approvals.
+    fn chosen_approval(&self) -> Option<ChatApproval> {
+        self.approval.lock().ok().and_then(|approval| *approval)
+    }
+
+    /// The permissions the harness starts with: the chat's pick, else `default`
     /// (Settings → Chat → Approvals).
     fn approval(&self, default: ChatApproval) -> ChatApproval {
-        self.approval
-            .lock()
-            .ok()
-            .and_then(|approval| *approval)
-            .unwrap_or(default)
+        self.chosen_approval().unwrap_or(default)
     }
 
     /// How Enter, or with `secondary` Ctrl/Cmd+Enter, hands the draft over. While a turn
@@ -917,8 +934,8 @@ impl CompiApp {
 
     /// Before drawing: state for each chat shown, kept while its pane or view is in the
     /// workspace; a watcher per chat shown (lingering after); the form of a question
-    /// asked; each chat's session sent to the daemon once the harness has one; and a
-    /// redraw each second while one works.
+    /// asked; each chat's session sent to the daemon once the harness has one; the
+    /// threads listed for a draft's Continue; and a redraw each second while one works.
     pub(super) fn prepare_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = &self.workspace else {
             return;
@@ -983,6 +1000,17 @@ impl CompiApp {
                     },
                 ));
             }
+        }
+        let draft_shown = present.iter().any(|&(_, chat)| {
+            shown.contains(&chat.id)
+                && self
+                    .chat
+                    .chats
+                    .get(&chat.id)
+                    .is_some_and(|model| model.draft(chat))
+        });
+        if draft_shown {
+            self.sidebar.want_threads();
         }
         if let Some((pane_id, chat)) = update {
             self.mutate(
@@ -1135,7 +1163,7 @@ impl CompiApp {
     }
 
     /// Reads whether `chat`'s folder is in a Git repository, for Open in diff, and its
-    /// branch, for the line under the composer.
+    /// branch and changed files, for the line under the composer and a draft's header.
     fn read_chat_repo(&self, chat: &ChatContent, cx: &mut Context<Self>) {
         let target = self.target.clone();
         let (id, environment, folder) = (
@@ -1156,6 +1184,8 @@ impl CompiApp {
                 if let Some(model) = this.chat.chats.get_mut(&id) {
                     model.repo = match listing {
                         Ok(Some(listing)) => Repo::At {
+                            changes: changed_files(&listing),
+                            truncated: listing.truncated,
                             top: listing.repo,
                             branch: listing.branch,
                         },
@@ -1420,7 +1450,7 @@ impl CompiApp {
         self.chat_action(chat, message, window, cx);
     }
 
-    /// The permissions chat `chat`'s harness starts with: its draft's pick, else
+    /// The permissions chat `chat`'s harness starts with: its own pick, else
     /// Settings → Chat → Approvals.
     fn chat_approval(&self, chat: &str) -> ChatApproval {
         let default = self.config.chat_approval;
@@ -1777,10 +1807,12 @@ impl CompiApp {
 
     /// Keys in the focused chat's composer, before the field's own: Ctrl+V (Cmd+V) with an
     /// image on the clipboard attaches it, and long text becomes a file (Ctrl+Shift+V types
-    /// it in); the transcript's paging keys; Alt+Up edits the last queued prompt; the
-    /// completion list's arrows, Tab and Escape; Up and Down walk earlier prompts; with
-    /// the draft empty, Enter answers a waiting permission with its first allow option;
-    /// Escape does what `chat_escape` says and keeps the keyboard in the draft.
+    /// it in); the transcript's paging keys; Alt+Up edits the last queued prompt; in a
+    /// draft, Alt+T, F, D, B and M (Option on macOS) open something else in its place,
+    /// typed text or not; the completion list's arrows, Tab and Escape; Up and Down walk
+    /// earlier prompts; with the draft empty, Enter answers a waiting permission with its
+    /// first allow option; Escape does what `chat_escape` says and keeps the keyboard in
+    /// the draft.
     pub(super) fn chat_composer_key(
         &mut self,
         key: &Keystroke,
@@ -1822,6 +1854,17 @@ impl CompiApp {
         if key.key == "up" && alt_only && self.edit_last_queued_chat(&chat, window, cx) {
             return true;
         }
+        if let Some(choice) = draft::open_instead_key(&key.key, modifiers)
+            && self.chat_pane(&chat).is_some_and(|(_, content)| {
+                self.chat
+                    .chats
+                    .get(&chat)
+                    .is_some_and(|model| model.draft(&content))
+            })
+        {
+            self.open_instead(&chat, choice, window, cx);
+            return true;
+        }
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift {
             return false;
         }
@@ -1838,18 +1881,6 @@ impl CompiApp {
         };
         let empty = model.composer.read(cx).value().trim().is_empty();
         let editing = model.editing.is_some();
-        // An empty draft's letters open something else in its place; any other text types.
-        let untouched = model.composer.read(cx).value().is_empty()
-            && model.attachments.is_empty()
-            && model.images.is_empty()
-            && !editing
-            && self
-                .chat_pane(&chat)
-                .is_some_and(|(_, content)| model.draft(&content));
-        if let Some(choice) = draft::open_instead_key(&key.key, untouched) {
-            self.open_instead(&chat, choice, window, cx);
-            return true;
-        }
         match key.key.as_str() {
             "enter" if empty && !editing => self.answer_chat_permission_by_kind(
                 &chat,

@@ -835,9 +835,9 @@ impl CompiApp {
         }
     }
 
-    /// Under the transcript: notices, what waits on the reader, the composer and its row.
-    /// A `draft`'s row holds its permissions too, and a failed harness shows here, as it
-    /// has no transcript to show it in.
+    /// Under the transcript: notices, what waits on the reader, the composer and its row,
+    /// then where the chat works; a `draft` names that in its header instead, and a
+    /// failed harness shows here, as a draft has no transcript to show it in.
     pub(super) fn render_chat_footer(
         &self,
         chat: &ChatContent,
@@ -961,16 +961,8 @@ impl CompiApp {
                 },
             )
             .child(self.render_chat_card(chat, model, &frame, cx))
-            // A draft shows only its permissions under the message box; a thread, where
-            // it works.
-            .child(if draft {
-                div()
-                    .flex()
-                    .justify_end()
-                    .child(self.render_chat_approval(chat, model, cx))
-                    .into_any_element()
-            } else {
-                self.render_chat_context(chat, model)
+            .when(!draft, |footer| {
+                footer.child(self.render_chat_context(chat, model))
             })
             .into_any_element()
     }

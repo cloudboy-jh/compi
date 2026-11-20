@@ -1,23 +1,27 @@
-//! New thread drafts. Every new chat starts as one: a question over its message box in
-//! the middle of the pane, the project under the question, the permissions the agent
-//! starts with under the message box, and a list of what else the pane can be (a
-//! terminal, Files, Changes, a browser or Monitor), each with its letter. The daemon
-//! keeps no thread of a draft until its first prompt (`ChatState::thread`), so closing
-//! an untouched one leaves nothing; closing one with typed text offers Undo for a few
-//! seconds.
+//! New thread drafts. Every new chat starts as one, in the middle of its pane: its
+//! project as the header (icon, name, and a line of the branch, changed files and
+//! folder), the message box, the project's recent threads to continue instead, and a
+//! row of what else the pane can be (a terminal, Files, Changes, a browser or Monitor),
+//! each on Alt and its letter (Option on macOS). The chat's permissions sit in its model
+//! picker. The daemon keeps no thread of a draft until its first prompt
+//! (`ChatState::thread`), so closing an untouched one leaves nothing; closing one with
+//! typed text offers Undo for a few seconds.
 use super::*;
+use crate::chat::{age_label, thread_title};
+use compi_protocol::chat::{ThreadActivity, ThreadInfo};
 use compi_protocol::{
-    BrowserContent, MonitorContent, MutationId, MutationReceipt, PaneReplacement, SessionId,
-    SplitAxis,
+    BrowserContent, MonitorContent, MutationId, MutationReceipt, PaneReplacement, Project,
+    SessionId, SplitAxis,
 };
+use gpui::{Div, Hsla, Modifiers};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How long "Draft discarded · Undo" stays.
 const UNDO_LIFETIME: Duration = Duration::from_secs(5);
 /// The widest the draft's column grows.
 const DRAFT_WIDTH: f32 = 680.0;
-/// The width of the list of what else the pane can be.
-const SURFACES_WIDTH: f32 = 300.0;
+/// The most threads Continue lists.
+const CONTINUE_LIMIT: usize = 4;
 
 static NEXT_NOTICE: AtomicU64 = AtomicU64::new(0);
 
@@ -70,14 +74,25 @@ impl OpenInstead {
         }
     }
 
-    /// The letter that picks it in an empty draft, in GPUI keystroke syntax.
-    fn key(self) -> &'static str {
+    /// The letter that picks it with Alt, in GPUI keystroke syntax.
+    fn letter(self) -> &'static str {
         match self {
             Self::Terminal => "t",
             Self::Files => "f",
             Self::Changes => "d",
             Self::Browser => "b",
             Self::Monitor => "m",
+        }
+    }
+
+    /// Its shortcut, in GPUI keystroke syntax.
+    fn shortcut(self) -> &'static str {
+        match self {
+            Self::Terminal => "alt-t",
+            Self::Files => "alt-f",
+            Self::Changes => "alt-d",
+            Self::Browser => "alt-b",
+            Self::Monitor => "alt-m",
         }
     }
 
@@ -92,16 +107,21 @@ impl OpenInstead {
     }
 }
 
-/// What `key`, pressed without a modifier in a draft, opens instead: one of the row's
-/// letters, only while the draft is `empty` (no text, files or images); otherwise the
-/// key types.
-pub(super) fn open_instead_key(key: &str, empty: bool) -> Option<OpenInstead> {
-    if !empty {
+/// What `key` pressed with `modifiers` in a draft opens in its place: Alt (Option on
+/// macOS) and one of the row's letters, whatever the message box holds. A letter
+/// without Alt, or with another modifier too, types.
+pub(super) fn open_instead_key(key: &str, modifiers: &Modifiers) -> Option<OpenInstead> {
+    let alt_only = modifiers.alt
+        && !modifiers.control
+        && !modifiers.platform
+        && !modifiers.shift
+        && !modifiers.function;
+    if !alt_only {
         return None;
     }
     OpenInstead::ALL
         .into_iter()
-        .find(|choice| choice.key() == key)
+        .find(|choice| choice.letter() == key)
 }
 
 /// Where a discarded draft was, so Undo opens it there again.
@@ -161,26 +181,66 @@ fn edge_leaf(node: &LayoutNode, first: bool) -> Option<PaneId> {
     }
 }
 
-/// The icon and name of a permissions choice Compi makes.
-fn approval_face(approval: ChatApproval) -> (IconName, &'static str) {
-    match approval {
-        ChatApproval::Harness => (IconName::Shield, "OMP's own setting"),
-        ChatApproval::AlwaysAsk => (IconName::ShieldCheck, "Ask before anything"),
-        ChatApproval::Write => (IconName::ShieldHalf, "Edits allowed"),
-        ChatApproval::Yolo => (IconName::ShieldOff, "Full access"),
-    }
+/// The threads a draft's Continue lists: those whose project is one of `projects` (the
+/// draft's tab project and its repository's top folder, which a link can make differ),
+/// else those of the draft's folder; newest first, at most `CONTINUE_LIMIT`, never the
+/// draft.
+fn continue_threads<'a>(
+    threads: &'a [ThreadInfo],
+    draft: &ChatContent,
+    projects: &[&Project],
+) -> Vec<&'a ThreadInfo> {
+    let mut listed: Vec<&ThreadInfo> = threads
+        .iter()
+        .filter(|thread| thread.chat.id != draft.id)
+        .filter(|thread| {
+            thread
+                .project
+                .as_ref()
+                .is_some_and(|theirs| projects.contains(&theirs))
+                || (thread.chat.environment == draft.environment
+                    && thread.chat.folder == draft.folder)
+        })
+        .collect();
+    listed.sort_by_key(|thread| std::cmp::Reverse(thread.updated_ms));
+    listed.truncate(CONTINUE_LIMIT);
+    listed
 }
 
-/// The icon and name of an OMP approval mode the agent runs with.
-fn approval_mode_face(mode: &str) -> (IconName, &'static str) {
-    match mode {
-        "always-ask" => (IconName::ShieldCheck, "Ask before anything"),
-        "always-ask-cached" => (IconName::ShieldCheck, "Ask once per tool"),
-        "write" => (IconName::ShieldHalf, "Edits allowed"),
-        "yolo" => (IconName::ShieldOff, "Full access"),
-        _ => (IconName::Shield, "OMP's own setting"),
+/// The line under a draft's project name: the branch, how many files have changes, and
+/// `folder`; before Git answers, and outside Git, the folder alone.
+fn draft_facts(repo: &Repo, folder: &str) -> String {
+    let mut facts = Vec::new();
+    if let Repo::At {
+        branch,
+        changes,
+        truncated,
+        ..
+    } = repo
+    {
+        facts.extend(branch.clone());
+        facts.push(match (*changes, *truncated) {
+            (count, true) => format!("{count}+ changes"),
+            (0, false) => "No changes".to_owned(),
+            (1, false) => "1 change".to_owned(),
+            (count, false) => format!("{count} changes"),
+        });
     }
+    facts.push(folder.to_owned());
+    facts.join(" · ")
 }
+
+/// A draft section's quiet heading.
+fn draft_heading(text: &'static str, muted: Hsla) -> Div {
+    div()
+        .px_2()
+        .pb_1()
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(muted)
+        .child(text)
+}
+
 impl CompiApp {
     /// Split right or down from `beside`, which shows `source`: a new thread draft in
     /// `source`'s folder, in a pane of its own.
@@ -194,8 +254,8 @@ impl CompiApp {
         self.open_content_split(beside, axis, PaneContent::Chat(draft));
     }
 
-    /// A draft pane: the question and the project, the message box with its
-    /// permissions, then what else the pane can be, in the middle of the pane.
+    /// A draft pane, in the middle of the pane: the project, the message box, the
+    /// threads to continue, then what else the pane can be.
     pub(super) fn render_chat_draft(
         &self,
         pane_id: &PaneId,
@@ -205,11 +265,56 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let project = self.pane_project(pane_id);
+        // The tab's project, else the repository the folder is in.
+        let repo_project = match &model.repo {
+            Repo::At { top, .. } => Some(Project {
+                environment: chat.environment.clone(),
+                root: top.clone(),
+            }),
+            Repo::Reading | Repo::None => None,
+        };
+        let project = self.pane_project(pane_id).or(repo_project.as_ref());
         let name: SharedString = match project {
             Some(project) => project.name().to_owned().into(),
             None => model.folder_label.clone(),
         };
+        let projects: Vec<&Project> = self
+            .pane_project(pane_id)
+            .into_iter()
+            .chain(repo_project.as_ref())
+            .collect();
+        let threads = continue_threads(self.sidebar.threads(), chat, &projects);
+        let header = div()
+            .id("chat-draft-project")
+            .w_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(self.project_icon(project, 28.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(ui_rems(22.0))
+                            .line_height(ui_rems(28.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color(colors.foreground))
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(draft_facts(&model.repo, &model.folder_label)),
+                    ),
+            )
+            .tooltip(controls::tooltip(model.folder.clone(), None, None));
         div()
             .id("chat-draft")
             .flex_1()
@@ -227,47 +332,118 @@ impl CompiApp {
                     .max_w(ui_rems(DRAFT_WIDTH))
                     .flex()
                     .flex_col()
-                    .items_center()
+                    .child(header)
                     .child(
                         div()
-                            .text_center()
-                            .text_size(ui_rems(30.0))
-                            .line_height(ui_rems(36.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(color(colors.foreground))
-                            .child("What should we work on?"),
-                    )
-                    .child(
-                        div()
-                            .id("chat-draft-project")
-                            .mt_2()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .text_size(ui_rems(UI_BODY_TEXT_SIZE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(muted)
-                            .child(self.project_icon(project, 16.0))
-                            .child(name)
-                            .tooltip(controls::tooltip(model.folder.clone(), None, None)),
-                    )
-                    .child(
-                        div()
-                            .mt_6()
+                            .mt_4()
                             .w_full()
                             .child(self.render_chat_footer(chat, model, true, cx)),
                     )
-                    .child(
-                        div()
-                            .mt_10()
-                            .child(self.render_open_instead(chat, model, cx)),
-                    ),
+                    .children(self.render_continue(chat, &threads, cx))
+                    .child(self.render_open_instead(chat, model, cx)),
             )
             .into_any_element()
     }
 
-    /// What else the pane can be, one row each: its icon, name and letter. Changes is
-    /// dimmed outside a Git repository.
+    /// Continue: the project's latest threads, one row each with its title, a dot while
+    /// it works or waits, and its age. `None` without any.
+    fn render_continue(
+        &self,
+        chat: &ChatContent,
+        threads: &[&ThreadInfo],
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if threads.is_empty() {
+            return None;
+        }
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let foreground = color(colors.foreground);
+        let hover = color(colors.surface_hover);
+        let now = now_ms();
+        let rows = threads.iter().enumerate().map(|(index, thread)| {
+            let dot = match self.thread_activity(thread) {
+                ThreadActivity::Working => Some((colors.accent, "Working")),
+                ThreadActivity::Waiting => Some((colors.modified, "Waiting for you")),
+                ThreadActivity::Idle => None,
+            };
+            let (draft, opened) = (chat.id.clone(), thread.chat.clone());
+            div()
+                .id(("chat-continue", index))
+                .h(ui_rems(30.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(ui_rems(6.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(hover))
+                .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                .child(controls::glyph(IconName::MessageSquare, muted))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(foreground)
+                        .child(thread_title(thread).to_owned()),
+                )
+                .children(dot.map(|(tint, label)| {
+                    div()
+                        .id(("chat-continue-status", index))
+                        .flex_none()
+                        .size(px(7.0))
+                        .rounded_full()
+                        .bg(color(tint))
+                        .tooltip(controls::tooltip(label, None, None))
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                        .text_color(muted)
+                        .child(age_label(thread.updated_ms, now)),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.continue_thread(&draft, opened.clone(), window, cx);
+                    cx.notify();
+                }))
+        });
+        Some(
+            div()
+                .mt_5()
+                .w_full()
+                .px_3()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(draft_heading("Continue", muted))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// What thread `thread` is doing: as this window's chat state says when it watches
+    /// it, else as the listing said.
+    fn thread_activity(&self, thread: &ThreadInfo) -> ThreadActivity {
+        let state = self
+            .chat
+            .chats
+            .get(&thread.chat.id)
+            .and_then(|model| model.state.as_ref());
+        match state {
+            Some(state) if state.permission.is_some() || state.question.is_some() => {
+                ThreadActivity::Waiting
+            }
+            Some(state) if state.working() => ThreadActivity::Working,
+            Some(_) => ThreadActivity::Idle,
+            None if thread.open => thread.activity,
+            None => ThreadActivity::Idle,
+        }
+    }
+
+    /// What else the pane can be, as a row of quiet buttons: icon, name and Alt with its
+    /// letter. Changes is dimmed outside a Git repository.
     fn render_open_instead(
         &self,
         chat: &ChatContent,
@@ -278,165 +454,100 @@ impl CompiApp {
         let muted = color(modal_text_color(colors.muted, &colors));
         let foreground = color(colors.foreground);
         let hover = color(colors.surface_hover);
-        let badge = color(colors.surface_hover);
-        let rows = OpenInstead::ALL
+        let border = color(colors.border);
+        let buttons = OpenInstead::ALL
             .into_iter()
             .enumerate()
             .map(|(index, choice)| {
                 let unavailable =
                     choice == OpenInstead::Changes && matches!(model.repo, Repo::None);
-                let tint = if unavailable { muted } else { foreground };
                 let id = chat.id.clone();
                 div()
                     .id(("chat-open-instead", index))
-                    .h(ui_rems(34.0))
-                    .px_2()
+                    .h(ui_rems(28.0))
+                    .pl_2()
+                    .pr_1()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .rounded(ui_rems(8.0))
-                    .text_size(ui_rems(UI_BODY_TEXT_SIZE))
-                    .text_color(tint)
-                    .when(unavailable, |row| row.opacity(0.55))
-                    .when(!unavailable, |row| {
-                        row.cursor_pointer()
-                            .hover(|style| style.bg(hover))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.open_instead(&id, choice, window, cx);
-                                cx.notify();
-                            }))
-                    })
-                    .when(unavailable, |row| {
-                        row.tooltip(controls::tooltip(
+                    .gap_1p5()
+                    .rounded(ui_rems(6.0))
+                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                    .text_color(muted)
+                    .when(unavailable, |button| {
+                        button.opacity(0.55).tooltip(controls::tooltip(
                             "Changes",
                             Some("This folder is not in a Git repository".into()),
                             None,
                         ))
                     })
+                    .when(!unavailable, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hover).text_color(foreground))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.open_instead(&id, choice, window, cx);
+                                cx.notify();
+                            }))
+                    })
                     .child(
-                        controls::glyph(choice.icon(), tint).with_size(gpui_component::Size::Small),
+                        controls::glyph(choice.icon(), muted)
+                            .with_size(gpui_component::Size::Small),
                     )
-                    .child(div().flex_1().child(choice.label()))
+                    .child(choice.label())
                     .child(
                         div()
                             .flex_none()
-                            .min_w(ui_rems(22.0))
-                            .h(ui_rems(22.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(ui_rems(5.0))
-                            .bg(badge)
+                            .px_1()
+                            .rounded(ui_rems(4.0))
+                            .border_1()
+                            .border_color(border)
                             .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(muted)
-                            .child(choice.key().to_uppercase()),
+                            .child(controls::key_label(choice.shortcut()).replace('+', " ")),
                     )
             });
         div()
-            .w(ui_rems(SURFACES_WIDTH))
+            .mt_5()
+            .w_full()
+            .px_3()
             .flex()
             .flex_col()
-            .gap_0p5()
-            .child(
-                div()
-                    .pb_2()
-                    .text_center()
-                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(muted)
-                    .child("Or open here"),
-            )
-            .children(rows)
+            .child(draft_heading("Open here", muted))
+            .child(div().flex().flex_wrap().gap_1().children(buttons))
             .into_any_element()
     }
 
-    /// The draft's permissions as one chip: the mode the agent runs with (what Compi
-    /// chose for this chat, else OMP's own setting as the daemon reports it), with a
-    /// shield; its menu picks another for this chat only.
-    pub(super) fn render_chat_approval(
-        &self,
-        chat: &ChatContent,
-        model: &ChatModel,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let open = model.menu == Some(ChatMenu::Approval);
-        let current = model.approval(self.config.chat_approval);
-        let running = model
-            .state
-            .as_ref()
-            .and_then(|state| state.approval_mode.as_deref());
-        let (icon, label) = match current {
-            ChatApproval::Harness => {
-                running.map_or((IconName::Shield, "OMP's own setting"), approval_mode_face)
-            }
-            chosen => approval_face(chosen),
-        };
-        let trigger = text_button("chat-approval", label)
-            .ghost()
-            .icon(icon)
-            .menu_open(open)
-            .tooltip("Permissions")
-            .detail(format!(
-                "How {} asks before it runs tools, for this chat only",
-                chat.harness.name()
-            ));
-        // Entries are built only for an open menu: a closed one draws just its button.
-        let entries = crate::config::CHAT_APPROVALS
-            .into_iter()
-            .filter(|_| open)
-            .map(|approval| {
-                let id = chat.id.clone();
-                let label = match approval {
-                    ChatApproval::Harness => "OMP's own setting",
-                    chosen => approval_face(chosen).1,
-                };
-                controls::menu_item(
-                    label,
-                    cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.pick_draft_approval(&id, approval, window, cx);
-                        cx.notify();
-                    }),
-                )
-                .checked(approval == current)
-            });
-        let id = chat.id.clone();
-        controls::menu(
-            "chat-approval-menu",
-            trigger,
-            open,
-            entries.collect::<Vec<_>>(),
-        )
-        .anchor(Anchor::TopRight)
-        .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
-            this.set_chat_menu(&id, ChatMenu::Approval, *open);
-            cx.notify();
-        }))
-        .into_any_element()
-    }
-
-    /// Starts chat `chat`'s harness with `approval`: its watcher passes it on, and a
-    /// harness already running starts again with it, on a new session, as a draft has
-    /// nothing to resume.
-    fn pick_draft_approval(
+    /// Continue: thread `thread` in the place of draft `chat`, which goes. A pane or
+    /// view holding the thread already is focused instead, and the draft stays.
+    fn continue_thread(
         &mut self,
         chat: &str,
-        approval: ChatApproval,
+        thread: ChatContent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let default = self.config.chat_approval;
-        let Some(model) = self.chat.chats.get_mut(chat) else {
+        let held = self
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| program_status::chat_place(workspace, &thread.id).is_some());
+        if held {
+            self.open_thread(thread, window, cx);
+            return;
+        }
+        let Some((pane_id, _, view)) = self.draft_place(chat) else {
             return;
         };
-        model.menu = None;
-        let changed = model.approval(default) != approval;
-        if let Ok(mut chosen) = model.approval.lock() {
-            *chosen = Some(approval);
-        }
-        if changed && model.state.is_some() {
-            self.restart_chat(chat, window, cx);
-        }
+        self.put_in_draft_place(&pane_id, view, PaneContent::Chat(thread), window, cx);
+    }
+
+    /// Draft `chat`'s pane and chat, and whether it is a terminal's view.
+    fn draft_place(&self, chat: &str) -> Option<(PaneId, ChatContent, bool)> {
+        let (pane_id, content) = self.chat_pane(chat)?;
+        let view = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| content::find_leaf(workspace, &pane_id))
+            .is_some_and(|leaf| leaf.surface_id().is_some());
+        Some((pane_id, content, view))
     }
 
     /// Puts `choice` in the place of draft `chat`, in its folder; the draft goes. A draft
@@ -449,14 +560,9 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((pane_id, content)) = self.chat_pane(chat) else {
+        let Some((pane_id, content, view)) = self.draft_place(chat) else {
             return;
         };
-        let view = self
-            .workspace
-            .as_ref()
-            .and_then(|workspace| content::find_leaf(workspace, &pane_id))
-            .is_some_and(|leaf| leaf.surface_id().is_some());
         let ChatContent {
             environment,
             folder,
@@ -884,18 +990,133 @@ mod tests {
     }
 
     #[test]
-    fn open_instead_letters_work_only_in_an_empty_draft() {
-        assert_eq!(open_instead_key("t", true), Some(OpenInstead::Terminal));
-        assert_eq!(open_instead_key("f", true), Some(OpenInstead::Files));
-        assert_eq!(open_instead_key("d", true), Some(OpenInstead::Changes));
-        assert_eq!(open_instead_key("b", true), Some(OpenInstead::Browser));
-        assert_eq!(open_instead_key("m", true), Some(OpenInstead::Monitor));
-        // Other keys type, and once there is text every key types.
-        assert_eq!(open_instead_key("x", true), None);
-        assert_eq!(open_instead_key("enter", true), None);
+    fn alt_and_a_letter_open_instead_and_plain_letters_type() {
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(open_instead_key("t", &alt), Some(OpenInstead::Terminal));
+        assert_eq!(open_instead_key("f", &alt), Some(OpenInstead::Files));
+        assert_eq!(open_instead_key("d", &alt), Some(OpenInstead::Changes));
+        assert_eq!(open_instead_key("b", &alt), Some(OpenInstead::Browser));
+        assert_eq!(open_instead_key("m", &alt), Some(OpenInstead::Monitor));
+        assert_eq!(open_instead_key("x", &alt), None);
+        assert_eq!(open_instead_key("up", &alt), None);
+        let others = [
+            Modifiers::default(),
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                platform: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+        ];
         for choice in OpenInstead::ALL {
-            assert_eq!(open_instead_key(choice.key(), false), None);
+            assert_eq!(choice.shortcut(), format!("alt-{}", choice.letter()));
+            for modifiers in &others {
+                assert_eq!(open_instead_key(choice.letter(), modifiers), None);
+            }
         }
+    }
+
+    fn thread(id: &str, folder: &str, project: Option<&str>, updated_ms: u64) -> ThreadInfo {
+        ThreadInfo {
+            chat: ChatContent {
+                folder: folder.into(),
+                ..chat(id)
+            },
+            title: Some(id.into()),
+            created_ms: 0,
+            updated_ms,
+            activity: ThreadActivity::Idle,
+            open: false,
+            project: project.map(|root| Project {
+                environment: ContentEnvironment::Host,
+                root: root.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn continue_lists_the_projects_newest_four_threads_but_the_draft() {
+        let threads = [
+            thread("old", "/work", Some("/work"), 1),
+            thread("draft", "/work", Some("/work"), 99),
+            thread("other", "/elsewhere", Some("/elsewhere"), 98),
+            thread("sub", "/work/crates", Some("/work"), 7),
+            thread("a", "/work", Some("/work"), 5),
+            thread("b", "/work", Some("/work"), 6),
+            thread("c", "/work", Some("/work"), 4),
+        ];
+        let project = Project {
+            environment: ContentEnvironment::Host,
+            root: "/work".into(),
+        };
+        let ids = |listed: Vec<&ThreadInfo>| -> Vec<String> {
+            listed.iter().map(|thread| thread.chat.id.clone()).collect()
+        };
+        assert_eq!(
+            ids(continue_threads(&threads, &chat("draft"), &[&project])),
+            ["sub", "b", "a", "c"]
+        );
+        // Without a project, threads of the draft's folder.
+        assert_eq!(
+            ids(continue_threads(&threads, &chat("draft"), &[])),
+            ["b", "a", "c", "old"]
+        );
+        // A link names the project by another path; the repository's top folder, the
+        // second project, still finds its threads.
+        let linked = Project {
+            environment: ContentEnvironment::Host,
+            root: "/link".into(),
+        };
+        let elsewhere = ChatContent {
+            folder: "/link/src".into(),
+            ..chat("draft")
+        };
+        assert_eq!(
+            ids(continue_threads(&threads, &elsewhere, &[&linked, &project])),
+            ["sub", "b", "a", "c"]
+        );
+        assert!(continue_threads(&threads, &elsewhere, &[&linked]).is_empty());
+    }
+
+    #[test]
+    fn the_header_line_names_branch_changes_and_folder() {
+        let at = |branch: Option<&str>, changes, truncated| Repo::At {
+            top: "/work".into(),
+            branch: branch.map(Into::into),
+            changes,
+            truncated,
+        };
+        assert_eq!(
+            draft_facts(&at(Some("main"), 3, false), "…/proj/compi"),
+            "main · 3 changes · …/proj/compi"
+        );
+        assert_eq!(
+            draft_facts(&at(Some("main"), 1, false), "/w"),
+            "main · 1 change · /w"
+        );
+        assert_eq!(draft_facts(&at(None, 0, false), "/w"), "No changes · /w");
+        assert_eq!(
+            draft_facts(&at(None, 5000, true), "/w"),
+            "5000+ changes · /w"
+        );
+        assert_eq!(draft_facts(&Repo::None, "/w"), "/w");
+        assert_eq!(draft_facts(&Repo::Reading, "/w"), "/w");
     }
 
     #[test]

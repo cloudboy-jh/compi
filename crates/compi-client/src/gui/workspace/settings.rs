@@ -3863,12 +3863,8 @@ impl CompiApp {
         let focused = self.settings_focused(row, action);
         let current = self.config.chat_approval;
         let options = crate::config::CHAT_APPROVALS.into_iter().map(|approval| {
-            controls::select_option(chat_approval_label(approval)).detail(match approval {
-                ChatApproval::Harness => "OMP's own approval setting",
-                ChatApproval::AlwaysAsk => "Ask before anything but reading",
-                ChatApproval::Write => "Read and edit; ask before commands",
-                ChatApproval::Yolo => "Run every tool without asking",
-            })
+            controls::select_option(chat_approval_label(approval))
+                .detail(chat_approval_detail(approval))
         });
         let open_row = row.clone();
         let select = controls::select(
@@ -5610,6 +5606,16 @@ pub(super) fn chat_approval_label(approval: ChatApproval) -> &'static str {
         ChatApproval::AlwaysAsk => "Always ask",
         ChatApproval::Write => "Allow edits",
         ChatApproval::Yolo => "Allow everything",
+    }
+}
+
+/// What `approval` lets the agent do, as Approvals and a chat's picker describe it.
+pub(super) fn chat_approval_detail(approval: ChatApproval) -> &'static str {
+    match approval {
+        ChatApproval::Harness => "OMP's own approval setting",
+        ChatApproval::AlwaysAsk => "Ask before anything but reading",
+        ChatApproval::Write => "Read and edit; ask before commands",
+        ChatApproval::Yolo => "Run every tool without asking",
     }
 }
 
