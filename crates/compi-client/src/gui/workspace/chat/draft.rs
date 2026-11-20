@@ -485,6 +485,81 @@ impl CompiApp {
         );
     }
 
+    /// Draft `chat` starts again with `harness`, in its place and keeping what was
+    /// typed. Only a draft switches: a thread keeps the agent of its first message.
+    pub(super) fn switch_draft_agent(
+        &mut self,
+        chat: &str,
+        harness: ChatHarness,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, content, view)) = self.draft_place(chat) else {
+            return;
+        };
+        let Some(model) = self.chat.chats.get(chat) else {
+            return;
+        };
+        if content.harness == harness || !model.draft(&content) {
+            return;
+        }
+        let text = model.composer.read(cx).value().to_string();
+        let switched = crate::chat::new_chat(harness, content.environment, content.folder);
+        let id = switched.id.clone();
+        self.put_in_draft_place(&pane_id, view, PaneContent::Chat(switched), window, cx);
+        if !text.trim().is_empty() {
+            self.chat.pending.insert(id, text);
+        }
+    }
+
+    /// The agents installed in `environment` as last asked; every agent while the daemon
+    /// has not said, or could not.
+    pub(in crate::gui::workspace) fn installed_agents(
+        &self,
+        environment: &ContentEnvironment,
+    ) -> Vec<ChatHarness> {
+        match self.chat.agents.get(environment) {
+            Some(agents) if !agents.is_empty() => agents.clone(),
+            _ => ChatHarness::ALL.to_vec(),
+        }
+    }
+
+    /// Asks the daemon, off the UI thread and once per environment, which agents are
+    /// installed in `environment`.
+    pub(in crate::gui::workspace) fn want_agents(
+        &mut self,
+        environment: &ContentEnvironment,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.agents.contains_key(environment) {
+            return;
+        }
+        self.chat.agents.insert(environment.clone(), Vec::new());
+        let target = self.target.clone();
+        let environment = environment.clone();
+        cx.spawn(async move |this, cx| {
+            let asked = environment.clone();
+            let listed = cx
+                .background_executor()
+                .spawn(async move { target.connect()?.chat_agents(&asked) })
+                .await;
+            this.update(cx, |this, cx| {
+                match listed {
+                    Ok(agents) => {
+                        this.chat.agents.insert(environment, agents);
+                    }
+                    // Asked again next time.
+                    Err(_) => {
+                        this.chat.agents.remove(&environment);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The draft with typed text that `operation` closes, and where it was; `None` when
     /// it closes none, or only untouched ones.
     pub(in crate::gui) fn discarded_draft(

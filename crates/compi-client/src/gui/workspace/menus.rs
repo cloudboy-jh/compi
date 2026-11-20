@@ -555,7 +555,8 @@ impl CompiApp {
         self.open_menu(position, Anchor::TopLeft, entries, window, cx);
     }
 
-    /// Right-click on the tab strip's +: a thread or a terminal, whichever New tabs says.
+    /// Right-click on the tab strip's +: a thread with the default agent or another
+    /// installed one, or a terminal, whichever New tabs says + opens.
     pub(super) fn open_new_tab_menu(
         &mut self,
         position: Point<Pixels>,
@@ -563,8 +564,28 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         let context = self.command_context(cx);
+        let reason = Command::NewThreadTab.disabled_reason(&context);
+        let agents = match self.chat_scope() {
+            Ok((environment, _)) => {
+                self.want_agents(&environment, cx);
+                self.installed_agents(&environment)
+            }
+            Err(_) => compi_protocol::chat::ChatHarness::ALL.to_vec(),
+        };
+        let with = agents.into_iter().map(|agent| {
+            menu_item(
+                agent.name(),
+                cx.listener(move |this, _, _, cx| {
+                    this.create_thread_tab(agent);
+                    cx.notify();
+                }),
+            )
+            .disabled_because(reason)
+            .into()
+        });
         let entries = vec![
             self.command_entry(Command::NewThreadTab, "New thread tab", &context, cx),
+            controls::submenu("New thread with", with.collect::<Vec<MenuEntry>>()),
             self.command_entry(Command::NewTerminalTab, "New terminal tab", &context, cx),
         ];
         self.open_menu(position, Anchor::TopLeft, entries, window, cx);

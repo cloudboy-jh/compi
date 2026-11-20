@@ -715,6 +715,11 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((_, content)) = self.chat_pane(chat)
+            && self.chat_draft(&content) == Some(true)
+        {
+            self.want_agents(&content.environment, cx);
+        }
         let remembered = self
             .chat
             .chats
@@ -1628,6 +1633,50 @@ impl CompiApp {
             "Favorites and recent".to_owned(),
             None,
         );
+        // A draft can still change agent: one mark per installed agent heads the strip,
+        // its own lit, another starting the draft again with that agent.
+        let agents: Vec<AnyElement> = if self.chat_draft(chat) == Some(true) {
+            self.installed_agents(&chat.environment)
+                .into_iter()
+                .enumerate()
+                .map(|(index, agent)| {
+                    let current = agent == chat.harness;
+                    let id = chat.id.clone();
+                    div()
+                        .id(("chat-agent-tab", index))
+                        .w_full()
+                        .h(ui_rems(STRIP_WIDTH - 8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .child(img(harness_mark(agent)).flex_none().size(ui_rems(18.0)))
+                        .when(current, |button| button.bg(lit))
+                        .when(!current, |button| {
+                            button
+                                .cursor_pointer()
+                                .opacity(0.55)
+                                .hover(move |button| button.bg(lit).opacity(1.0))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.switch_draft_agent(&id, agent, window, cx);
+                                    cx.notify();
+                                }))
+                        })
+                        .tooltip(controls::tooltip(
+                            agent.name(),
+                            Some(if current {
+                                "This draft's agent".into()
+                            } else {
+                                "Start this draft with it instead; what you typed stays".into()
+                            }),
+                            None,
+                        ))
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let providers =
             providers(option, plans)
                 .into_iter()
@@ -1675,6 +1724,11 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_1()
+            .when(!agents.is_empty(), |strip| {
+                strip
+                    .children(agents)
+                    .child(div().mx_1().border_b_1().border_color(color(colors.border)))
+            })
             .child(saved)
             .child(div().mx_1().border_b_1().border_color(color(colors.border)))
             .children(providers)

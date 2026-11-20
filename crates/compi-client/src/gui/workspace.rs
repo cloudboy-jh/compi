@@ -1851,9 +1851,9 @@ impl CompiApp {
         ));
     }
 
-    /// A new thread draft in a tab of its own, in the focused pane's folder. With no
-    /// folder to start it in (nothing focused), a terminal tab instead.
-    fn create_thread_tab(&mut self) {
+    /// A new thread draft with `harness` in a tab of its own, in the focused pane's
+    /// folder. With no folder to start it in (nothing focused), a terminal tab instead.
+    pub(super) fn create_thread_tab(&mut self, harness: compi_protocol::chat::ChatHarness) {
         let (Some(session_id), Ok((environment, folder))) =
             (self.state.selected_session.clone(), self.chat_scope())
         else {
@@ -1865,7 +1865,7 @@ impl CompiApp {
                 session_id,
                 label: String::new(),
                 content: compi_protocol::PaneContent::Chat(crate::chat::new_chat(
-                    self.config.chat_agent,
+                    harness,
                     environment,
                     folder,
                 )),
@@ -3630,7 +3630,7 @@ impl CompiApp {
         self.set_new_tab(new_tab, cx);
         self.dismiss_overlay();
         if new_tab == crate::config::NewTab::Chat {
-            self.create_thread_tab();
+            self.create_thread_tab(self.config.chat_agent);
         }
         cx.notify();
     }
@@ -3942,11 +3942,11 @@ impl CompiApp {
                 }
             }
             Command::NewTab => match self.config.new_tab.unwrap_or_default() {
-                crate::config::NewTab::Chat => self.create_thread_tab(),
+                crate::config::NewTab::Chat => self.create_thread_tab(self.config.chat_agent),
                 crate::config::NewTab::Terminal => self.create_terminal_tab(),
             },
             Command::NewTerminalTab => self.create_terminal_tab(),
-            Command::NewThreadTab => self.create_thread_tab(),
+            Command::NewThreadTab => self.create_thread_tab(self.config.chat_agent),
             Command::SwitchTab => self.open_overlay(Overlay::Tabs { hidden_only: false }, ""),
             Command::RestoreHiddenTab => self.open_overlay(Overlay::Tabs { hidden_only: true }, ""),
             Command::PreviousTab | Command::NextTab => {
@@ -4357,7 +4357,13 @@ impl CompiApp {
             Command::OpenMonitor => self.open_monitor(window, cx),
             Command::OpenBrowser => self.open_browser(compi_protocol::BrowserContent::BLANK.into()),
             Command::OpenChat => {
-                self.open_chat(window, cx);
+                self.open_chat(self.config.chat_agent, window, cx);
+            }
+            Command::OpenChatOmp => {
+                self.open_chat(compi_protocol::chat::ChatHarness::Omp, window, cx);
+            }
+            Command::OpenChatClaude => {
+                self.open_chat(compi_protocol::chat::ChatHarness::Claude, window, cx);
             }
             Command::Threads => self.open_palette(Some(palette::Scope::Threads), cx),
             Command::SendSelectionToChat => self.send_selection_to_chat(window, cx),

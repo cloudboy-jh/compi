@@ -286,6 +286,9 @@ pub(in crate::gui) struct ChatUi {
     discarding: Option<(MutationId, Discarded)>,
     /// "Draft discarded · Undo", while it shows.
     discarded: Option<DiscardNotice>,
+    /// The agents installed in each environment, as a draft's model picker last asked;
+    /// an empty list while the answer is on its way.
+    agents: HashMap<ContentEnvironment, Vec<ChatHarness>>,
 }
 
 /// Every chat in `node` with its pane: content panes, and terminal views on either side.
@@ -715,12 +718,13 @@ fn watch_chat(
 }
 
 impl CompiApp {
-    /// New chat: a chat with the default agent in the focused terminal's folder, shown in
-    /// its place or, as Settings → Chat → Opening a chat says, beside it; from another
-    /// pane, or a terminal already carrying a chat, in that pane's folder, beside it. The
-    /// new chat's id, when one was asked for.
+    /// New chat: a chat with `harness` in the focused terminal's folder, shown in its
+    /// place or, as Settings → Chat → Opening a chat says, beside it; from another pane,
+    /// or a terminal already carrying a chat, in that pane's folder, beside it. The new
+    /// chat's id, when one was asked for.
     pub(super) fn open_chat(
         &mut self,
+        harness: ChatHarness,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
@@ -735,7 +739,7 @@ impl CompiApp {
                 return None;
             }
         };
-        let chat = crate::chat::new_chat(self.config.chat_agent, environment, folder);
+        let chat = crate::chat::new_chat(harness, environment, folder);
         let id = chat.id.clone();
         let content = PaneContent::Chat(chat);
         // A terminal already carrying a chat keeps it as its view; the new one goes beside.
@@ -821,7 +825,7 @@ impl CompiApp {
             self.focus_pane(pane);
             Some(chat)
         } else {
-            self.open_chat(window, cx)
+            self.open_chat(self.config.chat_agent, window, cx)
         };
         let Some(chat) = chat else {
             return;

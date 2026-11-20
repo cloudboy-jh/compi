@@ -184,6 +184,8 @@ registry! {
     OpenMonitor, "open_monitor", "Monitor", None, None;
     OpenBrowser, "open_browser", "Open browser", None, None;
     OpenChat, "open_chat", "New chat", None, None;
+    OpenChatOmp, "open_chat_omp", "New chat with OMP", None, None;
+    OpenChatClaude, "open_chat_claude", "New chat with Claude Code", None, None;
     Threads, "threads", "Threads", None, None;
     BrowserBack, "browser_back", "Back", None, None;
     BrowserForward, "browser_forward", "Forward", None, None;
@@ -368,8 +370,10 @@ impl Command {
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
-            | SwapPaneDown | RemovePane | OpenBrowser | OpenChat | Threads | BrowserBack
-            | BrowserForward | BrowserReload | FocusAddressBar => CommandCategory::Panes,
+            | SwapPaneDown | RemovePane | OpenBrowser | OpenChat | OpenChatOmp | OpenChatClaude
+            | Threads | BrowserBack | BrowserForward | BrowserReload | FocusAddressBar => {
+                CommandCategory::Panes
+            }
             ShowFiles | ShowChanges | DiffThisFile | ToggleMarkdownRead | NextChange
             | PreviousChange | GitFetch | GitPull | GitPush | SwitchBranch | CreateBranch
             | OpenFile | FindProjectFile | NewEditor | RecoverUnsavedEdits => {
@@ -601,6 +605,8 @@ impl Command {
             }
             OpenBrowser => "web page url localhost preview site dev server http",
             OpenChat => "new agent ai assistant omp claude code chat prompt llm acp",
+            OpenChatOmp => "new agent ai assistant omp oh my pi chat with thread",
+            OpenChatClaude => "new agent ai assistant claude code anthropic chat with thread",
             Threads => {
                 "chat history sessions conversations agent omp claude ai reopen resume delete"
             }
@@ -708,6 +714,8 @@ impl Command {
                 | EndSurface
                 | RestartSurface
                 | OpenChat
+                | OpenChatOmp
+                | OpenChatClaude
         );
         if !c.connected
             && (mutation
@@ -977,7 +985,7 @@ impl Command {
             GitPull => c.git_reason.or(c.pull_reason),
             GitPush => c.git_reason.or(c.push_reason),
             RecoverUnsavedEdits => (!c.has_pane).then_some("Select a pane first"),
-            OpenChat => {
+            OpenChat | OpenChatOmp | OpenChatClaude => {
                 if !c.has_pane {
                     Some("Select a pane first")
                 } else {
