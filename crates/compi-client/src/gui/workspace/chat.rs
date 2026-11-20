@@ -329,20 +329,24 @@ fn chat_title(state: &ChatState) -> Option<String> {
 
 /// What Esc in a chat does once its completion list, pickers and menus are closed: it
 /// drops the queued prompt being edited, else with the draft `empty` answers a waiting
-/// `permission` with its reject option, else nothing. Esc never leaves the chat: the
-/// keyboard stays where it is and the pane never shows its shell.
+/// `permission` with its reject option, else stops the turn while one is `working`, else
+/// nothing. Esc never leaves the chat: the keyboard stays where it is and the pane never
+/// shows its shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChatEscape {
     EndQueuedEdit,
     Reject,
+    Stop,
     Nothing,
 }
 
-fn chat_escape(editing: bool, empty: bool, permission: bool) -> ChatEscape {
+fn chat_escape(editing: bool, empty: bool, permission: bool, working: bool) -> ChatEscape {
     if editing {
         ChatEscape::EndQueuedEdit
     } else if empty && permission {
         ChatEscape::Reject
+    } else if working {
+        ChatEscape::Stop
     } else {
         ChatEscape::Nothing
     }
@@ -1780,11 +1784,10 @@ impl CompiApp {
                 cx,
             ),
             "escape" => {
-                let permission = model
-                    .state
-                    .as_ref()
-                    .is_some_and(|state| state.permission.is_some());
-                match chat_escape(editing, empty, permission) {
+                let state = model.state.as_ref();
+                let permission = state.is_some_and(|state| state.permission.is_some());
+                let working = state.is_some_and(ChatState::working);
+                match chat_escape(editing, empty, permission, working) {
                     ChatEscape::EndQueuedEdit => {
                         if let Some(model) = self.chat.chats.get_mut(&chat) {
                             model.end_queued_edit(window, cx);
@@ -1798,6 +1801,7 @@ impl CompiApp {
                             cx,
                         );
                     }
+                    ChatEscape::Stop => self.cancel_chat(&chat, window, cx),
                     ChatEscape::Nothing => {}
                 }
                 true
@@ -2310,12 +2314,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_in_a_chat_with_nothing_open_stays_in_the_chat() {
-        assert_eq!(chat_escape(false, true, false), ChatEscape::Nothing);
-        assert_eq!(chat_escape(false, false, false), ChatEscape::Nothing);
-        // A draft keeps a waiting permission waiting.
-        assert_eq!(chat_escape(false, false, true), ChatEscape::Nothing);
-        assert_eq!(chat_escape(false, true, true), ChatEscape::Reject);
-        assert_eq!(chat_escape(true, true, true), ChatEscape::EndQueuedEdit);
+    fn escape_in_a_chat_stops_the_turn_and_never_leaves_the_chat() {
+        assert_eq!(chat_escape(false, true, false, false), ChatEscape::Nothing);
+        assert_eq!(chat_escape(false, false, false, false), ChatEscape::Nothing);
+        assert_eq!(chat_escape(false, false, false, true), ChatEscape::Stop);
+        // A waiting permission is turned down first while the draft is empty.
+        assert_eq!(chat_escape(false, true, true, true), ChatEscape::Reject);
+        assert_eq!(chat_escape(false, false, true, true), ChatEscape::Stop);
+        assert_eq!(
+            chat_escape(true, true, true, true),
+            ChatEscape::EndQueuedEdit
+        );
     }
 }
