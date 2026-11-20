@@ -11,7 +11,6 @@ use compi_protocol::{
     BrowserContent, MonitorContent, MutationId, MutationReceipt, PaneReplacement, Project,
     SessionId, SplitAxis,
 };
-use gpui::Modifiers;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How long "Draft discarded · Undo" stays.
@@ -71,17 +70,6 @@ impl OpenInstead {
         }
     }
 
-    /// The letter that picks it with Alt, in GPUI keystroke syntax.
-    fn letter(self) -> &'static str {
-        match self {
-            Self::Terminal => "t",
-            Self::Files => "f",
-            Self::Changes => "d",
-            Self::Browser => "b",
-            Self::Monitor => "m",
-        }
-    }
-
     fn icon(self) -> IconName {
         match self {
             Self::Terminal => IconName::SquareTerminal,
@@ -91,23 +79,6 @@ impl OpenInstead {
             Self::Monitor => IconName::Gauge,
         }
     }
-}
-
-/// What `key` pressed with `modifiers` in a draft opens in its place: Alt (Option on
-/// macOS) and one of the row's letters, whatever the message box holds. A letter
-/// without Alt, or with another modifier too, types.
-pub(super) fn open_instead_key(key: &str, modifiers: &Modifiers) -> Option<OpenInstead> {
-    let alt_only = modifiers.alt
-        && !modifiers.control
-        && !modifiers.platform
-        && !modifiers.shift
-        && !modifiers.function;
-    if !alt_only {
-        return None;
-    }
-    OpenInstead::ALL
-        .into_iter()
-        .find(|choice| choice.letter() == key)
 }
 
 /// Where a discarded draft was, so Undo opens it there again.
@@ -299,8 +270,8 @@ impl CompiApp {
     }
 
     /// What else the pane can be, as a list under the message box and as wide: a muted
-    /// heading, then one row each with its icon, name and key (Alt and its letter).
-    /// Changes is dimmed outside a Git repository.
+    /// heading, then one row each with its icon and name. Changes is dimmed outside a
+    /// Git repository.
     fn render_open_instead(
         &self,
         chat: &ChatContent,
@@ -311,28 +282,6 @@ impl CompiApp {
         let muted = color(modal_text_color(colors.muted, &colors));
         let foreground = color(colors.foreground);
         let hover = color(colors.surface_hover);
-        let badge = color(colors.foreground).opacity(0.07);
-        let key = |text: SharedString| {
-            div()
-                .flex_none()
-                .h(ui_rems(20.0))
-                .min_w(ui_rems(20.0))
-                .px_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(ui_rems(4.0))
-                .bg(badge)
-                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(muted)
-                .child(text)
-        };
-        let modifier = if cfg!(target_os = "macos") {
-            "⌥"
-        } else {
-            "Alt "
-        };
         let rows = OpenInstead::ALL
             .into_iter()
             .enumerate()
@@ -370,9 +319,6 @@ impl CompiApp {
                             .with_size(gpui_component::Size::Small),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(choice.label()))
-                    .child(key(
-                        format!("{modifier}{}", choice.letter().to_uppercase()).into()
-                    ))
             });
         div()
             .w_full()
@@ -839,48 +785,6 @@ mod tests {
                 content: other,
             };
             assert_eq!(split_draft(&leaf), None);
-        }
-    }
-
-    #[test]
-    fn alt_and_a_letter_open_instead_and_plain_letters_type() {
-        let alt = Modifiers {
-            alt: true,
-            ..Modifiers::default()
-        };
-        assert_eq!(open_instead_key("t", &alt), Some(OpenInstead::Terminal));
-        assert_eq!(open_instead_key("f", &alt), Some(OpenInstead::Files));
-        assert_eq!(open_instead_key("d", &alt), Some(OpenInstead::Changes));
-        assert_eq!(open_instead_key("b", &alt), Some(OpenInstead::Browser));
-        assert_eq!(open_instead_key("m", &alt), Some(OpenInstead::Monitor));
-        assert_eq!(open_instead_key("x", &alt), None);
-        assert_eq!(open_instead_key("up", &alt), None);
-        let others = [
-            Modifiers::default(),
-            Modifiers {
-                shift: true,
-                ..Modifiers::default()
-            },
-            Modifiers {
-                control: true,
-                alt: true,
-                ..Modifiers::default()
-            },
-            Modifiers {
-                alt: true,
-                shift: true,
-                ..Modifiers::default()
-            },
-            Modifiers {
-                platform: true,
-                alt: true,
-                ..Modifiers::default()
-            },
-        ];
-        for choice in OpenInstead::ALL {
-            for modifiers in &others {
-                assert_eq!(open_instead_key(choice.letter(), modifiers), None);
-            }
         }
     }
 

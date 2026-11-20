@@ -1843,17 +1843,6 @@ impl CompiApp {
         if key.key == "up" && alt_only && self.edit_last_queued_chat(&chat, window, cx) {
             return true;
         }
-        if let Some(choice) = draft::open_instead_key(&key.key, modifiers)
-            && self.chat_pane(&chat).is_some_and(|(_, content)| {
-                self.chat
-                    .chats
-                    .get(&chat)
-                    .is_some_and(|model| model.draft(&content))
-            })
-        {
-            self.open_instead(&chat, choice, window, cx);
-            return true;
-        }
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift {
             return false;
         }
