@@ -5657,7 +5657,6 @@ impl CompiApp {
                 .chain(tooltip_detail.map(|detail| detail.to_string()))
                 .reduce(|lines, line| format!("{lines}\n{line}"))
                 .map(SharedString::from);
-            let project_icon = self.project_icon(tab.project.as_ref(), 14.0);
             // Not over its own menu or while the tab is dragged.
             let tooltip = self.tab_menu.is_none()
                 && self.context_menu.is_none()
@@ -5740,7 +5739,6 @@ impl CompiApp {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(project_icon)
                         .children(program_status)
                         .child(
                             div()

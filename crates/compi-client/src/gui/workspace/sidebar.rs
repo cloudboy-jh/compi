@@ -2264,7 +2264,6 @@ impl CompiApp {
                             .gap_1p5()
                             .text_size(px(UI_MICRO_TEXT_SIZE))
                             .text_color(muted)
-                            .child(self.project_icon(card.project.as_ref(), 14.0))
                             .child(
                                 div()
                                     .flex_1()

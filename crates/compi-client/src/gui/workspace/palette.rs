@@ -1087,22 +1087,11 @@ impl CompiApp {
         );
     }
 
-    /// The project whose icon leads a palette row: a tab's (and its panes'), a thread's,
-    /// or a visited folder taken as a project's root. `None` for rows without one.
-    pub(super) fn palette_row_project(&self, action: &ChoiceAction) -> Option<Option<Project>> {
+    /// The project a palette row stands for, whose icon leads it: a visited folder taken
+    /// as a project's root. `None` for every other row.
+    pub(super) fn palette_row_project(&self, action: &ChoiceAction) -> Option<Project> {
         match action {
-            ChoiceAction::Tab(tab_id) | ChoiceAction::Pane(tab_id, _) => Some(
-                self.workspace
-                    .as_ref()?
-                    .sessions
-                    .iter()
-                    .flat_map(|session| &session.tabs)
-                    .find(|tab| &tab.id == tab_id)?
-                    .project
-                    .clone(),
-            ),
-            ChoiceAction::Thread(chat) => Some(self.palette_thread(chat)?.project.clone()),
-            ChoiceAction::Project(path) => Some(Some(self.visited_project(path))),
+            ChoiceAction::Project(path) => Some(self.visited_project(path)),
             _ => None,
         }
     }

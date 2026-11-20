@@ -111,12 +111,12 @@ impl CompiApp {
                 ThreadActivity::Idle => None,
             });
             let delete = thread.map(|thread| thread.chat.id.clone());
-            // Tab, pane, thread and project rows lead with their project's icon, a file
-            // with its language's, the rest with their kind's.
+            // Project rows lead with their project's icon, threads with their agent's
+            // mark, a file with its language's icon, the rest with their kind's.
             let leading: Option<AnyElement> = if !palette {
                 None
             } else if let Some(project) = self.palette_row_project(&choice.action) {
-                Some(self.project_icon(project.as_ref(), 14.0))
+                Some(self.project_icon(Some(&project), 14.0))
             } else {
                 let glyph = |icon| controls::glyph(icon, muted).into_any_element();
                 Some(match &choice.action {
@@ -127,6 +127,13 @@ impl CompiApp {
                             None => glyph(IconName::File),
                         }
                     }
+                    ChoiceAction::Thread(_) => match thread {
+                        Some(thread) => gpui::img(super::chat::harness_mark(thread.chat.harness))
+                            .flex_none()
+                            .size(px(14.0))
+                            .into_any_element(),
+                        None => glyph(IconName::MessageSquare),
+                    },
                     _ => glyph(IconName::SquareTerminal),
                 })
             };

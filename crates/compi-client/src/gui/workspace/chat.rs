@@ -2045,7 +2045,7 @@ impl CompiApp {
                     cx.notify();
                 }),
             )
-            .child(self.render_chat_header(pane_id, chat, model, cx))
+            .child(self.render_chat_header(chat, model, cx))
             .map(|pane| {
                 if model.draft(chat) {
                     pane.child(self.render_chat_draft(pane_id, chat, model, cx))
@@ -2073,11 +2073,10 @@ impl CompiApp {
         px(UI_BODY_TEXT_SIZE * self.config.chat_text_size / crate::config::DEFAULT_CHAT_TEXT_SIZE)
     }
 
-    /// The harness, the chat's title ("New thread" while it is a draft), its tab's
-    /// project and folder, whether it is reachable, and its menu.
+    /// The harness, the chat's title ("New thread" while it is a draft), its folder,
+    /// whether it is reachable, and its menu.
     fn render_chat_header(
         &self,
-        pane_id: &PaneId,
         chat: &ChatContent,
         model: &ChatModel,
         cx: &Context<Self>,
@@ -2126,7 +2125,6 @@ impl CompiApp {
                         .child(title),
                 )
             })
-            .child(self.project_icon(self.pane_project(pane_id), 14.0))
             .child(
                 div()
                     .id("chat-folder")
