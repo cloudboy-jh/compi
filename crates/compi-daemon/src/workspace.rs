@@ -1,8 +1,8 @@
 use crate::workspace_store::{PendingRemoval, RemovalTarget, StoredWorkspace, WorkspaceStore};
 use compi_protocol::{
-    ContentEnvironment, ErrorCode, KeptTerminal, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS,
-    MAX_TAB_PANES, MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId,
-    PaneSide, PaneView, PlannedLayoutNode, ProcessLifetimeId, Project, ServerGeneration, SessionId,
+    ContentEnvironment, ErrorCode, LaunchRequest, LayoutNode, MAX_MUTATION_RECEIPTS, MAX_TAB_PANES,
+    MergedTab, MutationId, MutationReceipt, MutationRequest, PaneContent, PaneId, PaneSide,
+    PaneView, PlannedLayoutNode, ProcessLifetimeId, Project, ServerGeneration, SessionId,
     SplitAxis, SurfaceId, SurfaceInfo, SurfaceStatus, TabGroup, TabGroupId, TabId, TabMerge,
     TabPlacement, WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
@@ -989,27 +989,9 @@ fn apply_mutation(
             validate_content(&content).map_err(invalid)?;
             let tab_id = TabId::new(allocate("tab", ordinal));
             let pane_id = PaneId::new(allocate("pane", ordinal));
-            let kept = workspace
-                .kept_terminals
-                .iter()
-                .position(|kept| kept.chat == chat.id)
-                .map(|index| workspace.kept_terminals.remove(index));
-            let layout = match kept {
-                Some(kept) => {
-                    affected_surfaces.push(kept.surface_id.clone());
-                    LayoutNode::Pane {
-                        pane_id: pane_id.clone(),
-                        surface_id: kept.surface_id,
-                        view: Some(PaneView {
-                            content,
-                            side: PaneSide::View,
-                        }),
-                    }
-                }
-                None => LayoutNode::Content {
-                    pane_id: pane_id.clone(),
-                    content,
-                },
+            let layout = LayoutNode::Content {
+                pane_id: pane_id.clone(),
+                content,
             };
             let session = workspace
                 .sessions
@@ -1029,39 +1011,6 @@ fn apply_mutation(
             affected_tabs.push(tab_id);
             affected_panes.push(pane_id);
             Ok("committed".into())
-        }
-        WorkspaceMutation::ForgetThreadTerminal { chat } => {
-            let Some(index) = workspace
-                .kept_terminals
-                .iter()
-                .position(|kept| &kept.chat == chat)
-            else {
-                return Ok("committed".into());
-            };
-            let kept = workspace.kept_terminals.remove(index);
-            affected_surfaces.push(kept.surface_id.clone());
-            let mut state = "removed";
-            if let Some(surface) = workspace
-                .surfaces
-                .iter_mut()
-                .find(|surface| surface.id == kept.surface_id)
-                && matches!(
-                    surface.status,
-                    SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
-                )
-            {
-                if surface.status != SurfaceStatus::Ending {
-                    surface.status = SurfaceStatus::Ending;
-                    effects.push(WorkspaceEffect::End {
-                        surface_id: kept.surface_id.clone(),
-                        process_lifetime_id: surface.process_lifetime_id.clone(),
-                    });
-                }
-                state = "ending";
-            }
-            // A terminal still ending stays a surface until its process ends.
-            prune_unreferenced_surfaces(workspace);
-            Ok(state.into())
         }
         WorkspaceMutation::RenameTab { tab_id, label } => {
             validate_label(label, false).map_err(invalid)?;
@@ -1940,42 +1889,10 @@ fn prepare_removal(
             Some(workspace.revision),
         )
     })?;
-    // A terminal showing a thread's chat keeps running for that thread instead of
-    // ending. A thread keeps one terminal; any other showing it ends as usual.
-    let mut kept: Vec<KeptTerminal> = Vec::new();
-    let mut ids = Vec::new();
-    for leaf in leaves {
-        let LayoutNode::Pane {
-            surface_id, view, ..
-        } = leaf
-        else {
-            continue;
-        };
-        if let Some(PaneView {
-            content: PaneContent::Chat(chat),
-            ..
-        }) = view
-            && !workspace
-                .kept_terminals
-                .iter()
-                .chain(
-                    workspace
-                        .pending_removals
-                        .iter()
-                        .flat_map(|removal| &removal.kept),
-                )
-                .chain(&kept)
-                .any(|kept| kept.chat == chat.id)
-        {
-            kept.push(KeptTerminal {
-                chat: chat.id.clone(),
-                surface_id: surface_id.clone(),
-            });
-        } else {
-            ids.push(surface_id.clone());
-        }
-    }
-    affected_surfaces.extend(kept.iter().map(|kept| kept.surface_id.clone()));
+    let ids: Vec<SurfaceId> = leaves
+        .into_iter()
+        .filter_map(|leaf| leaf.surface_id().cloned())
+        .collect();
     let mut pending = Vec::new();
     for id in &ids {
         let Some(surface) = workspace
@@ -2001,13 +1918,12 @@ fn prepare_removal(
         }
     }
     if pending.is_empty() {
-        apply_removal(workspace, &target, kept);
+        apply_removal(workspace, &target);
         Ok("removed".into())
     } else {
         workspace.pending_removals.push(PendingRemoval {
             target,
             surfaces: pending,
-            kept,
         });
         Ok("ending".into())
     }
@@ -2214,11 +2130,9 @@ fn apply_observation(
             .pending_removals
             .retain(|removal| !completed.iter().any(|done| done.target == removal.target));
         for removal in completed {
-            apply_removal(&mut candidate, &removal.target, removal.kept);
+            apply_removal(&mut candidate, &removal.target);
         }
     }
-    // A thread's forgotten terminal leaves once its process ends.
-    prune_unreferenced_surfaces(&mut candidate);
     candidate.revision = candidate.revision.saturating_add(1);
     Some(candidate)
 }
@@ -2841,8 +2755,7 @@ fn target_leaves<'a>(
     Some(leaves)
 }
 
-/// Removes `target`, keeping its `kept` terminals for their threads.
-fn apply_removal(workspace: &mut StoredWorkspace, target: &RemovalTarget, kept: Vec<KeptTerminal>) {
+fn apply_removal(workspace: &mut StoredWorkspace, target: &RemovalTarget) {
     match target {
         RemovalTarget::Pane { pane_id } => {
             for tab in workspace
@@ -2870,7 +2783,6 @@ fn apply_removal(workspace: &mut StoredWorkspace, target: &RemovalTarget, kept: 
                 .retain(|session| &session.id != session_id);
         }
     }
-    workspace.kept_terminals.extend(kept);
     prune_unreferenced_surfaces(workspace);
     // Pending tab removals finish later, so their groups settle here too.
     for session in &mut workspace.sessions {
@@ -2900,17 +2812,12 @@ fn remove_pane(node: LayoutNode, target: &PaneId) -> Option<LayoutNode> {
     }
 }
 
-/// Drops the surfaces no tab or thread holds once their processes have ended; a
-/// terminal a thread forgot stays until its process ends.
+/// Drops the surfaces no tab holds.
 fn prune_unreferenced_surfaces(workspace: &mut StoredWorkspace) {
-    let held = crate::workspace_store::held_surfaces(workspace);
-    workspace.surfaces.retain(|surface| {
-        held.contains(&surface.id)
-            || matches!(
-                surface.status,
-                SurfaceStatus::Starting | SurfaceStatus::Running | SurfaceStatus::Ending
-            )
-    });
+    let held = crate::workspace_store::tab_surfaces(workspace);
+    workspace
+        .surfaces
+        .retain(|surface| held.contains(&surface.id));
     workspace
         .last_directories
         .retain(|surface, _| held.contains(surface));
@@ -4024,7 +3931,6 @@ mod tests {
             pending_removals: vec![],
             recovery_message: after.recovery_message.clone(),
             last_directories: Default::default(),
-            kept_terminals: Vec::new(),
         };
         let path = std::env::temp_dir().join(format!(
             "compi-detach-{}-{}.json",
@@ -4257,7 +4163,6 @@ mod tests {
             pending_removals: vec![],
             recovery_message: None,
             last_directories: Default::default(),
-            kept_terminals: Vec::new(),
         })
         .unwrap();
 
@@ -4589,7 +4494,6 @@ mod tests {
             pending_removals: vec![],
             recovery_message: None,
             last_directories: Default::default(),
-            kept_terminals: Vec::new(),
         };
         crate::workspace_store::validate(&stored).unwrap();
     }
@@ -7201,27 +7105,8 @@ mod tests {
         }
     }
 
-    /// Shows thread `chat` on the terminal of the only tab and closes that tab, keeping
-    /// the terminal for the thread.
-    fn keep_for_thread(actor: &WorkspaceActor, terminal: &PaneId, chat: &str) {
-        let tab_id = actor.snapshot().unwrap().sessions[0].tabs[0].id.clone();
-        mutate_current(
-            actor,
-            "show-thread",
-            show_view(terminal, PaneContent::Chat(thread(chat))),
-        )
-        .unwrap();
-        let receipt = mutate_current(
-            actor,
-            "close-thread",
-            WorkspaceMutation::RemoveTab { tab_id },
-        )
-        .unwrap();
-        assert_eq!(receipt.operation_state, "removed");
-    }
-
     #[test]
-    fn closing_a_chat_pane_keeps_its_terminal_while_plain_terminals_end() {
+    fn closing_a_chat_pane_ends_its_terminal_like_any_other() {
         let (actor, effects, surface, terminal) = running_terminal();
         mutate_current(
             &actor,
@@ -7239,21 +7124,10 @@ mod tests {
         let WorkspaceEffect::Launch(plain, _) = effects.recv().unwrap() else {
             panic!("splitting launches a terminal");
         };
-        let chat = thread("chat-1");
         mutate_current(
             &actor,
             "show",
-            show_view(&terminal, PaneContent::Chat(chat.clone())),
-        )
-        .unwrap();
-        // Whichever side the pane shows, its terminal stays the thread's.
-        mutate_current(
-            &actor,
-            "flip",
-            WorkspaceMutation::SetPaneSide {
-                pane_id: terminal.clone(),
-                side: PaneSide::Terminal,
-            },
+            show_view(&terminal, PaneContent::Chat(thread("chat-1"))),
         )
         .unwrap();
         let receipt = mutate_current(
@@ -7264,107 +7138,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(receipt.operation_state, "removed");
-        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
-        let closed = actor.snapshot().unwrap();
-        let kept = vec![KeptTerminal {
-            chat: chat.id.clone(),
-            surface_id: surface.id.clone(),
-        }];
-        assert_eq!(closed.kept_terminals, kept);
-        assert_eq!(
-            closed.surface(&surface.id).unwrap().status,
-            SurfaceStatus::Running
-        );
-        assert!(matches!(
-            &closed.sessions[0].tabs[0].layout,
-            LayoutNode::Pane { surface_id, view: None, .. } if *surface_id == plain.id
-        ));
-
-        // The plain terminal ends with its tab, and the kept one is not pruned.
-        let closing = mutate_current(
-            &actor,
-            "close-tab",
-            WorkspaceMutation::RemoveTab {
-                tab_id: closed.sessions[0].tabs[0].id.clone(),
-            },
-        )
-        .unwrap();
-        assert_eq!(closing.operation_state, "ending");
-        let WorkspaceEffect::End { surface_id, .. } = effects.recv().unwrap() else {
-            panic!("closing the tab ends its plain terminal");
-        };
-        assert_eq!(surface_id, plain.id);
-        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
-        let ending = actor.snapshot().unwrap();
-        actor.observe(RuntimeObservation::Exited {
-            surface_id: plain.id.clone(),
-            process_lifetime_id: plain.process_lifetime_id.clone(),
-            exit_code: 0,
-        });
-        let emptied = wait_revision(&actor, ending.revision + 1);
-        assert!(emptied.sessions[0].tabs.is_empty());
-        assert_eq!(emptied.surfaces.len(), 1);
-        assert_eq!(emptied.surfaces[0].id, surface.id);
-        assert_eq!(emptied.kept_terminals, kept);
-
-        // Opening the thread brings its terminal back with the chat as its view.
-        let opened = mutate_current(
-            &actor,
-            "open-thread",
-            WorkspaceMutation::OpenThread {
-                session_id: emptied.sessions[0].id.clone(),
-                chat: chat.clone(),
-            },
-        )
-        .unwrap();
-        let reopened = actor.snapshot().unwrap();
-        let tab = &reopened.sessions[0].tabs[0];
-        assert_eq!(opened.affected_tabs, vec![tab.id.clone()]);
-        assert_eq!(opened.affected_panes.len(), 1);
-        assert_eq!(opened.affected_surfaces, vec![surface.id.clone()]);
-        assert_eq!(tab.label, "compi-content-project");
-        assert_eq!(
-            tab.layout,
-            viewing(
-                &opened.affected_panes[0],
-                &surface,
-                &PaneContent::Chat(chat),
-                PaneSide::View
-            )
-        );
-        assert!(reopened.kept_terminals.is_empty());
-        assert_eq!(
-            reopened.surface(&surface.id).unwrap().status,
-            SurfaceStatus::Running
-        );
-        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
-    }
-
-    #[test]
-    fn forgetting_a_thread_terminal_ends_it_then_the_thread_opens_as_content() {
-        let (actor, effects, surface, terminal) = running_terminal();
-        let session_id = actor.snapshot().unwrap().sessions[0].id.clone();
-        keep_for_thread(&actor, &terminal, "chat-1");
-        let forget = || WorkspaceMutation::ForgetThreadTerminal {
-            chat: "chat-1".into(),
-        };
-        let receipt = mutate_current(&actor, "forget", forget()).unwrap();
         assert_eq!(receipt.operation_state, "ending");
-        assert_eq!(receipt.affected_surfaces, vec![surface.id.clone()]);
         let WorkspaceEffect::End {
             surface_id,
             process_lifetime_id,
         } = effects.recv().unwrap()
         else {
-            panic!("forgetting the thread's terminal ends it");
+            panic!("closing the chat's pane ends its terminal");
         };
         assert_eq!(surface_id, surface.id);
-        let forgetting = actor.snapshot().unwrap();
-        assert!(forgetting.kept_terminals.is_empty());
-        // It stays a surface until it ends, so its runtime is not retired early.
+        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
+        let ending = actor.snapshot().unwrap();
         assert_eq!(
-            forgetting.surface(&surface.id).unwrap().status,
+            ending.surface(&surface.id).unwrap().status,
             SurfaceStatus::Ending
         );
         actor.observe(RuntimeObservation::Exited {
@@ -7372,14 +7158,19 @@ mod tests {
             process_lifetime_id,
             exit_code: 0,
         });
-        let forgotten = wait_revision(&actor, forgetting.revision + 1);
-        assert!(forgotten.surfaces.is_empty());
+        let closed = wait_revision(&actor, ending.revision + 1);
+        assert_eq!(closed.surfaces.len(), 1);
+        assert_eq!(closed.surfaces[0].id, plain.id);
+        assert!(matches!(
+            &closed.sessions[0].tabs[0].layout,
+            LayoutNode::Pane { surface_id, view: None, .. } if *surface_id == plain.id
+        ));
+    }
 
-        let receipt = mutate_current(&actor, "forget-again", forget()).unwrap();
-        assert_eq!(receipt.operation_state, "committed");
-        assert!(receipt.affected_surfaces.is_empty());
-        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
-
+    #[test]
+    fn a_thread_opens_as_a_content_tab() {
+        let (actor, effects, _surface, _terminal) = running_terminal();
+        let session_id = actor.snapshot().unwrap().sessions[0].id.clone();
         let chat = thread("chat-1");
         let opened = mutate_current(
             &actor,
@@ -7390,8 +7181,9 @@ mod tests {
             },
         )
         .unwrap();
-        let tab = actor.snapshot().unwrap().sessions[0].tabs[0].clone();
+        let tab = actor.snapshot().unwrap().sessions[0].tabs[1].clone();
         assert_eq!(opened.affected_tabs, vec![tab.id]);
+        assert_eq!(tab.label, "compi-content-project");
         assert_eq!(
             tab.layout,
             LayoutNode::Content {
@@ -7400,38 +7192,6 @@ mod tests {
             }
         );
         assert!(opened.affected_surfaces.is_empty());
-        assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
-    }
-
-    #[test]
-    fn a_kept_terminal_that_exits_stays_kept_until_forgotten() {
-        let (actor, effects, surface, terminal) = running_terminal();
-        keep_for_thread(&actor, &terminal, "chat-1");
-        let kept = actor.snapshot().unwrap();
-        actor.observe(RuntimeObservation::Exited {
-            surface_id: surface.id.clone(),
-            process_lifetime_id: surface.process_lifetime_id.clone(),
-            exit_code: 0,
-        });
-        let exited = wait_revision(&actor, kept.revision + 1);
-        assert_eq!(exited.kept_terminals, kept.kept_terminals);
-        assert_eq!(
-            exited.surface(&surface.id).unwrap().status,
-            SurfaceStatus::Exited
-        );
-
-        let receipt = mutate_current(
-            &actor,
-            "forget",
-            WorkspaceMutation::ForgetThreadTerminal {
-                chat: "chat-1".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(receipt.operation_state, "removed");
-        let forgotten = actor.snapshot().unwrap();
-        assert!(forgotten.kept_terminals.is_empty());
-        assert!(forgotten.surfaces.is_empty());
         assert!(matches!(effects.try_recv(), Err(TryRecvError::Empty)));
     }
 }

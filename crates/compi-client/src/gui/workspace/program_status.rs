@@ -364,11 +364,6 @@ impl CompiApp {
             .max()
     }
 
-    /// The state chat `chat`'s records most need the user for.
-    pub(super) fn chat_program_headline(&self, chat: &str) -> Option<Headline> {
-        status::headline(self.program_status.chat_records(chat))
-    }
-
     /// Hover text for the tab's program status. A tab of one pane has its name as the
     /// tooltip title, so only its records; otherwise every reporting pane by name, then
     /// its records, so a program cannot pose as one in another pane.

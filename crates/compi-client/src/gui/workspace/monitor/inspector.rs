@@ -1007,7 +1007,6 @@ mod tests {
             ],
             surfaces: vec![],
             recovery_message: None,
-            kept_terminals: Vec::new(),
         };
         assert_eq!(
             surface_pane(&workspace, &SurfaceId::new("surface-c")),

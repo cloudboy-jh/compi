@@ -390,9 +390,8 @@ impl CompiApp {
     }
 
     /// Close pane: a terminal ends its process tree (asking first only with "Confirm
-    /// before closing"), a content pane asks only about unsaved edits. A terminal showing
-    /// a chat keeps running for its thread, so it closes like a content pane. A tab's
-    /// last pane closes the tab.
+    /// before closing"), and a chat in it or in a content pane ends with it; a content
+    /// pane asks only about unsaved edits. A tab's last pane closes the tab.
     pub(super) fn close_pane(
         &mut self,
         pane_id: &PaneId,
@@ -403,20 +402,15 @@ impl CompiApp {
             return;
         };
         let pane_id = pane_id.clone();
-        let keeps_running = facts.running.is_none() || self.pane_chat_content(&pane_id).is_some();
         if facts.panes < 2 {
-            if keeps_running {
-                self.remove_work(WorkspaceMutation::RemoveTab { tab_id }, window, cx);
-            } else {
-                self.close_work(
-                    WorkspaceMutation::RemoveTab { tab_id },
-                    "Close this tab and end every process in its panes?",
-                    "Close tab",
-                    window,
-                    cx,
-                );
-            }
-        } else if keeps_running {
+            self.close_work(
+                WorkspaceMutation::RemoveTab { tab_id },
+                "Close this tab and end every process in its panes?",
+                "Close tab",
+                window,
+                cx,
+            );
+        } else if facts.running.is_none() {
             // No process ends; only unsaved edits would be lost.
             self.remove_work(WorkspaceMutation::RemovePane { pane_id }, window, cx);
         } else {

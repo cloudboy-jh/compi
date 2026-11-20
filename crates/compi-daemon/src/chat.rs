@@ -1,15 +1,14 @@
 //! Native agent chats: the daemon runs each chat's harness (`omp acp`) like a shell and
 //! speaks the Agent Client Protocol (JSON-RPC 2.0, one message per line) to it over its
-//! standard input and output. The transcript lives here, so a chat keeps going with no
-//! window open; windows watch it (`WatchChat`) and get its state, then every change.
+//! standard input and output. The transcript lives here; windows watch a chat
+//! (`WatchChat`) and get its state, then every change.
 //!
-//! A chat is keyed by its pane's chat ID and is kept as a thread: Compi saves its
-//! transcript (`threads`), and the chat outlives its pane until the thread is deleted
-//! (`ChatHub::delete_thread`). A chat no pane or view holds runs on while something runs
-//! in it, then stops its harness (`ChatHub::retain`); watching it again starts the
-//! harness on the same session. The harness keeps its own session; a chat that knows its
-//! session resumes it (`session/load`) when it starts again, after a restart of the
-//! daemon too, and the transcript Compi saved stands in for the harness's replay of it.
+//! A chat is keyed by its pane's chat ID and lives as long as a pane or view holds it:
+//! once none does, its turn and harness stop (`ChatHub::retain`). Compi saves its
+//! transcript as a thread (`threads`) until the thread is deleted
+//! (`ChatHub::delete_thread`). The harness keeps its own session; watching a saved
+//! thread again starts the harness on that session (`session/load`), after a restart of
+//! the daemon too, and the transcript Compi saved stands in for the harness's replay.
 use crate::program_status::ChatStatusHub;
 use compi_protocol::chat::{
     ChatAgent, ChatAgentsFinished, ChatAnswer, ChatAnswers, ChatApproval, ChatChange, ChatChoice,
@@ -22,7 +21,7 @@ use compi_protocol::chat::{
     ThreadInfo,
 };
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
-use compi_protocol::{ContentEnvironment, LayoutNode, SessionId, SurfaceId, WorkspaceSnapshot};
+use compi_protocol::{ContentEnvironment, LayoutNode, SurfaceId, WorkspaceSnapshot};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -92,11 +91,10 @@ impl ChatHub {
     }
 
     /// The chat's whole state and a receiver of its later changes, starting the chat if it
-    /// is not running: on its saved thread when there is one, or again on its session when
-    /// its harness stopped once no pane held it. `approval` applies from the harness's
-    /// next start, this one when it starts it; so does `surface`, the terminal whose view
-    /// shows the chat, if one does. `picks` apply to the next new session, this one when
-    /// it starts one.
+    /// is not running: on its saved thread, its session resumed, when there is one.
+    /// `approval` applies from the harness's next start, this one when it starts it; so
+    /// does `surface`, the terminal whose view shows the chat, if one does. `picks` apply
+    /// to the next new session, this one when it starts one.
     pub fn watch(
         &self,
         content: &ChatContent,
@@ -128,11 +126,7 @@ impl ChatHub {
         let mut inner = chat.lock();
         inner.approval = approval;
         inner.picks = picks;
-        inner.held = true;
         inner.show_on(surface);
-        if inner.dormant {
-            chat.wake(&mut inner);
-        }
         let (sender, receiver) = mpsc::channel();
         inner.watchers.push(sender);
         (fit(inner.state.clone(), WATCH_STATE_BYTES), receiver)
@@ -243,10 +237,9 @@ impl ChatHub {
         Ok(())
     }
 
-    /// Notes which chats a pane or view of `workspace` holds, the terminal each shows in
-    /// for its harness's next start, and the workspace of the tab holding it, which its
-    /// thread keeps. A chat none holds stays, its thread saved; its harness stops once
-    /// nothing runs in it. One that never became a thread ends.
+    /// Notes which chats a pane or view of `workspace` holds, and the terminal each shows
+    /// in for its harness's next start. A chat none holds ends at once: its running turn
+    /// stops, its harness stops, its status goes and its thread is saved.
     pub fn retain(&self, workspace: &WorkspaceSnapshot) {
         let chats: Vec<(String, Arc<Chat>)> = lock(&self.chats)
             .iter()
@@ -258,22 +251,9 @@ impl ChatHub {
         let mut held = held_chats(workspace);
         let mut ended = Vec::new();
         for (id, chat) in chats {
-            let mut inner = chat.lock();
             match held.remove(&id) {
-                Some(holder) => {
-                    inner.held = true;
-                    inner.show_on(holder.surface);
-                    inner.held_in(holder.workspace);
-                }
-                None if inner.thread.is_none() => {
-                    drop(inner);
-                    ended.push((id, chat));
-                }
-                None if inner.held => {
-                    inner.held = false;
-                    inner.save_thread(false);
-                }
-                None => {}
+                Some(surface) => chat.lock().show_on(surface),
+                None => ended.push((id, chat)),
             }
         }
         if ended.is_empty() {
@@ -283,13 +263,15 @@ impl ChatHub {
         for (id, chat) in ended {
             if chats.get(&id).is_some_and(|kept| Arc::ptr_eq(kept, &chat)) {
                 chats.remove(&id);
-                chat.close();
+                if let Some(record) = chat.end() {
+                    self.threads.save(record);
+                }
             }
         }
     }
 
-    /// Every thread kept, newest change first, with what runs in it and where `workspace`
-    /// shows it.
+    /// Every thread kept, newest change first, with what runs in it and whether a pane or
+    /// view of `workspace` holds it.
     pub fn threads(&self, workspace: &WorkspaceSnapshot) -> Vec<ThreadInfo> {
         let held = held_chats(workspace);
         let mut threads: Vec<ThreadInfo> = self
@@ -309,34 +291,18 @@ impl ChatHub {
                     if let Some(times) = inner.thread {
                         stored.updated_ms = times.updated_ms;
                     }
-                    if inner.last_workspace.is_some() {
-                        stored.workspace = inner.last_workspace.clone();
-                    }
                 }
-                let holder = held.get(&id);
-                let terminal = holder
-                    .and_then(|holder| holder.surface.clone())
-                    .or_else(|| {
-                        workspace
-                            .kept_terminals
-                            .iter()
-                            .find(|kept| kept.chat == id)
-                            .map(|kept| kept.surface_id.clone())
-                    });
-                let held_in = holder.map(|holder| holder.workspace.clone());
                 ThreadInfo {
                     project: crate::project::project_of(
                         &stored.chat.environment,
                         &stored.chat.folder,
                     ),
-                    open: holder.is_some(),
+                    open: held.contains_key(&id),
                     chat: stored.chat,
                     title: stored.title,
                     created_ms: stored.created_ms,
                     updated_ms: stored.updated_ms,
                     activity,
-                    terminal,
-                    workspace: held_in.or(stored.workspace),
                 }
             })
             .collect();
@@ -372,35 +338,15 @@ impl ChatHub {
 /// The terminal whose view shows chat `id` in `workspace`; `None` when a content pane
 /// shows it, or nothing does.
 pub fn chat_surface(workspace: &WorkspaceSnapshot, id: &str) -> Option<SurfaceId> {
-    held_chats(workspace)
-        .remove(id)
-        .and_then(|holder| holder.surface)
+    held_chats(workspace).remove(id).flatten()
 }
 
-/// Where a pane or view of a workspace holds a chat.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Holder {
-    /// The terminal whose view shows it, when a terminal's view does.
-    surface: Option<SurfaceId>,
-    /// The workspace of the tab holding it.
-    workspace: SessionId,
-}
-
-/// Every chat a pane or view of `workspace` holds, with where it holds it.
-fn held_chats(workspace: &WorkspaceSnapshot) -> HashMap<String, Holder> {
+/// Every chat a pane or view of `workspace` holds, with the terminal whose view shows
+/// it, when a terminal's view does.
+fn held_chats(workspace: &WorkspaceSnapshot) -> HashMap<String, Option<SurfaceId>> {
     let mut held = HashMap::new();
-    for session in &workspace.sessions {
-        let mut leaves = HashMap::new();
-        for tab in &session.tabs {
-            chat_leaves(&tab.layout, &mut leaves);
-        }
-        held.extend(leaves.into_iter().map(|(id, surface)| {
-            let holder = Holder {
-                surface,
-                workspace: session.id.clone(),
-            };
-            (id, holder)
-        }));
+    for tab in workspace.sessions.iter().flat_map(|session| &session.tabs) {
+        chat_leaves(&tab.layout, &mut held);
     }
     held
 }
@@ -655,15 +601,6 @@ struct Inner {
     thread: Option<ThreadTimes>,
     /// The thread changed since it was last saved.
     save_due: bool,
-    /// The terminal whose view last showed the chat, which its thread keeps.
-    last_surface: Option<SurfaceId>,
-    /// The workspace whose tab last held the chat, which its thread keeps.
-    last_workspace: Option<SessionId>,
-    /// A pane or view holds the chat.
-    held: bool,
-    /// The harness was stopped because no pane held the chat and nothing ran in it; a
-    /// watch starts it again.
-    dormant: bool,
     /// The transcript is Compi's own, so the session's replay while it loads is left out.
     skip_replay: bool,
     /// The chat's environment and folder; a turn's end marks its project's files changed.
@@ -685,10 +622,9 @@ enum Unseen {
     Error(String),
 }
 
-/// A chat's locked state. Letting go of it stops the harness of a chat that is done
-/// with it, publishes the chat's program status, so watchers see where the changes made
-/// under the lock ended, never a step on the way, and hands its thread to the store
-/// when it changed.
+/// A chat's locked state. Letting go of it publishes the chat's program status, so
+/// watchers see where the changes made under the lock ended, never a step on the way,
+/// and hands its thread to the store when it changed.
 struct Locked<'a> {
     inner: MutexGuard<'a, Inner>,
     content: &'a ChatContent,
@@ -710,7 +646,6 @@ impl DerefMut for Locked<'_> {
 
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
-        self.inner.rest_if_idle();
         self.inner.publish_status();
         if let Some(record) = self.inner.thread_to_save(self.content) {
             hub().threads.save(record);
@@ -755,7 +690,6 @@ impl Chat {
             approval,
             picks,
             surface,
-            held: true,
             folder: Some((content.environment.clone(), content.folder.clone())),
             ..Inner::default()
         };
@@ -785,7 +719,6 @@ impl Chat {
     fn spawn(self: &Arc<Self>, inner: &mut Inner) {
         inner.generation += 1;
         inner.initialized = false;
-        inner.dormant = false;
         let generation = inner.generation;
         let chosen = inner.approval.omp_mode();
         let chat = self.clone();
@@ -1294,16 +1227,11 @@ impl Chat {
             .ok_or_else(|| format!("{harness} has no session yet"))
     }
 
-    /// Hands `prompt` to the harness as `delivery` says. A chat whose harness stopped for
-    /// want of a pane starts it again, the prompt queued until it is ready.
+    /// Hands `prompt` to the harness as `delivery` says.
     fn send(self: &Arc<Self>, prompt: Prompt, delivery: ChatDelivery) -> Result<(), String> {
         prompt.check()?;
         let harness = self.content.harness.name();
         let mut inner = self.lock();
-        let woke = inner.dormant;
-        if woke {
-            self.wake(&mut inner);
-        }
         let steer = delivery == ChatDelivery::Steer;
         if steer && inner.state.working() && inner.can_steer {
             let session = inner
@@ -1317,7 +1245,7 @@ impl Chat {
                 json!({ "sessionId": session, "prompt": blocks }),
                 Pending::Steer(prompt),
             );
-        } else if !woke && delivery == ChatDelivery::Prompt
+        } else if delivery == ChatDelivery::Prompt
             || (steer && matches!(inner.state.status, ChatStatus::Ready))
         {
             let session = self.ready_session(&inner)?;
@@ -1481,16 +1409,6 @@ impl Chat {
         Ok(())
     }
 
-    /// Starts the harness again on the chat's session after it stopped for want of a
-    /// pane; the transcript stays, the session's replay left out.
-    fn wake(self: &Arc<Self>, inner: &mut Inner) {
-        inner.skip_replay = true;
-        inner.emit(ChatEvent::Status {
-            status: ChatStatus::Starting,
-        });
-        self.spawn(inner);
-    }
-
     /// Ends the harness and starts it again; a chat with a session resumes it. The
     /// transcript stays as it is, the session's replay left out: what the harness left
     /// open ends as at a turn's end, and the queue empties.
@@ -1524,6 +1442,31 @@ impl Chat {
         inner.stop();
         inner.watchers.clear();
     }
+
+    /// Ends the chat once no pane or view holds it: a running turn is cancelled and ends
+    /// as a restart ends it, the harness stops and its status goes. Returns its thread to
+    /// save one last time, when it has one.
+    fn end(&self) -> Option<ThreadRecord> {
+        let mut inner = self.lock();
+        let working = inner.state.working();
+        if working && let Some(session) = inner.state.session.clone() {
+            inner.write(&json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": { "sessionId": session },
+            }));
+        }
+        inner.stop();
+        inner.stop_agents();
+        if working {
+            inner.end_turn();
+        }
+        inner.save_thread(false);
+        let record = inner.thread_to_save(&self.content);
+        inner.closed = true;
+        inner.watchers.clear();
+        record
+    }
 }
 
 impl Inner {
@@ -1553,8 +1496,6 @@ impl Inner {
             created_ms: thread.created_ms,
             updated_ms: thread.updated_ms,
         });
-        self.last_surface = thread.last_surface;
-        self.last_workspace = thread.workspace;
         self.skip_replay = true;
     }
 
@@ -1596,29 +1537,13 @@ impl Inner {
             self.state.title.clone(),
             times.created_ms,
             times.updated_ms,
-            self.last_surface.clone(),
-            self.last_workspace.clone(),
             self.state.entries.clone(),
         ))
     }
 
     /// Notes `surface`, the terminal whose view shows the chat now, if one does.
     fn show_on(&mut self, surface: Option<SurfaceId>) {
-        if let Some(shown) = &surface
-            && self.last_surface.as_ref() != Some(shown)
-        {
-            self.last_surface = Some(shown.clone());
-            self.save_thread(false);
-        }
         self.surface = surface;
-    }
-
-    /// Notes `workspace`, the workspace of the tab holding the chat now.
-    fn held_in(&mut self, workspace: SessionId) {
-        if self.last_workspace.as_ref() != Some(&workspace) {
-            self.last_workspace = Some(workspace);
-            self.save_thread(false);
-        }
     }
 
     /// What the chat is doing, for the threads list.
@@ -1637,32 +1562,6 @@ impl Inner {
         self.pending
             .values()
             .any(|pending| matches!(pending, Pending::LoadSession))
-    }
-
-    /// Stops the harness of a chat no pane holds once nothing runs in it: no turn, no
-    /// permission or question waiting, no sub-agent running, no prompt waiting to go, no
-    /// session loading.
-    /// The chat stays, its status showing; a watch starts the harness again. A harness
-    /// that already ended stays ended.
-    fn rest_if_idle(&mut self) {
-        if self.held
-            || self.dormant
-            || self.closed
-            || matches!(self.state.status, ChatStatus::Failed { .. })
-            || self.state.working()
-            || self.state.permission.is_some()
-            || self.state.question.is_some()
-            || (!self.queue.is_empty() && !self.queue_held)
-            || self.loading()
-            || self.state.entries.iter().any(|entry| {
-                matches!(entry, ChatEntry::Tool(tool)
-                    if tool.agents.iter().any(|agent| agent.status.is_open()))
-            })
-        {
-            return;
-        }
-        self.stop();
-        self.dormant = true;
     }
 
     /// Applies `event` and sends it to every watcher still listening.
@@ -3696,69 +3595,6 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_keeps_the_workspace_of_the_tab_that_last_held_it() {
-        use compi_protocol::{PaneContent, PaneId, ServerGeneration, ServerId, TabId};
-        use compi_protocol::{WorkspaceSession, WorkspaceTab};
-        let session = |id: &str, chat: Option<&str>| WorkspaceSession {
-            id: SessionId::new(id),
-            label: id.into(),
-            tabs: chat
-                .map(|chat| WorkspaceTab {
-                    id: TabId::new(format!("tab-{id}")),
-                    label: "Chat".into(),
-                    layout: LayoutNode::Content {
-                        pane_id: PaneId::new(format!("pane-{id}")),
-                        content: PaneContent::Chat(thread_chat(chat)),
-                    },
-                    previous_layout: None,
-                    merge: None,
-                    group: None,
-                    project: None,
-                })
-                .into_iter()
-                .collect(),
-            groups: Vec::new(),
-        };
-        let workspace = |sessions| WorkspaceSnapshot {
-            server_id: ServerId::new("server"),
-            server_generation: ServerGeneration::new("1"),
-            revision: 1,
-            initialized: true,
-            sessions,
-            surfaces: Vec::new(),
-            recovery_message: None,
-            kept_terminals: Vec::new(),
-        };
-        let held = held_chats(&workspace(vec![
-            session("session-1", None),
-            session("session-2", Some("chat-1")),
-        ]));
-        let holder = held["chat-1"].clone();
-        assert_eq!(holder.workspace, SessionId::new("session-2"));
-
-        // The chat's thread saves the workspace once a tab holds it, and keeps it after.
-        let mut inner = Inner {
-            thread: Some(ThreadTimes {
-                created_ms: 1,
-                updated_ms: 2,
-            }),
-            ..Inner::default()
-        };
-        inner.held_in(holder.workspace);
-        let record = inner.thread_to_save(&thread_chat("chat-1")).unwrap();
-        assert_eq!(record.workspace, Some(SessionId::new("session-2")));
-        assert_eq!(
-            record.updated_ms, 2,
-            "where it is held changes no transcript"
-        );
-        let mut seeded = Inner::default();
-        seeded.seed(record);
-        assert_eq!(seeded.last_workspace, Some(SessionId::new("session-2")));
-        inner.held_in(SessionId::new("session-2"));
-        assert!(inner.thread_to_save(&thread_chat("chat-1")).is_none());
-    }
-
-    #[test]
     fn streamed_chunks_join_one_entry_per_speaker_and_tool_calls_update_in_place() {
         let mut inner = Inner::default();
         let chunk = |kind: &str, text: &str| json!({ "sessionUpdate": kind, "content": { "type": "text", "text": text } });
@@ -4617,7 +4453,6 @@ mod tests {
                     model: Some("opus".into()),
                     thought_level: Some("max".into()),
                 },
-                held: true,
                 ..Inner::default()
             }),
         });
@@ -4805,8 +4640,6 @@ mod tests {
             None,
             10,
             20,
-            Some(SurfaceId::new("surface-1")),
-            Some(SessionId::new("session-1")),
             vec![
                 ChatEntry::User {
                     text: "\n  Fix the build\nthen test".into(),
@@ -4863,8 +4696,6 @@ mod tests {
             Some("Make it".into()),
             5,
             50,
-            None,
-            None,
             vec![
                 ChatEntry::User {
                     text: "make".into(),
@@ -4921,62 +4752,96 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_no_pane_holds_stays_and_stops_its_harness_only_once_idle() {
-        let shown = |inner: &Inner| inner.status_shown().map(|(state, ..)| state);
-        let mut inner = Inner {
-            chat_id: "chat-rest-test".into(),
-            state: ChatState {
-                session: Some("s".into()),
-                status: ChatStatus::Ready,
-                ..ChatState::default()
-            },
-            held: true,
-            ..Inner::default()
+    fn a_chat_no_pane_holds_ends_at_once_and_saves_its_thread() {
+        use compi_protocol::{PaneContent, PaneId, ServerGeneration, ServerId, TabId};
+        use compi_protocol::{WorkspaceSession, WorkspaceTab};
+        let folder = std::env::temp_dir().join(format!("compi-threads-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let hub = ChatHub {
+            threads: Arc::new(ThreadStore::at(folder.clone())),
+            ..ChatHub::default()
         };
-        inner.rest_if_idle();
-        assert!(!inner.dormant, "a held chat keeps its harness");
-
-        inner.start_prompt("s".into(), text_prompt("go"));
-        assert!(inner.thread.is_some(), "the first prompt starts its thread");
-        assert!(inner.save_due);
-        // Its pane closes while the turn runs.
-        inner.held = false;
-        inner.rest_if_idle();
-        assert!(!inner.dormant, "a running turn goes on");
-        inner.permission(
-            json!(1),
-            &json!({
-                "toolCall": { "toolCallId": "t1", "title": "rm x", "kind": "execute" },
-                "options": [{ "optionId": "a", "name": "Allow once", "kind": "allow_once" }],
-            }),
-        );
-        inner.rest_if_idle();
-        assert!(!inner.dormant, "a waiting permission keeps it");
-
-        inner.prompt_ended(Ok(json!({ "stopReason": "end_turn" })));
-        inner.rest_if_idle();
-        assert!(
-            inner.dormant,
-            "an idle chat no pane holds stops its harness"
-        );
-        assert!(!inner.closed);
-        assert_eq!(
-            shown(&inner),
-            Some(ProgramState::Done),
-            "it still reports its result"
-        );
-
-        // A chat whose harness failed is not started again by a watch.
-        let mut failed = Inner {
-            state: ChatState {
-                status: ChatStatus::Failed {
-                    message: "OMP stopped".into(),
+        let chat = |id: &str| {
+            let content = thread_chat(id);
+            let mut inner = Inner {
+                chat_id: content.id.clone(),
+                state: ChatState {
+                    session: content.session.clone(),
+                    status: ChatStatus::Ready,
+                    ..ChatState::default()
                 },
-                ..ChatState::default()
-            },
-            ..Inner::default()
+                ..Inner::default()
+            };
+            inner.start_prompt("s1".into(), text_prompt("go"));
+            let chat = Arc::new(Chat {
+                content,
+                instance: None,
+                inner: Mutex::new(inner),
+            });
+            lock(&hub.chats).insert(id.to_owned(), chat.clone());
+            chat
         };
-        failed.rest_if_idle();
-        assert!(!failed.dormant);
+        let held = chat("chat-held");
+        let closed = chat("chat-closed");
+        let workspace = WorkspaceSnapshot {
+            server_id: ServerId::new("server"),
+            server_generation: ServerGeneration::new("1"),
+            revision: 1,
+            initialized: true,
+            sessions: vec![WorkspaceSession {
+                id: compi_protocol::SessionId::new("session-1"),
+                label: "Default".into(),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("tab-1"),
+                    label: "Chat".into(),
+                    layout: LayoutNode::Content {
+                        pane_id: PaneId::new("pane-1"),
+                        content: PaneContent::Chat(thread_chat("chat-held")),
+                    },
+                    previous_layout: None,
+                    merge: None,
+                    group: None,
+                    project: None,
+                }],
+                groups: Vec::new(),
+            }],
+            surfaces: Vec::new(),
+            recovery_message: None,
+        };
+        hub.retain(&workspace);
+
+        assert!(lock(&hub.chats).contains_key("chat-held"));
+        let kept = lock(&held.inner);
+        assert!(!kept.closed);
+        assert!(kept.state.working(), "a held chat's turn goes on");
+        drop(kept);
+
+        assert!(!lock(&hub.chats).contains_key("chat-closed"));
+        let ended = lock(&closed.inner);
+        assert!(ended.closed);
+        assert!(ended.agent.is_none());
+        assert!(ended.status_shown().is_none(), "its status goes");
+        assert!(matches!(
+            ended.state.entries[0],
+            ChatEntry::User {
+                ended_ms: Some(_),
+                ..
+            }
+        ));
+        drop(ended);
+        hub.threads.flush();
+        let saved = hub
+            .threads
+            .load("chat-closed")
+            .expect("its thread is saved");
+        assert!(matches!(
+            saved.entries[0],
+            ChatEntry::User {
+                ended_ms: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(saved.chat.session.as_deref(), Some("s1"));
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }

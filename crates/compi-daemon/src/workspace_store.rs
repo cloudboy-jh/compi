@@ -1,8 +1,8 @@
 use crate::Result;
 use compi_protocol::{
-    KeptTerminal, LaunchRequest, LayoutNode, MutationReceipt, PaneId, ProcessLifetimeId,
-    ServerGeneration, ServerId, SessionId, SurfaceId, SurfaceInfo, SurfaceStatus, TabId,
-    WorkingDirectory, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
+    LaunchRequest, LayoutNode, MutationReceipt, PaneId, ProcessLifetimeId, ServerGeneration,
+    ServerId, SessionId, SurfaceId, SurfaceInfo, SurfaceStatus, TabId, WorkingDirectory,
+    WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -33,8 +33,8 @@ use windows::core::PCWSTR;
 /// way Monitor is. Format 9 (protocol 37) adds tab groups (`groups` on a session, `group`
 /// on a tab and a merge record); older daemons ignore the keys and reach their format check.
 /// Format 10 (protocol 38) adds the Chat kind, stored the way Monitor is. Format 11
-/// (protocol 41) adds `kept_terminals`, the terminals kept for threads whose panes closed;
-/// older daemons ignore the key and reach their format check.
+/// (protocol 41) adds a tab's `project`; older daemons ignore the key and reach their
+/// format check.
 const FORMAT_VERSION: u32 = 11;
 
 #[derive(Clone)]
@@ -57,20 +57,12 @@ pub struct StoredWorkspace {
     /// restarts comes back where the user was. Daemon-internal; never sent to clients.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub last_directories: BTreeMap<SurfaceId, String>,
-    /// Terminals kept running for threads whose panes closed. Each one's surface is in
-    /// `surfaces` and in no tab.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub kept_terminals: Vec<KeptTerminal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingRemoval {
     pub target: RemovalTarget,
     pub surfaces: Vec<(SurfaceId, ProcessLifetimeId)>,
-    /// Terminals of the target that show a thread's chat: kept for their threads when
-    /// the removal finishes, never ended.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub kept: Vec<KeptTerminal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -283,7 +275,6 @@ impl StoredWorkspace {
             receipts: Vec::new(),
             recovery_message: None,
             last_directories: BTreeMap::new(),
-            kept_terminals: Vec::new(),
         }
     }
 
@@ -296,7 +287,6 @@ impl StoredWorkspace {
             sessions: self.sessions.clone(),
             surfaces: self.surfaces.clone(),
             recovery_message: self.recovery_message.clone(),
-            kept_terminals: self.kept_terminals.clone(),
         }
     }
 }
@@ -384,7 +374,6 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
             backup.display()
         )),
         last_directories: BTreeMap::new(),
-        kept_terminals: Vec::new(),
     }
 }
 
@@ -722,9 +711,9 @@ fn recover_lost_surfaces(workspace: &mut StoredWorkspace) {
         );
         changed = true;
     }
-    // A thread's terminal forgotten while it was ending held its place only until it
-    // ended, and Compi's restart ended it.
-    let held = held_surfaces(workspace);
+    // A surface no tab holds (a file from a build that kept chats' terminals running
+    // after their panes closed) ended with the restart.
+    let held = tab_surfaces(workspace);
     let count = workspace.surfaces.len();
     workspace
         .surfaces
@@ -816,45 +805,11 @@ pub(crate) fn validate(workspace: &StoredWorkspace) -> Result<()> {
     if merged_ids.iter().any(|id| tab_ids.contains(id)) {
         return Err("a merged tab record reuses a live tab ID".into());
     }
-    let in_tabs = tab_surfaces(workspace);
-    let mut kept_chats = HashSet::new();
-    let mut kept_surfaces = HashSet::new();
-    for kept in &workspace.kept_terminals {
-        if !kept_chats.insert(&kept.chat) || !kept_surfaces.insert(&kept.surface_id) {
-            return Err("workspace keeps a thread or its terminal twice".into());
-        }
-        if !surface_ids.contains(&kept.surface_id) {
-            return Err(format!(
-                "thread {} keeps missing surface {}",
-                kept.chat, kept.surface_id
-            )
-            .into());
-        }
-        if in_tabs.contains(&kept.surface_id) {
-            return Err(format!(
-                "surface {} is kept for thread {} and also in a tab",
-                kept.surface_id, kept.chat
-            )
-            .into());
-        }
-    }
     Ok(())
 }
 
-/// The surfaces the workspace holds: those in a tab and those kept for threads.
-pub(crate) fn held_surfaces(workspace: &StoredWorkspace) -> HashSet<SurfaceId> {
-    let mut held = tab_surfaces(workspace);
-    held.extend(
-        workspace
-            .kept_terminals
-            .iter()
-            .map(|kept| kept.surface_id.clone()),
-    );
-    held
-}
-
 /// The surfaces of the terminal panes in every tab's layout.
-fn tab_surfaces(workspace: &StoredWorkspace) -> HashSet<SurfaceId> {
+pub(crate) fn tab_surfaces(workspace: &StoredWorkspace) -> HashSet<SurfaceId> {
     fn collect(node: &LayoutNode, output: &mut HashSet<SurfaceId>) {
         match node {
             LayoutNode::Pane { surface_id, .. } => {
@@ -1163,7 +1118,6 @@ mod tests {
                 tab_id: TabId::new("tab-1"),
             },
             surfaces: Vec::new(),
-            kept: Vec::new(),
         });
         store.commit(&workspace).unwrap();
         let (_, interrupted) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
@@ -1983,7 +1937,6 @@ mod tests {
 
             let (_, workspace) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
             assert_eq!(workspace.sessions, expected.sessions);
-            assert!(workspace.kept_terminals.is_empty());
             let saved: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved["format_version"], FORMAT_VERSION);
@@ -1992,52 +1945,31 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_terminal_survives_reopen_and_must_be_outside_tabs() {
+    fn kept_chat_terminals_of_an_earlier_build_are_dropped_on_load() {
         let (mut workspace, _) = content_workspace(SurfaceStatus::Running);
         let mut kept = workspace.surfaces[0].clone();
         kept.id = SurfaceId::new("surface-kept");
         workspace.surfaces.push(kept);
-        workspace.kept_terminals.push(KeptTerminal {
-            chat: "chat-1".into(),
-            surface_id: SurfaceId::new("surface-kept"),
-        });
-        // A surface only an ending, forgotten thread held.
-        let mut forgotten = workspace.surfaces[0].clone();
-        forgotten.id = SurfaceId::new("surface-forgotten");
-        forgotten.status = SurfaceStatus::Ending;
-        workspace.surfaces.push(forgotten);
+        let mut manifest = serde_json::to_value(Manifest {
+            format_version: FORMAT_VERSION,
+            workspace,
+        })
+        .unwrap();
+        manifest["workspace"]["kept_terminals"] =
+            serde_json::json!([{ "chat": "chat-1", "surface_id": "surface-kept" }]);
         let path = test_path("kept-terminal");
-        let (store, _) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
-        store.commit(&workspace).unwrap();
-        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            saved["workspace"]["kept_terminals"],
-            serde_json::json!([{ "chat": "chat-1", "surface_id": "surface-kept" }])
-        );
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
         let (_, reopened) = WorkspaceStore::open_path(path.clone(), &[]).unwrap();
-        assert_eq!(reopened.kept_terminals, workspace.kept_terminals);
-        let kept = reopened
-            .surfaces
-            .iter()
-            .find(|surface| surface.id.as_str() == "surface-kept")
-            .expect("a kept terminal stays a surface");
-        // Like a tab's terminal, it ended with the daemon.
-        assert_eq!(kept.status, SurfaceStatus::Lost);
         assert!(
             !reopened
                 .surfaces
                 .iter()
-                .any(|surface| surface.id.as_str() == "surface-forgotten")
+                .any(|surface| surface.id.as_str() == "surface-kept")
         );
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["workspace"].get("kept_terminals").is_none());
         let _ = fs::remove_file(path);
-
-        let mut shown = workspace.clone();
-        shown.kept_terminals[0].surface_id = SurfaceId::new("surface-1");
-        assert!(validate(&shown).is_err());
-        let mut missing = workspace;
-        missing.kept_terminals[0].surface_id = SurfaceId::new("surface-gone");
-        assert!(validate(&missing).is_err());
     }
 
     /// `content_kinds_workspace` with its tab in a named, folded group.

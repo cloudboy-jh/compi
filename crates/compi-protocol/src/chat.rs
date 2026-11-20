@@ -638,7 +638,8 @@ pub enum ThreadActivity {
 }
 
 /// A thread the daemon keeps: a chat, its agent session and its transcript, kept after
-/// its pane closes until it is deleted.
+/// its pane closes until it is deleted. Opening it again starts its agent on the same
+/// session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadInfo {
     /// The chat as a pane holds it: id, agent, environment, folder and session.
@@ -650,18 +651,11 @@ pub struct ThreadInfo {
     /// When its transcript last changed.
     pub updated_ms: u64,
     pub activity: ThreadActivity,
-    /// The terminal it was shown on, while the daemon keeps it: in a tab, or kept
-    /// running since the thread's pane closed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal: Option<crate::SurfaceId>,
-    /// A pane or view holds it now.
+    /// A pane or view holds it now; a thread none holds has ended.
     pub open: bool,
     /// The project its folder belongs to: the Git top level above it, else the folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<crate::Project>,
-    /// The workspace whose tab last held it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<crate::SessionId>,
 }
 
 /// How much of a session's first prompt and last reply its listing carries.

@@ -1,10 +1,9 @@
-//! `compi threads`: the chats the daemon keeps, open in a pane or not, newest first; and
-//! `compi threads delete ID`, which ends one and the terminal kept for it.
+//! `compi threads`: the chats the daemon keeps, open in a pane or ended, newest first;
+//! and `compi threads delete ID`, which deletes an ended one.
 use super::human::{self, Fit};
-use super::{CliError, Options, Output, submit};
+use super::{CliError, Options, Output};
 use crate::DaemonClient;
 use crate::chat::{age_label, now_ms, thread_status, thread_title};
-use compi_protocol::WorkspaceMutation;
 use compi_protocol::chat::ThreadInfo;
 use serde_json::json;
 
@@ -20,15 +19,6 @@ pub(super) fn run(client: &mut DaemonClient, options: &Options) -> Result<Output
         Some("delete") => {
             let chat = &options.args[2];
             client.delete_thread(chat)?;
-            let state = client.workspace()?;
-            if state.kept_terminals.iter().any(|kept| kept.chat == *chat) {
-                submit(
-                    client,
-                    &state,
-                    WorkspaceMutation::ForgetThreadTerminal { chat: chat.clone() },
-                    None,
-                )?;
-            }
             Ok(Output::Report {
                 text: format!("Deleted thread {chat}\n"),
                 value: json!({"chat": chat, "deleted": true}),
@@ -85,16 +75,14 @@ mod tests {
             created_ms: 0,
             updated_ms: now - 3 * 3_600_000,
             activity: ThreadActivity::Idle,
-            terminal: None,
             project: None,
-            workspace: None,
             open: false,
         }];
         assert_eq!(
             table(&threads, now, 100).lines().collect::<Vec<_>>(),
             [
                 "THREAD         FOLDER       AGE  STATUS  ID",
-                "Fix the build  /work/compi  3h   Idle    chat-1",
+                "Fix the build  /work/compi  3h   Ended   chat-1",
             ]
         );
         assert_eq!(table(&[], now, 100), "No threads.\n");

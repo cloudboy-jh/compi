@@ -615,9 +615,8 @@ impl CompiApp {
         }
     }
 
-    /// Deletes thread `chat` off the UI thread, then ends the terminal kept for it and
-    /// lists the threads again. The daemon refuses while a pane or view holds the
-    /// thread; its reason shows.
+    /// Deletes thread `chat` off the UI thread, then lists the threads again. The daemon
+    /// refuses while a pane or view holds the thread; its reason shows.
     pub(super) fn delete_thread(&mut self, chat: String, cx: &mut Context<Self>) {
         let target = self.target.clone();
         cx.spawn(async move |this, cx| {
@@ -632,22 +631,9 @@ impl CompiApp {
             this.update(cx, |this, cx| {
                 match deleted {
                     Ok(()) => {
-                        let kept = this.workspace.as_ref().is_some_and(|workspace| {
-                            workspace
-                                .kept_terminals
-                                .iter()
-                                .any(|kept| kept.chat == chat)
-                        });
-                        if kept {
-                            this.mutate(
-                                WorkspaceMutation::ForgetThreadTerminal { chat: chat.clone() },
-                                false,
-                            );
-                        }
                         if let ThreadList::Listed(threads) = &mut this.palette.threads {
                             threads.retain(|thread| thread.chat.id != chat);
                         }
-                        this.sidebar_thread_deleted(&chat);
                         if matches!(this.overlay, Some(Overlay::Palette)) {
                             let count = this.palette_choices(cx).0.len();
                             this.overlay_index = this.overlay_index.min(count.saturating_sub(1));
@@ -1470,9 +1456,7 @@ mod tests {
             created_ms: 0,
             updated_ms,
             activity,
-            terminal: None,
             project: None,
-            workspace: None,
             open,
         }
     }
@@ -1488,7 +1472,7 @@ mod tests {
                 "/home/me/proj/compi",
                 now - 5 * 60_000,
                 ThreadActivity::Working,
-                false,
+                true,
             ),
             thread(
                 "c2",
@@ -1496,7 +1480,7 @@ mod tests {
                 "/work/api",
                 now - 2 * 3_600_000,
                 ThreadActivity::Idle,
-                true,
+                false,
             ),
         ];
         let tabs = [tab("t1", "api server", false)];
@@ -1539,7 +1523,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("Fix the build", "…/proj/compi · 5m · Working"),
-                ("New thread", "/work/api · 2h · Open"),
+                ("New thread", "/work/api · 2h · Ended"),
             ]
         );
         assert!(groups[0].note.is_none());

@@ -1503,8 +1503,7 @@ fn unsaved_files(
 }
 
 /// Ask once before a close that would end running processes or discard edits that open
-/// windows hold unsaved in its content panes or terminals' Files views. A terminal that
-/// shows a chat keeps running for its thread, so it does not count. With no GUI host
+/// windows hold unsaved in its content panes or terminals' Files views. With no GUI host
 /// running nothing is unsaved. There is no bypass: scripts terminate panes and save
 /// files first.
 fn confirm_close(
@@ -1521,17 +1520,12 @@ fn confirm_close(
                 surface_id,
                 view,
             } => {
-                let kept = view.as_ref().is_some_and(|view| {
-                    matches!(view.content, compi_protocol::PaneContent::Chat(_))
-                });
-                if !kept
-                    && state.surface(&surface_id).is_some_and(|surface| {
-                        matches!(
-                            surface.status,
-                            SurfaceStatus::Starting | SurfaceStatus::Running
-                        )
-                    })
-                {
+                if state.surface(&surface_id).is_some_and(|surface| {
+                    matches!(
+                        surface.status,
+                        SurfaceStatus::Starting | SurfaceStatus::Running
+                    )
+                }) {
                     running.push(surface_id);
                 }
                 if view.is_some_and(|view| view.content.folder().is_some()) {

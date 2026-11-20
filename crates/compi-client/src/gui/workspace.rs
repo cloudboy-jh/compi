@@ -1079,7 +1079,7 @@ impl CompiApp {
                         this.poll_metadata(cx);
                         this.poll_browser_home(cx);
                         this.poll_dev_servers(cx);
-                        this.poll_sidebar_threads(cx);
+                        this.list_sidebar_threads(cx);
                         this.expire_toasts(cx);
                         let now = Instant::now();
                         let mut scroll_expired = false;
@@ -4582,7 +4582,7 @@ impl CompiApp {
                         ChoiceAction::File(path) => self.open_palette_file(path, window, cx),
                         ChoiceAction::Thread(chat) => {
                             if let Some(thread) = self.palette_thread(&chat).cloned() {
-                                self.open_thread(thread.chat, thread.terminal, None, window, cx);
+                                self.open_thread(thread.chat, window, cx);
                             }
                         }
                         ChoiceAction::Window(handle) => {

@@ -1,36 +1,34 @@
 //! The window's sidebar, with T3 Code's rounded cards and search bar in Compi's own
 //! look. At the top, the search with New workspace, New tab and New thread beside it.
-//! Under it, each workspace as a plain label that folds, over its cards: one per tab,
-//! and one per thread no pane holds. At the bottom, a row of equal icon buttons across
-//! the sidebar, with the update button last while a release is on offer.
+//! Under it, each workspace as a plain label that folds, over its cards: one per open
+//! tab. At the bottom, a row of equal icon buttons across the sidebar, with the update
+//! button last while a release is on offer.
 //!
 //! Cards keep their workspace's tab order, pinned tabs first in the order they were
-//! pinned, then the workspace's closed threads, newest first; nothing reorders them on
-//! its own. When a workspace's cards belong to two or more projects (cards without a
-//! project count as one more), they gather under a one-line header per project, in the
-//! order each project's first card comes. A header folds its project's cards and,
-//! folded, shows one dot for the most urgent of them. Headers and cards sit at one
-//! indent: this is a list of cards, never a file tree. The window's state keeps what
-//! is folded.
+//! pinned; nothing reorders them on its own. When a workspace's cards belong to two or
+//! more projects (cards without a project count as one more), they gather under a
+//! one-line header per project, in the order each project's first card comes. A header
+//! folds its project's cards and, folded, shows one dot for the most urgent of them.
+//! Headers and cards sit at one indent: this is a list of cards, never a file tree.
+//! The window's state keeps what is folded.
 //!
 //! A card shows the project's icon and folder with how long ago its status changed,
 //! the chat's or the tab's title, whether a chat or a terminal is in it, and one dot
-//! for what its programs most need the user for.
+//! for what its programs most need the user for. A chat card's title is the chat's
+//! while this window watches it, else the one the daemon's thread list gives, asked
+//! for off the UI thread when the workspace changes.
 //!
 //! New workspace makes "Workspace N" at once and renames its label in place: Enter
-//! keeps the name typed, Escape the default. Dragging a tab's card onto another
-//! workspace's label or cards moves the tab to the end of that workspace. A card and a
-//! label each have a menu on right-click.
+//! keeps the name typed, Escape the default. Dragging a card onto another workspace's
+//! label or cards moves the tab to the end of that workspace. A card, a project header
+//! and a workspace label each have a menu on right-click, as T3 Code's thread, folder
+//! and project rows do.
 //!
 //! Typing in the search shows only the cards whose title, folder or project matches,
 //! without headers; with the search holding the keyboard, Up and Down move through
 //! them, Enter opens one, Escape clears the search and F2 renames the tab. Ctrl+1–9
 //! (Cmd+1–9 on macOS) open the first nine cards shown, skipping folded workspaces and
 //! projects.
-//!
-//! Closed threads come from the daemon's thread list, asked for off the UI thread when
-//! the workspace changes and every ten seconds while the sidebar shows. A thread goes
-//! under the workspace whose tab last held it, else under the selected workspace.
 use super::*;
 use crate::chat::{age_label, now_ms, thread_title};
 use crate::gui::controls::{IconName, MenuEntry, menu_item};
@@ -41,8 +39,6 @@ use gpui::{DragMoveEvent, Entity, Render, img};
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 
-/// How often the sidebar lists the daemon's threads while it shows.
-const THREAD_LISTING_INTERVAL: Duration = Duration::from_secs(10);
 /// The cards Go to sidebar card 1–9 reach.
 const SHORTCUT_CARDS: usize = 9;
 /// How tall the bottom row's buttons are.
@@ -59,14 +55,13 @@ pub(in crate::gui) struct SidebarUi {
     /// The shown card Up and Down moved to while the search has the keyboard.
     highlight: Option<usize>,
     scroll: ScrollHandle,
-    /// The daemon's threads as last listed.
+    /// The daemon's threads as last listed: the titles of chats this window does not
+    /// watch.
     threads: Vec<ThreadInfo>,
     /// A listing is under way.
     listing: bool,
     /// The workspace changed since the last listing began.
     listing_due: bool,
-    /// When the last listing began.
-    listed_at: Option<Instant>,
     /// The workspace label being renamed in place.
     rename: Option<LabelRename>,
     /// The workspace New workspace asked for, until the daemon answers.
@@ -98,7 +93,6 @@ impl SidebarUi {
             threads: Vec::new(),
             listing: false,
             listing_due: true,
-            listed_at: None,
             rename: None,
             creating: None,
             drop_target: None,
@@ -162,16 +156,9 @@ impl Render for CardDrag {
     }
 }
 
-/// What a card opens: a tab, or a thread no pane holds (by its chat's ID).
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CardTarget {
-    Tab(TabId),
-    Thread(String),
-}
-
-/// One card as the sidebar draws it.
+/// One card as the sidebar draws it: one tab.
 struct SidebarCard {
-    target: CardTarget,
+    tab: TabId,
     /// The workspace whose group shows it.
     session: SessionId,
     title: String,
@@ -249,19 +236,14 @@ impl SidebarGroup {
     }
 }
 
-/// A workspace's cards in order: pinned tabs in the order pinned, the other tabs in
-/// the workspace's order, then its closed `threads` as given.
-fn card_order(tabs: &[TabId], pinned: &[TabId], threads: &[&ThreadInfo]) -> Vec<CardTarget> {
+/// A workspace's cards in order: pinned tabs in the order pinned, then the other tabs
+/// in the workspace's order.
+fn card_order(tabs: &[TabId], pinned: &[TabId]) -> Vec<TabId> {
     pinned
         .iter()
         .filter(|id| tabs.contains(id))
         .chain(tabs.iter().filter(|id| !pinned.contains(id)))
-        .map(|id| CardTarget::Tab(id.clone()))
-        .chain(
-            threads
-                .iter()
-                .map(|thread| CardTarget::Thread(thread.chat.id.clone())),
-        )
+        .cloned()
         .collect()
 }
 
@@ -297,39 +279,6 @@ fn shown_count(projects: &[Option<&Project>], folded: impl Fn(Option<&Project>) 
         .filter(|(project, _)| !folded(project.as_ref()))
         .map(|(_, cards)| cards.len())
         .sum()
-}
-
-/// The threads no pane holds, by the workspace whose group shows them, newest first:
-/// the workspace whose tab last held a thread when it is one of `sessions`, else
-/// `fallback`. `held` says a pane holds a thread although the listing is older.
-fn closed_threads<'a>(
-    threads: &'a [ThreadInfo],
-    sessions: &[SessionId],
-    fallback: Option<&SessionId>,
-    held: impl Fn(&str) -> bool,
-) -> HashMap<SessionId, Vec<&'a ThreadInfo>> {
-    let mut grouped: HashMap<SessionId, Vec<&ThreadInfo>> = HashMap::new();
-    for thread in threads
-        .iter()
-        .filter(|thread| !thread.open && !held(&thread.chat.id))
-    {
-        let session = thread
-            .workspace
-            .as_ref()
-            .filter(|workspace| sessions.contains(workspace))
-            .or(fallback);
-        if let Some(session) = session {
-            grouped.entry(session.clone()).or_default().push(thread);
-        }
-    }
-    for threads in grouped.values_mut() {
-        threads.sort_by(|a, b| {
-            b.created_ms
-                .cmp(&a.created_ms)
-                .then_with(|| a.chat.id.cmp(&b.chat.id))
-        });
-    }
-    grouped
 }
 
 /// Whether every word of `query` (lowercase) is in one of `fields`.
@@ -447,16 +396,191 @@ fn leaves<'a>(node: &'a LayoutNode, output: &mut Vec<&'a LayoutNode>) {
     }
 }
 
-/// Copy path: puts `path` on the clipboard; unavailable while the folder is unknown.
-fn copy_path_entry(path: Option<String>) -> MenuEntry {
-    let reason = path.is_none().then_some("Its folder is not known yet");
-    menu_item("Copy path", move |_, _, cx: &mut App| {
-        if let Some(path) = &path {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
+/// An entry putting `text` on the clipboard; unavailable, saying `reason`, without it.
+fn copy_entry(
+    label: &'static str,
+    text: Option<String>,
+    reason: Option<&'static str>,
+) -> MenuEntry {
+    menu_item(label, move |_, _, cx: &mut App| {
+        if let Some(text) = &text {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
         }
     })
     .disabled_because(reason)
     .into()
+}
+
+/// What a row of a card's menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardAction {
+    Pin,
+    Unpin,
+    Rename,
+    CopyPath,
+    CopyThreadId,
+    MoveToWorkspace,
+    AddToTabGroup,
+    RemoveFromTabGroup,
+    MoveToNewWindow,
+    Close,
+}
+
+impl CardAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pin => "Pin",
+            Self::Unpin => "Unpin",
+            Self::Rename => "Rename…",
+            Self::CopyPath => "Copy path",
+            Self::CopyThreadId => "Copy thread ID",
+            Self::MoveToWorkspace => "Move to workspace",
+            Self::AddToTabGroup => "Add to tab group",
+            Self::RemoveFromTabGroup => "Remove from tab group",
+            Self::MoveToNewWindow => "Move to new window",
+            Self::Close => "Close",
+        }
+    }
+}
+
+/// What a row of a project header's menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectAction {
+    NewTerminal,
+    NewThread,
+    CopyPath,
+}
+
+impl ProjectAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NewTerminal => "New terminal here",
+            Self::NewThread => "New thread here",
+            Self::CopyPath => "Copy path",
+        }
+    }
+}
+
+/// What a row of a workspace label's menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceAction {
+    Rename,
+    NewTerminal,
+    NewThread,
+    Fold,
+    Unfold,
+    Close,
+}
+
+impl WorkspaceAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rename => "Rename…",
+            Self::NewTerminal => "New terminal",
+            Self::NewThread => "New thread",
+            Self::Fold => "Fold",
+            Self::Unfold => "Unfold",
+            Self::Close => "Close workspace…",
+        }
+    }
+}
+
+/// A sidebar menu's rows, top to bottom: an action with why it is unavailable, or
+/// `None` for a separator.
+type MenuRows<A> = Vec<Option<(A, Option<&'static str>)>>;
+
+/// A card's menu, as T3 Code's thread row has it without settling, snoozing and
+/// archiving: Pin or Unpin, Rename…, Copy path, Copy thread ID (a chat's card only),
+/// Move to workspace ›, Add to tab group › (and Remove from tab group for a grouped
+/// tab), Move to new window and Close.
+fn card_menu_rows(
+    pinned: bool,
+    path_known: bool,
+    chat: bool,
+    grouped: bool,
+) -> MenuRows<CardAction> {
+    let pin = if pinned {
+        CardAction::Unpin
+    } else {
+        CardAction::Pin
+    };
+    let mut rows = vec![
+        Some((pin, None)),
+        Some((CardAction::Rename, None)),
+        None,
+        Some((
+            CardAction::CopyPath,
+            (!path_known).then_some("Its folder is not known yet"),
+        )),
+    ];
+    if chat {
+        rows.push(Some((CardAction::CopyThreadId, None)));
+    }
+    rows.extend([
+        None,
+        Some((CardAction::MoveToWorkspace, None)),
+        Some((CardAction::AddToTabGroup, None)),
+    ]);
+    if grouped {
+        rows.push(Some((CardAction::RemoveFromTabGroup, None)));
+    }
+    rows.extend([
+        Some((CardAction::MoveToNewWindow, None)),
+        None,
+        Some((CardAction::Close, None)),
+    ]);
+    rows
+}
+
+/// A project header's menu, as T3 Code's folder header has it: New terminal here, New
+/// thread here and Copy path, all at the project's root; unavailable for the cards
+/// without a project.
+fn project_menu_rows(project: Option<&Project>) -> MenuRows<ProjectAction> {
+    let reason = project
+        .is_none()
+        .then_some("These tabs belong to no project");
+    vec![
+        Some((ProjectAction::NewTerminal, reason)),
+        Some((ProjectAction::NewThread, reason)),
+        None,
+        Some((ProjectAction::CopyPath, reason)),
+    ]
+}
+
+/// A workspace label's menu: Rename…, New terminal, New thread, Fold or Unfold, and
+/// Close workspace…. A thread starts from a pane, so an `empty` workspace starts none.
+fn workspace_menu_rows(folded: bool, empty: bool) -> MenuRows<WorkspaceAction> {
+    let fold = if folded {
+        WorkspaceAction::Unfold
+    } else {
+        WorkspaceAction::Fold
+    };
+    vec![
+        Some((WorkspaceAction::Rename, None)),
+        None,
+        Some((WorkspaceAction::NewTerminal, None)),
+        Some((
+            WorkspaceAction::NewThread,
+            empty.then_some("A thread starts from a tab; open one here first"),
+        )),
+        None,
+        Some((fold, None)),
+        None,
+        Some((WorkspaceAction::Close, None)),
+    ]
+}
+
+/// `rows` as menu entries, each action's from `entry`.
+fn menu_entries<A>(
+    rows: MenuRows<A>,
+    mut entry: impl FnMut(A, Option<&'static str>) -> MenuEntry,
+) -> Vec<MenuEntry> {
+    rows.into_iter()
+        .map(|row| match row {
+            Some((action, reason)) => entry(action, reason),
+            None => MenuEntry::Separator,
+        })
+        .collect()
 }
 
 impl CompiApp {
@@ -473,34 +597,16 @@ impl CompiApp {
             .selected_session(workspace)
             .map(|session| session.id.clone());
         let selected_tab = self.selected_tab().map(|tab| tab.id.clone());
-        let sessions: Vec<SessionId> = workspace
-            .sessions
-            .iter()
-            .map(|session| session.id.clone())
-            .collect();
-        let threads = closed_threads(
-            &self.sidebar.threads,
-            &sessions,
-            selected_session.as_ref(),
-            |chat| program_status::chat_place(workspace, chat).is_some(),
-        );
         workspace
             .sessions
             .iter()
             .filter_map(|session| {
                 let tabs: Vec<TabId> = session.tabs.iter().map(|tab| tab.id.clone()).collect();
-                let closed = threads.get(&session.id).map_or(&[][..], Vec::as_slice);
-                let cards: Vec<SidebarCard> = card_order(&tabs, &self.state.pinned_tabs, closed)
+                let cards: Vec<SidebarCard> = card_order(&tabs, &self.state.pinned_tabs)
                     .into_iter()
-                    .filter_map(|target| match target {
-                        CardTarget::Tab(id) => {
-                            let tab = session.tabs.iter().find(|tab| tab.id == id)?;
-                            Some(self.tab_card(&session.id, tab, selected_tab.as_ref()))
-                        }
-                        CardTarget::Thread(chat) => {
-                            let thread = closed.iter().find(|thread| thread.chat.id == chat)?;
-                            Some(self.thread_card(&session.id, thread))
-                        }
+                    .filter_map(|id| {
+                        let tab = session.tabs.iter().find(|tab| tab.id == id)?;
+                        Some(self.tab_card(&session.id, tab, selected_tab.as_ref()))
                     })
                     .filter(|card| card.matches(query))
                     .collect();
@@ -566,7 +672,7 @@ impl CompiApp {
             .map(|headline| headline.state)
             .filter(|state| *state != ProgramState::Idle);
         SidebarCard {
-            target: CardTarget::Tab(tab.id.clone()),
+            tab: tab.id.clone(),
             session: session.clone(),
             title,
             folder,
@@ -579,30 +685,6 @@ impl CompiApp {
             hidden: self.state.hidden_tabs.contains(&tab.id),
             pinned: self.state.pinned_tabs.contains(&tab.id),
             selected: selected_tab == Some(&tab.id),
-        }
-    }
-
-    fn thread_card(&self, session: &SessionId, thread: &ThreadInfo) -> SidebarCard {
-        let state = self
-            .chat_program_headline(&thread.chat.id)
-            .filter(|_| self.config.program_status.sidebar)
-            .map(|headline| headline.state)
-            .filter(|state| *state != ProgramState::Idle);
-        SidebarCard {
-            target: CardTarget::Thread(thread.chat.id.clone()),
-            session: session.clone(),
-            title: thread_title(thread).to_owned(),
-            folder: Some(match &thread.project {
-                Some(project) => project.name().to_owned(),
-                None => folder_name(&thread.chat.folder).to_owned(),
-            }),
-            project: thread.project.clone(),
-            chat: true,
-            state,
-            changed_ms: Some(thread.updated_ms),
-            hidden: false,
-            pinned: false,
-            selected: false,
         }
     }
 
@@ -660,21 +742,6 @@ impl CompiApp {
         let Some(workspace) = &self.workspace else {
             return 0;
         };
-        let sessions: Vec<SessionId> = workspace
-            .sessions
-            .iter()
-            .map(|session| session.id.clone())
-            .collect();
-        let fallback = self
-            .state
-            .selected_session(workspace)
-            .map(|session| session.id.clone());
-        let threads = closed_threads(
-            &self.sidebar.threads,
-            &sessions,
-            fallback.as_ref(),
-            |chat| program_status::chat_place(workspace, chat).is_some(),
-        );
         workspace
             .sessions
             .iter()
@@ -684,13 +751,6 @@ impl CompiApp {
                     .tabs
                     .iter()
                     .map(|tab| tab.project.as_ref())
-                    .chain(
-                        threads
-                            .get(&session.id)
-                            .into_iter()
-                            .flatten()
-                            .map(|thread| thread.project.as_ref()),
-                    )
                     .collect();
                 shown_count(&projects, |project| {
                     self.state.project_folded(&session.id, project)
@@ -708,43 +768,17 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         let groups = self.sidebar_groups();
-        let card = shown_cards(&groups, searching(&self.sidebar.query))
+        let tab = shown_cards(&groups, searching(&self.sidebar.query))
             .nth(number.saturating_sub(1))
-            .map(|card| (card.target.clone(), card.session.clone()));
-        if let Some((target, session)) = card {
-            self.open_card(&target, &session, window, cx);
+            .map(|card| card.tab.clone());
+        if let Some(tab) = tab {
+            self.open_card(tab, window, cx);
         }
     }
 
-    /// Opens a card: selects its tab, or opens its thread in its workspace; then gives
-    /// the panes the keyboard.
-    fn open_card(
-        &mut self,
-        target: &CardTarget,
-        session: &SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match target {
-            CardTarget::Tab(id) => self.select_terminal(id.clone(), true),
-            CardTarget::Thread(chat) => {
-                let thread = self
-                    .sidebar
-                    .threads
-                    .iter()
-                    .find(|thread| &thread.chat.id == chat)
-                    .cloned();
-                if let Some(thread) = thread {
-                    self.open_thread(
-                        thread.chat,
-                        thread.terminal,
-                        Some(session.clone()),
-                        window,
-                        cx,
-                    );
-                }
-            }
-        }
+    /// Opens a card: selects its tab, then gives the panes the keyboard.
+    fn open_card(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_terminal(tab, true);
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -926,15 +960,9 @@ impl CompiApp {
         self.apply_label_rename(cx);
     }
 
-    /// Takes the daemon's thread list.
+    /// Takes the daemon's thread list; a chat's title may now match the search.
     pub(super) fn sidebar_threads_listed(&mut self, threads: Vec<ThreadInfo>) {
         self.sidebar.threads = threads;
-        self.clamp_sidebar_highlight();
-    }
-
-    /// Thread `chat` was deleted.
-    pub(super) fn sidebar_thread_deleted(&mut self, chat: &str) {
-        self.sidebar.threads.retain(|thread| thread.chat.id != chat);
         self.clamp_sidebar_highlight();
     }
 
@@ -946,24 +974,19 @@ impl CompiApp {
         }
     }
 
-    /// Lists the daemon's threads off the UI thread once the workspace changed, and
-    /// every `THREAD_LISTING_INTERVAL` while the sidebar shows; one listing at a time.
-    pub(super) fn poll_sidebar_threads(&mut self, cx: &mut Context<Self>) {
+    /// Lists the daemon's threads off the UI thread once the workspace changed; one
+    /// listing at a time.
+    pub(super) fn list_sidebar_threads(&mut self, cx: &mut Context<Self>) {
         let sidebar = &self.sidebar;
-        let interval_due = self.sidebar_open
-            && sidebar
-                .listed_at
-                .is_none_or(|at| at.elapsed() >= THREAD_LISTING_INTERVAL);
         if sidebar.listing
+            || !sidebar.listing_due
             || self.workspace.is_none()
             || self.connection_error.is_some()
-            || !(sidebar.listing_due || interval_due)
         {
             return;
         }
         self.sidebar.listing = true;
         self.sidebar.listing_due = false;
-        self.sidebar.listed_at = Some(Instant::now());
         let target = self.target.clone();
         cx.spawn(async move |this, cx| {
             let listed = cx
@@ -1053,15 +1076,15 @@ impl CompiApp {
             }
             "enter" => {
                 let groups = self.sidebar_groups();
-                let card = self
+                let tab = self
                     .sidebar
                     .highlight
                     .or(searching.then_some(0))
                     .and_then(|at| shown_cards(&groups, searching).nth(at))
-                    .map(|card| (card.target.clone(), card.session.clone()));
-                if let Some((target, session)) = card {
+                    .map(|card| card.tab.clone());
+                if let Some(tab) = tab {
                     self.clear_sidebar_search(window, cx);
-                    self.open_card(&target, &session, window, cx);
+                    self.open_card(tab, window, cx);
                 }
                 true
             }
@@ -1075,16 +1098,12 @@ impl CompiApp {
             }
             "f2" => {
                 let groups = self.sidebar_groups();
-                let highlighted = self
+                let tab = self
                     .sidebar
                     .highlight
                     .and_then(|at| shown_cards(&groups, searching).nth(at))
-                    .map(|card| card.target.clone());
-                let tab = match highlighted {
-                    Some(CardTarget::Tab(id)) => Some(id),
-                    Some(CardTarget::Thread(_)) => None,
-                    None => self.selected_tab().map(|tab| tab.id.clone()),
-                };
+                    .map(|card| card.tab.clone())
+                    .or_else(|| self.selected_tab().map(|tab| tab.id.clone()));
                 if let Some(id) = tab {
                     self.rename_tab(&id);
                 }
@@ -1114,110 +1133,71 @@ impl CompiApp {
         self.sidebar.highlight = None;
     }
 
-    /// Right-click on a card: a tab's menu, or a closed thread's.
+    /// Right-click on tab `id`'s card in workspace `session` (`card_menu_rows`).
     fn open_card_menu(
         &mut self,
-        target: CardTarget,
+        id: TabId,
         session: SessionId,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entries = match target {
-            CardTarget::Tab(id) => self.tab_card_menu(&id, &session, cx),
-            CardTarget::Thread(chat) => self.thread_card_menu(chat, session, cx),
-        };
-        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
-    }
-
-    /// Pin or Unpin, Rename…, Move to workspace ›, Add to tab group › (and Remove from
-    /// tab group for a grouped tab), Move to new window, Copy path, Hide tab (Show tab
-    /// when hidden) and Close.
-    fn tab_card_menu(&self, id: &TabId, session: &SessionId, cx: &Context<Self>) -> Vec<MenuEntry> {
-        let pinned = self.state.pinned_tabs.contains(id);
-        let hidden = self.state.hidden_tabs.contains(id);
-        let path = self.tab_by_id(id).and_then(|tab| self.tab_path(tab));
-        let tab = |id: &TabId| id.clone();
-        let (pin, rename, ungroup, transfer, hide, close) =
-            (tab(id), tab(id), tab(id), tab(id), tab(id), tab(id));
-        let mut entries = vec![
-            menu_item(
-                if pinned { "Unpin" } else { "Pin" },
-                cx.listener(move |this, _, _, cx| {
-                    this.state.set_pinned(&pin, !pinned);
-                    this.save_state();
-                    cx.notify();
-                }),
-            )
-            .into(),
-            menu_item(
-                "Rename…",
-                cx.listener(move |this, _, _, cx| {
-                    this.rename_tab(&rename);
-                    cx.notify();
-                }),
-            )
-            .into(),
-            MenuEntry::Separator,
-            controls::submenu(
-                "Move to workspace",
-                self.move_to_workspace_entries(id, session, cx),
+        let tab = self.tab_by_id(&id);
+        let path = tab.and_then(|tab| self.tab_path(tab));
+        let chat = tab
+            .and_then(|tab| self.tab_chat_content(tab))
+            .map(|chat| chat.id.clone());
+        let rows = card_menu_rows(
+            self.state.pinned_tabs.contains(&id),
+            path.is_some(),
+            chat.is_some(),
+            self.tab_group(&id).is_some(),
+        );
+        let entries = menu_entries(rows, |action, reason| match action {
+            CardAction::CopyPath => copy_entry(action.label(), path.clone(), reason),
+            CardAction::CopyThreadId => copy_entry(action.label(), chat.clone(), reason),
+            CardAction::MoveToWorkspace => controls::submenu(
+                action.label(),
+                self.move_to_workspace_entries(&id, &session, cx),
             ),
-            controls::submenu("Add to tab group", self.tab_group_entries(id, cx)),
-        ];
-        if self.tab_group(id).is_some() {
-            entries.push(
+            CardAction::AddToTabGroup => {
+                controls::submenu(action.label(), self.tab_group_entries(&id, cx))
+            }
+            _ => {
+                let id = id.clone();
                 menu_item(
-                    "Remove from tab group",
-                    cx.listener(move |this, _, _, cx| {
-                        this.join_group(ungroup.clone(), None);
+                    action.label(),
+                    cx.listener(move |this, _, window, cx| {
+                        match action {
+                            CardAction::Pin | CardAction::Unpin => {
+                                this.state.set_pinned(&id, action == CardAction::Pin);
+                                this.save_state();
+                            }
+                            CardAction::Rename => this.rename_tab(&id),
+                            CardAction::RemoveFromTabGroup => this.join_group(id.clone(), None),
+                            CardAction::MoveToNewWindow => {
+                                this.transfer_tabs(vec![id.clone()], None, window, cx);
+                            }
+                            CardAction::Close => this.close_work(
+                                WorkspaceMutation::RemoveTab { tab_id: id.clone() },
+                                "Close this tab and end every process in its panes?",
+                                "Close tab",
+                                window,
+                                cx,
+                            ),
+                            CardAction::CopyPath
+                            | CardAction::CopyThreadId
+                            | CardAction::MoveToWorkspace
+                            | CardAction::AddToTabGroup => {}
+                        }
                         cx.notify();
                     }),
                 )
-                .into(),
-            );
-        }
-        entries.extend([
-            menu_item(
-                "Move to new window",
-                cx.listener(move |this, _, window, cx| {
-                    this.transfer_tabs(vec![transfer.clone()], None, window, cx);
-                    cx.notify();
-                }),
-            )
-            .into(),
-            copy_path_entry(path),
-            MenuEntry::Separator,
-            menu_item(
-                if hidden { "Show tab" } else { "Hide tab" },
-                cx.listener(move |this, _, _, cx| {
-                    if hidden {
-                        this.select_terminal(hide.clone(), true);
-                    } else {
-                        this.hide_terminal(&hide);
-                    }
-                    cx.notify();
-                }),
-            )
-            .into(),
-            menu_item(
-                "Close",
-                cx.listener(move |this, _, window, cx| {
-                    this.close_work(
-                        WorkspaceMutation::RemoveTab {
-                            tab_id: close.clone(),
-                        },
-                        "Close this tab and end every process in its panes?",
-                        "Close tab",
-                        window,
-                        cx,
-                    );
-                    cx.notify();
-                }),
-            )
-            .into(),
-        ]);
-        entries
+                .disabled_because(reason)
+                .into()
+            }
+        });
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
     }
 
     /// Move to workspace's rows: every other workspace, then New workspace….
@@ -1260,43 +1240,7 @@ impl CompiApp {
         entries
     }
 
-    /// Open, Copy path (the thread's folder) and Delete.
-    fn thread_card_menu(
-        &self,
-        chat: String,
-        session: SessionId,
-        cx: &Context<Self>,
-    ) -> Vec<MenuEntry> {
-        let path = self
-            .sidebar
-            .threads
-            .iter()
-            .find(|thread| thread.chat.id == chat)
-            .map(|thread| thread.chat.folder.clone());
-        let open = CardTarget::Thread(chat.clone());
-        vec![
-            menu_item(
-                "Open",
-                cx.listener(move |this, _, window, cx| {
-                    this.open_card(&open, &session, window, cx);
-                }),
-            )
-            .into(),
-            copy_path_entry(path),
-            MenuEntry::Separator,
-            menu_item(
-                "Delete",
-                cx.listener(move |this, _, _, cx| {
-                    this.delete_thread(chat.clone(), cx);
-                    cx.notify();
-                }),
-            )
-            .into(),
-        ]
-    }
-
-    /// Right-click on a workspace's label: Rename…, New tab here, New thread here, Fold
-    /// or Unfold, and Close workspace….
+    /// Right-click on a workspace's label (`workspace_menu_rows`).
     fn open_workspace_menu(
         &mut self,
         session: SessionId,
@@ -1313,62 +1257,115 @@ impl CompiApp {
         }) else {
             return;
         };
-        let folded = self.state.workspace_folded(&session);
-        let (rename, tab, thread, fold, close) = (
-            session.clone(),
-            session.clone(),
-            session.clone(),
-            session.clone(),
-            session,
-        );
-        let entries = vec![
+        let rows = workspace_menu_rows(self.state.workspace_folded(&session), empty);
+        let entries = menu_entries(rows, |action, reason| {
+            let session = session.clone();
+            let label = label.clone();
             menu_item(
-                "Rename…",
+                action.label(),
                 cx.listener(move |this, _, window, cx| {
-                    this.start_label_rename(Some(rename.clone()), label.clone(), window, cx);
-                }),
-            )
-            .into(),
-            MenuEntry::Separator,
-            menu_item(
-                "New tab here",
-                cx.listener(move |this, _, window, cx| {
-                    this.select_workspace(&tab, window);
-                    this.execute(Command::NewTab, window, cx);
+                    match action {
+                        WorkspaceAction::Rename => {
+                            this.start_label_rename(
+                                Some(session.clone()),
+                                label.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                        WorkspaceAction::NewTerminal => {
+                            this.select_workspace(&session, window);
+                            this.execute(Command::NewTab, window, cx);
+                        }
+                        WorkspaceAction::NewThread => {
+                            this.select_workspace(&session, window);
+                            this.execute(Command::OpenChat, window, cx);
+                        }
+                        WorkspaceAction::Fold | WorkspaceAction::Unfold => {
+                            this.toggle_sidebar_fold(&session);
+                        }
+                        WorkspaceAction::Close => this.remove_workspace(session.clone()),
+                    }
                     cx.notify();
                 }),
             )
-            .into(),
-            menu_item(
-                "New thread here",
-                cx.listener(move |this, _, window, cx| {
-                    this.select_workspace(&thread, window);
-                    this.execute(Command::OpenChat, window, cx);
-                    cx.notify();
-                }),
-            )
-            .disabled_because(empty.then_some("A thread starts from a tab; open one here first"))
-            .into(),
-            MenuEntry::Separator,
-            menu_item(
-                if folded { "Unfold" } else { "Fold" },
-                cx.listener(move |this, _, _, cx| {
-                    this.toggle_sidebar_fold(&fold);
-                    cx.notify();
-                }),
-            )
-            .into(),
-            MenuEntry::Separator,
-            menu_item(
-                "Close workspace…",
-                cx.listener(move |this, _, _, cx| {
-                    this.remove_workspace(close.clone());
-                    cx.notify();
-                }),
-            )
-            .into(),
-        ];
+            .disabled_because(reason)
+            .into()
+        });
         self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
+    /// Right-click on a project header of workspace `session` (`project_menu_rows`).
+    fn open_project_menu(
+        &mut self,
+        session: SessionId,
+        project: Option<Project>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = project_menu_rows(project.as_ref());
+        let entries = menu_entries(rows, |action, reason| {
+            if action == ProjectAction::CopyPath {
+                let root = project.as_ref().map(|project| project.root.clone());
+                return copy_entry(action.label(), root, reason);
+            }
+            let (session, project) = (session.clone(), project.clone());
+            menu_item(
+                action.label(),
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(project) = &project {
+                        match action {
+                            ProjectAction::NewTerminal => {
+                                this.new_project_terminal(session.clone(), project);
+                            }
+                            ProjectAction::NewThread => {
+                                this.new_project_thread(session.clone(), project);
+                            }
+                            ProjectAction::CopyPath => {}
+                        }
+                    }
+                    cx.notify();
+                }),
+            )
+            .disabled_because(reason)
+            .into()
+        });
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
+    /// New terminal here: a new tab of workspace `session` whose shell starts at the
+    /// project's root, in the project's WSL distribution for a WSL project.
+    fn new_project_terminal(&mut self, session: SessionId, project: &Project) {
+        let distribution = match &project.environment {
+            compi_protocol::ContentEnvironment::Wsl { distribution } => Some(distribution.clone()),
+            compi_protocol::ContentEnvironment::Host => None,
+        };
+        self.mutate_in(
+            WorkspaceMutation::CreateTab {
+                session_id: session,
+                label: String::new(),
+                cols: self.terminal_cols,
+                rows: self.terminal_rows,
+                working_directory: Some(project.root.clone()),
+            },
+            true,
+            distribution,
+        );
+    }
+
+    /// New thread here: an OMP chat at the project's root, in a new tab of workspace
+    /// `session`.
+    fn new_project_thread(&mut self, session: SessionId, project: &Project) {
+        let chat = crate::chat::new_chat(project.environment.clone(), project.root.clone());
+        self.mutate(
+            WorkspaceMutation::CreateContentTab {
+                session_id: session,
+                label: String::new(),
+                content: PaneContent::Chat(chat),
+            },
+            true,
+        );
     }
 
     pub(super) fn render_sidebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
@@ -2023,6 +2020,7 @@ impl CompiApp {
                 ))
         });
         let (fold_session, fold_project) = (session.clone(), section.project.clone());
+        let (menu_session, menu_project) = (session.clone(), section.project.clone());
         div()
             .id(("sidebar-project", row))
             .mx_2()
@@ -2046,6 +2044,19 @@ impl CompiApp {
                 this.toggle_project_fold(&fold_session, fold_project.as_ref());
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.open_project_menu(
+                        menu_session.clone(),
+                        menu_project.clone(),
+                        event.position,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
             .when_some(
                 tooltip.filter(|_| self.context_menu.is_none()),
                 |header, tooltip| header.tooltip(tooltip),
@@ -2092,22 +2103,18 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let tab = match &card.target {
-            CardTarget::Tab(id) => Some(id.clone()),
-            CardTarget::Thread(_) => None,
-        };
-        // A tab's card can be dragged onto another workspace; a closed thread's cannot.
-        let drag = tab.as_ref().map(|tab| CardDrag {
-            tab: tab.clone(),
+        // A card can be dragged onto another workspace.
+        let drag = CardDrag {
+            tab: card.tab.clone(),
             session: card.session.clone(),
             title: card.title.clone(),
             background: colors.surface,
             foreground: colors.foreground,
             border: colors.accent,
-        });
+        };
         let session = card.session.clone();
-        let (open_target, open_session) = (card.target.clone(), card.session.clone());
-        let (menu_target, menu_session) = (card.target.clone(), card.session.clone());
+        let (open, rename) = (card.tab.clone(), card.tab.clone());
+        let (menu_tab, menu_session) = (card.tab.clone(), card.session.clone());
         let kind = if card.chat {
             img(controls::OMP_MARK)
                 .flex_none()
@@ -2179,13 +2186,13 @@ impl CompiApp {
                     .cursor_pointer()
             })
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_card(&open_target, &open_session, window, cx);
+                this.open_card(open.clone(), window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.open_card_menu(
-                        menu_target.clone(),
+                        menu_tab.clone(),
                         menu_session.clone(),
                         event.position,
                         window,
@@ -2194,10 +2201,8 @@ impl CompiApp {
                     cx.stop_propagation();
                 }),
             )
-            .when_some(drag, |card, drag| {
-                card.on_drag(drag, |drag: &CardDrag, _, _, cx: &mut App| {
-                    cx.new(|_| drag.clone())
-                })
+            .on_drag(drag, |drag: &CardDrag, _, _, cx: &mut App| {
+                cx.new(|_| drag.clone())
             })
             .when_some(tooltip, |card, tooltip| card.tooltip(tooltip))
             .child(
@@ -2237,18 +2242,14 @@ impl CompiApp {
                             .text_ellipsis()
                             .text_size(px(UI_SMALL_TEXT_SIZE))
                             .child(card.title)
-                            // A double click on a tab's title renames the tab.
-                            .when_some(tab, |title, tab| {
-                                title.on_click(cx.listener(
-                                    move |this, event: &ClickEvent, _, cx| {
-                                        if event.click_count() >= 2 {
-                                            this.rename_tab(&tab);
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }
-                                    },
-                                ))
-                            }),
+                            // A double click on the title renames the tab.
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if event.click_count() >= 2 {
+                                    this.rename_tab(&rename);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            })),
                     ),
             )
             .child(
@@ -2274,27 +2275,6 @@ impl CompiApp {
 mod tests {
     use super::*;
     use compi_protocol::ContentEnvironment;
-    use compi_protocol::chat::ThreadActivity;
-
-    fn tabs(ids: &[&str]) -> Vec<TabId> {
-        ids.iter().map(|id| TabId::from(*id)).collect()
-    }
-
-    fn thread(id: &str, workspace: Option<&str>, created_ms: u64, open: bool) -> ThreadInfo {
-        let mut chat = crate::chat::new_chat(ContentEnvironment::Host, "/work/compi".into());
-        chat.id = id.into();
-        ThreadInfo {
-            chat,
-            title: None,
-            created_ms,
-            updated_ms: created_ms,
-            activity: ThreadActivity::Idle,
-            terminal: None,
-            open,
-            project: None,
-            workspace: workspace.map(SessionId::new),
-        }
-    }
 
     fn project(root: &str) -> Project {
         Project {
@@ -2303,13 +2283,13 @@ mod tests {
         }
     }
 
-    fn card(target: CardTarget) -> SidebarCard {
+    fn tab_card(id: &str, project: Option<&Project>) -> SidebarCard {
         SidebarCard {
-            target,
+            tab: TabId::from(id),
             session: SessionId::new("s"),
             title: String::new(),
             folder: None,
-            project: None,
+            project: project.cloned(),
             chat: false,
             state: None,
             changed_ms: None,
@@ -2317,12 +2297,6 @@ mod tests {
             pinned: false,
             selected: false,
         }
-    }
-
-    fn tab_card(id: &str, project: Option<&Project>) -> SidebarCard {
-        let mut card = card(CardTarget::Tab(TabId::from(id)));
-        card.project = project.cloned();
-        card
     }
 
     /// A workspace whose cards are `ids`, all without a project.
@@ -2354,14 +2328,12 @@ mod tests {
         }
     }
 
-    fn targets<'a>(cards: impl Iterator<Item = &'a SidebarCard>) -> Vec<CardTarget> {
-        cards.map(|card| card.target.clone()).collect()
+    fn targets<'a>(cards: impl Iterator<Item = &'a SidebarCard>) -> Vec<TabId> {
+        cards.map(|card| card.tab.clone()).collect()
     }
 
-    fn tab_targets(ids: &[&str]) -> Vec<CardTarget> {
-        ids.iter()
-            .map(|id| CardTarget::Tab(TabId::from(*id)))
-            .collect()
+    fn tab_targets(ids: &[&str]) -> Vec<TabId> {
+        ids.iter().map(|id| TabId::from(*id)).collect()
     }
 
     fn session(id: &str, tabs: &[&str]) -> WorkspaceSession {
@@ -2388,53 +2360,124 @@ mod tests {
     }
 
     #[test]
-    fn cards_keep_the_tab_order_with_pins_first_then_closed_threads() {
-        let older = thread("older", None, 1, false);
-        let newer = thread("newer", None, 2, false);
+    fn cards_are_the_open_tabs_with_pins_first() {
         let order = card_order(
-            &tabs(&["a", "b", "c", "d"]),
-            &tabs(&["c", "gone", "a"]),
-            &[&newer, &older],
+            &tab_targets(&["a", "b", "c", "d"]),
+            &tab_targets(&["c", "gone", "a"]),
+        );
+        assert_eq!(order, tab_targets(&["c", "a", "b", "d"]));
+    }
+
+    #[test]
+    fn a_cards_menu_follows_t3s_thread_row() {
+        let labels = |rows: MenuRows<CardAction>| -> Vec<&'static str> {
+            rows.iter()
+                .map(|row| row.map_or("-", |(action, _)| action.label()))
+                .collect()
+        };
+        assert_eq!(
+            labels(card_menu_rows(false, true, false, false)),
+            [
+                "Pin",
+                "Rename…",
+                "-",
+                "Copy path",
+                "-",
+                "Move to workspace",
+                "Add to tab group",
+                "Move to new window",
+                "-",
+                "Close",
+            ]
+        );
+        // A pinned, grouped chat's card copies its thread's ID and leaves its group.
+        assert_eq!(
+            labels(card_menu_rows(true, true, true, true)),
+            [
+                "Unpin",
+                "Rename…",
+                "-",
+                "Copy path",
+                "Copy thread ID",
+                "-",
+                "Move to workspace",
+                "Add to tab group",
+                "Remove from tab group",
+                "Move to new window",
+                "-",
+                "Close",
+            ]
+        );
+        // Only Copy path waits for a folder.
+        let disabled: Vec<CardAction> = card_menu_rows(false, false, true, false)
+            .into_iter()
+            .flatten()
+            .filter(|(_, reason)| reason.is_some())
+            .map(|(action, _)| action)
+            .collect();
+        assert_eq!(disabled, [CardAction::CopyPath]);
+    }
+
+    #[test]
+    fn a_project_headers_menu_starts_work_at_its_root() {
+        let compi = project("/work/compi");
+        let rows = project_menu_rows(Some(&compi));
+        assert_eq!(
+            rows,
+            [
+                Some((ProjectAction::NewTerminal, None)),
+                Some((ProjectAction::NewThread, None)),
+                None,
+                Some((ProjectAction::CopyPath, None)),
+            ]
         );
         assert_eq!(
-            order,
-            [
-                CardTarget::Tab(TabId::from("c")),
-                CardTarget::Tab(TabId::from("a")),
-                CardTarget::Tab(TabId::from("b")),
-                CardTarget::Tab(TabId::from("d")),
-                CardTarget::Thread("newer".into()),
-                CardTarget::Thread("older".into()),
-            ]
+            rows.iter()
+                .flatten()
+                .map(|(action, _)| action.label())
+                .collect::<Vec<_>>(),
+            ["New terminal here", "New thread here", "Copy path"]
+        );
+        // The cards without a project have no root to start at.
+        assert!(
+            project_menu_rows(None)
+                .into_iter()
+                .flatten()
+                .all(|(_, reason)| reason.is_some())
         );
     }
 
     #[test]
-    fn closed_threads_go_under_the_workspace_that_last_held_them_newest_first() {
-        let threads = [
-            thread("one", Some("w1"), 1, false),
-            thread("two", Some("w2"), 2, false),
-            thread("three", Some("w1"), 3, false),
-            thread("open", Some("w1"), 4, true),
-            thread("gone", Some("removed"), 5, false),
-            thread("nowhere", None, 6, false),
-            thread("reopened", Some("w2"), 7, false),
-        ];
-        let sessions = [SessionId::new("w1"), SessionId::new("w2")];
-        let selected = SessionId::new("w2");
-        let grouped = closed_threads(&threads, &sessions, Some(&selected), |chat| {
-            chat == "reopened"
-        });
-        let ids = |session: &str| -> Vec<&str> {
-            grouped[&SessionId::new(session)]
-                .iter()
-                .map(|thread| thread.chat.id.as_str())
+    fn a_workspace_labels_menu_folds_and_starts_threads_only_from_a_tab() {
+        let labels = |rows: &MenuRows<WorkspaceAction>| -> Vec<&'static str> {
+            rows.iter()
+                .map(|row| row.map_or("-", |(action, _)| action.label()))
                 .collect()
         };
-        assert_eq!(ids("w1"), ["three", "one"]);
-        // A workspace that is gone, or none, puts the thread under the selected one.
-        assert_eq!(ids("w2"), ["nowhere", "gone", "two"]);
-        assert_eq!(grouped.len(), 2);
+        let open = workspace_menu_rows(false, false);
+        assert_eq!(
+            labels(&open),
+            [
+                "Rename…",
+                "-",
+                "New terminal",
+                "New thread",
+                "-",
+                "Fold",
+                "-",
+                "Close workspace…",
+            ]
+        );
+        assert!(open.iter().flatten().all(|(_, reason)| reason.is_none()));
+        let folded_empty = workspace_menu_rows(true, true);
+        assert_eq!(labels(&folded_empty)[5], "Unfold");
+        let disabled: Vec<WorkspaceAction> = folded_empty
+            .into_iter()
+            .flatten()
+            .filter(|(_, reason)| reason.is_some())
+            .map(|(action, _)| action)
+            .collect();
+        assert_eq!(disabled, [WorkspaceAction::NewThread]);
     }
 
     #[test]
@@ -2445,7 +2488,7 @@ mod tests {
         assert!(matches_query("fix site", &fields));
         assert!(matches_query("comp", &fields));
         assert!(!matches_query("fix deploy", &fields));
-        let mut card = card(CardTarget::Tab(TabId::from("a")));
+        let mut card = tab_card("a", None);
         card.title = "Release Notes".into();
         card.folder = Some("docs".into());
         assert!(card.matches("release"));
@@ -2515,7 +2558,7 @@ mod tests {
             tab_card("f", None),
         ];
         let group = headed_group(false, cards, &[]);
-        let sections: Vec<(Option<&str>, Vec<CardTarget>)> = group
+        let sections: Vec<(Option<&str>, Vec<TabId>)> = group
             .sections
             .iter()
             .map(|section| {

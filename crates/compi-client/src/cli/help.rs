@@ -442,15 +442,15 @@ pub(super) const ENTRIES: &[Entry] = &[
         action: None,
         usage: "chat",
         summary: "Chat with OMP in or beside the terminal's pane",
-        detail: "Start a new chat with OMP (the omp agent harness) in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. OMP works in the shell's current directory, in the terminal's environment (a WSL distribution runs omp there). The chat is a thread the daemon keeps: it keeps going while the view is hidden, and closing its pane or view leaves it (and its terminal) running; Threads in the palette reopens it, compi threads lists it, and only deleting it ends it. --json adds the chat's id and folder.",
+        detail: "Start a new chat with OMP (the omp agent harness) in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. OMP works in the shell's current directory, in the terminal's environment (a WSL distribution runs omp there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
         example: "compi chat",
     },
     Entry {
         command: "threads",
         action: None,
         usage: "threads",
-        summary: "List chats with OMP, open or closed",
-        detail: "List the threads the daemon keeps, newest first: every chat with OMP, whether a pane shows it or not, with its title, folder, how long ago it last changed, what it is doing (Working, Waiting, Open in a pane, else Idle) and its id. Threads in the palette opens one in a pane again. --json returns each thread's chat, title, created_ms, updated_ms, activity, terminal and open.",
+        summary: "List chats with OMP, open or ended",
+        detail: "List the threads the daemon keeps, newest first: every chat with OMP, whether a pane shows it or it has ended, with its title, folder, how long ago it last changed, what it is doing (Working, Waiting, Open in a pane, else Ended) and its id. Threads in the palette opens an ended one in a pane again, its agent starting again on the same session. --json returns each thread's chat, title, created_ms, updated_ms, activity, open and project.",
         example: "compi threads",
     },
     Entry {
@@ -458,7 +458,7 @@ pub(super) const ENTRIES: &[Entry] = &[
         action: Some("delete"),
         usage: "threads delete ID",
         summary: "Delete a thread",
-        detail: "Delete thread ID (from compi threads): the thread ends, and so does the terminal kept for it since its pane closed. A thread a pane or view still holds is refused; close its pane first.",
+        detail: "Delete ended thread ID (from compi threads): its saved transcript goes, and Threads in the palette no longer lists it. A thread a pane or view still holds is refused; close its pane first.",
         example: "compi threads delete chat-18c2f0a91b2-1f40-0",
     },
     Entry {

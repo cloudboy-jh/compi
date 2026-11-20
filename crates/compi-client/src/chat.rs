@@ -33,14 +33,16 @@ pub fn thread_title(thread: &ThreadInfo) -> &str {
         .unwrap_or("New thread")
 }
 
-/// What a thread is doing: Working or Waiting while a turn runs or asks; otherwise Open
-/// while a pane holds it, else Idle.
+/// What a thread is doing: Ended once no pane holds it; otherwise Working or Waiting
+/// while a turn runs or asks, else Open.
 pub fn thread_status(thread: &ThreadInfo) -> &'static str {
+    if !thread.open {
+        return "Ended";
+    }
     match thread.activity {
         ThreadActivity::Working => "Working",
         ThreadActivity::Waiting => "Waiting",
-        ThreadActivity::Idle if thread.open => "Open",
-        ThreadActivity::Idle => "Idle",
+        ThreadActivity::Idle => "Open",
     }
 }
 
@@ -101,13 +103,11 @@ mod tests {
             created_ms: 0,
             updated_ms: 0,
             activity: ThreadActivity::Idle,
-            terminal: None,
             project: None,
-            workspace: None,
             open: false,
         };
         assert_eq!(thread_title(&thread), "New thread");
-        assert_eq!(thread_status(&thread), "Idle");
+        assert_eq!(thread_status(&thread), "Ended");
         thread.title = Some("Fix the build".into());
         thread.open = true;
         assert_eq!(thread_title(&thread), "Fix the build");

@@ -525,7 +525,7 @@ impl Command {
                 "Starts a chat with OMP in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
             ),
             Threads => Some(
-                "Lists your chats with OMP, open or closed; one reopens in a pane, × deletes it.",
+                "Lists your chats with OMP, open or ended; an ended one reopens in a pane on its session, × deletes it.",
             ),
             SendSelectionToChat => Some(
                 "Puts the selected terminal text at the end of a chat's message box: the terminal's own chat, else the tab's, else a new one.",

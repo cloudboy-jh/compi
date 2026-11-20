@@ -1,8 +1,7 @@
 //! Notifications: a terminal's program reporting (OSC 7501), or a chat reporting, that
 //! it needs the user (`blocked`: a permission, a question or a sign-in) or that its work
 //! is done tells the user, in Compi (a toast at the bottom right of the window showing
-//! the pane) or from the system, and a click goes to its pane. A thread no pane holds
-//! still tells; its click opens the thread as the palette's Threads does.
+//! the pane) or from the system, and a click goes to its pane.
 //!
 //! Only transitions count: a record entering `blocked` or `done` in a status change.
 //! The snapshot a window's watching connection starts with (and restarts with after a
@@ -67,7 +66,7 @@ pub(in crate::gui) enum NoticeKind {
     Note,
 }
 
-/// What a notification opens: a terminal, or a chat's pane, else its thread.
+/// What a notification opens: a terminal, or the pane holding a chat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::gui) enum NoticeTarget {
     Surface(SurfaceId),
@@ -355,8 +354,7 @@ fn tag(target: &NoticeTarget) -> String {
 }
 
 /// A system notification was clicked: the window showing its pane (else any window of
-/// its target that has it) opens it. A terminal's pane that is gone opens nothing; a
-/// chat's opens its thread.
+/// its target that has it) opens it. A pane that is gone opens nothing.
 fn open_route(tag: &str, cx: &mut App) {
     let Some((target, notice_target)) = cx
         .try_global::<NotificationRoutes>()
@@ -378,8 +376,6 @@ fn open_route(tag: &str, cx: &mut App) {
         }) else {
             continue;
         };
-        // A thread no pane holds opens from any window of its target.
-        let has = has || matches!(notice_target, NoticeTarget::Chat(_));
         if !same || !has {
             continue;
         }
@@ -500,8 +496,7 @@ impl CompiApp {
     }
 
     /// Tells the user `record` of `target` needs them or finished, unless they are using
-    /// its pane or this window's workspace does not have it. A thread no pane holds tells
-    /// from Threads.
+    /// its pane or this window's workspace does not have it.
     fn announce(
         &mut self,
         target: NoticeTarget,
@@ -510,27 +505,21 @@ impl CompiApp {
         records: &[ProgramStatusRecord],
         cx: &mut Context<Self>,
     ) {
-        let (pane_title, place) = match self.notice_place(&target) {
-            Some((_, tab_id, pane_id)) => {
-                if self.in_use(&pane_id, cx) {
-                    return;
-                }
-                let tab = self.tab_by_id(&tab_id);
-                let pane_title = tab
-                    .map(|tab| self.tab_panes(tab))
-                    .and_then(|panes| panes.into_iter().find(|pane| pane.pane_id == pane_id))
-                    .map(|pane| pane.title)
-                    .unwrap_or_default();
-                let place = tab
-                    .map(|tab| bounded(&self.tab_label(tab)))
-                    .unwrap_or_default();
-                (pane_title, place)
-            }
-            None if matches!(target, NoticeTarget::Chat(_)) => {
-                ("A thread".to_owned(), "Threads".to_owned())
-            }
-            None => return,
+        let Some((_, tab_id, pane_id)) = self.notice_place(&target) else {
+            return;
         };
+        if self.in_use(&pane_id, cx) {
+            return;
+        }
+        let tab = self.tab_by_id(&tab_id);
+        let pane_title = tab
+            .map(|tab| self.tab_panes(tab))
+            .and_then(|panes| panes.into_iter().find(|pane| pane.pane_id == pane_id))
+            .map(|pane| pane.title)
+            .unwrap_or_default();
+        let place = tab
+            .map(|tab| bounded(&self.tab_label(tab)))
+            .unwrap_or_default();
         let (title, message) = notice_text(kind, record, records, &pane_title);
         let notice = Notice {
             kind,
@@ -1014,8 +1003,7 @@ impl CompiApp {
     }
 
     /// Opens the pane of `target` from a notification, with the terminal or the chat
-    /// showing, and brings its window forward; a terminal's pane that is gone opens
-    /// nothing, and a thread no pane holds opens as the palette's Threads opens it.
+    /// showing, and brings its window forward; a pane that is gone opens nothing.
     pub(super) fn open_notice_target(
         &mut self,
         target: &NoticeTarget,
@@ -1023,11 +1011,6 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) {
         let Some((session, tab, pane_id)) = self.notice_place(target) else {
-            if let NoticeTarget::Chat(chat) = target {
-                self.open_thread_id(chat.clone(), window, cx);
-                window.activate_window();
-                cx.activate(true);
-            }
             return;
         };
         let side = match target {

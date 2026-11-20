@@ -377,7 +377,6 @@ mod tests {
             ],
             surfaces: vec![],
             recovery_message: None,
-            kept_terminals: Vec::new(),
         }
     }
 

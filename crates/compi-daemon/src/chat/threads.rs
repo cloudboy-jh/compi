@@ -5,7 +5,6 @@
 //! latest per chat winning, so no chat waits on the disk. What the threads list shows of
 //! each is read from the folder once, then kept current as threads are saved.
 use compi_protocol::chat::{ChatContent, ChatEntry};
-use compi_protocol::{SessionId, SurfaceId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -30,12 +29,6 @@ pub(super) struct ThreadRecord {
     pub created_ms: u64,
     /// When its transcript last changed.
     pub updated_ms: u64,
-    /// The terminal whose view last showed it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_surface: Option<SurfaceId>,
-    /// The workspace whose tab last held it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<SessionId>,
     pub entries: Vec<ChatEntry>,
 }
 
@@ -45,8 +38,6 @@ impl ThreadRecord {
         title: Option<String>,
         created_ms: u64,
         updated_ms: u64,
-        last_surface: Option<SurfaceId>,
-        workspace: Option<SessionId>,
         entries: Vec<ChatEntry>,
     ) -> Self {
         Self {
@@ -55,8 +46,6 @@ impl ThreadRecord {
             title,
             created_ms,
             updated_ms,
-            last_surface,
-            workspace,
             entries,
         }
     }
@@ -70,8 +59,6 @@ pub(super) struct ThreadSummary {
     pub title: Option<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
-    /// The workspace whose tab last held it.
-    pub workspace: Option<SessionId>,
 }
 
 impl ThreadSummary {
@@ -81,7 +68,6 @@ impl ThreadSummary {
             title: thread_title(record.title.as_deref(), &record.entries),
             created_ms: record.created_ms,
             updated_ms: record.updated_ms,
-            workspace: record.workspace.clone(),
         }
     }
 }

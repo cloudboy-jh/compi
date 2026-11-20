@@ -1571,7 +1571,6 @@ mod tests {
             initialized: true,
             surfaces: Vec::new(),
             recovery_message: None,
-            kept_terminals: Vec::new(),
             sessions: ["one", "two", "three"]
                 .into_iter()
                 .map(|session| WorkspaceSession {

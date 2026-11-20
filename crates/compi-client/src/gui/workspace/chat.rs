@@ -327,6 +327,27 @@ fn chat_title(state: &ChatState) -> Option<String> {
     })
 }
 
+/// What Esc in a chat does once its completion list, pickers and menus are closed: it
+/// drops the queued prompt being edited, else with the draft `empty` answers a waiting
+/// `permission` with its reject option, else nothing. Esc never leaves the chat: the
+/// keyboard stays where it is and the pane never shows its shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatEscape {
+    EndQueuedEdit,
+    Reject,
+    Nothing,
+}
+
+fn chat_escape(editing: bool, empty: bool, permission: bool) -> ChatEscape {
+    if editing {
+        ChatEscape::EndQueuedEdit
+    } else if empty && permission {
+        ChatEscape::Reject
+    } else {
+        ChatEscape::Nothing
+    }
+}
+
 /// Tokens as the footer shows them: `950`, `31k`, `1.2M`.
 fn token_label(tokens: u64) -> String {
     let scaled = |value: u64, unit: u64, suffix: &str| {
@@ -677,16 +698,12 @@ impl CompiApp {
             .and_then(chat_title)
     }
 
-    /// Opens thread `chat`: the pane or view holding it is revealed and focused. A thread
-    /// whose view was closed while its terminal, `terminal`, stays in a tab shows as that
-    /// terminal's view again, unless the terminal carries another view now. Any other
-    /// opens in a new tab of workspace `session`, else of the selected workspace, on the
-    /// terminal the daemon kept for it when there is one.
+    /// Opens thread `chat`: the pane or view holding it is revealed and focused; an ended
+    /// thread opens in a new tab of the selected workspace, its agent started again on
+    /// the same session.
     pub(super) fn open_thread(
         &mut self,
         chat: ChatContent,
-        terminal: Option<SurfaceId>,
-        session: Option<SessionId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -704,70 +721,15 @@ impl CompiApp {
             );
             return;
         }
-        let carrier = terminal
-            .and_then(|surface| monitor::surface_pane(workspace, &surface))
-            .filter(|(_, _, pane_id)| self.pane_view(pane_id).is_none());
-        if let Some((session, tab, pane_id)) = carrier {
-            if !self.show_view(&pane_id, PaneContent::Chat(chat), window, cx) {
-                return;
-            }
-            if self.selected_tab().map(|selected| &selected.id) != Some(&tab) {
-                if let Some(workspace) = &self.workspace {
-                    self.state.select_session(workspace, &session);
-                }
-                let hidden = self.state.hidden_tabs.contains(&tab);
-                self.select_terminal(tab, hidden);
-            }
-            self.focus_pane(pane_id);
-            self.rebuild_layout(window, true);
-            cx.notify();
-            return;
-        }
-        let Some(session_id) = session
-            .filter(|session| workspace.sessions.iter().any(|known| &known.id == session))
-            .or_else(|| {
-                self.state
-                    .selected_session(workspace)
-                    .map(|session| session.id.clone())
-            })
+        let Some(session_id) = self
+            .state
+            .selected_session(workspace)
+            .map(|session| session.id.clone())
         else {
             self.global_error = Some("Select a workspace first".into());
             return;
         };
         self.mutate(WorkspaceMutation::OpenThread { session_id, chat }, true);
-    }
-
-    /// Opens thread `chat` by its id, as a notification about a thread no pane holds
-    /// does: the daemon's threads are listed off the UI thread first.
-    pub(super) fn open_thread_id(
-        &mut self,
-        chat: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let target = self.target.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let listed = cx
-                .background_executor()
-                .spawn(async move { palette::fetch_threads(&target) })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                match listed
-                    .map(|threads| threads.into_iter().find(|thread| thread.chat.id == chat))
-                {
-                    Ok(Some(thread)) => {
-                        this.open_thread(thread.chat, thread.terminal, None, window, cx);
-                    }
-                    Ok(None) => this.global_error = Some("That thread was deleted".into()),
-                    Err(error) => {
-                        this.global_error = Some(format!("Cannot open the thread: {error}"));
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// Send selection to chat: the focused terminal's selected text goes to the end of a
@@ -1751,9 +1713,8 @@ impl CompiApp {
     /// image on the clipboard attaches it, and long text becomes a file (Ctrl+Shift+V types
     /// it in); the transcript's paging keys; Alt+Up edits the last queued prompt; the
     /// completion list's arrows, Tab and Escape; Up and Down walk earlier prompts; with
-    /// the draft empty, Enter and Escape answer a waiting permission (its first allow or
-    /// reject option); Escape drops a queued edit, else leaves the draft and hands the
-    /// keyboard to the pane, where Escape again shows the shell.
+    /// the draft empty, Enter answers a waiting permission with its first allow option;
+    /// Escape does what `chat_escape` says and keeps the keyboard in the draft.
     pub(super) fn chat_composer_key(
         &mut self,
         key: &Keystroke,
@@ -1819,23 +1780,25 @@ impl CompiApp {
                 cx,
             ),
             "escape" => {
-                if let Some(model) = self.chat.chats.get_mut(&chat)
-                    && model.end_queued_edit(window, cx)
-                {
-                    return true;
-                }
-                if empty
-                    && self.answer_chat_permission_by_kind(
-                        &chat,
-                        &["reject_once", "reject_always"],
-                        window,
-                        cx,
-                    )
-                {
-                    return true;
-                }
-                if let Some(model) = self.chat.chats.get(&chat) {
-                    window.focus(&model.focus, cx);
+                let permission = model
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.permission.is_some());
+                match chat_escape(editing, empty, permission) {
+                    ChatEscape::EndQueuedEdit => {
+                        if let Some(model) = self.chat.chats.get_mut(&chat) {
+                            model.end_queued_edit(window, cx);
+                        }
+                    }
+                    ChatEscape::Reject => {
+                        self.answer_chat_permission_by_kind(
+                            &chat,
+                            &["reject_once", "reject_always"],
+                            window,
+                            cx,
+                        );
+                    }
+                    ChatEscape::Nothing => {}
                 }
                 true
             }
@@ -1945,9 +1908,10 @@ impl CompiApp {
                 ),
                 _ => false,
             };
-        // Esc that let go of everything shows a terminal's shell again.
-        if !answered && !self.handle_app_key(event, window, cx) && escape {
-            self.escape_to_shell(pane_id);
+        // Esc never leaves the chat: Ctrl+Shift+E (Cmd+Shift+E) or the pane menu shows a
+        // terminal's shell.
+        if !answered {
+            self.handle_app_key(event, window, cx);
         }
         // Nothing typed in a chat reaches a shell.
         cx.stop_propagation();
@@ -2338,5 +2302,20 @@ impl CompiApp {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_in_a_chat_with_nothing_open_stays_in_the_chat() {
+        assert_eq!(chat_escape(false, true, false), ChatEscape::Nothing);
+        assert_eq!(chat_escape(false, false, false), ChatEscape::Nothing);
+        // A draft keeps a waiting permission waiting.
+        assert_eq!(chat_escape(false, false, true), ChatEscape::Nothing);
+        assert_eq!(chat_escape(false, true, true), ChatEscape::Reject);
+        assert_eq!(chat_escape(true, true, true), ChatEscape::EndQueuedEdit);
     }
 }
