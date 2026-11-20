@@ -659,6 +659,9 @@ pub struct ThreadInfo {
     /// The project its folder belongs to: the Git top level above it, else the folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<crate::Project>,
+    /// The workspace whose tab last held it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::SessionId>,
 }
 
 /// How much of a session's first prompt and last reply its listing carries.

@@ -94,6 +94,15 @@ registry! {
     RemoveTab, "remove_tab", "Close terminal tab", None, None;
     DetachTab, "detach_tab", "Hide terminal tab", Some("cmd-w"), Some("ctrl-w");
     RestoreHiddenTab, "restore_hidden_tab", "Restore hidden terminal tab", Some("cmd-shift-t"), Some("ctrl-shift-t");
+    SidebarCard1, "sidebar_card_1", "Go to sidebar card 1", Some("cmd-1"), Some("ctrl-1");
+    SidebarCard2, "sidebar_card_2", "Go to sidebar card 2", Some("cmd-2"), Some("ctrl-2");
+    SidebarCard3, "sidebar_card_3", "Go to sidebar card 3", Some("cmd-3"), Some("ctrl-3");
+    SidebarCard4, "sidebar_card_4", "Go to sidebar card 4", Some("cmd-4"), Some("ctrl-4");
+    SidebarCard5, "sidebar_card_5", "Go to sidebar card 5", Some("cmd-5"), Some("ctrl-5");
+    SidebarCard6, "sidebar_card_6", "Go to sidebar card 6", Some("cmd-6"), Some("ctrl-6");
+    SidebarCard7, "sidebar_card_7", "Go to sidebar card 7", Some("cmd-7"), Some("ctrl-7");
+    SidebarCard8, "sidebar_card_8", "Go to sidebar card 8", Some("cmd-8"), Some("ctrl-8");
+    SidebarCard9, "sidebar_card_9", "Go to sidebar card 9", Some("cmd-9"), Some("ctrl-9");
     GroupTab, "group_tab", "Add tab to group…", Some("cmd-shift-g"), Some("ctrl-shift-g");
     RemoveTabFromGroup, "remove_tab_from_group", "Remove tab from group", None, None;
     RenameTabGroup, "rename_tab_group", "Rename tab group…", None, None;
@@ -315,6 +324,9 @@ pub struct CommandContext {
     /// The selected tab has a layout to restore or merged tabs to split back out.
     pub has_previous_arrangement: bool,
     pub has_merged_tabs: bool,
+    /// Cards the sidebar shows outside folded workspaces: what Go to sidebar card 1–9
+    /// reach.
+    pub sidebar_cards: usize,
 }
 
 impl Command {
@@ -331,6 +343,15 @@ impl Command {
             | RemoveTab
             | DetachTab
             | RestoreHiddenTab
+            | SidebarCard1
+            | SidebarCard2
+            | SidebarCard3
+            | SidebarCard4
+            | SidebarCard5
+            | SidebarCard6
+            | SidebarCard7
+            | SidebarCard8
+            | SidebarCard9
             | GroupTab
             | RemoveTabFromGroup
             | RenameTabGroup
@@ -374,12 +395,33 @@ impl Command {
         }
     }
 
+    /// The 1-based number of the sidebar card a Go to sidebar card command opens.
+    pub const fn sidebar_card(self) -> Option<usize> {
+        use Command::*;
+        match self {
+            SidebarCard1 => Some(1),
+            SidebarCard2 => Some(2),
+            SidebarCard3 => Some(3),
+            SidebarCard4 => Some(4),
+            SidebarCard5 => Some(5),
+            SidebarCard6 => Some(6),
+            SidebarCard7 => Some(7),
+            SidebarCard8 => Some(8),
+            SidebarCard9 => Some(9),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn description(self) -> Option<&'static str> {
         use Command::*;
         match self {
             RemoveWorkspace => Some("Stops every terminal in this workspace and removes it."),
             RemoveTab => Some("Stops every terminal in this tab and removes it."),
             DetachTab => Some("Hides this tab without stopping its terminals."),
+            SidebarCard1 | SidebarCard2 | SidebarCard3 | SidebarCard4 | SidebarCard5
+            | SidebarCard6 | SidebarCard7 | SidebarCard8 | SidebarCard9 => Some(
+                "Opens the sidebar card with this number, counted from the top; folded workspaces are skipped.",
+            ),
             NewWindow => Some("Opens another window without duplicating your terminals."),
             MoveTabToNewWindow | MoveTabToWindow => {
                 Some("Moves this tab and its splits without stopping terminals.")
@@ -511,6 +553,10 @@ impl Command {
             Reconnect => "server attach retry",
             DetachTab => "hide close keep running",
             RestoreHiddenTab => "reopen unhide",
+            SidebarCard1 | SidebarCard2 | SidebarCard3 | SidebarCard4 | SidebarCard5
+            | SidebarCard6 | SidebarCard7 | SidebarCard8 | SidebarCard9 => {
+                "switch jump select tab thread card number"
+            }
             GroupTab => "group tabs label colour color organize",
             RemoveTabFromGroup => "group ungroup leave out",
             RenameTabGroup => "group label name",
@@ -568,6 +614,10 @@ impl Command {
     }
     pub fn disabled_reason(self, c: &CommandContext) -> Option<&'static str> {
         use Command::*;
+        if let Some(number) = self.sidebar_card() {
+            return (c.sidebar_cards < number)
+                .then_some("The sidebar has no card with that number");
+        }
         if matches!(
             self,
             BrowserBack | BrowserForward | BrowserReload | FocusAddressBar
@@ -2047,6 +2097,66 @@ mod tests {
             Some(Command::OpenFile)
         );
         assert!(search("quick open").any(|spec| spec.command == Command::OpenFile));
+    }
+
+    #[test]
+    fn ctrl_digits_go_to_sidebar_cards_from_a_terminal_too() {
+        let context = CommandContext {
+            sidebar_cards: 3,
+            ..ready()
+        };
+        let bindings = HashMap::new();
+        let route = |platform, key, owner| resolve_key(platform, key, owner, &context, &bindings);
+        let cmd = |key| ShortcutKey {
+            key,
+            command: true,
+            ..ShortcutKey::default()
+        };
+        // Terminals send nothing useful for Ctrl+digit, so the shortcut works everywhere.
+        for owner in [
+            InputOwner::Terminal,
+            InputOwner::Content,
+            InputOwner::Editor,
+        ] {
+            assert_eq!(
+                route(Platform::Windows, ctrl("1"), owner),
+                KeyRoute::Command(Command::SidebarCard1)
+            );
+            assert_eq!(
+                route(Platform::Linux, ctrl("3"), owner),
+                KeyRoute::Command(Command::SidebarCard3)
+            );
+            assert_eq!(
+                route(Platform::Mac, cmd("2"), owner),
+                KeyRoute::Command(Command::SidebarCard2)
+            );
+        }
+        // Past the last card the key is still Compi's, never the shell's.
+        assert!(matches!(
+            route(Platform::Windows, ctrl("4"), InputOwner::Terminal),
+            KeyRoute::Disabled(Command::SidebarCard4, _)
+        ));
+        // Ctrl+digit on a Mac stays with the terminal; text fields keep their keys.
+        assert_eq!(
+            route(Platform::Mac, ctrl("1"), InputOwner::Terminal),
+            KeyRoute::Terminal
+        );
+        assert_eq!(
+            route(Platform::Windows, ctrl("1"), InputOwner::TextField),
+            KeyRoute::Owned
+        );
+        assert_eq!(
+            (1..=9)
+                .map(|number| commands_for_card(number).sidebar_card())
+                .collect::<Vec<_>>(),
+            (1..=9).map(Some).collect::<Vec<_>>()
+        );
+    }
+
+    fn commands_for_card(number: usize) -> Command {
+        by_id(&format!("sidebar_card_{number}"))
+            .expect("every card number has a command")
+            .command
     }
 
     #[test]

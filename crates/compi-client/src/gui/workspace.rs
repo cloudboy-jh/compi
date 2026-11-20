@@ -31,6 +31,7 @@ pub(in crate::gui) mod program_status;
 pub(in crate::gui) mod prompt;
 pub(in crate::gui) mod remote;
 pub(in crate::gui) mod settings;
+pub(in crate::gui) mod sidebar;
 pub(in crate::gui) mod tab_groups;
 pub(super) mod tree;
 mod tree_ui;
@@ -928,7 +929,7 @@ impl CompiApp {
             remote: Default::default(),
             tab_scroll_handle: ScrollHandle::new(),
             workspace_scroll: ScrollHandle::new(),
-            sidebar_scroll: ScrollHandle::new(),
+            sidebar: sidebar::SidebarUi::new(window, cx),
             sidebar_open: false,
             whats_new_expanded: false,
             settings_update_notes_expanded: false,
@@ -938,7 +939,6 @@ impl CompiApp {
             sidebar_width,
             sidebar_drag: false,
             workspace_scroll_drag: None,
-            expanded_workspaces: HashSet::new(),
             tab_drag_origin: None,
             dragging_tab: None,
             dragging_group: None,
@@ -1022,8 +1022,6 @@ impl CompiApp {
         };
         if let Some(workspace) = &this.workspace {
             this.global_error = workspace.recovery_message.clone();
-            this.expanded_workspaces
-                .extend(this.state.selected_session.clone());
         }
         if !slot_diagnostics.is_empty() {
             this.global_warning = Some(slot_diagnostics.join("\n"));
@@ -1081,6 +1079,7 @@ impl CompiApp {
                         this.poll_metadata(cx);
                         this.poll_browser_home(cx);
                         this.poll_dev_servers(cx);
+                        this.poll_sidebar_threads(cx);
                         this.expire_toasts(cx);
                         let now = Instant::now();
                         let mut scroll_expired = false;
@@ -2000,6 +1999,7 @@ impl CompiApp {
             }
             let shell_focus = self.shell_focus();
             self.state.reconcile(self.workspace.as_ref(), &workspace);
+            self.sidebar.workspace_changed();
             self.workspace = Some(workspace);
             self.sync_visible_views();
             self.views_settled(shell_focus);
@@ -3532,6 +3532,7 @@ impl CompiApp {
             has_previous_arrangement: tab
                 .is_some_and(|tab| tab.previous_layout.is_some() || tab.merge.is_some()),
             has_merged_tabs: tab.is_some_and(|tab| tab.merge.is_some()),
+            sidebar_cards: self.sidebar_card_count(),
         }
     }
 
@@ -3837,6 +3838,19 @@ impl CompiApp {
             .cloned();
         match command {
             Command::OpenPalette => self.open_palette(None, cx),
+            Command::SidebarCard1
+            | Command::SidebarCard2
+            | Command::SidebarCard3
+            | Command::SidebarCard4
+            | Command::SidebarCard5
+            | Command::SidebarCard6
+            | Command::SidebarCard7
+            | Command::SidebarCard8
+            | Command::SidebarCard9 => {
+                if let Some(number) = command.sidebar_card() {
+                    self.open_sidebar_card(number, window, cx);
+                }
+            }
             Command::CreateWorkspace => self.open_overlay(
                 Overlay::Text {
                     purpose: TextPurpose::CreateWorkspace,
@@ -4561,7 +4575,7 @@ impl CompiApp {
                         ChoiceAction::File(path) => self.open_palette_file(path, window, cx),
                         ChoiceAction::Thread(chat) => {
                             if let Some(thread) = self.palette_thread(&chat).cloned() {
-                                self.open_thread(thread.chat, thread.terminal, window, cx);
+                                self.open_thread(thread.chat, thread.terminal, None, window, cx);
                             }
                         }
                         ChoiceAction::Window(handle) => {
@@ -5376,25 +5390,6 @@ impl CompiApp {
         command: Command,
         cx: &Context<Self>,
     ) -> AnyElement {
-        self.command_button_face(id, label, command, false, cx)
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.execute(command, window, cx);
-                cx.stop_propagation();
-            }))
-            .into_any_element()
-    }
-
-    /// A sidebar command button without its click: also the trigger of a popup that
-    /// is `open`.
-    fn command_button_face(
-        &self,
-        id: impl Into<gpui::ElementId>,
-        label: &'static str,
-        command: Command,
-        open: bool,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
         let colors = *self.colors();
         let reason = command.disabled_reason(&self.command_context(cx));
         div()
@@ -5408,9 +5403,14 @@ impl CompiApp {
             } else {
                 colors.foreground
             }))
-            .when(open, |button| button.bg(color(colors.surface_hover)))
             .hover(move |style| style.bg(color(colors.surface_hover)).cursor_pointer())
             .child(label)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.execute(command, window, cx);
+                cx.stop_propagation();
+            }))
+            .into_any_element()
     }
 
     fn command_icon_button(
@@ -5991,247 +5991,6 @@ impl CompiApp {
                             true,
                             colors,
                         )),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_sidebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
-        let colors = *self.colors();
-        let mut rows = Vec::new();
-        if let Some(workspace) = &self.workspace {
-            for (index, session) in workspace.sessions.iter().enumerate() {
-                let id = session.id.clone();
-                let switch_id = id.clone();
-                let expanded = self.expanded_workspaces.contains(&id);
-                let active = self.state.selected_session.as_ref() == Some(&id);
-                rows.push(
-                    div()
-                        .id(("workspace-heading", index))
-                        .px_2()
-                        .py_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .bg(color(if active {
-                            colors.surface_hover
-                        } else {
-                            colors.surface
-                        })
-                        .opacity(if self.glass { 0.88 } else { 1.0 }))
-                        .child(
-                            div()
-                                .id(("workspace-expand", index))
-                                .w(px(20.0))
-                                .cursor_pointer()
-                                .child(if expanded { "⌄" } else { "›" })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if !this.expanded_workspaces.remove(&id) {
-                                        this.expanded_workspaces.insert(id.clone());
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(session.label.clone()),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(workspace) = &this.workspace {
-                                this.state.select_session(workspace, &switch_id);
-                            }
-                            this.sync_visible_views();
-                            this.save_state();
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                );
-                if expanded {
-                    for (tab_index, tab) in session.tabs.iter().enumerate() {
-                        let tab_id = tab.id.clone();
-                        let hidden = self.state.hidden_tabs.contains(&tab_id);
-                        rows.push(
-                            div()
-                                .id(("workspace-terminal", index * 1_000_000 + tab_index))
-                                .pl_5()
-                                .pr_2()
-                                .py_2()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .text_color(color(if hidden {
-                                    colors.muted
-                                } else {
-                                    colors.foreground
-                                }))
-                                .hover(move |style| {
-                                    style.bg(color(colors.surface_hover)).cursor_pointer()
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_terminal(tab_id.clone(), true);
-                                    cx.notify();
-                                }))
-                                .child(
-                                    div()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(self.tab_label(tab)),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(UI_MICRO_TEXT_SIZE))
-                                        .text_color(color(colors.muted))
-                                        .child(self.tab_status(tab)),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                }
-            }
-        }
-        let comfy = self.comfy();
-        div()
-            .w(px(self.sidebar_extent()))
-            .h_full()
-            .flex_none()
-            .flex()
-            // Comfy: an island inset by the gutter on the canvas behind the panes.
-            .when(comfy, |sidebar| {
-                sidebar
-                    .relative()
-                    .pl(px(PANE_GUTTER))
-                    .py(px(PANE_GUTTER))
-                    .child(self.comfy_canvas(|bounds| {
-                        let gutter = px(PANE_GUTTER);
-                        vec![Bounds::new(
-                            point(bounds.left() + gutter, bounds.top() + gutter),
-                            size(
-                                bounds.size.width - gutter,
-                                bounds.size.height - gutter * 2.0,
-                            ),
-                        )]
-                    }))
-            })
-            .child(
-                div()
-                    .w(px(self.sidebar_extent()
-                        - if comfy {
-                            PANE_GUTTER
-                        } else {
-                            self.seam_width()
-                        }))
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .when(comfy, |island| island.rounded(px(PANE_RADIUS)))
-                    .bg(color(colors.surface).opacity(if self.glass { 0.9 } else { 1.0 }))
-                    .child(
-                        div()
-                            .px_3()
-                            .py_3()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child("Workspaces")
-                            .child(self.command_button(
-                                "create-workspace",
-                                "New",
-                                Command::CreateWorkspace,
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("workspace-sidebar-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.sidebar_scroll)
-                            .children(rows),
-                    )
-                    .children(self.render_update_card(cx))
-                    .children(self.render_whats_new_card(cx))
-                    .child(
-                        div()
-                            .p_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .border_t_1()
-                            .border_color(color(colors.border))
-                            .child(self.command_button(
-                                "workspace-actions",
-                                "Commands",
-                                Command::OpenPalette,
-                                cx,
-                            ))
-                            .child(
-                                self.render_quick_appearance(
-                                    "quick-appearance",
-                                    self.command_button_face(
-                                        "appearance-sidebar",
-                                        "Appearance",
-                                        Command::OpenQuickAppearance,
-                                        self.popup == Some(Popup::QuickAppearance),
-                                        cx,
-                                    )
-                                    .into_any_element(),
-                                    Anchor::BottomLeft,
-                                    window,
-                                    cx,
-                                ),
-                            )
-                            .child(self.command_button(
-                                "settings-sidebar",
-                                "Settings",
-                                Command::OpenSettings,
-                                cx,
-                            )),
-                    ),
-            )
-            .when(!comfy, |sidebar| {
-                sidebar.child(
-                    // One device pixel of seam; the transparent grab zone extends into the
-                    // sidebar's padding so the seam stays easy to drag.
-                    div()
-                        .w(px(self.seam_width()))
-                        .h_full()
-                        .relative()
-                        .bg(color(self.seam_color()))
-                        .child(
-                            div()
-                                .id("sidebar-divider")
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .right_0()
-                                .w(px(SEAM_GRAB))
-                                .group("sidebar-seam")
-                                .cursor(gpui::CursorStyle::ResizeLeftRight)
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .bottom_0()
-                                        .right_0()
-                                        .w(px(self.seam_width()))
-                                        .when(self.sidebar_drag, |line| {
-                                            line.bg(color(colors.accent))
-                                        })
-                                        .group_hover("sidebar-seam", move |style| {
-                                            style.bg(color(colors.accent))
-                                        }),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(Self::on_sidebar_divider_down),
-                                ),
-                        ),
                 )
             })
             .into_any_element()

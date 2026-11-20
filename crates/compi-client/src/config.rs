@@ -418,7 +418,7 @@ pub struct ProgramStatusSettings {
     pub tabs: bool,
     /// The dot on tiled panes and the glyph in floating title strips.
     pub panes: bool,
-    /// The state at the start of the sidebar and palette status line.
+    /// The dot on sidebar cards and the state at the start of the palette's status line.
     pub sidebar: bool,
 }
 

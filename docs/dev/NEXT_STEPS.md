@@ -15,7 +15,6 @@ Order and scope: the vault's `feat and bugs.md` → **Chat first** (decided 2026
 Implementation notes that the vault leaves out:
 
 - **Agents** get their own drivers for fidelity: Codex `app-server` (JSON-RPC over stdio), OpenCode's HTTP server and event stream, Pi `--mode rpc` (JSON lines). OMP stays on ACP with Compi's OMP extras. Claude Code: try its JSON stream mode from Rust first, else a Node helper running the Agent SDK. Plain ACP loses sub-agents, real rewind, steering and plan cards ([agent fidelity](../research/t3-code/agent-fidelity.md)). `ChatHarness` (`compi-protocol/src/chat.rs`) holds only `Omp` today; drivers report capabilities and the UI hides what an agent can't do. The agent is a setting (Default agent), with **New thread with…** for exceptions.
-- **Sidebar** rebuild: replaces the `Workspaces · New` header, tab rows and text footer in `gui/workspace.rs` (sidebar render). Workspace groups stay; rows become T3-style cards.
 
 ## 0.7.4: not seen yet
 

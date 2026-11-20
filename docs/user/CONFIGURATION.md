@@ -103,7 +103,7 @@ A manual tab label takes precedence over automatic names. Enabled fields follow 
 [program_status]
 tabs = true     # glyph on tab chips
 panes = true    # dot on tiled panes, glyph and progress on floating title strips
-sidebar = true  # state at the start of the sidebar and palette status line
+sidebar = true  # dot on sidebar cards, state at the start of the palette status line
 ```
 
 ## Notifications

@@ -112,6 +112,8 @@ gpui_kit_assets::icon_assets!(
         Image,
         RotateCcwClock,
         MessageSquare,
+        MessageSquarePlus,
+        FolderPlus,
         ChevronsDownUp,
     ]
 );
@@ -2089,6 +2091,8 @@ mod tests {
             IconName::Clock,
             IconName::Bell,
             IconName::MessageSquare,
+            IconName::MessageSquarePlus,
+            IconName::FolderPlus,
             IconName::Cloud,
             IconName::Search,
             IconName::Folder,

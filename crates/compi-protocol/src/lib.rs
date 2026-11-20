@@ -91,7 +91,8 @@ use std::fmt;
 // chats as threads after their panes close: `ListThreads` (`Threads`, `ThreadInfo`),
 // `DeleteThread`, and the mutations `OpenThread` and `ForgetThreadTerminal`. Tabs and
 // threads belong to a project (`Project`, `WorkspaceTab::project`, `ThreadInfo::project`),
-// with `ProjectIcon` and `SearchProjectFiles`.
+// with `ProjectIcon` and `SearchProjectFiles`; a thread names the workspace whose tab last
+// held it (`ThreadInfo::workspace`).
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;

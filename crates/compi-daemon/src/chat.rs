@@ -22,7 +22,7 @@ use compi_protocol::chat::{
     ThreadInfo,
 };
 use compi_protocol::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
-use compi_protocol::{ContentEnvironment, LayoutNode, SurfaceId, WorkspaceSnapshot};
+use compi_protocol::{ContentEnvironment, LayoutNode, SessionId, SurfaceId, WorkspaceSnapshot};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -243,9 +243,10 @@ impl ChatHub {
         Ok(())
     }
 
-    /// Notes which chats a pane or view of `workspace` holds, and the terminal each shows
-    /// in for its harness's next start. A chat none holds stays, its thread saved; its
-    /// harness stops once nothing runs in it. One that never became a thread ends.
+    /// Notes which chats a pane or view of `workspace` holds, the terminal each shows in
+    /// for its harness's next start, and the workspace of the tab holding it, which its
+    /// thread keeps. A chat none holds stays, its thread saved; its harness stops once
+    /// nothing runs in it. One that never became a thread ends.
     pub fn retain(&self, workspace: &WorkspaceSnapshot) {
         let chats: Vec<(String, Arc<Chat>)> = lock(&self.chats)
             .iter()
@@ -259,9 +260,10 @@ impl ChatHub {
         for (id, chat) in chats {
             let mut inner = chat.lock();
             match held.remove(&id) {
-                Some(surface) => {
+                Some(holder) => {
                     inner.held = true;
-                    inner.show_on(surface);
+                    inner.show_on(holder.surface);
+                    inner.held_in(holder.workspace);
                 }
                 None if inner.thread.is_none() => {
                     drop(inner);
@@ -307,26 +309,34 @@ impl ChatHub {
                     if let Some(times) = inner.thread {
                         stored.updated_ms = times.updated_ms;
                     }
+                    if inner.last_workspace.is_some() {
+                        stored.workspace = inner.last_workspace.clone();
+                    }
                 }
-                let terminal = held.get(&id).cloned().flatten().or_else(|| {
-                    workspace
-                        .kept_terminals
-                        .iter()
-                        .find(|kept| kept.chat == id)
-                        .map(|kept| kept.surface_id.clone())
-                });
+                let holder = held.get(&id);
+                let terminal = holder
+                    .and_then(|holder| holder.surface.clone())
+                    .or_else(|| {
+                        workspace
+                            .kept_terminals
+                            .iter()
+                            .find(|kept| kept.chat == id)
+                            .map(|kept| kept.surface_id.clone())
+                    });
+                let held_in = holder.map(|holder| holder.workspace.clone());
                 ThreadInfo {
                     project: crate::project::project_of(
                         &stored.chat.environment,
                         &stored.chat.folder,
                     ),
-                    open: held.contains_key(&id),
+                    open: holder.is_some(),
                     chat: stored.chat,
                     title: stored.title,
                     created_ms: stored.created_ms,
                     updated_ms: stored.updated_ms,
                     activity,
                     terminal,
+                    workspace: held_in.or(stored.workspace),
                 }
             })
             .collect();
@@ -362,15 +372,35 @@ impl ChatHub {
 /// The terminal whose view shows chat `id` in `workspace`; `None` when a content pane
 /// shows it, or nothing does.
 pub fn chat_surface(workspace: &WorkspaceSnapshot, id: &str) -> Option<SurfaceId> {
-    held_chats(workspace).remove(id).flatten()
+    held_chats(workspace)
+        .remove(id)
+        .and_then(|holder| holder.surface)
 }
 
-/// Every chat a pane or view of `workspace` holds, with the terminal it shows in when a
-/// terminal's view holds it.
-fn held_chats(workspace: &WorkspaceSnapshot) -> HashMap<String, Option<SurfaceId>> {
+/// Where a pane or view of a workspace holds a chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Holder {
+    /// The terminal whose view shows it, when a terminal's view does.
+    surface: Option<SurfaceId>,
+    /// The workspace of the tab holding it.
+    workspace: SessionId,
+}
+
+/// Every chat a pane or view of `workspace` holds, with where it holds it.
+fn held_chats(workspace: &WorkspaceSnapshot) -> HashMap<String, Holder> {
     let mut held = HashMap::new();
-    for tab in workspace.sessions.iter().flat_map(|session| &session.tabs) {
-        chat_leaves(&tab.layout, &mut held);
+    for session in &workspace.sessions {
+        let mut leaves = HashMap::new();
+        for tab in &session.tabs {
+            chat_leaves(&tab.layout, &mut leaves);
+        }
+        held.extend(leaves.into_iter().map(|(id, surface)| {
+            let holder = Holder {
+                surface,
+                workspace: session.id.clone(),
+            };
+            (id, holder)
+        }));
     }
     held
 }
@@ -627,6 +657,8 @@ struct Inner {
     save_due: bool,
     /// The terminal whose view last showed the chat, which its thread keeps.
     last_surface: Option<SurfaceId>,
+    /// The workspace whose tab last held the chat, which its thread keeps.
+    last_workspace: Option<SessionId>,
     /// A pane or view holds the chat.
     held: bool,
     /// The harness was stopped because no pane held the chat and nothing ran in it; a
@@ -1522,6 +1554,7 @@ impl Inner {
             updated_ms: thread.updated_ms,
         });
         self.last_surface = thread.last_surface;
+        self.last_workspace = thread.workspace;
         self.skip_replay = true;
     }
 
@@ -1564,6 +1597,7 @@ impl Inner {
             times.created_ms,
             times.updated_ms,
             self.last_surface.clone(),
+            self.last_workspace.clone(),
             self.state.entries.clone(),
         ))
     }
@@ -1577,6 +1611,14 @@ impl Inner {
             self.save_thread(false);
         }
         self.surface = surface;
+    }
+
+    /// Notes `workspace`, the workspace of the tab holding the chat now.
+    fn held_in(&mut self, workspace: SessionId) {
+        if self.last_workspace.as_ref() != Some(&workspace) {
+            self.last_workspace = Some(workspace);
+            self.save_thread(false);
+        }
     }
 
     /// What the chat is doing, for the threads list.
@@ -3654,6 +3696,69 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_keeps_the_workspace_of_the_tab_that_last_held_it() {
+        use compi_protocol::{PaneContent, PaneId, ServerGeneration, ServerId, TabId};
+        use compi_protocol::{WorkspaceSession, WorkspaceTab};
+        let session = |id: &str, chat: Option<&str>| WorkspaceSession {
+            id: SessionId::new(id),
+            label: id.into(),
+            tabs: chat
+                .map(|chat| WorkspaceTab {
+                    id: TabId::new(format!("tab-{id}")),
+                    label: "Chat".into(),
+                    layout: LayoutNode::Content {
+                        pane_id: PaneId::new(format!("pane-{id}")),
+                        content: PaneContent::Chat(thread_chat(chat)),
+                    },
+                    previous_layout: None,
+                    merge: None,
+                    group: None,
+                    project: None,
+                })
+                .into_iter()
+                .collect(),
+            groups: Vec::new(),
+        };
+        let workspace = |sessions| WorkspaceSnapshot {
+            server_id: ServerId::new("server"),
+            server_generation: ServerGeneration::new("1"),
+            revision: 1,
+            initialized: true,
+            sessions,
+            surfaces: Vec::new(),
+            recovery_message: None,
+            kept_terminals: Vec::new(),
+        };
+        let held = held_chats(&workspace(vec![
+            session("session-1", None),
+            session("session-2", Some("chat-1")),
+        ]));
+        let holder = held["chat-1"].clone();
+        assert_eq!(holder.workspace, SessionId::new("session-2"));
+
+        // The chat's thread saves the workspace once a tab holds it, and keeps it after.
+        let mut inner = Inner {
+            thread: Some(ThreadTimes {
+                created_ms: 1,
+                updated_ms: 2,
+            }),
+            ..Inner::default()
+        };
+        inner.held_in(holder.workspace);
+        let record = inner.thread_to_save(&thread_chat("chat-1")).unwrap();
+        assert_eq!(record.workspace, Some(SessionId::new("session-2")));
+        assert_eq!(
+            record.updated_ms, 2,
+            "where it is held changes no transcript"
+        );
+        let mut seeded = Inner::default();
+        seeded.seed(record);
+        assert_eq!(seeded.last_workspace, Some(SessionId::new("session-2")));
+        inner.held_in(SessionId::new("session-2"));
+        assert!(inner.thread_to_save(&thread_chat("chat-1")).is_none());
+    }
+
+    #[test]
     fn streamed_chunks_join_one_entry_per_speaker_and_tool_calls_update_in_place() {
         let mut inner = Inner::default();
         let chunk = |kind: &str, text: &str| json!({ "sessionUpdate": kind, "content": { "type": "text", "text": text } });
@@ -4701,6 +4806,7 @@ mod tests {
             10,
             20,
             Some(SurfaceId::new("surface-1")),
+            Some(SessionId::new("session-1")),
             vec![
                 ChatEntry::User {
                     text: "\n  Fix the build\nthen test".into(),
@@ -4757,6 +4863,7 @@ mod tests {
             Some("Make it".into()),
             5,
             50,
+            None,
             None,
             vec![
                 ChatEntry::User {

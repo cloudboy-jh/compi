@@ -103,6 +103,7 @@ mod tests {
             activity: ThreadActivity::Idle,
             terminal: None,
             project: None,
+            workspace: None,
             open: false,
         };
         assert_eq!(thread_title(&thread), "New thread");

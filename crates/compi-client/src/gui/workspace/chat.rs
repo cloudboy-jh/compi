@@ -667,15 +667,26 @@ impl CompiApp {
         opened.then_some(id)
     }
 
+    /// What chat `chat`'s header calls it, while this window watches it.
+    pub(super) fn watched_chat_title(&self, chat: &str) -> Option<String> {
+        self.chat
+            .chats
+            .get(chat)?
+            .state
+            .as_ref()
+            .and_then(chat_title)
+    }
+
     /// Opens thread `chat`: the pane or view holding it is revealed and focused. A thread
     /// whose view was closed while its terminal, `terminal`, stays in a tab shows as that
     /// terminal's view again, unless the terminal carries another view now. Any other
-    /// opens in a new tab of the selected workspace, on the terminal the daemon kept for
-    /// it when there is one.
+    /// opens in a new tab of workspace `session`, else of the selected workspace, on the
+    /// terminal the daemon kept for it when there is one.
     pub(super) fn open_thread(
         &mut self,
         chat: ChatContent,
         terminal: Option<SurfaceId>,
+        session: Option<SessionId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -712,10 +723,13 @@ impl CompiApp {
             cx.notify();
             return;
         }
-        let Some(session_id) = self
-            .state
-            .selected_session(workspace)
-            .map(|session| session.id.clone())
+        let Some(session_id) = session
+            .filter(|session| workspace.sessions.iter().any(|known| &known.id == session))
+            .or_else(|| {
+                self.state
+                    .selected_session(workspace)
+                    .map(|session| session.id.clone())
+            })
         else {
             self.global_error = Some("Select a workspace first".into());
             return;
@@ -735,16 +749,15 @@ impl CompiApp {
         cx.spawn_in(window, async move |this, cx| {
             let listed = cx
                 .background_executor()
-                .spawn(async move {
-                    (|| -> crate::Result<_> { target.connect()?.list_threads() })()
-                        .map_err(|error| error.to_string())
-                })
+                .spawn(async move { palette::fetch_threads(&target) })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 match listed
                     .map(|threads| threads.into_iter().find(|thread| thread.chat.id == chat))
                 {
-                    Ok(Some(thread)) => this.open_thread(thread.chat, thread.terminal, window, cx),
+                    Ok(Some(thread)) => {
+                        this.open_thread(thread.chat, thread.terminal, None, window, cx);
+                    }
                     Ok(None) => this.global_error = Some("That thread was deleted".into()),
                     Err(error) => {
                         this.global_error = Some(format!("Cannot open the thread: {error}"));

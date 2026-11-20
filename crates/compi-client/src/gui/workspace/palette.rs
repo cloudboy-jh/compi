@@ -36,6 +36,13 @@ static NEXT_FILE_SEARCH: AtomicU64 = AtomicU64::new(1);
 static NEXT_THREAD_LISTING: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROJECT_SEARCH: AtomicU64 = AtomicU64::new(1);
 
+/// The daemon's threads, listed over a connection of their own. It blocks, so it runs
+/// off the UI thread.
+pub(super) fn fetch_threads(target: &ConnectionTarget) -> Result<Vec<ThreadInfo>, String> {
+    (|| -> crate::Result<_> { target.connect()?.list_threads() })()
+        .map_err(|error| error.to_string())
+}
+
 /// What the palette lists: everything, or only one kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Scope {
@@ -551,7 +558,8 @@ impl CompiApp {
     }
 
     /// Lists the daemon's threads off the UI thread; what is listed stays shown until
-    /// the reply replaces it, and a reply to an older listing is dropped.
+    /// the reply replaces it, and a reply to an older listing is dropped. The sidebar
+    /// takes the listing too.
     fn list_palette_threads(&mut self, cx: &mut Context<Self>) {
         let request = NEXT_THREAD_LISTING.fetch_add(1, Ordering::Relaxed);
         self.palette.threads_request = request;
@@ -559,15 +567,16 @@ impl CompiApp {
         cx.spawn(async move |this, cx| {
             let listed = cx
                 .background_executor()
-                .spawn(async move {
-                    (|| -> crate::Result<_> { target.connect()?.list_threads() })()
-                        .map_err(|error| error.to_string())
-                })
+                .spawn(async move { fetch_threads(&target) })
                 .await;
             this.update(cx, |this, cx| {
+                if let Ok(threads) = &listed {
+                    this.sidebar_threads_listed(threads.clone());
+                }
                 if !matches!(this.overlay, Some(Overlay::Palette))
                     || this.palette.threads_request != request
                 {
+                    cx.notify();
                     return;
                 }
                 this.palette.threads = match listed {
@@ -638,6 +647,7 @@ impl CompiApp {
                         if let ThreadList::Listed(threads) = &mut this.palette.threads {
                             threads.retain(|thread| thread.chat.id != chat);
                         }
+                        this.sidebar_thread_deleted(&chat);
                         if matches!(this.overlay, Some(Overlay::Palette)) {
                             let count = this.palette_choices(cx).0.len();
                             this.overlay_index = this.overlay_index.min(count.saturating_sub(1));
@@ -1462,6 +1472,7 @@ mod tests {
             activity,
             terminal: None,
             project: None,
+            workspace: None,
             open,
         }
     }

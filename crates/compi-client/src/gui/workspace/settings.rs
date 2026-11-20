@@ -723,7 +723,7 @@ static ROWS: &[Row] = &[
     status_row(
         "status-sidebar",
         "Sidebar and palette",
-        "Start each tab's status line with it.",
+        "Show it as a dot on each sidebar card, and first in each palette tab's status line.",
         |_| vec![SettingsAction::ProgramStatus(2)],
         |app, row, cx| app.render_status_row(row, 2, cx),
     ),

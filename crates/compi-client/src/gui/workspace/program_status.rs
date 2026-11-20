@@ -24,6 +24,11 @@ enum Acknowledgement {
 pub(in crate::gui) struct ProgramStatusUi {
     statuses: HashMap<SurfaceId, SurfaceProgramStatus>,
     chats: HashMap<String, ChatProgramStatus>,
+    /// When this window saw each terminal's and chat's status last change, in
+    /// milliseconds since the epoch; a status that was already there when the watch
+    /// began has none.
+    surface_changes: HashMap<SurfaceId, u64>,
+    chat_changes: HashMap<String, u64>,
     acknowledgements: mpsc::Sender<Acknowledgement>,
 }
 
@@ -41,6 +46,8 @@ impl ProgramStatusUi {
         Self {
             statuses: HashMap::new(),
             chats: HashMap::new(),
+            surface_changes: HashMap::new(),
+            chat_changes: HashMap::new(),
             acknowledgements,
         }
     }
@@ -61,6 +68,11 @@ impl ProgramStatusUi {
     }
 
     pub(in crate::gui) fn update(&mut self, status: SurfaceProgramStatus) {
+        let before = self.statuses.get(&status.surface_id);
+        if before.map_or(&[][..], |before| &before.records) != status.records.as_slice() {
+            self.surface_changes
+                .insert(status.surface_id.clone(), crate::chat::now_ms());
+        }
         if status.records.is_empty() {
             self.statuses.remove(&status.surface_id);
         } else {
@@ -69,6 +81,10 @@ impl ProgramStatusUi {
     }
 
     pub(in crate::gui) fn update_chat(&mut self, status: ChatProgramStatus) {
+        if self.chat_records(&status.chat_id) != status.records.as_slice() {
+            self.chat_changes
+                .insert(status.chat_id.clone(), crate::chat::now_ms());
+        }
         if status.records.is_empty() {
             self.chats.remove(&status.chat_id);
         } else {
@@ -86,6 +102,16 @@ impl ProgramStatusUi {
         self.chats
             .get(chat)
             .map_or(&[][..], |status| &status.records)
+    }
+
+    /// When this window saw `surface_id`'s status change last.
+    pub(in crate::gui) fn surface_changed_ms(&self, surface_id: &SurfaceId) -> Option<u64> {
+        self.surface_changes.get(surface_id).copied()
+    }
+
+    /// When this window saw chat `chat`'s status change last.
+    pub(in crate::gui) fn chat_changed_ms(&self, chat: &str) -> Option<u64> {
+        self.chat_changes.get(chat).copied()
     }
 }
 
@@ -315,6 +341,34 @@ impl CompiApp {
         )
     }
 
+    /// When this window last saw the program status of any of the tab's panes change.
+    pub(super) fn tab_status_changed_ms(&self, tab: &WorkspaceTab) -> Option<u64> {
+        let mut leaves = Vec::new();
+        leaf_nodes(&tab.layout, &mut leaves);
+        leaves
+            .into_iter()
+            .flat_map(|leaf| {
+                let surface = match leaf {
+                    LayoutNode::Pane { surface_id, .. } => {
+                        self.program_status.surface_changed_ms(surface_id)
+                    }
+                    _ => None,
+                };
+                let chat = leaf
+                    .content()
+                    .and_then(PaneContent::chat)
+                    .and_then(|chat| self.program_status.chat_changed_ms(&chat.id));
+                [surface, chat]
+            })
+            .flatten()
+            .max()
+    }
+
+    /// The state chat `chat`'s records most need the user for.
+    pub(super) fn chat_program_headline(&self, chat: &str) -> Option<Headline> {
+        status::headline(self.program_status.chat_records(chat))
+    }
+
     /// Hover text for the tab's program status. A tab of one pane has its name as the
     /// tooltip title, so only its records; otherwise every reporting pane by name, then
     /// its records, so a program cannot pose as one in another pane.
@@ -341,7 +395,7 @@ impl CompiApp {
         lines.join("\n")
     }
 
-    fn program_state_color(&self, state: ProgramState) -> u32 {
+    pub(super) fn program_state_color(&self, state: ProgramState) -> u32 {
         let colors = self.colors();
         match state {
             ProgramState::Idle => colors.muted,

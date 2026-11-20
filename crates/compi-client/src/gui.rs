@@ -961,19 +961,18 @@ struct CompiApp {
     remote: workspace::remote::RemoteState,
     tab_scroll_handle: ScrollHandle,
     workspace_scroll: ScrollHandle,
-    sidebar_scroll: ScrollHandle,
+    sidebar: workspace::sidebar::SidebarUi,
     sidebar_open: bool,
     whats_new_expanded: bool,
     settings_update_notes_expanded: bool,
     /// A release is on offer and Later wasn't chosen for it.
     update_dot: bool,
-    /// The sidebar's update card as last drawn.
+    /// The release the sidebar's update button offers, as last drawn.
     update_card: Option<crate::updates::UpdateCard>,
     updates_page_open: bool,
     sidebar_width: f32,
     sidebar_drag: bool,
     workspace_scroll_drag: Option<bool>,
-    expanded_workspaces: HashSet<SessionId>,
     tab_drag_origin: Option<Point<Pixels>>,
     dragging_tab: Option<TabId>,
     /// A group label picked up in the tab strip; let go without dragging, it folds.

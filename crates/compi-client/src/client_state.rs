@@ -226,6 +226,10 @@ pub struct ClientState {
     /// most `MAX_FILE_PROJECTS` projects of `MAX_PROJECT_FILES` files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_files: Vec<RecentProjectFiles>,
+    /// Tabs pinned to the top of their workspace in the sidebar, in the order pinned.
+    /// Additive; tabs that close are dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_tabs: Vec<TabId>,
 }
 
 impl Default for ClientState {
@@ -249,6 +253,7 @@ impl Default for ClientState {
             read_files: Vec::new(),
             recent_addresses: Vec::new(),
             project_files: Vec::new(),
+            pinned_tabs: Vec::new(),
         }
     }
 }
@@ -314,6 +319,14 @@ impl ClientState {
             .iter()
             .find(|files| files.project == *project)
             .map_or(&[], |files| &files.paths)
+    }
+
+    /// Pins tab `id` after the tabs pinned before it, or unpins it.
+    pub fn set_pinned(&mut self, id: &TabId, pinned: bool) {
+        self.pinned_tabs.retain(|known| known != id);
+        if pinned {
+            self.pinned_tabs.push(id.clone());
+        }
     }
 
     pub fn selected_session<'a>(
@@ -478,6 +491,7 @@ impl ClientState {
             .map(|tab| (tab.id.as_str(), tab))
             .collect();
         self.hidden_tabs.retain(|id| tabs.contains_key(id.as_str()));
+        self.pinned_tabs.retain(|id| tabs.contains_key(id.as_str()));
         self.selected_tabs
             .retain(|id, _| session_ids.contains(id.as_str()));
         self.focused_panes
@@ -736,6 +750,12 @@ impl ClientState {
         self.read_files = source.read_files.clone();
         self.recent_addresses = source.recent_addresses.clone();
         self.project_files = source.project_files.clone();
+        self.pinned_tabs = source
+            .pinned_tabs
+            .iter()
+            .filter(|id| ids.contains(id))
+            .cloned()
+            .collect();
         self.selected_session = None;
         self.selected_tabs.clear();
         self.focused_panes.clear();
@@ -803,6 +823,7 @@ impl ClientState {
         if self.selected_tabs.len() > MAX_REFERENCES
             || self.focused_panes.len() > MAX_REFERENCES
             || self.hidden_tabs.len() > MAX_REFERENCES
+            || self.pinned_tabs.len() > MAX_REFERENCES
             || self.viewports.len() > MAX_REFERENCES
         {
             return Err("client state exceeds its navigation reference limit".into());
@@ -844,17 +865,22 @@ impl ClientState {
         let before = self.selected_tabs.len()
             + self.focused_panes.len()
             + self.hidden_tabs.len()
+            + self.pinned_tabs.len()
             + self.viewports.len();
         self.selected_tabs
             .retain(|key, id| valid_id(key) && valid_id(id.as_str()));
         self.focused_panes
             .retain(|key, id| valid_id(key) && valid_id(id.as_str()));
         self.hidden_tabs.retain(|id| valid_id(id.as_str()));
+        let mut pinned = HashSet::new();
+        self.pinned_tabs
+            .retain(|id| valid_id(id.as_str()) && pinned.insert(id.clone()));
         self.viewports.retain(|id, viewport| viewport.valid(id));
         changed |= before
             != self.selected_tabs.len()
                 + self.focused_panes.len()
                 + self.hidden_tabs.len()
+                + self.pinned_tabs.len()
                 + self.viewports.len();
         changed |= self.project_history.sanitize();
         let project_files = self.project_files.len();
@@ -1303,6 +1329,7 @@ impl StateSlot {
             || !state.appearance.valid()
             || state.focused_panes.len() > MAX_REFERENCES
             || state.hidden_tabs.len() > MAX_REFERENCES
+            || state.pinned_tabs.len() > MAX_REFERENCES
             || state.viewports.len() > MAX_REFERENCES
             || state.floating.len() > MAX_FLOATING
             || state.floating.iter().any(|float| {
@@ -1321,6 +1348,7 @@ impl StateSlot {
                 .iter()
                 .any(|(key, id)| !valid_id(key) || !valid_id(id.as_str()))
             || state.hidden_tabs.iter().any(|id| !valid_id(id.as_str()))
+            || state.pinned_tabs.iter().any(|id| !valid_id(id.as_str()))
             || state
                 .viewports
                 .iter()
