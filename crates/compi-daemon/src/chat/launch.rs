@@ -99,9 +99,10 @@ fn script(harness: ChatHarness, args: &[Arg], locate: bool) -> String {
         ChatHarness::Claude if locate => {
             format!(r#"{SCRIPT_START}{CLAUDE_FIND}; [ -n "$found$windows" ]"#)
         }
-        // The WSL note is about Linux: a Windows `claude` runs without it.
+        // A Linux `claude` gets the WSL note; a Windows one, the note telling it its
+        // commands belong in WSL.
         ChatHarness::Claude => format!(
-            r#"{SCRIPT_START}{CLAUDE_FIND}; if [ -n "$found" ]; then exec "$found"{args} ${{COMPI_AGENT_NOTE:+--append-system-prompt "$COMPI_AGENT_NOTE"}}; elif [ -n "$windows" ]; then exec "$windows"{args}; else exit 127; fi"#
+            r#"{SCRIPT_START}{CLAUDE_FIND}; if [ -n "$found" ]; then exec "$found"{args} ${{COMPI_AGENT_NOTE:+--append-system-prompt "$COMPI_AGENT_NOTE"}}; elif [ -n "$windows" ]; then exec "$windows"{args} ${{COMPI_AGENT_WINDOWS_NOTE:+--append-system-prompt "$COMPI_AGENT_WINDOWS_NOTE"}}; else exit 127; fi"#
         ),
     }
 }
@@ -366,12 +367,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_prefers_a_linux_install_and_only_that_one_gets_the_wsl_note() {
+    fn claude_prefers_a_linux_install_and_each_gets_its_own_note() {
         let args = [Arg::word("--resume"), Arg::word("s 1")];
         let run = script(ChatHarness::Claude, &args, false);
         assert!(run.contains(r#"for dir in $PATH${COMPI_WINDOWS_HOME:+:$COMPI_WINDOWS_HOME/.local/bin:$COMPI_WINDOWS_HOME/AppData/Roaming/npm}; do"#));
         assert!(run.ends_with(
-            r#"if [ -n "$found" ]; then exec "$found" --resume 's 1' ${COMPI_AGENT_NOTE:+--append-system-prompt "$COMPI_AGENT_NOTE"}; elif [ -n "$windows" ]; then exec "$windows" --resume 's 1'; else exit 127; fi"#
+            r#"if [ -n "$found" ]; then exec "$found" --resume 's 1' ${COMPI_AGENT_NOTE:+--append-system-prompt "$COMPI_AGENT_NOTE"}; elif [ -n "$windows" ]; then exec "$windows" --resume 's 1' ${COMPI_AGENT_WINDOWS_NOTE:+--append-system-prompt "$COMPI_AGENT_WINDOWS_NOTE"}; else exit 127; fi"#
         ));
         assert!(script(ChatHarness::Claude, &[], true).ends_with(r#"; [ -n "$found$windows" ]"#));
         // The script travels in a variable, so its single quotes reach the shell as typed.

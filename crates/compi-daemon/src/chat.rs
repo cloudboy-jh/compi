@@ -742,6 +742,16 @@ impl Chat {
         )
         .map(|mut environment| {
             environment.extend(note.map(|note| ("COMPI_AGENT_NOTE", note)));
+            // A Windows `claude` in a WSL chat is told where the project is and that its
+            // commands belong in WSL; the launch script passes it to that one only.
+            if let (Driver::Claude(_), ContentEnvironment::Wsl { distribution }) =
+                (&inner.driver, &self.content.environment)
+            {
+                environment.push((
+                    "COMPI_AGENT_WINDOWS_NOTE",
+                    windows_agent_note(distribution, &self.content.folder),
+                ));
+            }
             environment
         })
         .map_err(|error| format!("Couldn't prepare Compi's shell context: {error}"))
@@ -2019,6 +2029,27 @@ fn wsl_note(distribution: &str, windows_home: &str, linux_home: &str) -> String 
          powershell.exe, tasklist.exe and winget.exe. To see an open Windows app window, \
          such as a dialog you caused: `compi screenshot` lists the windows, and \
          `compi screenshot NAME` saves one as a PNG and prints its path for you to read."
+    )
+}
+
+/// What a Windows agent (a Windows `claude` reached from WSL) is told in a WSL chat in
+/// `folder`: the project is Linux's, so its commands run there and its file tools use the
+/// share's paths, not the Windows drive's.
+fn windows_agent_note(distribution: &str, folder: &str) -> String {
+    let share = format!(
+        r"\\wsl.localhost\{distribution}{}",
+        folder.replace('/', r"\")
+    );
+    let quoted = format!("'{}'", folder.replace('\'', r"'\''"));
+    format!(
+        "This project is in WSL ({distribution}) at {folder}, which Windows sees as {share}. \
+         You run as a Windows program: your Bash tool is a Windows shell (Git Bash) and your \
+         file tools take Windows paths. Run every shell command inside WSL, in the project \
+         folder, exactly as: MSYS_NO_PATHCONV=1 wsl.exe -d {distribution} --cd {quoted} -- \
+         bash -lc 'COMMAND' (without MSYS_NO_PATHCONV, Git Bash rewrites the Linux path). \
+         For file tools, the Linux path /a/b is \\\\wsl.localhost\\{distribution}\\a\\b, never \
+         C:\\a\\b. Inside those WSL commands, `compi screenshot` lists open Windows app \
+         windows and `compi screenshot NAME` saves one as a PNG and prints its path."
     )
 }
 
