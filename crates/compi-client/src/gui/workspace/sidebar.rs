@@ -56,10 +56,8 @@ pub(in crate::gui) struct SidebarUi {
     highlight: Option<usize>,
     scroll: ScrollHandle,
     /// The daemon's threads as last listed: the titles of chats this window does not
-    /// watch, and a draft's Continue.
+    /// watch.
     threads: Vec<ThreadInfo>,
-    /// A listing came back since the window opened.
-    listed: bool,
     /// A listing is under way.
     listing: bool,
     /// The workspace changed since the last listing began.
@@ -93,7 +91,6 @@ impl SidebarUi {
             highlight: None,
             scroll: ScrollHandle::new(),
             threads: Vec::new(),
-            listed: false,
             listing: false,
             listing_due: true,
             rename: None,
@@ -106,19 +103,6 @@ impl SidebarUi {
     /// The workspace changed: the threads are listed again.
     pub(in crate::gui) fn workspace_changed(&mut self) {
         self.listing_due = true;
-    }
-
-    /// The daemon's threads as last listed.
-    pub(super) fn threads(&self) -> &[ThreadInfo] {
-        &self.threads
-    }
-
-    /// Something shows the threads (a draft's Continue): they are listed unless a
-    /// listing already came back.
-    pub(super) fn want_threads(&mut self) {
-        if !self.listed {
-            self.listing_due = true;
-        }
     }
 }
 
@@ -995,7 +979,6 @@ impl CompiApp {
     /// Takes the daemon's thread list; a chat's title may now match the search.
     pub(super) fn sidebar_threads_listed(&mut self, threads: Vec<ThreadInfo>) {
         self.sidebar.threads = threads;
-        self.sidebar.listed = true;
         self.clamp_sidebar_highlight();
     }
 

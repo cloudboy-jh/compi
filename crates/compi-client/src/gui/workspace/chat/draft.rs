@@ -7,21 +7,19 @@
 //! (`ChatState::thread`), so closing an untouched one leaves nothing; closing one with
 //! typed text offers Undo for a few seconds.
 use super::*;
-use crate::chat::{age_label, thread_title};
-use compi_protocol::chat::{ThreadActivity, ThreadInfo};
 use compi_protocol::{
     BrowserContent, MonitorContent, MutationId, MutationReceipt, PaneReplacement, Project,
     SessionId, SplitAxis,
 };
-use gpui::{Div, Hsla, Modifiers};
+use gpui::Modifiers;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How long "Draft discarded · Undo" stays.
 const UNDO_LIFETIME: Duration = Duration::from_secs(5);
 /// The widest the draft's column grows.
 const DRAFT_WIDTH: f32 = 680.0;
-/// The most threads Continue lists.
-const CONTINUE_LIMIT: usize = 4;
+/// The width of the list of what else the pane can be.
+const SURFACES_WIDTH: f32 = 320.0;
 
 static NEXT_NOTICE: AtomicU64 = AtomicU64::new(0);
 
@@ -82,17 +80,6 @@ impl OpenInstead {
             Self::Changes => "d",
             Self::Browser => "b",
             Self::Monitor => "m",
-        }
-    }
-
-    /// Its shortcut, in GPUI keystroke syntax.
-    fn shortcut(self) -> &'static str {
-        match self {
-            Self::Terminal => "alt-t",
-            Self::Files => "alt-f",
-            Self::Changes => "alt-d",
-            Self::Browser => "alt-b",
-            Self::Monitor => "alt-m",
         }
     }
 
@@ -181,32 +168,6 @@ fn edge_leaf(node: &LayoutNode, first: bool) -> Option<PaneId> {
     }
 }
 
-/// The threads a draft's Continue lists: those whose project is one of `projects` (the
-/// draft's tab project and its repository's top folder, which a link can make differ),
-/// else those of the draft's folder; newest first, at most `CONTINUE_LIMIT`, never the
-/// draft.
-fn continue_threads<'a>(
-    threads: &'a [ThreadInfo],
-    draft: &ChatContent,
-    projects: &[&Project],
-) -> Vec<&'a ThreadInfo> {
-    let mut listed: Vec<&ThreadInfo> = threads
-        .iter()
-        .filter(|thread| thread.chat.id != draft.id)
-        .filter(|thread| {
-            thread
-                .project
-                .as_ref()
-                .is_some_and(|theirs| projects.contains(&theirs))
-                || (thread.chat.environment == draft.environment
-                    && thread.chat.folder == draft.folder)
-        })
-        .collect();
-    listed.sort_by_key(|thread| std::cmp::Reverse(thread.updated_ms));
-    listed.truncate(CONTINUE_LIMIT);
-    listed
-}
-
 /// The line under a draft's project name: the branch, how many files have changes, and
 /// `folder`; before Git answers, and outside Git, the folder alone.
 fn draft_facts(repo: &Repo, folder: &str) -> String {
@@ -230,17 +191,6 @@ fn draft_facts(repo: &Repo, folder: &str) -> String {
     facts.join(" · ")
 }
 
-/// A draft section's quiet heading.
-fn draft_heading(text: &'static str, muted: Hsla) -> Div {
-    div()
-        .px_2()
-        .pb_1()
-        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(muted)
-        .child(text)
-}
-
 impl CompiApp {
     /// Split right or down from `beside`, which shows `source`: a new thread draft in
     /// `source`'s folder, in a pane of its own.
@@ -254,8 +204,9 @@ impl CompiApp {
         self.open_content_split(beside, axis, PaneContent::Chat(draft));
     }
 
-    /// A draft pane, in the middle of the pane: the project, the message box, the
-    /// threads to continue, then what else the pane can be.
+    /// A draft pane, on one centre line: the project's icon and name with its branch,
+    /// changes and folder under them, the message box in the middle, then what else the
+    /// pane can be.
     pub(super) fn render_chat_draft(
         &self,
         pane_id: &PaneId,
@@ -278,41 +229,38 @@ impl CompiApp {
             Some(project) => project.name().to_owned().into(),
             None => model.folder_label.clone(),
         };
-        let projects: Vec<&Project> = self
-            .pane_project(pane_id)
-            .into_iter()
-            .chain(repo_project.as_ref())
-            .collect();
-        let threads = continue_threads(self.sidebar.threads(), chat, &projects);
         let header = div()
             .id("chat-draft-project")
             .w_full()
-            .px_3()
             .flex()
+            .flex_col()
             .items_center()
-            .gap_3()
-            .child(self.project_icon(project, 28.0))
+            .gap_1()
             .child(
                 div()
-                    .min_w_0()
+                    .max_w_full()
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .gap_2p5()
+                    .child(self.project_icon(project, 24.0))
                     .child(
                         div()
+                            .min_w_0()
                             .truncate()
                             .text_size(ui_rems(22.0))
                             .line_height(ui_rems(28.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color(colors.foreground))
                             .child(name),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
-                            .text_color(muted)
-                            .child(draft_facts(&model.repo, &model.folder_label)),
                     ),
+            )
+            .child(
+                div()
+                    .max_w_full()
+                    .truncate()
+                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                    .text_color(muted)
+                    .child(draft_facts(&model.repo, &model.folder_label)),
             )
             .tooltip(controls::tooltip(model.folder.clone(), None, None));
         div()
@@ -332,118 +280,26 @@ impl CompiApp {
                     .max_w(ui_rems(DRAFT_WIDTH))
                     .flex()
                     .flex_col()
+                    .items_center()
                     .child(header)
                     .child(
                         div()
-                            .mt_4()
+                            .mt_5()
                             .w_full()
                             .child(self.render_chat_footer(chat, model, true, cx)),
                     )
-                    .children(self.render_continue(chat, &threads, cx))
-                    .child(self.render_open_instead(chat, model, cx)),
+                    .child(
+                        div()
+                            .mt_8()
+                            .child(self.render_open_instead(chat, model, cx)),
+                    ),
             )
             .into_any_element()
     }
 
-    /// Continue: the project's latest threads, one row each with its title, a dot while
-    /// it works or waits, and its age. `None` without any.
-    fn render_continue(
-        &self,
-        chat: &ChatContent,
-        threads: &[&ThreadInfo],
-        cx: &Context<Self>,
-    ) -> Option<AnyElement> {
-        if threads.is_empty() {
-            return None;
-        }
-        let colors = *self.colors();
-        let muted = color(modal_text_color(colors.muted, &colors));
-        let foreground = color(colors.foreground);
-        let hover = color(colors.surface_hover);
-        let now = now_ms();
-        let rows = threads.iter().enumerate().map(|(index, thread)| {
-            let dot = match self.thread_activity(thread) {
-                ThreadActivity::Working => Some((colors.accent, "Working")),
-                ThreadActivity::Waiting => Some((colors.modified, "Waiting for you")),
-                ThreadActivity::Idle => None,
-            };
-            let (draft, opened) = (chat.id.clone(), thread.chat.clone());
-            div()
-                .id(("chat-continue", index))
-                .h(ui_rems(30.0))
-                .px_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .rounded(ui_rems(6.0))
-                .cursor_pointer()
-                .hover(|style| style.bg(hover))
-                .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
-                .child(controls::glyph(IconName::MessageSquare, muted))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(foreground)
-                        .child(thread_title(thread).to_owned()),
-                )
-                .children(dot.map(|(tint, label)| {
-                    div()
-                        .id(("chat-continue-status", index))
-                        .flex_none()
-                        .size(px(7.0))
-                        .rounded_full()
-                        .bg(color(tint))
-                        .tooltip(controls::tooltip(label, None, None))
-                }))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                        .text_color(muted)
-                        .child(age_label(thread.updated_ms, now)),
-                )
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.continue_thread(&draft, opened.clone(), window, cx);
-                    cx.notify();
-                }))
-        });
-        Some(
-            div()
-                .mt_5()
-                .w_full()
-                .px_3()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(draft_heading("Continue", muted))
-                .children(rows)
-                .into_any_element(),
-        )
-    }
-
-    /// What thread `thread` is doing: as this window's chat state says when it watches
-    /// it, else as the listing said.
-    fn thread_activity(&self, thread: &ThreadInfo) -> ThreadActivity {
-        let state = self
-            .chat
-            .chats
-            .get(&thread.chat.id)
-            .and_then(|model| model.state.as_ref());
-        match state {
-            Some(state) if state.permission.is_some() || state.question.is_some() => {
-                ThreadActivity::Waiting
-            }
-            Some(state) if state.working() => ThreadActivity::Working,
-            Some(_) => ThreadActivity::Idle,
-            None if thread.open => thread.activity,
-            None => ThreadActivity::Idle,
-        }
-    }
-
-    /// What else the pane can be, as a row of quiet buttons: icon, name and Alt with its
-    /// letter. Changes is dimmed outside a Git repository.
+    /// What else the pane can be, as a short list centred under the message box: a
+    /// heading with the Alt it takes, then one row each with its icon, name and letter.
+    /// Changes is dimmed outside a Git repository.
     fn render_open_instead(
         &self,
         chat: &ChatContent,
@@ -454,8 +310,29 @@ impl CompiApp {
         let muted = color(modal_text_color(colors.muted, &colors));
         let foreground = color(colors.foreground);
         let hover = color(colors.surface_hover);
-        let border = color(colors.border);
-        let buttons = OpenInstead::ALL
+        let badge = color(colors.foreground).opacity(0.07);
+        let key = |text: SharedString| {
+            div()
+                .flex_none()
+                .h(ui_rems(20.0))
+                .min_w(ui_rems(20.0))
+                .px_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(ui_rems(4.0))
+                .bg(badge)
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(muted)
+                .child(text)
+        };
+        let modifier: SharedString = if cfg!(target_os = "macos") {
+            "⌥".into()
+        } else {
+            "Alt".into()
+        };
+        let rows = OpenInstead::ALL
             .into_iter()
             .enumerate()
             .map(|(index, choice)| {
@@ -464,79 +341,56 @@ impl CompiApp {
                 let id = chat.id.clone();
                 div()
                     .id(("chat-open-instead", index))
-                    .h(ui_rems(28.0))
-                    .pl_2()
-                    .pr_1()
+                    .h(ui_rems(32.0))
+                    .px(ui_rems(10.0))
                     .flex()
                     .items_center()
-                    .gap_1p5()
-                    .rounded(ui_rems(6.0))
-                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
-                    .text_color(muted)
-                    .when(unavailable, |button| {
-                        button.opacity(0.55).tooltip(controls::tooltip(
+                    .gap(ui_rems(10.0))
+                    .rounded(ui_rems(8.0))
+                    .text_size(ui_rems(UI_BODY_TEXT_SIZE))
+                    .text_color(foreground)
+                    .when(unavailable, |row| {
+                        row.opacity(0.5).tooltip(controls::tooltip(
                             "Changes",
                             Some("This folder is not in a Git repository".into()),
                             None,
                         ))
                     })
-                    .when(!unavailable, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(|style| style.bg(hover).text_color(foreground))
+                    .when(!unavailable, |row| {
+                        row.cursor_pointer()
+                            .hover(|style| style.bg(hover))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 this.open_instead(&id, choice, window, cx);
                                 cx.notify();
                             }))
                     })
                     .child(
-                        controls::glyph(choice.icon(), muted)
+                        controls::glyph(choice.icon(), foreground)
                             .with_size(gpui_component::Size::Small),
                     )
-                    .child(choice.label())
-                    .child(
-                        div()
-                            .flex_none()
-                            .px_1()
-                            .rounded(ui_rems(4.0))
-                            .border_1()
-                            .border_color(border)
-                            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                            .child(controls::key_label(choice.shortcut()).replace('+', " ")),
-                    )
+                    .child(div().flex_1().min_w_0().truncate().child(choice.label()))
+                    .child(key(choice.letter().to_uppercase().into()))
             });
         div()
-            .mt_5()
-            .w_full()
-            .px_3()
+            .w(ui_rems(SURFACES_WIDTH))
             .flex()
             .flex_col()
-            .child(draft_heading("Open here", muted))
-            .child(div().flex().flex_wrap().gap_1().children(buttons))
+            .gap_0p5()
+            .child(
+                div()
+                    .mb_2()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1p5()
+                    .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(muted)
+                    .child("Open here")
+                    .child(key(format!("{modifier} +").into())),
+            )
+            .children(rows)
             .into_any_element()
-    }
-
-    /// Continue: thread `thread` in the place of draft `chat`, which goes. A pane or
-    /// view holding the thread already is focused instead, and the draft stays.
-    fn continue_thread(
-        &mut self,
-        chat: &str,
-        thread: ChatContent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let held = self
-            .workspace
-            .as_ref()
-            .is_some_and(|workspace| program_status::chat_place(workspace, &thread.id).is_some());
-        if held {
-            self.open_thread(thread, window, cx);
-            return;
-        }
-        let Some((pane_id, _, view)) = self.draft_place(chat) else {
-            return;
-        };
-        self.put_in_draft_place(&pane_id, view, PaneContent::Chat(thread), window, cx);
     }
 
     /// Draft `chat`'s pane and chat, and whether it is a terminal's view.
@@ -1025,73 +879,10 @@ mod tests {
             },
         ];
         for choice in OpenInstead::ALL {
-            assert_eq!(choice.shortcut(), format!("alt-{}", choice.letter()));
             for modifiers in &others {
                 assert_eq!(open_instead_key(choice.letter(), modifiers), None);
             }
         }
-    }
-
-    fn thread(id: &str, folder: &str, project: Option<&str>, updated_ms: u64) -> ThreadInfo {
-        ThreadInfo {
-            chat: ChatContent {
-                folder: folder.into(),
-                ..chat(id)
-            },
-            title: Some(id.into()),
-            created_ms: 0,
-            updated_ms,
-            activity: ThreadActivity::Idle,
-            open: false,
-            project: project.map(|root| Project {
-                environment: ContentEnvironment::Host,
-                root: root.into(),
-            }),
-        }
-    }
-
-    #[test]
-    fn continue_lists_the_projects_newest_four_threads_but_the_draft() {
-        let threads = [
-            thread("old", "/work", Some("/work"), 1),
-            thread("draft", "/work", Some("/work"), 99),
-            thread("other", "/elsewhere", Some("/elsewhere"), 98),
-            thread("sub", "/work/crates", Some("/work"), 7),
-            thread("a", "/work", Some("/work"), 5),
-            thread("b", "/work", Some("/work"), 6),
-            thread("c", "/work", Some("/work"), 4),
-        ];
-        let project = Project {
-            environment: ContentEnvironment::Host,
-            root: "/work".into(),
-        };
-        let ids = |listed: Vec<&ThreadInfo>| -> Vec<String> {
-            listed.iter().map(|thread| thread.chat.id.clone()).collect()
-        };
-        assert_eq!(
-            ids(continue_threads(&threads, &chat("draft"), &[&project])),
-            ["sub", "b", "a", "c"]
-        );
-        // Without a project, threads of the draft's folder.
-        assert_eq!(
-            ids(continue_threads(&threads, &chat("draft"), &[])),
-            ["b", "a", "c", "old"]
-        );
-        // A link names the project by another path; the repository's top folder, the
-        // second project, still finds its threads.
-        let linked = Project {
-            environment: ContentEnvironment::Host,
-            root: "/link".into(),
-        };
-        let elsewhere = ChatContent {
-            folder: "/link/src".into(),
-            ..chat("draft")
-        };
-        assert_eq!(
-            ids(continue_threads(&threads, &elsewhere, &[&linked, &project])),
-            ["sub", "b", "a", "c"]
-        );
-        assert!(continue_threads(&threads, &elsewhere, &[&linked]).is_empty());
     }
 
     #[test]

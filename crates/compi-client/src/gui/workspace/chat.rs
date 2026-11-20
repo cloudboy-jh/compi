@@ -1001,17 +1001,6 @@ impl CompiApp {
                 ));
             }
         }
-        let draft_shown = present.iter().any(|&(_, chat)| {
-            shown.contains(&chat.id)
-                && self
-                    .chat
-                    .chats
-                    .get(&chat.id)
-                    .is_some_and(|model| model.draft(chat))
-        });
-        if draft_shown {
-            self.sidebar.want_threads();
-        }
         if let Some((pane_id, chat)) = update {
             self.mutate(
                 WorkspaceMutation::UpdateContent {
