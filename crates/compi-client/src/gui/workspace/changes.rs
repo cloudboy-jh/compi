@@ -65,11 +65,20 @@ const LINE_ENDINGS_HINT: &str =
     "Only CRLF/LF differ, often from Windows and WSL tools sharing this folder";
 
 /// How every Changes list and diff tab of a window shows changes. Not saved.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ChangesSettings {
     pub diff: DiffSettings,
-    /// The list groups changes by folder.
+    /// The list groups changes by folder, as it does unless switched to a flat list.
     pub tree: bool,
+}
+
+impl Default for ChangesSettings {
+    fn default() -> Self {
+        Self {
+            diff: DiffSettings::default(),
+            tree: true,
+        }
+    }
 }
 
 /// What a content pane's folder sidebar, or its folder view, lists. Client-local.
@@ -297,12 +306,15 @@ enum ListRow {
         collapsed: bool,
     },
     /// A folder in tree mode; `label` joins a chain of folders that hold only the next.
+    /// `added` and `removed` total its files' lines.
     Folder {
         scope: GitScope,
         path: String,
         label: String,
         depth: usize,
         collapsed: bool,
+        added: u64,
+        removed: u64,
     },
     /// A change, by index through `Listed`.
     File { change: usize, depth: usize },
@@ -717,17 +729,27 @@ fn short_id(id: &str) -> &str {
     id.get(..7).unwrap_or(id)
 }
 
-/// A folder of the tree being built, borrowing the listing's paths.
+/// A folder of the tree being built, borrowing the listing's paths, with the lines its
+/// files add and remove.
 #[derive(Default)]
 struct TreeFolder<'a> {
     folders: BTreeMap<&'a str, TreeFolder<'a>>,
     files: Vec<(&'a str, usize)>,
+    added: u64,
+    removed: u64,
 }
 
 impl<'a> TreeFolder<'a> {
-    fn insert(&mut self, path: &'a str, change: usize) {
+    /// Files change `change` at `path` below this folder, adding `counts` to every folder
+    /// on its way.
+    fn insert(&mut self, path: &'a str, change: usize, counts: (u64, u64)) {
         match path.split_once('/') {
-            Some((folder, rest)) => self.folders.entry(folder).or_default().insert(rest, change),
+            Some((folder, rest)) => {
+                let folder = self.folders.entry(folder).or_default();
+                folder.added += counts.0;
+                folder.removed += counts.1;
+                folder.insert(rest, change, counts);
+            }
             None => self.files.push((path, change)),
         }
     }
@@ -769,6 +791,8 @@ impl<'a> TreeFolder<'a> {
                     label,
                     depth,
                     collapsed,
+                    added: folder.added,
+                    removed: folder.removed,
                 });
             }
             folder.emit(
@@ -826,7 +850,13 @@ fn list_rows(
             if tree {
                 let mut root = TreeFolder::default();
                 for (index, change) in members {
-                    root.insert(&change.path, index);
+                    let counts = change
+                        .added
+                        .zip(change.removed)
+                        .map_or((0, 0), |(added, removed)| {
+                            (u64::from(added), u64::from(removed))
+                        });
+                    root.insert(&change.path, index, counts);
                 }
                 root.emit(&scope, "", 0, collapsed, folds, &mut rows, &mut order);
             } else {
@@ -1257,6 +1287,44 @@ fn line_counts(added: u64, removed: u64, colors: &ThemeColors) -> Option<impl In
                         .child(format!("−{removed}")),
                 )
             })
+    })
+}
+
+/// A count in at most five characters: `+1290`, `+12k`.
+fn count_text(sign: char, value: u64) -> String {
+    if value < 10_000 {
+        format!("{sign}{value}")
+    } else {
+        format!("{sign}{}k", value / 1000)
+    }
+}
+
+/// Lines added and removed as two right-aligned columns of a fixed width (`glyph` wide
+/// characters), so every row's counts line up; a column without lines stays empty.
+/// Nothing when both are zero.
+fn aligned_counts(added: u64, removed: u64, colors: &ThemeColors, glyph: f32) -> Option<Div> {
+    (added > 0 || removed > 0).then(|| {
+        let column = |text: Option<String>, tint: u32| {
+            div()
+                .flex_none()
+                .w(px(glyph * 5.5))
+                .flex()
+                .justify_end()
+                .text_color(color(tint))
+                .children(text)
+        };
+        div()
+            .flex_none()
+            .flex()
+            .gap_1()
+            .child(column(
+                (added > 0).then(|| count_text('+', added)),
+                colors.added,
+            ))
+            .child(column(
+                (removed > 0).then(|| count_text('−', removed)),
+                colors.removed,
+            ))
     })
 }
 
@@ -3129,6 +3197,29 @@ impl CompiApp {
         }
     }
 
+    /// Collapse all folders (`fold`) in `pane_id`'s Changes tree, or expand them all.
+    fn fold_all_changes(&mut self, pane_id: &PaneId, fold: bool) {
+        let tree = self.content.changes.tree;
+        let Some(ui) = self.content.panes.get_mut(pane_id) else {
+            return;
+        };
+        if fold {
+            let shown: Vec<_> = ui
+                .repo
+                .rows
+                .iter()
+                .filter_map(|row| match row {
+                    ListRow::Folder { scope, path, .. } => Some((scope.clone(), path.clone())),
+                    _ => None,
+                })
+                .collect();
+            ui.repo.folds.folders.extend(shown);
+        } else {
+            ui.repo.folds.folders.clear();
+        }
+        ui.repo.rebuild(tree);
+    }
+
     /// `[` and `]` in Diff mode: the previous or next change in the active commit,
     /// or across the working tree's sections. An unedited file's tab is reused;
     /// otherwise the next diff opens beside it.
@@ -3365,6 +3456,29 @@ impl CompiApp {
             settings.tree = !settings.tree;
             this.set_changes_settings(settings, cx);
         }));
+        // Collapse all while every folder is open, else expand all.
+        let any_folded = !repo.folds.folders.is_empty();
+        let fold_button = tree.then(|| {
+            let folder = pane_id.clone();
+            icon_button(
+                "changes-fold-all",
+                if any_folded {
+                    IconName::ChevronsUpDown
+                } else {
+                    IconName::ChevronsDownUp
+                },
+                if any_folded {
+                    "Expand all folders"
+                } else {
+                    "Collapse all folders"
+                },
+            )
+            .header()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.fold_all_changes(&folder, !any_folded);
+                cx.notify();
+            }))
+        });
         let header = div()
             .flex_none()
             .pl_3()
@@ -3418,6 +3532,7 @@ impl CompiApp {
                     .items_center()
                     .gap(px(2.0))
                     .children(self.remote_controls(pane_id, Ok(listing), cx))
+                    .children(fold_button)
                     .child(tree_button),
             );
         // A commit's section shows whether or not the working tree has changes.
@@ -3894,6 +4009,8 @@ impl CompiApp {
                         label,
                         depth,
                         collapsed,
+                        added,
+                        removed,
                         ..
                     } => base
                         .pl(px(TREE_INSET + *depth as f32 * TREE_INDENT))
@@ -3912,6 +4029,17 @@ impl CompiApp {
                                     .text_ellipsis()
                                     .text_color(color(colors.muted))
                                     .child(label.clone()),
+                            )
+                            .child(div().flex_1())
+                            .children(
+                                aligned_counts(*added, *removed, &colors, micro_glyph).map(
+                                    |counts| {
+                                        counts
+                                            .font_family(mono.clone())
+                                            .text_size(micro)
+                                            .opacity(0.8)
+                                    },
+                                ),
                             ),
                         )
                         .into_any_element(),
@@ -3930,11 +4058,14 @@ impl CompiApp {
                             .zip(change.removed)
                             .filter(|_| !change.line_endings_only)
                             .map(|(added, removed)| (u64::from(added), u64::from(removed)));
-                        let counts_chars = counts.map_or(0, |(added, removed)| {
-                            let digits = |value: u64| value.to_string().len();
-                            (if added > 0 { digits(added) + 2 } else { 0 })
-                                + if removed > 0 { digits(removed) + 2 } else { 0 }
-                        });
+                        // Two aligned columns of five and a half characters each.
+                        let counts_chars =
+                            counts.map_or(
+                                0,
+                                |(added, removed)| {
+                                    if added > 0 || removed > 0 { 12 } else { 0 }
+                                },
+                            );
                         let language = language_icon(LanguageHint::Path(&change.path));
                         // What the folder may take once the letter, the language icon,
                         // the name and the counts have theirs.
@@ -4071,22 +4202,20 @@ impl CompiApp {
                                     })
                                     .child(div().flex_1())
                                     .children(counts.and_then(|(added, removed)| {
-                                        line_counts(added, removed, &colors).map(|counts| {
-                                            div()
-                                                .flex_none()
-                                                .font_family(mono.clone())
-                                                .text_size(micro)
-                                                .map(|counts| {
-                                                    if actions_shown {
-                                                        counts.invisible()
-                                                    } else {
-                                                        counts.group_hover("changes-row", |style| {
-                                                            style.invisible()
-                                                        })
-                                                    }
-                                                })
-                                                .child(counts)
-                                        })
+                                        aligned_counts(added, removed, &colors, micro_glyph).map(
+                                            |counts| {
+                                                let counts = counts
+                                                    .font_family(mono.clone())
+                                                    .text_size(micro);
+                                                if actions_shown {
+                                                    counts.invisible()
+                                                } else {
+                                                    counts.group_hover("changes-row", |style| {
+                                                        style.invisible()
+                                                    })
+                                                }
+                                            },
+                                        )
                                     })),
                             )
                             .child(row_controls(actions_shown, &colors, actions))
