@@ -4,17 +4,18 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 ## Release state
 
-- **0.8.2** is Latest: published 2026-11-19 01:47 UTC, tagged `v0.8.2` at `382509d` (release prep), release run [44435599983](https://github.com/cloudboy-jh/compi/actions/runs/44435599983), 12 assets. Windows, macOS and publish jobs passed; Core CI on the release commit passed. Signed update and Setup metadata say version 0.8.2, protocol 40, qualified daemon 0.8.2 and the 0.8.2 notes, with hashes matching `SHA256SUMS.txt`. The installed 0.8.1 CLI's `compi update --check` reports 0.8.2 with its headline. The update from 0.8.1 in the app still runs 0.8.1's release code (the window hang), so the notes send 0.8.1 Windows users to Setup; installing 0.8.2 with Setup on the working instance is not done yet.
+- [**0.8.2**](https://github.com/cloudboy-jh/compi/releases/tag/v0.8.2) is the latest public release (2026-11-19, `382509d`, [release run 44435599983](https://github.com/cloudboy-jh/compi/actions/runs/44435599983)). Daemon protocol 40, workspace format 10. The working Windows machine has 0.8.2 installed; its in-app upgrade to the next version is not checked. Windows installs still on 0.8.0 or 0.8.1 should use Setup because their in-app updater can hang.
 - **0.8.1**: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3`, release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Its in-app update from 0.8.0 rolled back on the working instance (the window hang, fixed in 0.8.2); Setup installed it.
 - **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
 
-## Next: chat first
+## Before v0.9.0
 
-Order and scope: the vault's `feat and bugs.md` → **Chat first** (decided 2026-11-18). T3 Code behaviour it borrows, with source references: [T3 Code research](../research/t3-code/README.md). Compi stays a terminal workspace; nothing here removes a terminal path.
+The batch is chat-first setup and new tabs, four native agents (OMP, Claude Code, Codex, OpenCode), faster first tabs in warm WSL, reorganized Settings, and saved projects shared by the sidebar and Settings. The latest project work is still local. See [Completed work](COMPLETED.md#chat-first-not-released) for what ran and [T3 Code research](../research/t3-code/README.md) for the reference. Pi is not part of this release.
 
-Implementation notes that the vault leaves out:
-
-- **Agents** get their own drivers for fidelity: Codex `app-server` (JSON-RPC over stdio), OpenCode's HTTP server and event stream, Pi `--mode rpc` (JSON lines). OMP stays on ACP with Compi's OMP extras. Claude Code: try its JSON stream mode from Rust first, else a Node helper running the Agent SDK. Plain ACP loses sub-agents, real rewind, steering and plan cards ([agent fidelity](../research/t3-code/agent-fidelity.md)). `ChatHarness` (`compi-protocol/src/chat.rs`) holds only `Omp` today; drivers report capabilities and the UI hides what an agent can't do. The agent is a setting (Default agent), with **New thread with…** for exceptions.
+1. **Review and commit the project changes.** Windows `cargo dev` already covered adding a Windows folder, cloning a public HTTPS repo into Ubuntu, persistence after a client restart, archive/restore, and removal without deleting files. Before choosing the release commit, check the tab-strip `+` menu, `Ctrl+T` in both modes, draft agent switching with text retained, and project name/icon/defaults in Settings. Check the project picker on a native Mac when available; the Windows run did not cover SSH clone or private credentials.
+2. **Prepare the version and notes.** Set the root workspace version and lockfile to `0.9.0`; rewrite [release notes](../user/release-notes.md) before packaging. Source and all five release scripts already use daemon protocol **41**; workspace format is **11**. Verify both on the release commit. Warn that upgrading from 0.8.2 requires a local daemon restart, ending open shells and chats. Don't claim cold WSL boot gains: the measurements were taken with WSL already running.
+3. **Check and package the reviewed commit.** Run the relevant formatting, lint, tests and Core CI. With explicit authorization, tag `v0.9.0`. Follow the [release flow](RELEASE-FLOW.md): check both draft packages, checksums, signed updater notes, and the Windows Setup and repair metadata. Exercise the update from an installed 0.8.2 on an isolated native setup; do not stop the daily instance.
+4. **Publish only after the draft is reviewed.** After approval, publish stable and verify 0.8.2 discovers 0.9.0 with the signed notes. A draft is not an available update.
 
 ## 0.7.4: not seen yet
 
@@ -40,6 +41,7 @@ Smoke test 2026-11-11 (installed 0.8.0, OMP chat in WSL, `compi-landingpage` rep
 
 ## Planned, later
 
+- **Pi native chat** is the next agent, after v0.9.0. Add its RPC driver through the [agent recipe](ADDING_AN_AGENT.md), check it on Windows and WSL, and only show controls its driver supports.
 - **Chat → OMP's TUI in the same pane** (asked 2026-11-10). Today Ctrl/Cmd+Shift+E shows the plain shell under the chat. The ⋯ menu gets **Open in terminal**: the daemon stops the chat's `omp acp` (two OMP processes must not write one session file), the pane shows its shell, and Compi types `omp --resume <session>` there, in the session's saved folder. Going back loads the session again with `session/load`, turns made in the TUI included (OMP shares sessions between ACP and its TUI both ways). Open: a shell already running a program (ask, or open a new tab as **Jump to project** does), PowerShell panes (`omp.exe`), noticing the TUI's exit to offer the chat again.
 - **Updates that keep shells.** Release metadata qualifies only the release's own daemon (`qualified_daemons = [version]` in the smoke scripts), so every update restarts the daemon, even with the protocol unchanged. Qualify the previous daemon when protocol and workspace format did not change.
 - **Updater upkeep.** A repair from Settings → Apps after Setup removed its run folder is untested. Root `Compi-Setup.exe` still changes only through Setup. Setup and the in-app updater keep two journals and two scheduled-task guards. The 0.1.x–0.3.0 migration paths and `INSTALLER_UPDATES_PLAN.md` (a 0.1.3-era plan) are out of date. macOS activation has never run natively.
@@ -58,7 +60,7 @@ Smoke test 2026-11-11 (installed 0.8.0, OMP chat in WSL, `compi-landingpage` rep
 - **Installed in-app update check** builds and installs since `0519b8e`, then times out on "test GUI attached to the original running shell" (dry run [42879581522](https://github.com/cloudboy-jh/compi/actions/runs/42879581522)), before any update. Next: evidence on timeout (`COMPI_PERF_LOG`, client startup log, screenshot), and a `workflow_dispatch` that reruns only `smoke-windows-installed-update.ps1`.
 - **Daemon handle-count test** (`repeated_surface_cycles_release_daemon_process_handles`) fails on some Windows runs, about +15 handles each time (225→241). Find the leak before changing the limit.
 - **Cargo 1.100 build layout** (fixed 2026-11-18, `cc8ada5`): stable Rust 1.100 moved test executables out of `target/<profile>/deps` into a folder per build unit, so the ConPTY test no longer found `OpenConsole.exe` and Core CI failed on Windows from 2026-11-14. `compi-daemon/build.rs` now finds the profile folder in both layouts, and the test copies the runtime beside itself. Run 44408665049 passed every Windows step. Under full-suite load on the OneDrive checkout, `lost_shell_restarts_in_its_last_reported_directory` once hit its 10 s save deadline; it passes alone.
-- The daemon protocol is pinned by hand in five release scripts (`tools/sign-release-metadata.py`, `smoke-update-cycle.py`, `smoke-macos-bundle.sh`, `smoke-windows-distribution.ps1`, `smoke-windows-installed-update.ps1`); a missed bump already cost 0.5.0 a rebuild.
+- The protocol is still pinned by hand in five release scripts (listed in the [release flow](RELEASE-FLOW.md)). All five currently match 41; a missed bump previously cost 0.5.0 a rebuild.
 
 ## Not yet checked
 
