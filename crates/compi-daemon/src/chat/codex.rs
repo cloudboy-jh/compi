@@ -789,7 +789,13 @@ fn prompt(inner: &mut Inner, prompt: &Prompt) {
         )));
         return;
     };
-    let mut params = json!({ "threadId": thread, "input": prompt_input(prompt), "cwd": cwd });
+    // Reasoning always shows, as a summary, whatever the user's Codex config defaults to.
+    let mut params = json!({
+        "threadId": thread,
+        "input": prompt_input(prompt),
+        "cwd": cwd,
+        "summary": "auto",
+    });
     if codex.model != codex.thread_model
         && let Some(model) = &codex.model
     {
