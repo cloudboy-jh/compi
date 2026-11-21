@@ -784,7 +784,10 @@ mod tests {
         assert!(lookup.ends_with(
             r#"[ -n "$found" ] || exit 127; printf '\036compi-agent-version\n'; exec "$found" --version 2>&1"#
         ));
-        assert_eq!(version("2.1.326 (Claude Code)\n").as_deref(), Some("2.1.326"));
+        assert_eq!(
+            version("2.1.326 (Claude Code)\n").as_deref(),
+            Some("2.1.326")
+        );
         assert_eq!(version("omp/19.0.0\n").as_deref(), Some("19.0.0"));
         assert_eq!(version("codex-cli 0.169.0\n").as_deref(), Some("0.169.0"));
         assert_eq!(version("opencode v1.19.0.\n").as_deref(), Some("1.19.0"));

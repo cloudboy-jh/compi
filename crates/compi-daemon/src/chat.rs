@@ -386,11 +386,13 @@ pub fn agent_installs() -> compi_protocol::chat::AgentInstalls {
         agents: ChatHarness::ALL
             .into_iter()
             .zip(windows.into_iter().zip(linux))
-            .map(|(harness, (windows, linux))| compi_protocol::chat::AgentInstall {
-                harness,
-                windows: join(windows),
-                linux: join(linux),
-            })
+            .map(
+                |(harness, (windows, linux))| compi_protocol::chat::AgentInstall {
+                    harness,
+                    windows: join(windows),
+                    linux: join(linux),
+                },
+            )
             .collect(),
     }
 }

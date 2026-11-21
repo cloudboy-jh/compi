@@ -725,7 +725,9 @@ impl CompiApp {
             let (app, owner) = (cx.entity().downgrade(), PickerOwner::Chat(chat.id.clone()));
             move |key: &Keystroke, window: &mut Window, cx: &mut App| {
                 if let Some(app) = app.upgrade() {
-                    app.update(cx, |this, cx| this.model_picker_key(&owner, key, window, cx));
+                    app.update(cx, |this, cx| {
+                        this.model_picker_key(&owner, key, window, cx)
+                    });
                 }
             }
         };
@@ -1972,7 +1974,9 @@ impl CompiApp {
                                                 .on_click(cx.listener(
                                                     move |this, _: &ClickEvent, _, cx| {
                                                         this.toggle_favorite(
-                                                            &star_owner, star_index, cx,
+                                                            &star_owner,
+                                                            star_index,
+                                                            cx,
                                                         );
                                                         cx.stop_propagation();
                                                         cx.notify();
@@ -2225,11 +2229,19 @@ impl CompiApp {
     /// The project model picker's popover: the strip and the searched model list, then
     /// a footer with the keys (or that the agent never listed its models) and its
     /// agent's own model.
-    fn render_project_model_picker(&self, project: &ProjectPicker, cx: &Context<Self>) -> AnyElement {
+    fn render_project_model_picker(
+        &self,
+        project: &ProjectPicker,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         let picker = &project.picker;
-        let (owner, harness, name) = (PickerOwner::Project, project.harness, project.harness.name());
+        let (owner, harness, name) = (
+            PickerOwner::Project,
+            project.harness,
+            project.harness.name(),
+        );
         let remembered = self.remembered_models(harness);
         let searching = !picker.search.read(cx).value().trim().is_empty();
         let strip = (!searching).then(|| {
@@ -2277,7 +2289,9 @@ impl CompiApp {
                 text_button("project-model-default", format!("{name}'s default"))
                     .ghost()
                     .selected(project.option.current.is_empty())
-                    .detail(format!("New threads start on the model {name} picks itself"))
+                    .detail(format!(
+                        "New threads start on the model {name} picks itself"
+                    ))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.pick_project_model(None, cx);
                         cx.notify();

@@ -40,7 +40,8 @@ impl Server {
             .split(|c: char| c == '/' || c.is_whitespace())
             .next()
             .filter(|address| address.contains(':'))?;
-        let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{USER}:{password}"));
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(format!("{USER}:{password}"));
         Some(Self {
             address: address.to_owned(),
             authorization: format!("Basic {credentials}"),
@@ -143,7 +144,10 @@ fn encode(text: &mut String, value: &str) {
 
 fn connect(server: &Server, timeout: Duration) -> Result<TcpStream, String> {
     let unreachable = |error: &dyn std::fmt::Display| {
-        format!("Couldn't reach OpenCode's server at {}: {error}", server.address)
+        format!(
+            "Couldn't reach OpenCode's server at {}: {error}",
+            server.address
+        )
     };
     let addresses = server
         .address
@@ -205,7 +209,8 @@ struct Head {
 }
 
 fn read_head(reader: &mut impl BufRead) -> Result<Head, String> {
-    let broke = |error: &dyn std::fmt::Display| format!("OpenCode's server answered badly: {error}");
+    let broke =
+        |error: &dyn std::fmt::Display| format!("OpenCode's server answered badly: {error}");
     let mut reader = reader.take(MAX_HEAD_BYTES);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|error| broke(&error))?;
@@ -280,7 +285,9 @@ impl<R: BufRead> Read for Chunked<R> {
                 return Ok(0);
             }
         }
-        let wanted = buffer.len().min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let wanted = buffer
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
         let read = self.inner.read(&mut buffer[..wanted])?;
         if read == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
@@ -366,14 +373,19 @@ mod tests {
             }
         );
         let mut body = String::new();
-        body_reader(reader, &head).read_to_string(&mut body).unwrap();
+        body_reader(reader, &head)
+            .read_to_string(&mut body)
+            .unwrap();
         assert_eq!(body, "data: {\"a\":1}\n\n");
     }
 
     #[test]
     fn errors_say_opencode_s_own_message() {
         assert_eq!(
-            error_text(400, br#"{"_tag":"InvalidRequestError","message":"Invalid session ID"}"#),
+            error_text(
+                400,
+                br#"{"_tag":"InvalidRequestError","message":"Invalid session ID"}"#
+            ),
             "Invalid session ID"
         );
         assert_eq!(

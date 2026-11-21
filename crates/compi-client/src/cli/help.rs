@@ -855,7 +855,10 @@ mod tests {
     #[test]
     fn chat_help_names_every_agent() {
         let chat = find("chat", None).unwrap();
-        assert_eq!(usage(chat), "compi chat [--agent omp|claude|codex|opencode]");
+        assert_eq!(
+            usage(chat),
+            "compi chat [--agent omp|claude|codex|opencode]"
+        );
         assert!(
             chat.detail.contains(
                 "--agent, omp (OMP), claude (Claude Code), codex (Codex) or opencode (OpenCode), else"

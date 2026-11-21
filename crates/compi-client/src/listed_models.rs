@@ -68,7 +68,10 @@ impl ListedModels {
     /// Written whole before it takes its name, so a write cut short never replaces it.
     fn write(&self, path: &Path) -> Result<(), String> {
         let failed = |error: &dyn std::fmt::Display| {
-            format!("Could not save the agents' model lists to {}: {error}", path.display())
+            format!(
+                "Could not save the agents' model lists to {}: {error}",
+                path.display()
+            )
         };
         let json = serde_json::to_vec(self).map_err(|error| failed(&error))?;
         let partial = path.with_extension("json.partial");

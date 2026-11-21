@@ -9,7 +9,9 @@ use super::{
     Inner, Model, Prompt, Role, ask_card, ask_permission, ask_question, chosen_model, ours,
     resolved, session_cost, session_error, step_tokens, title, turn_began, turn_ended,
 };
-use compi_protocol::chat::{ChatChoice, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatToolStatus};
+use compi_protocol::chat::{
+    ChatChoice, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatToolStatus,
+};
 use serde_json::{Value, json};
 
 /// The error OpenCode ends a turn with when it is stopped.
@@ -201,7 +203,12 @@ pub(super) fn event(inner: &mut Inner, event: &Value) {
             let Some(kind) = inner.opencode_state().parts.get(id).copied() else {
                 return;
             };
-            tools::delta(inner, id, kind, properties["delta"].as_str().unwrap_or_default());
+            tools::delta(
+                inner,
+                id,
+                kind,
+                properties["delta"].as_str().unwrap_or_default(),
+            );
         }
         "permission.asked" if ours(inner, session) => permission(inner, properties),
         "permission.replied" => {
@@ -251,7 +258,11 @@ fn part(inner: &mut Inner, part: &Value, replay: bool) {
             if part["synthetic"] == true || part["ignored"] == true {
                 return;
             }
-            let kind = if kind == "text" { Text::Reply } else { Text::Thought };
+            let kind = if kind == "text" {
+                Text::Reply
+            } else {
+                Text::Thought
+            };
             let text = part["text"].as_str().unwrap_or_default();
             let ended = !part["time"]["end"].is_null() || replay;
             if !root {
@@ -419,7 +430,11 @@ pub(super) fn replay(inner: &mut Inner, messages: &Value) {
                     Some("file") => images.extend(
                         part["filename"]
                             .as_str()
-                            .filter(|_| part["mime"].as_str().is_some_and(|mime| mime.starts_with("image/")))
+                            .filter(|_| {
+                                part["mime"]
+                                    .as_str()
+                                    .is_some_and(|mime| mime.starts_with("image/"))
+                            })
                             .map(str::to_owned),
                     ),
                     _ => {}

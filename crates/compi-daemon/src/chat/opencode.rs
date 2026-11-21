@@ -229,7 +229,9 @@ enum Pending {
     /// The session to resume, then its rules set, then its messages page by page.
     Session,
     Rules,
-    Messages { pages: usize },
+    Messages {
+        pages: usize,
+    },
     /// A new session, for the waiting prompt.
     Create,
     Prompt,
@@ -423,10 +425,7 @@ fn listen(chat: &Weak<Chat>, generation: u64, server: &http::Server, folder: &st
     }
     inner.emit(ChatEvent::Status {
         status: ChatStatus::Failed {
-            message: format!(
-                "Lost {}'s events: {failure}",
-                ChatHarness::OpenCode.name()
-            ),
+            message: format!("Lost {}'s events: {failure}", ChatHarness::OpenCode.name()),
         },
     });
 }
@@ -566,9 +565,12 @@ fn answered(inner: &mut Inner, id: u64, result: Result<Value, String>) {
                 .map(|text| v1::recent_models(&text))
                 .unwrap_or_default();
             let opencode = inner.opencode_state();
-            let model = recent
-                .into_iter()
-                .find(|model| opencode.models.iter().any(|offered| offered.value() == *model));
+            let model = recent.into_iter().find(|model| {
+                opencode
+                    .models
+                    .iter()
+                    .any(|offered| offered.value() == *model)
+            });
             defaults_known(inner, model, agent);
         }
         Pending::Session => match result {
@@ -671,15 +673,16 @@ fn answered(inner: &mut Inner, id: u64, result: Result<Value, String>) {
 /// `name` in OpenCode's state folder `state` as the daemon reads it: a Linux program's
 /// in WSL through `\\wsl.localhost`.
 fn state_file(inner: &Inner, state: &str, name: &str) -> std::path::PathBuf {
-    let windows = inner.started.as_ref().is_some_and(|started| started.windows);
+    let windows = inner
+        .started
+        .as_ref()
+        .is_some_and(|started| started.windows);
     match &inner.folder {
-        Some((compi_protocol::ContentEnvironment::Wsl { distribution }, _)) if !windows => {
-            format!(
-                r"\\wsl.localhost\{distribution}{}\{name}",
-                state.replace('/', "\\")
-            )
-            .into()
-        }
+        Some((compi_protocol::ContentEnvironment::Wsl { distribution }, _)) if !windows => format!(
+            r"\\wsl.localhost\{distribution}{}\{name}",
+            state.replace('/', "\\")
+        )
+        .into(),
         _ => std::path::Path::new(state).join(name),
     }
 }
@@ -701,11 +704,22 @@ fn pick_defaults(inner: &mut Inner, model: Option<String>, agent: Option<String>
         .model
         .filter(offered)
         .or(model)
-        .or_else(|| opencode.provider_defaults.iter().find(|value| offered(value)).cloned())
+        .or_else(|| {
+            opencode
+                .provider_defaults
+                .iter()
+                .find(|value| offered(value))
+                .cloned()
+        })
         .or_else(|| opencode.models.first().map(Model::value));
     let variants = model
         .as_ref()
-        .and_then(|model| opencode.models.iter().find(|offered| offered.value() == *model))
+        .and_then(|model| {
+            opencode
+                .models
+                .iter()
+                .find(|offered| offered.value() == *model)
+        })
         .map(|model| model.variants.clone())
         .unwrap_or_default();
     opencode.variant = picks
@@ -751,8 +765,7 @@ fn resumed(inner: &mut Inner, session: &Value) {
     }
     let model = &session["model"];
     let opencode = inner.opencode();
-    if let (Some(provider), Some(model_id)) = (model["providerID"].as_str(), model["id"].as_str())
-    {
+    if let (Some(provider), Some(model_id)) = (model["providerID"].as_str(), model["id"].as_str()) {
         let value = format!("{provider}/{model_id}");
         opencode.model = Some(value.clone());
         opencode.variant = Some(
@@ -871,7 +884,10 @@ fn rules(chosen: Option<&str>) -> Vec<(&'static str, &'static str, &'static str)
 /// The model the settings show, when OpenCode lists it.
 fn current_model(opencode: &OpenCode) -> Option<&Model> {
     let model = opencode.model.as_deref()?;
-    opencode.models.iter().find(|offered| offered.value() == model)
+    opencode
+        .models
+        .iter()
+        .find(|offered| offered.value() == model)
 }
 
 /// A thinking level as people read it.
@@ -1103,7 +1119,10 @@ fn switch_settings(inner: &mut Inner, session: &str) {
     let opencode = inner.opencode();
     let shown = chosen_model(opencode).map(|(provider, id)| {
         (
-            (format!("{provider}/{id}"), opencode.variant.clone().unwrap_or_default()),
+            (
+                format!("{provider}/{id}"),
+                opencode.variant.clone().unwrap_or_default(),
+            ),
             v2::model(&provider, &id, opencode.variant.as_deref()),
         )
     });

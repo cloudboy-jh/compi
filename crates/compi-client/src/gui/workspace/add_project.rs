@@ -827,7 +827,7 @@ impl CompiApp {
             }
             "enter" if path_focused || url_focused => {
                 let folder = (path_focused && !modified)
-                    .then(|| picker.highlight)
+                    .then_some(picker.highlight)
                     .flatten()
                     .and_then(|index| picker.selected_folder(index));
                 if let Some(folder) = folder {

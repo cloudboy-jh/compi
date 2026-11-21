@@ -808,27 +808,22 @@ impl CompiApp {
                         .flex_col()
                         .gap_3()
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(preview)
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child(self.project_name(&picker.project)),
-                                        )
-                                        .child(self.icon_picker_caption(
-                                            "Automatic, an icon, an emoji, a monogram or an image.",
-                                        )),
-                                ),
+                            div().flex().items_center().gap_3().child(preview).child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(self.project_name(&picker.project)),
+                                    )
+                                    .child(self.icon_picker_caption(
+                                        "Automatic, an icon, an emoji, a monogram or an image.",
+                                    )),
+                            ),
                         )
                         .child(
                             div()

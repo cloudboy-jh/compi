@@ -1280,7 +1280,11 @@ impl CompiApp {
         let harness = state.harness;
         let models = crate::listed_models::AgentModels {
             choices: option.choices.clone(),
-            plans: state.plans.iter().map(|plan| plan.provider.clone()).collect(),
+            plans: state
+                .plans
+                .iter()
+                .map(|plan| plan.provider.clone())
+                .collect(),
         };
         if !self.chat.listed.set(harness, models.clone()) {
             return;

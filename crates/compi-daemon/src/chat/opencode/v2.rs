@@ -11,7 +11,9 @@ use super::{
     Inner, Model, Prompt, ask_card, ask_permission, ask_question, ours, resolved, session_cost,
     session_error, step_tokens, title, turn_began, turn_ended,
 };
-use compi_protocol::chat::{ChatChoice, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatToolStatus};
+use compi_protocol::chat::{
+    ChatChoice, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatToolStatus,
+};
 use serde_json::{Map, Value, json};
 
 /// The models of every provider OpenCode is set up with (`/api/model`).
@@ -47,7 +49,9 @@ pub(super) fn agents(answer: &Value) -> Vec<(String, String)> {
         .filter(|agent| agent["mode"] != "subagent" && agent["hidden"] != true)
         .filter_map(|agent| {
             let id = agent["id"].as_str()?;
-            let name = agent["name"].as_str().map_or_else(|| super::capitalized(id), str::to_owned);
+            let name = agent["name"]
+                .as_str()
+                .map_or_else(|| super::capitalized(id), str::to_owned);
             Some((id.to_owned(), name))
         })
         .collect()
@@ -134,7 +138,11 @@ fn block(data: &Value, kind: Text) -> String {
         "{}:{}:{}",
         data["assistantMessageID"].as_str().unwrap_or_default(),
         data["ordinal"].as_i64().unwrap_or_default(),
-        if kind == Text::Reply { "text" } else { "reasoning" }
+        if kind == Text::Reply {
+            "text"
+        } else {
+            "reasoning"
+        }
     )
 }
 
@@ -217,7 +225,14 @@ pub(super) fn event(inner: &mut Inner, event: &Value) {
         }
         "session.tool.success" if root || child => {
             let output = content_text(&data["content"]);
-            call(inner, session, root, data, ChatToolStatus::Completed, output);
+            call(
+                inner,
+                session,
+                root,
+                data,
+                ChatToolStatus::Completed,
+                output,
+            );
         }
         "session.tool.failed" if root || child => {
             let error = &data["error"];
@@ -457,10 +472,20 @@ fn replay_item(inner: &mut Inner, message: &str, index: usize, item: &Value) {
     let key = format!("{message}:{index}");
     match item["type"].as_str() {
         Some("text") => {
-            tools::done(inner, &key, Text::Reply, item["text"].as_str().unwrap_or_default());
+            tools::done(
+                inner,
+                &key,
+                Text::Reply,
+                item["text"].as_str().unwrap_or_default(),
+            );
         }
         Some("reasoning") => {
-            tools::done(inner, &key, Text::Thought, item["text"].as_str().unwrap_or_default());
+            tools::done(
+                inner,
+                &key,
+                Text::Thought,
+                item["text"].as_str().unwrap_or_default(),
+            );
         }
         Some("tool") => {
             let (Some(id), Some(name)) = (item["id"].as_str(), item["name"].as_str()) else {

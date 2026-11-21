@@ -121,7 +121,10 @@ fn start_v2(inner: &mut Inner) {
 
 /// Loads 1.x's providers, agents and configuration, and takes the chat to Ready.
 fn start_v1(inner: &mut Inner) {
-    super::event(inner, &json!({ "type": "server.connected", "properties": {} }));
+    super::event(
+        inner,
+        &json!({ "type": "server.connected", "properties": {} }),
+    );
     reply(
         inner,
         "/config/providers",
@@ -225,7 +228,10 @@ fn v2_loads_its_models_by_provider_then_a_first_prompt_opens_a_session_on_the_pi
         json!({ "id": "gpt-5.5", "providerID": "openai", "variant": "high" })
     );
     assert_eq!(body["agent"], "build");
-    assert_eq!(body["permissions"][0], json!({ "action": "*", "resource": "*", "effect": "ask" }));
+    assert_eq!(
+        body["permissions"][0],
+        json!({ "action": "*", "resource": "*", "effect": "ask" })
+    );
     assert_eq!(inner.state.session.as_deref(), Some("ses_1"));
     let prompt = sent(&mut inner).pop().unwrap();
     assert_eq!(prompt.path, "/api/session/ses_1/prompt");
@@ -278,7 +284,10 @@ fn a_v2_turn_streams_its_reply_runs_its_calls_asks_and_ends() {
     assert_eq!(replies(&inner).last(), Some(&"All steps are done."));
     assert!(inner.state.entries.iter().any(|entry| matches!(
         entry,
-        ChatEntry::Thought { ended_ms: Some(_), .. }
+        ChatEntry::Thought {
+            ended_ms: Some(_),
+            ..
+        }
     )));
 
     let shell = tool(&inner, "shell");
@@ -342,13 +351,19 @@ fn a_v2_form_is_a_question_answered_by_field_key() {
         );
         answer_question(inner, Some(answers)).unwrap();
         let job = sent(inner).pop().unwrap();
-        assert!(job.path.ends_with("/form/frm_1fc0ca10c001mmTJ86Ir51vulb/reply"));
+        assert!(
+            job.path
+                .ends_with("/form/frm_1fc0ca10c001mmTJ86Ir51vulb/reply")
+        );
         assert_eq!(job.body, Some(json!({ "answer": { "q0": "Blue" } })));
         answered_once = true;
     });
     assert!(answered_once);
     assert_eq!(inner.state.status, ChatStatus::Ready);
-    assert_eq!(tool(&inner, "question").title, "Ask: Do you prefer red or blue?");
+    assert_eq!(
+        tool(&inner, "question").title,
+        "Ask: Do you prefer red or blue?"
+    );
 }
 
 #[test]
@@ -368,7 +383,10 @@ fn stopping_a_v2_turn_interrupts_its_session_and_the_call_stops() {
     assert!(can_steer(&inner));
     cancel(&mut inner);
     let job = sent(&mut inner).pop().unwrap();
-    assert_eq!(job.path, "/api/session/ses_e03f34364ffe1xKglqeF0QAuXv/interrupt");
+    assert_eq!(
+        job.path,
+        "/api/session/ses_e03f34364ffe1xKglqeF0QAuXv/interrupt"
+    );
     feed(&mut inner, &V2_INTERRUPT[start.len()..], |_| {});
     assert_eq!(inner.state.status, ChatStatus::Ready);
     assert_eq!(inner.state.entries.last(), Some(&ChatEntry::Cancelled));
@@ -380,7 +398,11 @@ fn a_v2_steer_shows_once_taken_and_waits_its_turn_when_declined() {
     let mut inner = chat(Dialect::V2, None);
     start_v2(&mut inner);
     inner.start_prompt(text_prompt("first"));
-    reply(&mut inner, "/api/session", json!({ "data": { "id": "ses_1" } }));
+    reply(
+        &mut inner,
+        "/api/session",
+        json!({ "data": { "id": "ses_1" } }),
+    );
     sent(&mut inner);
     assert!(!can_steer(&inner));
     super::event(
@@ -390,7 +412,10 @@ fn a_v2_steer_shows_once_taken_and_waits_its_turn_when_declined() {
     assert!(can_steer(&inner));
     steer(&mut inner, "OpenCode", text_prompt("also this")).unwrap();
     let job = sent(&mut inner).pop().unwrap();
-    assert_eq!(job.body, Some(json!({ "text": "also this", "delivery": "steer" })));
+    assert_eq!(
+        job.body,
+        Some(json!({ "text": "also this", "delivery": "steer" }))
+    );
     answered(&mut inner, job.id, Ok(json!({ "data": {} })));
     assert!(matches!(
         inner.state.entries.last(),
@@ -416,7 +441,11 @@ fn v1_streams_parts_shows_todos_and_sub_agents_and_answers_by_request_id() {
     );
     assert_eq!(create.body.unwrap()["permission"][0]["action"], "ask");
     let prompt = sent(&mut inner).pop().unwrap();
-    assert!(prompt.path.starts_with("/session/ses_e03fa66b8ffemu6bPdQu9QQT33/prompt_async"));
+    assert!(
+        prompt
+            .path
+            .starts_with("/session/ses_e03fa66b8ffemu6bPdQu9QQT33/prompt_async")
+    );
     let body = prompt.body.unwrap();
     assert_eq!(body["parts"][0]["text"], "Do these steps in order");
     assert_eq!(
@@ -448,14 +477,21 @@ fn v1_streams_parts_shows_todos_and_sub_agents_and_answers_by_request_id() {
             );
             answer_question(inner, Some(answers)).unwrap();
             let job = sent(inner).pop().unwrap();
-            assert!(job.path.starts_with("/question/que_1fc061e03001hsrYVoo8G3p164/reply"));
+            assert!(
+                job.path
+                    .starts_with("/question/que_1fc061e03001hsrYVoo8G3p164/reply")
+            );
             assert_eq!(job.body, Some(json!({ "answers": [["red"]] })));
         }
     });
     assert_eq!((permissions, questions), (6, 1));
     assert_eq!(inner.state.status, ChatStatus::Ready);
     // The prompt OpenCode echoes is not a reply.
-    assert!(!replies(&inner).iter().any(|text| text.starts_with("Do these steps")));
+    assert!(
+        !replies(&inner)
+            .iter()
+            .any(|text| text.starts_with("Do these steps"))
+    );
     assert!(!replies(&inner).is_empty());
 
     let todos = tools(&inner)
@@ -502,7 +538,10 @@ fn stopping_a_v1_turn_aborts_its_session_and_ends_it_cancelled() {
     assert!(!can_steer(&inner));
     cancel(&mut inner);
     let job = sent(&mut inner).pop().unwrap();
-    assert!(job.path.starts_with("/session/ses_e03f0e29dffetLWhT2JnlEVMmM/abort"));
+    assert!(
+        job.path
+            .starts_with("/session/ses_e03f0e29dffetLWhT2JnlEVMmM/abort")
+    );
     feed(&mut inner, &V1_INTERRUPT[start.len()..], |_| {});
     assert_eq!(inner.state.status, ChatStatus::Ready);
     assert!(inner.state.entries.contains(&ChatEntry::Cancelled));
@@ -546,7 +585,10 @@ fn a_chat_with_a_session_resumes_it_with_compi_s_rules_and_replays_its_messages(
     assert_eq!(tool(&inner, "shell").output.as_deref(), Some("a\n"));
     assert_eq!(replies(&inner), ["Fixed."]);
     assert_eq!(inner.state.entries.last(), Some(&ChatEntry::Cancelled));
-    assert_eq!(inner.state.option("model").unwrap().current, "openai/gpt-5.5");
+    assert_eq!(
+        inner.state.option("model").unwrap().current,
+        "openai/gpt-5.5"
+    );
     assert_eq!(inner.state.option("thought_level").unwrap().current, "low");
     assert_eq!(inner.state.option("mode").unwrap().current, "plan");
 }
@@ -561,7 +603,10 @@ fn listings_leave_out_sub_agents_and_sessions_never_prompted() {
     ]);
     let sessions = sessions(&listed);
     assert_eq!(
-        sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(),
+        sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
         ["d", "a"]
     );
     assert_eq!(sessions[0].title, None);
@@ -571,7 +616,10 @@ fn listings_leave_out_sub_agents_and_sessions_never_prompted() {
 #[test]
 fn v1_without_a_configured_model_starts_on_the_one_last_picked_in_it() {
     let mut inner = chat(Dialect::V1, None);
-    super::event(&mut inner, &json!({ "type": "server.connected", "properties": {} }));
+    super::event(
+        &mut inner,
+        &json!({ "type": "server.connected", "properties": {} }),
+    );
     reply(
         &mut inner,
         "/config/providers",
@@ -580,7 +628,11 @@ fn v1_without_a_configured_model_starts_on_the_one_last_picked_in_it() {
             { "id": "openai", "models": { "gpt-6.1-sol": { "name": "GPT-6.1 Sol" } } },
         ], "default": { "anthropic": "claude-opus-4-5" } }),
     );
-    reply(&mut inner, "/agent", json!([{ "name": "build", "mode": "primary" }]));
+    reply(
+        &mut inner,
+        "/agent",
+        json!([{ "name": "build", "mode": "primary" }]),
+    );
     reply(&mut inner, "/config", json!({}));
     let state = std::env::temp_dir().join(format!("compi-opencode-state-{}", std::process::id()));
     std::fs::create_dir_all(&state).unwrap();
@@ -589,8 +641,15 @@ fn v1_without_a_configured_model_starts_on_the_one_last_picked_in_it() {
         r#"{"recent":[{"providerID":"gone","modelID":"x"},{"providerID":"openai","modelID":"gpt-6.1-sol"}]}"#,
     )
     .unwrap();
-    reply(&mut inner, "/path", json!({ "state": state.to_str().unwrap() }));
+    reply(
+        &mut inner,
+        "/path",
+        json!({ "state": state.to_str().unwrap() }),
+    );
     std::fs::remove_dir_all(&state).unwrap();
     assert_eq!(inner.state.status, ChatStatus::Ready);
-    assert_eq!(inner.state.option("model").unwrap().current, "openai/gpt-6.1-sol");
+    assert_eq!(
+        inner.state.option("model").unwrap().current,
+        "openai/gpt-6.1-sol"
+    );
 }

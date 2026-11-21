@@ -160,10 +160,14 @@ pub(super) fn call(inner: &mut Inner, report: &Report<'_>) {
     describe(&mut tool, report.name, report.input, report.metadata);
     let mut status = report.status;
     if status.is_open() {
-        let asked = inner.opencode_state().asks.iter().any(|ask| match &ask.kind {
-            AskKind::Permission(shown) => shown.tool.as_deref() == Some(report.id),
-            AskKind::Question(..) => false,
-        });
+        let asked = inner
+            .opencode_state()
+            .asks
+            .iter()
+            .any(|ask| match &ask.kind {
+                AskKind::Permission(shown) => shown.tool.as_deref() == Some(report.id),
+                AskKind::Question(..) => false,
+            });
         status = if report.replay {
             ChatToolStatus::Stopped
         } else if asked {
@@ -333,7 +337,12 @@ fn edit_diffs(name: &str, input: &Value, metadata: &Value, path: Option<&str>) -
         return vec![diff];
     }
     let side = |text: &str| (text.len() <= MAX_CHAT_DIFF_BYTES).then(|| text.to_owned());
-    match (name, input["content"].as_str(), input["oldString"].as_str(), input["newString"].as_str()) {
+    match (
+        name,
+        input["content"].as_str(),
+        input["oldString"].as_str(),
+        input["newString"].as_str(),
+    ) {
         ("write", Some(content), ..) => vec![ChatDiff {
             path: path.to_owned(),
             old_text: None,
@@ -376,7 +385,9 @@ fn agents(inner: &mut Inner, tool: &mut ChatTool, report: &Report<'_>) {
         && !inner.opencode_state().children.contains_key(session)
         && tool.agents.is_empty()
     {
-        let kind = text("subagent_type").or_else(|| text("agent")).unwrap_or("task");
+        let kind = text("subagent_type")
+            .or_else(|| text("agent"))
+            .unwrap_or("task");
         let name = agent_name(inner, tool, text("description").unwrap_or(kind));
         let mut agent = new_agent(&name);
         agent.agent = kind.to_owned();
@@ -386,7 +397,8 @@ fn agents(inner: &mut Inner, tool: &mut ChatTool, report: &Report<'_>) {
             ChatToolStatus::Running
         };
         agent.started_ms = Some(now_ms());
-        agent.assignment = text("prompt").map(|prompt| head(prompt.to_owned(), MAX_CHAT_TOOL_INPUT_BYTES));
+        agent.assignment =
+            text("prompt").map(|prompt| head(prompt.to_owned(), MAX_CHAT_TOOL_INPUT_BYTES));
         agent.activity = text("prompt").and_then(short_line);
         let model = &report.metadata["model"];
         agent.model = model["modelID"]
@@ -422,7 +434,11 @@ fn agents(inner: &mut Inner, tool: &mut ChatTool, report: &Report<'_>) {
         _ => ChatToolStatus::Stopped,
     };
     let now = now_ms();
-    for agent in tool.agents.iter_mut().filter(|agent| agent.status.is_open()) {
+    for agent in tool
+        .agents
+        .iter_mut()
+        .filter(|agent| agent.status.is_open())
+    {
         end_agent(agent, status, now);
         if agent.result.is_none() {
             agent.result.clone_from(&answer);
@@ -493,7 +509,10 @@ pub(super) fn adopt(inner: &mut Inner, session: &str, parent: &str) {
         steps: VecDeque::new(),
         reply: None,
     };
-    opencode.children.entry(session.to_owned()).or_insert(adopted);
+    opencode
+        .children
+        .entry(session.to_owned())
+        .or_insert(adopted);
 }
 
 /// Changes the sub-agent of session `session` on its call's card.
